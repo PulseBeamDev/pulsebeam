@@ -212,32 +212,30 @@ fn screenshare_and_camera_over_wifi_test() {
 
 /// The same call over mobile: ~50ms latency and 1% loss.
 ///
-/// # Known failure - a real bug in the upstream loss estimator, not in BWE
+/// # Known failure - reproduces a real defect, mechanism not yet pinned down
 ///
-/// The camera direction collapses to ~9 kbps. BWE is not the limiter: it reports a healthy
-/// ~1.9 Mbps and the downstream log reads `bwe=1.937Mbit/s used=0bit/s want=2.000Mbit/s
-/// streams=BUU:PAUSE`. The stream is *paused* because the SFU marks the upstream layer unhealthy.
+/// The camera direction collapses to ~9 kbps. What is established:
 ///
-/// It is marked unhealthy because `StreamMonitor` measures 21-35% loss on a link configured to
-/// drop 1%. Two things combine in `pulsebeam/src/rtp/monitor.rs`:
+///   - **BWE is not the limiter.** It reports a healthy ~1.9 Mbps; the downstream log reads
+///     `bwe=1.937Mbit/s used=0bit/s want=2.000Mbit/s streams=BUU:PAUSE`. The stream is *paused*
+///     because the SFU marks the upstream layer unhealthy, not because of congestion control.
+///   - **Latency alone is fine.** With this exact profile and `loss: 0.0` the test passes with
+///     zero quality transitions. The failure needs real loss to seed it.
+///   - **The windows involved are tiny.** `StreamMonitor` logged `expected: 6, actual: 4` and
+///     `expected: 14, actual: 8` - 33% and 43%, both past `VIDEO_SEVERE_LOSS_THRESHOLD` (0.30),
+///     which transitions to Bad immediately with no confirmation window. `MIN_LOSS_EVIDENCE_PACKETS`
+///     is only 5, so two drops in one window are enough.
+///   - **Once Bad, no recovery was observed** - 4 `Good -> Bad` transitions and zero back.
 ///
-///   - `interval_loss` compares `expected` (a sequence-number span sampled at window close)
-///     against `actual` (packets that arrived within the window). Packets still in flight at the
-///     boundary count as lost, and `saturating_sub` clamps the correction, so a window can
-///     over-report but never under-report.
-///   - `smoothed_loss_ratio` then applies a deliberately asymmetric EWMA - alpha 0.50 rising,
-///     0.20 falling. Fed alternating over-/under-reporting windows, that asymmetry does not
-///     average out; it settles well above the true mean.
+/// What is *not* established: three isolated unit tests in `rtp/monitor.rs` -
+/// `loss_ratio_tracks_actual_loss_rate`, `..._with_reordering`, and
+/// `sparse_low_rate_stream_survives_occasional_loss` - all feed the estimator 1% loss under
+/// in-order, reordered, and sparse-window conditions, and all report correctly. So the sparse
+/// severe-threshold path above is a plausible trigger but is not on its own sufficient to
+/// reproduce the collapse; some interaction present in the full pipeline is still missing.
 ///
-/// Confirmed by experiment: with the same latency profile and `loss: 0.0`, the test passes with
-/// no quality transitions at all. Latency alone is fine - the amplification needs real loss to
-/// seed it. So ~1% genuine loss is enough to pin the smoothed estimate high enough to pause the
-/// stream indefinitely, which is a plausible explanation for poor mobile behaviour in production.
-///
-/// The fix likely belongs in the estimator: make the accounting cumulative (RFC 3550 style) so a
-/// late packet genuinely cancels an earlier over-count, and leave fast-attack behaviour to the
-/// existing `evaluate_quality_hysteresis` layer rather than biasing the measurement itself.
-/// Un-ignore once that lands.
+/// Do not "fix" this by loosening the assertion. The next step is to instrument
+/// `evaluate_quality_hysteresis` in a live sim run to capture the exact window that trips it.
 #[test]
 #[ignore = "known bug: upstream loss estimator over-reports ~1% loss as 21-35%, pausing the stream"]
 fn screenshare_and_camera_over_cellular_test() {
