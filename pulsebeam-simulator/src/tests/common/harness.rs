@@ -321,6 +321,16 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
+    /// The downstream bandwidth estimate on every participant stayed at or above `min_bps`
+    /// during the last `Step::Run`.
+    ///
+    /// Distinct from the byte checks: a poisoned estimate does not necessarily reduce throughput,
+    /// because the allocator just drops to a lower simulcast layer and the viewer keeps receiving
+    /// something. This asserts the estimate itself.
+    CheckMinBwe {
+        description: &'static str,
+        min_bps: u64,
+    },
     /// Bytes sent since the last Step::Run ≥ min_bytes (per-window rate check).
     CheckTxBytesInterval {
         description: &'static str,
@@ -789,6 +799,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
         Step::CheckTxBytesInterval { .. } => "CheckTxBytesInterval",
+        Step::CheckMinBwe { .. } => "CheckMinBwe",
         Step::CheckDataReceived { .. } => "CheckDataReceived",
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
         Step::CheckDataSequence { .. } => "CheckDataSequence",
@@ -815,6 +826,8 @@ async fn execute_plan(
                 for handle in handles.values_mut() {
                     handle.snapshot_interval();
                 }
+                // Same windowing as the byte baselines, so CheckMinBwe describes this step.
+                pulsebeam::sim_metrics::reset();
                 tokio::time::sleep(*duration).await;
             }
 
@@ -1142,6 +1155,24 @@ async fn execute_plan(
                 );
             }
 
+            Step::CheckMinBwe {
+                description,
+                min_bps,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)"
+                );
+                let observed = pulsebeam::sim_metrics::min_downstream_bwe_bps();
+                let Some((min_seen, count)) = observed else {
+                    panic!(
+                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps\n  actual:       no allocation passes observed - the check would pass vacuously"
+                    );
+                };
+                assert!(
+                    min_seen >= *min_bps,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps on every participant\n  actual:       {min_seen} bps (low-water mark over {count} allocation passes)"
+                );
+            }
             Step::CheckRxBytesInterval {
                 description,
                 participant,

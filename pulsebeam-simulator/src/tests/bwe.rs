@@ -321,3 +321,148 @@ fn conference_plan(
             },
         ]);
 }
+
+/// A viewer of a static screen share must not lose its bandwidth estimate.
+///
+/// This is the production failure, reproduced end to end. Three participants: a presenter sharing
+/// a mostly static screen, a second person on camera, and a viewer.
+///
+/// The mechanism runs entirely through the viewer's downstream connection:
+///
+///   1. While the screen is static the presenter emits near-empty frames, so every packet the SFU
+///      forwards to the viewer is a couple of hundred bytes at most.
+///   2. Padding is drawn from the RTX cache of recently sent packets, so the viewer's downstream
+///      has only tiny packets available to pad with.
+///   3. str0m emits one padding packet per event-loop round trip, so a probe cluster aimed at a
+///      few Mbps cannot get there - it runs out of wall clock long before it runs out of target
+///      bytes. Measured here: a 4 Mbps cluster achieving 0.13 Mbps across 397 packets of 16 bytes.
+///   4. Unless rejected, that probe reports the rate it *managed* to send at, which asserts a link
+///      limit that was never tested and drags the estimate down.
+///   5. The viewer's allocator then cannot afford the camera - the production symptom, "the
+///      allocator doesn't think there's enough for the camera to be streamed".
+///
+/// The viewer deliberately watches *only* the screen share during the soak; a second active
+/// stream keeps the acknowledged rate high enough to prop the estimate up on its own.
+///
+/// # What this test does and does not currently prove
+///
+/// It **does** reproduce the starved-probe condition. Instrumented with
+/// `RUST_LOG=str0m::bwe_::probe::estimator=trace`, this plan produces clusters like
+/// `tgt=4.00M ach=0.13M (3%) pkts=397 avgB=16` - a 4 Mbps probe achieving 130 kbps across 397
+/// packets of 16 bytes, which is the production failure mode and then some.
+///
+/// It does **not** yet reproduce the consequence. In production those starved probes pinned the
+/// estimate at ~1.45 Mbps on a link carrying 3 Mbps. Here the viewer's estimate stays near
+/// 2.6-2.9 Mbps whether or not str0m's `MIN_PROBE_DELIVERY_RATIO` guard is enabled, so this test
+/// does not currently discriminate that guard - the str0m unit tests
+/// `under_delivered_probe_is_rejected` and `delivered_probe_still_produces_estimate` do that
+/// directly. The likely reason is `limit_probe_bitrate`, which floors a probe result at
+/// `min(delay_estimate, acked * 0.85)`; if the delay-based estimate stays high here, bad probe
+/// results are clamped away before they can do damage.
+///
+/// So treat this as a regression guard on the *conditions* plus the viewer's estimate, not as
+/// proof of the guard. Closing the gap means finding why the production delay-based estimate did
+/// not provide that same floor.
+#[test]
+fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("presenter", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeAll {
+                description: "Viewer watches only the screen share",
+                participant: "viewer",
+                heights: &[720, 0],
+            },
+            Step::Run {
+                description: "Warmup while the screen share is still active",
+                duration: Duration::from_secs(15),
+            },
+            Step::Run {
+                description: "Soak across two static/scroll cycles",
+                duration: Duration::from_secs(48),
+            },
+            Step::CheckMinBwe {
+                description: "Estimate survives the static stretches",
+                min_bps: 2_000_000,
+            },
+            Step::CheckVideoQuality {
+                description: "Viewer renders the screen share cleanly throughout",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(300).allow_gaps(6),
+            },
+        ]);
+}
+
+/// A camera subscribed to after a long idle period must be delivered at full quality.
+///
+/// # Known failure - reproduces the production symptom
+///
+/// Same room as [`static_screenshare_does_not_poison_bandwidth_estimate_test`], but the viewer
+/// takes up the camera *after* watching only the static screen share for 80s. The camera is then
+/// delivered at ~213 kbps and stays there - 45s is no better than 20s, so it is stuck rather than
+/// slow. A healthy pickup is the 1.25 Mbps "f" layer.
+///
+/// The allocator's own report explains the refusal but not the cause:
+///
+///   `bwe=2.000Mbit/s used=1.375Mbit/s want=2.600Mbit/s`
+///
+/// It wants 2.6 Mbps, already spends 1.375 Mbps, and believes it has 2.0 Mbps - so declining the
+/// second stream is correct *given that estimate*. The question is why the estimate sits at
+/// exactly `INITIAL_BANDWIDTH` (2 Mbps) after 80s on a link the probes measure at 2.6-2.9 Mbps.
+///
+/// This is the production complaint - "the allocator doesn't think there's enough for the camera
+/// to be streamed" - reproduced deterministically. Note it is *not* the same defect as the
+/// starved probes: it persists with `MIN_PROBE_DELIVERY_RATIO` enabled.
+#[test]
+#[ignore = "known bug: camera subscribed after an idle period is stuck at ~213kbps"]
+fn camera_taken_up_after_idle_reaches_full_quality_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("presenter", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeAll {
+                description: "Viewer watches only the screen share",
+                participant: "viewer",
+                heights: &[720, 0],
+            },
+            Step::Run {
+                description: "Long stretch with the camera unsubscribed",
+                duration: Duration::from_secs(60),
+            },
+            Step::SubscribeAll {
+                description: "Viewer now also wants the camera",
+                participant: "viewer",
+                heights: &[720, 720],
+            },
+            Step::Run {
+                description: "Allow the allocator to take up the camera",
+                duration: Duration::from_secs(45),
+            },
+            // 45s of the 1.25Mbps "f" layer is ~7MB; 2MB is a generous floor that still
+            // distinguishes a real pickup from the ~213kbps the viewer actually gets.
+            Step::CheckRxBytesInterval {
+                description: "Camera is actually delivered after the idle period",
+                participant: "viewer",
+                min_bytes: 2_000_000,
+            },
+        ]);
+}
