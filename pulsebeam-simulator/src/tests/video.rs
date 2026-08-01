@@ -108,7 +108,6 @@ fn repeated_simulcast_switching_stays_decodable_test() {
 // pre-existing bug: PLI for the layer switch targets a mid/rid that no longer
 // exists on the publisher side, so no fresh keyframe is delivered and bob gets
 // 0 bytes throughout the soak.
-#[ignore = "pre-existing bug: PLI stream-not-found leaves subscriber starved of keyframes"]
 #[test]
 fn simulcast_stream_stability_test() {
     LocalNodeSim::new()
