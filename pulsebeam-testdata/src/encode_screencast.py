@@ -11,10 +11,15 @@ def main():
     parser.add_argument("--height", required=True, type=int)
     parser.add_argument("--bitrate", required=True, type=int)
     parser.add_argument("--fps", default=30, type=int)
+    parser.add_argument("--idle-fps", default=0.5, type=float)
     args = parser.parse_args()
     output = pathlib.Path(args.output)
-    heartbeat = max(1, args.fps // 2)
-    selection = f"select='gt(scene,0.001)+not(mod(n,{heartbeat}))',scale=-2:{args.height}:flags=lanczos"
+    assert 0 < args.idle_fps <= args.fps
+    heartbeat = max(1, round(args.fps / args.idle_fps))
+    selection = (
+        f"fps={args.fps},select='gt(scene,0.01)+not(mod(n,{heartbeat}))',"
+        f"scale=-2:{args.height}:flags=lanczos"
+    )
 
     with tempfile.TemporaryDirectory() as directory:
         container = pathlib.Path(directory) / "screen.mkv"
@@ -23,7 +28,7 @@ def main():
                 "ffmpeg", "-v", "error", "-y", "-i", args.input, "-an", "-vf", selection,
                 "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "veryfast", "-tune",
                 "zerolatency", "-profile:v", "baseline", "-bf", "0", "-g", "3000",
-                "-sc_threshold", "0", "-crf", "30", "-maxrate", f"{args.bitrate}k",
+                "-sc_threshold", "0", "-crf", "50", "-maxrate", f"{args.bitrate}k",
                 "-bufsize", f"{args.bitrate * 3 // 5}k", "-x264-params",
                 "nal-hrd=none:force-cfr=0:repeat-headers=1", str(container),
             ],

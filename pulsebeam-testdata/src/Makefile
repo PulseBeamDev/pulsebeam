@@ -8,6 +8,10 @@ INPUT_H264   = full_f_cbr.h264
 SCREENCAST   = screencast.mp4
 OUT_DIR      = .
 FPS          = 30
+SCREEN_FPS   = 15
+SCREEN_IDLE_FPS = 0.5
+SCREEN_HEIGHT = 1056
+SCREEN_BITRATE = 2500
 
 # Bitrates in kbps (GStreamer x264enc uses kbit/sec)
 BITRATE_F = 1250
@@ -91,25 +95,15 @@ $(OUT_DIR)/quarter_q_cbr.h264: $(INPUT_VIDEO)
 		video/x-h264,profile=baseline,stream-format=byte-stream ! \
 		filesink location=$@
 
-screenshare: $(OUT_DIR)/screen_f_vbr.h264 \
-             $(OUT_DIR)/screen_h_vbr.h264 \
-             $(OUT_DIR)/screen_q_vbr.h264
+screenshare: $(OUT_DIR)/screen_f_vbr.h264
 
 $(OUT_DIR)/screen_f_vbr.h264: $(SCREENCAST)
-	python3 encode_screencast.py --input $< --output $@ --height 720 --bitrate $(BITRATE_F) --fps $(FPS)
-
-$(OUT_DIR)/screen_h_vbr.h264: $(SCREENCAST)
-	python3 encode_screencast.py --input $< --output $@ --height 360 --bitrate $(BITRATE_H) --fps $(FPS)
-
-$(OUT_DIR)/screen_q_vbr.h264: $(SCREENCAST)
-	python3 encode_screencast.py --input $< --output $@ --height 180 --bitrate $(BITRATE_Q) --fps $(FPS)
+	python3 encode_screencast.py --input $< --output $@ --height $(SCREEN_HEIGHT) --bitrate $(SCREEN_BITRATE) --fps $(SCREEN_FPS) --idle-fps $(SCREEN_IDLE_FPS)
 
 screenshare-analyze: screenshare
 	python3 analyze_screencast.py \
 		--source $(SCREENCAST) \
-		--stream f:$(BITRATE_F):$(OUT_DIR)/screen_f_vbr.h264 \
-		--stream h:$(BITRATE_H):$(OUT_DIR)/screen_h_vbr.h264 \
-		--stream q:$(BITRATE_Q):$(OUT_DIR)/screen_q_vbr.h264
+		--stream f:$(SCREEN_BITRATE):$(OUT_DIR)/screen_f_vbr.h264
 
 # ==============================================================================
 # ANALYSIS & UTILITIES

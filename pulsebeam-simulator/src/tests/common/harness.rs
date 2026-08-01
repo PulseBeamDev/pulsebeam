@@ -101,10 +101,10 @@ impl Participant {
     /// A publisher whose content is screen sharing: strongly variable bitrate, long static
     /// stretches. This is the case that exercises str0m's probe controller, because the sender
     /// sits in ALR whenever the screen is still.
-    pub fn screensharer(name: &'static str, rids: &[&'static str]) -> Self {
+    pub fn screensharer(name: &'static str) -> Self {
         Self {
             vbr: Some(VbrProfile::screenshare()),
-            ..Self::publisher(name, rids)
+            ..Self::publisher(name, &["f"])
         }
     }
 
@@ -1205,9 +1205,7 @@ async fn execute_plan(
                 description,
                 min_bps,
             } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)"
-                );
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)");
                 let observed = pulsebeam::sim_metrics::downstream_bwe_summary();
                 let Some((min_seen, max_seen, last_seen, count)) = observed else {
                     panic!(

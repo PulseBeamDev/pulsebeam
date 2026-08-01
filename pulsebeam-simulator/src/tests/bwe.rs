@@ -117,8 +117,8 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
 /// publish and subscribe, so four simulcast ladders are in flight at once and every congestion
 /// controller is being driven by real media rather than a synthetic ramp.
 ///
-/// The screen share is VBR ([`VbrProfile::screenshare`]): 4s bursts at 30fps separated by 20s of
-/// near-static content at 2fps. That ~15x swing is what makes this worth simulating.
+/// The screen share replays a captured desktop at up to 15fps and falls to a 0.5fps heartbeat
+/// while static. That swing is what makes this worth simulating.
 ///
 ///   - during the quiet phase the sender is application limited, so str0m enters ALR and the
 ///     probe controller alone keeps the bandwidth estimate alive. If probing stalls, the estimate
@@ -130,7 +130,7 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
 ///     screen share's bursts. Production symptom: "the allocator doesn't think there is enough
 ///     for the camera to be streamed".
 ///
-/// Measured over 48s (two full VBR cycles) on [`LinkProfile::fiber`]: the camera direction
+/// Measured over 48s of the captured activity on [`LinkProfile::fiber`]: the camera direction
 /// carries ~1.16 Mbps, i.e. essentially the full 1.25 Mbps "f" layer, so the screen share's
 /// bursts are not starving it. The screen-share direction carries less in absolute terms purely
 /// because of its duty cycle - `(4s x 1.25Mbps + 20s x 83kbps) / 24s` is ~278 kbps - so it too is
@@ -141,9 +141,7 @@ fn screenshare_and_camera_conference_test() {
         .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
-                .with_participant(
-                    Participant::screensharer("screen", &["q", "h", "f"]).and_subscribes(),
-                )
+                .with_participant(Participant::screensharer("screen").and_subscribes())
                 .with_participant(
                     Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
                 ),
@@ -170,7 +168,7 @@ fn screenshare_and_camera_conference_test() {
                 duration: Duration::from_secs(20),
             },
             Step::Run {
-                description: "Soak across two full VBR cycles (static -> scroll -> static)",
+                description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
             // ~224 kbps measured. The camera is constant-bitrate, so any collapse here means the
@@ -195,7 +193,7 @@ fn screenshare_and_camera_conference_test() {
             Step::CheckVideoQuality {
                 description: "Camera participant renders the screen share cleanly throughout",
                 participant: "camera",
-                quality: VideoQuality::min_frames(300).allow_gaps(3),
+                quality: VideoQuality::min_frames(150).allow_gaps(3),
             },
         ]);
 }
@@ -207,7 +205,7 @@ fn screenshare_and_camera_conference_test() {
 /// should be absorbed as inherent loss rather than triggering a backoff.
 #[test]
 fn screenshare_and_camera_over_wifi_test() {
-    conference_plan(LinkProfile::wifi(), 3_000_000, 700_000, 600, 200, 8, 2);
+    conference_plan(LinkProfile::wifi(), 3_000_000, 700_000, 600, 100, 8, 2);
 }
 
 /// The same call over mobile: ~50ms latency and 1% loss.
@@ -263,9 +261,7 @@ fn conference_plan(
         .with_link(link)
         .with_room(
             Room::new("room1")
-                .with_participant(
-                    Participant::screensharer("screen", &["q", "h", "f"]).and_subscribes(),
-                )
+                .with_participant(Participant::screensharer("screen").and_subscribes())
                 .with_participant(
                     Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
                 ),
@@ -292,7 +288,7 @@ fn conference_plan(
                 duration: Duration::from_secs(20),
             },
             Step::Run {
-                description: "Soak across two full VBR cycles (static -> scroll -> static)",
+                description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
             Step::CheckRxBytesInterval {
@@ -369,7 +365,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
         .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::screensharer("presenter", &["q", "h", "f"]))
+                .with_participant(Participant::screensharer("presenter"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
                 .with_participant(Participant::multi_subscriber("viewer", 2)),
         )
@@ -388,7 +384,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
                 duration: Duration::from_secs(15),
             },
             Step::Run {
-                description: "Soak across two static/scroll cycles",
+                description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
             Step::CheckMinBwe {
@@ -398,7 +394,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
             Step::CheckVideoQuality {
                 description: "Viewer renders the screen share cleanly throughout",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(300).allow_gaps(6),
+                quality: VideoQuality::min_frames(150).allow_gaps(6),
             },
         ]);
 }
@@ -442,7 +438,7 @@ fn late_video_subscription_is_delivered_test() {
         .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::screensharer("presenter", &["q", "h", "f"]))
+                .with_participant(Participant::screensharer("presenter"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
                 .with_participant(Participant::multi_subscriber("viewer", 2)),
         )

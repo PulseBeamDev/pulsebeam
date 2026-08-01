@@ -9,6 +9,8 @@ WIDTH = 160
 HEIGHT = 90
 STATIC_PIXEL_DELTA = 0.5
 STATIC_TARGET_FRACTION = 0.25
+STATIC_MAX_KBPS = 20
+STATIC_MEAN_MAX_KBPS = 60
 
 
 def command_output(command):
@@ -103,7 +105,7 @@ def main():
         f"source: {len(motion)}s, static: {len(static_seconds)}s "
         f"(mean pixel delta <= {STATIC_PIXEL_DELTA})"
     )
-    print("layer target_kbps overall_kbps static_median static_p95 static_max status")
+    print("layer target_kbps overall_kbps static_mean static_median static_p95 static_max status")
 
     failed = False
     for name, target_kbps, path in args.stream:
@@ -112,20 +114,21 @@ def main():
         assert aligned_static, f"{name}: no static source seconds overlap encoded stream"
         ordered = sorted(aligned_static)
         p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+        mean = statistics.mean(ordered)
         median = statistics.median(ordered)
         maximum = max(ordered)
         overall = sum(sizes) * 8 / 1000 / duration
-        limit = target_kbps * STATIC_TARGET_FRACTION
-        passed = median <= limit
+        limit = min(target_kbps * STATIC_TARGET_FRACTION, STATIC_MAX_KBPS)
+        passed = median <= limit and mean <= STATIC_MEAN_MAX_KBPS
         failed |= not passed
         print(
-            f"{name:>5} {target_kbps:>11.0f} {overall:>12.1f} {median:>13.1f} "
+            f"{name:>5} {target_kbps:>11.0f} {overall:>12.1f} {mean:>11.1f} {median:>13.1f} "
             f"{p95:>10.1f} {maximum:>10.1f} {'PASS' if passed else 'FAIL'}"
         )
 
     if failed:
         raise SystemExit(
-            f"static median must be <= {STATIC_TARGET_FRACTION:.0%} of each layer target"
+            f"static median must be <= {STATIC_MAX_KBPS} kbps and mean <= {STATIC_MEAN_MAX_KBPS} kbps"
         )
 
 
