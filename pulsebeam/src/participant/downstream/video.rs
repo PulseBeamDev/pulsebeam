@@ -918,8 +918,24 @@ impl AllocationEngine {
         self.snap(layer).bitrate_bps
     }
 
+    /// Cost used to derive `desired`, floored at the layer's configured capacity.
+    ///
+    /// `stable_bitrate_bps` is an EWMA over the measured (or VLA-declared) rate with a 30s fall
+    /// constant and no lower bound, so a publisher that goes quiet - static screenshare being
+    /// the common case - drags it toward zero. Feeding that straight into `desired` conflates
+    /// "what the publisher is sending right now" with "what this subscription may grow into".
+    ///
+    /// str0m caps every bandwidth probe at `2 x desired`, so a decayed `desired` starves the
+    /// probe controller and the estimate cannot recover enough to allocate a higher layer -
+    /// the stream stays stuck at low quality after the content goes static.
+    ///
+    /// Flooring at the layer's configured seed keeps `desired` a statement about capacity, which
+    /// is what libWebRTC's `max_total_allocated_bitrate` is: a sum of *configured* stream maxima
+    /// that does not decay. Allocation decisions keep using the unfloored [`Self::cost`], so this
+    /// only affects how much headroom we ask BWE to probe for.
     fn stable_cost(&self, layer: &TrackLayer) -> f64 {
-        self.snap(layer).stable_bitrate_bps
+        let measured = self.snap(layer).stable_bitrate_bps;
+        measured.max(layer.quality.seed_bitrate_bps() as f64)
     }
 
     /// Lowest healthy layer ignoring the spatial constraint. Used as a
@@ -1014,10 +1030,36 @@ impl AllocationEngine {
     pub fn run_desired(&self, slots: &[SlotView<'_>]) -> Bitrate {
         let total: f64 = slots
             .iter()
-            .filter_map(|s| self.best_healthy(s))
-            .map(|l| self.stable_cost(l))
+            .map(|s| {
+                let flowing = self.best_healthy(s).map(|l| self.stable_cost(l)).unwrap_or(0.0);
+                flowing.max(self.requested_capacity(s))
+            })
             .sum();
         Bitrate::from(total as u64)
+    }
+
+    /// Configured capacity this subscription is asking for, independent of what is flowing.
+    ///
+    /// [`Self::best_healthy`] only sees layers that are currently healthy and carrying data. A
+    /// layer that was paused for lack of bandwidth is invisible to it - which is precisely the
+    /// layer we need BWE to find headroom for. Deriving `desired` from flowing layers alone
+    /// makes it a description of current *supply*, and since str0m caps every probe at
+    /// `2 x desired`, the estimate can then never grow enough to un-pause the layer. The
+    /// subscription stays stuck at low quality with no way out - a subscriber that asks for 720p
+    /// after a long stretch at 180p never gets it, on a link that could carry it the whole time.
+    ///
+    /// Selecting purely on the client's spatial request, and valuing it at the layer's
+    /// configured seed rather than its measured rate, keeps `desired` a statement of demand.
+    /// This mirrors libWebRTC's `max_total_allocated_bitrate`, which is a sum of *configured*
+    /// stream maxima and does not decay with what the encoder happens to be emitting.
+    fn requested_capacity(&self, slot: &SlotView<'_>) -> f64 {
+        slot.track
+            .layers
+            .iter()
+            .filter(|layer| self.spatially_allowed(slot, layer))
+            .max_by_key(|layer| layer.quality)
+            .map(|layer| layer.quality.seed_bitrate_bps() as f64)
+            .unwrap_or(0.0)
     }
 
     fn used_bitrate(decisions: &SecondaryMap<SlotKey, AllocationDecision<'_>>) -> Bitrate {
@@ -2494,18 +2536,32 @@ mod allocation_tests {
                 .map(|mid| slot(mid, max_height, &t, LayerQuality::Low))
                 .collect();
 
+            // Layer *selection* is by raw measured bitrate (`cost`), so mirror that first...
             let spatial_max = cases
                 .iter()
                 .filter(|(_, _, healthy, height)| *healthy && *height <= max_height)
-                .map(|(_, bitrate, _, _)| *bitrate)
-                .max();
+                .max_by_key(|(_, bitrate, _, _)| *bitrate)
+                .map(|(quality, bitrate, _, _)| (*quality, *bitrate));
             let fallback = cases
                 .iter()
                 .filter(|(_, _, healthy, _)| *healthy)
                 .min_by_key(|(quality, _, _, _)| *quality)
-                .map(|(_, bitrate, _, _)| *bitrate);
-            let expected_per_slot = spatial_max.or(fallback).unwrap_or(0);
-            let expected = expected_per_slot * slot_count as u64;
+                .map(|(quality, bitrate, _, _)| (*quality, *bitrate));
+            // ...then apply the configured-capacity floor `stable_cost` puts on the value, so a
+            // publisher sending below its layer's capacity still reports capacity as desired.
+            let flowing = spatial_max
+                .or(fallback)
+                .map(|(quality, bitrate)| bitrate.max(quality.seed_bitrate_bps()))
+                .unwrap_or(0);
+            // `desired` is also floored by what the subscription *asks* for, so a layer paused
+            // for lack of bandwidth still counts toward the headroom we want BWE to find.
+            let requested_capacity = cases
+                .iter()
+                .filter(|(_, _, _, height)| *height <= max_height)
+                .map(|(quality, _, _, _)| quality.seed_bitrate_bps())
+                .max()
+                .unwrap_or(0);
+            let expected = flowing.max(requested_capacity) * slot_count as u64;
             let desired = AllocationEngine::desired_bitrate(&slots);
 
             prop_assert_eq!(desired.as_f64(), expected as f64);
@@ -2695,8 +2751,10 @@ mod allocation_tests {
                 .quality(StreamQuality::Bad);
         }
 
-        let reactive_bps: u64 = 400_000;
-        let stable_bps: u64 = 900_000;
+        // Both above LayerQuality::High's configured seed, so the capacity floor in
+        // `stable_cost` does not mask which of the two signals is being read.
+        let reactive_bps: u64 = 1_400_000;
+        let stable_bps: u64 = 1_900_000;
 
         // Set reactive and stable to different values to distinguish them.
         t.by_quality(LayerQuality::High)
@@ -2713,6 +2771,51 @@ mod allocation_tests {
             (desired.as_f64() - stable_bps as f64).abs() < 1.0,
             "desired_bitrate should use stable_bitrate_bps ({stable_bps}) not \
              reactive bitrate_bps ({reactive_bps}); got {:.0}",
+            desired.as_f64()
+        );
+    }
+
+    /// `desired` must not decay below the layer's configured capacity.
+    ///
+    /// `stable_bitrate_bps` is an EWMA over the *measured* (or VLA-declared) rate with a 30s
+    /// fall constant and no lower bound (`rtp/monitor.rs`). During static screenshare the
+    /// encoder emits almost nothing, so it decays toward zero and `desired` collapses to the
+    /// `MIN_BANDWIDTH` clamp.
+    ///
+    /// That is not a statement about what the subscriber wants - it is a statement about what
+    /// the publisher happens to be sending right now. str0m caps every bandwidth probe at
+    /// `2 x desired`, so a collapsed `desired` starves probing and the estimate cannot recover
+    /// to allocate a higher layer. libWebRTC's equivalent (`max_total_allocated_bitrate`) is a
+    /// sum of *configured* stream maxima and does not decay.
+    #[test]
+    fn desired_bitrate_does_not_decay_below_configured_layer_capacity() {
+        let t = healthy_track();
+        for q in [LayerQuality::Medium, LayerQuality::Low] {
+            t.by_quality(q)
+                .unwrap()
+                .state
+                .update_for_test()
+                .quality(StreamQuality::Bad);
+        }
+
+        // Static screenshare: the stable filter has decayed to almost nothing.
+        let decayed_bps: u64 = 20_000;
+        t.by_quality(LayerQuality::High)
+            .unwrap()
+            .state
+            .update_for_test()
+            .bitrate(decayed_bps)
+            .stable_bitrate(decayed_bps);
+
+        let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
+        let desired = AllocationEngine::desired_bitrate(&slots);
+
+        let seed = LayerQuality::High.seed_bitrate_bps();
+        assert!(
+            desired.as_f64() >= seed as f64,
+            "desired_bitrate must stay at or above the High layer's configured capacity \
+             ({seed} bps) even when the measured stable rate has decayed to {decayed_bps} bps; \
+             got {:.0}. A decayed desired caps str0m's probes at 2x it and stalls recovery.",
             desired.as_f64()
         );
     }
