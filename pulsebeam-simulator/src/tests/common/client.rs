@@ -439,12 +439,21 @@ pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
 }
 
 pub fn create_vbr_looper_for_rid(rid: Option<&str>, profile: VbrProfile) -> VbrLooper {
-    let data = match rid {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
-        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+    let (data, timing) = match rid {
+        Some("f") => (
+            pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
+            pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
+        ),
+        Some("h") => (
+            pulsebeam_testdata::RAW_H264_SCREEN_HALF_VBR,
+            pulsebeam_testdata::RAW_H264_SCREEN_HALF_TIMING,
+        ),
+        Some("q") | _ => (
+            pulsebeam_testdata::RAW_H264_SCREEN_QUARTER_VBR,
+            pulsebeam_testdata::RAW_H264_SCREEN_QUARTER_TIMING,
+        ),
     };
-    VbrLooper::new(data, profile)
+    VbrLooper::new_scheduled(data, timing, profile)
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

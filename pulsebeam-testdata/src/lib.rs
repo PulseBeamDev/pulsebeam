@@ -1,6 +1,12 @@
 pub const RAW_H264_FULL_CBR: &[u8] = include_bytes!("full_f_cbr.h264");
 pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");
 pub const RAW_H264_QUARTER_CBR: &[u8] = include_bytes!("quarter_q_cbr.h264");
+pub const RAW_H264_SCREEN_FULL_VBR: &[u8] = include_bytes!("screen_f_vbr.h264");
+pub const RAW_H264_SCREEN_HALF_VBR: &[u8] = include_bytes!("screen_h_vbr.h264");
+pub const RAW_H264_SCREEN_QUARTER_VBR: &[u8] = include_bytes!("screen_q_vbr.h264");
+pub const RAW_H264_SCREEN_FULL_TIMING: &str = include_str!("screen_f_vbr.timing");
+pub const RAW_H264_SCREEN_HALF_TIMING: &str = include_str!("screen_h_vbr.timing");
+pub const RAW_H264_SCREEN_QUARTER_TIMING: &str = include_str!("screen_q_vbr.timing");
 
 // 16 video and 5 audio downstream slots
 pub const RAW_CHROME_SDP: &str = include_str!("chrome.sdp");
@@ -79,4 +85,86 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
         frames.push(current_frame_bytes);
     }
     frames
+}
+
+pub fn frame_timestamps_micros(data: &str) -> Vec<u64> {
+    let timestamps: Vec<u64> = data
+        .lines()
+        .map(|line| line.parse().expect("valid frame timestamp"))
+        .collect();
+    debug_assert!(!timestamps.is_empty());
+    debug_assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
+    timestamps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_share_fixtures_have_variable_cadence_and_low_static_bitrate() {
+        for (name, encoded, timing, target_kbps) in [
+            (
+                "f",
+                RAW_H264_SCREEN_FULL_VBR,
+                RAW_H264_SCREEN_FULL_TIMING,
+                1_250,
+            ),
+            (
+                "h",
+                RAW_H264_SCREEN_HALF_VBR,
+                RAW_H264_SCREEN_HALF_TIMING,
+                400,
+            ),
+            (
+                "q",
+                RAW_H264_SCREEN_QUARTER_VBR,
+                RAW_H264_SCREEN_QUARTER_TIMING,
+                150,
+            ),
+        ] {
+            let sizes = h264_frame_sizes(encoded);
+            let timestamps = frame_timestamps_micros(timing);
+            assert_eq!(sizes.len(), timestamps.len(), "{name} frame schedule");
+
+            let gaps: Vec<u64> = timestamps
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect();
+            assert!(
+                gaps.iter().any(|gap| *gap <= 34_000),
+                "{name} has motion cadence"
+            );
+            assert!(
+                gaps.iter().any(|gap| *gap >= 500_000),
+                "{name} has static cadence"
+            );
+
+            let mut static_window_rates = Vec::new();
+            for second in 0..timestamps.last().copied().unwrap() / 1_000_000 {
+                let indices: Vec<usize> = timestamps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, timestamp)| **timestamp / 1_000_000 == second)
+                    .map(|(index, _)| index)
+                    .collect();
+                if indices.len() <= 3 {
+                    let kbps = indices
+                        .iter()
+                        .map(|index| sizes[*index] as u64)
+                        .sum::<u64>()
+                        * 8
+                        / 1_000;
+                    static_window_rates.push(kbps);
+                }
+            }
+            assert!(!static_window_rates.is_empty(), "{name} has static windows");
+            static_window_rates.sort_unstable();
+            let median = static_window_rates[static_window_rates.len() / 2];
+            assert!(
+                median <= target_kbps / 4,
+                "{name} static median {median}kbps exceeds 25% of {target_kbps}kbps"
+            );
+        }
+    }
 }
