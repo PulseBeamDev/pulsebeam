@@ -378,10 +378,10 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
                 description: "Establish connections and discover both tracks",
                 duration: Duration::from_secs(20),
             },
-            Step::SubscribeAll {
+            Step::SubscribeTo {
                 description: "Viewer watches only the screen share",
                 participant: "viewer",
-                heights: &[720, 0],
+                targets: &[("presenter", 720)],
             },
             Step::Run {
                 description: "Warmup while the screen share is still active",
@@ -403,29 +403,41 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
         ]);
 }
 
-/// A camera subscribed to after a long idle period must be delivered at full quality.
+/// A video subscription added after the initial one must actually be delivered.
 ///
-/// # Known failure - reproduces the production symptom
+/// # Known failure - reproduces the production symptom, and it is not a BWE bug
 ///
-/// Same room as [`static_screenshare_does_not_poison_bandwidth_estimate_test`], but the viewer
-/// takes up the camera *after* watching only the static screen share for 80s. The camera is then
-/// delivered at ~213 kbps and stays there - 45s is no better than 20s, so it is stuck rather than
-/// slow. A healthy pickup is the 1.25 Mbps "f" layer.
+/// The viewer subscribes to the presenter, runs for 60s, then re-issues subscriptions for *both*
+/// the presenter and the camera. The camera never arrives: the viewer receives ~213 kbps for the
+/// next 45s, which is the screen share's VBR average alone, and 45s is no better than 20s.
 ///
-/// The allocator's own report explains the refusal but not the cause:
+/// Narrowed down as follows:
 ///
-///   `bwe=2.000Mbit/s used=1.375Mbit/s want=2.600Mbit/s`
+///   - **Not bandwidth.** During the pickup window the downstream estimate measures
+///     min 2.76 / max 3.07 Mbps against `want=2.6Mbps`. There is more than enough headroom, and
+///     the allocator's own report confirms it is not congestion-limited.
+///   - **Not the probe guard.** Reproduces identically with `MIN_PROBE_DELIVERY_RATIO` enabled or
+///     disabled, so it is unrelated to the starved-probe defect.
+///   - **Not the `height == 0` hide path.** Omitting the camera from the first subscription
+///     entirely, rather than subscribing at height 0, gives byte-for-byte the same result
+///     (1_200_940). So this is not `signaling.rs`'s `if req.target_height == 0 { continue; }`.
+///   - **Not inherent to two streams.** `screenshare_and_camera_conference_test` subscribes to
+///     both from the start and comfortably clears 6 MB over a comparable window.
 ///
-/// It wants 2.6 Mbps, already spends 1.375 Mbps, and believes it has 2.0 Mbps - so declining the
-/// second stream is correct *given that estimate*. The question is why the estimate sits at
-/// exactly `INITIAL_BANDWIDTH` (2 Mbps) after 80s on a link the probes measure at 2.6-2.9 Mbps.
+/// The slot simply stops being allocated. With `RUST_LOG=pulsebeam=debug` two slots exist and
+/// both are bound initially, then one drops out of every subsequent allocation report while the
+/// other climbs q -> h -> f normally:
 ///
-/// This is the production complaint - "the allocator doesn't think there's enough for the camera
-/// to be streamed" - reproduced deterministically. Note it is *not* the same defect as the
-/// starved probes: it persists with `MIN_PROBE_DELIVERY_RATIO` enabled.
+///   `streams=brG:PAUSE(150.000kbit/s) k9U:M(400.000kbit/s)`   <- both bound
+///   `streams=brG:M(400.000kbit/s)`                            <- k9U gone
+///   `streams=brG:H(1.250Mbit/s)`                              <- and never returns
+///
+/// So the defect is in how a re-issued `SetSubscriptions` re-binds slots, not in congestion
+/// control. This is the production complaint - "the allocator doesn't think there's enough for
+/// the camera to be streamed" - except that the allocator has the bandwidth and has lost the slot.
 #[test]
-#[ignore = "known bug: camera subscribed after an idle period is stuck at ~213kbps"]
-fn camera_taken_up_after_idle_reaches_full_quality_test() {
+#[ignore = "known bug: a video subscription added after the first is never delivered"]
+fn late_video_subscription_is_delivered_test() {
     LocalNodeSim::new()
         .with_tick(Duration::from_millis(1))
         .with_room(
@@ -439,28 +451,29 @@ fn camera_taken_up_after_idle_reaches_full_quality_test() {
                 description: "Establish connections and discover both tracks",
                 duration: Duration::from_secs(20),
             },
-            Step::SubscribeAll {
+            Step::SubscribeTo {
                 description: "Viewer watches only the screen share",
                 participant: "viewer",
-                heights: &[720, 0],
+                targets: &[("presenter", 720)],
             },
             Step::Run {
-                description: "Long stretch with the camera unsubscribed",
+                description: "Long stretch with only the presenter subscribed",
                 duration: Duration::from_secs(60),
             },
-            Step::SubscribeAll {
+            Step::SubscribeTo {
                 description: "Viewer now also wants the camera",
                 participant: "viewer",
-                heights: &[720, 720],
+                targets: &[("presenter", 720), ("camera", 720)],
             },
             Step::Run {
                 description: "Allow the allocator to take up the camera",
                 duration: Duration::from_secs(45),
             },
-            // 45s of the 1.25Mbps "f" layer is ~7MB; 2MB is a generous floor that still
-            // distinguishes a real pickup from the ~213kbps the viewer actually gets.
+            // 45s of the 1.25Mbps "f" layer is ~7MB, and the screen share adds ~1.5MB on top.
+            // 2MB is a generous floor that still separates a real pickup from the ~213kbps
+            // (1_200_940 bytes) the viewer actually receives.
             Step::CheckRxBytesInterval {
-                description: "Camera is actually delivered after the idle period",
+                description: "Camera is delivered after being added to the subscription",
                 participant: "viewer",
                 min_bytes: 2_000_000,
             },
