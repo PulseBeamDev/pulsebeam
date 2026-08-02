@@ -57,8 +57,8 @@ pub struct StreamCache {
     /// Direct-mapped ring indexed by `seq & CACHE_MASK`. Two sequence numbers
     /// `CAPACITY` apart share a slot; a read verifies `slot.seq_no == wanted`, so
     /// an evicted entry (overwritten by a newer packet at the same slot) reads as
-    /// absent. Packets are boxed so an idle stream's ring costs only pointers.
-    ring: Box<[Option<Box<RtpPacket>>]>,
+    /// absent.
+    ring: Box<[Option<RtpPacket>]>,
     /// Highest sequence number stored — the write frontier. The live window is
     /// `[newest_seq - CAPACITY + 1, newest_seq]`.
     newest_seq: Option<u64>,
@@ -98,7 +98,7 @@ impl StreamCache {
     #[inline]
     fn slot(&self, seq: u64) -> Option<&RtpPacket> {
         self.ring[(seq & CACHE_MASK) as usize]
-            .as_deref()
+            .as_ref()
             .filter(|p| *p.seq_no == seq)
     }
 
@@ -122,7 +122,7 @@ impl StreamCache {
 
         // Placing the packet naturally evicts whatever occupied its slot
         // `CAPACITY` positions ago — no eviction loop needed.
-        self.ring[(seq & CACHE_MASK) as usize] = Some(Box::new(pkt.clone()));
+        self.ring[(seq & CACHE_MASK) as usize] = Some(pkt.clone());
         self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
 
         let frame_ts = pkt.rtp_ts.numer();

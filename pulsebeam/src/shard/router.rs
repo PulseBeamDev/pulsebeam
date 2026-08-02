@@ -44,13 +44,13 @@ pub(crate) trait RoutingContext: CrossShardSend {
     );
     fn forward_audio_rtp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         slot_idx: AudioSelectorSlotId,
         pkt: &RtpPacket,
     );
     fn forward_sctp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         origin: ParticipantId,
         topic: &Topic,
         pkt: &[u8],
@@ -67,7 +67,7 @@ pub(crate) trait RoutingContext: CrossShardSend {
 
     fn forward_reliable_sctp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         origin: ParticipantId,
         topic: &Topic,
         frame: &[u8],
@@ -82,7 +82,7 @@ pub(crate) struct ParticipantShardMeta {
 }
 
 pub(crate) struct ShardRoomContext {
-    pub members: FastIndexSet<ParticipantId>,
+    pub members: FastIndexSet<ParticipantHandle>,
     pub remote_shards: FastIndexSet<ShardId>,
     pub audio_selector: TopNAudioSelector,
     pub data_streams: HashMap<DataStreamId, DataStreamRoute>,
@@ -119,7 +119,7 @@ impl DataStreamId {
 }
 
 pub(crate) struct AllPublisherSubscriptions {
-    local_by_topic: HashMap<Topic, FastIndexSet<ParticipantId>>,
+    local_by_topic: HashMap<Topic, FastIndexSet<ParticipantHandle>>,
     remote_by_topic: HashMap<Topic, FastIndexSet<ShardId>>,
 }
 
@@ -134,7 +134,7 @@ impl AllPublisherSubscriptions {
 
 pub(crate) struct DataStreamRoute {
     published: bool,
-    local_subscribers: FastIndexSet<ParticipantId>,
+    local_subscribers: FastIndexSet<ParticipantHandle>,
     remote_subscriber_shards: HashMap<ShardId, usize>,
 }
 
@@ -259,7 +259,7 @@ impl ShardRoutingTable {
             .entry(room_id)
             .or_insert_with(|| ShardRoomContext::new(rng))
             .members
-            .insert(participant_id);
+            .insert(handle);
     }
 
     /// Removes a local participant from its room and evicts its audio
@@ -276,18 +276,21 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        room.members.swap_remove(participant_id);
+        let Some(removed_handle) = removed_handle else {
+            return;
+        };
+        room.members.swap_remove(&removed_handle);
         for subscribers in room.all_publisher_subscriptions.local_by_topic.values_mut() {
-            subscribers.swap_remove(participant_id);
+            subscribers.swap_remove(&removed_handle);
         }
         room.all_publisher_subscriptions
             .local_by_topic
             .retain(|_, subscribers| !subscribers.is_empty());
         for route in room.data_streams.values_mut() {
-            route.local_subscribers.swap_remove(participant_id);
+            route.local_subscribers.swap_remove(&removed_handle);
         }
         room.data_streams.retain(|_, route| !route.is_unused());
-        room.reliable.remove_participant(participant_id);
+        room.reliable.remove_participant(removed_handle);
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -512,6 +515,9 @@ impl ShardRoutingTable {
         topic: Topic,
         publisher: Option<ParticipantId>,
     ) -> bool {
+        let Some(handle) = self.local_participants.get(&subscriber).copied() else {
+            return false;
+        };
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
@@ -522,7 +528,7 @@ impl ShardRoutingTable {
                     .entry(DataStreamId::new(publisher, topic))
                     .or_insert_with(DataStreamRoute::new);
                 let was_empty = route.local_subscribers.is_empty();
-                route.local_subscribers.insert(subscriber);
+                route.local_subscribers.insert(handle);
                 was_empty
             }
             None => {
@@ -532,11 +538,11 @@ impl ShardRoutingTable {
                     .entry(topic.clone())
                     .or_insert_with(fast_set);
                 let was_empty = subscribers.is_empty();
-                let inserted = subscribers.insert(subscriber);
+                let inserted = subscribers.insert(handle);
                 debug_assert!(inserted);
                 for (stream_id, route) in &mut room.data_streams {
                     if route.published && stream_id.topic == topic {
-                        route.local_subscribers.insert(subscriber);
+                        route.local_subscribers.insert(handle);
                     }
                 }
                 was_empty
@@ -551,6 +557,9 @@ impl ShardRoutingTable {
         topic: &Topic,
         publisher: Option<ParticipantId>,
     ) -> bool {
+        let Some(handle) = self.local_participants.get(&subscriber).copied() else {
+            return false;
+        };
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
@@ -560,9 +569,9 @@ impl ShardRoutingTable {
                 let Some(route) = room.data_streams.get_mut(&key) else {
                     return false;
                 };
-                let was_one = route.local_subscribers.len() == 1
-                    && route.local_subscribers.contains(&subscriber);
-                route.local_subscribers.swap_remove(&subscriber);
+                let was_one =
+                    route.local_subscribers.len() == 1 && route.local_subscribers.contains(&handle);
+                route.local_subscribers.swap_remove(&handle);
                 if route.is_unused() {
                     room.data_streams.remove(&key);
                 }
@@ -576,8 +585,8 @@ impl ShardRoutingTable {
                 else {
                     return false;
                 };
-                let was_one = subscribers.len() == 1 && subscribers.contains(&subscriber);
-                subscribers.swap_remove(&subscriber);
+                let was_one = subscribers.len() == 1 && subscribers.contains(&handle);
+                subscribers.swap_remove(&handle);
                 if subscribers.is_empty() {
                     room.all_publisher_subscriptions
                         .local_by_topic
@@ -585,7 +594,7 @@ impl ShardRoutingTable {
                 }
                 for (stream_id, route) in &mut room.data_streams {
                     if stream_id.topic == *topic {
-                        route.local_subscribers.swap_remove(&subscriber);
+                        route.local_subscribers.swap_remove(&handle);
                     }
                 }
                 was_one
@@ -704,11 +713,11 @@ impl ShardRoutingTable {
             return;
         };
         let tracks = std::slice::from_ref(&track);
-        for &participant_id in &room.members {
-            if participant_id == publisher {
+        for &participant in &room.members {
+            if participant.participant_id() == publisher {
                 continue;
             }
-            ctx.notify_tracks_published(participant_id, tracks);
+            ctx.notify_tracks_published(participant.participant_id(), tracks);
         }
     }
 
@@ -727,8 +736,8 @@ impl ShardRoutingTable {
             tracing::debug!(%room_id, "unpublish_tracks: room missing on this shard");
             return;
         };
-        for &participant_id in &room.members {
-            ctx.notify_tracks_unpublished(participant_id, track_ids);
+        for &participant in &room.members {
+            ctx.notify_tracks_unpublished(participant.participant_id(), track_ids);
         }
     }
 
@@ -793,11 +802,11 @@ impl ShardRoutingTable {
         let Some(slot_idx) = room.audio_selector.filter(ev.stream_id, &mut ev.pkt) else {
             return;
         };
-        for &participant_id in &room.members {
-            if participant_id == ev.origin {
+        for &participant in &room.members {
+            if participant.participant_id() == ev.origin {
                 continue;
             }
-            ctx.forward_audio_rtp(participant_id, slot_idx, &ev.pkt);
+            ctx.forward_audio_rtp(participant, slot_idx, &ev.pkt);
         }
     }
 
@@ -818,8 +827,8 @@ impl ShardRoutingTable {
             return;
         };
         debug_assert!(route.published);
-        for &subscriber_id in &route.local_subscribers {
-            ctx.forward_sctp(subscriber_id, origin, topic, pkt);
+        for &subscriber in &route.local_subscribers {
+            ctx.forward_sctp(subscriber, origin, topic, pkt);
         }
 
         if ctx.is_local(&origin) {
@@ -867,10 +876,13 @@ impl ShardRoutingTable {
         subscriber: ParticipantId,
         topic: Topic,
     ) -> bool {
+        let Some(handle) = self.local_participants.get(&subscriber).copied() else {
+            return false;
+        };
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        room.reliable.subscribe_local(subscriber, topic)
+        room.reliable.subscribe_local(handle, topic)
     }
 
     pub fn unregister_reliable_data_subscriber(
@@ -879,10 +891,13 @@ impl ShardRoutingTable {
         subscriber: ParticipantId,
         topic: &Topic,
     ) -> bool {
+        let Some(handle) = self.local_participants.get(&subscriber).copied() else {
+            return false;
+        };
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        room.reliable.unsubscribe_local(subscriber, topic)
+        room.reliable.unsubscribe_local(handle, topic)
     }
 
     pub fn route_reliable_data(
@@ -1051,22 +1066,24 @@ mod tests {
         }
         fn forward_audio_rtp(
             &mut self,
-            subscriber: ParticipantId,
+            subscriber: ParticipantHandle,
             slot_idx: AudioSelectorSlotId,
             _pkt: &RtpPacket,
         ) {
             self.forwarded_audio
                 .borrow_mut()
-                .push((subscriber, slot_idx));
+                .push((subscriber.participant_id(), slot_idx));
         }
         fn forward_sctp(
             &mut self,
-            subscriber: ParticipantId,
+            subscriber: ParticipantHandle,
             _origin: ParticipantId,
             _topic: &Topic,
             _pkt: &[u8],
         ) {
-            self.forwarded_sctp.borrow_mut().push(subscriber);
+            self.forwarded_sctp
+                .borrow_mut()
+                .push(subscriber.participant_id());
         }
         fn notify_tracks_published(&mut self, participant_id: ParticipantId, _tracks: &[Track]) {
             self.published.borrow_mut().push(participant_id);
@@ -1092,12 +1109,14 @@ mod tests {
 
         fn forward_reliable_sctp(
             &mut self,
-            subscriber: ParticipantId,
+            subscriber: ParticipantHandle,
             _origin: ParticipantId,
             _topic: &Topic,
             _frame: &[u8],
         ) {
-            self.forwarded_sctp.borrow_mut().push(subscriber);
+            self.forwarded_sctp
+                .borrow_mut()
+                .push(subscriber.participant_id());
         }
 
         fn deliver_reliable_control(

@@ -157,6 +157,17 @@ impl ParticipantRegistry {
         Some(participant)
     }
 
+    pub fn get_mut_with_handle(
+        &mut self,
+        id: &ParticipantId,
+    ) -> Option<(ParticipantHandle, &mut ParticipantMeta)> {
+        let key = *self.participant_keys.get(id)?;
+        let participant = self.participants.get_mut(key)?;
+        debug_assert_eq!(participant.participant_id, *id);
+        let handle = ParticipantHandle::new(key, *id, participant.generation);
+        Some((handle, participant))
+    }
+
     #[cfg(test)]
     pub fn get(&self, id: &ParticipantId) -> Option<&ParticipantMeta> {
         let key = *self.participant_keys.get(id)?;

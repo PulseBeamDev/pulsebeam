@@ -53,17 +53,17 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.resolve_mut(subscriber) {
             p.on_forward_rtp(stream_id, pkt, cache);
-            self.dirty.mark(subscriber.participant_id(), p);
+            self.dirty.mark(subscriber, p);
         }
     }
 
     fn forward_audio_rtp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         slot_idx: AudioSelectorSlotId,
         pkt: &RtpPacket,
     ) {
-        if let Some(p) = self.registry.get_mut(&subscriber) {
+        if let Some(p) = self.registry.resolve_mut(subscriber) {
             p.on_forward_audio_rtp(slot_idx, pkt);
             self.dirty.mark(subscriber, p);
         }
@@ -71,12 +71,12 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_sctp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         origin: ParticipantId,
         topic: &crate::track::Topic,
         pkt: &[u8],
     ) {
-        if let Some(p) = self.registry.get_mut(&subscriber) {
+        if let Some(p) = self.registry.resolve_mut(subscriber) {
             p.on_forward_sctp(topic, origin, pkt);
             self.dirty.mark(subscriber, p);
         }
@@ -87,9 +87,9 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         participant_id: ParticipantId,
         tracks: &[crate::track::Track],
     ) {
-        if let Some(p) = self.registry.get_mut(&participant_id) {
+        if let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) {
             p.on_tracks_published(tracks);
-            self.dirty.mark(participant_id, p);
+            self.dirty.mark(handle, p);
         }
     }
 
@@ -98,12 +98,12 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         participant_id: ParticipantId,
         track_ids: &[crate::entity::TrackId],
     ) {
-        let Some(p) = self.registry.get_mut(&participant_id) else {
+        let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) else {
             return;
         };
 
         if p.on_tracks_unpublished(track_ids) {
-            self.dirty.mark(participant_id, p);
+            self.dirty.mark(handle, p);
         }
     }
 
@@ -113,9 +113,9 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         stream_id: StreamId,
         kind: str0m::media::KeyframeRequestKind,
     ) {
-        if let Some(p) = self.registry.get_mut(&participant_id) {
+        if let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) {
             p.handle_remote_keyframe_request(stream_id, kind);
-            self.dirty.mark(participant_id, p);
+            self.dirty.mark(handle, p);
         }
     }
 
@@ -125,12 +125,12 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_reliable_sctp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         origin: ParticipantId,
         topic: &crate::track::Topic,
         frame: &[u8],
     ) {
-        if let Some(p) = self.registry.get_mut(&subscriber) {
+        if let Some(p) = self.registry.resolve_mut(subscriber) {
             p.on_forward_reliable_sctp(topic, origin, frame);
             self.dirty.mark(subscriber, p);
         }
@@ -142,9 +142,9 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         topic: &crate::track::Topic,
         bytes: &[u8],
     ) {
-        if let Some(p) = self.registry.get_mut(&publisher) {
+        if let Some((handle, p)) = self.registry.get_mut_with_handle(&publisher) {
             p.on_deliver_reliable_control(topic, bytes);
-            self.dirty.mark(publisher, p);
+            self.dirty.mark(handle, p);
         }
     }
 }
@@ -185,7 +185,7 @@ impl ShardCore {
         self.timers.drain_expired(now, |handle| {
             if let Some(participant) = registry.resolve_mut(handle) {
                 participant.on_timeout(now);
-                dirty.mark(handle.participant_id(), participant);
+                dirty.mark(handle, participant);
             }
         });
     }
@@ -198,9 +198,9 @@ impl ShardCore {
         let Some(participant_id) = self.registry.demux(&batch) else {
             return;
         };
-        if let Some(participant) = self.registry.get_mut(&participant_id) {
+        if let Some((handle, participant)) = self.registry.get_mut_with_handle(&participant_id) {
             participant.on_ingress(batch);
-            self.dirty.mark(participant_id, participant);
+            self.dirty.mark(handle, participant);
         } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
             router.send(
                 shard_id,
@@ -379,22 +379,17 @@ impl ShardCore {
         debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
         while let Some(entry) = self.dirty.next() {
-            let Some(handle) = self.registry.handle(&entry.participant_id) else {
-                continue;
-            };
+            let handle = entry.handle;
             let Some(participant) = self.registry.resolve_mut(handle) else {
                 continue;
             };
-            if participant.generation != entry.generation {
-                continue;
-            }
             debug_assert!(participant.queued_dirty);
-            debug_assert_eq!(participant.participant_id, entry.participant_id);
+            debug_assert_eq!(participant.participant_id, handle.participant_id());
             participant.queued_dirty = false;
             let room_id = participant.room_id;
             let mut sink = self
                 .pipeline
-                .participant_sink(room_id, entry.participant_id);
+                .participant_sink(room_id, handle.participant_id());
             let deadline = participant.poll(now, &mut sink);
             if let Some(deadline) = deadline {
                 self.timers.schedule(handle, deadline);
@@ -586,9 +581,11 @@ impl ShardCore {
                 participant_id,
                 batch,
             } => {
-                if let Some(participant) = self.registry.get_mut(&participant_id) {
+                if let Some((handle, participant)) =
+                    self.registry.get_mut_with_handle(&participant_id)
+                {
                     participant.on_ingress(batch);
-                    self.dirty.mark(participant_id, participant);
+                    self.dirty.mark(handle, participant);
                 }
             }
             CrossShardEvent::KeyframeRequested(req) => {
@@ -658,7 +655,7 @@ impl ShardCore {
             .registry
             .get_mut(&participant_id)
             .expect("newly inserted participant must be present");
-        self.dirty.mark(participant_id, participant);
+        self.dirty.mark(handle, participant);
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<()> {
@@ -778,9 +775,7 @@ mod test {
     fn clear_dirty(core: &mut ShardCore) {
         core.dirty.begin_phase();
         while let Some(entry) = core.dirty.next() {
-            if let Some(participant) = core.registry.get_mut(&entry.participant_id)
-                && participant.generation == entry.generation
-            {
+            if let Some(participant) = core.registry.resolve_mut(entry.handle) {
                 participant.queued_dirty = false;
             }
         }
@@ -852,10 +847,10 @@ mod test {
         assert!(core.dirty.next().is_none());
         core.dirty.finish_phase();
 
-        assert_eq!(stale.participant_id, participant);
-        assert_ne!(stale.generation, current_generation);
-        assert_eq!(current.participant_id, participant);
-        assert_eq!(current.generation, current_generation);
+        assert_eq!(stale.handle.participant_id(), participant);
+        assert_ne!(stale.handle.generation(), current_generation);
+        assert_eq!(current.handle.participant_id(), participant);
+        assert_eq!(current.handle.generation(), current_generation);
     }
 
     #[test]

@@ -2,8 +2,8 @@ use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indexmap::IndexSet;
 
 use super::router::RoutingContext;
-use crate::entity::ParticipantId;
 use crate::track::Topic;
+use crate::{entity::ParticipantId, shard::participants::ParticipantHandle};
 
 type FastIndexSet<T> = IndexSet<T, ahash::RandomState>;
 
@@ -15,7 +15,7 @@ struct StreamId {
 
 pub(super) struct ReliableRoutes {
     published: HashSet<StreamId>,
-    local_subscribers: HashMap<Topic, FastIndexSet<ParticipantId>>,
+    local_subscribers: HashMap<Topic, FastIndexSet<ParticipantHandle>>,
 }
 
 impl ReliableRoutes {
@@ -26,14 +26,14 @@ impl ReliableRoutes {
         }
     }
 
-    pub(super) fn remove_participant(&mut self, participant: &ParticipantId) {
+    pub(super) fn remove_participant(&mut self, participant: ParticipantHandle) {
         for subscribers in self.local_subscribers.values_mut() {
-            subscribers.swap_remove(participant);
+            subscribers.swap_remove(&participant);
         }
         self.local_subscribers
             .retain(|_, subscribers| !subscribers.is_empty());
         self.published
-            .retain(|stream| &stream.publisher != participant);
+            .retain(|stream| stream.publisher != participant.participant_id());
     }
 
     pub(super) fn publish(&mut self, publisher: ParticipantId, topic: Topic) {
@@ -49,7 +49,7 @@ impl ReliableRoutes {
         debug_assert!(removed);
     }
 
-    pub(super) fn subscribe_local(&mut self, subscriber: ParticipantId, topic: Topic) -> bool {
+    pub(super) fn subscribe_local(&mut self, subscriber: ParticipantHandle, topic: Topic) -> bool {
         let subscribers = self.local_subscribers.entry(topic).or_insert_with(|| {
             IndexSet::with_capacity_and_hasher(256, ahash::RandomState::default())
         });
@@ -59,7 +59,11 @@ impl ReliableRoutes {
         was_empty
     }
 
-    pub(super) fn unsubscribe_local(&mut self, subscriber: ParticipantId, topic: &Topic) -> bool {
+    pub(super) fn unsubscribe_local(
+        &mut self,
+        subscriber: ParticipantHandle,
+        topic: &Topic,
+    ) -> bool {
         let Some(subscribers) = self.local_subscribers.get_mut(topic) else {
             debug_assert!(false, "unsubscribing from an unknown reliable topic");
             return false;
