@@ -343,6 +343,16 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
+    /// Change a participant's downlink capacity mid-plan.
+    ///
+    /// Models the link improving or degrading under a live call, which is what separates a
+    /// congestion controller that re-discovers capacity from one that has talked itself into a
+    /// corner it cannot probe out of.
+    SetBandwidth {
+        description: &'static str,
+        participant: &'static str,
+        bits_per_sec: u64,
+    },
     /// Bytes received since the last Step::Run ≤ `max_bytes`.
     ///
     /// The counterpart to [`Step::CheckRxBytesInterval`]: asserts a subscription is not being
@@ -837,6 +847,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
         Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
+        Step::SetBandwidth { .. } => "SetBandwidth",
         Step::CheckTxBytesInterval { .. } => "CheckTxBytesInterval",
         Step::CheckMinBwe { .. } => "CheckMinBwe",
         Step::CheckDataReceived { .. } => "CheckDataReceived",
@@ -1243,6 +1254,20 @@ async fn execute_plan(
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps on every participant\n  actual:       min {min_seen} / max {max_seen} / last {last_seen} bps over {count} allocation passes"
                 );
             }
+            Step::SetBandwidth {
+                description,
+                participant,
+                bits_per_sec,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {bits_per_sec} bps)"
+                );
+                let ip = name_to_ip.get(participant).copied().ok_or_else(|| {
+                    anyhow::anyhow!("step \"{description}\": unknown participant {participant}")
+                })?;
+                pulsebeam_runtime::net::shaper::set_downlink(ip, *bits_per_sec);
+            }
+
             Step::CheckMaxRxBytesInterval {
                 description,
                 participant,
@@ -1460,6 +1485,13 @@ pub struct LinkProfile {
     pub max_latency: Duration,
     /// Fraction of messages dropped outright, 0.0..=1.0.
     pub loss: f64,
+    /// Downlink capacity per participant, in bits per second. `None` leaves the path unlimited.
+    ///
+    /// turmoil has no notion of capacity, so without this a simulated path carries any offered
+    /// load: there is no queueing delay, the delay-based estimator never backs off, and a probe
+    /// that under-delivers cannot pull the estimate down. Set it to make congestion real. See
+    /// `pulsebeam_runtime::net::shaper`.
+    pub bandwidth_bps: Option<u64>,
 }
 
 impl LinkProfile {
@@ -1469,6 +1501,7 @@ impl LinkProfile {
             min_latency: Duration::from_millis(5),
             max_latency: Duration::from_millis(6),
             loss: 0.0,
+            bandwidth_bps: None,
         }
     }
 
@@ -1478,6 +1511,7 @@ impl LinkProfile {
             min_latency: Duration::from_millis(8),
             max_latency: Duration::from_millis(13),
             loss: 0.002,
+            bandwidth_bps: None,
         }
     }
 
@@ -1488,6 +1522,7 @@ impl LinkProfile {
             min_latency: Duration::from_millis(45),
             max_latency: Duration::from_millis(52),
             loss: 0.01,
+            bandwidth_bps: None,
         }
     }
 }
@@ -1528,6 +1563,12 @@ impl LocalNodeSim {
     /// Set the simulated link characteristics. See [`LinkProfile`].
     pub fn with_link(mut self, link: LinkProfile) -> Self {
         self.link = link;
+        self
+    }
+
+    /// Cap each participant's downlink. See [`LinkProfile::bandwidth_bps`].
+    pub fn with_bandwidth(mut self, bits_per_sec: u64) -> Self {
+        self.link.bandwidth_bps = Some(bits_per_sec);
         self
     }
 
@@ -1579,6 +1620,10 @@ impl LocalNodeSim {
             .rng_seed(self.rng_seed)
             .build();
 
+        // The shaper registry is process-global and plans run in parallel, so clear whatever a
+        // previous plan on this thread left behind before claiming new addresses.
+        pulsebeam_runtime::net::shaper::clear();
+
         let subnet = reserve_subnet();
         let server_ip = subnet_ip(subnet, 1);
         let coordinator_ip = subnet_ip(subnet, 254);
@@ -1612,6 +1657,12 @@ impl LocalNodeSim {
                 ip_counter += 1;
 
                 name_to_ip.insert(participant.name, ip);
+
+                // Shaping is keyed by destination, so this caps what the SFU can push down to
+                // this participant without touching the paths between anyone else.
+                if let Some(bps) = self.link.bandwidth_bps {
+                    pulsebeam_runtime::net::shaper::set_downlink(ip, bps);
+                }
 
                 let shared = Arc::new(ParticipantShared::new());
                 let (cmd_tx, cmd_rx) = mpsc::channel::<ParticipantCmd>(16);

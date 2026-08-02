@@ -761,3 +761,130 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
             },
         ]);
 }
+
+/// On a link that comfortably fits the top layer, the subscription must actually get there.
+///
+/// The "stuck at 360p" guard. 3 Mbps carries the 1.25 Mbps `f` layer several times over, so a
+/// viewer asking for 720p has no excuse to settle for `h`.
+///
+/// # Why this needs a rate-limited link
+///
+/// Every other plan here runs unlimited, and that quietly removes the failure mode. turmoil models
+/// latency and loss but not capacity, so an unlimited path carries any offered load: there is no
+/// queueing delay, the delay-based estimate never falls, and `limit_probe_bitrate` floors probe
+/// results at it. A starved probe simply cannot drag the estimate down, so no unlimited plan can
+/// distinguish congestion control that ramps from congestion control that gives up.
+///
+/// [`LocalNodeSim::with_bandwidth`] adds a real bottleneck - rate, queueing delay, and tail drop
+/// once the buffer fills - so the estimate tracks capacity for the first time. Sanity-checked at
+/// 800 kbps, where the estimate settles at 663 kbps and the allocator walks the ladder down
+/// `H -> M -> L` as it should.
+#[test]
+fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_bandwidth(3_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for 720p; the link carries it twice over",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Warmup: BWE has to find the capacity that is there",
+                duration: Duration::from_secs(40),
+            },
+            Step::Run {
+                description: "Measurement window",
+                duration: Duration::from_secs(30),
+            },
+            // 30s of f is ~4.7 MB; of h, ~1.5 MB. 3 MB cleanly separates "reached the top layer"
+            // from "stuck partway up the ladder".
+            Step::CheckRxBytesInterval {
+                description: "Bob reaches the 720p layer rather than stalling below it",
+                participant: "bob",
+                min_bytes: 3_000_000,
+            },
+            Step::CheckMinBwe {
+                description: "The estimate finds the link's real capacity",
+                min_bps: 1_500_000,
+            },
+        ]);
+}
+
+/// A subscription squeezed onto a low layer must climb back when the link recovers.
+///
+/// The link starts at 500 kbps, which only affords `q`, then widens to 3 Mbps. The viewer asked
+/// for 720p throughout, so it has to find its way back to `f`.
+///
+/// This is the shape of the production lock. `desired` is what str0m probes against - every probe
+/// targets `2 x desired` - so a subscription whose `desired` describes what is *currently
+/// flowing* rather than what it is entitled to can never demonstrate the capacity it would need
+/// to climb, and stays at low quality on a link that has long since recovered.
+///
+/// Note what this plan does *not* pin down. Deleting either guard against that - the
+/// `requested_capacity` floor in `run_desired`, or the seed floor in `stable_cost` - leaves it
+/// passing. Both draw on `snap(layer)`, which measures the *publisher's* upstream rate, and the
+/// simulated publisher keeps sending all three layers however the subscriber is doing. So `f`
+/// reads ~1.25 Mbps here no matter what, and `desired` cannot collapse. In production the
+/// publisher's own congestion control pauses layers, which is what removes `f` from the sum.
+/// Reaching that needs the publisher's *uplink* shaped as well - now possible via
+/// `Step::SetBandwidth` against `"server"`, since shaping is keyed by destination - and is the
+/// obvious next step.
+#[test]
+fn subscription_climbs_back_after_the_link_recovers_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_bandwidth(500_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for 720p, but the link only affords the bottom layer",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Squeeze: long enough to settle on the low layer",
+                duration: Duration::from_secs(60),
+            },
+            Step::SetBandwidth {
+                description: "The link recovers to 3 Mbps",
+                participant: "bob",
+                bits_per_sec: 3_000_000,
+            },
+            Step::Run {
+                description: "Give BWE room to re-discover the capacity",
+                duration: Duration::from_secs(60),
+            },
+            Step::Run {
+                description: "Measurement window",
+                duration: Duration::from_secs(30),
+            },
+            // 30s of f is ~4.7 MB; of h, ~1.5 MB; of q, ~0.5 MB. 3 MB means it climbed all the
+            // way back rather than stalling on a rung.
+            Step::CheckRxBytesInterval {
+                description: "Bob is back on the 720p layer, not stranded below it",
+                participant: "bob",
+                min_bytes: 3_000_000,
+            },
+        ]);
+}
