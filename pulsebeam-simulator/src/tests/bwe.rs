@@ -401,6 +401,100 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
         ]);
 }
 
+/// The estimate must grow enough to carry one screen share plus one camera.
+///
+/// This is the production complaint stated as an assertion: "the allocator doesn't think there's
+/// enough bandwidth for the camera to be streamed". Two full-quality streams need ~2.5 Mbps of
+/// media (two 1.25 Mbps `f` layers), and the allocator wants the estimate above ~2.8 Mbps before
+/// it will grant both. The estimate never gets there.
+///
+/// # The link is not the limit
+///
+/// `LinkProfile` models latency and loss only - turmoil applies no capacity limit whatsoever, so
+/// this path has effectively infinite bandwidth. There is no ceiling here to *discover*. Any
+/// ceiling the estimate settles at is manufactured by the sender, which is what makes this a clean
+/// reproduction rather than a tuning argument.
+///
+/// # Measured failure
+///
+/// ```text
+/// CheckRxBytesInterval  expected >= 4000000 bytes    actual 373203 bytes
+/// CheckMinBwe           expected >= 4000000 bps      actual min 2660618 / max 2792793 bps
+///                                                           over 305 allocation passes
+/// ```
+///
+/// 373 kB across the 30s soak is ~100 kbps - the screen share's VBR average on its own. The camera
+/// contributes nothing. The allocator's own report shows why; it stalls here and never recovers:
+///
+/// ```text
+/// streams=Ttv:H(1.250Mbit/s) Yxl:PAUSE(150.000kbit/s)
+/// ```
+///
+/// # Why the estimate stops at ~2.7 Mbps
+///
+/// Because that is how fast str0m can emit padding, and probe results read back the sender's own
+/// throughput. From a production run with `RUST_LOG=str0m::bwe_=trace`, every probe converges on
+/// the same actual send rate no matter what it aims at:
+///
+/// ```text
+/// target_bps=2800000  sent_bytes=5520   packets=5   send_ms=13   -> 3.4 Mbit/s actual
+/// target_bps=5600000  sent_bytes=10688  packets=15  send_ms=27   -> 3.2 Mbit/s actual
+/// target_bps=5600000  (rejected)        packets=31               -> 1.7 Mbit/s actual (31%)
+/// ```
+///
+/// Five packets in 13 ms is one packet per 2.6 ms; fifteen in 27 ms is one per 1.8 ms. That is
+/// `poll_packet_padding` being gated to one packet per `handle_timeout`
+/// (`needs_timeout_before_next_poll`, str0m `src/pacer/leaky.rs`). At ~1 kB per packet it puts a
+/// hard ~3 Mbps ceiling on what *any* probe can demonstrate, so probes aimed higher are rejected
+/// as under-delivered and the ones that land assert a limit the link never had.
+///
+/// The estimate is therefore a readout of str0m's padding throughput rather than of the path, and
+/// it lands just below what two streams need - which is exactly the reported symptom.
+#[test]
+#[ignore = "known bug: probe send rate is capped by str0m's one-packet-per-timeout padding gate, \
+            pinning the estimate at ~2.7 Mbps on an unlimited link so the camera is never allocated"]
+fn estimate_grows_to_fit_screenshare_and_camera_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("presenter"))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(20),
+            },
+            // Both in one call: adding a subscription later hits the separate, already-known
+            // binding bug covered by `late_video_subscription_is_delivered_test`.
+            Step::SubscribeTo {
+                description: "Viewer watches the screen share and the camera at full quality",
+                participant: "viewer",
+                targets: &[("presenter", 720), ("camera", 720)],
+            },
+            Step::Run {
+                description: "Warmup: let the estimate ramp with both streams live",
+                duration: Duration::from_secs(40),
+            },
+            Step::Run {
+                description: "Soak: the estimate should have found the link's real capacity",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckRxBytesInterval {
+                description: "Viewer receives both streams, not just one",
+                participant: "viewer",
+                min_bytes: 4_000_000,
+            },
+            Step::CheckMinBwe {
+                description: "Estimate leaves room for both streams",
+                min_bps: 4_000_000,
+            },
+        ]);
+}
+
 /// A video subscription added after the initial one must actually be delivered.
 ///
 /// # Known failure - reproduces the production symptom, and it is not a BWE bug
