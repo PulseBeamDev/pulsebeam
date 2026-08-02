@@ -94,19 +94,20 @@ impl SubscriptionManager {
             }
         }
 
-        // Pass 3: Construct VideoRequests and update active state
+        // Pass 3: Construct VideoRequests and update active state.
+        //
+        // Every assignment is sent, not just the ones that changed. The SFU treats a
+        // `ClientIntent` as a declarative statement of desired state: `VideoAllocator::configure`
+        // walks all of its slots and stops any whose mid the intent does not mention. Sending a
+        // delta therefore unbinds the slots left out of it - subscribing to a second track would
+        // silently drop the first, which is the "allocator doesn't think there's enough for the
+        // camera" report. The slot is not starved of bandwidth, it is unbound.
         let mut requests = Vec::new();
 
-        // We only care about slots that changed or were cleared
         for &mid in &self.slots {
-            let next = next_assignments.get(&mid);
-            let current = self.active_assignments.get(&mid);
-
-            if next == current {
+            let Some(sub) = next_assignments.get(&mid) else {
                 continue;
-            }
-
-            let Some(sub) = next else { continue };
+            };
             requests.push(VideoRequest {
                 mid: mid.to_string(),
                 track_id: sub.track_id.clone(),
