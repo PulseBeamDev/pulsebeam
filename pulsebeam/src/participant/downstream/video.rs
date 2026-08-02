@@ -31,6 +31,14 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
+/// How far below a requested height a layer may sit and still be preferred over rounding up.
+///
+/// Simulcast ladders halve resolution per tier, so the tallest layer under a request is either a
+/// near miss (a ladder tier that happens to sit just below it) or roughly half of it. 0.8 splits
+/// those cleanly: 180p against a 200p request is kept at 90%, while 540p against a 720p request
+/// is 75% and rounds up instead of shipping a visibly softer stream than was asked for.
+const MAX_HEIGHT_SHORTFALL: f64 = 0.8;
+
 pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
@@ -896,13 +904,51 @@ impl AllocationEngine {
             .expect("track has at least one layer")
     }
 
-    /// Whether a layer is permitted by the client's spatial request. The
-    /// ceiling is raised to the track's shortest layer height so a track
-    /// whose layers are all taller than `max_height` (e.g. screen-share
-    /// simulcast tiers that only differ in fps) still has something eligible
-    /// instead of every layer being rejected.
+    /// Tallest layer height this subscription may be served at: the shortest layer that reaches
+    /// `max_height`, or the track's shortest layer when none does.
+    ///
+    /// A request landing between two tiers is satisfied by rounding *up*. A client asking for
+    /// 540p from a 720/360/180 ladder is asking for more than 360p, and the ladder's job is to
+    /// satisfy the request rather than undershoot it.
+    ///
+    /// Rounding down - the obvious reading of "max height" - is what produced the "never reaches
+    /// 720p" reports, and it costs more than one tier of sharpness. [`Self::requested_capacity`]
+    /// values a subscription at the seed bitrate of the tallest *allowed* layer, so undershooting
+    /// also halves what the SFU asks BWE for. str0m probes at `2 x desired` and a probe only ever
+    /// proves its own target, so the estimate then pins just above the layer already in use and
+    /// the taller one can never be afforded. See `height_request_rounds_up_the_ladder_test`.
+    ///
+    /// Overshoot is bounded by construction - this is the *smallest* satisfying layer - and it is
+    /// a ceiling, not a floor: the allocator still drops to a lower layer whenever bandwidth is
+    /// short, and `min_height` remains the separate control for what must never be dropped.
+    ///
+    /// Subsumes the old special case for tracks whose layers are all taller than the request
+    /// (screen-share tiers differing only in fps): the `unwrap_or_else` arm handles it.
+    fn spatial_ceiling(&self, slot: &SlotView<'_>) -> u32 {
+        let heights = || slot.track.layers.iter().map(|l| self.height(l));
+
+        // The tallest layer that fits under the request is the natural answer, and is kept
+        // whenever it is a near miss - a 180p layer against a 200p request is worth far more
+        // than the bitrate of jumping to 360p.
+        let best_below = heights().filter(|h| *h <= slot.max_height).max();
+        if let Some(h) = best_below
+            && f64::from(h) >= f64::from(slot.max_height) * MAX_HEIGHT_SHORTFALL
+        {
+            return h;
+        }
+
+        // Otherwise the only candidate below is a long way down - a ladder tier rather than a
+        // near miss - so round up to the shortest layer that does satisfy the request.
+        heights()
+            .filter(|h| *h >= slot.max_height)
+            .min()
+            .or(best_below)
+            .unwrap_or_else(|| self.min_track_height(slot.track))
+    }
+
+    /// Whether a layer is permitted by the client's spatial request.
     fn spatially_allowed(&self, slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        self.height(layer) <= slot.max_height.max(self.min_track_height(slot.track))
+        self.height(layer) <= self.spatial_ceiling(slot)
     }
 
     /// Whether a layer may currently be forwarded or switched into.
@@ -2149,6 +2195,62 @@ mod allocation_tests {
         // The Medium layer declared nothing → keeps its 360p fallback → forbidden.
         let medium = t.by_quality(LayerQuality::Medium).unwrap();
         assert!(!engine.spatially_allowed(&slot, medium));
+    }
+
+    /// A request landing between two tiers takes the layer above it, not the one below.
+    #[test]
+    fn request_between_tiers_rounds_up_to_the_satisfying_layer() {
+        let t = healthy_track();
+        // Default ladder: High 720 / Medium 360 / Low 180. 540 matches none of them.
+        let slot = slot("a", 540, &t, LayerQuality::Medium);
+        let engine = AllocationEngine::new(std::slice::from_ref(&slot));
+
+        // 360 is only 67% of the request, so rounding down would ship a visibly softer stream
+        // than was asked for while 720 sits available.
+        let high = t.by_quality(LayerQuality::High).unwrap();
+        assert!(engine.spatially_allowed(&slot, high));
+        assert_eq!(engine.spatial_ceiling(&slot), 720);
+
+        // Lower tiers stay admissible - the ceiling is a cap, not a floor, so the allocator can
+        // still drop down when bandwidth is short.
+        let medium = t.by_quality(LayerQuality::Medium).unwrap();
+        assert!(engine.spatially_allowed(&slot, medium));
+    }
+
+    /// The production case: a 1080p screen share against a 720p request.
+    ///
+    /// Rounding down pinned these subscriptions to the Medium layer, which set `desired` to its
+    /// 400 kbps seed, which capped every str0m probe at 800 kbps, which held the estimate near
+    /// 500 kbps - far too low to ever afford the 1.25 Mbps top layer. Observed in production as
+    /// `target_bps=800000` on every probe for an entire run.
+    #[test]
+    fn screenshare_taller_than_the_request_is_still_admitted() {
+        let t = healthy_track();
+        for (quality, height) in [
+            (LayerQuality::High, 1080),
+            (LayerQuality::Medium, 540),
+            (LayerQuality::Low, 270),
+        ] {
+            t.by_quality(quality)
+                .unwrap()
+                .state
+                .update_for_test()
+                .height(height);
+        }
+
+        let slot = slot("a", 720, &t, LayerQuality::Medium);
+        let engine = AllocationEngine::new(std::slice::from_ref(&slot));
+
+        // 540 is 75% of 720 - a ladder tier below, not a near miss - so the 1080p layer wins.
+        assert_eq!(engine.spatial_ceiling(&slot), 1080);
+        let high = t.by_quality(LayerQuality::High).unwrap();
+        assert!(engine.spatially_allowed(&slot, high));
+
+        // And `desired` is now valued at the top layer's seed rather than the middle one's.
+        assert_eq!(
+            engine.requested_capacity(&slot),
+            LayerQuality::High.seed_bitrate_bps() as f64
+        );
     }
 
     /// Screen-share simulcast tiers often share one resolution and differ
