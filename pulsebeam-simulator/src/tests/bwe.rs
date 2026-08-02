@@ -111,6 +111,71 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
         ]);
 }
 
+/// A height request must be satisfied by rounding *up* the simulcast ladder, not down.
+///
+/// This is the "stream never reaches 720p" report. The viewer asks for 540p from a ladder of
+/// f=720 / h=360 / q=180. No layer is exactly 540, so the request sits between two tiers.
+///
+/// Spatial gating admitted only layers at or below the request, so the viewer was handed h=360 -
+/// visibly softer than it asked for - while f=720 sat unused on a link with ample room for it.
+///
+/// # Why this is worth more than one tier of sharpness
+///
+/// `requested_capacity` values a subscription at the seed bitrate of the tallest *spatially
+/// allowed* layer, so rounding down also halves what the SFU asks BWE for: 400 kbps (Medium seed)
+/// instead of 1.25 Mbps (High). str0m probes at `2 x desired`, and a probe can only ever prove
+/// its own target, so the estimate pins just above the layer already in use with no headroom
+/// left. Production, a 1080p screen share against a 720p request:
+///
+/// ```text
+/// Probe queued kind=PeriodicAlr target_bps=800000   <- every probe, for the whole run
+/// BWE estimate updated estimate_bps=355072..702511
+/// ```
+///
+/// 800000 is exactly `2 x 400000`, and 400000 is exactly `LayerQuality::Medium.seed_bitrate_bps()`.
+/// The connection could never climb to the 1.25 Mbps `f` layer because it never asked to, and the
+/// margin left over the layer it did use was thin enough that VBR bursts paused the slot.
+///
+/// A second connection in the same log, whose request did admit `f`, sat at 3.8-4.7 Mbps
+/// throughout. The link was never the constraint.
+#[test]
+fn height_request_rounds_up_the_ladder_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Viewer asks for 540p, which no layer matches exactly",
+                participant: "viewer",
+                targets: &[("camera", 540)],
+            },
+            Step::Run {
+                description: "Warmup: let BWE settle with room to spare",
+                duration: Duration::from_secs(30),
+            },
+            Step::Run {
+                description: "Measurement window",
+                duration: Duration::from_secs(30),
+            },
+            // f is 1.25 Mbps, so 30s of it is ~4.7 MB; h is 400 kbps, ~1.5 MB. 3 MB cleanly
+            // separates "rounded up to f" from "rounded down to h".
+            Step::CheckRxBytesInterval {
+                description: "Viewer gets the 720p layer, not the 360p one",
+                participant: "viewer",
+                min_bytes: 3_000_000,
+            },
+        ]);
+}
+
 /// The real-world call: one screen share plus one camera, both directions live.
 ///
 /// This is the scenario from production that motivated the BWE work. Two participants each
