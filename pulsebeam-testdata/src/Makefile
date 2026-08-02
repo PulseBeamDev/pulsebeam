@@ -5,8 +5,13 @@ INPUT_VIDEO  = driving.mp4
 # INPUT_VIDEO = BigBuckBunny_720p.mov
 
 INPUT_H264   = full_f_cbr.h264
+SCREENCAST   = screencast.mp4
 OUT_DIR      = .
 FPS          = 30
+SCREEN_FPS   = 15
+SCREEN_IDLE_FPS = 0.5
+SCREEN_HEIGHT = 1056
+SCREEN_BITRATE = 2500
 
 # Bitrates in kbps (GStreamer x264enc uses kbit/sec)
 BITRATE_F = 1250
@@ -35,7 +40,7 @@ BASE_COMMON = tune=zerolatency \
 # Specific rate-control modifiers
 CBR_FLAGS = pass=cbr vbv-buf-capacity=200
 
-.PHONY: all clean prepare estimate download distclean
+.PHONY: all clean prepare estimate download distclean screenshare screenshare-analyze
 
 all: prepare $(INPUT_VIDEO) \
      $(OUT_DIR)/full_f_cbr.h264 \
@@ -90,6 +95,16 @@ $(OUT_DIR)/quarter_q_cbr.h264: $(INPUT_VIDEO)
 		video/x-h264,profile=baseline,stream-format=byte-stream ! \
 		filesink location=$@
 
+screenshare: $(OUT_DIR)/screen_f_vbr.h264
+
+$(OUT_DIR)/screen_f_vbr.h264: $(SCREENCAST)
+	python3 encode_screencast.py --input $< --output $@ --height $(SCREEN_HEIGHT) --bitrate $(SCREEN_BITRATE) --fps $(SCREEN_FPS) --idle-fps $(SCREEN_IDLE_FPS)
+
+screenshare-analyze: screenshare
+	python3 analyze_screencast.py \
+		--source $(SCREENCAST) \
+		--stream f:$(SCREEN_BITRATE):$(OUT_DIR)/screen_f_vbr.h264
+
 # ==============================================================================
 # ANALYSIS & UTILITIES
 # ==============================================================================
@@ -112,7 +127,9 @@ estimate:
 
 clean:
 	rm -f $(OUT_DIR)/trimmed.mp4 \
-	      $(OUT_DIR)/*_cbr.h264
+	      $(OUT_DIR)/*_cbr.h264 \
+	      $(OUT_DIR)/screen_*_vbr.h264 \
+	      $(OUT_DIR)/screen_*_vbr.timing
 
 # Deep clean to drop the large source video file
 distclean: clean
