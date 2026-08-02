@@ -216,6 +216,7 @@ pub struct VbrLooper {
     small: Vec<usize>,
     small_index: usize,
     profile: VbrProfile,
+    frame_times: Option<Vec<Duration>>,
 }
 
 impl VbrLooper {
@@ -234,7 +235,21 @@ impl VbrLooper {
             small,
             small_index: 0,
             profile,
+            frame_times: None,
         }
+    }
+
+    pub fn new_scheduled(data: &[u8], timing: &str, profile: VbrProfile) -> Self {
+        let mut looper = Self::new(data, profile);
+        let frame_times: Vec<Duration> = timing
+            .lines()
+            .map(|line| Duration::from_micros(line.parse().expect("valid frame timestamp")))
+            .collect();
+        debug_assert!(!frame_times.is_empty());
+        debug_assert_eq!(looper.asset.frames.len(), frame_times.len());
+        debug_assert!(frame_times.windows(2).all(|pair| pair[0] < pair[1]));
+        looper.frame_times = Some(frame_times);
+        looper
     }
 
     /// Next frame for the static phase: the smallest frames the asset has. Falls back to the
@@ -270,6 +285,45 @@ impl VbrLooper {
         let rid = sender.rid;
 
         let start = tokio::time::Instant::now();
+        if let Some(frame_times) = self.frame_times.take() {
+            debug_assert_eq!(self.asset.frames.len(), frame_times.len());
+            let loop_duration = frame_times
+                .last()
+                .copied()
+                .expect("non-empty frame schedule")
+                + Duration::from_millis(500);
+            let mut loop_start = start;
+            let mut index = 0usize;
+            loop {
+                debug_assert!(index < frame_times.len());
+                tokio::time::sleep_until(loop_start + frame_times[index]).await;
+                let now = tokio::time::Instant::now();
+                if sender.keyframe_rx.is_requested() {
+                    index = self.asset.first_idr;
+                    debug_assert_eq!(index, 0, "scheduled fixture must begin with its first IDR");
+                    loop_start = now;
+                }
+                debug_assert!(index < self.asset.frames.len());
+                let frame = MediaFrame {
+                    ts: MediaTime::from_90khz(
+                        (now.duration_since(start).as_secs_f64() * clock_rate) as u64,
+                    ),
+                    data: self.asset.frames[index].clone(),
+                    capture_time: now,
+                    abs_capture_time: Some(crate::clock::capture_wallclock()),
+                    contiguous: true,
+                    is_keyframe: false,
+                };
+                if sender.send(frame).await.is_err() {
+                    return;
+                }
+                index += 1;
+                if index == frame_times.len() {
+                    index = 0;
+                    loop_start += loop_duration;
+                }
+            }
+        }
         let mut next_frame_at = start;
 
         loop {
@@ -287,7 +341,12 @@ impl VbrLooper {
             next_frame_at = now + Duration::from_secs_f64(1.0 / fps as f64);
 
             if sender.keyframe_rx.is_requested() {
-                tracing::debug!(?mid, ?rid, first_idr = self.asset.first_idr, "keyframe reset");
+                tracing::debug!(
+                    ?mid,
+                    ?rid,
+                    first_idr = self.asset.first_idr,
+                    "keyframe reset"
+                );
                 self.index = self.asset.first_idr;
             }
 
@@ -296,7 +355,11 @@ impl VbrLooper {
             // receiver would see the media clock stall during quiet stretches.
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz((elapsed.as_secs_f64() * clock_rate) as u64),
-                data: if active { self.next() } else { self.next_small() },
+                data: if active {
+                    self.next()
+                } else {
+                    self.next_small()
+                },
                 capture_time: now,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
