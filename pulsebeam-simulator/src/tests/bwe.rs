@@ -401,58 +401,36 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
         ]);
 }
 
-/// The estimate must grow enough to carry one screen share plus one camera.
+/// A viewer subscribing to two publishers must receive both.
 ///
-/// This is the production complaint stated as an assertion: "the allocator doesn't think there's
-/// enough bandwidth for the camera to be streamed". Two full-quality streams need ~2.5 Mbps of
-/// media (two 1.25 Mbps `f` layers), and the allocator wants the estimate above ~2.8 Mbps before
-/// it will grant both. The estimate never gets there.
+/// This is the production complaint - "the allocator doesn't think there's enough bandwidth for
+/// the camera to be streamed" - reproduced end to end. A viewer takes one screen share plus one
+/// camera at 720p, which needs ~2.5 Mbps of media (two 1.25 Mbps `f` layers).
 ///
-/// # The link is not the limit
+/// It is worth being precise about what this asserts, because the obvious reading is wrong. The
+/// camera was never short of bandwidth: the estimate sat at ~3.2 Mbps throughout, comfortably
+/// above the ~2.8 Mbps two `f` layers cost. `CheckMinBwe` pins that down so a future regression
+/// that *does* starve the camera fails for a visibly different reason than one that unbinds it.
 ///
-/// `LinkProfile` models latency and loss only - turmoil applies no capacity limit whatsoever, so
-/// this path has effectively infinite bandwidth. There is no ceiling here to *discover*. Any
-/// ceiling the estimate settles at is manufactured by the sender, which is what makes this a clean
-/// reproduction rather than a tuning argument.
+/// # The bug this covers
 ///
-/// # Measured failure
+/// The agent's `SubscriptionManager::reconcile` used to emit only the slots whose assignment had
+/// changed, while the SFU's `VideoAllocator::configure` treats a `ClientIntent` as a declarative
+/// statement of desired state and stops every slot the intent does not mention. Subscribing to a
+/// second track sent an intent naming only that track, so the SFU unbound the first.
 ///
-/// ```text
-/// CheckRxBytesInterval  expected >= 4000000 bytes    actual 373203 bytes
-/// CheckMinBwe           expected >= 4000000 bps      actual min 2660618 / max 2792793 bps
-///                                                           over 305 allocation passes
-/// ```
-///
-/// 373 kB across the 30s soak is ~100 kbps - the screen share's VBR average on its own. The camera
-/// contributes nothing. The allocator's own report shows why; it stalls here and never recovers:
+/// The symptom read exactly like congestion control failing to ramp:
 ///
 /// ```text
-/// streams=Ttv:H(1.250Mbit/s) Yxl:PAUSE(150.000kbit/s)
+/// CheckRxBytesInterval  expected >= 4000000 bytes  actual 373203 bytes
 /// ```
 ///
-/// # Why the estimate stops at ~2.7 Mbps
-///
-/// Because that is how fast str0m can emit padding, and probe results read back the sender's own
-/// throughput. From a production run with `RUST_LOG=str0m::bwe_=trace`, every probe converges on
-/// the same actual send rate no matter what it aims at:
-///
-/// ```text
-/// target_bps=2800000  sent_bytes=5520   packets=5   send_ms=13   -> 3.4 Mbit/s actual
-/// target_bps=5600000  sent_bytes=10688  packets=15  send_ms=27   -> 3.2 Mbit/s actual
-/// target_bps=5600000  (rejected)        packets=31               -> 1.7 Mbit/s actual (31%)
-/// ```
-///
-/// Five packets in 13 ms is one packet per 2.6 ms; fifteen in 27 ms is one per 1.8 ms. That is
-/// `poll_packet_padding` being gated to one packet per `handle_timeout`
-/// (`needs_timeout_before_next_poll`, str0m `src/pacer/leaky.rs`). At ~1 kB per packet it puts a
-/// hard ~3 Mbps ceiling on what *any* probe can demonstrate, so probes aimed higher are rejected
-/// as under-delivered and the ones that land assert a limit the link never had.
-///
-/// The estimate is therefore a readout of str0m's padding throughput rather than of the path, and
-/// it lands just below what two streams need - which is exactly the reported symptom.
+/// 373 kB across the 30s soak is ~100 kbps, the screen share's VBR average on its own. But the
+/// estimate was 3.2 Mbps at the time - ample for both - and instrumenting the allocator showed
+/// the second slot was not paused for cost. It was absent: across 2719 allocation passes exactly
+/// one had both slots bound, and `slot.target()` was `None` for the other in all 913 passes that
+/// mattered. A slot with no target never reaches the allocator at all.
 #[test]
-#[ignore = "known bug: probe send rate is capped by str0m's one-packet-per-timeout padding gate, \
-            pinning the estimate at ~2.7 Mbps on an unlimited link so the camera is never allocated"]
 fn estimate_grows_to_fit_screenshare_and_camera_test() {
     LocalNodeSim::new()
         .with_tick(Duration::from_millis(1))
@@ -468,67 +446,68 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
                 description: "Establish connections and discover both tracks",
                 duration: Duration::from_secs(20),
             },
-            // Both in one call: adding a subscription later hits the separate, already-known
-            // binding bug covered by `late_video_subscription_is_delivered_test`.
-            Step::SubscribeTo {
+            Step::SubscribeAll {
                 description: "Viewer watches the screen share and the camera at full quality",
                 participant: "viewer",
-                targets: &[("presenter", 720), ("camera", 720)],
+                heights: &[720, 720],
             },
             Step::Run {
                 description: "Warmup: let the estimate ramp with both streams live",
                 duration: Duration::from_secs(40),
             },
             Step::Run {
-                description: "Soak: the estimate should have found the link's real capacity",
+                description: "Soak: both streams should be flowing",
                 duration: Duration::from_secs(30),
             },
+            // Well clear of the ~2.8 Mbps two `f` layers cost, so a regression that genuinely
+            // starves the camera fails here rather than on the byte count below.
+            Step::CheckMinBwe {
+                description: "Estimate leaves room for both streams",
+                min_bps: 2_500_000,
+            },
+            // The camera alone is 1.25 Mbps CBR, so 30s of it is ~4.7 MB. Anything near the
+            // screen share's ~100 kbps VBR average on its own means the camera is missing.
             Step::CheckRxBytesInterval {
                 description: "Viewer receives both streams, not just one",
                 participant: "viewer",
                 min_bytes: 4_000_000,
-            },
-            Step::CheckMinBwe {
-                description: "Estimate leaves room for both streams",
-                min_bps: 4_000_000,
             },
         ]);
 }
 
 /// A video subscription added after the initial one must actually be delivered.
 ///
-/// # Known failure - reproduces the production symptom, and it is not a BWE bug
-///
 /// The viewer subscribes to the presenter, runs for 60s, then re-issues subscriptions for *both*
-/// the presenter and the camera. The camera never arrives: the viewer receives ~213 kbps for the
-/// next 45s, which is the screen share's VBR average alone, and 45s is no better than 20s.
+/// the presenter and the camera. Before the fix the camera never arrived: the viewer received
+/// ~213 kbps for the next 45s, which is the screen share's VBR average alone, and 45s was no
+/// better than 20s.
 ///
-/// Narrowed down as follows:
+/// It looked like congestion control and was not. Ruled out in turn:
 ///
-///   - **Not bandwidth.** During the pickup window the downstream estimate measures
-///     min 2.76 / max 3.07 Mbps against `want=2.6Mbps`. There is more than enough headroom, and
-///     the allocator's own report confirms it is not congestion-limited.
-///   - **Not the probe guard.** Reproduces identically with `MIN_PROBE_DELIVERY_RATIO` enabled or
-///     disabled, so it is unrelated to the starved-probe defect.
+///   - **Not bandwidth.** During the pickup window the downstream estimate measured
+///     min 2.76 / max 3.07 Mbps against `want=2.6Mbps`. There was more than enough headroom, and
+///     the allocator's own report confirmed it was not congestion-limited.
+///   - **Not the probe guard.** Reproduced identically with `MIN_PROBE_DELIVERY_RATIO` enabled or
+///     disabled, so it was unrelated to the starved-probe defect.
 ///   - **Not the `height == 0` hide path.** Omitting the camera from the first subscription
-///     entirely, rather than subscribing at height 0, gives byte-for-byte the same result
-///     (1_200_940). So this is not `signaling.rs`'s `if req.target_height == 0 { continue; }`.
-///   - **Not inherent to two streams.** `screenshare_and_camera_conference_test` subscribes to
-///     both from the start and comfortably clears 6 MB over a comparable window.
+///     entirely, rather than subscribing at height 0, gave byte-for-byte the same result
+///     (1_200_940). So it was not `signaling.rs`'s `if req.target_height == 0 { continue; }`.
 ///
-/// The slot simply stops being allocated. With `RUST_LOG=pulsebeam=debug` two slots exist and
-/// both are bound initially, then one drops out of every subsequent allocation report while the
-/// other climbs q -> h -> f normally:
+/// The slot was simply not bound. With `RUST_LOG=pulsebeam=debug` two slots existed and both were
+/// bound initially, then one dropped out of every subsequent allocation report while the other
+/// climbed q -> h -> f normally:
 ///
 ///   `streams=brG:PAUSE(150.000kbit/s) k9U:M(400.000kbit/s)`   <- both bound
 ///   `streams=brG:M(400.000kbit/s)`                            <- k9U gone
 ///   `streams=brG:H(1.250Mbit/s)`                              <- and never returns
 ///
-/// So the defect is in how a re-issued `SetSubscriptions` re-binds slots, not in congestion
-/// control. This is the production complaint - "the allocator doesn't think there's enough for
-/// the camera to be streamed" - except that the allocator has the bandwidth and has lost the slot.
+/// The cause was a delta-versus-declarative mismatch in the signalling: the agent's
+/// `SubscriptionManager::reconcile` sent only the slots whose assignment had changed, while the
+/// SFU's `VideoAllocator::configure` stops every slot the intent does not name. Re-issuing a
+/// subscription that left the unchanged presenter out therefore unbound it. See
+/// [`estimate_grows_to_fit_screenshare_and_camera_test`], which covers the same defect without
+/// the re-issue.
 #[test]
-#[ignore = "known bug: a video subscription added after the first is never delivered"]
 fn late_video_subscription_is_delivered_test() {
     LocalNodeSim::new()
         .with_tick(Duration::from_millis(1))
