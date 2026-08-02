@@ -111,14 +111,79 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
         ]);
 }
 
+/// A height request must be satisfied by rounding *up* the simulcast ladder, not down.
+///
+/// This is the "stream never reaches 720p" report. The viewer asks for 540p from a ladder of
+/// f=720 / h=360 / q=180. No layer is exactly 540, so the request sits between two tiers.
+///
+/// Spatial gating admitted only layers at or below the request, so the viewer was handed h=360 -
+/// visibly softer than it asked for - while f=720 sat unused on a link with ample room for it.
+///
+/// # Why this is worth more than one tier of sharpness
+///
+/// `requested_capacity` values a subscription at the seed bitrate of the tallest *spatially
+/// allowed* layer, so rounding down also halves what the SFU asks BWE for: 400 kbps (Medium seed)
+/// instead of 1.25 Mbps (High). str0m probes at `2 x desired`, and a probe can only ever prove
+/// its own target, so the estimate pins just above the layer already in use with no headroom
+/// left. Production, a 1080p screen share against a 720p request:
+///
+/// ```text
+/// Probe queued kind=PeriodicAlr target_bps=800000   <- every probe, for the whole run
+/// BWE estimate updated estimate_bps=355072..702511
+/// ```
+///
+/// 800000 is exactly `2 x 400000`, and 400000 is exactly `LayerQuality::Medium.seed_bitrate_bps()`.
+/// The connection could never climb to the 1.25 Mbps `f` layer because it never asked to, and the
+/// margin left over the layer it did use was thin enough that VBR bursts paused the slot.
+///
+/// A second connection in the same log, whose request did admit `f`, sat at 3.8-4.7 Mbps
+/// throughout. The link was never the constraint.
+#[test]
+fn height_request_rounds_up_the_ladder_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Viewer asks for 540p, which no layer matches exactly",
+                participant: "viewer",
+                targets: &[("camera", 540)],
+            },
+            Step::Run {
+                description: "Warmup: let BWE settle with room to spare",
+                duration: Duration::from_secs(30),
+            },
+            Step::Run {
+                description: "Measurement window",
+                duration: Duration::from_secs(30),
+            },
+            // f is 1.25 Mbps, so 30s of it is ~4.7 MB; h is 400 kbps, ~1.5 MB. 3 MB cleanly
+            // separates "rounded up to f" from "rounded down to h".
+            Step::CheckRxBytesInterval {
+                description: "Viewer gets the 720p layer, not the 360p one",
+                participant: "viewer",
+                min_bytes: 3_000_000,
+            },
+        ]);
+}
+
 /// The real-world call: one screen share plus one camera, both directions live.
 ///
 /// This is the scenario from production that motivated the BWE work. Two participants each
 /// publish and subscribe, so four simulcast ladders are in flight at once and every congestion
 /// controller is being driven by real media rather than a synthetic ramp.
 ///
-/// The screen share is VBR ([`VbrProfile::screenshare`]): 4s bursts at 30fps separated by 20s of
-/// near-static content at 2fps. That ~15x swing is what makes this worth simulating.
+/// The screen share replays a captured desktop at up to 15fps and falls to a 0.5fps heartbeat
+/// while static. That swing is what makes this worth simulating.
 ///
 ///   - during the quiet phase the sender is application limited, so str0m enters ALR and the
 ///     probe controller alone keeps the bandwidth estimate alive. If probing stalls, the estimate
@@ -130,7 +195,7 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
 ///     screen share's bursts. Production symptom: "the allocator doesn't think there is enough
 ///     for the camera to be streamed".
 ///
-/// Measured over 48s (two full VBR cycles) on [`LinkProfile::fiber`]: the camera direction
+/// Measured over 48s of the captured activity on [`LinkProfile::fiber`]: the camera direction
 /// carries ~1.16 Mbps, i.e. essentially the full 1.25 Mbps "f" layer, so the screen share's
 /// bursts are not starving it. The screen-share direction carries less in absolute terms purely
 /// because of its duty cycle - `(4s x 1.25Mbps + 20s x 83kbps) / 24s` is ~278 kbps - so it too is
@@ -141,9 +206,7 @@ fn screenshare_and_camera_conference_test() {
         .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
-                .with_participant(
-                    Participant::screensharer("screen", &["q", "h", "f"]).and_subscribes(),
-                )
+                .with_participant(Participant::screensharer("screen").and_subscribes())
                 .with_participant(
                     Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
                 ),
@@ -170,7 +233,7 @@ fn screenshare_and_camera_conference_test() {
                 duration: Duration::from_secs(20),
             },
             Step::Run {
-                description: "Soak across two full VBR cycles (static -> scroll -> static)",
+                description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
             // ~224 kbps measured. The camera is constant-bitrate, so any collapse here means the
@@ -180,12 +243,14 @@ fn screenshare_and_camera_conference_test() {
                 participant: "screen",
                 min_bytes: 6_000_000,
             },
-            // ~86 kbps measured, matching the VBR average. A large shortfall means the bursts
-            // after a quiet phase were dropped - the estimate decayed while the screen was still.
+            // ~122 kbps measured, matching the VBR average: the fixture carries 843 kB per 60.5s
+            // loop (13.9 kB/s), so a full 48s soak can only ever deliver ~670 kB of media. A large
+            // shortfall means the bursts after a quiet phase were dropped - the estimate decayed
+            // while the screen was still.
             Step::CheckRxBytesInterval {
                 description: "Screen-share bursts survive the quiet phases",
                 participant: "camera",
-                min_bytes: 1_200_000,
+                min_bytes: 600_000,
             },
             Step::CheckVideoQuality {
                 description: "Screen-sharer renders the camera cleanly throughout",
@@ -195,7 +260,7 @@ fn screenshare_and_camera_conference_test() {
             Step::CheckVideoQuality {
                 description: "Camera participant renders the screen share cleanly throughout",
                 participant: "camera",
-                quality: VideoQuality::min_frames(300).allow_gaps(3),
+                quality: VideoQuality::min_frames(150).allow_gaps(3),
             },
         ]);
 }
@@ -207,7 +272,7 @@ fn screenshare_and_camera_conference_test() {
 /// should be absorbed as inherent loss rather than triggering a backoff.
 #[test]
 fn screenshare_and_camera_over_wifi_test() {
-    conference_plan(LinkProfile::wifi(), 3_000_000, 700_000, 600, 200, 8, 2);
+    conference_plan(LinkProfile::wifi(), 3_000_000, 700_000, 600, 100, 8, 2);
 }
 
 /// The same call over mobile: ~50ms latency and 1% loss.
@@ -263,9 +328,7 @@ fn conference_plan(
         .with_link(link)
         .with_room(
             Room::new("room1")
-                .with_participant(
-                    Participant::screensharer("screen", &["q", "h", "f"]).and_subscribes(),
-                )
+                .with_participant(Participant::screensharer("screen").and_subscribes())
                 .with_participant(
                     Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
                 ),
@@ -292,7 +355,7 @@ fn conference_plan(
                 duration: Duration::from_secs(20),
             },
             Step::Run {
-                description: "Soak across two full VBR cycles (static -> scroll -> static)",
+                description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
             Step::CheckRxBytesInterval {
@@ -369,7 +432,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
         .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::screensharer("presenter", &["q", "h", "f"]))
+                .with_participant(Participant::screensharer("presenter"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
                 .with_participant(Participant::multi_subscriber("viewer", 2)),
         )
@@ -388,7 +451,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
                 duration: Duration::from_secs(15),
             },
             Step::Run {
-                description: "Soak across two static/scroll cycles",
+                description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
             Step::CheckMinBwe {
@@ -398,51 +461,124 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
             Step::CheckVideoQuality {
                 description: "Viewer renders the screen share cleanly throughout",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(300).allow_gaps(6),
+                quality: VideoQuality::min_frames(100).allow_gaps(6),
+            },
+        ]);
+}
+
+/// A viewer subscribing to two publishers must receive both.
+///
+/// This is the production complaint - "the allocator doesn't think there's enough bandwidth for
+/// the camera to be streamed" - reproduced end to end. A viewer takes one screen share plus one
+/// camera at 720p, which needs ~2.5 Mbps of media (two 1.25 Mbps `f` layers).
+///
+/// It is worth being precise about what this asserts, because the obvious reading is wrong. The
+/// camera was never short of bandwidth: the estimate sat at ~3.2 Mbps throughout, comfortably
+/// above the ~2.8 Mbps two `f` layers cost. `CheckMinBwe` pins that down so a future regression
+/// that *does* starve the camera fails for a visibly different reason than one that unbinds it.
+///
+/// # The bug this covers
+///
+/// The agent's `SubscriptionManager::reconcile` used to emit only the slots whose assignment had
+/// changed, while the SFU's `VideoAllocator::configure` treats a `ClientIntent` as a declarative
+/// statement of desired state and stops every slot the intent does not mention. Subscribing to a
+/// second track sent an intent naming only that track, so the SFU unbound the first.
+///
+/// The symptom read exactly like congestion control failing to ramp:
+///
+/// ```text
+/// CheckRxBytesInterval  expected >= 4000000 bytes  actual 373203 bytes
+/// ```
+///
+/// 373 kB across the 30s soak is ~100 kbps, the screen share's VBR average on its own. But the
+/// estimate was 3.2 Mbps at the time - ample for both - and instrumenting the allocator showed
+/// the second slot was not paused for cost. It was absent: across 2719 allocation passes exactly
+/// one had both slots bound, and `slot.target()` was `None` for the other in all 913 passes that
+/// mattered. A slot with no target never reaches the allocator at all.
+#[test]
+fn estimate_grows_to_fit_screenshare_and_camera_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("presenter"))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeAll {
+                description: "Viewer watches the screen share and the camera at full quality",
+                participant: "viewer",
+                heights: &[720, 720],
+            },
+            Step::Run {
+                description: "Warmup: let the estimate ramp with both streams live",
+                duration: Duration::from_secs(40),
+            },
+            Step::Run {
+                description: "Soak: both streams should be flowing",
+                duration: Duration::from_secs(30),
+            },
+            // Well clear of the ~2.8 Mbps two `f` layers cost, so a regression that genuinely
+            // starves the camera fails here rather than on the byte count below.
+            Step::CheckMinBwe {
+                description: "Estimate leaves room for both streams",
+                min_bps: 2_500_000,
+            },
+            // The camera alone is 1.25 Mbps CBR, so 30s of it is ~4.7 MB. Anything near the
+            // screen share's ~100 kbps VBR average on its own means the camera is missing.
+            Step::CheckRxBytesInterval {
+                description: "Viewer receives both streams, not just one",
+                participant: "viewer",
+                min_bytes: 4_000_000,
             },
         ]);
 }
 
 /// A video subscription added after the initial one must actually be delivered.
 ///
-/// # Known failure - reproduces the production symptom, and it is not a BWE bug
-///
 /// The viewer subscribes to the presenter, runs for 60s, then re-issues subscriptions for *both*
-/// the presenter and the camera. The camera never arrives: the viewer receives ~213 kbps for the
-/// next 45s, which is the screen share's VBR average alone, and 45s is no better than 20s.
+/// the presenter and the camera. Before the fix the camera never arrived: the viewer received
+/// ~213 kbps for the next 45s, which is the screen share's VBR average alone, and 45s was no
+/// better than 20s.
 ///
-/// Narrowed down as follows:
+/// It looked like congestion control and was not. Ruled out in turn:
 ///
-///   - **Not bandwidth.** During the pickup window the downstream estimate measures
-///     min 2.76 / max 3.07 Mbps against `want=2.6Mbps`. There is more than enough headroom, and
-///     the allocator's own report confirms it is not congestion-limited.
-///   - **Not the probe guard.** Reproduces identically with `MIN_PROBE_DELIVERY_RATIO` enabled or
-///     disabled, so it is unrelated to the starved-probe defect.
+///   - **Not bandwidth.** During the pickup window the downstream estimate measured
+///     min 2.76 / max 3.07 Mbps against `want=2.6Mbps`. There was more than enough headroom, and
+///     the allocator's own report confirmed it was not congestion-limited.
+///   - **Not the probe guard.** Reproduced identically with `MIN_PROBE_DELIVERY_RATIO` enabled or
+///     disabled, so it was unrelated to the starved-probe defect.
 ///   - **Not the `height == 0` hide path.** Omitting the camera from the first subscription
-///     entirely, rather than subscribing at height 0, gives byte-for-byte the same result
-///     (1_200_940). So this is not `signaling.rs`'s `if req.target_height == 0 { continue; }`.
-///   - **Not inherent to two streams.** `screenshare_and_camera_conference_test` subscribes to
-///     both from the start and comfortably clears 6 MB over a comparable window.
+///     entirely, rather than subscribing at height 0, gave byte-for-byte the same result
+///     (1_200_940). So it was not `signaling.rs`'s `if req.target_height == 0 { continue; }`.
 ///
-/// The slot simply stops being allocated. With `RUST_LOG=pulsebeam=debug` two slots exist and
-/// both are bound initially, then one drops out of every subsequent allocation report while the
-/// other climbs q -> h -> f normally:
+/// The slot was simply not bound. With `RUST_LOG=pulsebeam=debug` two slots existed and both were
+/// bound initially, then one dropped out of every subsequent allocation report while the other
+/// climbed q -> h -> f normally:
 ///
 ///   `streams=brG:PAUSE(150.000kbit/s) k9U:M(400.000kbit/s)`   <- both bound
 ///   `streams=brG:M(400.000kbit/s)`                            <- k9U gone
 ///   `streams=brG:H(1.250Mbit/s)`                              <- and never returns
 ///
-/// So the defect is in how a re-issued `SetSubscriptions` re-binds slots, not in congestion
-/// control. This is the production complaint - "the allocator doesn't think there's enough for
-/// the camera to be streamed" - except that the allocator has the bandwidth and has lost the slot.
+/// The cause was a delta-versus-declarative mismatch in the signalling: the agent's
+/// `SubscriptionManager::reconcile` sent only the slots whose assignment had changed, while the
+/// SFU's `VideoAllocator::configure` stops every slot the intent does not name. Re-issuing a
+/// subscription that left the unchanged presenter out therefore unbound it. See
+/// [`estimate_grows_to_fit_screenshare_and_camera_test`], which covers the same defect without
+/// the re-issue.
 #[test]
-#[ignore = "known bug: a video subscription added after the first is never delivered"]
 fn late_video_subscription_is_delivered_test() {
     LocalNodeSim::new()
         .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::screensharer("presenter", &["q", "h", "f"]))
+                .with_participant(Participant::screensharer("presenter"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
                 .with_participant(Participant::multi_subscriber("viewer", 2)),
         )

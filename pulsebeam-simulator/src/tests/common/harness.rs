@@ -101,10 +101,10 @@ impl Participant {
     /// A publisher whose content is screen sharing: strongly variable bitrate, long static
     /// stretches. This is the case that exercises str0m's probe controller, because the sender
     /// sits in ALR whenever the screen is still.
-    pub fn screensharer(name: &'static str, rids: &[&'static str]) -> Self {
+    pub fn screensharer(name: &'static str) -> Self {
         Self {
             vbr: Some(VbrProfile::screenshare()),
-            ..Self::publisher(name, rids)
+            ..Self::publisher(name, &["f"])
         }
     }
 
@@ -550,14 +550,19 @@ async fn run_participant(
                     match op {
                         PendingDriverOp::SetSubscriptions(subs) => {
                             let incoming_tracks = ctx.incoming_track_tx.clone();
-                            let new_subscriptions: Vec<_> = subs
-                                .iter()
-                                .filter(|subscription| {
-                                    ctx.requested_tracks
-                                        .insert(subscription.participant_id.clone())
-                                })
-                                .cloned()
-                                .collect();
+                            // Every subscription is (re-)issued, including ones for a track that
+                            // is already subscribed. `SetSubscriptions` is a declarative step, and
+                            // a plan's whole point may be to change the *height* of an existing
+                            // subscription. Filtering on participant id alone silently dropped
+                            // those: a subscriber participant auto-subscribes at 720 as soon as it
+                            // discovers a track, so any later `SubscribeTo` naming that track was
+                            // a no-op and the plan quietly tested 720p instead of what it asked
+                            // for.
+                            let new_subscriptions: Vec<_> = subs.to_vec();
+                            for subscription in &subs {
+                                ctx.requested_tracks
+                                    .insert(subscription.participant_id.clone());
+                            }
                             for subscription in new_subscriptions {
                                 let agent = ctx.agent.clone();
                                 let incoming_tracks = incoming_tracks.clone();
@@ -1205,9 +1210,7 @@ async fn execute_plan(
                 description,
                 min_bps,
             } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)"
-                );
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)");
                 let observed = pulsebeam::sim_metrics::downstream_bwe_summary();
                 let Some((min_seen, max_seen, last_seen, count)) = observed else {
                     panic!(
