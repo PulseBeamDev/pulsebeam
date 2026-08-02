@@ -180,6 +180,15 @@ pub struct VbrProfile {
     /// leaves only tiny packets to pad with, and str0m emits one padding packet per event-loop
     /// round trip. A probe cluster then cannot reach a high target however long it runs.
     pub idle_max_frame_bytes: usize,
+    /// Silence between the end of one replay of the schedule and the start of the next.
+    ///
+    /// A truly static screen emits nothing at all, for as long as nobody touches it. That is a
+    /// different regime from a low frame *rate*: past a few seconds of silence the SFU marks the
+    /// layer dead, it drops out of `desired`, and the RTX cache the pacer draws padding from
+    /// drains - so probes have nothing to send and report a rate far below the link. A schedule
+    /// captured from a real screen share still has a frame every second or two, which never
+    /// reaches that regime.
+    pub loop_idle: Duration,
 }
 
 impl VbrProfile {
@@ -195,6 +204,20 @@ impl VbrProfile {
             idle_fps: 2,
             // Small enough to land in a single sub-MTU RTP packet, as a near-empty P-frame does.
             idle_max_frame_bytes: 300,
+            loop_idle: Duration::from_millis(500),
+        }
+    }
+
+    /// Screen sharing that goes genuinely still: the captured schedule, then a long silence.
+    ///
+    /// `loop_idle` is well past the SFU's 3s stream-dead timeout, so the layer is marked
+    /// unhealthy and the pacer's RTX cache empties - the conditions under which probing starves
+    /// and the estimate collapses. [`Self::screenshare`] never gets there; its schedule has a
+    /// frame every two seconds.
+    pub fn screenshare_static() -> Self {
+        Self {
+            loop_idle: Duration::from_secs(20),
+            ..Self::screenshare()
         }
     }
 }
@@ -291,7 +314,7 @@ impl VbrLooper {
                 .last()
                 .copied()
                 .expect("non-empty frame schedule")
-                + Duration::from_millis(500);
+                + self.profile.loop_idle;
             let mut loop_start = start;
             let mut index = 0usize;
             loop {

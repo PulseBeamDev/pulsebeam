@@ -678,3 +678,86 @@ fn capped_subscription_is_not_over_served_test() {
             },
         ]);
 }
+
+/// A screen share must come back to full quality after the screen has been still.
+///
+/// The scenario behind the "stuck at 360p" report. A viewer watches a screen share at 720p, the
+/// screen goes quiet long enough that the SFU marks the layer dead and the pacer's RTX cache
+/// drains, and then the user scrolls again.
+///
+/// # What this closes
+///
+/// Every other plan here runs against [`VbrProfile::screenshare`], whose captured schedule has a
+/// frame every two seconds - just inside the SFU's 3s stream-dead timeout. Our "static" screen
+/// share was therefore never actually static, and no plan reached the regime where a layer dies.
+/// [`VbrProfile::screenshare_static`] adds real silence, and the allocator confirms the regime is
+/// reached: the slot cycles `H(1.250Mbit/s)` -> `PAUSE(0bit/s)` -> `H(1.250Mbit/s)` as the layer
+/// dies and recovers.
+///
+/// # What this does NOT prove, and why
+///
+/// It is not a guard for the estimate collapse in the production trace. Deleting the
+/// `requested_capacity` floor from `run_desired` - the fix that keeps `desired` alive while the
+/// layer is dead - leaves this plan passing.
+///
+/// The reason is the link. [`LinkProfile`] models latency and loss only; turmoil 0.7.2 offers no
+/// bandwidth limit at all (`min/max_message_latency`, `fail_rate`, and a *message-count*
+/// `udp_capacity` that changes nothing here, since both ends drain their socket every tick). With
+/// no capacity to saturate there is no queueing delay, so the delay-based estimate never falls -
+/// measured at 2.0-3.0 Mbps for the whole plan - and `limit_probe_bitrate` floors probe results at
+/// it. A starved probe simply cannot drag the estimate down here, however badly it under-delivers.
+///
+/// Production is the opposite regime:
+///
+/// ```text
+/// Probe result estimate=20.224kbit/s
+/// Probe result estimate=2.638kbit/s
+/// Link capacity estimate updated to 26.984kbit/s from probe
+/// ```
+///
+/// Reproducing that needs a rate-limited link - a token bucket on the SFU-to-client path, which
+/// today would mean `AgentBuilder` accepting a socket trait rather than a concrete
+/// `turmoil::net::UdpSocket`. Until then, treat this as a regression guard on the *recovery path*
+/// through a genuinely dead layer, not on congestion control's response to a constrained link.
+#[test]
+fn screenshare_recovers_full_quality_after_going_still_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::static_screensharer("presenter"))
+                .with_participant(Participant::multi_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Viewer watches the screen share at full quality",
+                participant: "viewer",
+                targets: &[("presenter", 720)],
+            },
+            Step::Run {
+                description: "Warmup across a full replay, including the silence",
+                duration: Duration::from_secs(90),
+            },
+            Step::Run {
+                description: "Soak across two more quiet-then-active cycles",
+                duration: Duration::from_secs(160),
+            },
+            // The fixture carries 843 kB per replay and the loop is now 80.5s, so 160s spans
+            // about two replays: ~1.7 MB of media. A viewer stranded on a lower layer, or one
+            // whose estimate collapsed during the silence, falls well short.
+            Step::CheckRxBytesInterval {
+                description: "Bursts after the silence are delivered, not dropped",
+                participant: "viewer",
+                min_bytes: 1_400_000,
+            },
+            Step::CheckMinBwe {
+                description: "The estimate survives the silence",
+                min_bps: 1_500_000,
+            },
+        ]);
+}

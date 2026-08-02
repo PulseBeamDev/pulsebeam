@@ -108,6 +108,16 @@ impl Participant {
         }
     }
 
+    /// A screen sharer that goes genuinely still between bursts: long enough for the SFU to mark
+    /// the layer dead and for the pacer's RTX cache to drain. See
+    /// [`VbrProfile::screenshare_static`].
+    pub fn static_screensharer(name: &'static str) -> Self {
+        Self {
+            vbr: Some(VbrProfile::screenshare_static()),
+            ..Self::publisher(name, &["f"])
+        }
+    }
+
     /// Also receive video, making this a full two-way conference participant.
     pub fn and_subscribes(mut self) -> Self {
         self.subscribes = true;
