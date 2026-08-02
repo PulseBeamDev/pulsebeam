@@ -615,3 +615,66 @@ fn late_video_subscription_is_delivered_test() {
             },
         ]);
 }
+
+/// A capped subscription must not be served bandwidth it asked not to be given.
+///
+/// The viewer requests 360p, which the ladder satisfies exactly with the h layer at ~450 kbps.
+/// Over a 60s window that is ~3.4 MB of media. Anything much beyond it is padding and probe
+/// traffic aimed at capacity the subscription cannot use.
+///
+/// `desired` was not capped by intent. `run_desired` computes it correctly - `requested_capacity`
+/// is the seed of the tallest *spatially allowed* layer, so a 360p request yields ~470 kbps - but
+/// `BitrateController` then held the output far above it. Its job is to smooth the approach
+/// (`down_smoothing` 0.99, 200 kbps quantization, 250 kbps hysteresis, 300 kbps floor), and
+/// nothing bounded the result by what was actually wanted:
+///
+/// ```text
+/// raw_bps=472694  out_bps=800000  alloc_bps=449153
+/// ```
+///
+/// str0m probes at `2 x desired`, so a 360p subscription was probing at 1.6 Mbps and the viewer
+/// received 5074716 bytes for 3.4 MB of media - about 50% overhead.
+#[test]
+fn capped_subscription_is_not_over_served_test() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_millis(1))
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for 360p, which the h layer satisfies exactly",
+                participant: "bob",
+                targets: &[("alice", 360)],
+            },
+            Step::Run {
+                description: "Warmup",
+                duration: Duration::from_secs(30),
+            },
+            Step::Run {
+                description: "Measurement window",
+                duration: Duration::from_secs(60),
+            },
+            // ~3.4 MB is the h layer itself. Measured against `DESIRED_HEADROOM`: 3.57 MB at
+            // 1.0, 4.25 MB at 1.2, 5.01 MB at 1.5, against 5.07 MB uncapped. 4.5 MB holds the
+            // shipped 1.2 while still failing an uncapped `desired`.
+            Step::CheckMaxRxBytesInterval {
+                description: "Bob is not served bandwidth beyond what 360p needs",
+                participant: "bob",
+                max_bytes: 4_500_000,
+            },
+            // Still actually receiving the layer, not starved into passing the cap.
+            Step::CheckRxBytesInterval {
+                description: "Bob still receives the 360p layer",
+                participant: "bob",
+                min_bytes: 3_000_000,
+            },
+        ]);
+}

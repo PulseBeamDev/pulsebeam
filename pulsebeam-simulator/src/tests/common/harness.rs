@@ -333,6 +333,16 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
+    /// Bytes received since the last Step::Run ≤ `max_bytes`.
+    ///
+    /// The counterpart to [`Step::CheckRxBytesInterval`]: asserts a subscription is not being
+    /// *over*-served. A capped subscription that receives far more than its layer costs is
+    /// paying for padding and probes aimed at bandwidth it asked not to be given.
+    CheckMaxRxBytesInterval {
+        description: &'static str,
+        participant: &'static str,
+        max_bytes: u64,
+    },
     /// The downstream bandwidth estimate on every participant stayed at or above `min_bps`
     /// during the last `Step::Run`.
     ///
@@ -816,6 +826,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckRxBytes { .. } => "CheckRxBytes",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
+        Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
         Step::CheckTxBytesInterval { .. } => "CheckTxBytesInterval",
         Step::CheckMinBwe { .. } => "CheckMinBwe",
         Step::CheckDataReceived { .. } => "CheckDataReceived",
@@ -1222,6 +1233,23 @@ async fn execute_plan(
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps on every participant\n  actual:       min {min_seen} / max {max_seen} / last {last_seen} bps over {count} allocation passes"
                 );
             }
+            Step::CheckMaxRxBytesInterval {
+                description,
+                participant,
+                max_bytes,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, max {max_bytes} B)"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let baseline = handle.interval_rx_baseline;
+                let actual = handle.rx_bytes().saturating_sub(baseline);
+                assert!(
+                    actual <= *max_bytes,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     <= {max_bytes} bytes in last interval\n  actual:       {actual} bytes"
+                );
+            }
+
             Step::CheckRxBytesInterval {
                 description,
                 participant,
