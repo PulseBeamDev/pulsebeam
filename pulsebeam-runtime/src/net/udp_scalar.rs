@@ -63,6 +63,8 @@ pub fn from_socket(
         sock: socket.clone(),
         local_addr,
         drop_count: 0,
+        #[cfg(feature = "sim")]
+        shaper: Default::default(),
     };
     Ok(UdpTransport { reader, writer })
 }
@@ -126,6 +128,9 @@ pub struct UdpTransportWriter {
     sock: Arc<UdpSocket>,
     local_addr: SocketAddr,
     drop_count: usize,
+    /// Simulated bottleneck on the way out. See [`crate::net::shaper`].
+    #[cfg(feature = "sim")]
+    shaper: crate::net::shaper::Shaper,
 }
 
 impl UdpTransportWriter {
@@ -152,6 +157,20 @@ impl UdpTransportWriter {
     }
 
     pub fn try_send_group(&mut self, batch: &SendPacket) -> std::io::Result<bool> {
+        #[cfg(feature = "sim")]
+        {
+            use crate::net::shaper::Shaped;
+            let now = tokio::time::Instant::now();
+            // Release anything whose turn has come before offering more, so the queue drains at
+            // the shaped rate rather than all at once.
+            for (dst, buf) in self.shaper.drain_due(now) {
+                let _ = self.sock.try_send_to(&buf, dst);
+            }
+            if let Shaped::Absorbed = self.shaper.offer(now, batch.dst, batch.buf) {
+                return Ok(true);
+            }
+        }
+
         let res = self.sock.try_send_to(batch.buf, batch.dst);
 
         match res {
