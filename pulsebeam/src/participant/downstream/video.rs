@@ -68,6 +68,14 @@ impl VideoAllocator {
             min_bitrate: MIN_BANDWIDTH,
             max_bitrate: MAX_BANDWIDTH,
             default_bitrate: INITIAL_BANDWIDTH,
+            // Ask for exactly what the subscription represents, no more. Ramp headroom is
+            // already intent-shaped and comes from elsewhere: `run_desired` takes
+            // `max(flowing, requested_capacity)`, so a subscription sitting on a low layer
+            // already asks for the full capacity of the layer it may grow into, and str0m
+            // probes at `2 x desired` on top of that. Measured over 60s on a 360p-capped
+            // subscription, raising this to 1.2 costs 4.25 MB against 3.57 MB, and buys about
+            // 7% on the first 8s of a 720p ramp.
+            headroom_factor: 1.0,
             ..Default::default()
         }
         .build();

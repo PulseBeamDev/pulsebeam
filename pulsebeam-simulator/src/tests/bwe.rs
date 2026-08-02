@@ -662,13 +662,13 @@ fn capped_subscription_is_not_over_served_test() {
                 description: "Measurement window",
                 duration: Duration::from_secs(60),
             },
-            // ~3.4 MB is the h layer itself. Measured against `DESIRED_HEADROOM`: 3.57 MB at
-            // 1.0, 4.25 MB at 1.2, 5.01 MB at 1.5, against 5.07 MB uncapped. 4.5 MB holds the
-            // shipped 1.2 while still failing an uncapped `desired`.
+            // ~3.4 MB is the h layer itself. Measured against `headroom_factor`: 3.57 MB at
+            // 1.0 (shipped), 4.25 MB at 1.2, 5.01 MB at 1.5, against 5.07 MB uncapped. 4.0 MB
+            // leaves room for RTCP, retransmits and NAT-keepalive padding.
             Step::CheckMaxRxBytesInterval {
                 description: "Bob is not served bandwidth beyond what 360p needs",
                 participant: "bob",
-                max_bytes: 4_500_000,
+                max_bytes: 4_000_000,
             },
             // Still actually receiving the layer, not starved into passing the cap.
             Step::CheckRxBytesInterval {
