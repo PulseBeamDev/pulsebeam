@@ -10,9 +10,8 @@ use std::{io, net::SocketAddr};
 
 /// Maximum datagrams submitted to one `recvmmsg`/`sendmmsg` syscall.
 ///
-/// This is deliberately the Linux value formerly inherited from `quinn-udp`.
-/// Keeping it local makes the runtime independent of Quinn and bounds all
-/// per-socket scratch space.
+/// This keeps interactive-media burst latency and syscall scratch bounded;
+/// UDP GSO uses its independent 64-segment limit for aggregation.
 pub const BATCH_SIZE: usize = 32;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 1500;

@@ -11,7 +11,7 @@ use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::net::Protocol;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
@@ -31,14 +31,14 @@ use crate::participant::signaling;
 use crate::participant::{
     batcher::{Batcher, OwnedPacketQueue},
     downstream::DownstreamAllocator,
-    upstream::UpstreamAllocator,
+    upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamAllocator},
 };
 use crate::rtp::RtpPacket;
 use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
     KEYFRAME_DEBOUNCE, MAX_DATA_TOPIC_CHANNELS, StreamId, StreamWrite, StreamWriter, Topic, Track,
 };
-use str0m::rtp::RtpWrite;
+use str0m::rtp::{RtpWrite, Ssrc};
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -54,6 +54,14 @@ impl TrackAvailability {
     fn published() -> Self {
         Self { in_topology: true }
     }
+}
+
+#[derive(Clone, Copy)]
+struct IncomingRtpRoute {
+    mid: Mid,
+    rid: Option<Rid>,
+    upstream_slot: usize,
+    track_id: TrackId,
 }
 
 pub struct TrackMapping {
@@ -156,6 +164,7 @@ pub struct ParticipantCore {
     pub udp_packets: OwnedPacketQueue,
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
+    incoming_rtp_routes: HashMap<Ssrc, IncomingRtpRoute>,
     stream_writer: StreamWriter,
     pending_ingress: VecDeque<RecvPacketBatch>,
     pending_timeout: Option<Instant>,
@@ -221,6 +230,7 @@ impl ParticipantCore {
             tcp_batcher,
             upstream: UpstreamAllocator::new(ctx),
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub, rng),
+            incoming_rtp_routes: HashMap::with_capacity(MAX_UPSTREAM_ENCODED_STREAMS),
             disconnect_reason: None,
             signaling,
             last_slow_poll: Instant::now(),
@@ -513,15 +523,31 @@ impl ParticipantCore {
     }
 
     fn apply_stream_write(&mut self, write: StreamWrite, now: Instant) {
-        let (pkt, mid, rid, pt, kind) = match write {
-            StreamWrite::Video { pkt, mid, rid, pt } => (pkt, mid, rid, pt, MediaKind::Video),
-            StreamWrite::Audio { pkt, mid, pt } => (pkt, mid, None, pt, MediaKind::Audio),
+        let (pkt, mid, rid, ssrc, pt, kind) = match write {
+            StreamWrite::Video {
+                pkt,
+                mid,
+                rid,
+                ssrc,
+                pt,
+            } => (pkt, mid, rid, ssrc, pt, MediaKind::Video),
+            StreamWrite::Audio { pkt, mid, ssrc, pt } => {
+                (pkt, mid, None, ssrc, pt, MediaKind::Audio)
+            }
         };
         let nackable = kind == MediaKind::Video;
 
         let ctx = self.log_ctx();
         let mut api = self.rtc.direct_api();
-        let Some(stream) = api.stream_tx_by_mid(mid, rid) else {
+        let (stream, recovered) = match api.stream_tx(&ssrc) {
+            Some(stream) if stream.mid() == mid && stream.rid() == rid => (Some(stream), false),
+            Some(stream) => {
+                debug_assert!(stream.mid() != mid || stream.rid() != rid);
+                (api.stream_tx_by_mid(mid, rid), true)
+            }
+            None => (api.stream_tx_by_mid(mid, rid), true),
+        };
+        let Some(stream) = stream else {
             if nackable {
                 plog_warn!(ctx, target: crate::log::TARGET_VIDEO, %mid, ?rid, "no stream_tx_by_mid found");
             } else {
@@ -529,7 +555,13 @@ impl ParticipantCore {
             }
             return;
         };
+        debug_assert_eq!(stream.mid(), mid);
+        debug_assert_eq!(stream.rid(), rid);
         let ssrc = stream.ssrc();
+        if recovered {
+            let refreshed = self.downstream.refresh_ssrc(kind, mid, rid, ssrc);
+            debug_assert!(refreshed, "recovered stream has no downstream slot");
+        }
         #[cfg(debug_assertions)]
         if let Some(violation) =
             self.egress_guard
@@ -777,7 +809,11 @@ impl ParticipantCore {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
             }
-            Event::MediaAdded(media) => self.handle_media_added(media, events),
+            Event::MediaAdded(media) => {
+                self.incoming_rtp_routes.clear();
+                self.handle_media_added(media, events);
+            }
+            Event::MediaChanged(_) => self.incoming_rtp_routes.clear(),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => {
                 if let Some(layer) = self.downstream.handle_keyframe_request(req) {
@@ -1119,13 +1155,32 @@ impl ParticipantCore {
         events: &mut impl ParticipantSink,
     ) {
         plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.seq_no);
-        let mut api = self.rtc.direct_api();
-        let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
-            return;
+        let ssrc = rtp.header.ssrc;
+        let route = if let Some(route) = self.incoming_rtp_routes.get(&ssrc).copied() {
+            route
+        } else {
+            let mut api = self.rtc.direct_api();
+            let Some(stream) = api.stream_rx(&ssrc) else {
+                return;
+            };
+            let mid = stream.mid();
+            let rid = stream.rid();
+            let Some((upstream_slot, track_id)) = self.upstream.slot_for_mid(mid) else {
+                return;
+            };
+            let route = IncomingRtpRoute {
+                mid,
+                rid,
+                upstream_slot,
+                track_id,
+            };
+            self.incoming_rtp_routes
+                .retain(|_, cached| cached.mid != mid || cached.rid != rid);
+            self.incoming_rtp_routes.insert(ssrc, route);
+            route
         };
-        let (mid, rid) = (stream.mid(), stream.rid());
 
-        let Some(media) = self.rtc.media(mid) else {
+        let Some(media) = self.rtc.media(route.mid) else {
             return;
         };
 
@@ -1133,16 +1188,17 @@ impl ParticipantCore {
             MediaKind::Audio => RtpPacket::from_str0m(rtp, crate::rtp::Codec::Opus),
             MediaKind::Video => RtpPacket::from_str0m(rtp, crate::rtp::Codec::H264),
         };
-        if self
-            .upstream
-            .handle_incoming_rtp(mid, rid.as_ref(), &mut rtp, sr)
-        {
-            let track_id = self
-                .upstream
-                .track_id_for_mid(mid)
-                .expect("handle_incoming_rtp returned true so mid must have a slot");
-            let stream_id: StreamId = (track_id, rid);
+        if self.upstream.handle_incoming_rtp(
+            route.upstream_slot,
+            route.mid,
+            route.rid.as_ref(),
+            &mut rtp,
+            sr,
+        ) {
+            let stream_id: StreamId = (route.track_id, route.rid);
             events.publish_rtp(stream_id, rtp);
+        } else {
+            self.incoming_rtp_routes.remove(&ssrc);
         }
     }
 

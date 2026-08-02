@@ -180,6 +180,18 @@ impl VideoAllocator {
         self.slots.values().any(|s| s.mid == mid)
     }
 
+    pub fn refresh_ssrc(&mut self, mid: Mid, rid: Option<Rid>, ssrc: Ssrc) -> bool {
+        let Some(slot) = self
+            .slots
+            .values_mut()
+            .find(|slot| slot.mid == mid && slot.rid == rid)
+        else {
+            return false;
+        };
+        slot.ssrc = ssrc;
+        true
+    }
+
     pub fn add_slot(&mut self, config: SlotConfig) {
         if self.has_slot(config.mid) {
             plog_debug!(self.ctx, mid = %config.mid, "video slot already provisioned; skipping duplicate");
@@ -666,11 +678,11 @@ impl Slot {
         // The switcher owns the entire switching state machine; hand it the
         // cache update and let it emit whatever the subscriber should see. A
         // change in the active stream means a switch was promoted this tick.
-        let (mid, rid, pt) = (self.mid, self.rid, self.pt);
+        let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
         self.switcher
             .feed(*stream_id, cache, pkt.arrival_ts, &mut |out| {
-                writer.write_video_owned(out, mid, rid, pt);
+                writer.write_video_owned(out, mid, rid, ssrc, pt);
             });
         self.switcher.active_stream() != before
     }

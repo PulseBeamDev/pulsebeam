@@ -9,7 +9,9 @@ use crate::{
 };
 use str0m::media::Mid;
 
-const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 2;
+pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 2;
+pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
+    MAX_UPSTREAM_SLOT_PER_TYPE * (1 + crate::track::MAX_SIMULCAST_LAYERS);
 
 struct UpstreamSlot {
     mid: Mid,
@@ -75,20 +77,34 @@ impl UpstreamAllocator {
         true
     }
 
+    pub fn slot_for_mid(&self, mid: Mid) -> Option<(usize, TrackId)> {
+        self.published_tracks
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.mid == mid)
+            .map(|(index, slot)| (index, slot.track.meta.id))
+    }
+
     pub fn handle_incoming_rtp(
         &mut self,
+        slot_index: usize,
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
         rtp: &mut RtpPacket,
         sr: Option<SenderInfo>,
     ) -> bool {
-        if let Some(slot) = self.published_tracks.iter_mut().find(|t| t.mid == mid) {
-            rtp.ext_vals.rid = rid.cloned();
-            slot.track.process(rid, rtp, sr)
-        } else {
-            plog_warn!(self.ctx, %mid, ?rid, "Dropping incoming RTP packet; no published track found");
-            false
+        let Some(slot) = self.published_tracks.get_mut(slot_index) else {
+            debug_assert!(false, "cached upstream slot index is out of bounds");
+            return false;
+        };
+        debug_assert_eq!(slot.mid, mid);
+        if slot.mid != mid {
+            plog_warn!(self.ctx, %mid, ?rid, "Dropping incoming RTP packet; cached published track changed");
+            return false;
         }
+
+        rtp.ext_vals.rid = rid.cloned();
+        slot.track.process(rid, rtp, sr)
     }
 
     pub fn track_id_for_mid(&self, mid: Mid) -> Option<TrackId> {

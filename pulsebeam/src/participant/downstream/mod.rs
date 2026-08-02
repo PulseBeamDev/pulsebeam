@@ -212,6 +212,22 @@ impl DownstreamAllocator {
         }
     }
 
+    pub fn refresh_ssrc(
+        &mut self,
+        kind: MediaKind,
+        mid: Mid,
+        rid: Option<Rid>,
+        ssrc: Ssrc,
+    ) -> bool {
+        match kind {
+            MediaKind::Video => self.video.refresh_ssrc(mid, rid, ssrc),
+            MediaKind::Audio => {
+                debug_assert!(rid.is_none());
+                self.audio.refresh_ssrc(mid, ssrc)
+            }
+        }
+    }
+
     pub fn update_bitrate(&mut self, now: Instant, available_bandwidth: Bitrate) {
         self.available_bandwidth.update(now, available_bandwidth);
         self.dirty_allocation = true;

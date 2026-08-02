@@ -13,6 +13,7 @@ use crate::rtp::{
 pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
 use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
+use str0m::rtp::Ssrc;
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
@@ -37,11 +38,13 @@ pub enum StreamWrite {
         pkt: RtpPacket,
         mid: Mid,
         rid: Option<Rid>,
+        ssrc: Ssrc,
         pt: Pt,
     },
     Audio {
         pkt: RtpPacket,
         mid: Mid,
+        ssrc: Ssrc,
         pt: Pt,
     },
 }
@@ -65,13 +68,26 @@ impl StreamWriter {
         }
     }
 
-    pub fn write_video_owned(&mut self, pkt: RtpPacket, mid: Mid, rid: Option<Rid>, pt: Pt) {
-        self.pending
-            .push_back(StreamWrite::Video { pkt, mid, rid, pt });
+    pub fn write_video_owned(
+        &mut self,
+        pkt: RtpPacket,
+        mid: Mid,
+        rid: Option<Rid>,
+        ssrc: Ssrc,
+        pt: Pt,
+    ) {
+        self.pending.push_back(StreamWrite::Video {
+            pkt,
+            mid,
+            rid,
+            ssrc,
+            pt,
+        });
     }
 
-    pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, pt: Pt) {
-        self.pending.push_back(StreamWrite::Audio { pkt, mid, pt });
+    pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, ssrc: Ssrc, pt: Pt) {
+        self.pending
+            .push_back(StreamWrite::Audio { pkt, mid, ssrc, pt });
     }
 
     pub fn pop(&mut self) -> Option<StreamWrite> {

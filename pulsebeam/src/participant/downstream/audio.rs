@@ -72,6 +72,14 @@ impl AudioAllocator {
         self.slots.iter().flatten().any(|slot| slot.mid == mid)
     }
 
+    pub fn refresh_ssrc(&mut self, mid: Mid, ssrc: Ssrc) -> bool {
+        let Some(slot) = self.slots.iter_mut().flatten().find(|slot| slot.mid == mid) else {
+            return false;
+        };
+        slot.ssrc = ssrc;
+        true
+    }
+
     pub fn on_rtp(
         &mut self,
         slot_idx: AudioSelectorSlotId,
@@ -103,7 +111,7 @@ impl AudioAllocator {
             pkt.marker = true;
             slot.pending_marker = false;
         }
-        writer.write_audio_owned(pkt, slot.mid, slot.pt);
+        writer.write_audio_owned(pkt, slot.mid, slot.ssrc, slot.pt);
         Some(())
     }
 }
