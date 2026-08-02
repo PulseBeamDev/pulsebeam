@@ -62,7 +62,16 @@ impl BweFilter {
         }
     }
 
+    /// Advance the filter without new data, letting it decay toward its own value.
+    ///
+    /// Deliberately a no-op before the first `update`: `update`'s uninitialised path snaps the
+    /// filter to whatever it is handed and stamps `last_update`. Ticking first would stamp it
+    /// with the *seed* value, so the first real estimate would then be blended in from the seed
+    /// rather than adopted outright - a 2 Mbps link reads as ~360 kbps and takes seconds to climb.
     fn tick(&mut self, now: Instant) {
+        if self.last_update.is_none() {
+            return;
+        }
         self.update(now, self.current());
     }
 
