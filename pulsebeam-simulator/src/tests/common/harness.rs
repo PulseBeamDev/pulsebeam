@@ -1866,7 +1866,14 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
         .unwrap_or_default();
 
     let mut out = String::new();
+    let fixed = pulsebeam_runtime::net::shaper::capacity_is_fixed(ip);
     match capacity {
+        // Utilisation needs a capacity that held for the window. On a schedule the instantaneous
+        // value is the wrong denominator and produces nonsense - a ramp ending at 700 kbps whose
+        // window averaged ~1.6 Mbps reported 137% - so report the rate and omit the ratio.
+        Some(c) if !fixed => out.push_str(&format!(
+            "capacity {c} bps (scheduled) | received {received} B"
+        )),
         Some(c) => {
             let deliverable = c as f64 * window.as_secs_f64() / 8.0;
             out.push_str(&format!(
