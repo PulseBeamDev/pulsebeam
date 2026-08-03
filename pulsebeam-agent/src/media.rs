@@ -189,6 +189,19 @@ pub struct VbrProfile {
     /// captured from a real screen share still has a frame every second or two, which never
     /// reaches that regime.
     pub loop_idle: Duration,
+    /// Multiplier on every frame's size, leaving its timing alone.
+    ///
+    /// The fixture is one capture at one bitrate, but the client configures screen share and
+    /// camera at quite different rates - 2.5 Mbps against 1.25 - and the difference matters:
+    /// allocation decisions turn on what a layer *costs*, so a source at half the real rate
+    /// cannot reach the states production reaches.
+    ///
+    /// Scaling the payload rather than re-encoding is sound because nothing under test decodes
+    /// it. The SFU forwards opaque bytes and measures their size and arrival time, which is
+    /// exactly what is being scaled. What it preserves is the part that would be hard to
+    /// synthesise: the real cadence of a desktop being used, including the ragged distribution of
+    /// frame sizes within a burst.
+    pub bitrate_scale: f64,
 }
 
 impl VbrProfile {
@@ -205,6 +218,27 @@ impl VbrProfile {
             // Small enough to land in a single sub-MTU RTP packet, as a near-empty P-frame does.
             idle_max_frame_bytes: 300,
             loop_idle: Duration::from_millis(500),
+            bitrate_scale: 1.0,
+        }
+    }
+
+    /// Screen sharing as the client actually configures it: a single 2.5 Mbps layer.
+    ///
+    /// `VIDEO_PRESETS.detail` in the client is `layers: 1, baseBitrate: 2_500_000` - the full
+    /// ladder is negotiated but only `f` is ever sent, because resolution is worth more than
+    /// adaptability for screen content. Two consequences the other profiles do not reproduce:
+    ///
+    /// * It costs 2.5 Mbps, twice the camera's top layer. Where the two nearly fill the estimate,
+    ///   the allocator's choice between them is finely balanced - which is the regime where
+    ///   pricing bugs surface.
+    /// * With one live layer there is nothing to fall back to, so it pauses outright instead of
+    ///   degrading. A viewer sees the share vanish rather than soften.
+    pub fn screenshare_detail() -> Self {
+        Self {
+            // 15fps cap, per the client's detail preset.
+            active_fps: 15,
+            bitrate_scale: 2.0,
+            ..Self::screenshare()
         }
     }
 
@@ -220,6 +254,27 @@ impl VbrProfile {
             ..Self::screenshare()
         }
     }
+}
+
+/// Resize a frame to `scale` times its captured size, preserving its timing.
+///
+/// Padding with zeroes rather than re-encoding: nothing under test decodes the payload, so what
+/// matters is that a layer costs what the client configures it to cost. Shrinking truncates,
+/// which keeps the relative sizes within a burst intact - the ragged distribution that decides
+/// what a probe finds in the RTX cache.
+fn scale_frame(frame: &Arc<[u8]>, scale: f64) -> Arc<[u8]> {
+    if (scale - 1.0).abs() < f64::EPSILON {
+        return Arc::clone(frame);
+    }
+    let target = ((frame.len() as f64) * scale).round() as usize;
+    let mut out = Vec::with_capacity(target);
+    if target <= frame.len() {
+        out.extend_from_slice(&frame[..target]);
+    } else {
+        out.extend_from_slice(frame);
+        out.resize(target, 0);
+    }
+    Arc::from(out)
 }
 
 /// An [`H264Looper`] whose output follows a [`VbrProfile`], approximating a VBR encoder.
@@ -331,7 +386,7 @@ impl VbrLooper {
                     ts: MediaTime::from_90khz(
                         (now.duration_since(start).as_secs_f64() * clock_rate) as u64,
                     ),
-                    data: self.asset.frames[index].clone(),
+                    data: scale_frame(&self.asset.frames[index], self.profile.bitrate_scale),
                     capture_time: now,
                     abs_capture_time: Some(crate::clock::capture_wallclock()),
                     contiguous: true,

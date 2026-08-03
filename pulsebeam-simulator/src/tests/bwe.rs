@@ -1227,9 +1227,13 @@ fn estimate_survives_an_oscillating_lossy_link_test() {
 ///
 /// # The invariant
 ///
-/// While the source is still, the sender is *application limited*: it is sending ~140 kbps
-/// because that is all a static screen share produces, not because the link is full. The link
-/// here carries 3 Mbps and drops nothing. An estimate that falls under those conditions is
+/// While the source is still, the sender is *application limited*: it is sending a fraction of
+/// its layer rate because that is all a static screen share produces, not because the link is
+/// full. The link carries 6 Mbps against a 2.5 Mbps layer and drops nothing.
+///
+/// The headroom is deliberate and had to be raised once the share was modelled at the rate the
+/// client actually configures. At 2.5 Mbps on a 3 Mbps link the plan was running at 83%
+/// utilisation, where backing off is legitimate and the claim below would be unfair. An estimate that falls under those conditions is
 /// reporting the source's activity, not the network's capacity, and the two are unrelated.
 ///
 /// # Why it fails today
@@ -1247,7 +1251,7 @@ fn estimate_survives_an_oscillating_lossy_link_test() {
 #[test]
 fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
     LocalNodeSim::new()
-        .with_bandwidth(3_000_000)
+        .with_bandwidth(6_000_000)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))

@@ -6,7 +6,7 @@ use crate::tests::common::{
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,9 +117,21 @@ impl Participant {
     /// A publisher whose content is screen sharing: strongly variable bitrate, long static
     /// stretches. This is the case that exercises str0m's probe controller, because the sender
     /// sits in ALR whenever the screen is still.
+    /// A screen share configured the way the client configures one.
+    ///
+    /// `VIDEO_PRESETS.detail`: a single 2.5 Mbps layer. The full ladder is negotiated but only
+    /// `f` is sent, so there is no rung to fall back to and the stream pauses outright rather
+    /// than degrading.
+    ///
+    /// The rate is what makes this worth modelling separately from a camera. At 2.5 Mbps it costs
+    /// twice the camera's top layer, so a viewer watching both sits close to the edge of most
+    /// links - and that is the regime where allocation decisions are finely balanced. Every
+    /// simulated publisher previously topped out at 1.25 Mbps, which put that regime out of
+    /// reach: a production flap between the two streams was invisible here for want of a source
+    /// that cost what the real one costs.
     pub fn screensharer(name: &'static str) -> Self {
         Self {
-            vbr: Some(VbrProfile::screenshare()),
+            vbr: Some(VbrProfile::screenshare_detail()),
             ..Self::publisher(name, &["f"])
         }
     }
@@ -1706,6 +1718,16 @@ async fn execute_plan(
     //
     // Sorted by name: `handles` is a HashMap, and unordered output would make two runs diff
     // against each other for no reason.
+    // Forwarded quality is recorded against the publisher's participant id, so resolve those
+    // back to plan names once rather than per report.
+    let quality_by_publisher: BTreeMap<&'static str, u8> = handles
+        .iter()
+        .filter_map(|(name, handle)| {
+            let id = handle.participant_id()?;
+            Some((*name, pulsebeam::sim_metrics::forwarded_quality(&id)?))
+        })
+        .collect();
+
     let mut names: Vec<_> = handles.keys().copied().collect();
     names.sort_unstable();
     for name in names {
@@ -1720,10 +1742,12 @@ async fn execute_plan(
             "[scoreboard] {name}: {}",
             report_metrics(handle, ip, window)
         );
+        let mut report = measure(handle, ip, window);
+        report.forwarded_quality = quality_by_publisher.clone();
         reports
             .lock()
             .expect("reports poisoned")
-            .insert(name, measure(handle, ip, window));
+            .insert(name, report);
     }
 
     // Signal all participants to stop.
@@ -1916,6 +1940,13 @@ pub struct LinkReport {
     pub delivered_packets: u64,
     pub congestion_drops: u64,
     pub link_loss_drops: u64,
+    /// Layer last forwarded from each publisher, by participant name. 0 means paused.
+    ///
+    /// Keyed by the *publisher* rather than folded into the link's numbers, because contention is
+    /// a claim about how several streams fared against each other. A viewer receiving plenty of
+    /// bytes tells you nothing about whether one of its two streams was starved to pay for the
+    /// other.
+    pub forwarded_quality: BTreeMap<&'static str, u8>,
 }
 
 impl LinkReport {
@@ -1988,6 +2019,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
+        forwarded_quality: BTreeMap::new(),
     }
 }
 
@@ -2386,6 +2418,7 @@ pub struct LocalNodeSim {
     rooms: Vec<Room>,
     tick_duration: Duration,
     rng_seed: u64,
+    subnet: Option<u8>,
     tcp_only: bool,
     num_shards: usize,
     link: LinkProfile,
@@ -2403,6 +2436,7 @@ impl LocalNodeSim {
             rooms: Vec::new(),
             tick_duration: Duration::from_millis(1),
             rng_seed: 0xDEAD_BEEF,
+            subnet: None,
             tcp_only: false,
             num_shards: 1,
             link: LinkProfile::default(),
@@ -2423,6 +2457,23 @@ impl LocalNodeSim {
 
     pub fn with_room(mut self, r: Room) -> Self {
         self.rooms.push(r);
+        self
+    }
+
+    /// Pin the subnet this plan runs on, rather than taking the next one available.
+    ///
+    /// Addresses are otherwise handed out by a process-wide counter, so a plan's IPs depend on
+    /// how many plans ran before it. That is harmless when every plan is its own process, and
+    /// quietly destroys reproducibility when they are not: proptest runs all of its cases in one
+    /// process, draws a different sample each run, and so the *same* scenario lands on different
+    /// addresses depending on where in the sample it fell. A case that failed then passed on
+    /// replay, which is the one thing a randomised suite may not do.
+    ///
+    /// Callers deriving this from their input get addresses fixed by the scenario itself. Only
+    /// safe because plans within a process run one at a time; two concurrent plans on one subnet
+    /// would share a network.
+    pub fn with_subnet(mut self, subnet: u8) -> Self {
+        self.subnet = Some(1 + (subnet % 200));
         self
     }
 
@@ -2491,7 +2542,7 @@ impl LocalNodeSim {
             .rng_seed(self.rng_seed)
             .build();
 
-        let subnet = reserve_subnet();
+        let subnet = self.subnet.unwrap_or_else(reserve_subnet);
         let server_ip = subnet_ip(subnet, 1);
         let coordinator_ip = subnet_ip(subnet, 254);
         let seed = self.rng_seed;
