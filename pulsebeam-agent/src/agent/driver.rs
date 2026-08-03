@@ -26,6 +26,10 @@ use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{Direction, MediaAdded, MediaKind, Mid, Rid};
 use str0m::rtp::AbsCaptureTime;
+use str0m::rtp::vla::{
+    ResolutionAndFramerate, SimulcastStreamAllocation, SpatialLayerAllocation,
+    TemporalLayerAllocation, VideoLayersAllocation,
+};
 use str0m::{
     Event, Input, Output, Rtc,
     net::{Protocol, Receive},
@@ -715,6 +719,12 @@ impl AgentDriver {
                             clock_offset: None,
                         });
                     }
+                    // Declare the encoder's target so the SFU allocates against it rather than
+                    // inferring cost from bytes on the wire, which for screen content is a far
+                    // more variable signal (near zero while static, full rate on a scroll).
+                    if let Some(target_bps) = e.frame.target_bitrate_bps {
+                        writer = writer.user_extension_value(vla_for(target_bps, e.frame.resolution));
+                    }
                     let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
                 }
             }
@@ -1167,5 +1177,26 @@ mod tests {
         assert!(slot.accepts(screen));
         assert!(!slot.deactivate(camera));
         assert!(slot.accepts(screen));
+    }
+}
+
+/// A single-stream Video Layers Allocation declaring one layer's target bitrate.
+fn vla_for(target_bps: u64, resolution: Option<(u16, u16, u8)>) -> VideoLayersAllocation {
+    VideoLayersAllocation {
+        current_simulcast_stream_index: 0,
+        simulcast_streams: vec![SimulcastStreamAllocation {
+            spatial_layers: vec![SpatialLayerAllocation {
+                temporal_layers: vec![TemporalLayerAllocation {
+                    cumulative_kbps: target_bps / 1000,
+                }],
+                resolution_and_framerate: resolution.map(|(width, height, framerate)| {
+                    ResolutionAndFramerate {
+                        width,
+                        height,
+                        framerate,
+                    }
+                }),
+            }],
+        }],
     }
 }

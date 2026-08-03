@@ -134,6 +134,13 @@ impl AgentBuilder {
                 rtp_extensions::ABS_CAPTURE_TIME,
                 str0m::rtp::Extension::AbsoluteCaptureTime,
             )
+            .set_extension(
+                rtp_extensions::VIDEO_LAYERS_ALLOCATION,
+                str0m::rtp::Extension::with_serializer(
+                    str0m::rtp::vla::URI,
+                    str0m::rtp::vla::Serializer,
+                ),
+            )
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
