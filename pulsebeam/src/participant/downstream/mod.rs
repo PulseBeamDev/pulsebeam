@@ -41,6 +41,14 @@ impl Default for SlotConfig {
     }
 }
 
+/// How long everything may stay paused before the estimate is treated as unrecoverable.
+///
+/// Long enough to sit out the transients around a subscription change or renegotiation, short
+/// enough that a viewer does not watch a frozen stream for long. The condition it guards is
+/// absolute - *nothing* forwarded while something is wanted - so this is not trading off against
+/// ordinary congestion, only against churn.
+const STARVATION_TIMEOUT: Duration = Duration::from_secs(3);
+
 const BWE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
 const BWE_FALL_TIME_CONSTANT: Duration = Duration::from_millis(800);
 
@@ -62,7 +70,16 @@ impl BweFilter {
         }
     }
 
+    /// Advance the filter without new data, letting it decay toward its own value.
+    ///
+    /// Deliberately a no-op before the first `update`: `update`'s uninitialised path snaps the
+    /// filter to whatever it is handed and stamps `last_update`. Ticking first would stamp it
+    /// with the *seed* value, so the first real estimate would then be blended in from the seed
+    /// rather than adopted outright - a 2 Mbps link reads as ~360 kbps and takes seconds to climb.
     fn tick(&mut self, now: Instant) {
+        if self.last_update.is_none() {
+            return;
+        }
         self.update(now, self.current());
     }
 
@@ -105,6 +122,9 @@ pub struct DownstreamAllocator {
     available_bandwidth: BweFilter,
     last_desired: Bitrate,
 
+    /// When every slot was first found paused while demand existed, if it currently is.
+    starved_since: Option<Instant>,
+
     playout_delay: Option<(MediaTime, MediaTime)>,
     playout_delay_pending: bool,
     playout_delay_confirm: Option<PlayoutDelayConfirm>,
@@ -119,6 +139,7 @@ impl DownstreamAllocator {
 
             available_bandwidth: BweFilter::new(MIN_BANDWIDTH),
             last_desired: video::MIN_BANDWIDTH,
+            starved_since: None,
             playout_delay: None,
             playout_delay_pending: false,
             playout_delay_confirm: None,
@@ -239,12 +260,71 @@ impl DownstreamAllocator {
         let (desired, assignments_changed) = self
             .video
             .update_allocations(self.available_bandwidth.current());
-        bwe.set_current_bitrate(self.video.current_allocation());
+        let allocated = self.video.current_allocation();
+        bwe.set_current_bitrate(allocated);
         if self.last_desired != desired {
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;
         }
+        self.break_allocation_deadlock(now, desired, allocated, bwe);
         assignments_changed
+    }
+
+    /// Escape the state where nothing is forwarded and nothing can change that.
+    ///
+    /// Congestion control is a feedback loop and it has one failure mode that is not
+    /// self-correcting. If every slot is paused the connection carries no media; with no media
+    /// there is no transport feedback; with no feedback the estimate cannot move. It is then
+    /// pinned at whatever value caused the pause, which is by definition too low to un-pause
+    /// anything. Nothing in the loop can break it, because the loop is open.
+    ///
+    /// Observed exactly so: a still screen share over an idle 3 Mbps link that dropped nothing
+    /// and held 15ms of queue. The estimate fell to 864 kbps against ~1.4 Mbps of demand, the
+    /// single-layer share had no lower rung to fall to, and the viewer then received *zero* bytes
+    /// for the remaining 60s with the estimate frozen to the sample. In production this is the
+    /// screen share that never comes back until the subscription is touched.
+    ///
+    /// Resetting the estimate restores the loop: the allocator can afford a layer again, media
+    /// flows, feedback resumes, and the estimate is re-measured against the real link within a
+    /// second or two. If the link genuinely cannot carry it, the ordinary machinery observes that
+    /// and backs off - which it can only do once there is traffic to observe.
+    ///
+    /// Deliberately conservative about when. Requiring *nothing at all* forwarded while demand
+    /// exists means this cannot fire during ordinary congestion: a connection still carrying its
+    /// lowest layer has feedback and is not stuck. The dwell time keeps it away from the
+    /// transients around subscription changes and renegotiation.
+    fn break_allocation_deadlock(
+        &mut self,
+        now: Instant,
+        desired: Bitrate,
+        allocated: Bitrate,
+        bwe: &mut Bwe,
+    ) {
+        let starved = desired > Bitrate::ZERO && allocated == Bitrate::ZERO;
+        if !starved {
+            self.starved_since = None;
+            return;
+        }
+
+        let since = *self.starved_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < STARVATION_TIMEOUT {
+            return;
+        }
+        // Re-arm rather than clear: if the reset does not take, this retries on the same cadence
+        // instead of firing every pass.
+        self.starved_since = Some(now);
+
+        // Reset to what the application actually wants. Being briefly optimistic is recoverable -
+        // the ordinary response measures the link and corrects within a second - whereas staying
+        // stalled is not recoverable at all.
+        bwe.reset(desired);
+        self.available_bandwidth = BweFilter::new(desired);
+
+        tracing::warn!(
+            %desired,
+            "downstream starved with nothing forwarded; resetting the bandwidth estimate to \
+             restore feedback"
+        );
     }
 
     pub fn reconcile_routes(&mut self, now: Instant, events: &mut impl ParticipantSink) {
