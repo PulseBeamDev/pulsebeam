@@ -48,6 +48,14 @@ struct Samples {
     forwarded_quality: HashMap<String, u8>,
     /// Highest forwarded quality observed for each track origin since the last reset.
     max_forwarded_quality: HashMap<String, u8>,
+    /// How many times each origin's forwarded layer changed since the last reset.
+    ///
+    /// Switching layer is not free: the receiver needs a keyframe and the picture stutters. A
+    /// stream that changes several times a second never settles into a decodable run at all, so
+    /// the viewer sees nothing rather than something imperfect - which is how this presents in
+    /// production, and why counting the changes catches it where checking the final layer does
+    /// not. A settled stream changes a handful of times over a minute.
+    quality_changes: HashMap<String, u64>,
     /// Every downstream estimate as `(elapsed, estimate_bps, desired_bps)`, keyed by the
     /// *subscriber's* participant id.
     ///
@@ -134,6 +142,12 @@ pub fn forwarded_media_bytes(subscriber: &str) -> u64 {
 pub fn record_forwarded_quality(origin: &str, quality: Option<u8>) {
     let rank = quality.unwrap_or(0);
     SAMPLES.with_borrow_mut(|s| {
+        // Count transitions, not passes: this is called every pass, changed or not.
+        if let Some(previous) = s.forwarded_quality.get(origin)
+            && *previous != rank
+        {
+            *s.quality_changes.entry(origin.to_string()).or_default() += 1;
+        }
         s.forwarded_quality.insert(origin.to_string(), rank);
         s.max_forwarded_quality
             .entry(origin.to_string())
@@ -147,6 +161,11 @@ pub fn record_forwarded_quality(origin: &str, quality: Option<u8>) {
 /// paused.
 pub fn forwarded_quality(origin: &str) -> Option<u8> {
     SAMPLES.with_borrow(|s| s.forwarded_quality.get(origin).copied())
+}
+
+/// How many times `origin`'s forwarded layer changed since [`reset`].
+pub fn quality_changes(origin: &str) -> u64 {
+    SAMPLES.with_borrow(|s| s.quality_changes.get(origin).copied().unwrap_or(0))
 }
 
 /// Highest forwarded quality rank observed for `origin` since [`reset`]. `None` means no

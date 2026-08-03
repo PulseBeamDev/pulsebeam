@@ -40,6 +40,10 @@ struct Scenario {
     /// Height the viewer asks for, which decides how far up the ladder demand goes.
     target_height: u32,
     settle_secs: u64,
+    /// Whether a second publisher competes for the same viewer's link. Contention is a different
+    /// axis from link quality: a controller can be perfectly well behaved about capacity and
+    /// still let one stream starve to pay for another.
+    contended: bool,
     /// Faults layered on top of the link. Generated together rather than one at a time: real
     /// paths present them at once, and the combinations are where a controller tuned against
     /// each in isolation comes apart.
@@ -72,19 +76,23 @@ impl Scenario {
             0usize..3,
             30u64..70,
             0usize..4,
+            any::<bool>(),
         )
             .prop_map(
-                |(capacity_bps, screenshare, height_idx, settle_secs, fault_idx)| Scenario {
-                    capacity_bps,
-                    screenshare,
-                    target_height: [180, 360, 720][height_idx],
-                    settle_secs,
-                    fault: [
-                        Fault::None,
-                        Fault::BurstLoss,
-                        Fault::Reordering,
-                        Fault::Outage,
-                    ][fault_idx],
+                |(capacity_bps, screenshare, height_idx, settle_secs, fault_idx, contended)| {
+                    Scenario {
+                        capacity_bps,
+                        screenshare,
+                        target_height: [180, 360, 720][height_idx],
+                        settle_secs,
+                        contended,
+                        fault: [
+                            Fault::None,
+                            Fault::BurstLoss,
+                            Fault::Reordering,
+                            Fault::Outage,
+                        ][fault_idx],
+                    }
                 },
             )
     }
@@ -131,16 +139,44 @@ impl Scenario {
         }
     }
 
+    /// Like [`Scenario::healthy`] but always with a competing stream, for claims about
+    /// contention specifically.
+    fn contended() -> impl Strategy<Value = Scenario> {
+        Self::healthy().prop_map(|s| Scenario {
+            contended: true,
+            ..s
+        })
+    }
+
+    /// A subnet derived from the scenario, so identical scenarios get identical addresses.
+    fn subnet(&self) -> u8 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.capacity_bps.hash(&mut hasher);
+        self.screenshare.hash(&mut hasher);
+        self.target_height.hash(&mut hasher);
+        self.settle_secs.hash(&mut hasher);
+        self.contended.hash(&mut hasher);
+        format!("{:?}", self.fault).hash(&mut hasher);
+        (hasher.finish() % 200) as u8
+    }
+
     fn run(&self) -> LinkReport {
         let publisher = if self.screenshare {
             Participant::screensharer("publisher")
         } else {
             Participant::publisher("publisher", &["q", "h", "f"])
         };
-        let targets: &'static [(&'static str, u32)] = match self.target_height {
-            180 => &[("publisher", 180)],
-            360 => &[("publisher", 360)],
-            _ => &[("publisher", 720)],
+        // The co-tenant is always asked for at its lowest rung. The claim being set up is that a
+        // stream wanting very little is not starved outright, which is a far weaker thing to ask
+        // than that both get what they want.
+        let targets: &'static [(&'static str, u32)] = match (self.target_height, self.contended) {
+            (180, false) => &[("publisher", 180)],
+            (360, false) => &[("publisher", 360)],
+            (_, false) => &[("publisher", 720)],
+            (180, true) => &[("publisher", 180), ("cotenant", 180)],
+            (360, true) => &[("publisher", 360), ("cotenant", 180)],
+            (_, true) => &[("publisher", 720), ("cotenant", 180)],
         };
 
         let mut plan = vec![
@@ -166,13 +202,17 @@ impl Scenario {
             duration: Duration::from_secs(30),
         });
 
+        let mut room = Room::new("room1").with_participant(publisher);
+        if self.contended {
+            room = room.with_participant(Participant::publisher("cotenant", &["q", "h", "f"]));
+        }
+        let slots = if self.contended { 2 } else { 1 };
         let reports = LocalNodeSim::new()
+            // Addresses fixed by the scenario, so a replay of a recorded failure runs the same
+            // network it originally did rather than whichever one its position happened to give.
+            .with_subnet(self.subnet())
             .with_bandwidth(self.capacity_bps)
-            .with_room(
-                Room::new("room1")
-                    .with_participant(publisher)
-                    .with_participant(Participant::multi_subscriber("viewer", 1)),
-            )
+            .with_room(room.with_participant(Participant::multi_subscriber("viewer", slots)))
             .run_collecting(plan);
         reports
             .get("viewer")
@@ -270,6 +310,39 @@ proptest! {
             report.congestion_drops,
             report.delivered_packets + report.congestion_drops,
             report.max_backlog,
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// A stream asking for the least the ladder offers must not be starved to pay for another.
+    ///
+    /// The production report was "the allocator doesn't think there is enough for the camera",
+    /// with the camera paused while a screen share ran. The generator makes the co-tenant ask for
+    /// the bottom rung only - 150 kbps against links from 2 Mbps up - so there is no capacity
+    /// argument available: a stream left paused here was not priced out, it was overlooked.
+    ///
+    /// Stated as "not paused" rather than "gets its fair share". What fairness means between a
+    /// screen share and a camera is a policy question with defensible answers either way; being
+    /// dropped entirely is not one of them.
+    #[test]
+    fn a_cheap_co_tenant_is_not_starved(scenario in Scenario::contended()) {
+        let report = scenario.run();
+        prop_assume!(report.samples > 0 && report.received_bytes > 0);
+
+        let quality = report.forwarded_quality.get("cotenant").copied();
+        prop_assert!(
+            quality.is_some_and(|q| q > 0),
+            "the co-tenant was left at {quality:?} (0 = paused) while sharing a {} bps link, \
+             where its bottom layer costs 150 kbps. The other stream ended at {:?}. \
+             ({scenario:?}, estimate {} bps, demand {} bps, {:.2}% congestion loss)",
+            scenario.capacity_bps,
+            report.forwarded_quality.get("publisher"),
+            report.estimate_last_bps,
+            report.demand_last_bps,
+            report.congestion_loss_percent(),
         );
     }
 }

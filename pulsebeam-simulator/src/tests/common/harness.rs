@@ -1094,7 +1094,7 @@ async fn execute_plan(
                 let handle = handles.get(participant).ok_or_else(|| {
                     anyhow::anyhow!("step \"{description}\": unknown participant {participant}")
                 })?;
-                if let Err(reason) = check_property(property, handle, ip, window) {
+                if let Err(reason) = check_property(property, handle, ip, window, handles) {
                     // Print the full picture alongside the failure: the one number that broke
                     // rarely explains why on its own.
                     tracing::error!("  context: {}", report_metrics(handle, ip, window));
@@ -1728,6 +1728,14 @@ async fn execute_plan(
         })
         .collect();
 
+    let changes_by_publisher: BTreeMap<&'static str, u64> = handles
+        .iter()
+        .filter_map(|(name, handle)| {
+            let id = handle.participant_id()?;
+            Some((*name, pulsebeam::sim_metrics::quality_changes(&id)))
+        })
+        .collect();
+
     let mut names: Vec<_> = handles.keys().copied().collect();
     names.sort_unstable();
     for name in names {
@@ -1744,6 +1752,7 @@ async fn execute_plan(
         );
         let mut report = measure(handle, ip, window);
         report.forwarded_quality = quality_by_publisher.clone();
+        report.quality_changes = changes_by_publisher.clone();
         reports
             .lock()
             .expect("reports poisoned")
@@ -1889,6 +1898,22 @@ pub enum Property {
     /// Congestion drops only, distinct from configured link loss: this is the controller
     /// overusing the link.
     CongestionLossBelow(u8),
+    /// A publisher's forwarded layer changed at most this many times per minute.
+    ///
+    /// The instability check, and the one the rest of this vocabulary cannot express. Every other
+    /// property here is an average or an endpoint, and a stream flipping between two layers many
+    /// times a second satisfies all of them: the final layer is right, the byte count is right,
+    /// the estimate is right. Only the *count of changes* shows it.
+    ///
+    /// It matters because switching is not free. Each change needs a keyframe and stutters the
+    /// picture, so a stream that never holds a layer long enough to decode a run of frames shows
+    /// the viewer nothing at all. That is how it presented in production - "the screen share
+    /// never appeared" - rather than as visibly poor quality.
+    ///
+    /// Named per minute because that is the scale a human judges it on. A settled stream changes
+    /// a handful of times a minute as conditions move; the production failure was doing it
+    /// several times a second.
+    QualityChangesPerMinuteBelow { origin: &'static str, max: u64 },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
@@ -1940,6 +1965,12 @@ pub struct LinkReport {
     pub delivered_packets: u64,
     pub congestion_drops: u64,
     pub link_loss_drops: u64,
+    /// How many times each publisher's forwarded layer changed during the window.
+    ///
+    /// The measure that catches instability. Every other figure here is an average or an
+    /// endpoint, and a stream flipping between two layers many times a second looks perfectly
+    /// healthy in all of them - right final layer, right byte count, right estimate.
+    pub quality_changes: BTreeMap<&'static str, u64>,
     /// Layer last forwarded from each publisher, by participant name. 0 means paused.
     ///
     /// Keyed by the *publisher* rather than folded into the link's numbers, because contention is
@@ -2020,6 +2051,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
         forwarded_quality: BTreeMap::new(),
+        quality_changes: BTreeMap::new(),
     }
 }
 
@@ -2117,6 +2149,7 @@ fn check_property(
     handle: &ParticipantHandle,
     ip: IpAddr,
     window: Duration,
+    handles: &HashMap<&'static str, ParticipantHandle>,
 ) -> Result<(), String> {
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
@@ -2299,6 +2332,26 @@ fn check_property(
                     "{got:.1}% of offered packets were dropped by a full buffer \
                      ({} of {offered}); expected below {max}%",
                     stats.dropped_overflow
+                ));
+            }
+        }
+        Property::QualityChangesPerMinuteBelow { origin, max } => {
+            // Resolved here rather than read off the report: the report's map is filled by the
+            // end-of-plan scoreboard, which has not run yet mid-plan.
+            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+                return Err(format!(
+                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
+                ));
+            };
+            let changes = pulsebeam::sim_metrics::quality_changes(&id);
+            let minutes = window.as_secs_f64() / 60.0;
+            if minutes <= 0.0 {
+                return Err("the window has no duration to rate-limit against".to_string());
+            }
+            let rate = changes as f64 / minutes;
+            if rate > max as f64 {
+                return Err(format!(
+                    "{origin}'s layer changed {changes} times in {window:?} ({rate:.0}/min);                      expected at most {max}/min. Each change costs a keyframe and stutters the                      picture, so at this rate the stream never holds a layer long enough to                      decode and the viewer sees nothing at all"
                 ));
             }
         }

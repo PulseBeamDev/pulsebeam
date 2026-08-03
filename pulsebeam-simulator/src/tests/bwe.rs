@@ -272,6 +272,25 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
                 origin: "screen",
                 min_quality: 3,
             },
+            // Stability, which none of the claims above can see: a stream flipping between two
+            // layers many times a second satisfies every one of them - right final layer, right
+            // byte count, right estimate - while showing the viewer nothing.
+            Step::Expect {
+                description: "The screen share holds a layer instead of flapping",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "screen",
+                    max: 30,
+                },
+            },
+            Step::Expect {
+                description: "The camera holds a layer instead of flapping",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "camera",
+                    max: 30,
+                },
+            },
         ]);
 }
 
@@ -1315,6 +1334,17 @@ fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
                 description: "Nothing about the link justified a drop",
                 participant: "viewer",
                 property: Property::CongestionLossBelow(1),
+            },
+            // Measured at 3 changes/min on a settled stream. The production failure ran to
+            // several a second, so this discriminates by two orders of magnitude rather than
+            // sitting on a boundary.
+            Step::Expect {
+                description: "The share holds a layer rather than flapping",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "presenter",
+                    max: 30,
+                },
             },
         ]);
 }

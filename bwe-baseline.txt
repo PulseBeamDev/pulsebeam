@@ -190,7 +190,7 @@ tests::subscriptions::slots_prioritization_test
   [PASS]
   pub1: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
   pub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  sub: capacity unshaped | received 1556075 B | estimate last 2967604 min 2314349 max 2967604 bps, worst drawdown 0.0%, 102 samples | demand last 1884960 min 1628035 max 2059648 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.5%
+  sub: capacity unshaped | received 1620680 B | estimate last 3109327 min 3011171 max 3109327 bps, worst drawdown 0.0%, 103 samples | demand last 1665940 min 1627275 max 1688697 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.1%
 
 tests::video::fast_initial_ramp_up_on_good_network_test
   [PASS]
