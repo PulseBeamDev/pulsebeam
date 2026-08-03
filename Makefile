@@ -31,8 +31,19 @@ test: test-unit test-sim
 test-unit:
 	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --
 
+# One plan per process, one at a time.
+#
+# Simulation is CPU-intensive, and load is itself a source of nondeterminism: plans sharing a
+# process share the shaper's registry and the clock guard, and plans running concurrently compete
+# for CPU. Both make a run depend on what else happened to be running. nextest gives each plan its
+# own process; --test-threads=1 keeps them from contending.
+#
+# Use `make test-sim-fast` while iterating, when reproducibility matters less than turnaround.
 test-sim:
-	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture $(TEST)
+	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-capture --test-threads 1 --no-fail-fast $(TEST)
+
+test-sim-fast:
+	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator $(TEST)
 
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all
