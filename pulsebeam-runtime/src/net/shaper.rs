@@ -347,6 +347,15 @@ impl Shaper {
         self.with(|st| st.queue.is_empty())
     }
 
+    /// When the next queued packet is due, if anything is queued.
+    ///
+    /// Lets the release loop sleep until exactly that moment instead of polling, which is what
+    /// makes the departure schedule faithful rather than quantised to whenever the caller
+    /// happened to look.
+    pub fn next_release(&self) -> Option<Instant> {
+        self.with(|st| st.queue.front().map(|q| q.release_at))
+    }
+
     /// Return whether the next datagram to `ip` should be dropped by the loss model.
     pub fn should_drop_packet(&mut self, ip: IpAddr) -> bool {
         let loss = loss_for(&ip);
@@ -496,9 +505,43 @@ mod tests {
         );
     }
 
+    /// A burst offered all at once must leave spread over the time the link needs to carry it.
+    ///
+    /// This is the property every probe measurement depends on: the receiver reads a probe's
+    /// rate from how far apart its packets arrive, so if a burst leaves faster than the link can
+    /// carry it, the estimate is of the shaper rather than of the link.
+    #[test]
+    fn a_burst_is_released_over_the_time_the_link_needs() {
+        // Note the unique IP and the absence of `clear()`: the registries are process-global and
+        // tests run in parallel, so clearing them is clearing somebody else's link.
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let dst = SocketAddr::new(ip, 1234);
+        // Buffer deep enough that nothing is dropped for arriving early.
+        set_downlink_with_backlog(ip, 3_000_000, Duration::from_secs(5));
+
+        let mut shaper = Shaper::default();
+        let start = Instant::now();
+        // 13 x 1054 B = 13702 B, which at 3 Mbps is 36.5ms of serialisation.
+        for _ in 0..13 {
+            shaper.offer(start, dst, &[0u8; 1054]);
+        }
+        let expected = Duration::from_secs_f64(13.0 * 1054.0 * 8.0 / 3_000_000.0);
+
+        let half = shaper.drain_due(start + expected / 2).len();
+        assert!(
+            half < 13,
+            "half the serialisation time released the whole burst ({half} packets); a probe \
+             measured against this would read the shaper, not the link"
+        );
+        shaper.drain_due(start + expected + Duration::from_millis(1));
+        assert!(
+            shaper.is_empty(),
+            "the burst should be fully released once its serialisation time has elapsed"
+        );
+    }
+
     #[test]
     fn overflow_is_recorded_separately_from_configured_loss() {
-        clear();
         let ip: IpAddr = "5.6.7.8".parse().unwrap();
         let dst = SocketAddr::new(ip, 1234);
         set_downlink_with_backlog(ip, 100_000, Duration::from_millis(50));
@@ -514,6 +557,5 @@ mod tests {
         assert!(s.delivered > 0, "some packets should be queued");
         assert!(s.dropped_overflow > 0, "the buffer should have overflowed");
         assert_eq!(s.dropped_loss, 0, "no loss model was configured");
-        clear();
     }
 }

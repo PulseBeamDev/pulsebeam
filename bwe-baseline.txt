@@ -5,8 +5,8 @@ tests::bwe::capped_subscription_is_not_over_served_test
 
 tests::bwe::estimate_follows_a_sliding_link_without_riding_the_queue_test
   [PASS]
-  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max <µs> | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
-  bob: capacity 700000 bps (scheduled) | received 1431419 B | estimate last 574083 min 574083 max 719484 bps, worst drawdown 20.2%, 303 samples | ends 18.0% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/1834) | link loss 0 | media 99.9%
+  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
+  bob: capacity 700000 bps (scheduled) | received 1438369 B | estimate last 739684 min 739684 max 807390 bps, worst drawdown 8.4%, 306 samples | ends 5.7% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/1843) | link loss 0 | media 99.4%
 
 tests::bwe::estimate_grows_to_fit_screenshare_and_camera_test
   [PASS]
@@ -16,8 +16,8 @@ tests::bwe::estimate_grows_to_fit_screenshare_and_camera_test
 
 tests::bwe::estimate_survives_an_oscillating_lossy_link_test
   [PASS]
-  alice: capacity 2500000 bps | utilisation 0.0% (0 B / ~18750000 B) | estimate: no allocation passes | queue max <µs> | congestion loss 0.00% (0/1280) | link loss 0 | media 0.0%
-  bob: capacity 803399 bps (scheduled) | received 2917005 B | estimate last 1055940 min 754419 max 1225529 bps, worst drawdown 32.7%, 638 samples | ends 31.4% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/3727) | link loss 8 | media 98.4%
+  alice: capacity 2500000 bps | utilisation 0.0% (0 B / ~18750000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1284) | link loss 0 | media 0.0%
+  bob: capacity 803399 bps (scheduled) | received 3768798 B | estimate last 1087053 min 956266 max 1652451 bps, worst drawdown 42.1%, 670 samples | ends 35.3% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 4.70% (221/4705) | link loss 5 | media 100.6%
 
 tests::bwe::height_request_rounds_up_the_ladder_test
   [PASS]
@@ -26,9 +26,9 @@ tests::bwe::height_request_rounds_up_the_ladder_test
 
 tests::bwe::high_priority_camera_reclaims_bandwidth_from_screenshare_test
   [PASS]
-  camera: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1321) | link loss 0 | media 0.0%
-  screen: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max <µs> | congestion loss 0.00% (0/261) | link loss 0 | media 0.0%
-  viewer: capacity 2750000 bps | utilisation 17.2% (3547929 B / ~20625000 B) | estimate last 1476663 min 753405 max 1974723 bps, worst drawdown 46.7%, 651 samples | ends 46.3% off capacity | 80% never | 90% never | queue max <ms> | congestion loss 0.00% (0/4597) | link loss 0 | media 97.2%
+  camera: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1294) | link loss 0 | media 0.0%
+  screen: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/221) | link loss 0 | media 0.0%
+  viewer: capacity 2750000 bps | utilisation 16.3% (3371652 B / ~20625000 B) | estimate last 1619710 min 778596 max 2203918 bps, worst drawdown 64.7%, 738 samples | ends 41.1% off capacity | 80% at 285ms | 90% never | queue max <ms> | congestion loss 0.00% (0/4340) | link loss 0 | media 97.1%
 
 tests::bwe::late_video_subscription_is_delivered_test
   [PASS]
@@ -67,13 +67,13 @@ tests::bwe::static_screenshare_does_not_poison_bandwidth_estimate_test
 
 tests::bwe::steady_subscription_is_mostly_media_test
   [PASS]
-  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue max <µs> | congestion loss 0.00% (0/1280) | link loss 0 | media 0.0%
-  bob: capacity 3000000 bps | utilisation 38.7% (8698626 B / ~22500000 B) | estimate last 1805306 min 1729168 max 2167566 bps, worst drawdown 16.7%, 621 samples | ends 39.8% off capacity | 80% never | 90% never | queue max <ms> | congestion loss 0.00% (0/8744) | link loss 0 | media 99.9%
+  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1280) | link loss 0 | media 0.0%
+  bob: capacity 3000000 bps | utilisation 38.7% (8712960 B / ~22500000 B) | estimate last 2935751 min 2739140 max 2978916 bps, worst drawdown 5.9%, 623 samples | ends 2.1% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/8762) | link loss 0 | media 99.8%
 
 tests::bwe::subscriber_reaches_top_layer_on_a_rate_limited_link_test
   [PASS]
-  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max <µs> | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
-  bob: capacity 3000000 bps | utilisation 38.9% (4376622 B / ~11250000 B) | estimate last 1729168 min 1729168 max 1746724 bps, worst drawdown 1.0%, 302 samples | ends 42.4% off capacity | 80% never | 90% never | queue max <ms> | congestion loss 0.00% (0/4381) | link loss 0 | media 100.0%
+  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
+  bob: capacity 3000000 bps | utilisation 39.0% (4389620 B / ~11250000 B) | estimate last 2855718 min 2739140 max 2881199 bps, worst drawdown 4.8%, 311 samples | ends 4.8% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/4395) | link loss 0 | media 99.7%
 
 tests::bwe::subscriber_reaches_top_layer_on_fast_link_test
   [PASS]
@@ -82,8 +82,8 @@ tests::bwe::subscriber_reaches_top_layer_on_fast_link_test
 
 tests::bwe::subscription_climbs_back_after_the_link_recovers_test
   [PASS]
-  alice: capacity 500000 bps | utilisation 0.0% (0 B / ~1875000 B) | estimate: no allocation passes | queue max 832µs | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
-  bob: capacity 3000000 bps | utilisation 39.5% (4441200 B / ~11250000 B) | estimate last 1889065 min 1785270 max 1923889 bps, worst drawdown 6.4%, 330 samples | ends 37.0% off capacity | 80% never | 90% never | queue max <ms> | congestion loss 0.00% (0/4466) | link loss 0 | media 99.6%
+  alice: capacity 500000 bps | utilisation 0.0% (0 B / ~1875000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
+  bob: capacity 3000000 bps | utilisation 38.9% (4379851 B / ~11250000 B) | estimate last 2843501 min 2798781 max 2929415 bps, worst drawdown 2.9%, 309 samples | ends 5.2% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/4399) | link loss 0 | media 99.8%
 
 tests::bwe::upgrade_after_long_low_quality_period_test
   [PASS]

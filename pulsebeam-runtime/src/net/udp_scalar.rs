@@ -59,12 +59,45 @@ pub fn from_socket(
         local_addr,
         arena: vec![0; CHUNK_SIZE].into_boxed_slice(),
     };
+    #[cfg(feature = "sim")]
+    let shaper = crate::net::shaper::Shaper::default();
+
+    // Release queued packets on their own schedule.
+    //
+    // Draining opportunistically - only when the caller next sends - ties departure times to how
+    // often the event loop happens to run, and everything already due then leaves back to back.
+    // That destroys the inter-packet spacing the receiver measures, which is the entire signal a
+    // probe carries: on a 3 Mbps link a 13712-byte burst was seen arriving in 16ms, which that
+    // link cannot physically do (36.6ms of serialisation), yielding a 6.3 Mbps estimate. Other
+    // probes stretched the same way and read low. Both directions of error come from here.
+    #[cfg(feature = "sim")]
+    {
+        let shaper = shaper.clone();
+        let sock = socket.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                match shaper.next_release() {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    // Nothing queued. Idle briefly rather than spin; a packet offered in the
+                    // meantime is picked up on the next pass.
+                    None => tokio::time::sleep(std::time::Duration::from_micros(200)).await,
+                }
+                let mut shaper = shaper.clone();
+                for (dst, buf) in shaper.drain_due(tokio::time::Instant::now()) {
+                    if !shaper.should_drop_packet(dst.ip()) {
+                        let _ = sock.try_send_to(&buf, dst);
+                    }
+                }
+            }
+        });
+    }
+
     let writer = UdpTransportWriter {
         sock: socket.clone(),
         local_addr,
         drop_count: 0,
         #[cfg(feature = "sim")]
-        shaper: Default::default(),
+        shaper,
     };
     Ok(UdpTransport { reader, writer })
 }
@@ -161,13 +194,8 @@ impl UdpTransportWriter {
         {
             use crate::net::shaper::Shaped;
             let now = tokio::time::Instant::now();
-            // Release anything whose turn has come before offering more, so the queue drains at
-            // the shaped rate rather than all at once.
-            for (dst, buf) in self.shaper.drain_due(now) {
-                if !self.shaper.should_drop_packet(dst.ip()) {
-                    let _ = self.sock.try_send_to(&buf, dst);
-                }
-            }
+            // Offer only. Release is the release task's job, so a packet's departure time is set
+            // by the link rather than by when this happens to be called next.
             if let Shaped::Absorbed = self.shaper.offer(now, batch.dst, batch.buf) {
                 return Ok(true);
             }
