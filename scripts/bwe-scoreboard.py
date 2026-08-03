@@ -26,6 +26,12 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCOREBOARD = re.compile(r"\[scoreboard\] (.*)")
 RESULT = re.compile(r"^\s+(PASS|FAIL|TRY \d+ FAIL) \[.*?\] \(\s*\d+/\d+\) \S+ (\S+)")
 
+# Randomised plans are excluded. They draw a fresh seed each run, so their numbers differ every
+# time by design - that is the point of them. Including them would make the baseline churn on
+# every run and drown the signal from the fixed matrix. Anything they find is captured in
+# proptest's own regressions file instead, and re-runs from there.
+EXPLORATORY = re.compile(r"tests::properties::")
+
 # Volatile fields: real durations that vary with host speed even when the simulation itself is
 # reproducible. Kept out of the baseline so the diff shows behaviour, not machine noise.
 ELAPSED = re.compile(r"\d+\.\d+(µs|ms|ns|s)")
@@ -45,6 +51,9 @@ def main() -> int:
             pending.append(m.group(1).strip())
         elif m := RESULT.match(line):
             outcome, name = m.group(1), m.group(2)
+            if EXPLORATORY.search(name):
+                pending = []
+                continue
             # nextest reports each result twice: once as it happens, once in the summary.
             blocks.setdefault(name, [f"  [{outcome}]"] + [f"  {p}" for p in pending])
             pending = []

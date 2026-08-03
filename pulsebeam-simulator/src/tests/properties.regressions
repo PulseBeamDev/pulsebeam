@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c427bf6d995e252348c7c4d225d9e22e22f7a4fed0612c96540d9ddb11da1642 # shrinks to scenario = Scenario { capacity_bps: 2907769, screenshare: true, target_height: 720, settle_secs: 50 }

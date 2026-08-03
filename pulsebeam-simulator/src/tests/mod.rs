@@ -2,6 +2,7 @@ pub mod bwe;
 pub mod common;
 pub mod connectivity;
 pub mod data_channel;
+pub mod properties;
 pub mod subscriptions;
 pub mod video;
 

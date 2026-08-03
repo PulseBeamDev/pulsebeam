@@ -979,6 +979,7 @@ async fn execute_plan(
     plan: Vec<Step>,
     handles: &mut HashMap<&'static str, ParticipantHandle>,
     name_to_ip: &HashMap<&'static str, IpAddr>,
+    reports: &Mutex<HashMap<&'static str, LinkReport>>,
 ) -> anyhow::Result<()> {
     let total = plan.len();
     // Duration of the most recent Run, so interval properties know what window they describe.
@@ -1696,6 +1697,10 @@ async fn execute_plan(
             "[scoreboard] {name}: {}",
             report_metrics(handle, ip, window)
         );
+        reports
+            .lock()
+            .expect("reports poisoned")
+            .insert(name, measure(handle, ip, window));
     }
 
     // Signal all participants to stop.
@@ -1815,6 +1820,18 @@ pub enum Property {
     EstimateStable { max_drop_percent: u8 },
     /// The estimate reached `percent` of capacity within `within` of the window starting.
     EstimateConverges { percent: u8, within: Duration },
+    /// The estimate ended within `of_peak_percent` of the highest value it reached.
+    ///
+    /// A dip is not by itself a defect. A bursty source moves the estimate around, and a
+    /// controller that never dips is one that is not responding to anything. What distinguishes
+    /// working from broken is whether it comes *back*: the production failure was not that the
+    /// estimate fell, it was that it fell and stayed there while the link was fine.
+    ///
+    /// Prefer this to [`Property::EstimateStable`] wherever the source is bursty. Bounding peak
+    /// drawdown there asserts something stronger than the system owes - and, being tuned to
+    /// whatever the current dip happens to be, is the kind of threshold that gets quietly relaxed
+    /// until it means nothing.
+    EstimateRecovers { of_peak_percent: u8 },
     /// Standing queue at the bottleneck stayed below this.
     ///
     /// Bufferbloat: a controller can hold a link perfectly full while parking hundreds of
@@ -1847,6 +1864,110 @@ fn pct(part: f64, whole: f64) -> f64 {
 }
 
 /// Everything measurable about one participant's link over the last window.
+/// Everything measured about one participant's link over a window.
+///
+/// Separate from its formatting on purpose. A property needs to *compute* over these numbers, and
+/// a randomised scenario needs to return them rather than assert inline, so the measurement has
+/// to exist as data. Rendering it for a human is a second, lesser job.
+#[derive(Clone, Debug)]
+pub struct LinkReport {
+    /// Configured capacity, and whether it held still for the window. Utilisation and the
+    /// capacity-relative figures are only meaningful when it did.
+    pub capacity_bps: Option<u64>,
+    pub capacity_fixed: bool,
+    pub window: Duration,
+    pub received_bytes: u64,
+    pub forwarded_media_bytes: u64,
+    /// Allocation passes recorded. Zero means the plan never exercised this participant, which a
+    /// caller must not confuse with healthy behaviour.
+    pub samples: usize,
+    pub estimate_last_bps: u64,
+    pub estimate_min_bps: u64,
+    pub estimate_max_bps: u64,
+    /// Largest fall from a running peak, as a percentage. The collapse measure.
+    pub worst_drawdown_percent: f64,
+    pub demand_last_bps: u64,
+    pub demand_min_bps: u64,
+    pub demand_max_bps: u64,
+    pub max_backlog: Duration,
+    pub delivered_packets: u64,
+    pub congestion_drops: u64,
+    pub link_loss_drops: u64,
+}
+
+impl LinkReport {
+    /// Delivered throughput as a percentage of what the link could have carried. `None` unless
+    /// the capacity held still, since otherwise there is no single denominator.
+    pub fn utilisation_percent(&self) -> Option<f64> {
+        let capacity = self.capacity_bps.filter(|_| self.capacity_fixed)?;
+        let deliverable = capacity as f64 * self.window.as_secs_f64() / 8.0;
+        Some(pct(self.received_bytes as f64, deliverable))
+    }
+
+    /// Congestion tail-drop as a percentage of packets offered to the bottleneck. Distinct from
+    /// configured link loss: this is the controller overusing the link.
+    pub fn congestion_loss_percent(&self) -> f64 {
+        let offered = self.delivered_packets + self.congestion_drops;
+        pct(self.congestion_drops as f64, offered as f64)
+    }
+
+    /// Media payload as a percentage of bytes received. Exceeds 100% under loss - see
+    /// [`Property::MediaEfficiencyAtLeast`].
+    pub fn media_percent(&self) -> f64 {
+        pct(
+            self.forwarded_media_bytes as f64,
+            self.received_bytes as f64,
+        )
+    }
+
+    /// What the controller ought to have found: the lesser of what was asked for and what the
+    /// link could give. The reference that stays meaningful in both regimes.
+    pub fn need_bps(&self) -> u64 {
+        self.demand_last_bps
+            .min(self.capacity_bps.unwrap_or(u64::MAX))
+    }
+}
+
+fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkReport {
+    let now = tokio::time::Instant::now();
+    let stats = pulsebeam_runtime::net::shaper::stats(ip);
+    let series = handle
+        .participant_id()
+        .map(|id| pulsebeam::sim_metrics::bwe_series(&id))
+        .unwrap_or_default();
+
+    let mut peak = 0.0f64;
+    let mut drawdown = 0.0f64;
+    for (_, bps, _) in &series {
+        peak = peak.max(*bps as f64);
+        if peak > 0.0 {
+            drawdown = drawdown.max((peak - *bps as f64) / peak * 100.0);
+        }
+    }
+
+    LinkReport {
+        capacity_bps: pulsebeam_runtime::net::shaper::capacity_at(ip, now),
+        capacity_fixed: pulsebeam_runtime::net::shaper::capacity_is_fixed(ip),
+        window,
+        received_bytes: handle
+            .rx_bytes()
+            .saturating_sub(handle.interval_rx_baseline),
+        forwarded_media_bytes: handle.forwarded_media(),
+        samples: series.len(),
+        estimate_last_bps: series.last().map(|s| s.1).unwrap_or(0),
+        estimate_min_bps: series.iter().map(|(_, b, _)| *b).min().unwrap_or(0),
+        estimate_max_bps: series.iter().map(|(_, b, _)| *b).max().unwrap_or(0),
+        worst_drawdown_percent: drawdown,
+        demand_last_bps: series.last().map(|s| s.2).unwrap_or(0),
+        demand_min_bps: series.iter().map(|(_, _, d)| *d).min().unwrap_or(0),
+        demand_max_bps: series.iter().map(|(_, _, d)| *d).max().unwrap_or(0),
+        max_backlog: stats.max_backlog,
+        delivered_packets: stats.delivered,
+        congestion_drops: stats.dropped_overflow,
+        link_loss_drops: stats.dropped_loss,
+    }
+}
+
 fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> String {
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
@@ -2059,6 +2180,30 @@ fn check_property(
                 return Err(format!(
                     "estimate fell {worst:.1}% ({worst_from:.0} -> {worst_to:.0} bps) at \
                      {worst_at:?} into the window; expected no drop over {max_drop_percent}%"
+                ));
+            }
+        }
+        Property::EstimateRecovers { of_peak_percent } => {
+            let received = handle
+                .rx_bytes()
+                .saturating_sub(handle.interval_rx_baseline);
+            if received == 0 {
+                return Err(
+                    "nothing was received, so a recovered estimate means nothing moved at all"
+                        .to_string(),
+                );
+            }
+            let series = series()?;
+            let last = series.last().expect("non-empty").1 as f64;
+            let peak = series.iter().map(|(_, b, _)| *b).max().unwrap_or(0) as f64;
+            if peak <= 0.0 {
+                return Err("the estimate never rose above zero".to_string());
+            }
+            let got = last / peak * 100.0;
+            if got + 0.5 < of_peak_percent as f64 {
+                return Err(format!(
+                    "estimate ended at {last:.0} bps against a peak of {peak:.0} ({got:.1}% of \
+                     it); expected to recover to within {of_peak_percent}%"
                 ));
             }
         }
@@ -2277,7 +2422,21 @@ impl LocalNodeSim {
         self
     }
 
+    /// Run a plan, asserting nothing and returning what each participant's link did.
+    ///
+    /// The entry point randomised scenarios use: a generated plan cannot carry hand-written
+    /// thresholds, so it has to hand back measurements for the property to judge. Also the only
+    /// way to express a claim *across* runs, since anything asserted inside the simulation is a
+    /// panic on a turmoil host.
+    pub fn run_collecting(self, plan: Vec<Step>) -> HashMap<&'static str, LinkReport> {
+        self.run_inner(plan)
+    }
+
     pub fn run(self, plan: Vec<Step>) {
+        self.run_inner(plan);
+    }
+
+    fn run_inner(self, plan: Vec<Step>) -> HashMap<&'static str, LinkReport> {
         // Determinism. Both must be in force for the whole plan: the clock so dependencies read
         // simulated rather than real time, the RNG so map iteration order and key generation
         // repeat. Seeded per plan and per thread, since `cargo test` gives each plan its own
@@ -2381,14 +2540,19 @@ impl LocalNodeSim {
             }
         }
 
+        let reports: Arc<Mutex<HashMap<&'static str, LinkReport>>> = Default::default();
+        let reports_inner = reports.clone();
         sim.client(coordinator_ip, async move {
             let mut handles = handles;
-            execute_plan(plan, &mut handles, &name_to_ip)
+            execute_plan(plan, &mut handles, &name_to_ip, &reports_inner)
                 .await
                 .map_err(Into::into)
         });
 
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);
         run_sim_or_timeout(&mut sim, wall_budget).expect("simulation failed");
+
+        let out = reports.lock().expect("reports poisoned").clone();
+        out
     }
 }
