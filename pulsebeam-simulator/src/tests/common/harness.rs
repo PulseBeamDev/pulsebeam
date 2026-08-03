@@ -2023,6 +2023,19 @@ fn check_property(
             }
         }
         Property::EstimateStable { max_drop_percent } => {
+            // A plan that delivered nothing satisfies "the estimate did not fall" for the worst
+            // possible reason: a frozen estimate never moves. Caught in practice - a plan whose
+            // publisher went dead reported a 0.0% drawdown over 600 samples having received 0
+            // bytes, and passed.
+            let received = handle
+                .rx_bytes()
+                .saturating_sub(handle.interval_rx_baseline);
+            if received == 0 {
+                return Err(
+                    "nothing was received, so a stable estimate means nothing moved at all"
+                        .to_string(),
+                );
+            }
             let series = series()?;
             let mut peak = 0.0f64;
             let mut worst = 0.0f64;

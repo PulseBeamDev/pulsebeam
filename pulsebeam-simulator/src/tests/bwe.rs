@@ -1217,3 +1217,96 @@ fn estimate_survives_an_oscillating_lossy_link_test() {
             },
         ]);
 }
+
+/// A still screen share on a healthy link must not talk the estimate down.
+///
+/// This is the production report, reduced to its smallest form: one publisher, one subscriber,
+/// one link, no bandwidth changes and no competing stream. Everything the older recovery plan
+/// used to reach this state - a co-tenant, a squeeze, a restore - turned out to be scaffolding
+/// around the actual failure rather than part of it.
+///
+/// # The invariant
+///
+/// While the source is still, the sender is *application limited*: it is sending ~140 kbps
+/// because that is all a static screen share produces, not because the link is full. The link
+/// here carries 3 Mbps and drops nothing. An estimate that falls under those conditions is
+/// reporting the source's activity, not the network's capacity, and the two are unrelated.
+///
+/// # Why it fails today
+///
+/// str0m's delay-based rate control backs off to `observed_bitrate * BETA` on a delay increase
+/// (`delay/rate_control.rs`, `decrease`). `observed_bitrate` is the acked rate, so under ALR the
+/// backoff lands on the application-limited rate:
+///
+///     estimate=2151619  DelayBasedLimited                in_alr=true
+///     estimate= 133499  DelayBasedLimitedDelayIncreased  in_alr=true
+///
+/// a 94% cut on an idle 3 Mbps link. Recovery is then additive at the 1 kbps floor in the same
+/// file, so it takes thousands of feedback batches to climb back - which is what the viewer
+/// experiences as a stream that never comes back.
+#[test]
+fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("presenter"))
+                .with_participant(Participant::multi_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Viewer asks for the screen share",
+                participant: "viewer",
+                targets: &[("presenter", 720)],
+            },
+            Step::Run {
+                description: "Warmup: let the estimate find the link",
+                duration: Duration::from_secs(40),
+            },
+            // The measurement window. The link does not change and the source stays still, so
+            // nothing here should move the estimate at all.
+            Step::Report {
+                description: "end of warmup",
+                participant: "viewer",
+            },
+            Step::Run {
+                description: "Sit still on an unchanging link",
+                duration: Duration::from_secs(60),
+            },
+            Step::Report {
+                description: "after warmup",
+                participant: "viewer",
+            },
+            // The user-visible consequence first, because it is what a viewer reports: the
+            // stream is simply gone. A single-layer screen share has no lower rung to fall to,
+            // so once the estimate drops under its cost the slot pauses outright.
+            Step::CheckForwardedQuality {
+                description: "The screen share is still being forwarded",
+                origin: "presenter",
+                min_quality: 3,
+            },
+            // The cause. Demand is ~1.4 Mbps and the link carries 3 Mbps, so the estimate has no
+            // business sitting below what was asked for.
+            Step::Expect {
+                description: "The estimate covers what the viewer asked for",
+                participant: "viewer",
+                property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+            Step::Expect {
+                description: "An idle source does not drag the estimate down",
+                participant: "viewer",
+                property: Property::EstimateStable {
+                    max_drop_percent: 25,
+                },
+            },
+            Step::Expect {
+                description: "Nothing about the link justified a drop",
+                participant: "viewer",
+                property: Property::CongestionLossBelow(1),
+            },
+        ]);
+}

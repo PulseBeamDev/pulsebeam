@@ -70,6 +70,9 @@ tests::bwe::steady_subscription_is_mostly_media_test
   alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1280) | link loss 0 | media 0.0%
   bob: capacity 3000000 bps | utilisation 38.7% (8712960 B / ~22500000 B) | estimate last 2935751 min 2739140 max 2978916 bps, worst drawdown 5.9%, 623 samples | demand last 1604940 min 1463275 max 1710763 bps | ends 2.1% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/8762) | link loss 0 | media 99.8%
 
+tests::bwe::still_screenshare_does_not_talk_down_a_healthy_link_test
+  [FAIL]
+
 tests::bwe::subscriber_reaches_top_layer_on_a_rate_limited_link_test
   [PASS]
   alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
