@@ -188,6 +188,21 @@ pub struct ParticipantCore {
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
     reliable_channels: ReliableChannels,
 
+    /// Attributes str0m's own logs to this participant, for the simulator only.
+    ///
+    /// str0m is a library and logs without any notion of which peer it is serving, so a trace
+    /// contains interleaved lines from every connection with nothing to tell them apart. That is
+    /// not a cosmetic problem: probe results were read off such a trace and attributed to the
+    /// wrong link, producing a confident and wrong diagnosis. A span makes the attribution part
+    /// of the record instead of an inference.
+    ///
+    /// Built once here rather than per call. Constructing a span allocates and records fields,
+    /// so doing it inside the poll loop is what makes this expensive; entering an existing one is
+    /// comparatively cheap. It is still `sim`-only, because on the packet path even that cost is
+    /// unwarranted for something only a human reading a trace benefits from.
+    #[cfg(feature = "sim")]
+    sim_span: tracing::Span,
+
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
     signaling: Signaling,
@@ -223,6 +238,12 @@ impl ParticipantCore {
             exited: false,
             #[cfg(debug_assertions)]
             egress_guard: crate::rtp::egress_guard::EgressGuard::new(),
+            #[cfg(feature = "sim")]
+            sim_span: tracing::info_span!(
+                "peer",
+                participant_id = %cfg.participant_id,
+                room_id = %cfg.room_id
+            ),
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             rtc,
@@ -604,6 +625,11 @@ impl ParticipantCore {
         // str0m derives Sender Report and TWCC timing from this instant, so it
         // must be when the packet is handed over — not when it arrived. A switch
         // replays cached packets whose arrival is already in the past.
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_forwarded_media(
+            &self.participant_id.to_string(),
+            pkt.payload.len() as u64,
+        );
         let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
@@ -623,6 +649,16 @@ impl ParticipantCore {
         if self.exited {
             return None;
         }
+
+        // Entered once per poll cycle rather than per packet, so every str0m line produced by
+        // this participant's work carries its identity for the cost of one guard.
+        //
+        // Cloned first because the guard would otherwise hold a borrow of `self` for the whole
+        // function. `Span` is a handle, so this is a refcount bump rather than a rebuild.
+        #[cfg(feature = "sim")]
+        let sim_span = self.sim_span.clone();
+        #[cfg(feature = "sim")]
+        let _sim_guard = sim_span.enter();
 
         let mut budget = 3;
         'drain: loop {

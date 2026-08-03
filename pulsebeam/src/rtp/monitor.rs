@@ -14,6 +14,10 @@ const SIMULCAST_LAYER_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
 const SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA: Duration = Duration::from_secs(10);
 const STREAM_DEAD_TIMEOUT: Duration = Duration::from_millis(3000);
 const LOSS_MEASUREMENT_WINDOW: Duration = Duration::from_millis(500);
+// Keep a sample open briefly after its nominal boundary so a reordered packet is not
+// indistinguishable from a lost packet. This is below the quality confirmation timescale and
+// only delays loss evidence; it does not relax the loss thresholds.
+const LOSS_REORDER_GRACE: Duration = Duration::from_millis(100);
 const RATE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
 /// Reactive-cost fall constant — matches str0m's `EstimateSmoother::ESTIMATE_WINDOW` (3 s)
 /// so per-layer allocator costs converge on the same timescale as the reported BWE.
@@ -524,7 +528,7 @@ impl StreamMonitor {
         // enough packets have been seen to make interval_loss meaningful,
         // capped by MAX_LOSS_MEASUREMENT_WINDOW. See that constant's doc
         // comment.
-        let window_ready = window_elapsed >= LOSS_MEASUREMENT_WINDOW
+        let window_ready = window_elapsed >= LOSS_MEASUREMENT_WINDOW + LOSS_REORDER_GRACE
             && (expected >= MIN_LOSS_EVIDENCE_PACKETS
                 || window_elapsed >= MAX_LOSS_MEASUREMENT_WINDOW);
 
@@ -886,6 +890,192 @@ mod test {
             playout_time: arrival_ts,
             ..Default::default()
         }
+    }
+
+    /// A 1% loss rate must be reported as roughly 1%, not tens of percent.
+    ///
+    /// The upstream monitor gates stream health, and an unhealthy layer is dropped from
+    /// allocation entirely - so an over-reported loss ratio silently pauses a stream that the
+    /// link could carry. In simulation, a link configured to drop 1% produced a smoothed ratio of
+    /// 21-35% and the SFU paused the stream while BWE still reported 1.9 Mbps available.
+    #[test]
+    fn loss_ratio_tracks_actual_loss_rate() {
+        let shared = StreamState::new(false, 1_250_000);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
+        let start = Instant::now();
+
+        // 30 packets per 500ms window, 20 windows. Drop every 100th packet: exactly 1%.
+        let mut t = start;
+        let mut seq = 1u64;
+        for _ in 0..20 {
+            for _ in 0..30 {
+                if !seq.is_multiple_of(100) {
+                    monitor.process_packet(&packet(seq, t));
+                }
+                seq += 1;
+                t += Duration::from_millis(500 / 30);
+            }
+            monitor.poll(t, false);
+        }
+
+        let reported = monitor.smoothed_loss_ratio;
+        assert!(
+            reported < 0.05,
+            "1% packet loss should report as roughly 1%, got {:.1}%. An inflated ratio marks the \
+             layer unhealthy and pauses a stream the link can carry.",
+            reported * 100.0
+        );
+    }
+
+    /// 1% loss must still read as ~1% when the network also reorders packets.
+    ///
+    /// This is the case that breaks in simulation. `interval_loss` compares `expected` - a
+    /// sequence span sampled at window close - against packets that arrived *within* the window.
+    /// A packet reordered across the boundary is missing from the window that expected it, and
+    /// when it lands in the next window `saturating_sub` clamps the correction away. Windows can
+    /// therefore over-report but never under-report, and the deliberately asymmetric EWMA
+    /// (0.50 rising, 0.20 falling) turns that one-sided noise into a persistently high value.
+    #[test]
+    fn loss_ratio_tracks_actual_loss_rate_with_reordering() {
+        let shared = StreamState::new(false, 1_250_000);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
+        let start = Instant::now();
+
+        // Same 1% loss, but each packet's arrival is displaced by up to +/-3 positions, which is
+        // what a few ms of jitter does to a stream sent ~1ms apart.
+        let mut t = start;
+        let mut seq = 1u64;
+        for _ in 0..20 {
+            let mut batch: Vec<u64> = Vec::new();
+            for _ in 0..30 {
+                if !seq.is_multiple_of(100) {
+                    batch.push(seq);
+                }
+                seq += 1;
+            }
+            // Deterministic local shuffle: swap adjacent pairs three apart.
+            for i in (0..batch.len().saturating_sub(3)).step_by(6) {
+                batch.swap(i, i + 3);
+            }
+            for s in batch {
+                monitor.process_packet(&packet(s, t));
+                t += Duration::from_millis(500 / 30);
+            }
+            monitor.poll(t, false);
+        }
+
+        let reported = monitor.smoothed_loss_ratio;
+        assert!(
+            reported < 0.05,
+            "1% packet loss with mild reordering should still report as roughly 1%, got {:.1}%",
+            reported * 100.0
+        );
+    }
+
+    /// Packets that cross a measurement boundary are not lost. The monitor must give them a
+    /// chance to arrive before turning a sequence gap into loss evidence.
+    #[test]
+    fn late_packets_at_window_boundary_are_not_counted_as_loss() {
+        let shared = StreamState::new(false, 1_250_000);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
+        let start = Instant::now();
+
+        // Establish a clean sequence baseline so the first packet is not part of a measured
+        // interval. The following intervals deliberately leave three packets until just after
+        // the 500 ms sample boundary.
+        for seq in 1..=31u64 {
+            monitor.process_packet(&packet(seq, start + Duration::from_millis(seq * 10)));
+        }
+        let mut boundary = start + LOSS_MEASUREMENT_WINDOW;
+        monitor.poll(boundary, false);
+
+        let mut base = 31u64;
+        for _ in 0..20 {
+            // Sequence numbers base+28..=base+30 are merely late, not lost. base+31 advances
+            // the high-water mark and closes the interval before those packets arrive.
+            for (offset, seq) in ((base + 1)..=(base + 27)).enumerate() {
+                monitor.process_packet(&packet(
+                    seq,
+                    boundary + Duration::from_millis(10 + offset as u64 * 10),
+                ));
+            }
+            monitor.process_packet(&packet(base + 31, boundary + Duration::from_millis(490)));
+            let close = boundary + LOSS_MEASUREMENT_WINDOW;
+            monitor.poll(close, false);
+
+            // Deliver the three packets from the previous interval, followed by a clean next
+            // interval. The next poll therefore sees all packets, albeit in reordered arrival
+            // order across the previous boundary.
+            for (offset, seq) in ((base + 28)..=(base + 30)).enumerate() {
+                monitor.process_packet(&packet(
+                    seq,
+                    close + Duration::from_millis(10 + offset as u64),
+                ));
+            }
+            for (offset, seq) in ((base + 32)..=(base + 61)).enumerate() {
+                monitor.process_packet(&packet(
+                    seq,
+                    close + Duration::from_millis(20 + offset as u64),
+                ));
+            }
+            boundary = close + LOSS_MEASUREMENT_WINDOW;
+            monitor.poll(boundary, false);
+            base += 61;
+        }
+
+        assert!(
+            monitor.smoothed_loss_ratio < 0.05,
+            "reordering without packet loss should not report persistent loss, got {:.1}%",
+            monitor.smoothed_loss_ratio * 100.0
+        );
+    }
+
+    /// A low-rate stream must not be declared Bad by one or two lost packets.
+    ///
+    /// This is the screen-share case: static content encodes at 2-5 fps, so a measurement window
+    /// holds only a handful of packets. `MIN_LOSS_EVIDENCE_PACKETS` was 5, and
+    /// `VIDEO_SEVERE_LOSS_THRESHOLD` (0.30) transitions to Bad *immediately* with no confirmation
+    /// window - so two losses out of six expected read as 33% and instantly marked the layer
+    /// unhealthy. An unhealthy layer is dropped from allocation, so the SFU paused a stream the
+    /// link could carry. Observed in simulation at 1% link loss with windows of `expected: 6,
+    /// actual: 4` and `expected: 14, actual: 8`.
+    #[test]
+    fn sparse_low_rate_stream_survives_occasional_loss() {
+        let shared = StreamState::new(false, 400_000);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
+        let start = Instant::now();
+
+        // ~4 fps: two packets per frame, so a window sees only a handful of packets. Loss is
+        // pseudo-random at 1% rather than every-Nth, because what actually breaks is two drops
+        // landing in the same sparse window - which an evenly spaced pattern never produces.
+        let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next_rand = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let mut t = start;
+        let mut seq = 1u64;
+        for _ in 0..200 {
+            for _ in 0..4 {
+                if next_rand() % 100 != 0 {
+                    monitor.process_packet(&packet(seq, t));
+                }
+                seq += 1;
+                t += Duration::from_millis(125);
+            }
+            monitor.poll(t, false);
+        }
+
+        assert_ne!(
+            monitor.current_quality,
+            StreamQuality::Bad,
+            "a 1% loss rate must not mark a low-frame-rate layer unhealthy; smoothed ratio was \
+             {:.1}%",
+            monitor.smoothed_loss_ratio * 100.0
+        );
     }
 
     #[test]

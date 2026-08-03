@@ -134,6 +134,18 @@ impl AgentBuilder {
                 rtp_extensions::ABS_CAPTURE_TIME,
                 str0m::rtp::Extension::AbsoluteCaptureTime,
             )
+            // Without this the simulated client and the real one exercise different code paths
+            // in the SFU. Production browsers send VLA, so the SFU allocates against the
+            // encoder's declared target; a client that never negotiates it falls back to
+            // measuring bytes, which for screen content is a quite different - and far more
+            // variable - signal. Every simulated plan was taking the fallback.
+            .set_extension(
+                rtp_extensions::VIDEO_LAYERS_ALLOCATION,
+                str0m::rtp::Extension::with_serializer(
+                    str0m::rtp::vla::URI,
+                    str0m::rtp::vla::Serializer,
+                ),
+            )
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
