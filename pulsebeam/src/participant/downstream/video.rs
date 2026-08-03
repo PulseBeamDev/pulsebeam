@@ -1231,7 +1231,21 @@ impl AllocationEngine {
                 let step =
                     self.admission_cost(next) - allocs[i].map_or(0.0, |l| self.admission_cost(l));
                 let is_upgrade = next.quality > slot.current_quality;
-                if is_upgrade && !upgrade_used && step + reserve > budget {
+                // A slot may reclaim from lower-priority tenants both to climb and to *hold*.
+                //
+                // Restricting it to climbing made preemption self-undoing. Whether reaching a
+                // layer counts as an upgrade is decided against `current_quality`, which is the
+                // previous pass's output, so a slot that preempted its way up to a tier found the
+                // same tier reclassified as retention on the next pass - and retention could not
+                // preempt, so it could not hold what preemption had just won it. The reclaimed
+                // tenant was re-admitted, the budget vanished, and the slot dropped back: an
+                // indefinite loop between the two states, reproduced by three identical cameras
+                // on a 500 kbps estimate.
+                //
+                // Retention needs no reserve, matching its admission below.
+                let want = if is_upgrade { step + reserve } else { step };
+                let may_preempt = if is_upgrade { !upgrade_used } else { true };
+                if may_preempt && want > budget {
                     // Retention hysteresis may have admitted a lower-priority stream even though
                     // its full cost no longer fits. Do not let that stale allocation pin a
                     // higher-priority request at its floor: reclaim lower-priority allocations
@@ -1241,14 +1255,14 @@ impl AllocationEngine {
                         .filter(|&j| slots[j].priority < slot.priority)
                         .filter_map(|j| allocs[j].map(|layer| self.admission_cost(layer)))
                         .sum();
-                    if budget + reclaimable >= step + reserve {
+                    if budget + reclaimable >= want {
                         for j in ((i + 1)..slots.len()).rev() {
                             if slots[j].priority >= slot.priority {
                                 continue;
                             }
                             if let Some(layer) = allocs[j].take() {
                                 budget += self.admission_cost(layer);
-                                if budget >= step + reserve {
+                                if budget >= want {
                                     break;
                                 }
                             }
@@ -2450,9 +2464,8 @@ mod allocation_tests {
     /// bandwidth band to produce - three identical cameras will do. Each flip stops and restarts
     /// two streams, so neither ever holds a layer long enough to decode.
     ///
-    /// Found by the three-slot sweep, which is ignored for the same defect.
+    /// Fixed by letting retention preempt as well as climbing; kept as the regression.
     #[test]
-    #[ignore = "known defect: preemption and re-admission oscillate indefinitely"]
     fn preemption_does_not_oscillate_with_a_reclaimed_tenant() {
         let camera = build_track(&[
             (LayerQuality::Low, 187_500),
@@ -2501,7 +2514,6 @@ mod allocation_tests {
     /// under contention is a policy question with defensible answers; that the allocator stops
     /// changing its mind is not.
     #[test]
-    #[ignore = "known defect: preemption and re-admission oscillate indefinitely"]
     fn allocation_converges_with_three_slots_and_mixed_priorities() {
         let ladders = sweep_ladders();
         let tracks: Vec<(&str, Track)> = ladders
