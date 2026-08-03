@@ -34,7 +34,7 @@ pprof = { version = "0.15.0", features = [
   "prost-codec",
   "protobuf"
 ] }
-pulsebeam-core = { path = "../pulsebeam-core" }
+pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m"] }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 rand = { workspace = true }
@@ -64,6 +64,7 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
 
 [dev-dependencies]
+pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m", "test-utils"] }
 ctor = "1.0.10"
 hex = "0.4.3"
 more-asserts = { workspace = true }

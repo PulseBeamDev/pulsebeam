@@ -2796,10 +2796,15 @@ dependencies = [
 name = "pulsebeam-core"
 version = "0.3.2"
 dependencies = [
+ "arrayvec",
  "axum",
  "futures",
  "http",
+ "proptest",
+ "pulsebeam-core",
  "reqwest",
+ "str0m",
+ "thiserror 2.0.19",
  "tokio",
  "turmoil",
 ]

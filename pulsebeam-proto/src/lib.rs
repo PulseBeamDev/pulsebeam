@@ -19,6 +19,12 @@ pub mod rtp_extensions {
     /// receiver's jitter buffer (see `ClientIntent.max_playout_delay_ms`). 6 is
     /// free of the str0m defaults above.
     pub const PLAYOUT_DELAY: u8 = 6;
+
+    /// AV1 Dependency Descriptor. Not 13 (Chrome's usual id) because that is
+    /// str0m's default video-orientation, which registering over would evict;
+    /// str0m swaps ids to match the offerer, so both survive Chrome's 13. Must
+    /// stay <= 14, above which str0m forces the two-byte form on every packet.
+    pub const DEPENDENCY_DESCRIPTOR: u8 = 14;
 }
 
 pub mod namespace {

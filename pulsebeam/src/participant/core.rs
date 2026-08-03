@@ -590,10 +590,11 @@ impl ParticipantCore {
             );
         }
         // The sender's Video Layers Allocation describes its simulcast layers,
-        // which is meaningless on the single stream we forward to the viewer —
-        // strip it (abs-capture-time et al. are typed fields, kept intact).
+        // which is meaningless on the single stream we forward to the viewer.
         let mut ext_vals = pkt.ext_vals;
-        ext_vals.user_values = Default::default();
+        ext_vals
+            .user_values
+            .remove::<str0m::rtp::vla::VideoLayersAllocation>();
         if let Some((min, max)) = self.downstream.playout_delay_to_stamp() {
             ext_vals.play_delay_min = Some(min);
             ext_vals.play_delay_max = Some(max);

@@ -17,12 +17,25 @@ sim = [
     "dep:axum",
     "dep:futures",
 ]
+# RTP header extension serializers. Only the str0m glue needs this; the codecs
+# themselves are transport-agnostic.
+str0m = ["dep:str0m"]
+# Shared descriptor fixtures for downstream crates' tests.
+test-utils = []
 
 [dependencies]
 tokio = { workspace = true }
 futures = { version = "0.3", optional = true }
 http = { version = "^1" }
+arrayvec = "0.7.6"
+thiserror = { workspace = true }
 
 axum = { version = "^0.8", optional = true }
 turmoil = { workspace = true, optional = true }
 reqwest = { version = "0.13.4", optional = true }
+str0m = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+# Exercise the feature-gated str0m glue in this crate's own test runs.
+pulsebeam-core = { path = ".", features = ["str0m", "test-utils"] }

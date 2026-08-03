@@ -108,6 +108,12 @@ impl Negotiator {
             // Lets the SFU bound each subscriber's jitter buffer (latency cap)
             // by stamping min/max playout delay on egress RTP.
             .set_extension(rtp_extensions::PLAYOUT_DELAY, Extension::PlayoutDelay)
+            // Per-frame dependency structure for SVC codecs. Captured verbatim
+            // here; parsing needs per-stream template state (see rtp::dd).
+            .set_extension(
+                rtp_extensions::DEPENDENCY_DESCRIPTOR,
+                Extension::with_serializer(pulsebeam_core::dd::URI, pulsebeam_core::dd::Serializer),
+            )
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
             .enable_bwe(Some(INITIAL_BANDWIDTH))
@@ -271,5 +277,69 @@ impl Negotiator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chrome_like_offer() -> SdpOffer {
+        let mut config = RtcConfig::new()
+            .clear_codecs()
+            // Chrome's usual ids: dependency descriptor collides with str0m's
+            // default video-orientation slot.
+            .set_extension(
+                13,
+                Extension::with_serializer(pulsebeam_core::dd::URI, pulsebeam_core::dd::Serializer),
+            )
+            .set_extension(14, Extension::VideoOrientation);
+        config.codec_config().enable_h264(true);
+        let mut rtc = config.build(std::time::Instant::now());
+
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        change.apply().unwrap().0
+    }
+
+    fn answer_sdp() -> String {
+        let mut negotiator = Negotiator::new(Vec::new());
+        let (_, answer) = negotiator
+            .create_answer(chrome_like_offer(), IceCreds::new())
+            .unwrap();
+        answer.to_sdp_string()
+    }
+
+    #[test]
+    fn answer_negotiates_the_dependency_descriptor() {
+        assert!(
+            answer_sdp().contains(pulsebeam_core::dd::URI),
+            "answer did not carry the dependency descriptor extmap"
+        );
+    }
+
+    #[test]
+    fn dependency_descriptor_does_not_evict_video_orientation() {
+        let sdp = answer_sdp();
+        let dd_line = sdp
+            .lines()
+            .find(|l| l.contains(pulsebeam_core::dd::URI))
+            .expect("dependency descriptor extmap");
+        let cvo_line = sdp
+            .lines()
+            .find(|l| l.contains("urn:3gpp:video-orientation"))
+            .expect("video orientation extmap");
+
+        assert_ne!(dd_line, cvo_line);
+        for line in [dd_line, cvo_line] {
+            let id: u8 = line
+                .trim_start_matches("a=extmap:")
+                .split([' ', '/'])
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(id <= 14, "{line} exceeds the one-byte extension form");
+        }
     }
 }

@@ -11,6 +11,7 @@ use crate::rtp::{
     sync::Synchronizer,
 };
 pub use data_track::*;
+use pulsebeam_core::dd::{DependencyDescriptorReader, RawDependencyDescriptor};
 pub use pulsebeam_core::simulcast::LayerQuality;
 use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::Ssrc;
@@ -114,6 +115,10 @@ pub struct UpstreamTrackLayer {
     /// learned from its own packets. Used to read this layer's state out of a
     /// VLA carried on any sibling's packet.
     vla_index: Option<u8>,
+    /// Per-RTP-stream dependency descriptor state; templates only arrive on
+    /// keyframes and are referenced by later packets.
+    dd: DependencyDescriptorReader,
+    dd_errors: u64,
 }
 
 impl PartialEq for UpstreamTrackLayer {
@@ -141,8 +146,30 @@ impl UpstreamTrackLayer {
         {
             self.vla_index = Some(vla.current_simulcast_stream_index);
         }
+        self.parse_dependency_descriptor(pkt);
         // audio will only be filtered at the centralized audio_selector
         true
+    }
+
+    fn parse_dependency_descriptor(&mut self, pkt: &mut RtpPacket) {
+        let Some(raw) = pkt.ext_vals.user_values.get::<RawDependencyDescriptor>() else {
+            return;
+        };
+        match self.dd.read(&raw.0) {
+            Ok(dd) => pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd)),
+            Err(err) => {
+                self.dd_errors += 1;
+                if self.dd_errors.is_power_of_two() {
+                    tracing::warn!(
+                        mid = %self.mid,
+                        rid = ?self.rid,
+                        errors = self.dd_errors,
+                        %err,
+                        "dependency descriptor parse failed"
+                    );
+                }
+            }
+        }
     }
 
     /// Apply a (track-wide) Video Layers Allocation to this layer using its
@@ -361,6 +388,8 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             synchronizer: Synchronizer::new(rtp::AUDIO_FREQUENCY),
             monitor,
             vla_index: None,
+            dd: DependencyDescriptorReader::new(),
+            dd_errors: 0,
         }],
     };
     (
@@ -416,6 +445,8 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             synchronizer: Synchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor,
             vla_index: None,
+            dd: DependencyDescriptorReader::new(),
+            dd_errors: 0,
         });
         layers.push(TrackLayer {
             meta: meta.clone(),
@@ -944,6 +975,91 @@ mod data_track {
             let err = DataTrackIntent::try_from(&cfg(&one_byte_over)).unwrap_err();
             assert_eq!(err, DataTrackIntentError::LabelTooLong);
         }
+    }
+}
+
+#[cfg(test)]
+mod dd_tests {
+    use super::*;
+    use pulsebeam_core::dd::{
+        DependencyDescriptor, DependencyDescriptorWriter, MAX_DD_LEN, test_utils,
+    };
+
+    fn layer() -> UpstreamTrackLayer {
+        let state = StreamState::new_with_height(true, 500_000, 360);
+        UpstreamTrackLayer {
+            mid: Mid::from("0"),
+            rid: None,
+            quality: LayerQuality::High,
+            monitor: StreamMonitor::new(TrackKind::Video, "test".to_string(), state),
+            synchronizer: Synchronizer::new(rtp::VIDEO_FREQUENCY),
+            vla_index: None,
+            dd: DependencyDescriptorReader::new(),
+            dd_errors: 0,
+        }
+    }
+
+    fn packet_carrying(bytes: &[u8]) -> RtpPacket {
+        let mut pkt = RtpPacket::default();
+        pkt.ext_vals
+            .user_values
+            .set(RawDependencyDescriptor(bytes.iter().copied().collect()));
+        pkt
+    }
+
+    #[test]
+    fn attaches_parsed_descriptor_to_ingress_packets() {
+        let structure = test_utils::structure_l1t3();
+        let mut writer = DependencyDescriptorWriter::new();
+        let mut buf = [0u8; MAX_DD_LEN];
+        let mut layer = layer();
+
+        let len = writer
+            .write(&test_utils::keyframe(&structure), &mut buf)
+            .unwrap();
+        let mut pkt = packet_carrying(&buf[..len]);
+        assert!(layer.process(&mut pkt, None));
+        assert!(
+            pkt.ext_vals
+                .user_values
+                .get::<DependencyDescriptor>()
+                .is_some()
+        );
+
+        // A later delta frame carries only a template id, so it is decodable
+        // only because the layer retained the structure.
+        let sent = test_utils::delta(&structure, 2, 7);
+        let len = writer.write(&sent, &mut buf).unwrap();
+        let mut pkt = packet_carrying(&buf[..len]);
+        assert!(layer.process(&mut pkt, None));
+
+        let got = pkt.ext_vals.user_values.get::<DependencyDescriptor>();
+        assert_eq!(got, Some(&sent));
+        assert_eq!(layer.dd_errors, 0);
+    }
+
+    #[test]
+    fn forwards_packets_despite_malformed_descriptor() {
+        let mut layer = layer();
+        let mut pkt = packet_carrying(&[0xff; 12]);
+
+        assert!(layer.process(&mut pkt, None));
+        assert!(
+            pkt.ext_vals
+                .user_values
+                .get::<DependencyDescriptor>()
+                .is_none()
+        );
+        assert_eq!(layer.dd_errors, 1);
+    }
+
+    #[test]
+    fn packets_without_a_descriptor_are_untouched() {
+        let mut layer = layer();
+        let mut pkt = RtpPacket::default();
+
+        assert!(layer.process(&mut pkt, None));
+        assert_eq!(layer.dd_errors, 0);
     }
 }
 
