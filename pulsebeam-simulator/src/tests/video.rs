@@ -4,7 +4,6 @@ use std::time::Duration;
 #[test]
 fn fast_initial_ramp_up_on_good_network_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
@@ -108,11 +107,9 @@ fn repeated_simulcast_switching_stays_decodable_test() {
 // pre-existing bug: PLI for the layer switch targets a mid/rid that no longer
 // exists on the publisher side, so no fresh keyframe is delivered and bob gets
 // 0 bytes throughout the soak.
-#[ignore = "pre-existing bug: PLI stream-not-found leaves subscriber starved of keyframes"]
 #[test]
 fn simulcast_stream_stability_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))

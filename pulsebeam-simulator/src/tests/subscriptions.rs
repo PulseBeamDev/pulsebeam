@@ -48,7 +48,6 @@ fn declarative_subscription_test() {
 #[test]
 fn slots_layout_update_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("pub1"))
@@ -94,7 +93,6 @@ fn slots_layout_update_test() {
 #[test]
 fn slots_prioritization_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("pub1", &["q", "h", "f"]))

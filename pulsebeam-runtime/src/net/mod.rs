@@ -1,5 +1,7 @@
 #[cfg_attr(feature = "sim", path = "bound_udp_sim.rs")]
 mod bound_udp;
+#[cfg(feature = "sim")]
+pub mod shaper;
 pub mod tcp;
 pub mod udp;
 pub mod udp_scalar;

@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c427bf6d995e252348c7c4d225d9e22e22f7a4fed0612c96540d9ddb11da1642 # shrinks to scenario = Scenario { capacity_bps: 2907769, screenshare: true, target_height: 720, settle_secs: 50 }
+cc 351e24eaff446ab500e264f396272c99aad7333b7d2aeda84d11ffca499a286f # shrinks to scenario = Scenario { capacity_bps: 2037848, screenshare: true, target_height: 720, settle_secs: 66, contended: true, fault: Reordering }
+cc e8b1ec1ed6a54b08f2836f0d35bec691475950057e6543b386de63b05763b346 # shrinks to scenario = Scenario { capacity_bps: 2393971, screenshare: true, target_height: 360, settle_secs: 50, contended: true, fault: BurstLoss }
+cc 1cf9f1d382008b76b70d3841221da5a8c7733a3de33822762c33f52dcf6c3700 # shrinks to scenario = Scenario { capacity_bps: 2089175, screenshare: true, target_height: 360, settle_secs: 55, contended: true, fault: Outage }
+cc 88515d0953da2dc29651d4332526ac0f1c231090d4947be45e0d328aeea9d457 # shrinks to scenario = Scenario { capacity_bps: 2454601, screenshare: true, target_height: 720, settle_secs: 45, contended: false, fault: Outage }
+cc be6cb751c1d50a3e6eeaa8062fe81854dde804f3acc01df8c4b4367f45b15a73 # shrinks to scenario = Scenario { capacity_bps: 2869601, screenshare: true, target_height: 180, settle_secs: 58, contended: true, fault: Outage }
+cc dbb2bd535077c71a6b67ca1256a0a3eea4a08d6fdc12f59ff1c40ab72e73af78 # shrinks to scenario = Scenario { capacity_bps: 2632363, screenshare: true, target_height: 360, settle_secs: 35, contended: true, fault: None }

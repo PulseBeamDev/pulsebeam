@@ -139,12 +139,337 @@ impl H264Looper {
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
                 is_keyframe: false,
+                // A constant-rate source has nothing to declare beyond what it is sending, so
+                // leave VLA off and let the SFU measure. That is also the pre-VLA path, which is
+                // worth still exercising: not every sender emits the extension.
+                target_bitrate_bps: None,
+                resolution: None,
             };
 
             if sender.send(frame).await.is_err() {
                 break;
             }
             frame_count += 1;
+        }
+    }
+}
+
+/// How a [`VbrLooper`] alternates between busy and quiet content.
+///
+/// Models screen sharing, which is strongly variable-bitrate: a static desktop encodes to almost
+/// nothing because the encoder simply skips frames, then scrolling or a window change produces a
+/// burst at the full layer rate. Camera video, by contrast, is close to constant-bitrate.
+///
+/// The quiet phase is the interesting one for congestion control. The sender becomes application
+/// limited, which is what puts str0m into ALR and makes the probe controller - rather than the
+/// arrival of media - solely responsible for keeping the bandwidth estimate alive. If probing
+/// stalls there, the estimate decays while the screen is still, and the burst when the user
+/// scrolls again has nowhere to go.
+#[derive(Debug, Clone, Copy)]
+pub struct VbrProfile {
+    /// How long a burst of activity lasts.
+    pub active: Duration,
+    /// Frame rate during activity.
+    pub active_fps: u32,
+    /// How long the content stays static.
+    pub idle: Duration,
+    /// Frame rate while static. Real encoders drop to a few frames per second, so the bitrate
+    /// falls by roughly `active_fps / idle_fps`.
+    pub idle_fps: u32,
+    /// Only emit frames at or below this size while static.
+    ///
+    /// Frame *rate* alone does not reproduce what a static screen does to the sender. A still
+    /// desktop encodes near-empty P-frames - tens to a couple of hundred bytes - where moving
+    /// content produces frames several times the MTU. That difference is what reaches congestion
+    /// control: padding is drawn from the RTX cache of recently sent packets, so a quiet screen
+    /// leaves only tiny packets to pad with, and str0m emits one padding packet per event-loop
+    /// round trip. A probe cluster then cannot reach a high target however long it runs.
+    pub idle_max_frame_bytes: usize,
+    /// Silence between the end of one replay of the schedule and the start of the next.
+    ///
+    /// A truly static screen emits nothing at all, for as long as nobody touches it. That is a
+    /// different regime from a low frame *rate*: past a few seconds of silence the SFU marks the
+    /// layer dead, it drops out of `desired`, and the RTX cache the pacer draws padding from
+    /// drains - so probes have nothing to send and report a rate far below the link. A schedule
+    /// captured from a real screen share still has a frame every second or two, which never
+    /// reaches that regime.
+    pub loop_idle: Duration,
+    /// What the encoder declares this layer will cost, in bits per second.
+    ///
+    /// Sent as a Video Layers Allocation, and the reason it exists separately from the frames is
+    /// that the two genuinely disagree: a still screen encodes almost nothing while still being a
+    /// 2.5 Mbps layer the moment anyone scrolls. The SFU cannot infer that from bytes on the
+    /// wire, so the sender declares it.
+    pub declared_target_bps: u64,
+    /// What the declared target falls to while the content is static.
+    ///
+    /// Real encoders step their target down when there is nothing to send rather than dropping it
+    /// to zero - the production log shows the same layer at 1250 kbps and later at 729. Those
+    /// steps are what an allocator has to stay stable across.
+    pub idle_target_bps: u64,
+    /// How much of the gap to the current goal the declared target closes per frame.
+    ///
+    /// Chrome's `targetBitrate` climbs in visible steps rather than jumping - roughly 1.5 to 2.0
+    /// to 2.5 Mbps over a couple of seconds once a share becomes active. A two-state target would
+    /// cross every allocation boundary in one go and skip the intermediate values entirely, which
+    /// are exactly the ones that sit near a decision threshold.
+    pub target_step: f64,
+}
+
+impl VbrProfile {
+    /// Screen sharing: long static stretches broken by short scrolls.
+    ///
+    /// 2 fps against 30 fps is about a 15x bitrate drop, deep enough to hold the sender in ALR
+    /// for the whole quiet phase.
+    pub fn screenshare() -> Self {
+        Self {
+            active: Duration::from_secs(4),
+            active_fps: 30,
+            idle: Duration::from_secs(20),
+            idle_fps: 2,
+            // Small enough to land in a single sub-MTU RTP packet, as a near-empty P-frame does.
+            idle_max_frame_bytes: 300,
+            loop_idle: Duration::from_millis(500),
+            // The client's `detail` preset: one layer at 2.5 Mbps (see pulsebeam-js
+            // libs/core/src/preset.ts, VIDEO_PRESETS.detail).
+            declared_target_bps: 2_500_000,
+            target_step: 0.25,
+            // Roughly the 729/1250 step seen in production.
+            idle_target_bps: 1_460_000,
+        }
+    }
+
+    /// Screen sharing as the client actually configures it: a single 2.5 Mbps layer.
+    ///
+    /// `VIDEO_PRESETS.detail` in the client is `layers: 1, baseBitrate: 2_500_000` - the full
+    /// ladder is negotiated but only `f` is ever sent, because resolution is worth more than
+    /// adaptability for screen content. Two consequences the other profiles do not reproduce:
+    ///
+    /// * It costs 2.5 Mbps, twice the camera's top layer. Where the two nearly fill the estimate,
+    ///   the allocator's choice between them is finely balanced - which is the regime where
+    ///   pricing bugs surface.
+    /// * With one live layer there is nothing to fall back to, so it pauses outright instead of
+    ///   degrading. A viewer sees the share vanish rather than soften.
+    pub fn screenshare_detail() -> Self {
+        Self {
+            // Production peaks at 8fps, not the preset's 15 cap. `maintain-resolution` means the
+            // encoder sheds frames rather than pixels, so a screen share rarely reaches its
+            // configured ceiling: Chrome's framesPerSecond for a live 1080p share sits between 0
+            // and 8, spiky, with long stretches at zero.
+            active_fps: 8,
+            ..Self::screenshare()
+        }
+    }
+
+    /// Screen sharing that goes genuinely still: the captured schedule, then a long silence.
+    ///
+    /// `loop_idle` is well past the SFU's 3s stream-dead timeout, so the layer is marked
+    /// unhealthy and the pacer's RTX cache empties - the conditions under which probing starves
+    /// and the estimate collapses. [`Self::screenshare`] never gets there; its schedule has a
+    /// frame every two seconds.
+    pub fn screenshare_static() -> Self {
+        Self {
+            loop_idle: Duration::from_secs(20),
+            ..Self::screenshare()
+        }
+    }
+}
+
+/// An [`H264Looper`] whose output follows a [`VbrProfile`], approximating a VBR encoder.
+///
+/// Varies both frame rate and frame size, because congestion control reacts to each differently:
+/// rate governs whether the sender is application-limited (and so whether str0m enters ALR), while
+/// size governs what ends up in the RTX cache and therefore how large a padding packet a probe can
+/// draw. Reproducing the production failure needs both.
+///
+/// Frames are always taken whole from the asset rather than synthesised, so every emitted frame
+/// stays a valid, decodable H.264 access unit - the receiver-side QoE checks would reject
+/// truncated ones.
+pub struct VbrLooper {
+    asset: Arc<SharedH264Asset>,
+    index: usize,
+    /// Indices of frames small enough to stand in for static content, ascending.
+    small: Vec<usize>,
+    small_index: usize,
+    profile: VbrProfile,
+    frame_times: Option<Vec<Duration>>,
+    /// Current declared target, moved toward its goal a step at a time.
+    declared_bps: f64,
+}
+
+impl VbrLooper {
+    /// Move the declared target toward whichever goal the content is currently at, and report it.
+    ///
+    /// The gap between this and what is actually on the wire is the whole point of declaring it.
+    /// A static screen sends almost nothing - a few kbps of near-empty frames - while remaining a
+    /// 2.5 Mbps layer the instant the user scrolls. No amount of measuring bytes recovers that,
+    /// which is why the sender says so directly.
+    fn step_target(&mut self, active: bool) -> u64 {
+        let goal = if active {
+            self.profile.declared_target_bps
+        } else {
+            self.profile.idle_target_bps
+        } as f64;
+        self.declared_bps += (goal - self.declared_bps) * self.profile.target_step;
+        self.declared_bps.round() as u64
+    }
+
+    pub fn new(data: &[u8], profile: VbrProfile) -> Self {
+        let asset = Arc::new(SharedH264Asset::new(data));
+        let small: Vec<usize> = asset
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.len() <= profile.idle_max_frame_bytes)
+            .map(|(i, _)| i)
+            .collect();
+        Self {
+            asset,
+            index: 0,
+            small,
+            small_index: 0,
+            profile,
+            frame_times: None,
+            declared_bps: 0.0,
+        }
+    }
+
+    pub fn new_scheduled(data: &[u8], timing: &str, profile: VbrProfile) -> Self {
+        let mut looper = Self::new(data, profile);
+        let frame_times: Vec<Duration> = timing
+            .lines()
+            .map(|line| Duration::from_micros(line.parse().expect("valid frame timestamp")))
+            .collect();
+        debug_assert!(!frame_times.is_empty());
+        debug_assert_eq!(looper.asset.frames.len(), frame_times.len());
+        debug_assert!(frame_times.windows(2).all(|pair| pair[0] < pair[1]));
+        looper.frame_times = Some(frame_times);
+        looper
+    }
+
+    /// Next frame for the static phase: the smallest frames the asset has. Falls back to the
+    /// normal sequence when the asset has nothing small enough.
+    fn next_small(&mut self) -> Arc<[u8]> {
+        if self.small.is_empty() {
+            return self.next();
+        }
+        let idx = self.small[self.small_index % self.small.len()];
+        self.small_index = self.small_index.wrapping_add(1);
+        self.asset.frames[idx].clone()
+    }
+
+    fn next(&mut self) -> Arc<[u8]> {
+        let frame = &self.asset.frames[self.index];
+        self.index = (self.index + 1) % self.asset.frames.len();
+        frame.clone()
+    }
+
+    /// Whether we are in an active burst at `elapsed` into the run.
+    fn is_active(&self, elapsed: Duration) -> bool {
+        let cycle = self.profile.active + self.profile.idle;
+        if cycle.is_zero() {
+            return true;
+        }
+        let phase = (elapsed.as_nanos() % cycle.as_nanos()) as u64;
+        Duration::from_nanos(phase) < self.profile.active
+    }
+
+    pub async fn run(mut self, mut sender: LocalEncoding) {
+        let clock_rate = 90_000f64;
+        let mid = sender.mid;
+        let rid = sender.rid;
+
+        let start = tokio::time::Instant::now();
+        if let Some(frame_times) = self.frame_times.take() {
+            debug_assert_eq!(self.asset.frames.len(), frame_times.len());
+            let loop_duration = frame_times
+                .last()
+                .copied()
+                .expect("non-empty frame schedule")
+                + self.profile.loop_idle;
+            let mut loop_start = start;
+            let mut index = 0usize;
+            loop {
+                debug_assert!(index < frame_times.len());
+                tokio::time::sleep_until(loop_start + frame_times[index]).await;
+                let now = tokio::time::Instant::now();
+                if sender.keyframe_rx.is_requested() {
+                    index = self.asset.first_idr;
+                    debug_assert_eq!(index, 0, "scheduled fixture must begin with its first IDR");
+                    loop_start = now;
+                }
+                debug_assert!(index < self.asset.frames.len());
+                let frame = MediaFrame {
+                    ts: MediaTime::from_90khz(
+                        (now.duration_since(start).as_secs_f64() * clock_rate) as u64,
+                    ),
+                    data: self.asset.frames[index].clone(),
+                    capture_time: now,
+                    abs_capture_time: Some(crate::clock::capture_wallclock()),
+                    contiguous: true,
+                    is_keyframe: false,
+                    target_bitrate_bps: Some(
+                        self.step_target(self.is_active(now.duration_since(start))),
+                    ),
+                    resolution: None,
+                };
+                if sender.send(frame).await.is_err() {
+                    return;
+                }
+                index += 1;
+                if index == frame_times.len() {
+                    index = 0;
+                    loop_start += loop_duration;
+                }
+            }
+        }
+        let mut next_frame_at = start;
+
+        loop {
+            tokio::time::sleep_until(next_frame_at).await;
+            let now = tokio::time::Instant::now();
+            let elapsed = now.duration_since(start);
+
+            let active = self.is_active(elapsed);
+            let fps = if active {
+                self.profile.active_fps
+            } else {
+                self.profile.idle_fps
+            }
+            .max(1);
+            next_frame_at = now + Duration::from_secs_f64(1.0 / fps as f64);
+
+            if sender.keyframe_rx.is_requested() {
+                tracing::debug!(
+                    ?mid,
+                    ?rid,
+                    first_idr = self.asset.first_idr,
+                    "keyframe reset"
+                );
+                self.index = self.asset.first_idr;
+            }
+
+            // Derive the timestamp from wall-clock elapsed rather than a frame counter: the frame
+            // rate changes between phases, so a counter would drift against real time and the
+            // receiver would see the media clock stall during quiet stretches.
+            let frame = MediaFrame {
+                ts: MediaTime::from_90khz((elapsed.as_secs_f64() * clock_rate) as u64),
+                data: if active {
+                    self.next()
+                } else {
+                    self.next_small()
+                },
+                capture_time: now,
+                abs_capture_time: Some(crate::clock::capture_wallclock()),
+                contiguous: true,
+                is_keyframe: false,
+                target_bitrate_bps: Some(self.step_target(active)),
+                resolution: None,
+            };
+
+            if sender.send(frame).await.is_err() {
+                break;
+            }
         }
     }
 }
