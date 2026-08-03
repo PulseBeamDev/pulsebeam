@@ -1,4 +1,4 @@
-//! A bottleneck link for the simulator: rate limit, queueing delay, and tail drop.
+//! A bottleneck link for the simulator: capacity, queueing delay, loss, and tail drop.
 //!
 //! turmoil models latency and loss but has no notion of capacity, so a simulated path will carry
 //! any offered load. That makes a whole class of congestion-control behaviour untestable: with
@@ -13,6 +13,14 @@
 //!
 //! Shaping is applied on egress, keyed by destination IP, so one SFU socket gives every client its
 //! own downlink. Production builds never see this: the module is compiled only under `sim`.
+//!
+//! # Ground truth
+//!
+//! This module is the authority on what a link can actually carry, so it is also the reference an
+//! assertion should be written against. [`capacity_at`] and [`stats`] exist for that: a test says
+//! "the estimate must reach 80% of capacity" rather than "the viewer must receive 3,000,000
+//! bytes". The latter silently encodes link rate, codec, fixture length and current behaviour all
+//! at once, and stops meaning anything the moment any of them changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -26,10 +34,108 @@ use tokio::time::{Duration, Instant};
 /// consumer-router buffer - deep enough to show real bufferbloat before loss sets in.
 const DEFAULT_MAX_BACKLOG: Duration = Duration::from_millis(200);
 
+/// How a link's capacity behaves over time.
+///
+/// Real links do not change in instantaneous steps. A cell handover ramps, a congested shared
+/// segment breathes, and a controller that only ever sees square waves is never tested against
+/// the thing that actually destabilises it.
+#[derive(Clone, Copy, Debug)]
+pub enum Capacity {
+    Fixed(u64),
+    /// Linear transition from `from` to `to` over `over`, then holds at `to`.
+    Ramp {
+        from: u64,
+        to: u64,
+        over: Duration,
+    },
+    /// Triangle wave between `min` and `max`. Triangle rather than sine so the rate of change is
+    /// constant and a failure is easy to attribute to a level rather than to a slope.
+    Oscillate {
+        min: u64,
+        max: u64,
+        period: Duration,
+    },
+}
+
+impl Capacity {
+    fn bits_per_sec_at(&self, elapsed: Duration) -> u64 {
+        match *self {
+            Capacity::Fixed(bps) => bps,
+            Capacity::Ramp { from, to, over } => {
+                if elapsed >= over || over.is_zero() {
+                    return to;
+                }
+                let t = elapsed.as_secs_f64() / over.as_secs_f64();
+                (from as f64 + (to as f64 - from as f64) * t) as u64
+            }
+            Capacity::Oscillate { min, max, period } => {
+                if period.is_zero() {
+                    return max;
+                }
+                let phase = (elapsed.as_secs_f64() / period.as_secs_f64()).fract();
+                // Triangle: rise over the first half, fall over the second.
+                let t = if phase < 0.5 {
+                    phase * 2.0
+                } else {
+                    (1.0 - phase) * 2.0
+                };
+                (min as f64 + (max as f64 - min as f64) * t) as u64
+            }
+        }
+    }
+}
+
+/// Packet loss behaviour for a link.
+#[derive(Clone, Copy, Debug)]
+pub enum Loss {
+    /// Each packet dropped independently. Easy to reason about, but the least realistic: real
+    /// loss arrives in bursts, and a controller tuned against uniform loss is not tested against
+    /// what wireless actually does.
+    Independent(f64),
+    /// Gilbert-Elliott: a good state and a bad state with per-packet transition probabilities.
+    /// This is how wireless loss is normally modelled, and it produces the correlated bursts that
+    /// a loss-based controller responds to very differently from the same average spread evenly.
+    Burst {
+        /// Probability of leaving the good state on any packet.
+        to_bad: f64,
+        /// Probability of leaving the bad state on any packet.
+        to_good: f64,
+        loss_in_good: f64,
+        loss_in_bad: f64,
+    },
+}
+
+impl Loss {
+    pub const NONE: Loss = Loss::Independent(0.0);
+
+    /// Typical Wi-Fi: rare short bursts.
+    pub fn wifi() -> Self {
+        Loss::Burst {
+            to_bad: 0.002,
+            to_good: 0.4,
+            loss_in_good: 0.0,
+            loss_in_bad: 0.35,
+        }
+    }
+
+    /// Mobile: more frequent and longer bad periods.
+    pub fn cellular() -> Self {
+        Loss::Burst {
+            to_bad: 0.01,
+            to_good: 0.2,
+            loss_in_good: 0.001,
+            loss_in_bad: 0.5,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Limit {
-    bits_per_sec: u64,
+    capacity: Capacity,
     max_backlog: Duration,
+    /// When this limit was first applied. Set lazily on first use so callers do not have to hold
+    /// a simulated clock at configuration time.
+    since: Option<Instant>,
 }
 
 /// Per-destination limits. Keyed by IP so a single SFU socket shapes each client separately.
@@ -38,33 +144,141 @@ fn limits() -> &'static Mutex<HashMap<IpAddr, Limit>> {
     LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn losses() -> &'static Mutex<HashMap<IpAddr, Loss>> {
+    static LOSSES: std::sync::OnceLock<Mutex<HashMap<IpAddr, Loss>>> = std::sync::OnceLock::new();
+    LOSSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Observed behaviour of a link, for assertions that need more than throughput.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub delivered: u64,
+    /// Dropped because the bottleneck buffer was full. Distinct from configured loss: this is
+    /// congestion, and a controller that causes a lot of it is overusing the link.
+    pub dropped_overflow: u64,
+    /// Dropped by the configured loss model.
+    pub dropped_loss: u64,
+    /// Deepest queue occupancy seen, as time. This is the bufferbloat measure - a controller that
+    /// keeps the link full but the queue shallow is behaving well; one that drives 200ms of
+    /// standing queue is not, even if throughput looks fine.
+    pub max_backlog: Duration,
+}
+
+fn stats_map() -> &'static Mutex<HashMap<IpAddr, Stats>> {
+    static STATS: std::sync::OnceLock<Mutex<HashMap<IpAddr, Stats>>> = std::sync::OnceLock::new();
+    STATS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Rate-limit traffic sent to `ip`. Call before the hosts start.
 pub fn set_downlink(ip: IpAddr, bits_per_sec: u64) {
-    set_downlink_with_backlog(ip, bits_per_sec, DEFAULT_MAX_BACKLOG);
+    set_capacity(ip, Capacity::Fixed(bits_per_sec), DEFAULT_MAX_BACKLOG);
 }
 
 pub fn set_downlink_with_backlog(ip: IpAddr, bits_per_sec: u64, max_backlog: Duration) {
+    set_capacity(ip, Capacity::Fixed(bits_per_sec), max_backlog);
+}
+
+/// Apply a capacity schedule to `ip`. Resets the schedule's clock.
+pub fn set_capacity(ip: IpAddr, capacity: Capacity, max_backlog: Duration) {
     limits().lock().expect("shaper limits poisoned").insert(
         ip,
         Limit {
-            bits_per_sec,
+            capacity,
             max_backlog,
+            since: None,
         },
     );
+}
+
+/// The link's capacity right now, in bits per second. `None` when unshaped.
+///
+/// This is the ground truth an assertion should compare against.
+pub fn capacity_at(ip: IpAddr, now: Instant) -> Option<u64> {
+    let mut guard = limits().lock().expect("shaper limits poisoned");
+    let limit = guard.get_mut(&ip)?;
+    let since = *limit.since.get_or_insert(now);
+    Some(
+        limit
+            .capacity
+            .bits_per_sec_at(now.saturating_duration_since(since)),
+    )
+}
+
+/// Whether `ip`'s capacity is a constant rather than a schedule.
+///
+/// An assertion phrased as "within X% of capacity" has no single referent on a ramp or an
+/// oscillation, so callers use this to refuse rather than silently compare against whatever the
+/// instantaneous value happened to be.
+pub fn capacity_is_fixed(ip: IpAddr) -> bool {
+    limits()
+        .lock()
+        .expect("shaper limits poisoned")
+        .get(&ip)
+        .is_some_and(|l| matches!(l.capacity, Capacity::Fixed(_)))
+}
+
+/// Observed link behaviour for `ip` since the last [`reset_stats`].
+pub fn stats(ip: IpAddr) -> Stats {
+    stats_map()
+        .lock()
+        .expect("shaper stats poisoned")
+        .get(&ip)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Clear observed behaviour so an assertion describes only the window just run.
+pub fn reset_stats() {
+    stats_map().lock().expect("shaper stats poisoned").clear();
 }
 
 /// Drop every configured limit. The registry is process-global, so a plan that sets limits must
 /// clear them or leak them into whatever runs next.
 pub fn clear() {
     limits().lock().expect("shaper limits poisoned").clear();
+    losses().lock().expect("shaper losses poisoned").clear();
+    stats_map().lock().expect("shaper stats poisoned").clear();
 }
 
-fn limit_for(ip: &IpAddr) -> Option<Limit> {
-    limits()
+/// Configure datagram loss for traffic sent to `ip`.
+///
+/// turmoil's `fail_rate` models a link partition and clears the link's in-flight queue. That is
+/// useful for outage tests, but it is not a packet-loss percentage. The simulator uses this
+/// bounded, deterministic model instead.
+pub fn set_packet_loss(ip: IpAddr, rate: f64) {
+    assert!(
+        (0.0..=1.0).contains(&rate),
+        "packet loss must be between 0 and 1"
+    );
+    set_loss(ip, Loss::Independent(rate));
+}
+
+pub fn set_loss(ip: IpAddr, loss: Loss) {
+    losses()
         .lock()
-        .expect("shaper limits poisoned")
+        .expect("shaper losses poisoned")
+        .insert(ip, loss);
+}
+
+fn loss_for(ip: &IpAddr) -> Loss {
+    losses()
+        .lock()
+        .expect("shaper losses poisoned")
         .get(ip)
         .copied()
+        .unwrap_or(Loss::NONE)
+}
+
+/// SplitMix64 gives a cheap, deterministic sequence without sharing an RNG between simulator
+/// tasks. Only used to sample loss, not for cryptographic purposes.
+fn next_uniform(counter: &mut u64) -> f64 {
+    let mut value = *counter;
+    *counter = counter.wrapping_add(1);
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^= value >> 31;
+    (value >> 11) as f64 / (1u64 << 53) as f64
 }
 
 struct Queued {
@@ -86,7 +300,9 @@ struct ShaperState {
     /// When the link to a destination next falls idle. The backlog is this minus now.
     next_free: HashMap<IpAddr, Instant>,
     queue: VecDeque<Queued>,
-    dropped: u64,
+    loss_counter: u64,
+    /// Gilbert-Elliott position per destination: true while in the bad state.
+    in_bad_state: HashMap<IpAddr, bool>,
 }
 
 /// What the caller should do with a packet offered to the shaper.
@@ -105,10 +321,16 @@ impl Shaper {
 
     /// Offer a packet to the bottleneck.
     pub fn offer(&mut self, now: Instant, dst: SocketAddr, buf: &[u8]) -> Shaped {
-        let Some(limit) = limit_for(&dst.ip()) else {
+        let Some(bits_per_sec) = capacity_at(dst.ip(), now) else {
             return Shaped::PassThrough;
         };
-        self.with(|st| st.offer(now, dst, buf, limit))
+        let max_backlog = limits()
+            .lock()
+            .expect("shaper limits poisoned")
+            .get(&dst.ip())
+            .map(|l| l.max_backlog)
+            .unwrap_or(DEFAULT_MAX_BACKLOG);
+        self.with(|st| st.offer(now, dst, buf, bits_per_sec, max_backlog))
     }
 
     /// Take every packet whose turn on the wire has come.
@@ -124,33 +346,80 @@ impl Shaper {
     pub fn is_empty(&self) -> bool {
         self.with(|st| st.queue.is_empty())
     }
+
+    /// Return whether the next datagram to `ip` should be dropped by the loss model.
+    pub fn should_drop_packet(&mut self, ip: IpAddr) -> bool {
+        let loss = loss_for(&ip);
+        let drop = self.with(|st| st.sample_loss(ip, loss));
+        if drop {
+            record(ip, |s| s.dropped_loss += 1);
+        }
+        drop
+    }
+}
+
+fn record(ip: IpAddr, f: impl FnOnce(&mut Stats)) {
+    let mut guard = stats_map().lock().expect("shaper stats poisoned");
+    f(guard.entry(ip).or_default());
 }
 
 impl ShaperState {
-    fn offer(&mut self, now: Instant, dst: SocketAddr, buf: &[u8], limit: Limit) -> Shaped {
+    fn sample_loss(&mut self, ip: IpAddr, loss: Loss) -> bool {
+        match loss {
+            Loss::Independent(rate) => {
+                if rate == 0.0 {
+                    return false;
+                }
+                next_uniform(&mut self.loss_counter) < rate
+            }
+            Loss::Burst {
+                to_bad,
+                to_good,
+                loss_in_good,
+                loss_in_bad,
+            } => {
+                let bad = *self.in_bad_state.entry(ip).or_insert(false);
+                let transition = next_uniform(&mut self.loss_counter);
+                let bad = if bad {
+                    transition >= to_good
+                } else {
+                    transition < to_bad
+                };
+                self.in_bad_state.insert(ip, bad);
+                let rate = if bad { loss_in_bad } else { loss_in_good };
+                next_uniform(&mut self.loss_counter) < rate
+            }
+        }
+    }
 
+    fn offer(
+        &mut self,
+        now: Instant,
+        dst: SocketAddr,
+        buf: &[u8],
+        bits_per_sec: u64,
+        max_backlog: Duration,
+    ) -> Shaped {
         // Serialisation delay: how long this packet occupies the link.
         let on_wire =
-            Duration::from_secs_f64((buf.len() as f64 * 8.0) / limit.bits_per_sec.max(1) as f64);
+            Duration::from_secs_f64((buf.len() as f64 * 8.0) / bits_per_sec.max(1) as f64);
 
         let idle_at = self.next_free.entry(dst.ip()).or_insert(now);
         // A link idle in the past is idle now; it does not accrue credit.
         let release_at = (*idle_at).max(now);
+        let backlog = release_at.saturating_duration_since(now);
 
-        if release_at.saturating_duration_since(now) > limit.max_backlog {
+        if backlog > max_backlog {
             // Buffer full. Tail drop, exactly as a bottleneck queue does.
-            self.dropped += 1;
-            if self.dropped.is_multiple_of(200) {
-                tracing::debug!(
-                    dropped = self.dropped,
-                    %dst,
-                    "shaper: bottleneck buffer overflowing"
-                );
-            }
+            record(dst.ip(), |s| s.dropped_overflow += 1);
             return Shaped::Absorbed;
         }
 
         *idle_at = release_at + on_wire;
+        record(dst.ip(), |s| {
+            s.delivered += 1;
+            s.max_backlog = s.max_backlog.max(backlog);
+        });
         self.queue.push_back(Queued {
             release_at,
             dst,
@@ -169,5 +438,82 @@ impl ShaperState {
             out.push((q.dst, q.buf));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ramp_interpolates_then_holds() {
+        let c = Capacity::Ramp {
+            from: 1_000_000,
+            to: 3_000_000,
+            over: Duration::from_secs(10),
+        };
+        assert_eq!(c.bits_per_sec_at(Duration::ZERO), 1_000_000);
+        assert_eq!(c.bits_per_sec_at(Duration::from_secs(5)), 2_000_000);
+        assert_eq!(c.bits_per_sec_at(Duration::from_secs(10)), 3_000_000);
+        assert_eq!(c.bits_per_sec_at(Duration::from_secs(60)), 3_000_000);
+    }
+
+    #[test]
+    fn oscillate_is_a_triangle_between_bounds() {
+        let c = Capacity::Oscillate {
+            min: 1_000_000,
+            max: 2_000_000,
+            period: Duration::from_secs(4),
+        };
+        assert_eq!(c.bits_per_sec_at(Duration::ZERO), 1_000_000);
+        assert_eq!(c.bits_per_sec_at(Duration::from_secs(2)), 2_000_000);
+        assert_eq!(c.bits_per_sec_at(Duration::from_secs(4)), 1_000_000);
+    }
+
+    /// The bad state has to persist across packets, otherwise "burst" loss is just independent
+    /// loss with extra steps - which is the whole reason this model exists.
+    #[test]
+    fn burst_loss_is_correlated() {
+        let mut st = ShaperState::default();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let loss = Loss::Burst {
+            to_bad: 0.05,
+            to_good: 0.2,
+            loss_in_good: 0.0,
+            loss_in_bad: 1.0,
+        };
+
+        let drops: Vec<bool> = (0..5000).map(|_| st.sample_loss(ip, loss)).collect();
+        let total: usize = drops.iter().filter(|d| **d).count();
+        assert!(total > 0, "expected some loss");
+
+        // Consecutive-drop runs longer than 1 are the signature of correlation; independent loss
+        // at this rate would essentially never produce them.
+        let runs = drops.windows(2).filter(|w| w[0] && w[1]).count();
+        assert!(
+            runs > total / 10,
+            "loss should arrive in runs, got {runs} adjacent pairs out of {total} drops"
+        );
+    }
+
+    #[test]
+    fn overflow_is_recorded_separately_from_configured_loss() {
+        clear();
+        let ip: IpAddr = "5.6.7.8".parse().unwrap();
+        let dst = SocketAddr::new(ip, 1234);
+        set_downlink_with_backlog(ip, 100_000, Duration::from_millis(50));
+
+        let mut shaper = Shaper::default();
+        let now = Instant::now();
+        // Far more than a 100kbps link can hold in 50ms of buffer.
+        for _ in 0..200 {
+            shaper.offer(now, dst, &[0u8; 1200]);
+        }
+
+        let s = stats(ip);
+        assert!(s.delivered > 0, "some packets should be queued");
+        assert!(s.dropped_overflow > 0, "the buffer should have overflowed");
+        assert_eq!(s.dropped_loss, 0, "no loss model was configured");
+        clear();
     }
 }

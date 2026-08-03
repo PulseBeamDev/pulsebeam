@@ -164,9 +164,14 @@ impl UdpTransportWriter {
             // Release anything whose turn has come before offering more, so the queue drains at
             // the shaped rate rather than all at once.
             for (dst, buf) in self.shaper.drain_due(now) {
-                let _ = self.sock.try_send_to(&buf, dst);
+                if !self.shaper.should_drop_packet(dst.ip()) {
+                    let _ = self.sock.try_send_to(&buf, dst);
+                }
             }
             if let Shaped::Absorbed = self.shaper.offer(now, batch.dst, batch.buf) {
+                return Ok(true);
+            }
+            if self.shaper.should_drop_packet(batch.dst.ip()) {
                 return Ok(true);
             }
         }
