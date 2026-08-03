@@ -27,6 +27,7 @@ pub struct AgentBuilder {
     tracks: Vec<TrackRequest>,
     local_ips: Vec<IpAddr>,
     tcp_server_addr: Option<SocketAddr>,
+    manual_sub: bool,
 }
 
 impl AgentBuilder {
@@ -37,6 +38,7 @@ impl AgentBuilder {
             tracks: Vec::new(),
             local_ips: Vec::new(),
             tcp_server_addr: None,
+            manual_sub: false,
         }
     }
 
@@ -91,6 +93,12 @@ impl AgentBuilder {
 
     pub fn with_tcp_server_addr(mut self, addr: SocketAddr) -> Self {
         self.tcp_server_addr = Some(addr);
+        self
+    }
+
+    /// Keep downstream slots unassigned until the application sends explicit subscriptions.
+    pub fn manual_subscriptions(mut self) -> Self {
+        self.manual_sub = true;
         self
     }
 
@@ -244,6 +252,7 @@ impl AgentBuilder {
             .create_participant(CreateParticipantRequest {
                 room_id: room_id.to_string(),
                 offer,
+                manual_sub: self.manual_sub,
             })
             .await?;
 
