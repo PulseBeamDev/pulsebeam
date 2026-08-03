@@ -42,6 +42,13 @@ test-unit:
 test-sim:
 	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-capture --test-threads 1 --no-fail-fast $(TEST)
 
+# Regenerate the committed scoreboard. Diff it to see a change's effect on every scenario at
+# once, rather than discovering days later that a fix for one wrecked another.
+bwe-baseline:
+	-$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-capture --test-threads 1 --no-fail-fast 2>&1 \
+		| python3 scripts/bwe-scoreboard.py > bwe-baseline.txt
+	@git --no-pager diff --stat bwe-baseline.txt || true
+
 test-sim-fast:
 	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator $(TEST)
 
