@@ -4,25 +4,18 @@
 //! tests on either side cannot cover: `desired` is computed by pulsebeam and consumed by str0m's
 //! probe controller, and the failure modes only appear once both are in the loop.
 
-use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
+use super::common::{
+    Capacity, LinkProfile, LocalNodeSim, Loss, Participant, Property, Room, Step, VideoQuality,
+};
 use std::time::Duration;
 
 /// Upgrading after a long stretch at low quality must not break the stream.
 ///
-/// pulsebeam derives `desired` from `stable_bitrate_bps`, an EWMA over the *measured* rate with
-/// a 30s fall constant and no lower bound, and only counts layers that are currently healthy and
-/// flowing. While a subscriber sits on a low layer the higher layers get paused
-/// (`StreamPaused rid=f`) and drop out of the sum entirely, so `desired` collapses. Since str0m
-/// caps every probe at `2 x desired` (`ProbeControl::queue_probe`), that starves the probe
-/// controller precisely when the subscriber asks for more.
-///
-/// With `AllocationEngine::requested_capacity` this holds up: reading the probe targets emitted
-/// in this sim (`RUST_LOG=str0m::bwe_::probe::control=trace`, target is `2 x desired`), `desired`
-/// stays at ~1.8 Mbps across the upgrade instead of decaying to ~600 kbps.
+/// This is an end-to-end anchor for the transition from a long low-quality period to an explicit
+/// upgrade request. It covers the allocator, BWE-facing demand, and forwarding path together.
 #[test]
 fn upgrade_after_long_low_quality_period_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
@@ -79,7 +72,6 @@ fn upgrade_after_long_low_quality_period_test() {
 #[test]
 fn subscriber_reaches_top_layer_on_fast_link_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
@@ -119,30 +111,11 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
 /// Spatial gating admitted only layers at or below the request, so the viewer was handed h=360 -
 /// visibly softer than it asked for - while f=720 sat unused on a link with ample room for it.
 ///
-/// # Why this is worth more than one tier of sharpness
-///
-/// `requested_capacity` values a subscription at the seed bitrate of the tallest *spatially
-/// allowed* layer, so rounding down also halves what the SFU asks BWE for: 400 kbps (Medium seed)
-/// instead of 1.25 Mbps (High). str0m probes at `2 x desired`, and a probe can only ever prove
-/// its own target, so the estimate pins just above the layer already in use with no headroom
-/// left. Production, a 1080p screen share against a 720p request:
-///
-/// ```text
-/// Probe queued kind=PeriodicAlr target_bps=800000   <- every probe, for the whole run
-/// BWE estimate updated estimate_bps=355072..702511
-/// ```
-///
-/// 800000 is exactly `2 x 400000`, and 400000 is exactly `LayerQuality::Medium.seed_bitrate_bps()`.
-/// The connection could never climb to the 1.25 Mbps `f` layer because it never asked to, and the
-/// margin left over the layer it did use was thin enough that VBR bursts paused the slot.
-///
-/// A second connection in the same log, whose request did admit `f`, sat at 3.8-4.7 Mbps
-/// throughout. The link was never the constraint.
+/// The ladder has no exact 540p tier, so the spatial assertion specifically guards the choice to
+/// round up to the smallest layer that satisfies the request.
 #[test]
 fn height_request_rounds_up_the_ladder_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
-        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
@@ -176,6 +149,131 @@ fn height_request_rounds_up_the_ladder_test() {
         ]);
 }
 
+/// A high-priority camera request must reclaim bandwidth from a lower-priority screen share.
+///
+/// Both slots start on a low request, then the camera is explicitly raised to 720p while the
+/// screen share remains a low-priority 180p subscription. The link can carry either the camera's
+/// top layer or both streams' current layers, but not both the camera upgrade and the retained
+/// screen layer. The priority contract is that the camera wins this contention; a lower-priority
+/// stream may pause rather than pin the camera at its middle layer.
+#[test]
+fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(2_750_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("screen"))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer starts both streams at low priority and height",
+                participant: "viewer",
+                targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Let the screen share become the retained co-tenant",
+                duration: Duration::from_secs(30),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer raises the camera to 720p with higher priority",
+                participant: "viewer",
+                targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Allow the allocator and BWE to apply the priority change",
+                duration: Duration::from_secs(60),
+            },
+            Step::CheckForwardedQualityReached {
+                description: "The high-priority camera reaches its top layer during contention",
+                origin: "camera",
+                min_quality: 3,
+            },
+        ]);
+}
+
+/// A one-layer screen share must recover after a temporary downlink collapse while a camera
+/// remains subscribed on the same viewer.
+#[test]
+fn screenshare_recovers_after_competing_camera_pause_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("screen"))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer asks for the camera and one-layer screen share",
+                participant: "viewer",
+                targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Warmup with enough capacity for both streams",
+                duration: Duration::from_secs(30),
+            },
+            Step::SetBandwidth {
+                description: "Temporary downlink collapse pauses the screen share",
+                participant: "viewer",
+                bits_per_sec: 1_200_000,
+            },
+            Step::Run {
+                description: "Let the allocator respond to the constrained link",
+                duration: Duration::from_secs(45),
+            },
+            Step::SetBandwidth {
+                description: "Viewer link recovers",
+                participant: "viewer",
+                bits_per_sec: 3_000_000,
+            },
+            Step::Run {
+                description: "Allow BWE and the allocator to recover the screen share",
+                duration: Duration::from_secs(90),
+            },
+            Step::Report {
+                description: "post-recovery state",
+                participant: "viewer",
+            },
+            // The defect named directly. The link recovered to 3 Mbps, drops nothing and holds
+            // only ~30ms of queue, so nothing about it justifies the estimate walking down. A
+            // controller may take time to re-discover capacity; it may not talk itself out of it.
+            Step::Expect {
+                description: "The estimate does not collapse on a link that recovered",
+                participant: "viewer",
+                property: Property::EstimateStable {
+                    max_drop_percent: 40,
+                },
+            },
+            Step::Expect {
+                description: "The estimate finds enough for what the allocator asked for",
+                participant: "viewer",
+                property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+            Step::Expect {
+                description: "Recovery is not bought with standing queue",
+                participant: "viewer",
+                property: Property::QueueingDelayBelow(Duration::from_millis(150)),
+            },
+            // The user-visible consequence of the above, kept because it is what a viewer
+            // actually experiences.
+            Step::CheckForwardedQuality {
+                description: "Screen share is not stranded after the link recovers",
+                origin: "screen",
+                min_quality: 3,
+            },
+        ]);
+}
+
 /// The real-world call: one screen share plus one camera, both directions live.
 ///
 /// This is the scenario from production that motivated the BWE work. Two participants each
@@ -203,7 +301,6 @@ fn height_request_rounds_up_the_ladder_test() {
 #[test]
 fn screenshare_and_camera_conference_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("screen").and_subscribes())
@@ -277,32 +374,13 @@ fn screenshare_and_camera_over_wifi_test() {
 
 /// The same call over mobile: ~50ms latency and 1% loss.
 ///
-/// # Known failure - reproduces a real defect, mechanism not yet pinned down
+/// A mobile path with 1% datagram loss must not make the camera disappear while the screen share
+/// is active. This is intentionally an end-to-end anchor: the BWE, loss monitor, allocator, and
+/// packet forwarding path all have to tolerate the same lossy conditions together.
 ///
-/// The camera direction collapses to ~9 kbps. What is established:
-///
-///   - **BWE is not the limiter.** It reports a healthy ~1.9 Mbps; the downstream log reads
-///     `bwe=1.937Mbit/s used=0bit/s want=2.000Mbit/s streams=BUU:PAUSE`. The stream is *paused*
-///     because the SFU marks the upstream layer unhealthy, not because of congestion control.
-///   - **Latency alone is fine.** With this exact profile and `loss: 0.0` the test passes with
-///     zero quality transitions. The failure needs real loss to seed it.
-///   - **The windows involved are tiny.** `StreamMonitor` logged `expected: 6, actual: 4` and
-///     `expected: 14, actual: 8` - 33% and 43%, both past `VIDEO_SEVERE_LOSS_THRESHOLD` (0.30),
-///     which transitions to Bad immediately with no confirmation window. `MIN_LOSS_EVIDENCE_PACKETS`
-///     is only 5, so two drops in one window are enough.
-///   - **Once Bad, no recovery was observed** - 4 `Good -> Bad` transitions and zero back.
-///
-/// What is *not* established: three isolated unit tests in `rtp/monitor.rs` -
-/// `loss_ratio_tracks_actual_loss_rate`, `..._with_reordering`, and
-/// `sparse_low_rate_stream_survives_occasional_loss` - all feed the estimator 1% loss under
-/// in-order, reordered, and sparse-window conditions, and all report correctly. So the sparse
-/// severe-threshold path above is a plausible trigger but is not on its own sufficient to
-/// reproduce the collapse; some interaction present in the full pipeline is still missing.
-///
-/// Do not "fix" this by loosening the assertion. The next step is to instrument
-/// `evaluate_quality_hysteresis` in a live sim run to capture the exact window that trips it.
+/// The simulator uses per-datagram loss here. turmoil's `fail_rate` is a link-partition model
+/// that clears in-flight packets, and is therefore unsuitable for a packet-loss profile.
 #[test]
-#[ignore = "known bug: upstream loss estimator over-reports ~1% loss as 21-35%, pausing the stream"]
 fn screenshare_and_camera_over_cellular_test() {
     conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 14, 2);
 }
@@ -324,7 +402,6 @@ fn conference_plan(
     allowed_missing_parameter_sets: u64,
 ) {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_link(link)
         .with_room(
             Room::new("room1")
@@ -429,7 +506,6 @@ fn conference_plan(
 #[test]
 fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
@@ -498,8 +574,6 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
 #[test]
 fn estimate_grows_to_fit_screenshare_and_camera_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
-        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
@@ -575,7 +649,6 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
 #[test]
 fn late_video_subscription_is_delivered_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
@@ -622,11 +695,8 @@ fn late_video_subscription_is_delivered_test() {
 /// Over a 60s window that is ~3.4 MB of media. Anything much beyond it is padding and probe
 /// traffic aimed at capacity the subscription cannot use.
 ///
-/// `desired` was not capped by intent. `run_desired` computes it correctly - `requested_capacity`
-/// is the seed of the tallest *spatially allowed* layer, so a 360p request yields ~470 kbps - but
-/// `BitrateController` then held the output far above it. Its job is to smooth the approach
-/// (`down_smoothing` 0.99, 200 kbps quantization, 250 kbps hysteresis, 300 kbps floor), and
-/// nothing bounded the result by what was actually wanted:
+/// `BitrateController` used to return its quantized, smoothed internal target even after the raw
+/// demand had fallen. That allowed a capped subscription to keep probing above what it could use:
 ///
 /// ```text
 /// raw_bps=472694  out_bps=800000  alloc_bps=449153
@@ -637,8 +707,6 @@ fn late_video_subscription_is_delivered_test() {
 #[test]
 fn capped_subscription_is_not_over_served_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
-        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
@@ -694,18 +762,12 @@ fn capped_subscription_is_not_over_served_test() {
 /// reached: the slot cycles `H(1.250Mbit/s)` -> `PAUSE(0bit/s)` -> `H(1.250Mbit/s)` as the layer
 /// dies and recovers.
 ///
-/// # What this does NOT prove, and why
+/// # What this does not prove
 ///
-/// It is not a guard for the estimate collapse in the production trace. Deleting the
-/// `requested_capacity` floor from `run_desired` - the fix that keeps `desired` alive while the
-/// layer is dead - leaves this plan passing.
-///
-/// The reason is the link. [`LinkProfile`] models latency and loss only; turmoil 0.7.2 offers no
-/// bandwidth limit at all (`min/max_message_latency`, `fail_rate`, and a *message-count*
-/// `udp_capacity` that changes nothing here, since both ends drain their socket every tick). With
-/// no capacity to saturate there is no queueing delay, so the delay-based estimate never falls -
-/// measured at 2.0-3.0 Mbps for the whole plan - and `limit_probe_bitrate` floors probe results at
-/// it. A starved probe simply cannot drag the estimate down here, however badly it under-delivers.
+/// This anchor proves recovery through a genuinely dead layer. [`LinkProfile`] models latency and
+/// loss only; bandwidth shaping is a separate simulator control. With no capacity to saturate
+/// there is no queueing delay, so the delay-based estimate does not model a constrained-link
+/// response here.
 ///
 /// Production is the opposite regime:
 ///
@@ -715,15 +777,12 @@ fn capped_subscription_is_not_over_served_test() {
 /// Link capacity estimate updated to 26.984kbit/s from probe
 /// ```
 ///
-/// Reproducing that needs a rate-limited link - a token bucket on the SFU-to-client path, which
-/// today would mean `AgentBuilder` accepting a socket trait rather than a concrete
-/// `turmoil::net::UdpSocket`. Until then, treat this as a regression guard on the *recovery path*
-/// through a genuinely dead layer, not on congestion control's response to a constrained link.
+/// Reproducing that needs a rate-limited link on the SFU-to-client path. Until then, treat this as
+/// a regression guard on the recovery path through a genuinely dead layer, not on congestion
+/// control's response to a constrained link.
 #[test]
 fn screenshare_recovers_full_quality_after_going_still_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
-        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::static_screensharer("presenter"))
@@ -782,8 +841,6 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
 #[test]
 fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
-        .with_link(LinkProfile::fiber())
         .with_bandwidth(3_000_000)
         .with_room(
             Room::new("room1")
@@ -819,6 +876,40 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
                 description: "The estimate finds the link's real capacity",
                 min_bps: 1_500_000,
             },
+            Step::Report {
+                description: "steady state",
+                participant: "bob",
+            },
+            // Measured here: 1.0% drawdown, 13.7ms of queue, no congestion loss, 100% media.
+            // The thresholds sit well clear of those so ordinary variation does not flake, but
+            // close enough that a real regression trips them.
+            //
+            // Deliberately *not* asserting utilisation or "tracks capacity": the 720p layer wants
+            // ~1.25 Mbps of a 3 Mbps link, so the estimate correctly settles near demand rather
+            // than near capacity. Asserting otherwise would encode a misunderstanding of what a
+            // delay-based estimator can measure.
+            Step::Expect {
+                description: "The estimate covers what the viewer asked for",
+                participant: "bob",
+                property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+            Step::Expect {
+                description: "A steady link produces a steady estimate",
+                participant: "bob",
+                property: Property::EstimateStable {
+                    max_drop_percent: 20,
+                },
+            },
+            Step::Expect {
+                description: "The link is not driven into its buffer",
+                participant: "bob",
+                property: Property::QueueingDelayBelow(Duration::from_millis(100)),
+            },
+            Step::Expect {
+                description: "Throughput is video, not overhead",
+                participant: "bob",
+                property: Property::MediaEfficiencyAtLeast(90),
+            },
         ]);
 }
 
@@ -827,25 +918,12 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
 /// The link starts at 500 kbps, which only affords `q`, then widens to 3 Mbps. The viewer asked
 /// for 720p throughout, so it has to find its way back to `f`.
 ///
-/// This is the shape of the production lock. `desired` is what str0m probes against - every probe
-/// targets `2 x desired` - so a subscription whose `desired` describes what is *currently
-/// flowing* rather than what it is entitled to can never demonstrate the capacity it would need
-/// to climb, and stays at low quality on a link that has long since recovered.
-///
-/// Note what this plan does *not* pin down. Deleting either guard against that - the
-/// `requested_capacity` floor in `run_desired`, or the seed floor in `stable_cost` - leaves it
-/// passing. Both draw on `snap(layer)`, which measures the *publisher's* upstream rate, and the
-/// simulated publisher keeps sending all three layers however the subscriber is doing. So `f`
-/// reads ~1.25 Mbps here no matter what, and `desired` cannot collapse. In production the
-/// publisher's own congestion control pauses layers, which is what removes `f` from the sum.
-/// Reaching that needs the publisher's *uplink* shaped as well - now possible via
-/// `Step::SetBandwidth` against `"server"`, since shaping is keyed by destination - and is the
-/// obvious next step.
+/// This is a rate-limited downlink recovery anchor: the viewer must move from the bottom layer to
+/// the requested top layer after its SFU egress recovers. It does not model publisher uplink
+/// congestion, because the simulator's publisher socket bypasses the SFU egress shaper.
 #[test]
 fn subscription_climbs_back_after_the_link_recovers_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_millis(1))
-        .with_link(LinkProfile::fiber())
         .with_bandwidth(500_000)
         .with_room(
             Room::new("room1")
@@ -867,13 +945,18 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
                 duration: Duration::from_secs(60),
             },
             Step::SetBandwidth {
-                description: "The link recovers to 3 Mbps",
+                description: "The viewer link recovers to 3 Mbps",
                 participant: "bob",
                 bits_per_sec: 3_000_000,
             },
             Step::Run {
-                description: "Give BWE room to re-discover the capacity",
-                duration: Duration::from_secs(60),
+                description: "Give the viewer BWE room to re-discover the capacity",
+                duration: Duration::from_secs(90),
+            },
+            Step::CheckForwardedQuality {
+                description: "Bob has actually climbed back to the top layer",
+                origin: "alice",
+                min_quality: 3,
             },
             Step::Run {
                 description: "Measurement window",
@@ -885,6 +968,183 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
                 description: "Bob is back on the 720p layer, not stranded below it",
                 participant: "bob",
                 min_bytes: 3_000_000,
+            },
+        ]);
+}
+
+/// A steady 720p subscription should mostly carry video, not retransmission and padding.
+///
+/// A production capture showed a viewer receiving 46 MB over ~190s to deliver only 15 MB of
+/// actual video - 54% overhead - with `packetsLost` and `nackCount` at zero throughout, which
+/// rules out real loss recovery. That pattern is small, numerous RTX packets standing in for
+/// padding: str0m's pacer drawing from the RTX cache rather than sending blanks.
+///
+/// This asserts the ratio directly rather than only asserting total bytes delivered, which the
+/// existing throughput tests do not distinguish from overhead - a connection could clear its byte
+/// floor while spending most of the link on retransmission, and no test would notice.
+#[test]
+fn steady_subscription_is_mostly_media_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for 720p on a link that comfortably carries it",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Warmup: let the ramp settle",
+                duration: Duration::from_secs(30),
+            },
+            Step::Run {
+                description: "Steady state",
+                duration: Duration::from_secs(60),
+            },
+            // Measured here: 54%. The floor is set at 45% - below the production ratio that
+            // motivated this test, so a regression toward that failure mode is still caught, but
+            // this is not yet a guard for a healthy majority-media stream. See the doc comment.
+            Step::CheckMediaEfficiency {
+                description: "Most of what Bob received was video, not overhead",
+                participant: "bob",
+                min_percent: 45,
+            },
+        ]);
+}
+
+/// Capacity that slides instead of stepping, which is what a real link does.
+///
+/// Every other plan changes bandwidth instantaneously. A controller can handle square waves and
+/// still misbehave on a gradual change: a slow decline gives the delay estimator a continuously
+/// moving target, and the failure mode is riding the queue down rather than backing off, which
+/// shows up as latency long before it shows up as throughput.
+///
+/// The capacity-relative properties deliberately refuse to run here — on a ramp "the capacity" is
+/// not one number — so this asserts the two that remain meaningful: the controller must not park
+/// in the bottleneck's buffer, and must not sustain congestion loss.
+#[test]
+fn estimate_follows_a_sliding_link_without_riding_the_queue_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for 720p",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Warmup at full capacity",
+                duration: Duration::from_secs(30),
+            },
+            Step::SetCapacity {
+                description: "The link slides down to 700 kbps over 40s",
+                participant: "bob",
+                capacity: Capacity::Ramp {
+                    from: 3_000_000,
+                    to: 700_000,
+                    over: Duration::from_secs(40),
+                },
+            },
+            Step::Run {
+                description: "Follow the decline",
+                duration: Duration::from_secs(50),
+            },
+            Step::Report {
+                description: "after the decline",
+                participant: "bob",
+            },
+            Step::Expect {
+                description: "The controller backs off rather than filling the buffer",
+                participant: "bob",
+                property: Property::QueueingDelayBelow(Duration::from_millis(180)),
+            },
+            Step::Expect {
+                description: "Backing off is not achieved by sustained congestion loss",
+                participant: "bob",
+                property: Property::CongestionLossBelow(5),
+            },
+        ]);
+}
+
+/// A link that breathes, plus wireless-style burst loss.
+///
+/// Oscillation and Gilbert-Elliott loss together are the closest thing here to a real congested
+/// Wi-Fi link: capacity moves continuously and loss arrives in correlated runs rather than spread
+/// evenly. Uniform loss at the same average rate is a materially easier problem, so a controller
+/// that only ever sees it is not tested against what it will actually meet.
+#[test]
+fn estimate_survives_an_oscillating_lossy_link_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(2_500_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for 720p",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Warmup on a steady link",
+                duration: Duration::from_secs(30),
+            },
+            Step::SetCapacity {
+                description: "Capacity breathes between 800 kbps and 2.5 Mbps every 20s",
+                participant: "bob",
+                capacity: Capacity::Oscillate {
+                    min: 800_000,
+                    max: 2_500_000,
+                    period: Duration::from_secs(20),
+                },
+            },
+            Step::SetLoss {
+                description: "Wi-Fi style burst loss",
+                participant: "bob",
+                loss: Loss::wifi(),
+            },
+            Step::Run {
+                description: "Ride the oscillation",
+                duration: Duration::from_secs(80),
+            },
+            Step::Report {
+                description: "after oscillating",
+                participant: "bob",
+            },
+            Step::Expect {
+                description: "Chasing a moving link does not park latency in the buffer",
+                participant: "bob",
+                property: Property::QueueingDelayBelow(Duration::from_millis(180)),
+            },
+            // Deliberately no media-efficiency assertion: this link drops packets, and that
+            // property is not a meaningful ratio under loss. See its doc comment.
+            Step::Expect {
+                description: "Riding an oscillating link does not sustain congestion loss",
+                participant: "bob",
+                property: Property::CongestionLossBelow(5),
             },
         ]);
 }

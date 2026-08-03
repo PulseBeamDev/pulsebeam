@@ -1,7 +1,9 @@
 pub mod client;
 pub mod harness;
 
-pub use harness::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
+pub use harness::{
+    Capacity, LinkProfile, LocalNodeSim, Loss, Participant, Property, Room, Step, VideoQuality,
+};
 
 use pulsebeam_runtime::net::UdpMode;
 use std::{

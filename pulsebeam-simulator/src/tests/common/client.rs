@@ -91,6 +91,11 @@ impl SimClientBuilder {
         self
     }
 
+    pub fn manual_subscriptions(mut self) -> Self {
+        self.agent_builder = self.agent_builder.manual_subscriptions();
+        self
+    }
+
     /// Inject a shared `VideoReceiveLog` so the harness can read it externally.
     /// If not called, `connect()` allocates a private one.
     pub fn with_video_rx(mut self, rx: Arc<Mutex<VideoReceiveLog>>) -> Self {
