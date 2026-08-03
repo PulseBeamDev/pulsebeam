@@ -26,7 +26,7 @@
 //! the space rather than covering it. It is still strictly more than one hand-picked point, and
 //! the seed makes anything it finds reproducible.
 
-use super::common::{LinkReport, LocalNodeSim, Participant, Room, Step};
+use super::common::{LinkReport, LocalNodeSim, Loss, Participant, Reorder, Room, Step};
 use proptest::prelude::*;
 use std::time::Duration;
 
@@ -40,6 +40,23 @@ struct Scenario {
     /// Height the viewer asks for, which decides how far up the ladder demand goes.
     target_height: u32,
     settle_secs: u64,
+    /// Faults layered on top of the link. Generated together rather than one at a time: real
+    /// paths present them at once, and the combinations are where a controller tuned against
+    /// each in isolation comes apart.
+    fault: Fault,
+}
+
+/// A path impairment applied for the life of the plan.
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    None,
+    /// Correlated loss, as wireless produces. Distinct from uniform loss at the same average.
+    BurstLoss,
+    /// Packets overtaken by their successors, which disturbs the delay signal and is separately
+    /// counted as loss by the receiver until the gap fills.
+    Reordering,
+    /// A total interruption partway through, which the connection survives.
+    Outage,
 }
 
 impl Scenario {
@@ -49,14 +66,69 @@ impl Scenario {
     /// fails to be delivered. That is what makes a claim about these networks meaningful: there
     /// is no legitimate excuse available to the controller.
     fn healthy() -> impl Strategy<Value = Scenario> {
-        (2_000_000u64..8_000_000, any::<bool>(), 0usize..3, 30u64..70).prop_map(
-            |(capacity_bps, screenshare, height_idx, settle_secs)| Scenario {
-                capacity_bps,
-                screenshare,
-                target_height: [180, 360, 720][height_idx],
-                settle_secs,
-            },
+        (
+            2_000_000u64..8_000_000,
+            any::<bool>(),
+            0usize..3,
+            30u64..70,
+            0usize..4,
         )
+            .prop_map(
+                |(capacity_bps, screenshare, height_idx, settle_secs, fault_idx)| Scenario {
+                    capacity_bps,
+                    screenshare,
+                    target_height: [180, 360, 720][height_idx],
+                    settle_secs,
+                    fault: [
+                        Fault::None,
+                        Fault::BurstLoss,
+                        Fault::Reordering,
+                        Fault::Outage,
+                    ][fault_idx],
+                },
+            )
+    }
+
+    /// Steps that apply the generated fault, placed after the link has settled so the plan is
+    /// measuring a controller meeting an impairment rather than starting inside one.
+    ///
+    /// The outage is bounded well under the point where ICE tears the session down. Past that it
+    /// is not an impairment but a lost session, which is a different failure with a different fix
+    /// and would leave these properties asserting whichever they happened to hit.
+    fn fault_steps(&self) -> Vec<Step> {
+        match self.fault {
+            Fault::None => vec![],
+            Fault::BurstLoss => vec![Step::SetLoss {
+                description: "Wireless-style burst loss",
+                participant: "viewer",
+                loss: Loss::wifi(),
+            }],
+            Fault::Reordering => vec![Step::SetReorder {
+                description: "Occasional out-of-order delivery",
+                participant: "viewer",
+                reorder: Reorder::occasional(),
+            }],
+            Fault::Outage => vec![
+                Step::Partition {
+                    description: "The viewer drops off the network",
+                    from: "viewer",
+                    to: "server",
+                },
+                Step::Run {
+                    description: "Ride out the outage",
+                    duration: Duration::from_secs(6),
+                },
+                Step::Repair {
+                    description: "The network returns",
+                    from: "viewer",
+                    to: "server",
+                },
+                Step::Run {
+                    description: "Re-establish flow",
+                    duration: Duration::from_secs(40),
+                },
+            ],
+        }
     }
 
     fn run(&self) -> LinkReport {
@@ -71,6 +143,29 @@ impl Scenario {
             _ => &[("publisher", 720)],
         };
 
+        let mut plan = vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Viewer subscribes",
+                participant: "viewer",
+                targets,
+            },
+            Step::Run {
+                description: "Settle",
+                duration: Duration::from_secs(self.settle_secs),
+            },
+        ];
+        plan.extend(self.fault_steps());
+        // A fresh window last, so every claim describes the state the plan arrives at rather
+        // than the disturbance on the way there.
+        plan.push(Step::Run {
+            description: "Measurement window",
+            duration: Duration::from_secs(30),
+        });
+
         let reports = LocalNodeSim::new()
             .with_bandwidth(self.capacity_bps)
             .with_room(
@@ -78,25 +173,7 @@ impl Scenario {
                     .with_participant(publisher)
                     .with_participant(Participant::multi_subscriber("viewer", 1)),
             )
-            .run_collecting(vec![
-                Step::Run {
-                    description: "Establish connection and discover the track",
-                    duration: Duration::from_secs(20),
-                },
-                Step::SubscribeTo {
-                    description: "Viewer subscribes",
-                    participant: "viewer",
-                    targets,
-                },
-                Step::Run {
-                    description: "Settle",
-                    duration: Duration::from_secs(self.settle_secs),
-                },
-                Step::Run {
-                    description: "Measurement window",
-                    duration: Duration::from_secs(30),
-                },
-            ]);
+            .run_collecting(plan);
         reports
             .get("viewer")
             .cloned()

@@ -5,7 +5,7 @@ use crate::tests::common::{
 };
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
-pub use pulsebeam_runtime::net::shaper::{Capacity, Loss};
+pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -426,6 +426,16 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         loss: Loss,
+    },
+    /// Configure packet reordering on a participant's downlink.
+    ///
+    /// Distinct from loss and from jitter: a reordered packet is overtaken by its successors, so
+    /// the receiver both sees disturbed inter-arrival spacing and counts an unfilled gap as lost.
+    /// A controller meets all three on a real path and responds to them differently.
+    SetReorder {
+        description: &'static str,
+        participant: &'static str,
+        reorder: Reorder,
     },
     /// Assert a [`Property`] of the run just completed.
     ///
@@ -962,6 +972,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::SetBandwidth { .. } => "SetBandwidth",
         Step::SetCapacity { .. } => "SetCapacity",
         Step::SetLoss { .. } => "SetLoss",
+        Step::SetReorder { .. } => "SetReorder",
         Step::Expect { .. } => "Expect",
         Step::Report { .. } => "Report",
         Step::CheckMediaEfficiency { .. } => "CheckMediaEfficiency",
@@ -1033,6 +1044,18 @@ async fn execute_plan(
                     *capacity,
                     Duration::from_millis(200),
                 );
+            }
+
+            Step::SetReorder {
+                description,
+                participant,
+                reorder,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {reorder:?})"
+                );
+                let ip = resolve(name_to_ip, participant, description)?;
+                pulsebeam_runtime::net::shaper::set_reorder(ip, *reorder);
             }
 
             Step::SetLoss {

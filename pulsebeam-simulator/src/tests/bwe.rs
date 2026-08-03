@@ -1314,3 +1314,91 @@ fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
             },
         ]);
 }
+
+/// A stream must come back after the network drops out entirely.
+///
+/// The most ordinary fault a call meets - a Wi-Fi blip, a handover, a walk past a lift - and
+/// until now the one condition no bandwidth plan exercised. Every other plan degrades the link;
+/// none of them takes it away.
+///
+/// An outage is the sharpest form of the deadlock the allocator guards against. Nothing is
+/// delivered, so no feedback arrives and the estimate cannot move; when the path returns there is
+/// no traffic to re-measure it with, and a controller that waits for evidence before sending will
+/// wait forever. The recovery is only observable because something breaks that circularity.
+///
+/// Deliberately measured after the repair, with the outage in its own window: what is claimed is
+/// that the stream returns, not that anything survived the outage itself. Recovery is complete
+/// rather than partial - measured at 3.0% off capacity with 1.5% drawdown, i.e. the estimate is
+/// re-established rather than merely climbing again.
+///
+/// # The length is load-bearing
+///
+/// Six seconds is a blip the peer connection survives. Fifteen does not: ICE gives up, the
+/// session is torn down, and the viewer records *no allocation passes at all* afterwards - not a
+/// degraded stream but no stream, permanently, because nothing here reconnects it. That is a
+/// different failure with a different fix (the client re-establishes the session; see
+/// `connectivity::reconnection_recovery_test`), and folding it in here would leave this asserting
+/// whichever of the two it happened to hit. This plan is about the congestion controller
+/// recovering across an interruption the transport lived through.
+#[test]
+fn a_stream_returns_after_a_total_outage_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for 720p",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Settle on a healthy link",
+                duration: Duration::from_secs(40),
+            },
+            Step::Partition {
+                description: "The viewer's network drops out entirely",
+                from: "bob",
+                to: "server",
+            },
+            Step::Run {
+                description: "Ride out the outage",
+                duration: Duration::from_secs(6),
+            },
+            Step::Repair {
+                description: "The network comes back",
+                from: "bob",
+                to: "server",
+            },
+            Step::Run {
+                description: "Reconnect and re-establish flow",
+                duration: Duration::from_secs(45),
+            },
+            // Fresh window, so the claims describe the recovered call rather than the outage.
+            Step::Run {
+                description: "Measurement window after recovery",
+                duration: Duration::from_secs(30),
+            },
+            Step::Report {
+                description: "after the outage",
+                participant: "bob",
+            },
+            Step::CheckForwardedQuality {
+                description: "The stream is being forwarded again",
+                origin: "alice",
+                min_quality: 3,
+            },
+            Step::Expect {
+                description: "The estimate recovers what the viewer needs",
+                participant: "bob",
+                property: Property::EstimateMeetsNeed { percent: 70 },
+            },
+        ]);
+}

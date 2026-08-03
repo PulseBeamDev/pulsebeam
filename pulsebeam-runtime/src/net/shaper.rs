@@ -144,6 +144,67 @@ fn limits() -> &'static Mutex<HashMap<IpAddr, Limit>> {
     LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How often a packet is delivered out of order, and by how much.
+///
+/// Reordering is not loss and must not be modelled as it. GCC reads the spacing between arrivals,
+/// so a packet arriving late behind its successors perturbs the delay signal directly; separately
+/// the receiver counts a gap it has not yet filled as lost, so reordering shows up twice, in two
+/// subsystems, with different time constants. A model that only drops cannot produce either
+/// effect.
+///
+/// Real paths reorder for real reasons - ECMP across unequal paths, a wireless retransmit, a
+/// queue serviced out of order - and it is common enough on the public internet that a controller
+/// which has never met it is untested against a normal condition.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Reorder {
+    /// Fraction of packets delayed behind their successors, 0.0..=1.0.
+    pub probability: f64,
+    /// How far back a reordered packet is pushed. Should exceed the gap between packets or the
+    /// packet lands in the same place and nothing is reordered at all.
+    pub delay: Duration,
+}
+
+impl Reorder {
+    pub const NONE: Reorder = Reorder {
+        probability: 0.0,
+        delay: Duration::ZERO,
+    };
+
+    /// A path that occasionally delivers late: 1% of packets held back by 30ms.
+    pub fn occasional() -> Self {
+        Self {
+            probability: 0.01,
+            delay: Duration::from_millis(30),
+        }
+    }
+}
+
+fn reorders() -> &'static Mutex<HashMap<IpAddr, Reorder>> {
+    static REORDERS: std::sync::OnceLock<Mutex<HashMap<IpAddr, Reorder>>> =
+        std::sync::OnceLock::new();
+    REORDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_reorder(ip: IpAddr, reorder: Reorder) {
+    assert!(
+        (0.0..=1.0).contains(&reorder.probability),
+        "reorder probability must be between 0 and 1"
+    );
+    reorders()
+        .lock()
+        .expect("shaper reorders poisoned")
+        .insert(ip, reorder);
+}
+
+fn reorder_for(ip: &IpAddr) -> Reorder {
+    reorders()
+        .lock()
+        .expect("shaper reorders poisoned")
+        .get(ip)
+        .copied()
+        .unwrap_or(Reorder::NONE)
+}
+
 fn losses() -> &'static Mutex<HashMap<IpAddr, Loss>> {
     static LOSSES: std::sync::OnceLock<Mutex<HashMap<IpAddr, Loss>>> = std::sync::OnceLock::new();
     LOSSES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -158,6 +219,8 @@ pub struct Stats {
     pub dropped_overflow: u64,
     /// Dropped by the configured loss model.
     pub dropped_loss: u64,
+    /// Delivered behind a packet that was offered after it.
+    pub reordered: u64,
     /// Deepest queue occupancy seen, as time. This is the bufferbloat measure - a controller that
     /// keeps the link full but the queue shallow is behaving well; one that drives 200ms of
     /// standing queue is not, even if throughput looks fine.
@@ -237,6 +300,7 @@ pub fn reset_stats() {
 pub fn clear() {
     limits().lock().expect("shaper limits poisoned").clear();
     losses().lock().expect("shaper losses poisoned").clear();
+    reorders().lock().expect("shaper reorders poisoned").clear();
     stats_map().lock().expect("shaper stats poisoned").clear();
 }
 
@@ -330,7 +394,8 @@ impl Shaper {
             .get(&dst.ip())
             .map(|l| l.max_backlog)
             .unwrap_or(DEFAULT_MAX_BACKLOG);
-        self.with(|st| st.offer(now, dst, buf, bits_per_sec, max_backlog))
+        let reorder = reorder_for(&dst.ip());
+        self.with(|st| st.offer(now, dst, buf, bits_per_sec, max_backlog, reorder))
     }
 
     /// Take every packet whose turn on the wire has come.
@@ -408,6 +473,7 @@ impl ShaperState {
         buf: &[u8],
         bits_per_sec: u64,
         max_backlog: Duration,
+        reorder: Reorder,
     ) -> Shaped {
         // Serialisation delay: how long this packet occupies the link.
         let on_wire =
@@ -429,11 +495,27 @@ impl ShaperState {
             s.delivered += 1;
             s.max_backlog = s.max_backlog.max(backlog);
         });
+
+        // Reordering is applied to the release time, not by shuffling the queue, so the packet
+        // genuinely leaves after ones offered behind it. Delaying it in place would only add
+        // jitter; the queue is re-sorted below so departure order actually changes.
+        let mut release_at = release_at;
+        if reorder.probability > 0.0 && next_uniform(&mut self.loss_counter) < reorder.probability {
+            release_at += reorder.delay;
+            record(dst.ip(), |s| s.reordered += 1);
+        }
+
         self.queue.push_back(Queued {
             release_at,
             dst,
             buf: buf.to_vec(),
         });
+        // `drain_due` releases from the front while the front is due, so the queue has to stay
+        // ordered by release time for a delayed packet to be overtaken rather than to hold up
+        // everything behind it - which would be a stall, not a reorder.
+        self.queue
+            .make_contiguous()
+            .sort_by_key(|q: &Queued| q.release_at);
         Shaped::Absorbed
     }
 
@@ -538,6 +620,51 @@ mod tests {
             shaper.is_empty(),
             "the burst should be fully released once its serialisation time has elapsed"
         );
+    }
+
+    /// A reordered packet must be *overtaken*, not merely delayed, and must not hold up the
+    /// packets behind it.
+    ///
+    /// The distinction is the whole point. Delaying a packet in place is jitter, and holding the
+    /// queue behind it is a stall - neither is reordering, and a controller responds to the three
+    /// quite differently.
+    #[test]
+    fn a_reordered_packet_is_overtaken_rather_than_stalling_the_queue() {
+        let ip: IpAddr = "9.9.9.10".parse().unwrap();
+        let dst = SocketAddr::new(ip, 1234);
+        set_downlink_with_backlog(ip, 10_000_000, Duration::from_secs(5));
+        // Every packet is pushed back, so ordering is decided purely by the delay.
+        set_reorder(
+            ip,
+            Reorder {
+                probability: 1.0,
+                delay: Duration::from_millis(50),
+            },
+        );
+
+        let mut shaper = Shaper::default();
+        let start = Instant::now();
+        // First packet is reordered; the rest are offered far enough behind that they overtake it.
+        shaper.offer(start, dst, &[0u8; 200]);
+        set_reorder(ip, Reorder::NONE);
+        for _ in 0..3 {
+            shaper.offer(start + Duration::from_millis(10), dst, &[0u8; 200]);
+        }
+
+        let early = shaper.drain_due(start + Duration::from_millis(20));
+        assert_eq!(
+            early.len(),
+            3,
+            "the three later packets should have overtaken the delayed one, not queued behind it"
+        );
+        assert!(
+            !shaper.is_empty(),
+            "the delayed packet should still be waiting for its turn"
+        );
+
+        let late = shaper.drain_due(start + Duration::from_millis(60));
+        assert_eq!(late.len(), 1, "the delayed packet should arrive afterwards");
+        assert_eq!(stats(ip).reordered, 1);
     }
 
     #[test]
