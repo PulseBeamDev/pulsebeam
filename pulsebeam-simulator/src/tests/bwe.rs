@@ -530,9 +530,17 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
                 description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
-            Step::CheckMinBwe {
-                description: "Estimate survives the static stretches",
-                min_bps: 2_000_000,
+            Step::Expect {
+                description: "The estimate survives the static stretches",
+                participant: "viewer",
+                property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+            Step::Expect {
+                description: "The estimate holds rather than decaying away",
+                participant: "viewer",
+                property: Property::EstimateStable {
+                    max_drop_percent: 25,
+                },
             },
             Step::CheckVideoQuality {
                 description: "Viewer renders the screen share cleanly throughout",
@@ -600,9 +608,17 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
             },
             // Well clear of the ~2.8 Mbps two `f` layers cost, so a regression that genuinely
             // starves the camera fails here rather than on the byte count below.
-            Step::CheckMinBwe {
-                description: "Estimate leaves room for both streams",
-                min_bps: 2_500_000,
+            Step::Expect {
+                description: "The estimate leaves room for both streams",
+                participant: "viewer",
+                property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+            Step::Expect {
+                description: "The estimate holds rather than decaying away",
+                participant: "viewer",
+                property: Property::EstimateStable {
+                    max_drop_percent: 25,
+                },
             },
             // The camera alone is 1.25 Mbps CBR, so 30s of it is ~4.7 MB. Anything near the
             // screen share's ~100 kbps VBR average on its own means the camera is missing.
@@ -739,10 +755,16 @@ fn capped_subscription_is_not_over_served_test() {
                 max_bytes: 4_000_000,
             },
             // Still actually receiving the layer, not starved into passing the cap.
-            Step::CheckRxBytesInterval {
-                description: "Bob still receives the 360p layer",
-                participant: "bob",
-                min_bytes: 3_000_000,
+            //
+            // Stated as the layer rather than a byte floor. The floor was 3,000,000 - 60s at the
+            // h layer's nominal 400 kbps - which left no margin for the encoder landing anywhere
+            // below nominal, and it measured 2,853,400 (~380 kbps). The behaviour was correct and
+            // the number was wrong, which is the failure mode of encoding a rate, a duration and
+            // a codec into one constant.
+            Step::CheckForwardedQuality {
+                description: "Bob is still on the 360p layer, not dropped to the bottom",
+                origin: "alice",
+                min_quality: 2,
             },
         ]);
 }
@@ -814,9 +836,17 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
                 participant: "viewer",
                 min_bytes: 1_400_000,
             },
-            Step::CheckMinBwe {
+            Step::Expect {
                 description: "The estimate survives the silence",
-                min_bps: 1_500_000,
+                participant: "viewer",
+                property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+            Step::Expect {
+                description: "The estimate holds rather than decaying away",
+                participant: "viewer",
+                property: Property::EstimateStable {
+                    max_drop_percent: 30,
+                },
             },
         ]);
 }
@@ -1009,13 +1039,22 @@ fn steady_subscription_is_mostly_media_test() {
                 description: "Steady state",
                 duration: Duration::from_secs(60),
             },
-            // Measured here: 54%. The floor is set at 45% - below the production ratio that
-            // motivated this test, so a regression toward that failure mode is still caught, but
-            // this is not yet a guard for a healthy majority-media stream. See the doc comment.
-            Step::CheckMediaEfficiency {
+            // Measured here: 99.9%. The old floor was 45%, chosen to sit below the 46% seen in
+            // the production capture - which made it unfailable, since nothing this side of a
+            // total collapse goes near it. It was also reading a metric that summed every
+            // subscriber's forwarded bytes over one viewer's received bytes.
+            //
+            // 90% is comfortably under what a healthy stream measures and far above the
+            // production failure, so it catches a regression toward that failure rather than
+            // merely recording it.
+            //
+            // Note this plan does *not* currently reproduce the production RTX flood: the SFU
+            // forwards essentially pure media here. Whatever produced 54% overhead in the capture
+            // is not yet modelled, so this guards the property rather than proving the fix.
+            Step::Expect {
                 description: "Most of what Bob received was video, not overhead",
                 participant: "bob",
-                min_percent: 45,
+                property: Property::MediaEfficiencyAtLeast(90),
             },
         ]);
 }

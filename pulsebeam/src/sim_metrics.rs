@@ -48,7 +48,8 @@ struct Samples {
     forwarded_quality: HashMap<String, u8>,
     /// Highest forwarded quality observed for each track origin since the last reset.
     max_forwarded_quality: HashMap<String, u8>,
-    /// Every downstream estimate, keyed by the *subscriber's* participant id.
+    /// Every downstream estimate as `(elapsed, estimate_bps, desired_bps)`, keyed by the
+    /// *subscriber's* participant id.
     ///
     /// Min/max/last collapse a trace into three numbers, which cannot distinguish an estimate
     /// that settled at capacity from one that touched it once and fell away, nor an estimate
@@ -57,7 +58,6 @@ struct Samples {
     ///
     /// Keyed per subscriber because capacity is configured per link: an assertion comparing an
     /// estimate against its link's capacity is meaningless if two subscribers' traces are mixed.
-    /// `(elapsed, estimate_bps, desired_bps)`.
     ///
     /// Demand is kept alongside the estimate because most interesting claims are relative to it.
     /// An estimate far below link capacity is correct when the application is only asking for a
