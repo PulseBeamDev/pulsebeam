@@ -45,10 +45,10 @@ fn upgrade_after_long_low_quality_period_test() {
                 description: "Allow BWE to probe up and the allocator to upgrade",
                 duration: Duration::from_secs(15),
             },
-            Step::CheckRxBytesInterval {
+            Step::CheckForwardedQuality {
                 description: "Bob is upgraded well past the lowest layer",
-                participant: "bob",
-                min_bytes: 1_500_000,
+                origin: "alice",
+                min_quality: 3,
             },
             Step::CheckVideoQuality {
                 description: "Frames stay renderable across the upgrade",
@@ -95,10 +95,10 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
                 description: "Measurement window",
                 duration: Duration::from_secs(15),
             },
-            Step::CheckRxBytesInterval {
+            Step::CheckForwardedQuality {
                 description: "Bob receives the top layer, not just the middle one",
-                participant: "bob",
-                min_bytes: 2_000_000,
+                origin: "alice",
+                min_quality: 3,
             },
         ]);
 }
@@ -139,12 +139,13 @@ fn height_request_rounds_up_the_ladder_test() {
                 description: "Measurement window",
                 duration: Duration::from_secs(30),
             },
-            // f is 1.25 Mbps, so 30s of it is ~4.7 MB; h is 400 kbps, ~1.5 MB. 3 MB cleanly
-            // separates "rounded up to f" from "rounded down to h".
-            Step::CheckRxBytesInterval {
+            // Stated as the layer rather than inferred from a byte count. Which rung was chosen
+            // is the entire question here, and the forwarded quality answers it directly instead
+            // of via a threshold that has to be re-derived whenever the ladder's rates change.
+            Step::CheckForwardedQuality {
                 description: "Viewer gets the 720p layer, not the 360p one",
-                participant: "viewer",
-                min_bytes: 3_000_000,
+                origin: "camera",
+                min_quality: 3,
             },
         ]);
 }
@@ -897,10 +898,10 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
             },
             // 30s of f is ~4.7 MB; of h, ~1.5 MB. 3 MB cleanly separates "reached the top layer"
             // from "stuck partway up the ladder".
-            Step::CheckRxBytesInterval {
+            Step::CheckForwardedQuality {
                 description: "Bob reaches the 720p layer rather than stalling below it",
-                participant: "bob",
-                min_bytes: 3_000_000,
+                origin: "alice",
+                min_quality: 3,
             },
             Step::CheckMinBwe {
                 description: "The estimate finds the link's real capacity",
