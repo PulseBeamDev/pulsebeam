@@ -17,7 +17,7 @@ tests::bwe::estimate_grows_to_fit_screenshare_and_camera_test
   [PASS]
   camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
   presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 4781993 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 308 samples | demand last 3762979 min 3476173 max 4143931 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 97.8%
+  viewer: capacity unshaped | received 4747945 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 309 samples | demand last 3373855 min 3217998 max 3553455 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 97.6%
 
 tests::bwe::estimate_survives_an_oscillating_lossy_link_test
   [PASS]
@@ -31,44 +31,47 @@ tests::bwe::height_request_rounds_up_the_ladder_test
 
 tests::bwe::high_priority_camera_reclaims_bandwidth_from_screenshare_test
   [PASS]
-  camera: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1311) | link loss 0 | media 0.0%
-  screen: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/250) | link loss 0 | media 0.0%
-  viewer: capacity 2750000 bps | utilisation 22.3% (4597475 B / ~20625000 B) | estimate last 1821647 min 862797 max 2449647 bps, worst drawdown 59.3%, 715 samples | demand last 3976946 min 3612442 max 4497041 bps | ends 33.8% off capacity | 80% at <s> | 90% never | queue max <ms> | congestion loss 0.00% (0/5421) | link loss 0 | media 97.2%
+  camera: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1294) | link loss 0 | media 0.0%
+  screen: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/192) | link loss 0 | media 0.0%
+  viewer: capacity 2750000 bps | utilisation 16.2% (3336718 B / ~20625000 B) | estimate last 1599911 min 858565 max 2374918 bps, worst drawdown 63.8%, 748 samples | demand last 3586798 min 3356235 max 3898758 bps | ends 41.8% off capacity | 80% at 0ns | 90% never | queue max <ms> | congestion loss 0.00% (0/4289) | link loss 0 | media 94.5%
 
 tests::bwe::late_video_subscription_is_delivered_test
   [PASS]
   camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
   presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 7266590 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 465 samples | demand last 4242370 min 3562830 max 4301243 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 98.1%
+  viewer: capacity unshaped | received 7309870 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 463 samples | demand last 3770932 min 3250686 max 3992885 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 97.6%
 
 tests::bwe::screenshare_and_camera_conference_test
   [PASS]
-  camera: capacity unshaped | received 786785 B | estimate last 3819489 min 3598254 max 3899521 bps, worst drawdown 6.6%, 496 samples | demand last 2404172 min 1985128 max 2499999 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 85.0%
-  screen: capacity unshaped | received 6949327 B | estimate last 3348926 min 2823401 max 3377745 bps, worst drawdown 2.4%, 496 samples | demand last 1636819 min 1468954 max 1887546 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.7%
+  camera: capacity unshaped | received 805737 B | estimate last 3859954 min 3278798 max 3862838 bps, worst drawdown 3.2%, 496 samples | demand last 2149730 min 1709164 max 2390341 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 83.0%
+  screen: capacity unshaped | received 6949327 B | estimate last 3348926 min 2823410 max 3377745 bps, worst drawdown 2.4%, 496 samples | demand last 1636819 min 1468954 max 1887546 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.7%
 
 tests::bwe::screenshare_and_camera_over_cellular_test
   [PASS]
-  camera: capacity unshaped | received 797830 B | estimate last 3711083 min 3524532 max 3815941 bps, worst drawdown 4.2%, 494 samples | demand last 2407325 min 1986881 max 2499999 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 75 | media 83.8%
-  screen: capacity unshaped | received 7241712 B | estimate last 3166976 min 2911835 max 3166976 bps, worst drawdown 4.9%, 497 samples | demand last 1652607 min 1529386 max 1803351 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 81 | media 95.6%
+  camera: capacity unshaped | received 842190 B | estimate last 3528744 min 3146975 max 3652118 bps, worst drawdown 4.9%, 499 samples | demand last 2150701 min 1709479 max 2392590 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 64 | media 79.4%
+  screen: capacity unshaped | received 7259590 B | estimate last 3118305 min 2637878 max 3118305 bps, worst drawdown 2.5%, 496 samples | demand last 1652295 min 1529775 max 1803350 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 93 | media 95.3%
 
 tests::bwe::screenshare_and_camera_over_wifi_test
   [PASS]
-  camera: capacity unshaped | received 800419 B | estimate last 3724852 min 3708270 max 3850477 bps, worst drawdown 3.3%, 494 samples | demand last 2404172 min 1985128 max 2499999 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 10 | media 83.5%
-  screen: capacity unshaped | received 7003325 B | estimate last 3153768 min 2751441 max 3181383 bps, worst drawdown 3.9%, 495 samples | demand last 1636820 min 1469298 max 1887547 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 10 | media 98.9%
+  camera: capacity unshaped | received 803531 B | estimate last 4000321 min 3209081 max 4000321 bps, worst drawdown 1.1%, 493 samples | demand last 2149730 min 1709164 max 2390341 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 7 | media 83.2%
+  screen: capacity unshaped | received 7020458 B | estimate last 3350051 min 2888583 max 3393266 bps, worst drawdown 1.4%, 494 samples | demand last 1636776 min 1469298 max 1887473 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 12 | media 98.7%
 
 tests::bwe::screenshare_recovers_after_competing_camera_pause_test
-  [FAIL]
+  [PASS]
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  screen: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 6.1% (2053757 B / ~33750000 B) | estimate last 2451992 min 805090 max 2451992 bps, worst drawdown 55.4%, 962 samples | demand last 2099165 min 1914008 max 2681403 bps | ends 18.3% off capacity | 80% at <s> | 90% never | queue max <ms> | congestion loss 0.00% (0/4019) | link loss 0 | media 95.8%
 
 tests::bwe::screenshare_recovers_full_quality_after_going_still_test
   [PASS]
   presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 1993416 B | estimate last 3511711 min 3062172 max 3950743 bps, worst drawdown 22.5%, 1648 samples | demand last 2436175 min 0 max 2499999 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 86.0%
+  viewer: capacity unshaped | received 2061765 B | estimate last 3100080 min 3007460 max 3727548 bps, worst drawdown 19.3%, 1654 samples | demand last 2458523 min 0 max 2491790 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 83.2%
 
 tests::bwe::static_screenshare_does_not_poison_bandwidth_estimate_test
   [PASS]
   camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
   presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 7899545 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 495 samples | demand last 4030842 min 3476173 max 4143931 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 97.7%
+  viewer: capacity unshaped | received 7882349 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 495 samples | demand last 3536773 min 3217998 max 3553455 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 97.8%
 
 tests::bwe::steady_subscription_is_mostly_media_test
   [PASS]
@@ -78,7 +81,7 @@ tests::bwe::steady_subscription_is_mostly_media_test
 tests::bwe::still_screenshare_does_not_talk_down_a_healthy_link_test
   [PASS]
   presenter: capacity 6000000 bps | utilisation 0.0% (0 B / ~45000000 B) | estimate: no allocation passes | queue max 96µs | congestion loss 0.00% (0/283) | link loss 0 | media 0.0%
-  viewer: capacity 6000000 bps | utilisation 2.1% (956850 B / ~45000000 B) | estimate last 3768254 min 3644776 max 3936265 bps, worst drawdown 6.2%, 622 samples | demand last 1995736 min 1985128 max 2499999 bps | ends 37.2% off capacity | 80% never | 90% never | queue max <ms> | congestion loss 0.00% (0/7010) | link loss 0 | media 87.8%
+  viewer: capacity 6000000 bps | utilisation 2.2% (985544 B / ~45000000 B) | estimate last 3690970 min 3360741 max 3690970 bps, worst drawdown 4.6%, 617 samples | demand last 1948945 min 1709164 max 2390341 bps | ends 38.5% off capacity | 80% never | 90% never | queue max <ms> | congestion loss 0.00% (0/6604) | link loss 0 | media 85.2%
 
 tests::bwe::subscriber_reaches_top_layer_on_a_rate_limited_link_test
   [PASS]

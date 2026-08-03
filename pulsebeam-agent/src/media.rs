@@ -207,6 +207,13 @@ pub struct VbrProfile {
     /// to zero - the production log shows the same layer at 1250 kbps and later at 729. Those
     /// steps are what an allocator has to stay stable across.
     pub idle_target_bps: u64,
+    /// How much of the gap to the current goal the declared target closes per frame.
+    ///
+    /// Chrome's `targetBitrate` climbs in visible steps rather than jumping - roughly 1.5 to 2.0
+    /// to 2.5 Mbps over a couple of seconds once a share becomes active. A two-state target would
+    /// cross every allocation boundary in one go and skip the intermediate values entirely, which
+    /// are exactly the ones that sit near a decision threshold.
+    pub target_step: f64,
 }
 
 impl VbrProfile {
@@ -226,6 +233,7 @@ impl VbrProfile {
             // The client's `detail` preset: one layer at 2.5 Mbps (see pulsebeam-js
             // libs/core/src/preset.ts, VIDEO_PRESETS.detail).
             declared_target_bps: 2_500_000,
+            target_step: 0.25,
             // Roughly the 729/1250 step seen in production.
             idle_target_bps: 1_460_000,
         }
@@ -244,8 +252,11 @@ impl VbrProfile {
     ///   degrading. A viewer sees the share vanish rather than soften.
     pub fn screenshare_detail() -> Self {
         Self {
-            // 15fps cap, per the client's detail preset.
-            active_fps: 15,
+            // Production peaks at 8fps, not the preset's 15 cap. `maintain-resolution` means the
+            // encoder sheds frames rather than pixels, so a screen share rarely reaches its
+            // configured ceiling: Chrome's framesPerSecond for a live 1080p share sits between 0
+            // and 8, spiky, with long stretches at zero.
+            active_fps: 8,
             ..Self::screenshare()
         }
     }
@@ -282,9 +293,27 @@ pub struct VbrLooper {
     small_index: usize,
     profile: VbrProfile,
     frame_times: Option<Vec<Duration>>,
+    /// Current declared target, moved toward its goal a step at a time.
+    declared_bps: f64,
 }
 
 impl VbrLooper {
+    /// Move the declared target toward whichever goal the content is currently at, and report it.
+    ///
+    /// The gap between this and what is actually on the wire is the whole point of declaring it.
+    /// A static screen sends almost nothing - a few kbps of near-empty frames - while remaining a
+    /// 2.5 Mbps layer the instant the user scrolls. No amount of measuring bytes recovers that,
+    /// which is why the sender says so directly.
+    fn step_target(&mut self, active: bool) -> u64 {
+        let goal = if active {
+            self.profile.declared_target_bps
+        } else {
+            self.profile.idle_target_bps
+        } as f64;
+        self.declared_bps += (goal - self.declared_bps) * self.profile.target_step;
+        self.declared_bps.round() as u64
+    }
+
     pub fn new(data: &[u8], profile: VbrProfile) -> Self {
         let asset = Arc::new(SharedH264Asset::new(data));
         let small: Vec<usize> = asset
@@ -301,6 +330,7 @@ impl VbrLooper {
             small_index: 0,
             profile,
             frame_times: None,
+            declared_bps: 0.0,
         }
     }
 
@@ -378,11 +408,9 @@ impl VbrLooper {
                     abs_capture_time: Some(crate::clock::capture_wallclock()),
                     contiguous: true,
                     is_keyframe: false,
-                    target_bitrate_bps: Some(if self.is_active(now.duration_since(start)) {
-                        self.profile.declared_target_bps
-                    } else {
-                        self.profile.idle_target_bps
-                    }),
+                    target_bitrate_bps: Some(
+                        self.step_target(self.is_active(now.duration_since(start))),
+                    ),
                     resolution: None,
                 };
                 if sender.send(frame).await.is_err() {
@@ -435,11 +463,7 @@ impl VbrLooper {
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
                 is_keyframe: false,
-                target_bitrate_bps: Some(if active {
-                    self.profile.declared_target_bps
-                } else {
-                    self.profile.idle_target_bps
-                }),
+                target_bitrate_bps: Some(self.step_target(active)),
                 resolution: None,
             };
 

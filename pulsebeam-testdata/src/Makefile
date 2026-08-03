@@ -8,9 +8,12 @@ INPUT_H264   = full_f_cbr.h264
 SCREENCAST   = screencast.mp4
 OUT_DIR      = .
 FPS          = 30
-SCREEN_FPS   = 15
+# Chrome caps detail at 15fps but a real share peaks near 8: maintain-resolution sheds frames
+# rather than pixels, so the ceiling is rarely reached.
+SCREEN_FPS   = 8
 SCREEN_IDLE_FPS = 0.5
-SCREEN_HEIGHT = 1056
+# Production screen shares are 1080p (Chrome reports frameHeight=1080, frameWidth=1920).
+SCREEN_HEIGHT = 1080
 SCREEN_BITRATE = 2500
 
 # Bitrates in kbps (GStreamer x264enc uses kbit/sec)
