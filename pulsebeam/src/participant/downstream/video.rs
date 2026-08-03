@@ -298,6 +298,28 @@ impl VideoAllocator {
             .max(self.current_allocation);
         debug_assert!(self.current_allocation <= desired);
 
+        // Observation for the simulator: the estimate and demand driving this pass, and the layer
+        // each origin is being forwarded at. No effect on production - the whole block compiles
+        // out without the `sim` feature.
+        #[cfg(feature = "sim")]
+        if !views.is_empty() {
+            crate::sim_metrics::record_downstream_bwe(
+                &self.ctx.participant_id.to_string(),
+                available_bandwidth.as_f64() as u64,
+                desired.as_f64() as u64,
+            );
+            for view in &views {
+                let quality = match decisions.get(view.key) {
+                    Some(AllocationDecision::Forward(layer, _)) => Some(layer.quality as u8),
+                    _ => None,
+                };
+                crate::sim_metrics::record_forwarded_quality(
+                    &view.track.meta.origin.to_string(),
+                    quality,
+                );
+            }
+        }
+
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
         for (key, decision) in &decisions {

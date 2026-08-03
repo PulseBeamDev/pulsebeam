@@ -271,6 +271,14 @@ impl ParticipantCore {
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::StreamCache>,
     ) {
+        // Observation for the simulator: media payload actually forwarded to this subscriber,
+        // to compare against what it received (i.e. how much of the link was video vs overhead).
+        // Compiles out without the `sim` feature.
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_forwarded_media(
+            &self.participant_id.to_string(),
+            pkt.payload.len() as u64,
+        );
         let promoted =
             self.downstream
                 .on_forward_rtp(stream_id, pkt, cache, &mut self.stream_writer);
