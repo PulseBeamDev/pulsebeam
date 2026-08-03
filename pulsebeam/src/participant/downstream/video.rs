@@ -2403,13 +2403,23 @@ mod allocation_tests {
         ]);
         let rank = |q: Option<LayerQuality>| q.map_or(0, |q| q as u8 as u32);
 
+        // Compared once settled, as the sweep found it. A single pass says nothing: the
+        // allocator promotes at most one slot per call, so mid-ramp snapshots are not comparable
+        // between two different estimates.
         let mut previous: Option<(u64, u32)> = None;
         for kbps in (200..=6000).step_by(100) {
-            let (qa, qb, _) = allocate(
-                bw(kbps),
-                (&camera, LayerQuality::Low),
-                (&share, LayerQuality::Low),
-            );
+            let estimate = bw(kbps);
+            let mut cur = (LayerQuality::Low, LayerQuality::Low);
+            let mut settled = (None, None);
+            for _ in 0..12 {
+                let (qa, qb, _) = allocate(estimate, (&camera, cur.0), (&share, cur.1));
+                settled = (qa, qb);
+                cur = (
+                    qa.unwrap_or(LayerQuality::Low),
+                    qb.unwrap_or(LayerQuality::Low),
+                );
+            }
+            let (qa, qb) = settled;
             let total = rank(qa) + rank(qb);
             if let Some((prev_kbps, prev_total)) = previous {
                 assert!(
@@ -2419,6 +2429,131 @@ mod allocation_tests {
                 );
             }
             previous = Some((kbps, total));
+        }
+    }
+
+    /// Preemption and re-admission can hand off to each other indefinitely.
+    ///
+    /// Three identical cameras, one at high priority, on a 500 kbps estimate. The allocation
+    /// never settles:
+    ///
+    ///     [low, low, -] -> [medium, -, -] -> [low, low, -] -> [medium, -, -] -> ...
+    ///
+    /// The mechanism is a loop between two mechanisms that are each reasonable alone. From
+    /// [low, low, -] the high-priority slot cannot afford its next tier outright, so preemption
+    /// reclaims the lower-priority tenant's allocation to fund it, giving [medium, -, -]. The
+    /// next pass recomputes from scratch: the reclaimed slot is re-admitted at its floor because
+    /// nothing remembers it was just dropped, which leaves only enough for the high-priority slot
+    /// to reach `low` - and the cycle restarts.
+    ///
+    /// This is the production flap in its purest form, and it needs no exotic ladders or narrow
+    /// bandwidth band to produce - three identical cameras will do. Each flip stops and restarts
+    /// two streams, so neither ever holds a layer long enough to decode.
+    ///
+    /// Found by the three-slot sweep, which is ignored for the same defect.
+    #[test]
+    #[ignore = "known defect: preemption and re-admission oscillate indefinitely"]
+    fn preemption_does_not_oscillate_with_a_reclaimed_tenant() {
+        let camera = build_track(&[
+            (LayerQuality::Low, 187_500),
+            (LayerQuality::Medium, 437_500),
+            (LayerQuality::High, 1_250_000),
+        ]);
+        let estimate = bw(500);
+
+        let mut cur = [LayerQuality::High; 3];
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let slots = sorted(vec![
+                qos_slot("a", 1080, 0, 200, &camera, cur[0]),
+                qos_slot("b", 1080, 0, 0, &camera, cur[1]),
+                qos_slot("c", 1080, 0, 0, &camera, cur[2]),
+            ]);
+            let decisions = AllocationEngine::compute(estimate, &slots);
+            let mut outcome = [None; 3];
+            for (idx, mid) in ["a", "b", "c"].iter().enumerate() {
+                let key = slots.iter().find(|s| s.mid == Mid::from(*mid)).unwrap().key;
+                outcome[idx] = forwarded_quality(&decisions, key);
+            }
+            seen.push(outcome);
+            for i in 0..3 {
+                cur[i] = outcome[i].unwrap_or(LayerQuality::Low);
+            }
+        }
+
+        let settled = *seen.last().unwrap();
+        assert!(
+            seen[seen.len() - 3..].iter().all(|o| *o == settled),
+            "allocation never settled; it cycled through {seen:?}. Each flip stops and restarts \
+             two streams, so neither holds a layer long enough to decode"
+        );
+    }
+
+    /// Three slots with mixed priorities, which is where contention actually bites.
+    ///
+    /// The two-slot sweep covers the arithmetic; this covers the interaction. Preemption only
+    /// engages with a lower-priority tenant to reclaim from, and the production report - a camera
+    /// raised above a screen share already holding the link - needs three parties to reproduce
+    /// faithfully: the one being raised, the one being reclaimed from, and a bystander that
+    /// should not be disturbed by either.
+    ///
+    /// Asserts only convergence, the invariant that holds regardless of policy. Which slot wins
+    /// under contention is a policy question with defensible answers; that the allocator stops
+    /// changing its mind is not.
+    #[test]
+    #[ignore = "known defect: preemption and re-admission oscillate indefinitely"]
+    fn allocation_converges_with_three_slots_and_mixed_priorities() {
+        let ladders = sweep_ladders();
+        let tracks: Vec<(&str, Track)> = ladders
+            .iter()
+            .map(|(name, rates)| (*name, build_track(rates)))
+            .collect();
+
+        // A high-priority request against two equal lower-priority tenants is the shape that
+        // triggers reclamation.
+        let priorities = [[200u32, 0, 0], [0, 200, 0], [10, 10, 10]];
+
+        for (name_a, track_a) in &tracks {
+            for (name_b, track_b) in &tracks {
+                for (name_c, track_c) in &tracks {
+                    for prio in priorities {
+                        for kbps in (300..=5000).step_by(200) {
+                            let estimate = bw(kbps);
+                            let mut cur = [LayerQuality::High; 3];
+                            let mut seen = Vec::new();
+
+                            for _ in 0..14 {
+                                let slots = sorted(vec![
+                                    qos_slot("a", 1080, 0, prio[0], track_a, cur[0]),
+                                    qos_slot("b", 1080, 0, prio[1], track_b, cur[1]),
+                                    qos_slot("c", 1080, 0, prio[2], track_c, cur[2]),
+                                ]);
+                                let decisions = AllocationEngine::compute(estimate, &slots);
+                                let mut outcome = [None; 3];
+                                for (idx, mid) in ["a", "b", "c"].iter().enumerate() {
+                                    let key = slots
+                                        .iter()
+                                        .find(|s| s.mid == Mid::from(*mid))
+                                        .unwrap()
+                                        .key;
+                                    outcome[idx] = forwarded_quality(&decisions, key);
+                                }
+                                seen.push(outcome);
+                                for i in 0..3 {
+                                    cur[i] = outcome[i].unwrap_or(LayerQuality::Low);
+                                }
+                            }
+
+                            let settled = *seen.last().unwrap();
+                            assert!(
+                                seen[seen.len() - 4..].iter().all(|o| *o == settled),
+                                "{name_a}+{name_b}+{name_c} at {kbps} kbps with priorities \
+                                 {prio:?} never settled; it cycled through {seen:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3175,41 +3310,50 @@ mod allocation_tests {
         );
     }
 
-    proptest! {
-        #[ignore]
-        #[test]
-        fn allocation_is_order_independent_for_equal_priority_slots(n in 2usize..=5) {
-            let t = healthy_track();
-            let low_bps = layer_bps(&t, LayerQuality::Low);
+    /// Equal priority must mean equal treatment, not "whoever sorts first".
+    ///
+    /// Replaces a test that reversed the slot list and called `compute` directly. `compute`
+    /// contractually takes priority-sorted input and `priority_order` tie-breaks by mid, so a
+    /// correctly sorted list is always in mid order - the reversed one tripped a debug_assert
+    /// before testing anything, and had been ignored long enough for that to go unnoticed. The
+    /// question it was asking was vacuous besides: sorting normalises the input, so the outcome
+    /// depends on the set by construction.
+    ///
+    /// This asks the question worth asking. Given several identical slots at equal priority and a
+    /// budget that covers some but not all of them, the allocator must serve as many as it can
+    /// afford rather than lavishing budget on the first and starving the rest.
+    #[test]
+    fn equal_priority_slots_are_served_as_widely_as_the_budget_allows() {
+        let track = build_track(&[
+            (LayerQuality::Low, 187_500),
+            (LayerQuality::Medium, 437_500),
+            (LayerQuality::High, 1_250_000),
+        ]);
 
-            // Budget just barely covers one Low layer.
-            let available = bw((low_bps as u64) / 1_000 + 1);
-            let priority = 720;
+        for n in 2..=4usize {
+            // Enough for every slot's lowest rung, with a little headroom - but nowhere near
+            // enough for anyone's top layer.
+            let budget_bps = 187_500 * n as u64 + 50_000;
+            let mids: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+            let slots = sorted(
+                mids.iter()
+                    .map(|m| qos_slot(m, 1080, 0, 0, &track, LayerQuality::Low))
+                    .collect(),
+            );
+            let decisions = AllocationEngine::compute(bw(budget_bps / 1000), &slots);
 
-            let mid_names: Vec<String> = (0..n).map(|i| format!("m{}", i)).collect();
-            let slots: Vec<SlotView> = mid_names
+            let served = slots
                 .iter()
-                .map(|name| slot(name, priority, &t, LayerQuality::Low))
-                .collect();
-
-            let decisions1 = AllocationEngine::compute(available, &slots);
-
-            // Reorder the input slots and verify outcome stays the same.
-            let mut reversed = slots.clone();
-            reversed.reverse();
-            let decisions2 = AllocationEngine::compute(available, &reversed);
-
-            prop_assert_eq!(decisions1.len(), decisions2.len());
-            for s in &slots {
-                prop_assert_eq!(
-                    decisions1.get(s.key),
-                    decisions2.get(s.key),
-                    "decisions differ for slot {} when input order changes",
-                    s.mid
-                );
-            }
+                .filter(|s| forwarded_quality(&decisions, s.key).is_some())
+                .count();
+            assert_eq!(
+                served, n,
+                "with {n} equal-priority slots and budget for all of them at their lowest rung, \
+                 only {served} were served; equal priority became a queue"
+            );
         }
     }
+
     // ─── Property: desired bitrate reflects the best healthy layer, not the
     //               forwarded layer ──────────────────────────────────────────────
     //
