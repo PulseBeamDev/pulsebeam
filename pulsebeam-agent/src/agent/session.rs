@@ -10,6 +10,8 @@ use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::watch;
+#[cfg(feature = "sim")]
+use tracing::Instrument;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -693,11 +695,20 @@ pub struct AgentRunner {
     connection: watch::Sender<ConnectionState>,
     publications: watch::Sender<Arc<HashMap<String, Publication>>>,
     publication_state: HashMap<String, Publication>,
+    /// Correlates agent-side str0m logs with the SFU peer in simulator traces.
+    #[cfg(feature = "sim")]
+    sim_span: tracing::Span,
 }
 
 impl AgentRunner {
     pub(crate) fn new(driver: AgentDriver) -> (Agent, Self) {
         let participant_id = driver.participant_id().clone();
+        #[cfg(feature = "sim")]
+        let sim_span = tracing::info_span!(
+            "peer",
+            participant_id = %participant_id,
+            ext_room_id = %driver.room_id()
+        );
         let commands = driver.command_sender();
         let (stats, stats_rx) = watch::channel(Arc::new(driver.stats().clone()));
         let (connection, connection_rx) = watch::channel(ConnectionState::Connecting);
@@ -719,12 +730,23 @@ impl AgentRunner {
                 connection,
                 publications,
                 publication_state: HashMap::new(),
+                #[cfg(feature = "sim")]
+                sim_span,
             },
         )
     }
 
     pub async fn run(mut self) -> Result<(), AgentError> {
-        while let Some(event) = self.driver.poll().await {
+        while let Some(event) = {
+            #[cfg(feature = "sim")]
+            {
+                self.driver.poll().instrument(self.sim_span.clone()).await
+            }
+            #[cfg(not(feature = "sim"))]
+            {
+                self.driver.poll().await
+            }
+        } {
             match event {
                 AgentEvent::StatsUpdated => {
                     self.stats

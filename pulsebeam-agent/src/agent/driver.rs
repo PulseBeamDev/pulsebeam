@@ -203,6 +203,7 @@ pub(crate) struct DriverInit {
     pub api: HttpApiClient,
     pub signaling_cid: ChannelId,
     pub resource_uri: Uri,
+    pub room_id: String,
     pub participant_id: String,
     pub medias: Vec<MediaAdded>,
 }
@@ -279,6 +280,7 @@ struct SubscriptionSubsystem {
 struct SessionSubsystem {
     api: HttpApiClient,
     resource_uri: Uri,
+    room_id: String,
     participant_id: String,
     disconnected_reason: Option<String>,
     retry_count: u32,
@@ -371,6 +373,7 @@ impl AgentDriver {
             session: SessionSubsystem {
                 api: init.api,
                 resource_uri: init.resource_uri,
+                room_id: init.room_id,
                 participant_id: init.participant_id,
                 disconnected_reason: None,
                 retry_count: 0,
@@ -398,6 +401,10 @@ impl AgentDriver {
 
     pub fn participant_id(&self) -> &ParticipantId {
         &self.session.participant_id
+    }
+
+    pub fn room_id(&self) -> &str {
+        &self.session.room_id
     }
 
     pub(crate) fn command_sender(&self) -> mailbox::Sender<OutgoingCommand> {
