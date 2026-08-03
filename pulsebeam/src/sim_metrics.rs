@@ -17,6 +17,9 @@
 //! Compiled only under the `sim` feature.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Downstream bandwidth estimate observations, since the last [`reset`].
 #[derive(Debug, Default, Clone)]
@@ -27,6 +30,37 @@ struct Samples {
     /// Number of allocation passes observed. Distinguishes "estimate stayed high" from
     /// "nothing was ever recorded", which would otherwise both satisfy a minimum.
     count: u64,
+    /// Media payload bytes the SFU handed to str0m for forwarding.
+    forwarded_media_bytes: u64,
+    /// Last-seen forwarded quality per track origin (the publisher's participant id, as a
+    /// string), across every subscriber and slot forwarding from that origin. 0 = paused, else
+    /// [`pulsebeam_core::simulcast::LayerQuality`] as its numeric rank (Low=1 .. High=3).
+    ///
+    /// Keyed by origin rather than by (subscriber, slot) because the failure this exists to
+    /// catch - a stream regressing even as bandwidth grows - is about the *publisher's* track,
+    /// and a test only needs "what is this origin's viewer(s) currently getting" to check it.
+    forwarded_quality: HashMap<String, u8>,
+    /// Highest forwarded quality observed for each track origin since the last reset.
+    max_forwarded_quality: HashMap<String, u8>,
+    /// Every downstream estimate, keyed by the *subscriber's* participant id.
+    ///
+    /// Min/max/last collapse a trace into three numbers, which cannot distinguish an estimate
+    /// that settled at capacity from one that touched it once and fell away, nor an estimate
+    /// that ramped in two seconds from one that took thirty. Both distinctions are the
+    /// difference between working and broken congestion control, so the whole series is kept.
+    ///
+    /// Keyed per subscriber because capacity is configured per link: an assertion comparing an
+    /// estimate against its link's capacity is meaningless if two subscribers' traces are mixed.
+    /// `(elapsed, estimate_bps, desired_bps)`.
+    ///
+    /// Demand is kept alongside the estimate because most interesting claims are relative to it.
+    /// An estimate far below link capacity is correct when the application is only asking for a
+    /// fraction of it - a delay-based estimator cannot measure bandwidth it is not using - so
+    /// "tracks capacity" is only a fair test under saturation. "Reached the lesser of what was
+    /// wanted and what the link had" is the claim that holds in both regimes.
+    bwe_series: HashMap<String, Vec<(Duration, u64, u64)>>,
+    /// Reference point for series timestamps, set on the first sample after a reset.
+    series_origin: Option<Instant>,
 }
 
 thread_local! {
@@ -34,8 +68,16 @@ thread_local! {
 }
 
 /// Record one downstream allocation pass. Called from the allocator's reporting path.
-pub fn record_downstream_bwe(bwe_bps: u64) {
+///
+/// `subscriber` is the participant whose downstream link this estimate describes.
+pub fn record_downstream_bwe(subscriber: &str, bwe_bps: u64, desired_bps: u64) {
+    let now = Instant::now();
     SAMPLES.with_borrow_mut(|s| {
+        let origin = *s.series_origin.get_or_insert(now);
+        s.bwe_series
+            .entry(subscriber.to_string())
+            .or_default()
+            .push((now.saturating_duration_since(origin), bwe_bps, desired_bps));
         s.min_bwe_bps = Some(match s.min_bwe_bps {
             Some(m) => m.min(bwe_bps),
             None => bwe_bps,
@@ -55,6 +97,49 @@ pub fn reset() {
     SAMPLES.with_borrow_mut(|s| *s = Samples::default());
 }
 
+/// Record media payload handed to str0m for forwarding.
+///
+/// Everything else that reaches the subscriber - RTX, padding, probe bursts, RTCP - is generated
+/// below this point, so comparing this against what the subscriber actually received measures how
+/// much of the link carried video rather than overhead. That is the quantity Chrome reports as
+/// `retransmittedBytesReceived` against `bytesReceived`, and a capture showing 54% of payload
+/// being retransmission with zero packet loss is the failure this exists to catch.
+pub fn record_forwarded_media(bytes: u64) {
+    SAMPLES.with_borrow_mut(|s| s.forwarded_media_bytes += bytes);
+}
+
+/// Media payload forwarded since [`reset`].
+pub fn forwarded_media_bytes() -> u64 {
+    SAMPLES.with_borrow(|s| s.forwarded_media_bytes)
+}
+
+/// Record the layer currently forwarded to a subscriber from `origin`'s track. `None` means the
+/// slot is paused. Called from every allocation pass, not only ones that change anything, so the
+/// last value always reflects the current steady state.
+pub fn record_forwarded_quality(origin: &str, quality: Option<u8>) {
+    let rank = quality.unwrap_or(0);
+    SAMPLES.with_borrow_mut(|s| {
+        s.forwarded_quality.insert(origin.to_string(), rank);
+        s.max_forwarded_quality
+            .entry(origin.to_string())
+            .and_modify(|max| *max = (*max).max(rank))
+            .or_insert(rank);
+    });
+}
+
+/// Last-seen forwarded quality rank for `origin` since [`reset`]. `None` if nothing was ever
+/// recorded for that origin (never subscribed, or reset before the first pass); `Some(0)` means
+/// paused.
+pub fn forwarded_quality(origin: &str) -> Option<u8> {
+    SAMPLES.with_borrow(|s| s.forwarded_quality.get(origin).copied())
+}
+
+/// Highest forwarded quality rank observed for `origin` since [`reset`]. `None` means no
+/// allocation pass recorded that origin during the window; `Some(0)` means it was only paused.
+pub fn max_forwarded_quality(origin: &str) -> Option<u8> {
+    SAMPLES.with_borrow(|s| s.max_forwarded_quality.get(origin).copied())
+}
+
 /// Downstream estimate summary since [`reset`]: `(min, max, last, sample_count)`.
 ///
 /// Returns `None` when nothing was recorded, so a test can tell an untested path from a healthy
@@ -62,4 +147,17 @@ pub fn reset() {
 /// pinned at one value across hundreds of passes is a different failure from one that dips.
 pub fn downstream_bwe_summary() -> Option<(u64, u64, u64, u64)> {
     SAMPLES.with_borrow(|s| Some((s.min_bwe_bps?, s.max_bwe_bps?, s.last_bwe_bps?, s.count)))
+}
+
+/// Full estimate trace for one subscriber since [`reset`], as `(elapsed, estimate, desired)`.
+///
+/// Empty when that subscriber ran no allocation passes in the window, which a caller should
+/// treat as "untested" rather than "passed".
+pub fn bwe_series(subscriber: &str) -> Vec<(Duration, u64, u64)> {
+    SAMPLES.with_borrow(|s| s.bwe_series.get(subscriber).cloned().unwrap_or_default())
+}
+
+/// Subscribers that recorded at least one estimate since [`reset`].
+pub fn bwe_subscribers() -> Vec<String> {
+    SAMPLES.with_borrow(|s| s.bwe_series.keys().cloned().collect())
 }

@@ -341,7 +341,11 @@ impl VideoAllocator {
         // configured floor - folding that into a minimum would swamp the signal we care about.
         #[cfg(feature = "sim")]
         if !views.is_empty() {
-            crate::sim_metrics::record_downstream_bwe(available_bandwidth.as_f64() as u64);
+            crate::sim_metrics::record_downstream_bwe(
+                &self.ctx.participant_id.to_string(),
+                available_bandwidth.as_f64() as u64,
+                desired.as_f64() as u64,
+            );
         }
 
         if changed {
