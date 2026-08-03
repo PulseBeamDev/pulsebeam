@@ -26,6 +26,10 @@ use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{Direction, MediaAdded, MediaKind, Mid, Rid};
 use str0m::rtp::AbsCaptureTime;
+use str0m::rtp::vla::{
+    ResolutionAndFramerate, SimulcastStreamAllocation, SpatialLayerAllocation,
+    TemporalLayerAllocation, VideoLayersAllocation,
+};
 use str0m::{
     Event, Input, Output, Rtc,
     net::{Protocol, Receive},
@@ -708,6 +712,34 @@ impl AgentDriver {
                     };
                     if let Some(rid) = e.rid {
                         writer = writer.rid(rid);
+                    }
+                    // Declare what this layer costs, so the SFU allocates against the encoder's
+                    // own target rather than against however many bytes happened to go out. The
+                    // two disagree sharply for screen content: a still desktop encodes almost
+                    // nothing while remaining a full-rate layer the instant anyone scrolls.
+                    if let Some(target_bps) = e.frame.target_bitrate_bps {
+                        let resolution_and_framerate =
+                            e.frame.resolution.map(|(width, height, framerate)| {
+                                ResolutionAndFramerate {
+                                    width,
+                                    height,
+                                    framerate,
+                                }
+                            });
+                        writer = writer.user_extension_value(VideoLayersAllocation {
+                            current_simulcast_stream_index: 0,
+                            simulcast_streams: vec![SimulcastStreamAllocation {
+                                spatial_layers: vec![SpatialLayerAllocation {
+                                    // One temporal layer: the cumulative figure is simply the
+                                    // layer's target. Temporal structure is not modelled here and
+                                    // nothing downstream reads it.
+                                    temporal_layers: vec![TemporalLayerAllocation {
+                                        cumulative_kbps: target_bps / 1000,
+                                    }],
+                                    resolution_and_framerate,
+                                }],
+                            }],
+                        });
                     }
                     if let Some(abs_capture_time) = e.frame.abs_capture_time {
                         writer = writer.abs_capture_time(AbsCaptureTime {

@@ -139,6 +139,11 @@ impl H264Looper {
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
                 is_keyframe: false,
+                // A constant-rate source has nothing to declare beyond what it is sending, so
+                // leave VLA off and let the SFU measure. That is also the pre-VLA path, which is
+                // worth still exercising: not every sender emits the extension.
+                target_bitrate_bps: None,
+                resolution: None,
             };
 
             if sender.send(frame).await.is_err() {
@@ -189,19 +194,19 @@ pub struct VbrProfile {
     /// captured from a real screen share still has a frame every second or two, which never
     /// reaches that regime.
     pub loop_idle: Duration,
-    /// Multiplier on every frame's size, leaving its timing alone.
+    /// What the encoder declares this layer will cost, in bits per second.
     ///
-    /// The fixture is one capture at one bitrate, but the client configures screen share and
-    /// camera at quite different rates - 2.5 Mbps against 1.25 - and the difference matters:
-    /// allocation decisions turn on what a layer *costs*, so a source at half the real rate
-    /// cannot reach the states production reaches.
+    /// Sent as a Video Layers Allocation, and the reason it exists separately from the frames is
+    /// that the two genuinely disagree: a still screen encodes almost nothing while still being a
+    /// 2.5 Mbps layer the moment anyone scrolls. The SFU cannot infer that from bytes on the
+    /// wire, so the sender declares it.
+    pub declared_target_bps: u64,
+    /// What the declared target falls to while the content is static.
     ///
-    /// Scaling the payload rather than re-encoding is sound because nothing under test decodes
-    /// it. The SFU forwards opaque bytes and measures their size and arrival time, which is
-    /// exactly what is being scaled. What it preserves is the part that would be hard to
-    /// synthesise: the real cadence of a desktop being used, including the ragged distribution of
-    /// frame sizes within a burst.
-    pub bitrate_scale: f64,
+    /// Real encoders step their target down when there is nothing to send rather than dropping it
+    /// to zero - the production log shows the same layer at 1250 kbps and later at 729. Those
+    /// steps are what an allocator has to stay stable across.
+    pub idle_target_bps: u64,
 }
 
 impl VbrProfile {
@@ -218,7 +223,11 @@ impl VbrProfile {
             // Small enough to land in a single sub-MTU RTP packet, as a near-empty P-frame does.
             idle_max_frame_bytes: 300,
             loop_idle: Duration::from_millis(500),
-            bitrate_scale: 1.0,
+            // The client's `detail` preset: one layer at 2.5 Mbps (see pulsebeam-js
+            // libs/core/src/preset.ts, VIDEO_PRESETS.detail).
+            declared_target_bps: 2_500_000,
+            // Roughly the 729/1250 step seen in production.
+            idle_target_bps: 1_460_000,
         }
     }
 
@@ -237,7 +246,6 @@ impl VbrProfile {
         Self {
             // 15fps cap, per the client's detail preset.
             active_fps: 15,
-            bitrate_scale: 2.0,
             ..Self::screenshare()
         }
     }
@@ -254,27 +262,6 @@ impl VbrProfile {
             ..Self::screenshare()
         }
     }
-}
-
-/// Resize a frame to `scale` times its captured size, preserving its timing.
-///
-/// Padding with zeroes rather than re-encoding: nothing under test decodes the payload, so what
-/// matters is that a layer costs what the client configures it to cost. Shrinking truncates,
-/// which keeps the relative sizes within a burst intact - the ragged distribution that decides
-/// what a probe finds in the RTX cache.
-fn scale_frame(frame: &Arc<[u8]>, scale: f64) -> Arc<[u8]> {
-    if (scale - 1.0).abs() < f64::EPSILON {
-        return Arc::clone(frame);
-    }
-    let target = ((frame.len() as f64) * scale).round() as usize;
-    let mut out = Vec::with_capacity(target);
-    if target <= frame.len() {
-        out.extend_from_slice(&frame[..target]);
-    } else {
-        out.extend_from_slice(frame);
-        out.resize(target, 0);
-    }
-    Arc::from(out)
 }
 
 /// An [`H264Looper`] whose output follows a [`VbrProfile`], approximating a VBR encoder.
@@ -386,11 +373,17 @@ impl VbrLooper {
                     ts: MediaTime::from_90khz(
                         (now.duration_since(start).as_secs_f64() * clock_rate) as u64,
                     ),
-                    data: scale_frame(&self.asset.frames[index], self.profile.bitrate_scale),
+                    data: self.asset.frames[index].clone(),
                     capture_time: now,
                     abs_capture_time: Some(crate::clock::capture_wallclock()),
                     contiguous: true,
                     is_keyframe: false,
+                    target_bitrate_bps: Some(if self.is_active(now.duration_since(start)) {
+                        self.profile.declared_target_bps
+                    } else {
+                        self.profile.idle_target_bps
+                    }),
+                    resolution: None,
                 };
                 if sender.send(frame).await.is_err() {
                     return;
@@ -442,6 +435,12 @@ impl VbrLooper {
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
                 is_keyframe: false,
+                target_bitrate_bps: Some(if active {
+                    self.profile.declared_target_bps
+                } else {
+                    self.profile.idle_target_bps
+                }),
+                resolution: None,
             };
 
             if sender.send(frame).await.is_err() {
