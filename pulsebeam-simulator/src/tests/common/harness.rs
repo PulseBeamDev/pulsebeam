@@ -1899,9 +1899,14 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
                 drawdown = drawdown.max((peak - *bps as f64) / peak * 100.0);
             }
         }
+        // Demand alongside the estimate: the probe target is derived from it, so a demand that
+        // collapses drags the estimate down with it regardless of what the link can carry.
+        let d_last = series.last().expect("non-empty").2;
+        let d_min = series.iter().map(|(_, _, d)| *d).min().unwrap_or(0);
+        let d_max = series.iter().map(|(_, _, d)| *d).max().unwrap_or(0);
         out.push_str(&format!(
             " | estimate last {last} min {min} max {max} bps, worst drawdown {drawdown:.1}%, \
-             {} samples",
+             {} samples | demand last {d_last} min {d_min} max {d_max} bps",
             series.len()
         ));
 
