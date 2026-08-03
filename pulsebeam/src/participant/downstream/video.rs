@@ -919,13 +919,24 @@ impl AllocationEngine {
             .expect("track has at least one layer")
     }
 
-    /// Whether a layer is permitted by the client's spatial request. The
-    /// ceiling is raised to the track's shortest layer height so a track
-    /// whose layers are all taller than `max_height` (e.g. screen-share
-    /// simulcast tiers that only differ in fps) still has something eligible
-    /// instead of every layer being rejected.
+    /// Whether a layer is permitted by the client's spatial request.
+    ///
+    /// A request that falls between two tiers is satisfied by rounding *up*, not down: a viewer
+    /// asking for 540p on a q/h/f (180/360/720) ladder should be handed 720p, not the softer
+    /// 360p. The ceiling is therefore the smallest layer height at or above the request, which
+    /// also subsumes the all-taller-layers case (e.g. screen-share tiers that only differ in fps)
+    /// - the smallest layer is always eligible rather than every layer being rejected.
     fn spatially_allowed(&self, slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        self.height(layer) <= slot.max_height.max(self.min_track_height(slot.track))
+        let request = slot.max_height.max(self.min_track_height(slot.track));
+        let ceiling = slot
+            .track
+            .layers
+            .iter()
+            .map(|l| self.height(l))
+            .filter(|&h| h >= request)
+            .min()
+            .unwrap_or(request);
+        self.height(layer) <= ceiling
     }
 
     /// Whether a layer may currently be forwarded or switched into.
