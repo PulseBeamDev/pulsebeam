@@ -603,6 +603,11 @@ impl ParticipantCore {
         // str0m derives Sender Report and TWCC timing from this instant, so it
         // must be when the packet is handed over — not when it arrived. A switch
         // replays cached packets whose arrival is already in the past.
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_forwarded_media(
+            &self.participant_id.to_string(),
+            pkt.payload.len() as u64,
+        );
         let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,

@@ -30,8 +30,14 @@ struct Samples {
     /// Number of allocation passes observed. Distinguishes "estimate stayed high" from
     /// "nothing was ever recorded", which would otherwise both satisfy a minimum.
     count: u64,
-    /// Media payload bytes the SFU handed to str0m for forwarding.
-    forwarded_media_bytes: u64,
+    /// Media payload bytes the SFU handed to str0m for forwarding, keyed by the *subscriber*
+    /// receiving them.
+    ///
+    /// Per subscriber because the only use is comparing it against what one participant received.
+    /// A single total is not merely imprecise with several subscribers, it is meaningless: a
+    /// two-viewer plan measured 1024% "efficiency", being everyone's forwarded bytes over one
+    /// viewer's received bytes.
+    forwarded_media_bytes: HashMap<String, u64>,
     /// Last-seen forwarded quality per track origin (the publisher's participant id, as a
     /// string), across every subscriber and slot forwarding from that origin. 0 = paused, else
     /// [`pulsebeam_core::simulcast::LayerQuality`] as its numeric rank (Low=1 .. High=3).
@@ -104,13 +110,22 @@ pub fn reset() {
 /// much of the link carried video rather than overhead. That is the quantity Chrome reports as
 /// `retransmittedBytesReceived` against `bytesReceived`, and a capture showing 54% of payload
 /// being retransmission with zero packet loss is the failure this exists to catch.
-pub fn record_forwarded_media(bytes: u64) {
-    SAMPLES.with_borrow_mut(|s| s.forwarded_media_bytes += bytes);
+pub fn record_forwarded_media(subscriber: &str, bytes: u64) {
+    SAMPLES.with_borrow_mut(|s| {
+        *s.forwarded_media_bytes
+            .entry(subscriber.to_string())
+            .or_default() += bytes
+    });
 }
 
 /// Media payload forwarded since [`reset`].
-pub fn forwarded_media_bytes() -> u64 {
-    SAMPLES.with_borrow(|s| s.forwarded_media_bytes)
+pub fn forwarded_media_bytes(subscriber: &str) -> u64 {
+    SAMPLES.with_borrow(|s| {
+        s.forwarded_media_bytes
+            .get(subscriber)
+            .copied()
+            .unwrap_or(0)
+    })
 }
 
 /// Record the layer currently forwarded to a subscriber from `origin`'s track. `None` means the

@@ -591,6 +591,18 @@ impl ParticipantHandle {
         self.shared.video_rx.lock().unwrap().clone()
     }
 
+    /// The SFU-side participant id, once connected. Keys the per-subscriber metrics.
+    fn participant_id(&self) -> Option<String> {
+        self.shared.participant_id.lock().unwrap().clone()
+    }
+
+    /// Media payload the SFU forwarded *to this participant* in the current window.
+    fn forwarded_media(&self) -> u64 {
+        self.participant_id()
+            .map(|id| pulsebeam::sim_metrics::forwarded_media_bytes(&id))
+            .unwrap_or(0)
+    }
+
     fn snapshot_interval(&mut self) {
         self.interval_tx_baseline = self.tx_bytes();
         self.interval_rx_baseline = self.rx_bytes();
@@ -1474,7 +1486,7 @@ async fn execute_plan(
                 );
                 let handle = get_handle(handles, participant, description)?;
                 let received = handle.rx_bytes();
-                let forwarded = pulsebeam::sim_metrics::forwarded_media_bytes();
+                let forwarded = handle.forwarded_media();
                 assert!(
                     received > 0,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  nothing was received, so the ratio would be meaningless"
@@ -1842,7 +1854,7 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
     let received = handle
         .rx_bytes()
         .saturating_sub(handle.interval_rx_baseline);
-    let forwarded = pulsebeam::sim_metrics::forwarded_media_bytes();
+    let forwarded = handle.forwarded_media();
 
     let series = handle
         .shared
@@ -2072,7 +2084,7 @@ fn check_property(
             if received == 0 {
                 return Err("nothing was received, so the ratio would be meaningless".to_string());
             }
-            let forwarded = pulsebeam::sim_metrics::forwarded_media_bytes();
+            let forwarded = handle.forwarded_media();
             let got = pct(forwarded as f64, received as f64);
             if got < min as f64 {
                 return Err(format!(
@@ -2116,6 +2128,20 @@ pub struct LinkProfile {
     /// Fraction of SFU-egress datagrams dropped outright, 0.0..=1.0.
     pub loss: f64,
     /// Downlink capacity per participant, in bits per second. `None` leaves the path unlimited.
+    ///
+    /// **Only set this when the rate is meant to bind.** The shaper releases queued packets on
+    /// the next send attempt, so release is quantised to event-loop iterations. When the shaped
+    /// rate is the dominant delay that quantisation is lost in the serialisation delay and the
+    /// model is sound; on a link fast enough that serialisation is negligible it becomes the
+    /// largest source of inter-packet jitter, which is precisely the signal GCC measures. Shaping
+    /// a non-binding link therefore manufactures congestion rather than removing an artifact:
+    /// measured, a plan delivering 2 MB unshaped delivered 721 kB at both 50 Mbps *and* 1 Gbps —
+    /// identical, so the limit was the shaper rather than the link.
+    ///
+    /// The cost of leaving it `None` is that the plan says nothing about congestion control: with
+    /// nothing to saturate, the estimate climbs to `MAX_BANDWIDTH` and sits there (measured at
+    /// exactly 5,000,000 bps, 0.0% drawdown). That is the right trade for plans about allocation
+    /// or signalling, and the wrong one for plans about the estimator.
     ///
     /// turmoil has no notion of capacity, so without this a simulated path carries any offered
     /// load: there is no queueing delay, the delay-based estimator never backs off, and a probe
