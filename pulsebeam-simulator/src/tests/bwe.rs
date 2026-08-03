@@ -124,7 +124,7 @@ fn height_request_rounds_up_the_ladder_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer asks for 540p, which no layer matches exactly",
@@ -170,7 +170,7 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeToQos {
                 description: "Viewer starts both streams at low priority and height",
@@ -212,7 +212,7 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeToQos {
                 description: "Viewer asks for the camera and one-layer screen share",
@@ -535,7 +535,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer watches only the screen share",
@@ -611,7 +611,7 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeAll {
                 description: "Viewer watches the screen share and the camera at full quality",
@@ -694,7 +694,7 @@ fn late_video_subscription_is_delivered_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer watches only the screen share",
@@ -751,7 +751,7 @@ fn capped_subscription_is_not_over_served_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 360p, which the h layer satisfies exactly",
@@ -833,7 +833,7 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer watches the screen share at full quality",
@@ -900,7 +900,7 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 720p; the link carries it twice over",
@@ -983,7 +983,7 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 720p, but the link only affords the bottom layer",
@@ -1044,7 +1044,7 @@ fn steady_subscription_is_mostly_media_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 720p on a link that comfortably carries it",
@@ -1101,7 +1101,7 @@ fn estimate_follows_a_sliding_link_without_riding_the_queue_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 720p",
@@ -1173,7 +1173,7 @@ fn estimate_survives_an_oscillating_lossy_link_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 720p",
@@ -1279,7 +1279,7 @@ fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer asks for the screen share",
@@ -1386,7 +1386,7 @@ fn a_stream_returns_after_a_total_outage_test() {
         .run(vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 720p",

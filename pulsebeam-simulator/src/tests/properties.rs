@@ -182,7 +182,7 @@ impl Scenario {
         let mut plan = vec![
             Step::Run {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer subscribes",
