@@ -31,26 +31,26 @@ test: test-unit test-sim
 test-unit:
 	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --
 
-# One plan per process, one at a time.
+# One plan per process, across all cores.
 #
-# Simulation is CPU-intensive, and load is itself a source of nondeterminism: plans sharing a
-# process share the shaper's registry and the clock guard, and plans running concurrently compete
-# for CPU. Both make a run depend on what else happened to be running. nextest gives each plan its
-# own process; --test-threads=1 keeps them from contending.
+# nextest gives each plan its own process, so the shaper's registry, the clock guard and the RNG
+# are per-plan already. Wall-clock contention was the one reason to serialise, and the clock is
+# virtual now (clock_gettime reads turmoil's simulated time, see sim_clock.rs), so machine load
+# cannot change what a plan computes - parallel runs reproduce identically.
 #
-# Use `make test-sim-fast` while iterating, when reproducibility matters less than turnaround.
+# No --no-capture here on purpose: nextest forces test-threads=1 under it, to keep live output
+# from interleaving, so it is what was serialising the run. nextest still shows a failed plan's
+# captured output, which is all a pass/fail run needs. The scoreboard, which does need the live
+# [scoreboard] lines, keeps --no-capture in bwe-baseline and pays the serial cost there.
 test-sim:
-	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-capture --test-threads 1 --no-fail-fast $(TEST)
+	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-fail-fast $(TEST)
 
 # Regenerate the committed scoreboard. Diff it to see a change's effect on every scenario at
 # once, rather than discovering days later that a fix for one wrecked another.
 bwe-baseline:
-	-$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-capture --test-threads 1 --no-fail-fast 2>&1 \
+	-$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-capture --no-fail-fast 2>&1 \
 		| python3 scripts/bwe-scoreboard.py > bwe-baseline.txt
 	@git --no-pager diff --stat bwe-baseline.txt || true
-
-test-sim-fast:
-	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator $(TEST)
 
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all
