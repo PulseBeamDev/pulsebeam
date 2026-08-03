@@ -5,7 +5,6 @@ use std::time::Duration;
 #[test]
 fn data_channel_pubsub_forwarding_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room-data")
                 .with_participant(Participant::data_participant("pub"))
@@ -51,7 +50,6 @@ fn data_channel_pubsub_forwarding_test() {
 #[test]
 fn data_channel_scoped_subscribe_routing_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room-scoped")
                 .with_participant(Participant::data_participant("pub_a"))
@@ -160,7 +158,6 @@ fn data_channel_scoped_subscribe_routing_test() {
 #[test]
 fn ordered_topic_delivers_every_message_in_order() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room-ordered")
                 .with_participant(Participant::data_participant("pub"))
@@ -215,7 +212,6 @@ fn ordered_topic_delivers_every_message_in_order() {
 #[test]
 fn latest_topic_eventually_delivers_newest_state() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room-latest")
                 .with_participant(Participant::data_participant("pub"))
@@ -271,7 +267,6 @@ fn latest_topic_eventually_delivers_newest_state() {
 #[test]
 fn ordered_topic_continues_after_publisher_reconnect() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room-ordered-reconnect")
                 .with_participant(Participant::data_participant("pub"))

@@ -4,7 +4,6 @@ use std::time::Duration;
 #[test]
 fn simulation_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -97,7 +96,6 @@ fn simulation_test() {
 #[test]
 fn tcp_simulation_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_tcp_only()
         .with_room(
             Room::new("room1")
@@ -141,7 +139,6 @@ fn tcp_simulation_test() {
 #[test]
 fn tcp_multi_shard_simulation_test() {
     LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
         .with_shards(2)
         .with_room(
             Room::new("room1")

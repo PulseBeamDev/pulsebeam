@@ -32,6 +32,23 @@ pub struct MediaFrame {
     /// Whether this frame follows the previous one with no missing packets.
     pub contiguous: bool,
     pub is_keyframe: bool,
+    /// What the encoder says this layer will cost, if it declares one.
+    ///
+    /// Sent on to the SFU as a Video Layers Allocation. The distinction from the measured rate is
+    /// the point: screen content is genuinely variable - a still desktop encodes almost nothing -
+    /// so what a layer *costs* cannot be read from what it happens to be sending. The sender
+    /// knows its own target and says so, and the SFU allocates against that rather than against
+    /// an instantaneous byte count.
+    ///
+    /// A real encoder retargets as conditions change, so this is expected to step, not to hold
+    /// still: the production log shows the same layer declared at 1250 kbps and later at 729.
+    pub target_bitrate_bps: Option<u64>,
+    /// Resolution and current frame rate, when known.
+    ///
+    /// Framerate belongs here because a screen share configured `maintain-resolution` sheds
+    /// frames rather than pixels under pressure, so its fps moves continuously while its
+    /// resolution does not.
+    pub resolution: Option<(u16, u16, u8)>,
 }
 
 impl From<MediaData> for MediaFrame {
@@ -46,6 +63,8 @@ impl From<MediaData> for MediaFrame {
             data: value.data,
             capture_time: value.network_time.into(),
             abs_capture_time: value.ext_vals.abs_capture_time.map(|act| act.capture_time),
+            target_bitrate_bps: None,
+            resolution: None,
             contiguous: value.contiguous,
             is_keyframe,
         }

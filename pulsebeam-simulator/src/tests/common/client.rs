@@ -6,7 +6,7 @@ use pulsebeam_agent::agent::{
     DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
 };
 use pulsebeam_agent::api::HttpApiClient;
-use pulsebeam_agent::media::H264Looper;
+use pulsebeam_agent::media::{H264Looper, VbrLooper, VbrProfile};
 use pulsebeam_agent::{
     Agent, LocalTrack, ParticipantChange, Participants, RemoteTrack, SimulcastLayer,
 };
@@ -25,6 +25,8 @@ pub struct SimClientBuilder {
     agent_builder: AgentBuilder,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
     publishes_video: bool,
+    /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
+    vbr_profile: Option<VbrProfile>,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -47,6 +49,7 @@ impl SimClientBuilder {
             agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
             video_rx: None,
             publishes_video: false,
+            vbr_profile: None,
         })
     }
 
@@ -67,6 +70,7 @@ impl SimClientBuilder {
                 .with_tcp_server_addr(server_tcp_addr),
             video_rx: None,
             publishes_video: false,
+            vbr_profile: None,
         })
     }
 
@@ -76,8 +80,19 @@ impl SimClientBuilder {
         self
     }
 
+    /// Publish with a VBR source (see [`VbrProfile`]) rather than the constant-rate looper.
+    pub fn with_vbr(mut self, profile: VbrProfile) -> Self {
+        self.vbr_profile = Some(profile);
+        self
+    }
+
     pub fn receive_video(mut self, capacity: usize) -> Self {
         self.agent_builder = self.agent_builder.video_downstream_slots(capacity);
+        self
+    }
+
+    pub fn manual_subscriptions(mut self) -> Self {
+        self.agent_builder = self.agent_builder.manual_subscriptions();
         self
     }
 
@@ -125,8 +140,16 @@ impl SimClientBuilder {
         for publication in &ctx.local_publications {
             for sender in publication.encodings().iter().cloned() {
                 let rid = sender.rid();
-                let looper = create_h264_looper_for_rid(rid);
-                join_set.spawn(looper.run(sender));
+                match self.vbr_profile {
+                    Some(profile) => {
+                        let looper = create_vbr_looper_for_rid(rid, profile);
+                        join_set.spawn(looper.run(sender));
+                    }
+                    None => {
+                        let looper = create_h264_looper_for_rid(rid);
+                        join_set.spawn(looper.run(sender));
+                    }
+                }
             }
         }
         Ok(SimClient { ctx, join_set })
@@ -418,6 +441,15 @@ pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
         Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
     };
     H264Looper::new(data, 30)
+}
+
+pub fn create_vbr_looper_for_rid(rid: Option<&str>, profile: VbrProfile) -> VbrLooper {
+    debug_assert_eq!(rid.map(|rid| rid.as_ref()), Some("f"));
+    VbrLooper::new_scheduled(
+        pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
+        pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
+        profile,
+    )
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

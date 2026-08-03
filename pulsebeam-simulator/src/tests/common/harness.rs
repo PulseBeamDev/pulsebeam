@@ -4,7 +4,9 @@ use crate::tests::common::{
     start_sfu_node_tcp_only_multi_shard, subnet_ip,
 };
 use pulsebeam_agent::SimulcastLayer;
-use std::collections::{HashMap, HashSet};
+use pulsebeam_agent::media::VbrProfile;
+pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +29,13 @@ pub struct Participant {
     /// Number of RecvOnly video slots (for multi-subscriber participants). Default 1.
     pub slots: usize,
     pub starts_disconnected: bool,
+    /// Publish with a variable-bitrate source (screen sharing) instead of constant-rate.
+    pub vbr: Option<VbrProfile>,
+    /// Also receive video. A real conference participant both sends and receives; the plain
+    /// `publisher`/`subscriber` constructors keep the one-way shape used by older tests.
+    pub subscribes: bool,
+    /// Whether a receiving participant subscribes to newly discovered tracks automatically.
+    pub auto_subscribe: bool,
 }
 
 impl Participant {
@@ -37,6 +46,9 @@ impl Participant {
             rids: rids.to_vec(),
             slots: 0,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
+            auto_subscribe: true,
         }
     }
 
@@ -47,6 +59,9 @@ impl Participant {
             rids: Vec::new(),
             slots: 0,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
+            auto_subscribe: true,
         }
     }
 
@@ -57,6 +72,9 @@ impl Participant {
             rids: Vec::new(),
             slots: 1,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
+            auto_subscribe: true,
         }
     }
 
@@ -68,6 +86,17 @@ impl Participant {
             rids: Vec::new(),
             slots,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
+            auto_subscribe: true,
+        }
+    }
+
+    /// Subscriber whose tracks are bound only by explicit subscription steps.
+    pub fn manual_subscriber(name: &'static str, slots: usize) -> Self {
+        Self {
+            auto_subscribe: false,
+            ..Self::multi_subscriber(name, slots)
         }
     }
 
@@ -79,7 +108,49 @@ impl Participant {
             rids: Vec::new(),
             slots: 0,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
+            auto_subscribe: true,
         }
+    }
+
+    /// A publisher whose content is screen sharing: strongly variable bitrate, long static
+    /// stretches. This is the case that exercises str0m's probe controller, because the sender
+    /// sits in ALR whenever the screen is still.
+    /// A screen share configured the way the client configures one.
+    ///
+    /// `VIDEO_PRESETS.detail`: a single 2.5 Mbps layer. The full ladder is negotiated but only
+    /// `f` is sent, so there is no rung to fall back to and the stream pauses outright rather
+    /// than degrading.
+    ///
+    /// The rate is what makes this worth modelling separately from a camera. At 2.5 Mbps it costs
+    /// twice the camera's top layer, so a viewer watching both sits close to the edge of most
+    /// links - and that is the regime where allocation decisions are finely balanced. Every
+    /// simulated publisher previously topped out at 1.25 Mbps, which put that regime out of
+    /// reach: a production flap between the two streams was invisible here for want of a source
+    /// that cost what the real one costs.
+    pub fn screensharer(name: &'static str) -> Self {
+        Self {
+            vbr: Some(VbrProfile::screenshare_detail()),
+            ..Self::publisher(name, &["f"])
+        }
+    }
+
+    /// A screen sharer that goes genuinely still between bursts: long enough for the SFU to mark
+    /// the layer dead and for the pacer's RTX cache to drain. See
+    /// [`VbrProfile::screenshare_static`].
+    pub fn static_screensharer(name: &'static str) -> Self {
+        Self {
+            vbr: Some(VbrProfile::screenshare_static()),
+            ..Self::publisher(name, &["f"])
+        }
+    }
+
+    /// Also receive video, making this a full two-way conference participant.
+    pub fn and_subscribes(mut self) -> Self {
+        self.subscribes = true;
+        self.slots = self.slots.max(1);
+        self
     }
 
     pub fn starts_disconnected(mut self) -> Self {
@@ -204,6 +275,25 @@ pub enum Step {
         participant: &'static str,
         subscriptions: Vec<VideoSubscription>,
     },
+    /// Subscribe to specific participants by name, at the given heights.
+    ///
+    /// Prefer this over [`Step::SubscribeAll`] whenever *which* track gets which height matters.
+    /// `SubscribeAll` applies heights round-robin over tracks sorted by runtime participant id,
+    /// which is generated per run - so `heights: &[720, 0]` hides an arbitrary participant rather
+    /// than a chosen one, and a test written that way is not reproducible.
+    SubscribeTo {
+        description: &'static str,
+        participant: &'static str,
+        /// `(publisher name, target height)`. Height `0` hides that stream.
+        targets: &'static [(&'static str, u32)],
+    },
+    /// Subscribe to specific participants with the QoS fields that affect allocator contention.
+    /// Each tuple is `(publisher name, target height, minimum height, priority)`.
+    SubscribeToQos {
+        description: &'static str,
+        participant: &'static str,
+        targets: &'static [(&'static str, u32, u32, u32)],
+    },
     /// Subscribe the participant to ALL currently discovered video tracks.
     /// `heights` is applied round-robin to discovered tracks (sorted ascending).
     /// Example: heights=&[720, 180] with 2 tracks → track[0]@720, track[1]@180.
@@ -287,6 +377,117 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         min_bytes: u64,
+    },
+    /// At least `min_percent` of what a participant received was actual media.
+    ///
+    /// Compares the media payload the SFU forwarded against what the subscriber's RTP stats
+    /// report receiving. The difference is retransmission and padding generated below the SFU -
+    /// so a low ratio means the link is carrying overhead instead of video. Chrome shows the same
+    /// quantity as `retransmittedBytesReceived` against `bytesReceived`.
+    ///
+    /// Only meaningful with a single subscribing participant, since the forwarded counter is
+    /// per-simulation rather than per-participant.
+    CheckMediaEfficiency {
+        description: &'static str,
+        participant: &'static str,
+        min_percent: u64,
+    },
+    /// At least `min_quality` is currently being forwarded to subscribers of `origin`'s track.
+    ///
+    /// `min_quality` uses `LayerQuality`'s numeric rank: 1=Low, 2=Medium, 3=High. Reads the last
+    /// allocation pass's decision, so it describes the current steady state rather than a window
+    /// - unlike the byte checks, there is no reset between `Step::Run`s.
+    ///
+    /// Only meaningful when `origin` has exactly one subscriber in the plan; the metric is keyed
+    /// by origin because the question this exists to ask - "is this stream regressing" - is about
+    /// the publisher's track, not about any one viewer.
+    CheckForwardedQuality {
+        description: &'static str,
+        origin: &'static str,
+        min_quality: u8,
+    },
+    /// Assert that `origin` reached at least `min_quality` at some point during the last
+    /// [`Step::Run`]. This is useful for a transition whose final allocation may legitimately
+    /// rebalance afterward.
+    CheckForwardedQualityReached {
+        description: &'static str,
+        origin: &'static str,
+        min_quality: u8,
+    },
+    /// Change a participant's downlink capacity mid-plan.
+    ///
+    /// Models the link improving or degrading under a live call, which is what separates a
+    /// congestion controller that re-discovers capacity from one that has talked itself into a
+    /// corner it cannot probe out of.
+    SetBandwidth {
+        description: &'static str,
+        participant: &'static str,
+        bits_per_sec: u64,
+    },
+    /// Apply a capacity *schedule* — a ramp or an oscillation — rather than a step change.
+    ///
+    /// Real links do not change instantaneously. A controller that handles square waves but
+    /// oscillates on a slow ramp is broken in a way no `SetBandwidth` plan can reveal.
+    SetCapacity {
+        description: &'static str,
+        participant: &'static str,
+        capacity: Capacity,
+    },
+    /// Configure the loss model for a participant's downlink.
+    SetLoss {
+        description: &'static str,
+        participant: &'static str,
+        loss: Loss,
+    },
+    /// Configure packet reordering on a participant's downlink.
+    ///
+    /// Distinct from loss and from jitter: a reordered packet is overtaken by its successors, so
+    /// the receiver both sees disturbed inter-arrival spacing and counts an unfilled gap as lost.
+    /// A controller meets all three on a real path and responds to them differently.
+    SetReorder {
+        description: &'static str,
+        participant: &'static str,
+        reorder: Reorder,
+    },
+    /// Assert a [`Property`] of the run just completed.
+    ///
+    /// Prefer this to the `Check*` byte-count steps. See [`Property`] for why.
+    Expect {
+        description: &'static str,
+        participant: &'static str,
+        property: Property,
+    },
+    /// Log every measurable property for a participant, asserting nothing.
+    ///
+    /// Two jobs. It is how a threshold gets chosen — observe what healthy looks like rather than
+    /// guessing a number and calibrating it to whatever the code happens to do today, which is
+    /// how the byte-count floors ended up pinned below the bug they were meant to catch. And run
+    /// across a matrix of link profiles it is the scoreboard: one table showing a change's effect
+    /// on every scenario at once, instead of discovering two days later that a fix for
+    /// screenshare wrecked cellular.
+    Report {
+        description: &'static str,
+        participant: &'static str,
+    },
+    /// Bytes received since the last Step::Run ≤ `max_bytes`.
+    ///
+    /// The counterpart to [`Step::CheckRxBytesInterval`]: asserts a subscription is not being
+    /// *over*-served. A capped subscription that receives far more than its layer costs is
+    /// paying for padding and probes aimed at bandwidth it asked not to be given.
+    CheckMaxRxBytesInterval {
+        description: &'static str,
+        participant: &'static str,
+        max_bytes: u64,
+    },
+    /// The downstream bandwidth estimate on every participant stayed at or above `min_bps`
+    /// during the last `Step::Run`.
+    ///
+    /// Distinct from the byte checks: a poisoned estimate does not necessarily reduce throughput,
+    /// because the allocator just drops to a lower simulcast layer and the viewer keeps receiving
+    /// something. This asserts the estimate itself.
+    CheckMinBwe {
+        description: &'static str,
+        min_bps: u64,
     },
     /// Bytes sent since the last Step::Run ≥ min_bytes (per-window rate check).
     CheckTxBytesInterval {
@@ -412,6 +613,18 @@ impl ParticipantHandle {
         self.shared.video_rx.lock().unwrap().clone()
     }
 
+    /// The SFU-side participant id, once connected. Keys the per-subscriber metrics.
+    fn participant_id(&self) -> Option<String> {
+        self.shared.participant_id.lock().unwrap().clone()
+    }
+
+    /// Media payload the SFU forwarded *to this participant* in the current window.
+    fn forwarded_media(&self) -> u64 {
+        self.participant_id()
+            .map(|id| pulsebeam::sim_metrics::forwarded_media_bytes(&id))
+            .unwrap_or(0)
+    }
+
     fn snapshot_interval(&mut self) {
         self.interval_tx_baseline = self.tx_bytes();
         self.interval_rx_baseline = self.rx_bytes();
@@ -452,6 +665,12 @@ async fn run_participant(
                     Some(config.rids.iter().map(|r| SimulcastLayer::new(r)).collect())
                 };
                 builder = builder.publish_video(layers);
+                if let Some(profile) = config.vbr {
+                    builder = builder.with_vbr(profile);
+                }
+                if config.subscribes {
+                    builder = builder.receive_video(config.slots.max(1));
+                }
             }
             Role::Subscriber => {
                 builder = builder.receive_video(config.slots.max(1));
@@ -461,7 +680,12 @@ async fn run_participant(
             }
         }
 
-        let auto_subscribe = matches!(config.role, Role::Subscriber);
+        if !config.auto_subscribe {
+            builder = builder.manual_subscriptions();
+        }
+
+        let auto_subscribe =
+            config.auto_subscribe && (matches!(config.role, Role::Subscriber) || config.subscribes);
         let shared_clone = shared.clone();
         let mut client = builder
             .with_video_rx(shared.video_rx.clone())
@@ -489,14 +713,19 @@ async fn run_participant(
                     match op {
                         PendingDriverOp::SetSubscriptions(subs) => {
                             let incoming_tracks = ctx.incoming_track_tx.clone();
-                            let new_subscriptions: Vec<_> = subs
-                                .iter()
-                                .filter(|subscription| {
-                                    ctx.requested_tracks
-                                        .insert(subscription.participant_id.clone())
-                                })
-                                .cloned()
-                                .collect();
+                            // Every subscription is (re-)issued, including ones for a track that
+                            // is already subscribed. `SetSubscriptions` is a declarative step, and
+                            // a plan's whole point may be to change the *height* of an existing
+                            // subscription. Filtering on participant id alone silently dropped
+                            // those: a subscriber participant auto-subscribes at 720 as soon as it
+                            // discovers a track, so any later `SubscribeTo` naming that track was
+                            // a no-op and the plan quietly tested 720p instead of what it asked
+                            // for.
+                            let new_subscriptions: Vec<_> = subs.to_vec();
+                            for subscription in &subs {
+                                ctx.requested_tracks
+                                    .insert(subscription.participant_id.clone());
+                            }
                             for subscription in new_subscriptions {
                                 let agent = ctx.agent.clone();
                                 let incoming_tracks = incoming_tracks.clone();
@@ -737,6 +966,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::Reconnect { .. } => "Reconnect",
         Step::SetSubscriptions { .. } => "SetSubscriptions",
         Step::SubscribeAll { .. } => "SubscribeAll",
+        Step::SubscribeTo { .. } => "SubscribeTo",
+        Step::SubscribeToQos { .. } => "SubscribeToQos",
         Step::DeclarePublishTopic { .. } => "DeclarePublishTopic",
         Step::DeclareSubscribeTopic { .. } => "DeclareSubscribeTopic",
         Step::PublishData { .. } => "PublishData",
@@ -749,7 +980,18 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckRxBytes { .. } => "CheckRxBytes",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
+        Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
+        Step::SetBandwidth { .. } => "SetBandwidth",
+        Step::SetCapacity { .. } => "SetCapacity",
+        Step::SetLoss { .. } => "SetLoss",
+        Step::SetReorder { .. } => "SetReorder",
+        Step::Expect { .. } => "Expect",
+        Step::Report { .. } => "Report",
+        Step::CheckMediaEfficiency { .. } => "CheckMediaEfficiency",
+        Step::CheckForwardedQuality { .. } => "CheckForwardedQuality",
+        Step::CheckForwardedQualityReached { .. } => "CheckForwardedQualityReached",
         Step::CheckTxBytesInterval { .. } => "CheckTxBytesInterval",
+        Step::CheckMinBwe { .. } => "CheckMinBwe",
         Step::CheckDataReceived { .. } => "CheckDataReceived",
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
         Step::CheckDataSequence { .. } => "CheckDataSequence",
@@ -760,8 +1002,11 @@ async fn execute_plan(
     plan: Vec<Step>,
     handles: &mut HashMap<&'static str, ParticipantHandle>,
     name_to_ip: &HashMap<&'static str, IpAddr>,
+    reports: &Mutex<HashMap<&'static str, LinkReport>>,
 ) -> anyhow::Result<()> {
     let total = plan.len();
+    // Duration of the most recent Run, so interval properties know what window they describe.
+    let mut window = Duration::ZERO;
 
     for (idx, step) in plan.iter().enumerate() {
         let n = idx + 1;
@@ -776,7 +1021,89 @@ async fn execute_plan(
                 for handle in handles.values_mut() {
                     handle.snapshot_interval();
                 }
+                // Same windowing as the byte baselines, so the checks describe this step.
+                pulsebeam::sim_metrics::reset();
+                pulsebeam_runtime::net::shaper::reset_stats();
+                window = *duration;
                 tokio::time::sleep(*duration).await;
+            }
+
+            Step::Report {
+                description,
+                participant,
+            } => {
+                let ip = resolve(name_to_ip, participant, description)?;
+                let handle = handles.get(participant).ok_or_else(|| {
+                    anyhow::anyhow!("step \"{description}\": unknown participant {participant}")
+                })?;
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}) {}",
+                    report_metrics(handle, ip, window)
+                );
+            }
+
+            Step::SetCapacity {
+                description,
+                participant,
+                capacity,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {capacity:?})"
+                );
+                let ip = resolve(name_to_ip, participant, description)?;
+                pulsebeam_runtime::net::shaper::set_capacity(
+                    ip,
+                    *capacity,
+                    Duration::from_millis(200),
+                );
+            }
+
+            Step::SetReorder {
+                description,
+                participant,
+                reorder,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {reorder:?})"
+                );
+                let ip = resolve(name_to_ip, participant, description)?;
+                pulsebeam_runtime::net::shaper::set_reorder(ip, *reorder);
+            }
+
+            Step::SetLoss {
+                description,
+                participant,
+                loss,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {loss:?})"
+                );
+                let ip = resolve(name_to_ip, participant, description)?;
+                pulsebeam_runtime::net::shaper::set_loss(ip, *loss);
+            }
+
+            Step::Expect {
+                description,
+                participant,
+                property,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {property:?})"
+                );
+                let ip = resolve(name_to_ip, participant, description)?;
+                let handle = handles.get(participant).ok_or_else(|| {
+                    anyhow::anyhow!("step \"{description}\": unknown participant {participant}")
+                })?;
+                if let Err(reason) = check_property(property, handle, ip, window, handles) {
+                    // Print the full picture alongside the failure: the one number that broke
+                    // rarely explains why on its own.
+                    tracing::error!("  context: {}", report_metrics(handle, ip, window));
+                    panic!(
+                        "\nproperty not satisfied\n  plan step:   {n}/{total} {kind}\n  \
+                         description: \"{description}\"\n  participant:  {participant}\n  \
+                         property:     {property:?}\n  actual:       {reason}"
+                    );
+                }
             }
 
             Step::Partition {
@@ -872,6 +1199,72 @@ async fn execute_plan(
                     .lock()
                     .unwrap()
                     .push(PendingDriverOp::SetSubscriptions(subscriptions.clone()));
+            }
+
+            Step::SubscribeTo {
+                description,
+                participant,
+                targets,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
+                );
+                let mut subs: Vec<VideoSubscription> = Vec::new();
+                for (name, height) in targets.iter() {
+                    let pub_handle = get_handle(handles, name, description)?;
+                    let id = pub_handle.shared.participant_id.lock().unwrap().clone();
+                    let id = id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step \"{description}\": SubscribeTo target \"{name}\" has no runtime participant id yet; add a Step::Run before this step"
+                        )
+                    })?;
+                    subs.push(VideoSubscription {
+                        participant_id: id,
+                        height: *height,
+                        min_height: 0,
+                        priority: 0,
+                    });
+                }
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::SetSubscriptions(subs));
+            }
+
+            Step::SubscribeToQos {
+                description,
+                participant,
+                targets,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
+                );
+                let mut subs: Vec<VideoSubscription> = Vec::new();
+                for (name, height, min_height, priority) in targets.iter() {
+                    let pub_handle = get_handle(handles, name, description)?;
+                    let id = pub_handle.shared.participant_id.lock().unwrap().clone();
+                    let id = id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step \"{description}\": SubscribeToQos target \"{name}\" has no runtime participant id yet; add a Step::Run before this step"
+                        )
+                    })?;
+                    subs.push(VideoSubscription {
+                        participant_id: id,
+                        height: *height,
+                        min_height: *min_height,
+                        priority: *priority,
+                    });
+                }
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::SetSubscriptions(subs));
             }
 
             Step::SubscribeAll {
@@ -1103,6 +1496,120 @@ async fn execute_plan(
                 );
             }
 
+            Step::CheckMinBwe {
+                description,
+                min_bps,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)");
+                let observed = pulsebeam::sim_metrics::downstream_bwe_summary();
+                let Some((min_seen, max_seen, last_seen, count)) = observed else {
+                    panic!(
+                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps\n  actual:       no allocation passes observed - the check would pass vacuously"
+                    );
+                };
+                assert!(
+                    min_seen >= *min_bps,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps on every participant\n  actual:       min {min_seen} / max {max_seen} / last {last_seen} bps over {count} allocation passes"
+                );
+            }
+            Step::CheckMediaEfficiency {
+                description,
+                participant,
+                min_percent,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, min {min_percent}%)"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let received = handle.rx_bytes();
+                let forwarded = handle.forwarded_media();
+                assert!(
+                    received > 0,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  nothing was received, so the ratio would be meaningless"
+                );
+                let percent = forwarded.saturating_mul(100) / received;
+                assert!(
+                    percent >= *min_percent,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     >= {min_percent}% of received bytes to be media\n  actual:       {percent}% ({forwarded} media forwarded / {received} received)"
+                );
+            }
+
+            Step::CheckForwardedQuality {
+                description,
+                origin,
+                min_quality,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({origin}, min quality {min_quality})"
+                );
+                let handle = get_handle(handles, origin, description)?;
+                let id = handle.shared.participant_id.lock().unwrap().clone();
+                let id = id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "step \"{description}\": {origin} has no runtime participant id yet; add a Step::Run before this step"
+                    )
+                })?;
+                let actual = pulsebeam::sim_metrics::forwarded_quality(&id);
+                let bwe = pulsebeam::sim_metrics::downstream_bwe_summary();
+                assert!(
+                    actual.is_some_and(|q| q >= *min_quality),
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  origin:       {origin}\n  expected:     >= quality {min_quality}\n  actual:       {actual:?} (0=paused, None=never observed)\n  BWE window:   {bwe:?} (min, max, last, samples)"
+                );
+            }
+
+            Step::CheckForwardedQualityReached {
+                description,
+                origin,
+                min_quality,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({origin}, min quality {min_quality})"
+                );
+                let handle = get_handle(handles, origin, description)?;
+                let id = handle.shared.participant_id.lock().unwrap().clone();
+                let id = id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "step \"{description}\": {origin} has no runtime participant id yet; add a Step::Run before this step"
+                    )
+                })?;
+                let actual = pulsebeam::sim_metrics::max_forwarded_quality(&id);
+                assert!(
+                    actual.is_some_and(|q| q >= *min_quality),
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  origin:       {origin}\n  expected:     reached >= quality {min_quality} during the last Run\n  actual:       {actual:?} (0=paused, None=never observed)"
+                );
+            }
+
+            Step::SetBandwidth {
+                description,
+                participant,
+                bits_per_sec,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {bits_per_sec} bps)"
+                );
+                let ip = name_to_ip.get(participant).copied().ok_or_else(|| {
+                    anyhow::anyhow!("step \"{description}\": unknown participant {participant}")
+                })?;
+                pulsebeam_runtime::net::shaper::set_downlink(ip, *bits_per_sec);
+            }
+
+            Step::CheckMaxRxBytesInterval {
+                description,
+                participant,
+                max_bytes,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, max {max_bytes} B)"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let baseline = handle.interval_rx_baseline;
+                let actual = handle.rx_bytes().saturating_sub(baseline);
+                assert!(
+                    actual <= *max_bytes,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     <= {max_bytes} bytes in last interval\n  actual:       {actual} bytes"
+                );
+            }
+
             Step::CheckRxBytesInterval {
                 description,
                 participant,
@@ -1205,6 +1712,53 @@ async fn execute_plan(
         }
     }
 
+    // Scoreboard. Emitted for every plan whether or not it asserted anything, so a change's
+    // effect across the whole matrix is visible in one run rather than one scenario at a time,
+    // and so a threshold can be chosen by observing what healthy looks like instead of guessing.
+    //
+    // Sorted by name: `handles` is a HashMap, and unordered output would make two runs diff
+    // against each other for no reason.
+    // Forwarded quality is recorded against the publisher's participant id, so resolve those
+    // back to plan names once rather than per report.
+    let quality_by_publisher: BTreeMap<&'static str, u8> = handles
+        .iter()
+        .filter_map(|(name, handle)| {
+            let id = handle.participant_id()?;
+            Some((*name, pulsebeam::sim_metrics::forwarded_quality(&id)?))
+        })
+        .collect();
+
+    let changes_by_publisher: BTreeMap<&'static str, u64> = handles
+        .iter()
+        .filter_map(|(name, handle)| {
+            let id = handle.participant_id()?;
+            Some((*name, pulsebeam::sim_metrics::quality_changes(&id)))
+        })
+        .collect();
+
+    let mut names: Vec<_> = handles.keys().copied().collect();
+    names.sort_unstable();
+    for name in names {
+        let (Some(handle), Some(ip)) = (handles.get(name), name_to_ip.get(name).copied()) else {
+            continue;
+        };
+        // Publish-only participants never allocate downstream and have nothing to say.
+        if handle.shared.participant_id.lock().unwrap().is_none() {
+            continue;
+        }
+        tracing::info!(
+            "[scoreboard] {name}: {}",
+            report_metrics(handle, ip, window)
+        );
+        let mut report = measure(handle, ip, window);
+        report.forwarded_quality = quality_by_publisher.clone();
+        report.quality_changes = changes_by_publisher.clone();
+        reports
+            .lock()
+            .expect("reports poisoned")
+            .insert(name, report);
+    }
+
     // Signal all participants to stop.
     for handle in handles.values() {
         handle.send_command(ParticipantCmd::Done);
@@ -1276,12 +1830,651 @@ fn assert_video_quality(
 
 // ── LocalNodeSim ────────────────────────────────────────────────────────────
 
+/// A high-level claim about behaviour, stated against ground truth.
+///
+/// Byte-count assertions (`min_bytes: 3_000_000`) fold link rate, codec, fixture length and
+/// current behaviour into one number. They go stale silently — shrinking the screenshare fixture
+/// in `8263602` invalidated a batch of them and nothing failed — and being one-sided floors they
+/// cannot express collapse, overuse, or instability at all.
+///
+/// These are stated against what the simulator *configured*, so they survive changes to the
+/// fixture, the codec, or the ladder, and they fail when behaviour actually regresses.
+///
+/// The properties that reference capacity require a `Fixed` link: on a ramp or an oscillation
+/// "the capacity" is not a single number, and silently comparing against its instantaneous value
+/// would be exactly the kind of quietly-wrong assertion this type exists to remove. Use
+/// [`Property::EstimateStable`] and [`Property::QueueingDelayBelow`] on scheduled links.
+#[derive(Clone, Copy, Debug)]
+pub enum Property {
+    /// Delivered throughput was at least this percent of the link's capacity.
+    ///
+    /// Only meaningful when demand meets or exceeds capacity; a plan whose sources cannot fill
+    /// the link will fail this for reasons that are not the controller's fault.
+    UtilisationAtLeast(u8),
+    /// The estimate ended within `within_percent` of true capacity, in *both* directions.
+    ///
+    /// Two-sided on purpose: an estimate far above capacity is a controller that will overshoot
+    /// and drive loss, which a floor-style assertion silently permits.
+    ///
+    /// Only fair under saturation. When the application asks for less than the link can carry,
+    /// a delay-based estimator correctly settles near demand — it cannot measure bandwidth it is
+    /// not using. Use [`Property::EstimateMeetsNeed`] unless the plan deliberately overloads the
+    /// link.
+    EstimateTracksCapacity { within_percent: u8 },
+    /// The estimate reached `percent` of whatever is smaller: what the allocator asked for, or
+    /// what the link can actually carry.
+    ///
+    /// The claim that holds in every regime, and the one that matches what a user notices. Below
+    /// saturation it means "found enough for what was wanted"; above it, "saturated the link
+    /// trying". It cannot be satisfied by an estimate that quietly gave up, and unlike a byte
+    /// floor it does not have to be re-tuned when the ladder or the fixture changes.
+    EstimateMeetsNeed { percent: u8 },
+    /// The estimate never fell more than `max_drop_percent` below its running maximum.
+    ///
+    /// The collapse detector, and the most valuable property here: it states the production
+    /// failure — stable link, estimate falls away and does not recover — directly.
+    EstimateStable { max_drop_percent: u8 },
+    /// The estimate reached `percent` of capacity within `within` of the window starting.
+    EstimateConverges { percent: u8, within: Duration },
+    /// The estimate ended within `of_peak_percent` of the highest value it reached.
+    ///
+    /// A dip is not by itself a defect. A bursty source moves the estimate around, and a
+    /// controller that never dips is one that is not responding to anything. What distinguishes
+    /// working from broken is whether it comes *back*: the production failure was not that the
+    /// estimate fell, it was that it fell and stayed there while the link was fine.
+    ///
+    /// Prefer this to [`Property::EstimateStable`] wherever the source is bursty. Bounding peak
+    /// drawdown there asserts something stronger than the system owes - and, being tuned to
+    /// whatever the current dip happens to be, is the kind of threshold that gets quietly relaxed
+    /// until it means nothing.
+    EstimateRecovers { of_peak_percent: u8 },
+    /// Standing queue at the bottleneck stayed below this.
+    ///
+    /// Bufferbloat: a controller can hold a link perfectly full while parking hundreds of
+    /// milliseconds of queue. That looks healthy in throughput and is unusable for a call.
+    QueueingDelayBelow(Duration),
+    /// At most this percent of offered packets were dropped by a full bottleneck buffer.
+    ///
+    /// Congestion drops only, distinct from configured link loss: this is the controller
+    /// overusing the link.
+    CongestionLossBelow(u8),
+    /// A publisher's forwarded layer changed at most this many times per minute.
+    ///
+    /// The instability check, and the one the rest of this vocabulary cannot express. Every other
+    /// property here is an average or an endpoint, and a stream flipping between two layers many
+    /// times a second satisfies all of them: the final layer is right, the byte count is right,
+    /// the estimate is right. Only the *count of changes* shows it.
+    ///
+    /// It matters because switching is not free. Each change needs a keyframe and stutters the
+    /// picture, so a stream that never holds a layer long enough to decode a run of frames shows
+    /// the viewer nothing at all. That is how it presented in production - "the screen share
+    /// never appeared" - rather than as visibly poor quality.
+    ///
+    /// Named per minute because that is the scale a human judges it on. A settled stream changes
+    /// a handful of times a minute as conditions move; the production failure was doing it
+    /// several times a second.
+    QualityChangesPerMinuteBelow { origin: &'static str, max: u64 },
+    /// At least this percent of the bytes the viewer received were media payload.
+    ///
+    /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
+    /// true efficiency ratio on a lossless path: packets dropped in flight shrink the denominator
+    /// without shrinking the numerator, so it can exceed 100% (measured at 103.5% on a link
+    /// dropping 7%). Use it to catch overhead — RTX and padding crowding out video — on links
+    /// that are not dropping, and disregard it where congestion loss is significant.
+    ///
+    /// A loss-proof version needs the receiver to report media bytes separately from total bytes;
+    /// `VideoReceiveLog` is the place that would come from.
+    MediaEfficiencyAtLeast(u8),
+}
+
+fn pct(part: f64, whole: f64) -> f64 {
+    if whole <= 0.0 {
+        0.0
+    } else {
+        part / whole * 100.0
+    }
+}
+
+/// Everything measurable about one participant's link over the last window.
+/// Everything measured about one participant's link over a window.
+///
+/// Separate from its formatting on purpose. A property needs to *compute* over these numbers, and
+/// a randomised scenario needs to return them rather than assert inline, so the measurement has
+/// to exist as data. Rendering it for a human is a second, lesser job.
+#[derive(Clone, Debug)]
+pub struct LinkReport {
+    /// Configured capacity, and whether it held still for the window. Utilisation and the
+    /// capacity-relative figures are only meaningful when it did.
+    pub capacity_bps: Option<u64>,
+    pub capacity_fixed: bool,
+    pub window: Duration,
+    pub received_bytes: u64,
+    pub forwarded_media_bytes: u64,
+    /// Allocation passes recorded. Zero means the plan never exercised this participant, which a
+    /// caller must not confuse with healthy behaviour.
+    pub samples: usize,
+    pub estimate_last_bps: u64,
+    pub estimate_min_bps: u64,
+    pub estimate_max_bps: u64,
+    /// Largest fall from a running peak, as a percentage. The collapse measure.
+    pub worst_drawdown_percent: f64,
+    pub demand_last_bps: u64,
+    pub demand_min_bps: u64,
+    pub demand_max_bps: u64,
+    pub max_backlog: Duration,
+    pub delivered_packets: u64,
+    pub congestion_drops: u64,
+    pub link_loss_drops: u64,
+    /// How many times each publisher's forwarded layer changed during the window.
+    ///
+    /// The measure that catches instability. Every other figure here is an average or an
+    /// endpoint, and a stream flipping between two layers many times a second looks perfectly
+    /// healthy in all of them - right final layer, right byte count, right estimate.
+    pub quality_changes: BTreeMap<&'static str, u64>,
+    /// Layer last forwarded from each publisher, by participant name. 0 means paused.
+    ///
+    /// Keyed by the *publisher* rather than folded into the link's numbers, because contention is
+    /// a claim about how several streams fared against each other. A viewer receiving plenty of
+    /// bytes tells you nothing about whether one of its two streams was starved to pay for the
+    /// other.
+    pub forwarded_quality: BTreeMap<&'static str, u8>,
+}
+
+impl LinkReport {
+    /// Delivered throughput as a percentage of what the link could have carried. `None` unless
+    /// the capacity held still, since otherwise there is no single denominator.
+    pub fn utilisation_percent(&self) -> Option<f64> {
+        let capacity = self.capacity_bps.filter(|_| self.capacity_fixed)?;
+        let deliverable = capacity as f64 * self.window.as_secs_f64() / 8.0;
+        Some(pct(self.received_bytes as f64, deliverable))
+    }
+
+    /// Congestion tail-drop as a percentage of packets offered to the bottleneck. Distinct from
+    /// configured link loss: this is the controller overusing the link.
+    pub fn congestion_loss_percent(&self) -> f64 {
+        let offered = self.delivered_packets + self.congestion_drops;
+        pct(self.congestion_drops as f64, offered as f64)
+    }
+
+    /// Media payload as a percentage of bytes received. Exceeds 100% under loss - see
+    /// [`Property::MediaEfficiencyAtLeast`].
+    pub fn media_percent(&self) -> f64 {
+        pct(
+            self.forwarded_media_bytes as f64,
+            self.received_bytes as f64,
+        )
+    }
+
+    /// What the controller ought to have found: the lesser of what was asked for and what the
+    /// link could give. The reference that stays meaningful in both regimes.
+    pub fn need_bps(&self) -> u64 {
+        self.demand_last_bps
+            .min(self.capacity_bps.unwrap_or(u64::MAX))
+    }
+}
+
+fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkReport {
+    let now = tokio::time::Instant::now();
+    let stats = pulsebeam_runtime::net::shaper::stats(ip);
+    let series = handle
+        .participant_id()
+        .map(|id| pulsebeam::sim_metrics::bwe_series(&id))
+        .unwrap_or_default();
+
+    let mut peak = 0.0f64;
+    let mut drawdown = 0.0f64;
+    for (_, bps, _) in &series {
+        peak = peak.max(*bps as f64);
+        if peak > 0.0 {
+            drawdown = drawdown.max((peak - *bps as f64) / peak * 100.0);
+        }
+    }
+
+    LinkReport {
+        capacity_bps: pulsebeam_runtime::net::shaper::capacity_at(ip, now),
+        capacity_fixed: pulsebeam_runtime::net::shaper::capacity_is_fixed(ip),
+        window,
+        received_bytes: handle
+            .rx_bytes()
+            .saturating_sub(handle.interval_rx_baseline),
+        forwarded_media_bytes: handle.forwarded_media(),
+        samples: series.len(),
+        estimate_last_bps: series.last().map(|s| s.1).unwrap_or(0),
+        estimate_min_bps: series.iter().map(|(_, b, _)| *b).min().unwrap_or(0),
+        estimate_max_bps: series.iter().map(|(_, b, _)| *b).max().unwrap_or(0),
+        worst_drawdown_percent: drawdown,
+        demand_last_bps: series.last().map(|s| s.2).unwrap_or(0),
+        demand_min_bps: series.iter().map(|(_, _, d)| *d).min().unwrap_or(0),
+        demand_max_bps: series.iter().map(|(_, _, d)| *d).max().unwrap_or(0),
+        max_backlog: stats.max_backlog,
+        delivered_packets: stats.delivered,
+        congestion_drops: stats.dropped_overflow,
+        link_loss_drops: stats.dropped_loss,
+        forwarded_quality: BTreeMap::new(),
+        quality_changes: BTreeMap::new(),
+    }
+}
+
+fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> String {
+    let now = tokio::time::Instant::now();
+    let stats = pulsebeam_runtime::net::shaper::stats(ip);
+    let capacity = pulsebeam_runtime::net::shaper::capacity_at(ip, now);
+    let received = handle
+        .rx_bytes()
+        .saturating_sub(handle.interval_rx_baseline);
+    let forwarded = handle.forwarded_media();
+
+    let series = handle
+        .shared
+        .participant_id
+        .lock()
+        .unwrap()
+        .clone()
+        .map(|id| pulsebeam::sim_metrics::bwe_series(&id))
+        .unwrap_or_default();
+
+    let mut out = String::new();
+    let fixed = pulsebeam_runtime::net::shaper::capacity_is_fixed(ip);
+    match capacity {
+        // Utilisation needs a capacity that held for the window. On a schedule the instantaneous
+        // value is the wrong denominator and produces nonsense - a ramp ending at 700 kbps whose
+        // window averaged ~1.6 Mbps reported 137% - so report the rate and omit the ratio.
+        Some(c) if !fixed => out.push_str(&format!(
+            "capacity {c} bps (scheduled) | received {received} B"
+        )),
+        Some(c) => {
+            let deliverable = c as f64 * window.as_secs_f64() / 8.0;
+            out.push_str(&format!(
+                "capacity {c} bps | utilisation {:.1}% ({received} B / ~{deliverable:.0} B)",
+                pct(received as f64, deliverable)
+            ));
+        }
+        None => out.push_str(&format!("capacity unshaped | received {received} B")),
+    }
+
+    if series.is_empty() {
+        out.push_str(" | estimate: no allocation passes");
+    } else {
+        let last = series.last().expect("non-empty").1;
+        let min = series.iter().map(|(_, b, _)| *b).min().unwrap_or(0);
+        let max = series.iter().map(|(_, b, _)| *b).max().unwrap_or(0);
+
+        let mut peak = 0.0f64;
+        let mut drawdown = 0.0f64;
+        for (_, bps, _) in &series {
+            peak = peak.max(*bps as f64);
+            if peak > 0.0 {
+                drawdown = drawdown.max((peak - *bps as f64) / peak * 100.0);
+            }
+        }
+        // Demand alongside the estimate: the probe target is derived from it, so a demand that
+        // collapses drags the estimate down with it regardless of what the link can carry.
+        let d_last = series.last().expect("non-empty").2;
+        let d_min = series.iter().map(|(_, _, d)| *d).min().unwrap_or(0);
+        let d_max = series.iter().map(|(_, _, d)| *d).max().unwrap_or(0);
+        out.push_str(&format!(
+            " | estimate last {last} min {min} max {max} bps, worst drawdown {drawdown:.1}%, \
+             {} samples | demand last {d_last} min {d_min} max {d_max} bps",
+            series.len()
+        ));
+
+        if let Some(c) = capacity {
+            let off = (last as f64 - c as f64).abs() / c as f64 * 100.0;
+            out.push_str(&format!(" | ends {off:.1}% off capacity"));
+            for target in [80u8, 90] {
+                let want = c as f64 * target as f64 / 100.0;
+                match series.iter().find(|(_, b, _)| *b as f64 >= want) {
+                    Some((at, _, _)) => out.push_str(&format!(" | {target}% at {at:?}")),
+                    None => out.push_str(&format!(" | {target}% never")),
+                }
+            }
+        }
+    }
+
+    let offered = stats.delivered + stats.dropped_overflow;
+    out.push_str(&format!(
+        " | queue max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {} | media {:.1}%",
+        stats.max_backlog,
+        pct(stats.dropped_overflow as f64, offered as f64),
+        stats.dropped_overflow,
+        stats.dropped_loss,
+        pct(forwarded as f64, received as f64),
+    ));
+    out
+}
+
+/// Evaluate `property`, returning a human-readable reason on failure.
+fn check_property(
+    property: &Property,
+    handle: &ParticipantHandle,
+    ip: IpAddr,
+    window: Duration,
+    handles: &HashMap<&'static str, ParticipantHandle>,
+) -> Result<(), String> {
+    let now = tokio::time::Instant::now();
+    let stats = pulsebeam_runtime::net::shaper::stats(ip);
+
+    let capacity = || -> Result<f64, String> {
+        if !pulsebeam_runtime::net::shaper::capacity_is_fixed(ip) {
+            return Err(
+                "this property needs a fixed capacity, but the link is on a schedule".to_string(),
+            );
+        }
+        pulsebeam_runtime::net::shaper::capacity_at(ip, now)
+            .map(|c| c as f64)
+            .ok_or_else(|| "this property needs a shaped link, but none is configured".to_string())
+    };
+
+    let series = || -> Result<Vec<(Duration, u64, u64)>, String> {
+        let id = handle
+            .shared
+            .participant_id
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "participant never connected".to_string())?;
+        let s = pulsebeam::sim_metrics::bwe_series(&id);
+        if s.is_empty() {
+            // Distinguishing this from "passed" matters: a subscriber that ran no allocation
+            // passes satisfies every bound vacuously.
+            return Err(format!(
+                "no allocation passes recorded for {id}; the check would pass vacuously"
+            ));
+        }
+        Ok(s)
+    };
+
+    match *property {
+        Property::UtilisationAtLeast(min) => {
+            let capacity = capacity()?;
+            let received = handle
+                .rx_bytes()
+                .saturating_sub(handle.interval_rx_baseline);
+            let deliverable = capacity * window.as_secs_f64() / 8.0;
+            let got = pct(received as f64, deliverable);
+            if got + 0.5 < min as f64 {
+                return Err(format!(
+                    "used {got:.1}% of the link ({received} B of ~{deliverable:.0} B deliverable \
+                     at {capacity:.0} bps over {window:?}); expected >= {min}%"
+                ));
+            }
+        }
+        Property::EstimateMeetsNeed { percent } => {
+            let series = series()?;
+            // Steady-state demand, not the transient early value: the allocator's `desired`
+            // starts at a floor and rises as it learns the ladder, so the last sample is the
+            // honest statement of what was wanted.
+            let (_, last_bwe, last_desired) = *series.last().expect("non-empty");
+            let capacity = pulsebeam_runtime::net::shaper::capacity_at(ip, now).unwrap_or(u64::MAX);
+            let need = last_desired.min(capacity);
+            if need == 0 {
+                return Err("nothing was demanded, so the claim would be vacuous".to_string());
+            }
+            let got = pct(last_bwe as f64, need as f64);
+            if got + 0.5 < percent as f64 {
+                return Err(format!(
+                    "estimate ended at {last_bwe} bps against a need of {need} bps \
+                     (demand {last_desired}, capacity {capacity}) — {got:.1}%; expected \
+                     >= {percent}%"
+                ));
+            }
+        }
+        Property::EstimateTracksCapacity { within_percent } => {
+            let capacity = capacity()?;
+            let series = series()?;
+            let last = series.last().expect("non-empty").1 as f64;
+            let off = (last - capacity).abs() / capacity * 100.0;
+            if off > within_percent as f64 {
+                return Err(format!(
+                    "estimate ended at {last:.0} bps against {capacity:.0} bps of capacity \
+                     ({off:.1}% off); expected within {within_percent}%"
+                ));
+            }
+        }
+        Property::EstimateStable { max_drop_percent } => {
+            // A plan that delivered nothing satisfies "the estimate did not fall" for the worst
+            // possible reason: a frozen estimate never moves. Caught in practice - a plan whose
+            // publisher went dead reported a 0.0% drawdown over 600 samples having received 0
+            // bytes, and passed.
+            let received = handle
+                .rx_bytes()
+                .saturating_sub(handle.interval_rx_baseline);
+            if received == 0 {
+                return Err(
+                    "nothing was received, so a stable estimate means nothing moved at all"
+                        .to_string(),
+                );
+            }
+            let series = series()?;
+            let mut peak = 0.0f64;
+            let mut worst = 0.0f64;
+            let mut worst_at = Duration::ZERO;
+            let mut worst_from = 0.0f64;
+            let mut worst_to = 0.0f64;
+            for (at, bps, _) in &series {
+                let bps = *bps as f64;
+                peak = peak.max(bps);
+                if peak > 0.0 {
+                    let drop = (peak - bps) / peak * 100.0;
+                    if drop > worst {
+                        worst = drop;
+                        worst_at = *at;
+                        worst_from = peak;
+                        worst_to = bps;
+                    }
+                }
+            }
+            if worst > max_drop_percent as f64 {
+                return Err(format!(
+                    "estimate fell {worst:.1}% ({worst_from:.0} -> {worst_to:.0} bps) at \
+                     {worst_at:?} into the window; expected no drop over {max_drop_percent}%"
+                ));
+            }
+        }
+        Property::EstimateRecovers { of_peak_percent } => {
+            let received = handle
+                .rx_bytes()
+                .saturating_sub(handle.interval_rx_baseline);
+            if received == 0 {
+                return Err(
+                    "nothing was received, so a recovered estimate means nothing moved at all"
+                        .to_string(),
+                );
+            }
+            let series = series()?;
+            let last = series.last().expect("non-empty").1 as f64;
+            let peak = series.iter().map(|(_, b, _)| *b).max().unwrap_or(0) as f64;
+            if peak <= 0.0 {
+                return Err("the estimate never rose above zero".to_string());
+            }
+            let got = last / peak * 100.0;
+            if got + 0.5 < of_peak_percent as f64 {
+                return Err(format!(
+                    "estimate ended at {last:.0} bps against a peak of {peak:.0} ({got:.1}% of \
+                     it); expected to recover to within {of_peak_percent}%"
+                ));
+            }
+        }
+        Property::EstimateConverges { percent, within } => {
+            let capacity = capacity()?;
+            let series = series()?;
+            let target = capacity * percent as f64 / 100.0;
+            match series.iter().find(|(_, bps, _)| *bps as f64 >= target) {
+                Some((at, _, _)) if *at <= within => {}
+                Some((at, _, _)) => {
+                    return Err(format!(
+                        "reached {percent}% of capacity ({target:.0} bps) only after {at:?}; \
+                         expected within {within:?}"
+                    ));
+                }
+                None => {
+                    let best = series.iter().map(|(_, b, _)| *b).max().unwrap_or(0);
+                    return Err(format!(
+                        "never reached {percent}% of capacity ({target:.0} bps); best was \
+                         {best} bps against {capacity:.0} bps of link"
+                    ));
+                }
+            }
+        }
+        Property::QueueingDelayBelow(max) => {
+            if stats.max_backlog > max {
+                return Err(format!(
+                    "bottleneck queue reached {:?}; expected below {max:?}",
+                    stats.max_backlog
+                ));
+            }
+        }
+        Property::CongestionLossBelow(max) => {
+            let offered = stats.delivered + stats.dropped_overflow;
+            let got = pct(stats.dropped_overflow as f64, offered as f64);
+            if got > max as f64 {
+                return Err(format!(
+                    "{got:.1}% of offered packets were dropped by a full buffer \
+                     ({} of {offered}); expected below {max}%",
+                    stats.dropped_overflow
+                ));
+            }
+        }
+        Property::QualityChangesPerMinuteBelow { origin, max } => {
+            // Resolved here rather than read off the report: the report's map is filled by the
+            // end-of-plan scoreboard, which has not run yet mid-plan.
+            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+                return Err(format!(
+                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
+                ));
+            };
+            let changes = pulsebeam::sim_metrics::quality_changes(&id);
+            let minutes = window.as_secs_f64() / 60.0;
+            if minutes <= 0.0 {
+                return Err("the window has no duration to rate-limit against".to_string());
+            }
+            let rate = changes as f64 / minutes;
+            if rate > max as f64 {
+                return Err(format!(
+                    "{origin}'s layer changed {changes} times in {window:?} ({rate:.0}/min);                      expected at most {max}/min. Each change costs a keyframe and stutters the                      picture, so at this rate the stream never holds a layer long enough to                      decode and the viewer sees nothing at all"
+                ));
+            }
+        }
+        Property::MediaEfficiencyAtLeast(min) => {
+            let received = handle
+                .rx_bytes()
+                .saturating_sub(handle.interval_rx_baseline);
+            if received == 0 {
+                return Err("nothing was received, so the ratio would be meaningless".to_string());
+            }
+            let forwarded = handle.forwarded_media();
+            let got = pct(forwarded as f64, received as f64);
+            if got < min as f64 {
+                return Err(format!(
+                    "only {got:.1}% of received bytes were media ({forwarded} media / \
+                     {received} received); expected >= {min}%"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Characteristics of the simulated link between every pair of hosts.
+///
+/// **This matters enormously for congestion control.** turmoil's own default is a uniform
+/// random 0-100ms latency applied independently per message. That is not a network: it has no
+/// ordering correlation, so a burst of packets sent 2ms apart arrives smeared over 100ms in
+/// arbitrary order.
+///
+/// Inter-packet arrival spacing is precisely the signal GCC measures. Under turmoil's default,
+/// every probe under-reads its own send rate by 2-4x, the trendline estimator sees pure noise,
+/// and reordering is charged as packet loss - the loss controller settles on an 8-9% inherent
+/// loss estimate on a link that drops nothing. Any BWE conclusion drawn in that environment is
+/// an artifact of the simulator.
+///
+/// These profiles instead use a tight latency band, which is what a real path looks like:
+/// propagation delay is near-constant and jitter is small relative to it.
+///
+/// Note the jitter band must stay narrow even for "bad" networks. turmoil draws each message's
+/// latency *independently*, so a +/-15ms band reorders roughly 30 consecutive packets - far more
+/// than a real link, where packets queue in order behind one another. Measured against a 1% loss
+/// configuration that produced 17-51% apparent loss, because the receiver counts not-yet-arrived
+/// packets as lost. Model a worse network by raising latency and loss, not by widening jitter.
+///
+/// Capacity, buffer depth and the loss model live in `pulsebeam_runtime::net::shaper`; turmoil
+/// itself has no notion of any of them.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkProfile {
+    pub min_latency: Duration,
+    pub max_latency: Duration,
+    /// Fraction of SFU-egress datagrams dropped outright, 0.0..=1.0.
+    pub loss: f64,
+    /// Downlink capacity per participant, in bits per second. `None` leaves the path unlimited.
+    ///
+    /// **Only set this when the rate is meant to bind.** The shaper releases queued packets on
+    /// the next send attempt, so release is quantised to event-loop iterations. When the shaped
+    /// rate is the dominant delay that quantisation is lost in the serialisation delay and the
+    /// model is sound; on a link fast enough that serialisation is negligible it becomes the
+    /// largest source of inter-packet jitter, which is precisely the signal GCC measures. Shaping
+    /// a non-binding link therefore manufactures congestion rather than removing an artifact:
+    /// measured, a plan delivering 2 MB unshaped delivered 721 kB at both 50 Mbps *and* 1 Gbps —
+    /// identical, so the limit was the shaper rather than the link.
+    ///
+    /// The cost of leaving it `None` is that the plan says nothing about congestion control: with
+    /// nothing to saturate, the estimate climbs to `MAX_BANDWIDTH` and sits there (measured at
+    /// exactly 5,000,000 bps, 0.0% drawdown). That is the right trade for plans about allocation
+    /// or signalling, and the wrong one for plans about the estimator.
+    ///
+    /// turmoil has no notion of capacity, so without this a simulated path carries any offered
+    /// load: there is no queueing delay, the delay-based estimator never backs off, and a probe
+    /// that under-delivers cannot pull the estimate down. Set it to make congestion real. See
+    /// `pulsebeam_runtime::net::shaper`.
+    pub bandwidth_bps: Option<u64>,
+}
+
+impl LinkProfile {
+    /// Wired/fibre: ~10ms RTT, minimal jitter, no loss. The default.
+    pub fn fiber() -> Self {
+        Self {
+            min_latency: Duration::from_millis(5),
+            max_latency: Duration::from_millis(6),
+            loss: 0.0,
+            bandwidth_bps: None,
+        }
+    }
+
+    /// Home Wi-Fi: a little more latency and jitter than wired, plus occasional loss.
+    pub fn wifi() -> Self {
+        Self {
+            min_latency: Duration::from_millis(8),
+            max_latency: Duration::from_millis(13),
+            loss: 0.002,
+            bandwidth_bps: None,
+        }
+    }
+
+    /// Mobile: markedly higher latency and 1% loss, with jitter kept narrow (see the note above
+    /// on why a wide band is not a realistic way to model a worse network).
+    pub fn cellular() -> Self {
+        Self {
+            min_latency: Duration::from_millis(45),
+            max_latency: Duration::from_millis(52),
+            loss: 0.01,
+            bandwidth_bps: None,
+        }
+    }
+}
+
+impl Default for LinkProfile {
+    fn default() -> Self {
+        Self::fiber()
+    }
+}
+
 pub struct LocalNodeSim {
     rooms: Vec<Room>,
     tick_duration: Duration,
     rng_seed: u64,
+    subnet: Option<u8>,
     tcp_only: bool,
     num_shards: usize,
+    link: LinkProfile,
 }
 
 impl Default for LocalNodeSim {
@@ -1296,9 +2489,23 @@ impl LocalNodeSim {
             rooms: Vec::new(),
             tick_duration: Duration::from_millis(1),
             rng_seed: 0xDEAD_BEEF,
+            subnet: None,
             tcp_only: false,
             num_shards: 1,
+            link: LinkProfile::default(),
         }
+    }
+
+    /// Set the simulated link characteristics. See [`LinkProfile`].
+    pub fn with_link(mut self, link: LinkProfile) -> Self {
+        self.link = link;
+        self
+    }
+
+    /// Cap each participant's downlink. See [`LinkProfile::bandwidth_bps`].
+    pub fn with_bandwidth(mut self, bits_per_sec: u64) -> Self {
+        self.link.bandwidth_bps = Some(bits_per_sec);
+        self
     }
 
     pub fn with_room(mut self, r: Room) -> Self {
@@ -1306,8 +2513,20 @@ impl LocalNodeSim {
         self
     }
 
-    pub fn with_tick(mut self, d: Duration) -> Self {
-        self.tick_duration = d;
+    /// Pin the subnet this plan runs on, rather than taking the next one available.
+    ///
+    /// Addresses are otherwise handed out by a process-wide counter, so a plan's IPs depend on
+    /// how many plans ran before it. That is harmless when every plan is its own process, and
+    /// quietly destroys reproducibility when they are not: proptest runs all of its cases in one
+    /// process, draws a different sample each run, and so the *same* scenario lands on different
+    /// addresses depending on where in the sample it fell. A case that failed then passed on
+    /// replay, which is the one thing a randomised suite may not do.
+    ///
+    /// Callers deriving this from their input get addresses fixed by the scenario itself. Only
+    /// safe because plans within a process run one at a time; two concurrent plans on one subnet
+    /// would share a network.
+    pub fn with_subnet(mut self, subnet: u8) -> Self {
+        self.subnet = Some(1 + (subnet % 200));
         self
     }
 
@@ -1330,7 +2549,31 @@ impl LocalNodeSim {
         self
     }
 
+    /// Run a plan, asserting nothing and returning what each participant's link did.
+    ///
+    /// The entry point randomised scenarios use: a generated plan cannot carry hand-written
+    /// thresholds, so it has to hand back measurements for the property to judge. Also the only
+    /// way to express a claim *across* runs, since anything asserted inside the simulation is a
+    /// panic on a turmoil host.
+    pub fn run_collecting(self, plan: Vec<Step>) -> HashMap<&'static str, LinkReport> {
+        self.run_inner(plan)
+    }
+
     pub fn run(self, plan: Vec<Step>) {
+        self.run_inner(plan);
+    }
+
+    fn run_inner(self, plan: Vec<Step>) -> HashMap<&'static str, LinkReport> {
+        // Determinism. Both must be in force for the whole plan: the clock so dependencies read
+        // simulated rather than real time, the RNG so map iteration order and key generation
+        // repeat. Seeded per plan and per thread, since `cargo test` gives each plan its own
+        // thread and turmoil drives that plan's hosts on it.
+        //
+        // The guard is dropped at the end of this function rather than at process exit, so the
+        // real clock is back in force before the runtime tears down.
+        let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+        crate::sim_rand::set_thread_rng(self.rng_seed);
+
         let sim_duration = plan
             .iter()
             .filter_map(|s| match s {
@@ -1343,10 +2586,16 @@ impl LocalNodeSim {
         let mut sim = turmoil::Builder::new()
             .simulation_duration(sim_duration)
             .tick_duration(self.tick_duration)
+            .min_message_latency(self.link.min_latency)
+            .max_message_latency(self.link.max_latency)
+            // turmoil's fail_rate partitions the link and clears its in-flight queue; it is not
+            // a per-datagram loss percentage. Ordinary lossy profiles use the simulator's
+            // datagram dropper below. Explicit Step::Partition still exercises outages.
+            .fail_rate(0.0)
             .rng_seed(self.rng_seed)
             .build();
 
-        let subnet = reserve_subnet();
+        let subnet = self.subnet.unwrap_or_else(reserve_subnet);
         let server_ip = subnet_ip(subnet, 1);
         let coordinator_ip = subnet_ip(subnet, 254);
         let seed = self.rng_seed;
@@ -1379,6 +2628,20 @@ impl LocalNodeSim {
                 ip_counter += 1;
 
                 name_to_ip.insert(participant.name, ip);
+                // The runtime shaper sits on the SFU's egress socket, so this models loss and
+                // bandwidth on the path to the participant. Client UDP sockets bypass it; do not
+                // configure a misleading "server" destination here.
+                //
+                // State is keyed by unique simulation addresses. Do not clear the process-wide
+                // registry: cargo runs simulator tests in parallel and clearing it would change
+                // the network model of a different test already in flight.
+                pulsebeam_runtime::net::shaper::set_packet_loss(ip, self.link.loss);
+
+                // Shaping is keyed by destination, so this caps what the SFU can push down to
+                // this participant without touching the paths between anyone else.
+                if let Some(bps) = self.link.bandwidth_bps {
+                    pulsebeam_runtime::net::shaper::set_downlink(ip, bps);
+                }
 
                 let shared = Arc::new(ParticipantShared::new());
                 let (cmd_tx, cmd_rx) = mpsc::channel::<ParticipantCmd>(16);
@@ -1404,14 +2667,19 @@ impl LocalNodeSim {
             }
         }
 
+        let reports: Arc<Mutex<HashMap<&'static str, LinkReport>>> = Default::default();
+        let reports_inner = reports.clone();
         sim.client(coordinator_ip, async move {
             let mut handles = handles;
-            execute_plan(plan, &mut handles, &name_to_ip)
+            execute_plan(plan, &mut handles, &name_to_ip, &reports_inner)
                 .await
                 .map_err(Into::into)
         });
 
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);
         run_sim_or_timeout(&mut sim, wall_budget).expect("simulation failed");
+
+        let out = reports.lock().expect("reports poisoned").clone();
+        out
     }
 }

@@ -32,6 +32,7 @@ pub enum ApiError {
 pub struct CreateParticipantRequest {
     pub offer: SdpOffer,
     pub room_id: String,
+    pub manual_sub: bool,
 }
 
 pub struct CreateParticipantResponse {
@@ -136,7 +137,14 @@ impl HttpApiClient {
         &self,
         req: CreateParticipantRequest,
     ) -> Result<CreateParticipantResponse, ApiError> {
-        let uri = format!("{}/rooms/{}/participants", self.base_uri, req.room_id);
+        let uri = if req.manual_sub {
+            format!(
+                "{}/rooms/{}/participants?manual_sub=true",
+                self.base_uri, req.room_id
+            )
+        } else {
+            format!("{}/rooms/{}/participants", self.base_uri, req.room_id)
+        };
         tracing::info!(%uri, "Sending SDP Offer");
 
         let raw_body = req.offer.to_sdp_string().into_bytes();
