@@ -68,14 +68,6 @@ impl VideoAllocator {
             min_bitrate: MIN_BANDWIDTH,
             max_bitrate: MAX_BANDWIDTH,
             default_bitrate: INITIAL_BANDWIDTH,
-            // Ask for exactly what the subscription represents, no more. Ramp headroom is
-            // already intent-shaped and comes from elsewhere: `run_desired` takes
-            // `max(flowing, requested_capacity)`, so a subscription sitting on a low layer
-            // already asks for the full capacity of the layer it may grow into, and str0m
-            // probes at `2 x desired` on top of that. Measured over 60s on a 360p-capped
-            // subscription, raising this to 1.2 costs 4.25 MB against 3.57 MB, and buys about
-            // 7% on the first 8s of a 720p ramp.
-            headroom_factor: 1.0,
             ..Default::default()
         }
         .build();
@@ -287,7 +279,11 @@ impl VideoAllocator {
             .filter_map(|(key, s)| {
                 let current = s.target()?;
                 let track = self.tracks.get(&current.meta.id)?;
-                let current_quality = current.quality;
+                // Not `current.quality`: `target()`/`desired` is also where `pause_at` parks a
+                // cheap staging route while paused, which would read back as "just dropped to
+                // the bottom of the ladder" and force a full re-climb on every resume. See
+                // `Slot::last_forwarded_quality`.
+                let current_quality = s.last_forwarded_quality.unwrap_or(current.quality);
                 Some(SlotView {
                     key,
                     mid: s.mid,
@@ -346,6 +342,16 @@ impl VideoAllocator {
                 available_bandwidth.as_f64() as u64,
                 desired.as_f64() as u64,
             );
+            for view in &views {
+                let quality = match decisions.get(view.key) {
+                    Some(AllocationDecision::Forward(layer, _)) => Some(layer.quality as u8),
+                    _ => None,
+                };
+                crate::sim_metrics::record_forwarded_quality(
+                    &view.track.meta.origin.to_string(),
+                    quality,
+                );
+            }
         }
 
         if changed {
@@ -504,6 +510,22 @@ struct Slot {
     /// and every step of moving between them is owned by `switcher`.
     desired: Option<TrackLayer>,
 
+    /// The quality of the layer we were last confirmed *forwarding* - as opposed to `desired`,
+    /// which `pause_at` also uses to pick a cheap route to stay staged on while paused. Pausing
+    /// does not touch this field.
+    ///
+    /// Admission in `run_compute` needs to tell "we already earned this quality, retention is
+    /// free" apart from "this is a fresh climb, spend the once-per-pass upgrade grant on it".
+    /// Reading that distinction off `desired`/`target()` conflates the two: `pause_target` always
+    /// picks the *lowest* eligible layer (deliberately - a cheap route is enough to keep a
+    /// resume fast), so any pause reset the slot's apparent quality to the bottom of the ladder.
+    /// A brief pause from a co-tenant's burst then forced a multi-layer stream to re-climb from
+    /// scratch, one genuine tier per pass, and if it got paused again before finishing - which a
+    /// volatile co-tenant reliably causes - it never completed the climb. Two subscriptions on
+    /// one connection could livelock indefinitely: not from insufficient bandwidth, but from
+    /// losing the memory of what they had already earned.
+    last_forwarded_quality: Option<LayerQuality>,
+
     switcher: Switcher,
 
     mid: Mid,
@@ -531,6 +553,7 @@ impl Slot {
             pt: cfg.pt,
 
             desired: None,
+            last_forwarded_quality: None,
 
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY, rng),
             // With no signaling, we assume users are viewing with 720p playback
@@ -628,6 +651,7 @@ impl Slot {
             self.desired = Some(new_layer.clone());
             changed = true;
         }
+        self.last_forwarded_quality = Some(new_layer.quality);
 
         // Drive the switcher toward the new target. It is the authority on the
         // active/staging/draining streams; observe whether that changed.
@@ -936,11 +960,8 @@ impl AllocationEngine {
     /// satisfy the request rather than undershoot it.
     ///
     /// Rounding down - the obvious reading of "max height" - is what produced the "never reaches
-    /// 720p" reports, and it costs more than one tier of sharpness. [`Self::requested_capacity`]
-    /// values a subscription at the seed bitrate of the tallest *allowed* layer, so undershooting
-    /// also halves what the SFU asks BWE for. str0m probes at `2 x desired` and a probe only ever
-    /// proves its own target, so the estimate then pins just above the layer already in use and
-    /// the taller one can never be afforded. See `height_request_rounds_up_the_ladder_test`.
+    /// 720p" reports, and it costs more than one tier of sharpness. See
+    /// `height_request_rounds_up_the_ladder_test`.
     ///
     /// Overshoot is bounded by construction - this is the *smallest* satisfying layer - and it is
     /// a ceiling, not a floor: the allocator still drops to a lower layer whenever bandwidth is
@@ -987,24 +1008,30 @@ impl AllocationEngine {
         self.snap(layer).bitrate_bps
     }
 
-    /// Cost used to derive `desired`, floored at the layer's configured capacity.
+    /// What a layer is priced at when deciding whether it fits.
     ///
-    /// `stable_bitrate_bps` is an EWMA over the measured (or VLA-declared) rate with a 30s fall
-    /// constant and no lower bound, so a publisher that goes quiet - static screenshare being
-    /// the common case - drags it toward zero. Feeding that straight into `desired` conflates
-    /// "what the publisher is sending right now" with "what this subscription may grow into".
+    /// The slow-moving measurement, not the reactive one. Screen content is violently variable -
+    /// a still desktop costs almost nothing, a scrolled window costs the full layer rate - and
+    /// pricing admission off the instantaneous rate makes the decision chase that swing. Where
+    /// two streams are close to filling the estimate, each swing flips which of them fits, and
+    /// the allocation oscillates with the content rather than with the network.
     ///
-    /// str0m caps every bandwidth probe at `2 x desired`, so a decayed `desired` starves the
-    /// probe controller and the estimate cannot recover enough to allocate a higher layer -
-    /// the stream stays stuck at low quality after the content goes static.
+    /// Observed in production against a *perfectly stable* 3.325 Mbps estimate: a screen share
+    /// alternating between its top layer and paused on consecutive passes. Each flip stops and
+    /// restarts the stream, so it never accumulates a decodable picture and the viewer reports it
+    /// as simply never appearing - not as poor quality.
     ///
-    /// Flooring at the layer's configured seed keeps `desired` a statement about capacity, which
-    /// is what libWebRTC's `max_total_allocated_bitrate` is: a sum of *configured* stream maxima
-    /// that does not decay. Allocation decisions keep using the unfloored [`Self::cost`], so this
-    /// only affects how much headroom we ask BWE to probe for.
+    /// libWebRTC draws the same distinction, allocating against a stable target rather than the
+    /// instantaneous estimate, and for the same reason.
+    ///
+    /// Eligibility still reads the reactive rate: a layer that has genuinely stopped must drop
+    /// out promptly, and that is a liveness question rather than a pricing one.
+    fn admission_cost(&self, layer: &TrackLayer) -> f64 {
+        self.stable_cost(layer)
+    }
+
     fn stable_cost(&self, layer: &TrackLayer) -> f64 {
-        let measured = self.snap(layer).stable_bitrate_bps;
-        measured.max(layer.quality.seed_bitrate_bps() as f64)
+        self.snap(layer).stable_bitrate_bps
     }
 
     /// Lowest healthy layer ignoring the spatial constraint. Used as a
@@ -1099,36 +1126,10 @@ impl AllocationEngine {
     pub fn run_desired(&self, slots: &[SlotView<'_>]) -> Bitrate {
         let total: f64 = slots
             .iter()
-            .map(|s| {
-                let flowing = self.best_healthy(s).map(|l| self.stable_cost(l)).unwrap_or(0.0);
-                flowing.max(self.requested_capacity(s))
-            })
+            .filter_map(|s| self.best_healthy(s))
+            .map(|l| self.stable_cost(l))
             .sum();
         Bitrate::from(total as u64)
-    }
-
-    /// Configured capacity this subscription is asking for, independent of what is flowing.
-    ///
-    /// [`Self::best_healthy`] only sees layers that are currently healthy and carrying data. A
-    /// layer that was paused for lack of bandwidth is invisible to it - which is precisely the
-    /// layer we need BWE to find headroom for. Deriving `desired` from flowing layers alone
-    /// makes it a description of current *supply*, and since str0m caps every probe at
-    /// `2 x desired`, the estimate can then never grow enough to un-pause the layer. The
-    /// subscription stays stuck at low quality with no way out - a subscriber that asks for 720p
-    /// after a long stretch at 180p never gets it, on a link that could carry it the whole time.
-    ///
-    /// Selecting purely on the client's spatial request, and valuing it at the layer's
-    /// configured seed rather than its measured rate, keeps `desired` a statement of demand.
-    /// This mirrors libWebRTC's `max_total_allocated_bitrate`, which is a sum of *configured*
-    /// stream maxima and does not decay with what the encoder happens to be emitting.
-    fn requested_capacity(&self, slot: &SlotView<'_>) -> f64 {
-        slot.track
-            .layers
-            .iter()
-            .filter(|layer| self.spatially_allowed(slot, layer))
-            .max_by_key(|layer| layer.quality)
-            .map(|layer| layer.quality.seed_bitrate_bps() as f64)
-            .unwrap_or(0.0)
     }
 
     fn used_bitrate(decisions: &SecondaryMap<SlotKey, AllocationDecision<'_>>) -> Bitrate {
@@ -1198,7 +1199,7 @@ impl AllocationEngine {
         // pause a high-priority stream and cause severe underuse oscillation.
         for (i, slot) in slots.iter().enumerate() {
             if let Some(floor) = self.floor_layer(slot) {
-                let cost = self.cost(floor);
+                let cost = self.admission_cost(floor);
                 let threshold = if slot.current_quality >= floor.quality {
                     cost * Self::DOWNGRADE_FACTOR
                 } else {
@@ -1211,29 +1212,67 @@ impl AllocationEngine {
             }
         }
 
-        // Pass 2: raise toward target in priority order. Retention/recovery up to
-        // the current layer is free (sticky dead-band); climbing above it is a
-        // genuine upgrade, and only one is granted per call.
+        // Pass 2: raise toward target, one tier at a time across all slots, in priority order
+        // within each tier. Retention/recovery up to the current layer is free (sticky
+        // dead-band); climbing above it is a genuine upgrade, and only one is granted per call.
+        //
+        // Tier-at-a-time rather than each slot to exhaustion: serving a costly slot to its top
+        // layer first can leave a remainder that covers a co-tenant's next step but not that step
+        // plus `reserve`, pinning it at its floor indefinitely while the link sits underused.
+        // Priority still decides who steps first within a tier, which is what it should mean -
+        // not "takes everything before anyone else is considered".
         let mut upgrade_used = false;
-        for (i, slot) in slots.iter().enumerate() {
-            let mut cur = allocs[i];
-            while let Some(next) = self.next_layer(slot, cur) {
-                let step = self.cost(next) - cur.map_or(0.0, |l| self.cost(l));
-                let admitted = if next.quality > slot.current_quality {
+        loop {
+            let mut progressed = false;
+            for (i, slot) in slots.iter().enumerate() {
+                let Some(next) = self.next_layer(slot, allocs[i]) else {
+                    continue;
+                };
+                let step =
+                    self.admission_cost(next) - allocs[i].map_or(0.0, |l| self.admission_cost(l));
+                let is_upgrade = next.quality > slot.current_quality;
+                if is_upgrade && !upgrade_used && step + reserve > budget {
+                    // Retention hysteresis may have admitted a lower-priority stream even though
+                    // its full cost no longer fits. Do not let that stale allocation pin a
+                    // higher-priority request at its floor: reclaim lower-priority allocations
+                    // only when doing so makes this one upgrade affordable. Equal-priority slots
+                    // keep their deterministic order and are not preempted.
+                    let reclaimable: f64 = ((i + 1)..slots.len())
+                        .filter(|&j| slots[j].priority < slot.priority)
+                        .filter_map(|j| allocs[j].map(|layer| self.admission_cost(layer)))
+                        .sum();
+                    if budget + reclaimable >= step + reserve {
+                        for j in ((i + 1)..slots.len()).rev() {
+                            if slots[j].priority >= slot.priority {
+                                continue;
+                            }
+                            if let Some(layer) = allocs[j].take() {
+                                budget += self.admission_cost(layer);
+                                if budget >= step + reserve {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                let admitted = if is_upgrade {
                     !upgrade_used && step + reserve <= budget
                 } else {
                     step * Self::DOWNGRADE_FACTOR <= budget
                 };
                 if !admitted {
-                    break;
+                    continue;
                 }
-                if next.quality > slot.current_quality {
+                if is_upgrade {
                     upgrade_used = true;
                 }
                 budget -= step;
-                cur = Some(next);
+                allocs[i] = Some(next);
+                progressed = true;
             }
-            allocs[i] = cur;
+            if !progressed {
+                break;
+            }
         }
 
         // Finalize.
@@ -1242,12 +1281,18 @@ impl AllocationEngine {
             if let Some(layer) = allocs[i] {
                 decisions.insert(
                     slot.key,
-                    AllocationDecision::Forward(layer, Bitrate::from(self.cost(layer) as u64)),
+                    AllocationDecision::Forward(
+                        layer,
+                        Bitrate::from(self.admission_cost(layer) as u64),
+                    ),
                 );
             } else if let Some(target) = self.pause_target(slot) {
                 decisions.insert(
                     slot.key,
-                    AllocationDecision::Pause(target, Bitrate::from(self.cost(target) as u64)),
+                    AllocationDecision::Pause(
+                        target,
+                        Bitrate::from(self.admission_cost(target) as u64),
+                    ),
                 );
             }
         }
@@ -1620,6 +1665,140 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
         assert_eq!(allocator.slots().count(), 3);
+    }
+
+    fn bw(kbps: u64) -> Bitrate {
+        Bitrate::from(kbps * 1_000)
+    }
+
+    fn layer_bps(track: &Track, q: LayerQuality) -> f64 {
+        track.by_quality(q).unwrap().state.bitrate_bps()
+    }
+
+    /// A single-layer track (a screen share with no simulcast fallback), for tests where the
+    /// point is that a slot cannot gracefully step down - it forwards its one layer or nothing.
+    fn single_layer_track(mid: &str) -> (UpstreamTrack, Track) {
+        let pid = ParticipantId::new(&mut test_rng());
+        let (tx, track) = make_video_track(pid, Mid::from(mid), vec![SimulcastLayer::new("f")]);
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        (tx, track)
+    }
+
+    fn multi_layer_track(mid: &str) -> (UpstreamTrack, Track) {
+        let pid = ParticipantId::new(&mut test_rng());
+        let (tx, track) = make_video_track(
+            pid,
+            Mid::from(mid),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        (tx, track)
+    }
+
+    /// A slot paused by a co-tenant's burst must not lose the quality it already earned.
+    ///
+    /// Two subscriptions on one connection: a screen share with a single, expensive layer and no
+    /// fallback, prioritized above a multi-layer camera. Reproduces the production report - "the
+    /// screen share got stuck paused, and once it recovered the camera got stuck at 360p" - as
+    /// three direct `update_allocations` calls rather than as network simulation, because the
+    /// mechanism is pure allocator logic and does not need a link, VBR content, or wall-clock
+    /// time to reproduce: a `Slot` forgetting what it was forwarding, purely from being paused.
+    #[test]
+    fn slot_regains_quality_immediately_after_a_pause_clears() {
+        let mut allocator = setup_allocator();
+
+        let (screen_tx, screen_track) = single_layer_track("screen");
+        let (camera_tx, camera_track) = multi_layer_track("camera");
+        let screen_id = screen_tx.meta.id;
+        let camera_id = camera_tx.meta.id;
+        allocator.add_track(screen_track.clone());
+        allocator.add_track(camera_track.clone());
+        add_slots(&mut allocator, 2);
+
+        let slot_mids: Vec<Mid> = allocator.slots.values().map(|s| s.mid).collect();
+        let mut intents = HashMap::new();
+        intents.insert(
+            slot_mids[0],
+            Intent {
+                track_id: screen_id,
+                target_height: 1080,
+                min_height: 0,
+                priority: 1,
+            },
+        );
+        intents.insert(
+            slot_mids[1],
+            Intent {
+                track_id: camera_id,
+                target_height: 720,
+                min_height: 0,
+                priority: 0,
+            },
+        );
+        allocator.configure(&intents);
+
+        let screen_high = layer_bps(&screen_track, LayerQuality::High);
+        let camera_high = layer_bps(&camera_track, LayerQuality::High);
+        let ample = bw(((screen_high + camera_high) * 1.5 / 1_000.0) as u64);
+        let screen_only = bw((screen_high * 1.02 / 1_000.0) as u64);
+
+        let forwarded_quality = |allocator: &VideoAllocator, mid: Mid| -> Option<LayerQuality> {
+            allocator
+                .slots
+                .values()
+                .find(|s| s.mid == mid)
+                .filter(|s| !s.paused)
+                .and_then(|s| s.desired.as_ref())
+                .map(|l| l.quality)
+        };
+
+        // Pass 1: ample budget. Camera climbs from a cold start (Low), gated to one genuine
+        // upgrade per call, so it takes a couple of calls to walk up to High - this is
+        // `at_most_one_genuine_upgrade_per_call`'s rule and is not what this test is about.
+        for _ in 0..4 {
+            allocator.update_allocations(ample);
+        }
+        assert_eq!(
+            forwarded_quality(&allocator, slot_mids[0]),
+            Some(LayerQuality::High)
+        );
+        assert_eq!(
+            forwarded_quality(&allocator, slot_mids[1]),
+            Some(LayerQuality::High),
+            "camera should reach High once settled, with ample budget for both"
+        );
+
+        // Pass 2: a co-tenant burst leaves only enough for the single-layer screen share.
+        // Camera - all-or-nothing at every layer above Low here, since the budget cannot even
+        // cover Medium - is paused.
+        allocator.update_allocations(screen_only);
+        assert_eq!(
+            forwarded_quality(&allocator, slot_mids[0]),
+            Some(LayerQuality::High)
+        );
+        assert_eq!(
+            forwarded_quality(&allocator, slot_mids[1]),
+            None,
+            "camera should be paused while the budget cannot cover it"
+        );
+
+        // Pass 3: budget returns to the Pass 1 level. Camera must be back at High in this one
+        // call - it already proved it could sustain High, so regaining it is retention, not a
+        // fresh climb through Low and Medium gated one genuine upgrade per call.
+        allocator.update_allocations(ample);
+        assert_eq!(
+            forwarded_quality(&allocator, slot_mids[1]),
+            Some(LayerQuality::High),
+            "camera must regain High in the same call the budget returns, not over several calls"
+        );
     }
 
     #[test]
@@ -2048,6 +2227,231 @@ mod allocation_tests {
         }
     }
 
+    /// A costly high-priority stream must not pin a co-tenant at its floor.
+    ///
+    /// Taken from a production capture: a 1.617 Mbps estimate, a prioritized screen share whose
+    /// top layer costs 1.178 Mbps, and a camera that sat at 150 kbps for 27 seconds. Serving the
+    /// screen share to exhaustion first leaves 289 kbps - enough for the camera's 287 kbps step to
+    /// Medium, but not enough to also keep `RESERVE_FRACTION` free afterwards, so the camera never
+    /// moves. It only recovered when the screen share's VBR cost happened to fall.
+    ///
+    /// Climbing every slot a tier at a time, rather than each slot to exhaustion in turn, reaches
+    /// the same total but distributes it: the camera takes Medium before the screen share takes
+    /// its last and most expensive step. Priority still decides who steps first within each tier,
+    /// which is what it should mean - not "takes everything before anyone else is considered".
+    /// Repeating an allocation with unchanged inputs must produce the same answer.
+    ///
+    /// Straight from production, numbers and all: the estimate sat perfectly still at 3.325 Mbps
+    /// and slot 7 flapped between its top and middle layer on *every* pass, forever.
+    ///
+    ///     bwe=3.325M used=3.750M 7:H(1.250M) 8:H(2.500M)
+    ///     bwe=3.325M used=2.937M 7:M(437k)   8:H(2.500M)
+    ///     bwe=3.325M used=3.750M 7:H(1.250M) 8:H(2.500M)
+    ///
+    /// Note `used` exceeding `bwe` on alternate passes: the combination admitted costs more than
+    /// the estimate allows, the next pass sees that and downgrades, and the pass after re-admits
+    /// it. Nothing about the network is involved - the estimate never moves - so this is decided
+    /// entirely by the allocator, and reproducing it needs no simulation at all.
+    ///
+    /// The condition is narrow, which is why it went unseen: two *different* ladders, one topping
+    /// out at 2.5 Mbps rather than the usual 1.25, and total demand only slightly above the
+    /// estimate. Every simulated publisher used the same ladder, so the regime was unreachable.
+    ///
+    /// Asserted as a fixed point rather than as a particular choice. Which layer is correct here
+    /// is a policy question; that asking twice gives the same answer is not.
+    #[test]
+    fn allocation_is_a_fixed_point_when_nothing_changes() {
+        let camera = healthy_track();
+        let screen = healthy_track();
+        // A screen share negotiates the full ladder but only ever sends `f`: resolution is worth
+        // more than adaptability for screen content, so the lower rungs stay dark. That leaves it
+        // with no rung to fall back to, which is why it *pauses* rather than degrading - and it
+        // is why the log shows `8:PAUSE` rather than `8:L`.
+        for q in [LayerQuality::Low, LayerQuality::Medium] {
+            screen
+                .by_quality(q)
+                .unwrap()
+                .state
+                .update_for_test()
+                .inactive(true);
+        }
+
+        for (track, q, bps) in [
+            (&camera, LayerQuality::Low, 150_000),
+            (&camera, LayerQuality::Medium, 437_000),
+            (&camera, LayerQuality::High, 1_250_000),
+            (&screen, LayerQuality::High, 2_500_000),
+        ] {
+            track
+                .by_quality(q)
+                .unwrap()
+                .state
+                .update_for_test()
+                .bitrate(bps);
+        }
+
+        // The estimate at which the log alternates between `7:H 8:PAUSE` (using 1.250 Mbps of it)
+        // and `7:M 8:H` (using 2.937), against 3.750 Mbps of demand.
+        let estimate = bw(2971);
+
+        // Started from each of the two observed states. Both must reach the same answer: an
+        // allocator whose output depends on its own previous output has no fixed point, and the
+        // two states can then hand off to each other indefinitely.
+        let mut outcomes = Vec::new();
+        // Only `f` is live on the screen share, so its state is either that or paused.
+        for start in [
+            [LayerQuality::High, LayerQuality::High],
+            [LayerQuality::Medium, LayerQuality::High],
+        ] {
+            let mut current = start;
+            let mut seen = Vec::new();
+            for pass in 0..8 {
+                // Costs are measured, not declared, so they drift pass to pass as the encoder
+                // varies - the log shows the camera's bottom layer reported as 150.000, 150.080
+                // and 150.098 kbps within seconds. A fraction of a percent, and irrelevant unless
+                // a decision sits on the boundary, which is exactly where this one does.
+                // Screen content is violently variable: a still desktop costs almost nothing and
+                // a scrolled window costs the full layer rate. This is not jitter to be smoothed
+                // away, it is what the source does, and admission reads the *reactive* measured
+                // rate rather than the slow-moving `stable_bitrate_bps` kept alongside it.
+                let reactive = if pass % 2 == 0 { 2_500_000 } else { 900_000 };
+                screen
+                    .by_quality(LayerQuality::High)
+                    .unwrap()
+                    .state
+                    .update_for_test()
+                    .bitrate(reactive)
+                    // The stable rate barely moves - it is a 30s-fall filter - which is the whole
+                    // reason it is kept alongside the reactive one. Setting both, as the plain
+                    // `bitrate` helper does, would model a system that has only one measurement
+                    // and hide the distinction this test is about.
+                    .stable_bitrate(2_300_000);
+
+                let slots = sorted(vec![
+                    qos_slot("7", 1080, 0, 0, &camera, current[0]),
+                    qos_slot("8", 1080, 0, 0, &screen, current[1]),
+                ]);
+                let decisions = AllocationEngine::compute(estimate, &slots);
+
+                let camera_slot = slots.iter().find(|s| s.mid == Mid::from("7")).unwrap();
+                let screen_slot = slots.iter().find(|s| s.mid == Mid::from("8")).unwrap();
+                let picked = (
+                    forwarded_quality(&decisions, camera_slot.key),
+                    forwarded_quality(&decisions, screen_slot.key),
+                );
+
+                // Whatever is chosen must at least fit. Over-committing is what forces the
+                // correction on the next pass, and the correction is what oscillates.
+                let used: f64 = decisions
+                    .values()
+                    .filter_map(|d| match d {
+                        AllocationDecision::Forward(_, bitrate) => Some(bitrate.as_f64()),
+                        AllocationDecision::Pause(_, _) => None,
+                    })
+                    .sum();
+                assert!(
+                    used <= estimate.as_f64(),
+                    "allocated {used} bps against {} bps of estimate, starting from {start:?}",
+                    estimate.as_f64()
+                );
+
+                seen.push(picked);
+                current = [
+                    picked.0.unwrap_or(LayerQuality::Low),
+                    picked.1.unwrap_or(LayerQuality::Low),
+                ];
+            }
+
+            let settled = seen.last().copied().unwrap();
+            assert!(
+                seen[2..].iter().all(|p| *p == settled),
+                "allocation never settled from {start:?} with the estimate held still; it cycled \
+                 through {seen:?}. Each flip stops and restarts a stream, and a stream restarted \
+                 several times a second never accumulates a decodable picture - which is why the \
+                 screen share is reported as simply never appearing."
+            );
+            outcomes.push(settled);
+        }
+
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "the same estimate and the same ladders produced different allocations depending only \
+             on what was being forwarded beforehand: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn costly_high_priority_slot_does_not_pin_a_co_tenant_at_its_floor() {
+        let screen = healthy_track();
+        let camera = healthy_track();
+        for (track, q, bps) in [
+            (&screen, LayerQuality::High, 1_178_000),
+            (&camera, LayerQuality::Low, 150_000),
+            (&camera, LayerQuality::Medium, 437_000),
+            (&camera, LayerQuality::High, 1_250_000),
+        ] {
+            track
+                .by_quality(q)
+                .unwrap()
+                .state
+                .update_for_test()
+                .bitrate(bps);
+        }
+
+        let slots = sorted(vec![
+            qos_slot("8", 1080, 0, 1, &screen, LayerQuality::High),
+            qos_slot("7", 1080, 0, 0, &camera, LayerQuality::Low),
+        ]);
+        let decisions = AllocationEngine::compute(bw(1617), &slots);
+
+        let camera_slot = slots.iter().find(|s| s.priority == 0).unwrap();
+        let screen_slot = slots.iter().find(|s| s.priority == 1).unwrap();
+
+        assert!(
+            forwarded_quality(&decisions, camera_slot.key)
+                .is_some_and(|q| q >= LayerQuality::Medium),
+            "camera was left at {:?} while 289 kbps of a 1.617 Mbps estimate went unused",
+            forwarded_quality(&decisions, camera_slot.key)
+        );
+        assert!(
+            forwarded_quality(&decisions, screen_slot.key).is_some(),
+            "the prioritized screen share must still be forwarding"
+        );
+    }
+
+    #[test]
+    fn higher_priority_upgrade_preempts_lower_priority_retention() {
+        let screen = healthy_track();
+        for quality in [LayerQuality::Low, LayerQuality::Medium] {
+            screen
+                .by_quality(quality)
+                .unwrap()
+                .state
+                .update_for_test()
+                .quality(StreamQuality::Bad);
+        }
+        let camera = healthy_track();
+
+        let slots = sorted(vec![
+            qos_slot("camera", 720, 360, 200, &camera, LayerQuality::Low),
+            qos_slot("screen", 1080, 90, 10, &screen, LayerQuality::High),
+        ]);
+        let decisions = AllocationEngine::compute(bw(2_000), &slots);
+
+        let camera_slot = slots.iter().find(|s| s.mid == Mid::from("camera")).unwrap();
+        let screen_slot = slots.iter().find(|s| s.mid == Mid::from("screen")).unwrap();
+        assert_eq!(
+            forwarded_quality(&decisions, camera_slot.key),
+            Some(LayerQuality::High),
+            "a lower-priority retained layer must not pin the higher-priority upgrade"
+        );
+        assert_eq!(
+            forwarded_quality(&decisions, screen_slot.key),
+            None,
+            "the lower-priority layer should yield when the high-priority upgrade needs it"
+        );
+    }
+
     #[test]
     fn at_most_one_genuine_upgrade_per_call() {
         let t = healthy_track();
@@ -2269,12 +2673,6 @@ mod allocation_tests {
         assert_eq!(engine.spatial_ceiling(&slot), 1080);
         let high = t.by_quality(LayerQuality::High).unwrap();
         assert!(engine.spatially_allowed(&slot, high));
-
-        // And `desired` is now valued at the top layer's seed rather than the middle one's.
-        assert_eq!(
-            engine.requested_capacity(&slot),
-            LayerQuality::High.seed_bitrate_bps() as f64
-        );
     }
 
     /// Screen-share simulcast tiers often share one resolution and differ
@@ -2661,32 +3059,18 @@ mod allocation_tests {
                 .map(|mid| slot(mid, max_height, &t, LayerQuality::Low))
                 .collect();
 
-            // Layer *selection* is by raw measured bitrate (`cost`), so mirror that first...
             let spatial_max = cases
                 .iter()
                 .filter(|(_, _, healthy, height)| *healthy && *height <= max_height)
-                .max_by_key(|(_, bitrate, _, _)| *bitrate)
-                .map(|(quality, bitrate, _, _)| (*quality, *bitrate));
+                .map(|(_, bitrate, _, _)| *bitrate)
+                .max();
             let fallback = cases
                 .iter()
                 .filter(|(_, _, healthy, _)| *healthy)
                 .min_by_key(|(quality, _, _, _)| *quality)
-                .map(|(quality, bitrate, _, _)| (*quality, *bitrate));
-            // ...then apply the configured-capacity floor `stable_cost` puts on the value, so a
-            // publisher sending below its layer's capacity still reports capacity as desired.
-            let flowing = spatial_max
-                .or(fallback)
-                .map(|(quality, bitrate)| bitrate.max(quality.seed_bitrate_bps()))
-                .unwrap_or(0);
-            // `desired` is also floored by what the subscription *asks* for, so a layer paused
-            // for lack of bandwidth still counts toward the headroom we want BWE to find.
-            let requested_capacity = cases
-                .iter()
-                .filter(|(_, _, _, height)| *height <= max_height)
-                .map(|(quality, _, _, _)| quality.seed_bitrate_bps())
-                .max()
-                .unwrap_or(0);
-            let expected = flowing.max(requested_capacity) * slot_count as u64;
+                .map(|(_, bitrate, _, _)| *bitrate);
+            let expected_per_slot = spatial_max.or(fallback).unwrap_or(0);
+            let expected = expected_per_slot * slot_count as u64;
             let desired = AllocationEngine::desired_bitrate(&slots);
 
             prop_assert_eq!(desired.as_f64(), expected as f64);
@@ -2876,10 +3260,8 @@ mod allocation_tests {
                 .quality(StreamQuality::Bad);
         }
 
-        // Both above LayerQuality::High's configured seed, so the capacity floor in
-        // `stable_cost` does not mask which of the two signals is being read.
-        let reactive_bps: u64 = 1_400_000;
-        let stable_bps: u64 = 1_900_000;
+        let reactive_bps: u64 = 400_000;
+        let stable_bps: u64 = 900_000;
 
         // Set reactive and stable to different values to distinguish them.
         t.by_quality(LayerQuality::High)
@@ -2896,51 +3278,6 @@ mod allocation_tests {
             (desired.as_f64() - stable_bps as f64).abs() < 1.0,
             "desired_bitrate should use stable_bitrate_bps ({stable_bps}) not \
              reactive bitrate_bps ({reactive_bps}); got {:.0}",
-            desired.as_f64()
-        );
-    }
-
-    /// `desired` must not decay below the layer's configured capacity.
-    ///
-    /// `stable_bitrate_bps` is an EWMA over the *measured* (or VLA-declared) rate with a 30s
-    /// fall constant and no lower bound (`rtp/monitor.rs`). During static screenshare the
-    /// encoder emits almost nothing, so it decays toward zero and `desired` collapses to the
-    /// `MIN_BANDWIDTH` clamp.
-    ///
-    /// That is not a statement about what the subscriber wants - it is a statement about what
-    /// the publisher happens to be sending right now. str0m caps every bandwidth probe at
-    /// `2 x desired`, so a collapsed `desired` starves probing and the estimate cannot recover
-    /// to allocate a higher layer. libWebRTC's equivalent (`max_total_allocated_bitrate`) is a
-    /// sum of *configured* stream maxima and does not decay.
-    #[test]
-    fn desired_bitrate_does_not_decay_below_configured_layer_capacity() {
-        let t = healthy_track();
-        for q in [LayerQuality::Medium, LayerQuality::Low] {
-            t.by_quality(q)
-                .unwrap()
-                .state
-                .update_for_test()
-                .quality(StreamQuality::Bad);
-        }
-
-        // Static screenshare: the stable filter has decayed to almost nothing.
-        let decayed_bps: u64 = 20_000;
-        t.by_quality(LayerQuality::High)
-            .unwrap()
-            .state
-            .update_for_test()
-            .bitrate(decayed_bps)
-            .stable_bitrate(decayed_bps);
-
-        let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
-        let desired = AllocationEngine::desired_bitrate(&slots);
-
-        let seed = LayerQuality::High.seed_bitrate_bps();
-        assert!(
-            desired.as_f64() >= seed as f64,
-            "desired_bitrate must stay at or above the High layer's configured capacity \
-             ({seed} bps) even when the measured stable rate has decayed to {decayed_bps} bps; \
-             got {:.0}. A decayed desired caps str0m's probes at 2x it and stalls recovery.",
             desired.as_f64()
         );
     }
