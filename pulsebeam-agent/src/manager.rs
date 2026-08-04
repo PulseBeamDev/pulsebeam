@@ -59,7 +59,7 @@ impl SubscriptionManager {
 
     /// Reconciles desired state with available slots.
     /// Implements "Sticky Assignments" algorithm.
-    pub fn reconcile(&mut self) -> Vec<VideoRequest> {
+    pub fn reconcile(&mut self) -> (bool, Vec<VideoRequest>) {
         tracing::debug!(
             "reconcile: slots={:?}, desired={:?}, active={:?}",
             self.slots,
@@ -94,30 +94,24 @@ impl SubscriptionManager {
             }
         }
 
-        // Pass 3: Construct VideoRequests and update active state
-        let mut requests = Vec::new();
-
-        // We only care about slots that changed or were cleared
-        for &mid in &self.slots {
-            let next = next_assignments.get(&mid);
-            let current = self.active_assignments.get(&mid);
-
-            if next == current {
-                continue;
-            }
-
-            let Some(sub) = next else { continue };
-            requests.push(VideoRequest {
-                mid: mid.to_string(),
-                track_id: sub.track_id.clone(),
-                target_height: sub.height,
-                min_height: sub.min_height,
-                priority: sub.priority,
-            });
-        }
+        let changed = next_assignments != self.active_assignments;
+        let requests = self
+            .slots
+            .iter()
+            .filter_map(|mid| {
+                let sub = next_assignments.get(mid)?;
+                Some(VideoRequest {
+                    mid: mid.to_string(),
+                    track_id: sub.track_id.clone(),
+                    target_height: sub.height,
+                    min_height: sub.min_height,
+                    priority: sub.priority,
+                })
+            })
+            .collect();
 
         self.active_assignments = next_assignments;
-        requests
+        (changed, requests)
     }
 
     /// Clears the cached active assignments so that the next `reconcile` will
@@ -126,5 +120,47 @@ impl SubscriptionManager {
     /// has been reset and no longer knows about previous assignments.
     pub fn reset_active_assignments(&mut self) {
         self.active_assignments.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changed_subscription_emits_the_complete_assignment() {
+        let mids = vec![Mid::from("0"), Mid::from("1")];
+        let mut manager = SubscriptionManager::new(mids);
+        manager.set_desired(vec![
+            VideoSubscription::new("camera"),
+            VideoSubscription::new("screen"),
+        ]);
+        let (changed, requests) = manager.reconcile();
+        assert!(changed);
+        assert_eq!(requests.len(), 2);
+
+        manager.set_desired(vec![
+            VideoSubscription::new("camera").priority(200),
+            VideoSubscription::new("screen").priority(10),
+        ]);
+        let (changed, requests) = manager.reconcile();
+
+        assert!(changed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().any(|request| request.track_id == "camera"));
+        assert!(requests.iter().any(|request| request.track_id == "screen"));
+    }
+
+    #[test]
+    fn clearing_every_subscription_is_a_change() {
+        let mut manager = SubscriptionManager::new(vec![Mid::from("0")]);
+        manager.set_desired(vec![VideoSubscription::new("camera")]);
+        let _ = manager.reconcile();
+
+        manager.set_desired(Vec::new());
+        let (changed, requests) = manager.reconcile();
+
+        assert!(changed);
+        assert!(requests.is_empty());
     }
 }

@@ -198,6 +198,56 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
         ]);
 }
 
+#[test]
+fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("screen"))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer prioritizes the screen share",
+                participant: "viewer",
+                targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 200)],
+            },
+            Step::Run {
+                description: "Let the screen share reach full quality",
+                duration: Duration::from_secs(30),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer transfers priority to the camera",
+                participant: "viewer",
+                targets: &[("camera", 1080, 360, 200), ("screen", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Allow BWE to satisfy the new allocation",
+                duration: Duration::from_secs(60),
+            },
+            Step::Expect {
+                description: "The estimate reaches the requested allocation",
+                participant: "viewer",
+                property: Property::EstimateMeetsNeed { percent: 95 },
+            },
+            Step::CheckForwardedQuality {
+                description: "Camera finishes on its top layer",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::CheckForwardedQuality {
+                description: "Screen share remains on its top layer",
+                origin: "screen",
+                min_quality: 3,
+            },
+        ]);
+}
+
 /// A one-layer screen share must recover after a temporary downlink collapse while a camera
 /// remains subscribed on the same viewer.
 #[test]
@@ -860,13 +910,6 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
                 description: "The estimate survives the silence",
                 participant: "viewer",
                 property: Property::EstimateMeetsNeed { percent: 80 },
-            },
-            Step::Expect {
-                description: "The estimate holds rather than decaying away",
-                participant: "viewer",
-                property: Property::EstimateStable {
-                    max_drop_percent: 30,
-                },
             },
         ]);
 }

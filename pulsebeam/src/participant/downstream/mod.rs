@@ -56,6 +56,7 @@ slotmap::new_key_type! {
 #[derive(Debug)]
 struct BweFilter {
     filtered_bps: f64,
+    target_bps: f64,
     last_update: Option<Instant>,
 }
 
@@ -63,32 +64,41 @@ impl BweFilter {
     fn new(initial: Bitrate) -> Self {
         Self {
             filtered_bps: initial.as_f64(),
+            target_bps: initial.as_f64(),
             last_update: None,
         }
     }
 
     fn tick(&mut self, now: Instant) {
-        self.update(now, self.current());
+        self.advance(now, self.target_bps);
     }
 
     fn update(&mut self, now: Instant, raw: Bitrate) {
+        self.target_bps = raw.as_f64();
+        self.advance(now, self.target_bps);
+    }
+
+    fn advance(&mut self, now: Instant, target_bps: f64) {
+        debug_assert!(target_bps.is_finite());
+        debug_assert!(target_bps >= 0.0);
         let Some(last_update) = self.last_update else {
             self.last_update = Some(now);
-            self.filtered_bps = raw.as_f64();
+            self.filtered_bps = target_bps;
             return;
         };
 
         debug_assert!(now >= last_update);
         let elapsed = now.saturating_duration_since(last_update);
         self.last_update = Some(now);
-        let raw = raw.as_f64();
-        if raw >= self.filtered_bps {
+        if target_bps >= self.filtered_bps {
             let alpha = (-elapsed.as_secs_f64() / BWE_RISE_TIME_CONSTANT.as_secs_f64()).exp();
-            self.filtered_bps = raw + (self.filtered_bps - raw) * alpha;
+            self.filtered_bps = target_bps + (self.filtered_bps - target_bps) * alpha;
         } else {
             let alpha = (-elapsed.as_secs_f64() / BWE_FALL_TIME_CONSTANT.as_secs_f64()).exp();
-            self.filtered_bps = raw + (self.filtered_bps - raw) * alpha;
+            self.filtered_bps = target_bps + (self.filtered_bps - target_bps) * alpha;
         }
+        debug_assert!(self.filtered_bps.is_finite());
+        debug_assert!(self.filtered_bps >= 0.0);
     }
 
     fn current(&self) -> Bitrate {
@@ -109,7 +119,7 @@ pub struct DownstreamAllocator {
 
     available_bandwidth: BweFilter,
     last_desired: Bitrate,
-    /// When every slot was first found paused while demand existed, if it currently is.
+    /// When forwarding is below the minimum useful feedback rate while demand exists.
     starved_since: Option<Instant>,
 
     playout_delay: Option<(MediaTime, MediaTime)>,
@@ -257,7 +267,7 @@ impl DownstreamAllocator {
         assignments_changed
     }
 
-    /// Escape the state where nothing is forwarded and nothing can change that.
+    /// Escape the state where too little is forwarded to sustain useful feedback.
     ///
     /// Congestion control is a feedback loop with one open-loop failure: if every slot is paused
     /// there is no media, so no transport feedback, so the estimate cannot move off the value
@@ -265,9 +275,8 @@ impl DownstreamAllocator {
     /// to what the application wants restores the loop; the ordinary machinery then re-measures
     /// the real link within a second or two, and backs off again if it genuinely cannot carry it.
     ///
-    /// Guarded on *nothing at all* forwarded while demand exists, so it cannot fire during
-    /// ordinary congestion - a connection still carrying its lowest layer has feedback and is not
-    /// stuck. The dwell time keeps it clear of the transients around subscription changes.
+    /// The minimum-bandwidth threshold avoids resetting ordinary allocations while the dwell time
+    /// keeps the reset clear of subscription-change transients.
     fn break_starvation_deadlock(
         &mut self,
         now: Instant,
@@ -275,7 +284,8 @@ impl DownstreamAllocator {
         allocated: Bitrate,
         bwe: &mut Bwe,
     ) {
-        if desired == Bitrate::ZERO || allocated > Bitrate::ZERO {
+        debug_assert!(allocated <= desired || desired == Bitrate::ZERO);
+        if desired == Bitrate::ZERO || allocated >= MIN_BANDWIDTH {
             self.starved_since = None;
             return;
         }
@@ -283,7 +293,6 @@ impl DownstreamAllocator {
         if now.saturating_duration_since(since) < STARVATION_TIMEOUT {
             return;
         }
-        // Re-arm rather than clear, so this retries on the same cadence if the reset does not take.
         self.starved_since = Some(now);
         bwe.reset(desired);
         self.available_bandwidth = BweFilter::new(desired);
@@ -401,6 +410,33 @@ mod tests {
                 target,
                 Duration::from_millis(200),
                 BWE_FALL_TIME_CONSTANT,
+            ),
+        );
+    }
+
+    #[test]
+    fn bwe_filter_ticks_converge_to_the_latest_sample() {
+        let start = Instant::now();
+        let initial = 300_000.0;
+        let target = 4_200_000.0;
+        let mut filter = BweFilter::new(Bitrate::from(initial as u64));
+
+        filter.update(start, Bitrate::from(initial as u64));
+        filter.update(
+            start + Duration::from_millis(100),
+            Bitrate::from(target as u64),
+        );
+        for elapsed_ms in (200..=1_000).step_by(100) {
+            filter.tick(start + Duration::from_millis(elapsed_ms));
+        }
+
+        assert_close(
+            filter.current().as_f64(),
+            expected(
+                initial,
+                target,
+                Duration::from_millis(1_000),
+                BWE_RISE_TIME_CONSTANT,
             ),
         );
     }

@@ -1006,8 +1006,8 @@ impl AgentDriver {
             return;
         };
 
-        let requests = self.subscriptions.sub_manager.reconcile();
-        if requests.is_empty() && !self.subscriptions.upstream_dirty {
+        let (downstream_dirty, requests) = self.subscriptions.sub_manager.reconcile();
+        if !downstream_dirty && !self.subscriptions.upstream_dirty {
             self.subscriptions.pending_deadline = None;
             return;
         }

@@ -1050,7 +1050,8 @@ impl AllocationEngine {
             .filter_map(|s| self.best_healthy(s))
             .map(|l| self.stable_cost(l))
             .sum();
-        Bitrate::from(total as u64)
+        debug_assert!((0.0..1.0).contains(&Self::RESERVE_FRACTION));
+        Bitrate::from((total / (1.0 - Self::RESERVE_FRACTION)) as u64)
     }
 
     fn used_bitrate(decisions: &SecondaryMap<SlotKey, AllocationDecision<'_>>) -> Bitrate {
@@ -2131,14 +2132,14 @@ mod allocation_tests {
             .update_for_test()
             .height(180);
 
-        // Client caps at 200p. The hard-coded fallback rates High at 720p and
+        // Client caps at 180p. The hard-coded fallback rates High at 720p and
         // would forbid it, but the declared 180p must be allowed.
-        let slot = slot("a", 200, &t, LayerQuality::High);
+        let slot = slot("a", 180, &t, LayerQuality::High);
         let engine = AllocationEngine::new(std::slice::from_ref(&slot));
         let high = t.by_quality(LayerQuality::High).unwrap();
         assert!(engine.spatially_allowed(&slot, high));
 
-        // The Medium layer declared nothing → keeps its 360p fallback → forbidden.
+        // The Medium layer declared nothing and keeps its 360p fallback.
         let medium = t.by_quality(LayerQuality::Medium).unwrap();
         assert!(!engine.spatially_allowed(&slot, medium));
     }
@@ -2432,8 +2433,7 @@ mod allocation_tests {
     // ─── Property: desired bitrate reflects the best healthy layer, not the
     //               forwarded layer ──────────────────────────────────────────────
     //
-    // desired should equal the sum of the highest healthy layer bitrate across
-    // all slots, regardless of what was actually forwarded.
+    // desired includes the reserve required by the allocator.
 
     #[test]
     fn desired_bitrate_equals_sum_of_best_healthy_layers() {
@@ -2450,7 +2450,8 @@ mod allocation_tests {
             .map(|l| l.state.bitrate_bps())
             .fold(0.0_f64, f64::max);
 
-        let expected_total = expected_per_slot * slots.len() as f64;
+        let expected_total =
+            expected_per_slot * slots.len() as f64 / (1.0 - AllocationEngine::RESERVE_FRACTION);
 
         let desired = AllocationEngine::desired_bitrate(&slots);
 
@@ -2486,10 +2487,9 @@ mod allocation_tests {
             .inactive(true);
         let slots = vec![slot("a", 180, &t, LayerQuality::Medium)];
 
-        assert_eq!(
-            AllocationEngine::desired_bitrate(&slots).as_f64(),
-            layer_bps(&t, LayerQuality::Medium)
-        );
+        let expected =
+            layer_bps(&t, LayerQuality::Medium) / (1.0 - AllocationEngine::RESERVE_FRACTION);
+        assert!((AllocationEngine::desired_bitrate(&slots).as_f64() - expected).abs() < 1.0);
     }
 
     proptest! {
@@ -2538,10 +2538,11 @@ mod allocation_tests {
                 .min_by_key(|(quality, _, _, _)| *quality)
                 .map(|(_, bitrate, _, _)| *bitrate);
             let expected_per_slot = spatial_max.or(fallback).unwrap_or(0);
-            let expected = expected_per_slot * slot_count as u64;
+            let expected = (expected_per_slot as f64 * slot_count as f64
+                / (1.0 - AllocationEngine::RESERVE_FRACTION)) as u64;
             let desired = AllocationEngine::desired_bitrate(&slots);
 
-            prop_assert_eq!(desired.as_f64(), expected as f64);
+            prop_assert_eq!(desired.as_u64(), expected);
 
             let decisions = AllocationEngine::compute(Bitrate::from(available_bps), &slots);
             prop_assert!(desired >= AllocationEngine::used_bitrate(&decisions));
@@ -2743,7 +2744,9 @@ mod allocation_tests {
         let desired = AllocationEngine::desired_bitrate(&slots);
 
         assert!(
-            (desired.as_f64() - stable_bps as f64).abs() < 1.0,
+            (desired.as_f64() - stable_bps as f64 / (1.0 - AllocationEngine::RESERVE_FRACTION))
+                .abs()
+                < 1.0,
             "desired_bitrate should use stable_bitrate_bps ({stable_bps}) not \
              reactive bitrate_bps ({reactive_bps}); got {:.0}",
             desired.as_f64()

@@ -148,10 +148,12 @@ impl Scenario {
         })
     }
 
-    /// A subnet derived from the scenario, so identical scenarios get identical addresses.
-    fn subnet(&self) -> u8 {
+    /// A subnet derived from the property and scenario, so replayed cases are isolated.
+    fn subnet(&self, namespace: &str) -> u8 {
+        debug_assert!(!namespace.is_empty());
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        namespace.hash(&mut hasher);
         self.capacity_bps.hash(&mut hasher);
         self.screenshare.hash(&mut hasher);
         self.target_height.hash(&mut hasher);
@@ -161,7 +163,7 @@ impl Scenario {
         (hasher.finish() % 200) as u8
     }
 
-    fn run(&self) -> LinkReport {
+    fn run(&self, namespace: &str) -> LinkReport {
         let publisher = if self.screenshare {
             Participant::screensharer("publisher")
         } else {
@@ -210,9 +212,9 @@ impl Scenario {
         let reports = LocalNodeSim::new()
             // Addresses fixed by the scenario, so a replay of a recorded failure runs the same
             // network it originally did rather than whichever one its position happened to give.
-            .with_subnet(self.subnet())
+            .with_subnet(self.subnet(namespace))
             .with_bandwidth(self.capacity_bps)
-            .with_room(room.with_participant(Participant::multi_subscriber("viewer", slots)))
+            .with_room(room.with_participant(Participant::manual_subscriber("viewer", slots)))
             .run_collecting(plan);
         reports
             .get("viewer")
@@ -245,7 +247,7 @@ proptest! {
     /// Mbps top layer - so a failure is never the link's fault.
     #[test]
     fn a_subscribed_stream_is_delivered_on_a_link_with_room(scenario in Scenario::healthy()) {
-        let report = scenario.run();
+        let report = scenario.run("subscribed_stream");
         prop_assert!(
             report.samples > 0,
             "no allocation passes recorded; the plan never exercised the viewer, so every \
@@ -267,7 +269,7 @@ proptest! {
     /// demand it is being asked to carry, on a link demonstrably able to carry it.
     #[test]
     fn the_estimate_keeps_up_with_demand_it_can_afford(scenario in Scenario::healthy()) {
-        let report = scenario.run();
+        let report = scenario.run("demand");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
 
         let need = report.need_bps();
@@ -295,7 +297,7 @@ proptest! {
     /// being dropped for congestion.
     #[test]
     fn an_underused_link_is_not_driven_into_loss(scenario in Scenario::healthy()) {
-        let report = scenario.run();
+        let report = scenario.run("underused_link");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
         let Some(utilisation) = report.utilisation_percent() else {
             return Ok(());
@@ -329,7 +331,7 @@ proptest! {
     /// dropped entirely is not one of them.
     #[test]
     fn a_cheap_co_tenant_is_not_starved(scenario in Scenario::contended()) {
-        let report = scenario.run();
+        let report = scenario.run("cheap_cotenant");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
 
         // Conditioned on the *estimate* covering demand, not the link. The allocator can only
