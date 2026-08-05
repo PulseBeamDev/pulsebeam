@@ -911,6 +911,13 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
                 participant: "viewer",
                 property: Property::EstimateMeetsNeed { percent: 80 },
             },
+            Step::Expect {
+                description: "The estimate holds rather than decaying away",
+                participant: "viewer",
+                property: Property::EstimateStable {
+                    max_drop_percent: 30,
+                },
+            },
         ]);
 }
 
