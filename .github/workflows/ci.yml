@@ -18,5 +18,10 @@ jobs:
     - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.10
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
     - name: Run tests
       run: make test
+      env:
+        CARGO_TERM_COLOR: always
