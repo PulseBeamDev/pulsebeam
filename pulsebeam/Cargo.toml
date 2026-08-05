@@ -1,6 +1,6 @@
 [package]
 name = "pulsebeam"
-version = "0.4.6"
+version = "0.4.7"
 authors.workspace = true
 edition.workspace = true
 description = "Lightweight WebRTC SFU for Mobile, IoT, and Web"

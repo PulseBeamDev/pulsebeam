@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.7] - 2026-08-05
 
 * feat: simpler bwe and explicit current birate
 * feat: switcher v2 with shared cache
