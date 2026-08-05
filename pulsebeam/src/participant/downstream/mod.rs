@@ -275,8 +275,6 @@ impl DownstreamAllocator {
     /// to what the application wants restores the loop; the ordinary machinery then re-measures
     /// the real link within a second or two, and backs off again if it genuinely cannot carry it.
     ///
-    /// The minimum-bandwidth threshold avoids resetting ordinary allocations while the dwell time
-    /// keeps the reset clear of subscription-change transients.
     fn break_starvation_deadlock(
         &mut self,
         now: Instant,
@@ -285,7 +283,7 @@ impl DownstreamAllocator {
         bwe: &mut Bwe,
     ) {
         debug_assert!(allocated <= desired || desired == Bitrate::ZERO);
-        if desired == Bitrate::ZERO || allocated >= MIN_BANDWIDTH {
+        if desired == Bitrate::ZERO || allocated > Bitrate::ZERO {
             self.starved_since = None;
             return;
         }
