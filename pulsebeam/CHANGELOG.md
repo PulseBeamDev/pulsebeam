@@ -1,3 +1,18 @@
+## [unreleased]
+
+* feat: simpler bwe and explicit current birate
+* feat: switcher v2 with shared cache
+* feat: vla bitrate, inactive, spatial integration
+* fix!: reversed simulcast order
+* feat: add priority and min-height to allocator
+* more simulations and move to property based and deterministic
+* feat: various hot path optimizations
+* feat: remove quinn-udp & add sendmmsg
+* feat: pace join rate
+* feat: enable dtls 1.3 and SNAP
+* feat: playout-delay ext
+* feat: one-to-many data channel
+
 ## [pulsebeam-v0.4.6] - 2026-07-15
 
 * feat: defensive rtc poll loop
