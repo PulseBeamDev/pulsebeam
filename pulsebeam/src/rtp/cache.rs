@@ -1,5 +1,5 @@
 use crate::rtp::RtpPacket;
-use str0m::media::MediaTime;
+use str0m::media::{MediaTime, Rid};
 use str0m::rtp::SeqNo;
 
 /// Ring capacity. Must be a power of two so `seq & CACHE_MASK` indexes a slot.
@@ -330,6 +330,53 @@ impl StreamCache {
         self.pps = None;
     }
 }
+
+/// One track's worth of cache: a `StreamCache` per simulcast encoding, keyed by
+/// `rid`. The track is the routing unit; the encoding a packet belongs to is read
+/// from `pkt.ext_vals.rid`. A downstream forwarder holds the whole thing so it can
+/// replay a target encoding's keyframe segment while still forwarding the current
+/// one.
+#[derive(Debug, Default)]
+pub struct TrackStreamCache {
+    encodings: Vec<(Option<Rid>, StreamCache)>,
+}
+
+impl TrackStreamCache {
+    pub fn new() -> Self {
+        Self {
+            encodings: Vec::with_capacity(MAX_SIMULCAST_ENCODINGS),
+        }
+    }
+
+    /// Route `pkt` into its encoding's cache, reading the encoding from the
+    /// packet's `rid` (absent for non-simulcast tracks).
+    pub fn push(&mut self, pkt: &RtpPacket) {
+        self.encoding_mut(pkt.ext_vals.rid).push(pkt);
+    }
+
+    pub fn encoding(&self, rid: Option<Rid>) -> Option<&StreamCache> {
+        self.encodings
+            .iter()
+            .find(|(r, _)| *r == rid)
+            .map(|(_, c)| c)
+    }
+
+    fn encoding_mut(&mut self, rid: Option<Rid>) -> &mut StreamCache {
+        if let Some(pos) = self.encodings.iter().position(|(r, _)| *r == rid) {
+            return &mut self.encodings[pos].1;
+        }
+        debug_assert!(
+            self.encodings.len() < MAX_SIMULCAST_ENCODINGS,
+            "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
+        );
+        self.encodings.push((rid, StreamCache::default()));
+        &mut self.encodings.last_mut().unwrap().1
+    }
+}
+
+/// Simulcast tops out at three spatial layers; the `+1` leaves room for a
+/// non-rid encoding (`None`) coexisting during renegotiation without reallocating.
+const MAX_SIMULCAST_ENCODINGS: usize = 4;
 
 #[cfg(test)]
 mod test {

@@ -12,7 +12,7 @@ use crate::participant::downstream::video::MIN_BANDWIDTH;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
-use crate::track::{StreamId, StreamWriter, Track, TrackLayer};
+use crate::track::{StreamWriter, Track, TrackLayer};
 use pulsebeam_runtime::rand::RngCore;
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
@@ -316,12 +316,12 @@ impl DownstreamAllocator {
     #[inline]
     pub fn on_forward_rtp(
         &mut self,
-        stream_id: &StreamId,
+        track_id: TrackId,
         pkt: &RtpPacket,
-        cache: Option<&crate::rtp::cache::StreamCache>,
+        cache: Option<&crate::rtp::cache::TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        self.video.on_rtp(stream_id, pkt, cache, writer)
+        self.video.on_rtp(track_id, pkt, cache, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.

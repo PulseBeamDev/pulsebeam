@@ -1,7 +1,7 @@
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
-use crate::rtp::cache::StreamCache;
+use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -17,7 +17,7 @@ use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
-use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
+use crate::track::{LayerQuality, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Maximum number of video slots per participant.
 const VIDEO_MAX_SLOTS: usize = 25;
@@ -362,19 +362,19 @@ impl VideoAllocator {
     #[inline]
     pub fn on_rtp(
         &mut self,
-        stream_id: &StreamId,
+        track_id: TrackId,
         pkt: &RtpPacket,
-        cache: Option<&StreamCache>,
+        cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        let Some(&slot_key) = self.routes.get(&stream_id.0) else {
+        let Some(&slot_key) = self.routes.get(&track_id) else {
             return false;
         };
         let Some(slot) = self.slots.get_mut(slot_key) else {
-            plog_warn!(self.ctx, "no slot found for {:?}", stream_id);
+            plog_warn!(self.ctx, "no slot found for track {:?}", track_id);
             return false;
         };
-        slot.on_rtp(stream_id, pkt, cache, writer)
+        slot.on_rtp(track_id, pkt, cache, writer)
     }
 
     pub fn poll_slow(
@@ -684,13 +684,13 @@ impl Slot {
 
     fn on_rtp(
         &mut self,
-        stream_id: &StreamId,
+        track_id: TrackId,
         pkt: &RtpPacket,
-        cache: Option<&StreamCache>,
+        cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
         if self.paused {
-            plog_trace!(self.ctx, mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
+            plog_trace!(self.ctx, mid=%self.mid, track=?track_id, "slot paused, dropping incoming packet");
             return false;
         }
         let Some(cache) = cache else {
@@ -698,12 +698,12 @@ impl Slot {
         };
 
         // The switcher owns the entire switching state machine; hand it the
-        // cache update and let it emit whatever the subscriber should see. A
+        // whole track cache and let it emit whatever the subscriber should see. A
         // change in the active stream means a switch was promoted this tick.
         let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
         self.switcher
-            .feed(*stream_id, cache, pkt.arrival_ts, &mut |out| {
+            .feed(track_id, cache, pkt.arrival_ts, &mut |out| {
                 writer.write_video_owned(out, mid, rid, ssrc, pt);
             });
         self.switcher.active_stream() != before
@@ -731,12 +731,12 @@ impl Slot {
 #[cfg(test)]
 impl Slot {
     /// The stream the switcher is actively forwarding.
-    fn test_active(&self) -> Option<StreamId> {
+    fn test_active(&self) -> Option<crate::track::StreamId> {
         self.switcher.active_stream()
     }
 
     /// The stream the switcher is awaiting a keyframe on before switching.
-    fn test_staging(&self) -> Option<StreamId> {
+    fn test_staging(&self) -> Option<crate::track::StreamId> {
         self.switcher.staging_stream()
     }
 
@@ -1198,7 +1198,7 @@ mod assignment_tests {
 
     #[derive(Default)]
     struct FakeRouter {
-        subscribed: std::collections::HashSet<StreamId>,
+        subscribed: std::collections::HashSet<crate::track::StreamId>,
     }
 
     struct TestTracks {
@@ -1517,7 +1517,7 @@ mod assignment_tests {
         pkt.seq_no = 1.into();
 
         let mut writer = crate::track::StreamWriter::new();
-        slot.on_rtp(&high.stream_id(), &pkt, None, &mut writer);
+        slot.on_rtp(high.meta.id, &pkt, None, &mut writer);
 
         assert_eq!(
             slot.test_active(),
@@ -2854,7 +2854,6 @@ mod slot_switch_tests {
     use super::*;
     use crate::entity::ParticipantId;
     use crate::log::LogCtx;
-    use crate::rtp::cache::StreamCache;
     use crate::rtp::conformance::assert_decodable;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use crate::track::test_utils::make_video_track;
@@ -2881,6 +2880,7 @@ mod slot_switch_tests {
         slot: Slot,
         high: TrackLayer,
         low: TrackLayer,
+        cache: TrackStreamCache,
         writer: StreamWriter,
         emitted: Vec<RtpPacket>,
     }
@@ -2907,18 +2907,22 @@ mod slot_switch_tests {
                 slot,
                 high,
                 low,
+                cache: TrackStreamCache::new(),
                 writer: StreamWriter::new(),
                 emitted: Vec::new(),
             }
         }
 
-        /// Mirrors `route_video`: cache first, then hand the packet to the slot.
-        fn ingest(&mut self, layer: &TrackLayer, cache: &mut StreamCache, pkt: &RtpPacket) -> bool {
-            cache.push(pkt);
-            let stream_id = layer.stream_id();
+        /// Mirrors `route_video`: stamp the encoding's rid (as ingress does),
+        /// push into the track cache, then hand the packet to the slot.
+        fn ingest(&mut self, layer: &TrackLayer, pkt: &RtpPacket) -> bool {
+            let track_id = layer.meta.id;
+            let mut pkt = pkt.clone();
+            pkt.ext_vals.rid = layer.rid;
+            self.cache.push(&pkt);
             let promoted = self
                 .slot
-                .on_rtp(&stream_id, pkt, Some(cache), &mut self.writer);
+                .on_rtp(track_id, &pkt, Some(&self.cache), &mut self.writer);
             while let Some(w) = self.writer.pop() {
                 if let StreamWrite::Video { pkt, .. } = w {
                     self.emitted.push(pkt);
@@ -2927,15 +2931,10 @@ mod slot_switch_tests {
             promoted
         }
 
-        fn ingest_all(
-            &mut self,
-            layer: &TrackLayer,
-            cache: &mut StreamCache,
-            pkts: &[RtpPacket],
-        ) -> bool {
+        fn ingest_all(&mut self, layer: &TrackLayer, pkts: &[RtpPacket]) -> bool {
             let mut promoted = false;
             for p in pkts {
-                promoted |= self.ingest(layer, cache, p);
+                promoted |= self.ingest(layer, p);
             }
             promoted
         }
@@ -2946,8 +2945,6 @@ mod slot_switch_tests {
         let t0 = Instant::now();
         let mut fx = Fixture::new();
         let (high, low) = (fx.high.clone(), fx.low.clone());
-        let mut hi_cache = StreamCache::new();
-        let mut lo_cache = StreamCache::new();
         let mut hi = H264StreamBuilder::new(1, 300, 90_000, t0)
             .with_parameter_sets(ParameterSetStyle::SeparatePacket);
         let mut lo = H264StreamBuilder::new(2, 40_000, 600_000, t0)
@@ -2955,24 +2952,24 @@ mod slot_switch_tests {
 
         fx.slot.switch_to(&high, false);
         let kf = hi.keyframe(3);
-        assert!(fx.ingest_all(&high, &mut hi_cache, &kf));
+        assert!(fx.ingest_all(&high, &kf));
 
         for _ in 0..10 {
             let f = hi.delta_frame(3);
-            fx.ingest_all(&high, &mut hi_cache, &f);
+            fx.ingest_all(&high, &f);
             let f = lo.delta_frame(2);
-            fx.ingest_all(&low, &mut lo_cache, &f);
+            fx.ingest_all(&low, &f);
         }
 
         fx.slot.switch_to(&low, false);
         let kf = lo.keyframe(2);
         assert!(
-            fx.ingest_all(&low, &mut lo_cache, &kf),
+            fx.ingest_all(&low, &kf),
             "a fresh keyframe must promote the staged layer"
         );
         for _ in 0..5 {
             let f = lo.delta_frame(2);
-            fx.ingest_all(&low, &mut lo_cache, &f);
+            fx.ingest_all(&low, &f);
         }
 
         assert_eq!(fx.slot.test_active(), Some(low.stream_id()));
@@ -2984,8 +2981,6 @@ mod slot_switch_tests {
         let t0 = Instant::now();
         let mut fx = Fixture::new();
         let (high, low) = (fx.high.clone(), fx.low.clone());
-        let mut hi_cache = StreamCache::new();
-        let mut lo_cache = StreamCache::new();
         let mut hi = H264StreamBuilder::new(1, 300, 90_000, t0)
             .with_parameter_sets(ParameterSetStyle::SeparatePacket);
         // The low layer's keyframe is far in the past; its GOP is long.
@@ -2993,24 +2988,24 @@ mod slot_switch_tests {
             .with_parameter_sets(ParameterSetStyle::SeparatePacket);
 
         fx.slot.switch_to(&high, false);
-        fx.ingest_all(&high, &mut hi_cache, &hi.keyframe(3));
+        fx.ingest_all(&high, &hi.keyframe(3));
         let lo_kf = lo.keyframe(2);
-        fx.ingest_all(&low, &mut lo_cache, &lo_kf);
+        fx.ingest_all(&low, &lo_kf);
 
         // Push the low layer's segment past the replay window.
         let frames = 10;
         for _ in 0..frames {
             let f = hi.delta_frame(3);
-            fx.ingest_all(&high, &mut hi_cache, &f);
+            fx.ingest_all(&high, &f);
             let f = lo.delta_frame(2);
-            fx.ingest_all(&low, &mut lo_cache, &f);
+            fx.ingest_all(&low, &f);
         }
 
         let before = fx.emitted.len();
         fx.slot.switch_to(&low, false);
         for _ in 0..3 {
             let f = lo.delta_frame(2);
-            fx.ingest_all(&low, &mut lo_cache, &f);
+            fx.ingest_all(&low, &f);
         }
 
         assert_eq!(
@@ -3026,7 +3021,7 @@ mod slot_switch_tests {
 
         // The high layer keeps flowing while we wait.
         let f = hi.delta_frame(3);
-        fx.ingest_all(&high, &mut hi_cache, &f);
+        fx.ingest_all(&high, &f);
         assert!(fx.emitted.len() > before);
 
         // PLI is what unblocks the switch.
@@ -3040,7 +3035,7 @@ mod slot_switch_tests {
 
         // And once the publisher answers, the switch completes.
         let kf = lo.keyframe(2);
-        assert!(fx.ingest_all(&low, &mut lo_cache, &kf));
+        assert!(fx.ingest_all(&low, &kf));
         assert_eq!(fx.slot.test_active(), Some(low.stream_id()));
         assert_decodable(&fx.emitted, "deferred switch after PLI");
     }
@@ -3050,36 +3045,34 @@ mod slot_switch_tests {
         let t0 = Instant::now();
         let mut fx = Fixture::new();
         let (high, low) = (fx.high.clone(), fx.low.clone());
-        let mut hi_cache = StreamCache::new();
-        let mut lo_cache = StreamCache::new();
         let mut hi = H264StreamBuilder::new(1, 65_000, 90_000, t0)
             .with_parameter_sets(ParameterSetStyle::AggregatedWithIdr);
         let mut lo = H264StreamBuilder::new(2, 65_500, 4_000_000, t0)
             .with_parameter_sets(ParameterSetStyle::SeparatePacket);
 
         fx.slot.switch_to(&high, false);
-        fx.ingest_all(&high, &mut hi_cache, &hi.keyframe(3));
+        fx.ingest_all(&high, &hi.keyframe(3));
 
         for round in 0..30 {
             for _ in 0..4 {
                 let f = hi.delta_frame(3);
-                fx.ingest_all(&high, &mut hi_cache, &f);
+                fx.ingest_all(&high, &f);
                 let f = lo.delta_frame(2);
-                fx.ingest_all(&low, &mut lo_cache, &f);
+                fx.ingest_all(&low, &f);
             }
             let to_low = round % 2 == 0;
             let target = if to_low { low.clone() } else { high.clone() };
             fx.slot.switch_to(&target, false);
             if to_low {
                 let kf = lo.keyframe(2);
-                fx.ingest_all(&low, &mut lo_cache, &kf);
+                fx.ingest_all(&low, &kf);
                 let f = hi.delta_frame(3);
-                fx.ingest_all(&high, &mut hi_cache, &f);
+                fx.ingest_all(&high, &f);
             } else {
                 let kf = hi.keyframe(3);
-                fx.ingest_all(&high, &mut hi_cache, &kf);
+                fx.ingest_all(&high, &kf);
                 let f = lo.delta_frame(2);
-                fx.ingest_all(&low, &mut lo_cache, &f);
+                fx.ingest_all(&low, &f);
             }
         }
 

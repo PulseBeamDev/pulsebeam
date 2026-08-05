@@ -5,8 +5,9 @@ use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
+use crate::entity::TrackId;
 use crate::rtp::RtpPacket;
-use crate::rtp::cache::StreamCache;
+use crate::rtp::cache::{StreamCache, TrackStreamCache};
 use crate::rtp::timeline::Timeline;
 use crate::track::StreamId;
 
@@ -172,22 +173,41 @@ impl Switcher {
         self.tail = None;
     }
 
-    /// A stream this slot tracks has new packets in its cache. Routes the update
-    /// to the active (live pull), staging (switch), or draining (tail) role and
-    /// emits rewritten packets via `emit`.
+    /// The track this slot forwards has new packets. Reconciles every role
+    /// against the track's cache — pulling the active encoding's live tail,
+    /// draining the outgoing encoding's stragglers, and landing a pending switch
+    /// as soon as the target encoding is replayable — and emits rewritten packets
+    /// via `emit`.
+    ///
+    /// The whole `TrackStreamCache` is handed in, so a pending switch is
+    /// re-evaluated on *any* packet of the track, not only the target encoding's:
+    /// the switch lands the moment its keyframe is decodable, without waiting for
+    /// the next staging packet to drive it.
+    ///
+    /// Each role is guarded on `stream.0 == track_id` so a slot briefly
+    /// subscribed to two tracks (a track change in flight) never translates one
+    /// track's encoding through another track's cache.
     pub fn feed(
         &mut self,
-        stream: StreamId,
-        cache: &StreamCache,
+        track_id: TrackId,
+        cache: &TrackStreamCache,
         now: Instant,
         emit: &mut impl FnMut(RtpPacket),
     ) {
-        if self.active == Some(stream) {
-            self.pull_active(cache, emit);
-        } else if self.draining == Some(stream) {
-            self.drain_tail(cache, now, emit);
-        } else if self.staging == Some(stream) {
-            self.try_switch(cache, now, emit);
+        if let Some(active) = self.active.filter(|s| s.0 == track_id)
+            && let Some(encoding) = cache.encoding(active.1)
+        {
+            self.pull_active(encoding, emit);
+        }
+        if let Some(draining) = self.draining.filter(|s| s.0 == track_id)
+            && let Some(encoding) = cache.encoding(draining.1)
+        {
+            self.drain_tail(encoding, now, emit);
+        }
+        if let Some(staging) = self.staging.filter(|s| s.0 == track_id)
+            && let Some(encoding) = cache.encoding(staging.1)
+        {
+            self.try_switch(encoding, now, emit);
         }
     }
 
@@ -544,10 +564,8 @@ mod test {
     use super::*;
     use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp;
-    use crate::rtp::cache::StreamCache;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use pulsebeam_runtime::rand::seeded_rng;
-    use std::time::Duration;
     use str0m::media::Rid;
     use tokio::time::Instant;
 
@@ -562,18 +580,22 @@ mod test {
             .with_parameter_sets(ParameterSetStyle::SeparatePacket)
     }
 
-    /// Feed every packet into the cache then the switcher, mirroring `route_video`.
+    /// Feed every packet into the track cache then the switcher, mirroring
+    /// `route_video`: the packet is stamped with its encoding's rid (as ingress
+    /// does) so the track cache routes it to the right per-encoding ring.
     fn ingest(
         switcher: &mut Switcher,
         stream: StreamId,
-        cache: &mut StreamCache,
+        cache: &mut TrackStreamCache,
         packets: &[RtpPacket],
         out: &mut Vec<RtpPacket>,
     ) {
         for p in packets {
-            cache.push(p);
+            let mut p = p.clone();
+            p.ext_vals.rid = stream.1;
+            cache.push(&p);
             let now = p.arrival_ts;
-            switcher.feed(stream, cache, now, &mut |o| out.push(o));
+            switcher.feed(stream.0, cache, now, &mut |o| out.push(o));
         }
     }
 
@@ -581,7 +603,7 @@ mod test {
     fn initial_subscribe_replays_keyframe_then_follows_live_contiguously() {
         let (q, _) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(7));
-        let mut cache = StreamCache::new();
+        let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
 
@@ -610,7 +632,7 @@ mod test {
     fn live_upstream_loss_stays_visible_as_a_gap() {
         let (q, _) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(8));
-        let mut cache = StreamCache::new();
+        let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
 
@@ -634,7 +656,7 @@ mod test {
     fn a_burst_packet_is_never_emitted_twice_under_reordering() {
         let (q, _) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(12));
-        let mut cache = StreamCache::new();
+        let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
 
@@ -656,25 +678,24 @@ mod test {
     fn switching_layers_stays_contiguous_and_decodable() {
         let (q, h) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(20));
-        let mut cache_q = StreamCache::new();
-        let mut cache_h = StreamCache::new();
+        let mut cache = TrackStreamCache::new();
         let mut bq = builder(1);
         let mut bh = builder(2);
         let mut out = Vec::new();
 
         // Establish q.
         switcher.switch_to(q);
-        ingest(&mut switcher, q, &mut cache_q, &bq.keyframe(3), &mut out);
-        ingest(&mut switcher, q, &mut cache_q, &bq.delta_frame(2), &mut out);
+        ingest(&mut switcher, q, &mut cache, &bq.keyframe(3), &mut out);
+        ingest(&mut switcher, q, &mut cache, &bq.delta_frame(2), &mut out);
 
         // Request a switch to h; h's keyframe arrives and the switch lands.
         switcher.switch_to(h);
         assert!(switcher.awaiting_switch());
-        ingest(&mut switcher, h, &mut cache_h, &bh.keyframe(3), &mut out);
+        ingest(&mut switcher, h, &mut cache, &bh.keyframe(3), &mut out);
         assert_eq!(switcher.active_stream(), Some(h));
 
         // Live h follows.
-        ingest(&mut switcher, h, &mut cache_h, &bh.delta_frame(2), &mut out);
+        ingest(&mut switcher, h, &mut cache, &bh.delta_frame(2), &mut out);
 
         assert!(
             out.windows(2).all(|w| *w[1].seq_no > *w[0].seq_no),
@@ -695,22 +716,21 @@ mod test {
         // the next follows on a contiguous sequence number.
         let (q, h) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(30));
-        let mut cache_q = StreamCache::new();
-        let mut cache_h = StreamCache::new();
+        let mut cache = TrackStreamCache::new();
         let mut bq = builder(1);
         let mut bh = builder(2);
         let mut out = Vec::new();
 
         switcher.switch_to(q);
-        ingest(&mut switcher, q, &mut cache_q, &bq.keyframe(3), &mut out);
+        ingest(&mut switcher, q, &mut cache, &bq.keyframe(3), &mut out);
         for _ in 0..10 {
-            ingest(&mut switcher, q, &mut cache_q, &bq.delta_frame(3), &mut out);
+            ingest(&mut switcher, q, &mut cache, &bq.delta_frame(3), &mut out);
         }
 
         switcher.switch_to(h);
-        ingest(&mut switcher, h, &mut cache_h, &bh.keyframe(3), &mut out);
+        ingest(&mut switcher, h, &mut cache, &bh.keyframe(3), &mut out);
         for _ in 0..10 {
-            ingest(&mut switcher, h, &mut cache_h, &bh.delta_frame(3), &mut out);
+            ingest(&mut switcher, h, &mut cache, &bh.delta_frame(3), &mut out);
         }
 
         rtp::conformance::assert_decodable(&out, "subscribe + simulcast switch + soak");

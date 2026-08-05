@@ -12,7 +12,7 @@ use str0m::media::Rid;
 use tokio::time::Instant;
 
 use crate::entity::{ParticipantId, TrackKind};
-use crate::rtp::cache::StreamCache;
+use crate::rtp::cache::{StreamCache, TrackStreamCache};
 use crate::rtp::conformance::{assert_decodable, check_egress};
 use crate::rtp::switcher::Switcher;
 use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
@@ -29,7 +29,7 @@ pub type LayerId = u32;
 /// that `route_video` and `Slot::on_rtp` drive.
 pub struct Forwarder {
     track: crate::entity::TrackId,
-    caches: HashMap<LayerId, StreamCache>,
+    cache: TrackStreamCache,
     switcher: Switcher,
     out: Vec<RtpPacket>,
     /// Packets emitted by each single ingest, which is what actually leaves the
@@ -43,7 +43,7 @@ impl Forwarder {
             ParticipantId::new(&mut seeded_rng(seed)).derive_track_id(TrackKind::Video, "sw");
         Self {
             track,
-            caches: HashMap::default(),
+            cache: TrackStreamCache::new(),
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(seed)),
             out: Vec::new(),
             bursts: Vec::new(),
@@ -67,16 +67,19 @@ impl Forwarder {
         let sid = self.stream_id(layer);
         let now = pkt.arrival_ts;
 
-        self.caches.entry(layer).or_default().push(pkt);
+        // Ingress stamps the encoding's rid on every packet; mirror that so the
+        // track cache routes it to the right per-encoding ring.
+        let mut pkt = pkt.clone();
+        pkt.ext_vals.rid = sid.1;
+        self.cache.push(&pkt);
 
         let Forwarder {
             switcher,
-            caches,
+            cache,
             out,
             ..
         } = self;
-        let cache = &caches[&layer];
-        switcher.feed(sid, cache, now, &mut |o| out.push(o));
+        switcher.feed(sid.0, cache, now, &mut |o| out.push(o));
 
         self.bursts.push(self.out.len() - before);
     }

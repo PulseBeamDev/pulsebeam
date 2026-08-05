@@ -1,8 +1,9 @@
 use crate::rtp::RtpPacket;
+use ahash::HashMap;
 use std::time::{Duration, SystemTime};
 use str0m::{
     media::{Frequency, MediaTime},
-    rtp::rtcp::SenderInfo,
+    rtp::{Ssrc, rtcp::SenderInfo},
 };
 use tokio::time::Instant;
 
@@ -20,6 +21,31 @@ struct ClockReference {
 impl ClockReference {
     fn server_time_at_anchor(&self, ntp_delta: Duration) -> Instant {
         self.arrival_ts + ntp_delta
+    }
+
+    /// Of two anchors on the same NTP wall clock, the one implying the lower
+    /// propagation delay — i.e. whose server arrival is earliest for its NTP
+    /// instant. Only `ntp_time`/`arrival_ts` matter here (never `rtp_time`), so
+    /// this is meaningful across sibling encodings with unrelated RTP bases.
+    fn lower_delay(self, other: Self) -> Self {
+        match other.ntp_time.duration_since(self.ntp_time) {
+            // other is later on the NTP clock: does it arrive sooner than self predicts?
+            Ok(dt) => {
+                if other.arrival_ts < self.arrival_ts + dt {
+                    other
+                } else {
+                    self
+                }
+            }
+            // other is earlier on the NTP clock: compare the other way round.
+            Err(e) => {
+                if other.arrival_ts + e.duration() < self.arrival_ts {
+                    other
+                } else {
+                    self
+                }
+            }
+        }
     }
 }
 
@@ -221,6 +247,82 @@ impl Synchronizer {
     pub fn is_synchronized(&self) -> bool {
         self.latest_sr
             .is_some_and(|l| self.first_sr.is_some_and(|f| f.ntp_time != l.ntp_time))
+    }
+
+    /// This stream's current NTP↔server anchor (its estimate of the connection's
+    /// minimum propagation delay), for the track composer to reconcile across
+    /// sibling encodings.
+    fn ntp_anchor(&self) -> Option<ClockReference> {
+        self.ntp_anchor
+    }
+
+    /// Adopt an anchor chosen by the track composer, so every encoding of the
+    /// track maps NTP onto one shared server-time clock rather than each drifting
+    /// to its own.
+    fn adopt_ntp_anchor(&mut self, anchor: ClockReference) {
+        self.ntp_anchor = Some(anchor);
+    }
+}
+
+/// One synchronized clock for a whole track: it composes a per-SSRC
+/// [`Synchronizer`] for each simulcast encoding and orchestrates them onto a
+/// single timeline.
+///
+/// Every encoding is the same source captured by the same encoder over the same
+/// connection, so they share a wall clock and a propagation delay. Each keeps its
+/// own RTP↔time mapping (the RTP bases are independent per SSRC), but the
+/// connection's minimum-delay NTP anchor is reconciled across all of them: the
+/// composer keeps the lowest-delay anchor any encoding has observed and feeds it
+/// back to each, so their `playout_time`s land on one clock instead of drifting
+/// apart and putting a seam step into a layer switch.
+#[derive(Debug)]
+pub struct TrackSynchronizer {
+    clock_rate: Frequency,
+    streams: HashMap<Ssrc, Synchronizer>,
+    /// The connection-wide anchor: the lowest-delay NTP↔server reference any
+    /// encoding has reported. Shared into every per-SSRC synchronizer.
+    shared_anchor: Option<ClockReference>,
+}
+
+impl TrackSynchronizer {
+    pub fn new(clock_rate: Frequency) -> Self {
+        Self {
+            clock_rate,
+            streams: HashMap::default(),
+            shared_anchor: None,
+        }
+    }
+
+    /// Stamp `packet.playout_time` on the track's shared clock, routing it to its
+    /// encoding's synchronizer and reconciling the connection anchor.
+    pub fn process(&mut self, packet: &mut RtpPacket, sr: Option<SenderInfo>) {
+        let clock_rate = self.clock_rate;
+        let shared = self.shared_anchor;
+
+        let sync = self
+            .streams
+            .entry(packet.ssrc)
+            .or_insert_with(|| Synchronizer::new(clock_rate));
+
+        // Pin this encoding to the connection's shared anchor before it maps the
+        // packet, so its playout lands on the track clock, not its own.
+        if let Some(anchor) = shared {
+            sync.adopt_ntp_anchor(anchor);
+        }
+        sync.process(packet, sr);
+
+        // Fold whatever anchor this encoding now holds back into the shared one,
+        // keeping the lowest-delay estimate across the whole track.
+        if let Some(anchor) = sync.ntp_anchor() {
+            self.shared_anchor = Some(match self.shared_anchor {
+                Some(current) => current.lower_delay(anchor),
+                None => anchor,
+            });
+        }
+    }
+
+    pub fn is_synchronized(&self) -> bool {
+        self.streams.values().any(Synchronizer::is_synchronized)
     }
 }
 
@@ -560,5 +662,69 @@ mod tests {
         // Ensure that for p3, arrival_ts matches expected_playout (no filter triggered)
         // We can't check internal state easily, but if the anchor wasn't updated,
         // p3 would have had an expected_playout of base_time + 7s.
+    }
+
+    /// Two simulcast encodings of one track share a wall clock and a connection.
+    /// The composed `TrackSynchronizer` must pin both to the connection's
+    /// lowest-delay anchor so their `playout_time`s land on one clock — otherwise
+    /// a switch between them would step the timestamp by their delay difference.
+    #[test]
+    fn track_synchronizer_shares_one_clock_across_encodings() {
+        const LOW: u32 = 10;
+        const HIGH: u32 = 20;
+        const LOW_RTP_BASE: u64 = 1_000_000;
+        const HIGH_RTP_BASE: u64 = 5_000_000;
+        // The high encoding's report and packets consistently arrive later (more
+        // path delay on that stream).
+        const HIGH_DELAY: Duration = Duration::from_millis(80);
+
+        let base = Instant::now();
+        let ntp0 = UNIX_EPOCH + Duration::from_secs(NTP_UNIX_OFFSET_SECS + 1_000);
+        let mut track = TrackSynchronizer::new(VIDEO_FREQUENCY);
+
+        let sr = |ssrc: u32, rtp: u64, ntp: SystemTime| SenderInfo {
+            ssrc: ssrc.into(),
+            rtp_time: MediaTime::from_90khz(rtp),
+            ntp_time: ntp,
+            sender_packet_count: 0,
+            sender_octet_count: 0,
+        };
+        let frame = |ssrc: u32, rtp: u64, at: Instant| RtpPacket {
+            ssrc: ssrc.into(),
+            rtp_ts: MediaTime::from_90khz(rtp),
+            arrival_ts: at,
+            ..Default::default()
+        };
+
+        // Warm up both encodings past the first-packet baseline reset so each has an
+        // RTP baseline and SR history and the composer has reconciled the anchor.
+        for i in 0..4u64 {
+            let t = base + Duration::from_secs(i);
+            let ntp = ntp0 + Duration::from_secs(i);
+            let mut lo = frame(LOW, LOW_RTP_BASE + i * 90_000, t);
+            track.process(&mut lo, Some(sr(LOW, LOW_RTP_BASE + i * 90_000, ntp)));
+            let mut hi = frame(HIGH, HIGH_RTP_BASE + i * 90_000, t + HIGH_DELAY);
+            track.process(&mut hi, Some(sr(HIGH, HIGH_RTP_BASE + i * 90_000, ntp)));
+        }
+
+        // A frame from each encoding at the same wall-clock instant (10s in). Both
+        // map their own RTP base to that instant; on one shared clock they resolve
+        // to the same playout time. Independent clocks would strand the high layer
+        // `HIGH_DELAY` behind — the exact seam step a switch must never introduce.
+        let event = base + Duration::from_secs(10);
+        let mut lo = frame(LOW, LOW_RTP_BASE + 10 * 90_000, event);
+        track.process(&mut lo, None);
+        let mut hi = frame(HIGH, HIGH_RTP_BASE + 10 * 90_000, event + HIGH_DELAY);
+        track.process(&mut hi, None);
+
+        let delta = if hi.playout_time > lo.playout_time {
+            hi.playout_time - lo.playout_time
+        } else {
+            lo.playout_time - hi.playout_time
+        };
+        assert!(
+            delta < Duration::from_millis(10),
+            "encodings of one track must share a clock, got {delta:?}"
+        );
     }
 }

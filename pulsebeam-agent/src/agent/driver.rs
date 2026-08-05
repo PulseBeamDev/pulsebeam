@@ -724,12 +724,11 @@ impl AgentDriver {
                     // Declare the encoder's target so the SFU allocates against it rather than
                     // inferring cost from bytes on the wire, which for screen content is a far
                     // more variable signal (near zero while static, full rate on a scroll).
-                    if let Some(target_bps) = e.frame.target_bitrate_bps {
-                        if let Some(vla) =
+                    if let Some(target_bps) = e.frame.target_bitrate_bps
+                        && let Some(vla) =
                             vla_for(slot.encodings.len(), target_bps, e.frame.resolution)
-                        {
-                            writer = writer.user_extension_value(vla);
-                        }
+                    {
+                        writer = writer.user_extension_value(vla);
                     }
                     let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
                 }

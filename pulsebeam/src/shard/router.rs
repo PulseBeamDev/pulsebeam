@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use ahash::{HashMap, HashMapExt};
 use indexmap::IndexSet;
 use pulsebeam_runtime::rand;
-use str0m::media::KeyframeRequestKind;
+use str0m::media::{KeyframeRequestKind, Rid};
 
 use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
 use super::participants::ParticipantHandle;
@@ -11,9 +11,8 @@ use super::reliable::ReliableRoutes;
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
-use crate::rtp::{RtpPacket, cache::StreamCache};
-use crate::track::{StreamId, Topic, Track, TrackMeta};
-use str0m::media::Rid;
+use crate::rtp::{RtpPacket, cache::TrackStreamCache};
+use crate::track::{Topic, Track, TrackMeta};
 
 use super::worker::{CrossShardEvent, ShardEvent};
 
@@ -38,9 +37,9 @@ pub(crate) trait RoutingContext: CrossShardSend {
     fn forward_video_rtp(
         &mut self,
         subscriber: ParticipantHandle,
-        stream_id: &StreamId,
+        track_id: TrackId,
         pkt: &RtpPacket,
-        cache: Option<&StreamCache>,
+        cache: Option<&TrackStreamCache>,
     );
     fn forward_audio_rtp(
         &mut self,
@@ -60,7 +59,8 @@ pub(crate) trait RoutingContext: CrossShardSend {
     fn notify_keyframe_request(
         &mut self,
         participant_id: ParticipantId,
-        stream_id: StreamId,
+        track_id: TrackId,
+        rid: Option<Rid>,
         kind: KeyframeRequestKind,
     );
     fn is_local(&self, id: &ParticipantId) -> bool;
@@ -176,7 +176,7 @@ pub(crate) struct TrackRoute {
     pub kind: TrackKind,
     pub subscribers: Vec<ParticipantHandle>,
     pub remote_shards: Vec<ShardId>,
-    stream_caches: Vec<(Option<Rid>, StreamCache)>,
+    cache: TrackStreamCache,
 }
 
 impl TrackRoute {
@@ -185,23 +185,8 @@ impl TrackRoute {
             kind,
             subscribers: Vec::with_capacity(256),
             remote_shards: Vec::new(),
-            stream_caches: Vec::with_capacity(4),
+            cache: TrackStreamCache::new(),
         }
-    }
-
-    fn cache_for(&mut self, rid: Option<Rid>) -> &mut StreamCache {
-        if let Some(pos) = self.stream_caches.iter().position(|(r, _)| *r == rid) {
-            return &mut self.stream_caches[pos].1;
-        }
-        self.stream_caches.push((rid, StreamCache::default()));
-        &mut self.stream_caches.last_mut().unwrap().1
-    }
-
-    fn get_cache(&self, rid: Option<Rid>) -> Option<&StreamCache> {
-        self.stream_caches
-            .iter()
-            .find(|(r, _)| *r == rid)
-            .map(|(_, c)| c)
     }
 }
 
@@ -746,23 +731,22 @@ impl ShardRoutingTable {
     #[inline]
     pub fn route_video(
         &mut self,
-        stream_id: StreamId,
+        track_id: TrackId,
         pkt: &RtpPacket,
         ctx: &mut impl RoutingContext,
     ) {
-        let Some(route) = self.tracks.get_mut(&stream_id.0) else {
+        let Some(route) = self.tracks.get_mut(&track_id) else {
             return;
         };
-        route.cache_for(stream_id.1).push(pkt);
-        let cache = route.get_cache(stream_id.1);
+        route.cache.push(pkt);
         for &subscriber in &route.subscribers {
-            ctx.forward_video_rtp(subscriber, &stream_id, pkt, cache);
+            ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache));
         }
         for &shard_id in &route.remote_shards {
             ctx.send(
                 shard_id,
                 CrossShardEvent::VideoRtpPublished {
-                    stream_id,
+                    track_id,
                     pkt: pkt.deep_clone(),
                 },
             );
@@ -1056,9 +1040,9 @@ mod tests {
         fn forward_video_rtp(
             &mut self,
             subscriber: ParticipantHandle,
-            _stream_id: &StreamId,
+            _track_id: TrackId,
             _pkt: &RtpPacket,
-            _cache: Option<&StreamCache>,
+            _cache: Option<&TrackStreamCache>,
         ) {
             self.forwarded_video
                 .borrow_mut()
@@ -1098,7 +1082,8 @@ mod tests {
         fn notify_keyframe_request(
             &mut self,
             participant_id: ParticipantId,
-            _stream_id: StreamId,
+            _track_id: TrackId,
+            _rid: Option<Rid>,
             _kind: KeyframeRequestKind,
         ) {
             self.keyframed.borrow_mut().push(participant_id);
@@ -1261,7 +1246,6 @@ mod tests {
     fn route_video_forwards_to_subscribers_and_remote_shards() {
         let mut table = ShardRoutingTable::new();
         let track_id = pid().derive_track_id(TrackKind::Video, "v");
-        let stream_id: StreamId = (track_id, None);
         let subscriber = pid();
         add_local_subscriber(&mut table, subscriber);
 
@@ -1284,7 +1268,7 @@ mod tests {
             shard_id: ShardId::new(0),
             ..Default::default()
         };
-        table.route_video(stream_id, &RtpPacket::default(), &mut ctx);
+        table.route_video(track_id, &RtpPacket::default(), &mut ctx);
 
         assert_eq!(ctx.forwarded_video.borrow().as_slice(), &[subscriber]);
         assert_eq!(ctx.sent.borrow().len(), 1);

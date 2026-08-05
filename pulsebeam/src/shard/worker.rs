@@ -82,7 +82,8 @@ pub enum ClusterCommand {
 
 pub enum CrossShardEvent {
     /// Publisher shard → Subscriber shards: carry a video RTP packet across the shard boundary.
-    VideoRtpPublished { stream_id: StreamId, pkt: RtpPacket },
+    /// The encoding (simulcast rid) travels on the packet; the track is the routing unit.
+    VideoRtpPublished { track_id: TrackId, pkt: RtpPacket },
     /// Publisher shard → all other shards in the same room: carry an audio RTP packet.
     AudioRtpPublished {
         room_id: RoomId,

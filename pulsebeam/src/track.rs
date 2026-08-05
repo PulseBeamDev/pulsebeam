@@ -8,7 +8,7 @@ use crate::id::ShardId;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
-    sync::Synchronizer,
+    sync::TrackSynchronizer,
 };
 pub use data_track::*;
 use pulsebeam_core::dd::{DependencyDescriptorReader, RawDependencyDescriptor};
@@ -110,7 +110,6 @@ pub struct UpstreamTrackLayer {
     pub rid: Option<Rid>,
     pub quality: LayerQuality,
     pub monitor: StreamMonitor,
-    synchronizer: Synchronizer,
     /// The Video Layers Allocation simulcast-stream index this layer is sent on,
     /// learned from its own packets. Used to read this layer's state out of a
     /// VLA carried on any sibling's packet.
@@ -134,8 +133,7 @@ impl UpstreamTrackLayer {
         self.monitor.poll(now, is_any_sibling_active);
     }
 
-    pub fn process(&mut self, pkt: &mut RtpPacket, sr: Option<SenderInfo>) -> bool {
-        self.synchronizer.process(pkt, sr);
+    pub fn process(&mut self, pkt: &mut RtpPacket) -> bool {
         self.monitor.process_packet(pkt);
         // Learn which VLA simulcast-stream index this layer is sent on, so a VLA
         // carried on any sibling's packet can address this layer's state.
@@ -226,12 +224,20 @@ pub(crate) fn vla_stream_height_px(
 
 pub struct UpstreamTrack {
     pub meta: TrackMeta,
-    pub layers: Vec<UpstreamTrackLayer>,
+    /// One clock for the whole track. Every encoding is the same source over the
+    /// same connection, so their `playout_time`s are reconciled onto a single
+    /// timeline rather than each encoding running an independent clock.
+    synchronizer: TrackSynchronizer,
+    /// One monitor for the whole track. It owns every simulcast encoding's
+    /// ingest state and all cross-encoding reasoning (VLA fan-out, sibling
+    /// activity, aggregate demand), while each encoding keeps its own
+    /// `StreamState` so the downstream allocator still sees per-layer metadata.
+    pub monitor: TrackMonitor,
 }
 
 impl PartialEq for UpstreamTrack {
     fn eq(&self, other: &Self) -> bool {
-        self.meta == other.meta && self.layers == other.layers
+        self.meta == other.meta && self.monitor == other.monitor
     }
 }
 
@@ -244,48 +250,112 @@ impl UpstreamTrack {
         packet: &mut RtpPacket,
         sr: Option<SenderInfo>,
     ) -> bool {
+        // Stamp playout_time on the track's shared clock before the encoding's
+        // monitor and the switcher downstream see it.
+        self.synchronizer.process(packet, sr);
+        self.monitor.process(rid, packet)
+    }
+
+    pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
+        self.monitor.by_rid_mut(rid)
+    }
+
+    pub fn poll_stats(&mut self, now: Instant) {
+        self.monitor.poll(now);
+    }
+}
+
+/// The whole-track monitor: every simulcast encoding of one upstream track,
+/// mashed into a single unit. Per-encoding metrics stay separated (each
+/// `UpstreamTrackLayer` owns its own `StreamState`) so the allocator keeps its
+/// fine-grained per-layer view, but the cross-encoding decisions — a VLA on one
+/// encoding describing all of them, whether a layer has a live sibling, the
+/// track's aggregate demand — are made here where the whole ladder is visible.
+#[derive(Debug)]
+pub struct TrackMonitor {
+    encodings: Vec<UpstreamTrackLayer>,
+}
+
+impl PartialEq for TrackMonitor {
+    fn eq(&self, other: &Self) -> bool {
+        self.encodings == other.encodings
+    }
+}
+
+impl Eq for TrackMonitor {}
+
+impl TrackMonitor {
+    fn new(encodings: Vec<UpstreamTrackLayer>) -> Self {
+        Self { encodings }
+    }
+
+    pub fn process(&mut self, rid: Option<&Rid>, packet: &mut RtpPacket) -> bool {
         let processed = self
-            .layers
+            .encodings
             .iter_mut()
             .find(|s| s.rid.as_ref() == rid)
             .expect("expected sender to always be available")
-            .process(packet, sr);
+            .process(packet);
 
-        // A VLA on any layer's packet describes every simulcast stream; push it
-        // to every layer whose stream index we've already learned.
+        // A VLA on any encoding's packet describes every simulcast stream; push
+        // it to every encoding whose stream index we've already learned. This is
+        // the canonical cross-encoding decision — only the whole-track monitor
+        // sees all the siblings a single VLA refers to.
         if let Some(vla) = packet
             .ext_vals
             .user_values
             .get::<str0m::rtp::vla::VideoLayersAllocation>()
         {
-            for layer in &mut self.layers {
-                layer.apply_vla(vla);
+            for encoding in &mut self.encodings {
+                encoding.apply_vla(vla);
             }
         }
         processed
     }
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
-        self.layers.iter_mut().find(|s| s.rid == *rid)
+        self.encodings.iter_mut().find(|s| s.rid == *rid)
     }
 
-    pub fn poll_stats(&mut self, now: Instant) {
-        let total_active_streams = self
-            .layers
-            .iter()
-            .filter(|s| !s.monitor.shared_state().is_inactive())
-            .count();
+    pub fn poll(&mut self, now: Instant) {
+        let active_encodings = self.active_encoding_count();
 
-        for layer in self.layers.iter_mut() {
-            let is_current_layer_active = !layer.monitor.shared_state().is_inactive();
-            let is_any_sibling_active = if is_current_layer_active {
-                total_active_streams > 1
+        for encoding in self.encodings.iter_mut() {
+            let is_current_active = !encoding.monitor.shared_state().is_inactive();
+            let is_any_sibling_active = if is_current_active {
+                active_encodings > 1
             } else {
-                total_active_streams > 0
+                active_encodings > 0
             };
 
-            layer.poll_stats(now, is_any_sibling_active);
+            encoding.poll_stats(now, is_any_sibling_active);
         }
+    }
+
+    /// How many of the track's encodings are currently sending.
+    pub fn active_encoding_count(&self) -> usize {
+        self.encodings
+            .iter()
+            .filter(|s| !s.monitor.shared_state().is_inactive())
+            .count()
+    }
+
+    /// Whether any encoding of this track is currently sending.
+    pub fn any_active(&self) -> bool {
+        self.encodings
+            .iter()
+            .any(|s| !s.monitor.shared_state().is_inactive())
+    }
+
+    /// Aggregate slow-decay demand across every active encoding — the whole
+    /// track's stable bitrate, for demand/reservation reasoning that wants the
+    /// ladder as one figure rather than per layer.
+    pub fn aggregate_stable_bitrate_bps(&self) -> f64 {
+        self.encodings
+            .iter()
+            .filter(|s| !s.monitor.shared_state().is_inactive())
+            .map(|s| s.monitor.shared_state().stable_bitrate_bps())
+            .sum()
     }
 }
 
@@ -381,16 +451,16 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 
     let sender = UpstreamTrack {
         meta: meta.clone(),
-        layers: vec![UpstreamTrackLayer {
+        synchronizer: TrackSynchronizer::new(rtp::AUDIO_FREQUENCY),
+        monitor: TrackMonitor::new(vec![UpstreamTrackLayer {
             mid,
             rid: None,
             quality: LayerQuality::Low,
-            synchronizer: Synchronizer::new(rtp::AUDIO_FREQUENCY),
             monitor,
             vla_index: None,
             dd: DependencyDescriptorReader::new(),
             dd_errors: 0,
-        }],
+        }]),
     };
     (
         sender,
@@ -442,7 +512,6 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             mid,
             rid,
             quality,
-            synchronizer: Synchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor,
             vla_index: None,
             dd: DependencyDescriptorReader::new(),
@@ -467,7 +536,8 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     (
         UpstreamTrack {
             meta,
-            layers: senders,
+            synchronizer: TrackSynchronizer::new(rtp::VIDEO_FREQUENCY),
+            monitor: TrackMonitor::new(senders),
         },
         track,
     )
@@ -992,7 +1062,6 @@ mod dd_tests {
             rid: None,
             quality: LayerQuality::High,
             monitor: StreamMonitor::new(TrackKind::Video, "test".to_string(), state),
-            synchronizer: Synchronizer::new(rtp::VIDEO_FREQUENCY),
             vla_index: None,
             dd: DependencyDescriptorReader::new(),
             dd_errors: 0,
@@ -1018,7 +1087,7 @@ mod dd_tests {
             .write(&test_utils::keyframe(&structure), &mut buf)
             .unwrap();
         let mut pkt = packet_carrying(&buf[..len]);
-        assert!(layer.process(&mut pkt, None));
+        assert!(layer.process(&mut pkt));
         assert!(
             pkt.ext_vals
                 .user_values
@@ -1031,7 +1100,7 @@ mod dd_tests {
         let sent = test_utils::delta(&structure, 2, 7);
         let len = writer.write(&sent, &mut buf).unwrap();
         let mut pkt = packet_carrying(&buf[..len]);
-        assert!(layer.process(&mut pkt, None));
+        assert!(layer.process(&mut pkt));
 
         let got = pkt.ext_vals.user_values.get::<DependencyDescriptor>();
         assert_eq!(got, Some(&sent));
@@ -1043,7 +1112,7 @@ mod dd_tests {
         let mut layer = layer();
         let mut pkt = packet_carrying(&[0xff; 12]);
 
-        assert!(layer.process(&mut pkt, None));
+        assert!(layer.process(&mut pkt));
         assert!(
             pkt.ext_vals
                 .user_values
@@ -1058,7 +1127,7 @@ mod dd_tests {
         let mut layer = layer();
         let mut pkt = RtpPacket::default();
 
-        assert!(layer.process(&mut pkt, None));
+        assert!(layer.process(&mut pkt));
         assert_eq!(layer.dd_errors, 0);
     }
 }

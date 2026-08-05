@@ -267,9 +267,9 @@ impl ParticipantCore {
     #[inline]
     pub fn on_forward_rtp(
         &mut self,
-        stream_id: &StreamId,
+        track_id: TrackId,
         pkt: &RtpPacket,
-        cache: Option<&crate::rtp::cache::StreamCache>,
+        cache: Option<&crate::rtp::cache::TrackStreamCache>,
     ) {
         // Observation for the simulator: media payload actually forwarded to this subscriber,
         // to compare against what it received (i.e. how much of the link was video vs overhead).
@@ -281,7 +281,7 @@ impl ParticipantCore {
         );
         let promoted =
             self.downstream
-                .on_forward_rtp(stream_id, pkt, cache, &mut self.stream_writer);
+                .on_forward_rtp(track_id, pkt, cache, &mut self.stream_writer);
         if promoted {
             self.signaling.mark_assignments_dirty();
         }

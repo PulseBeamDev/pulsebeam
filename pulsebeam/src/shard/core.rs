@@ -7,7 +7,7 @@ use super::events::{
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
-    entity::{ParticipantId, TrackKind},
+    entity::{ParticipantId, TrackId, TrackKind},
     id::ShardId,
     participant::{ParticipantConfig, batcher::GsoSendBatch},
     rtp::RtpPacket,
@@ -17,8 +17,8 @@ use crate::{
         participants::{ParticipantHandle, ParticipantRegistry},
         timer::TimerWheel,
     },
-    track::StreamId,
 };
+use str0m::media::Rid;
 
 use super::router::{self, ParticipantShardMeta, RoutingContext, ShardRoutingTable};
 
@@ -47,12 +47,12 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     fn forward_video_rtp(
         &mut self,
         subscriber: ParticipantHandle,
-        stream_id: &StreamId,
+        track_id: TrackId,
         pkt: &RtpPacket,
-        cache: Option<&crate::rtp::cache::StreamCache>,
+        cache: Option<&crate::rtp::cache::TrackStreamCache>,
     ) {
         if let Some(p) = self.registry.resolve_mut(subscriber) {
-            p.on_forward_rtp(stream_id, pkt, cache);
+            p.on_forward_rtp(track_id, pkt, cache);
             self.dirty.mark(subscriber, p);
         }
     }
@@ -110,11 +110,12 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     fn notify_keyframe_request(
         &mut self,
         participant_id: ParticipantId,
-        stream_id: StreamId,
+        track_id: TrackId,
+        rid: Option<Rid>,
         kind: str0m::media::KeyframeRequestKind,
     ) {
         if let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) {
-            p.handle_remote_keyframe_request(stream_id, kind);
+            p.handle_remote_keyframe_request((track_id, rid), kind);
             self.dirty.mark(handle, p);
         }
     }
@@ -225,7 +226,7 @@ impl ShardCore {
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Video);
-            self.routing.route_video(ev.stream_id, &ev.pkt, &mut ctx);
+            self.routing.route_video(ev.stream_id.0, &ev.pkt, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {
@@ -452,7 +453,7 @@ impl ShardCore {
                     dirty: &mut self.dirty,
                     router,
                 };
-                ctx.notify_keyframe_request(req.origin, req.stream_id, req.kind);
+                ctx.notify_keyframe_request(req.origin, req.stream_id.0, req.stream_id.1, req.kind);
             }
             ClusterCommand::RegisterParticipant {
                 shard_id,
@@ -550,13 +551,13 @@ impl ShardCore {
         router: &impl CrossShardSend,
     ) {
         match ev {
-            CrossShardEvent::VideoRtpPublished { stream_id, pkt } => {
+            CrossShardEvent::VideoRtpPublished { track_id, pkt } => {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
                 };
-                self.routing.route_video(stream_id, &pkt, &mut ctx);
+                self.routing.route_video(track_id, &pkt, &mut ctx);
             }
             CrossShardEvent::AudioRtpPublished {
                 room_id,
@@ -594,7 +595,7 @@ impl ShardCore {
                     dirty: &mut self.dirty,
                     router,
                 };
-                ctx.notify_keyframe_request(req.origin, req.stream_id, req.kind);
+                ctx.notify_keyframe_request(req.origin, req.stream_id.0, req.stream_id.1, req.kind);
             }
             CrossShardEvent::DataSctpPublished {
                 room_id,
@@ -990,7 +991,7 @@ mod test {
 
         core.on_cross_shard_event(
             CrossShardEvent::VideoRtpPublished {
-                stream_id: video_stream(publisher),
+                track_id: video_stream(publisher).0,
                 pkt: crate::rtp::RtpPacket::default(),
             },
             tokio::time::Instant::now(),
