@@ -324,19 +324,22 @@ impl Switcher {
         // contiguously, which the subscriber would read as a completed frame.
         // Runs regardless of whether there is an old stream to drain, and before
         // the rebase below so the reserved gap sits ahead of the burst.
-        if self.newest_frame_left_open()
+        let reserved_hole = if self.newest_frame_left_open()
             && let Some(last) = self.last_output
         {
             self.timeline.skip_output_sequence(1);
-            self.holes.insert((*last).wrapping_add(1));
-        }
+            let reserved = (*last).wrapping_add(1);
+            self.holes.insert(reserved);
+            Some(reserved)
+        } else {
+            None
+        };
 
         // Hand the outgoing stream a window to complete frames the subscriber has
         // already seen part of. Must run before the rebase below, while the
-        // timeline still holds the old stream's translation; it inherits the
-        // reserved hole above so a late marker packet can still fill it.
+        // timeline still holds the old stream's translation.
         if self.active.is_some() {
-            self.open_tail(now);
+            self.open_tail(now, reserved_hole);
         }
 
         // Promote: the staged stream becomes active; the old active drains.
@@ -368,15 +371,24 @@ impl Switcher {
     /// Snapshot the outgoing stream's translation so its in-flight packets can
     /// still complete frames the subscriber has part of.
     ///
-    /// Inherits the current hole set — including any gap `try_switch` just
-    /// reserved for a frame left open — so a late marker packet on the old stream
-    /// can still fill it.
-    fn open_tail(&mut self, now: Instant) {
+    /// Tracks only holes left by the current active stream, plus any gap reserved
+    /// for a frame left open during this switch.
+    fn open_tail(&mut self, now: Instant, reserved_hole: Option<u64>) {
+        debug_assert!(self.active.is_some());
+        let seq_base = self.timeline.seq_base();
+        let mut holes: BTreeSet<u64> = self
+            .active_input_holes
+            .iter()
+            .map(|input_seq| input_seq.wrapping_add(*seq_base))
+            .collect();
+        if let Some(reserved) = reserved_hole {
+            holes.insert(reserved);
+        }
         self.tail = Some(Tail {
-            seq_base: self.timeline.seq_base(),
+            seq_base,
             ts_base: self.timeline.ts_base(),
             expires_at: now + TAIL_DRAIN_WINDOW,
-            holes: self.holes.clone(),
+            holes,
         });
     }
 

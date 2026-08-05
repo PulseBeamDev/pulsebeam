@@ -1051,6 +1051,42 @@ fn a_gap_can_only_be_filled_by_the_stream_that_left_it() {
     assert_decodable(fwd.emitted(), "two switches with a stale straggler");
 }
 
+#[test]
+fn a_delayed_packet_cannot_fill_a_hole_from_an_older_switch() {
+    let start = now();
+    let mut a = H264StreamBuilder::new(0x31, 100, 90_000, start);
+    let mut b = H264StreamBuilder::new(0x32, 1_000, 25_000, start);
+    let mut fwd = Forwarder::new(64);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &a.keyframe(3));
+    let orphan = a.delta_frame(4);
+    fwd.ingest(0, &orphan[0]);
+    fwd.ingest(0, &orphan[1]);
+    fwd.ingest(0, &orphan[3]);
+
+    fwd.switch_to(1);
+    let delayed = b.delta_frame(20);
+    for packet in delayed.iter().take(19) {
+        fwd.ingest(1, packet);
+    }
+    fwd.ingest_all(1, &b.keyframe(3));
+    fwd.ingest_all(1, &b.delta_frame(3));
+    assert!(fwd.switched());
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &a.keyframe(3));
+    fwd.ingest_all(0, &a.delta_frame(3));
+    assert!(fwd.switched());
+
+    fwd.ingest(1, &delayed[19]);
+    let violations = check_egress(fwd.emitted());
+    assert!(
+        violations.is_empty(),
+        "a delayed packet from a previous stream corrupted the egress: {violations:#?}"
+    );
+}
+
 /// Screen share: the publisher sends a keyframe and then goes quiet because
 /// nothing on screen changed. A viewer attaching later must be shown that
 /// keyframe as soon as anything arrives, not held on black until a PLI round
