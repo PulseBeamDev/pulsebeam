@@ -236,7 +236,7 @@ mod primitives {
 
         pub fn ptr_eq(this: &Self, other: &Self) -> bool {
             loom::sync::Arc::get_mut(&mut this.0.clone()).is_none() && // This is a hack, loom doesn't have ptr_eq directly sometimes
-            Arc::as_ptr(this) == Arc::as_ptr(other)
+            std::ptr::addr_eq(Arc::as_ptr(this), Arc::as_ptr(other))
         }
     }
 

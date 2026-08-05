@@ -9,7 +9,6 @@
 //! Linux only: `recvmmsg`/`sendmmsg`, `UDP_GRO`, and `UDP_SEGMENT` are all
 //! Linux-specific, so this file simply doesn't compile anywhere else.
 
-#![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
 
 use crate::net::{Transport, UdpMode};
@@ -39,6 +38,8 @@ const DISABLE_GSO_SEGMENT_SIZE: i32 = 0;
 const INVALID_GRO_SEGMENT_SIZE: i32 = 0;
 const SINGLE_SEGMENT: usize = 1;
 const DROP_LOG_INTERVAL: usize = 100;
+
+pub const MODE: UdpMode = UdpMode::Batch;
 
 pub const SOCKET_SEND_SIZE: usize = 2 * MEBIBYTE;
 pub const SOCKET_RECV_SIZE: usize = 4 * MEBIBYTE;

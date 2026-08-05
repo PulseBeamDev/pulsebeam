@@ -17,15 +17,9 @@ impl BoundUdpSocket {
 
 pub async fn bind_udp_socket(
     addr: SocketAddr,
-    mode: UdpMode,
+    _mode: UdpMode,
     external_addr: Option<SocketAddr>,
 ) -> io::Result<BoundUdpSocket> {
-    if mode == UdpMode::Batch {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "batched UDP is unavailable in simulation",
-        ));
-    }
     let socket = udp_scalar::bind(addr, external_addr).await?;
     let local_addr = socket.local_addr();
     Ok(BoundUdpSocket { socket, local_addr })

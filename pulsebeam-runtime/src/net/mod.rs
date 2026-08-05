@@ -3,8 +3,13 @@ mod bound_udp;
 #[cfg(feature = "sim")]
 pub mod shaper;
 pub mod tcp;
-pub mod udp;
 pub mod udp_scalar;
+
+#[cfg(target_os = "linux")]
+pub mod udp;
+#[cfg(not(target_os = "linux"))]
+#[path = "udp_fallback.rs"]
+pub mod udp;
 
 pub use bound_udp::{BoundUdpSocket, bind_udp_socket};
 
@@ -18,6 +23,21 @@ pub const BATCH_SIZE: usize = 32;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 1500;
 pub const MAX_UDP_GSO_PAYLOAD_SIZE: usize = u16::MAX as usize;
+
+#[cfg(not(feature = "sim"))]
+fn bind_scalar_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UdpMode {
@@ -168,7 +188,6 @@ impl UnifiedSocket {
     #[inline]
     pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<usize> {
         match self {
-            #[cfg(target_os = "linux")]
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::UdpScalar(inner) => inner.try_send_batch(batch),
         }
@@ -183,12 +202,13 @@ impl UnifiedSocket {
 
     pub fn transport(&self) -> Transport {
         match self {
-            Self::Udp(_) => Transport::Udp(UdpMode::Batch),
+            Self::Udp(_) => Transport::Udp(udp::MODE),
             Self::UdpScalar(_) => Transport::Udp(UdpMode::Scalar),
         }
     }
 }
 
+#[cfg(target_os = "linux")]
 fn fmt_bytes(b: usize) -> String {
     const KB: usize = 1024;
     const MB: usize = 1024 * 1024;
@@ -260,5 +280,11 @@ mod tests {
         };
 
         assert_eq!(batch.data(), &[1, 2]);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn batch_backend_uses_scalar_mode_outside_linux() {
+        assert_eq!(udp::MODE, UdpMode::Scalar);
     }
 }

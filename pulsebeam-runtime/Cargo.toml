@@ -19,6 +19,7 @@ futures-lite = { workspace = true }
 libc = "0.2.186"
 once_cell = "1.21.4"
 parking_lot = { version = "0.12", optional = true }
+loom = { version = "0.7", optional = true, features = ["futures"] }
 pulsebeam-core = { path = "../pulsebeam-core" }
 rand = { workspace = true }
 systemstat = "0.2.7"
@@ -28,10 +29,10 @@ tokio = { workspace = true }
 tokio-util = "0.7.18"
 tracing = { workspace = true }
 turmoil = { workspace = true, optional = true }
+socket2 = { version = "0.6", features = ["all"] }
 zerocopy = { version = "0.8.54", default-features = false, features = ["alloc"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["socket", "uio", "net"] }
-socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 async-stream = "0.3.6"
@@ -42,5 +43,6 @@ futures-test = "0.3.32"
 [features]
 default = ["parking_lot"]
 deep-metrics = []
+loom = ["dep:loom"]
 parking_lot = ["dep:parking_lot", "once_cell/parking_lot"]
 sim = ["pulsebeam-core/sim", "dep:turmoil"]

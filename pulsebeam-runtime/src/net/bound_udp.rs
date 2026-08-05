@@ -1,4 +1,4 @@
-use super::{UdpMode, UnifiedSocket, udp, udp_scalar};
+use super::{UdpMode, UnifiedSocket, bind_scalar_socket, udp, udp_scalar};
 use std::{io, net::SocketAddr};
 
 pub struct BoundUdpSocket {
@@ -43,18 +43,4 @@ pub async fn bind_udp_socket(
         external_addr,
         local_addr,
     })
-}
-
-fn bind_scalar_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::for_address(addr),
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    if addr.is_ipv6() {
-        socket.set_only_v6(false)?;
-    }
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    Ok(socket)
 }
