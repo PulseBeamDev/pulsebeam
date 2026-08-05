@@ -723,7 +723,11 @@ impl AgentDriver {
                     // inferring cost from bytes on the wire, which for screen content is a far
                     // more variable signal (near zero while static, full rate on a scroll).
                     if let Some(target_bps) = e.frame.target_bitrate_bps {
-                        writer = writer.user_extension_value(vla_for(target_bps, e.frame.resolution));
+                        if let Some(vla) =
+                            vla_for(slot.encodings.len(), target_bps, e.frame.resolution)
+                        {
+                            writer = writer.user_extension_value(vla);
+                        }
                     }
                     let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
                 }
@@ -1178,11 +1182,27 @@ mod tests {
         assert!(!slot.deactivate(camera));
         assert!(slot.accepts(screen));
     }
+
+    #[test]
+    fn vla_is_declared_only_for_single_encoding_tracks() {
+        assert!(vla_for(2, 500_000, None).is_none());
+
+        let allocation = vla_for(1, 500_000, Some((1280, 720, 30))).unwrap();
+        assert_eq!(allocation.current_simulcast_stream_index, 0);
+        assert_eq!(allocation.simulcast_streams.len(), 1);
+        assert_eq!(allocation.simulcast_streams[0].spatial_layers.len(), 1);
+    }
 }
 
-/// A single-stream Video Layers Allocation declaring one layer's target bitrate.
-fn vla_for(target_bps: u64, resolution: Option<(u16, u16, u8)>) -> VideoLayersAllocation {
-    VideoLayersAllocation {
+fn vla_for(
+    encoding_count: usize,
+    target_bps: u64,
+    resolution: Option<(u16, u16, u8)>,
+) -> Option<VideoLayersAllocation> {
+    if encoding_count != 1 {
+        return None;
+    }
+    Some(VideoLayersAllocation {
         current_simulcast_stream_index: 0,
         simulcast_streams: vec![SimulcastStreamAllocation {
             spatial_layers: vec![SpatialLayerAllocation {
@@ -1198,5 +1218,5 @@ fn vla_for(target_bps: u64, resolution: Option<(u16, u16, u8)>) -> VideoLayersAl
                 }),
             }],
         }],
-    }
+    })
 }
