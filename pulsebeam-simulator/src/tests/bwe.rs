@@ -344,6 +344,56 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
         ]);
 }
 
+#[test]
+fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::screensharer("screen"))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeTo {
+                description: "Viewer asks for both streams at 720p",
+                participant: "viewer",
+                targets: &[("camera", 720), ("screen", 720)],
+            },
+            Step::Run {
+                description: "Let both streams reach their requested layers",
+                duration: Duration::from_secs(30),
+            },
+            Step::SubscribeTo {
+                description: "Viewer resizes only the camera to 360p",
+                participant: "viewer",
+                targets: &[("camera", 360), ("screen", 720)],
+            },
+            Step::Run {
+                description: "Render both streams after the resize",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckVideoQuality {
+                description: "Camera remains decodable after the layer change",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(300).allow_gaps(4),
+            },
+            Step::CheckForwardedQuality {
+                description: "Camera settles on its 360p layer",
+                origin: "camera",
+                min_quality: 2,
+            },
+            Step::CheckForwardedQuality {
+                description: "Single-layer screen share keeps rendering",
+                origin: "screen",
+                min_quality: 3,
+            },
+        ]);
+}
+
 /// The real-world call: one screen share plus one camera, both directions live.
 ///
 /// This is the scenario from production that motivated the BWE work. Two participants each
