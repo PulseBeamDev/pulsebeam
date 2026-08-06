@@ -2,6 +2,7 @@ use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
 use crate::rtp::cache::TrackStreamCache;
+use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -310,7 +311,10 @@ impl VideoAllocator {
             );
             for view in &views {
                 let quality = match decisions.get(view.key) {
-                    Some(AllocationDecision::Forward(layer, _)) => Some(layer.quality as u8),
+                    Some(
+                        AllocationDecision::Forward(layer, _)
+                        | AllocationDecision::ForwardBaseLayer(layer, _),
+                    ) => Some(layer.quality as u8),
                     _ => None,
                 };
                 crate::sim_metrics::record_forwarded_quality(
@@ -331,10 +335,14 @@ impl VideoAllocator {
             match decision {
                 AllocationDecision::Forward(layer, _) => {
                     changed |= slot.switch_to(layer, false);
+                    changed |= slot.set_decode_target(DecodeTargetSelection::Full);
+                }
+                AllocationDecision::ForwardBaseLayer(layer, _) => {
+                    changed |= slot.switch_to(layer, false);
+                    changed |= slot.set_decode_target(DecodeTargetSelection::Target(0));
                 }
                 AllocationDecision::Pause(layer, _) => {
                     changed |= slot.pause_at(layer);
-                    let _stream_id = layer.stream_id();
                 }
             }
         }
@@ -646,6 +654,17 @@ impl Slot {
         changed
     }
 
+    /// Set the decode target the switcher forwards the active encoding at — `Full`
+    /// for every frame, or a lowered target that sheds temporal/spatial layers.
+    /// Returns whether it changed.
+    fn set_decode_target(&mut self, target: DecodeTargetSelection) -> bool {
+        if self.switcher.decode_target() == target {
+            return false;
+        }
+        self.switcher.set_decode_target(target);
+        true
+    }
+
     fn stop(&mut self) {
         plog_debug!(self.ctx, mid=%self.mid, "slot stopped");
         self.desired = None;
@@ -777,6 +796,16 @@ pub fn log_allocation(
                 };
                 format!("{}:{}({})", slot.mid, q, bw)
             }
+            Some(AllocationDecision::ForwardBaseLayer(l, bw)) => {
+                total_used_bps += bw.as_f64();
+                // Lowercase 'b' suffix marks a base-temporal-layer degrade.
+                let q = match l.quality {
+                    LayerQuality::High => "H",
+                    LayerQuality::Medium => "M",
+                    LayerQuality::Low => "L",
+                };
+                format!("{}:{}b({})", slot.mid, q, bw)
+            }
             Some(AllocationDecision::Pause(_, needed)) => format!("{}:PAUSE({})", slot.mid, needed),
             _ => format!("{}:IDLE", slot.mid),
         };
@@ -822,7 +851,6 @@ struct LayerSnap {
     /// the encoding is one indivisible rung; `> 1` is the number of temporal/
     /// spatial sub-layers the SFU could shed to. Consumed by the (deferred)
     /// decode-target allocation decision.
-    #[allow(dead_code)]
     decode_targets: u8,
 }
 
@@ -868,7 +896,6 @@ impl AllocationEngine {
     /// Decode targets this encoding advertises via its Dependency Descriptor
     /// (>= 1). `1` means no scalability. Foundation for the deferred decision that
     /// sheds temporal/spatial layers as finer rungs below a simulcast encoding.
-    #[allow(dead_code)]
     pub fn decode_target_count(&self, layer: &TrackLayer) -> u8 {
         self.snap(layer).decode_targets
     }
@@ -892,7 +919,13 @@ pub struct SlotView<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AllocationDecision<'a> {
+    /// Forward this encoding at full quality (every frame).
     Forward(&'a TrackLayer, Bitrate),
+    /// Forward only this scalable encoding's base temporal layer — a graceful
+    /// degrade under congestion for a slot that could not otherwise be admitted,
+    /// instead of pausing it outright. Requires the encoding to carry a
+    /// Dependency Descriptor.
+    ForwardBaseLayer(&'a TrackLayer, Bitrate),
     Pause(&'a TrackLayer, Bitrate),
 }
 
@@ -901,6 +934,9 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
         match self {
             AllocationDecision::Forward(layer, bitrate) => {
                 write!(f, "Forward({} @ {})", layer, bitrate)
+            }
+            AllocationDecision::ForwardBaseLayer(layer, bitrate) => {
+                write!(f, "ForwardBaseLayer({} @ {})", layer, bitrate)
             }
             AllocationDecision::Pause(layer, needed) => {
                 write!(f, "Pause({} needs {})", layer, needed)
@@ -914,6 +950,11 @@ impl AllocationEngine {
     // A slot keeps its layer until its cost exceeds ~1.33x the budget (1/0.75),
     // giving recoveries a hysteresis dead-band against churn.
     const DOWNGRADE_FACTOR: f64 = 0.75;
+    // Estimated cost of a scalable encoding's base temporal layer relative to the
+    // whole encoding. A conservative fraction pending per-decode-target VLA data:
+    // the base layer of an L1T3 stream is roughly half the full bitrate. Used only
+    // to size the base-layer graceful degrade, never to raise an encoding.
+    const BASE_DECODE_TARGET_COST_FRACTION: f64 = 0.5;
 
     /// Frame height (px) used for spatial gating.
     fn height(&self, layer: &TrackLayer) -> u32 {
@@ -1073,7 +1114,8 @@ impl AllocationEngine {
         let total = decisions
             .values()
             .filter_map(|decision| match decision {
-                AllocationDecision::Forward(_, bitrate) => Some(bitrate.as_f64()),
+                AllocationDecision::Forward(_, bitrate)
+                | AllocationDecision::ForwardBaseLayer(_, bitrate) => Some(bitrate.as_f64()),
                 AllocationDecision::Pause(_, _) => None,
             })
             .sum::<f64>();
@@ -1124,6 +1166,9 @@ impl AllocationEngine {
         let mut budget = bwe.as_f64();
         let reserve = budget * Self::RESERVE_FRACTION;
         let mut allocs: Vec<Option<&TrackLayer>> = vec![None; slots.len()];
+        // Slots admitted only at their encoding's base temporal layer (a scalable
+        // graceful degrade instead of a pause).
+        let mut degraded = vec![false; slots.len()];
 
         // Pass 1: guarantee each stream's floor, in priority order. A stream we
         // can't afford the floor for is left paused; droppable streams (no floor)
@@ -1145,15 +1190,29 @@ impl AllocationEngine {
                 if threshold <= budget {
                     budget -= cost;
                     allocs[i] = Some(floor);
+                } else if self.decode_target_count(floor) > 1 {
+                    // Can't afford the full floor, but the encoding is scalable:
+                    // forward its base temporal layer rather than pause the stream.
+                    let base_cost = cost * Self::BASE_DECODE_TARGET_COST_FRACTION;
+                    if base_cost <= budget {
+                        budget -= base_cost;
+                        allocs[i] = Some(floor);
+                        degraded[i] = true;
+                    }
                 }
             }
         }
 
         // Pass 2: raise toward target in priority order. Retention/recovery up to
         // the current layer is free (sticky dead-band); climbing above it is a
-        // genuine upgrade, and only one is granted per call.
+        // genuine upgrade, and only one is granted per call. A base-layer-degraded
+        // slot is left as-is: it is under congestion, and it recovers to full in a
+        // later pass once budget covers its floor again.
         let mut upgrade_used = false;
         for (i, slot) in slots.iter().enumerate() {
+            if degraded[i] {
+                continue;
+            }
             let mut cur = allocs[i];
             while let Some(next) = self.next_layer(slot, cur) {
                 let step = self.cost(next) - cur.map_or(0.0, |l| self.cost(l));
@@ -1178,10 +1237,13 @@ impl AllocationEngine {
         let mut decisions = SecondaryMap::new();
         for (i, slot) in slots.iter().enumerate() {
             if let Some(layer) = allocs[i] {
-                decisions.insert(
-                    slot.key,
-                    AllocationDecision::Forward(layer, Bitrate::from(self.cost(layer) as u64)),
-                );
+                let decision = if degraded[i] {
+                    let base = self.cost(layer) * Self::BASE_DECODE_TARGET_COST_FRACTION;
+                    AllocationDecision::ForwardBaseLayer(layer, Bitrate::from(base as u64))
+                } else {
+                    AllocationDecision::Forward(layer, Bitrate::from(self.cost(layer) as u64))
+                };
+                decisions.insert(slot.key, decision);
             } else if let Some(target) = self.pause_target(slot) {
                 decisions.insert(
                     slot.key,
@@ -2132,6 +2194,52 @@ mod allocation_tests {
         track.by_quality(q).unwrap().state.bitrate_bps()
     }
 
+    #[test]
+    fn base_layer_degrade_forwards_dd_base_instead_of_pausing() {
+        let t = healthy_track();
+        // Leave only "q" healthy, so it is the sole eligible floor.
+        t.by_quality(LayerQuality::High)
+            .unwrap()
+            .state
+            .update_for_test()
+            .inactive(true);
+        t.by_quality(LayerQuality::Medium)
+            .unwrap()
+            .state
+            .update_for_test()
+            .inactive(true);
+        let q = t.by_quality(LayerQuality::Low).unwrap();
+        q.state.update_for_test().bitrate(1_000_000); // 1 Mbps at full quality
+
+        // Budget covers the base temporal layer (0.5 Mbps) but not the full floor
+        // (0.75 Mbps after the retention factor).
+        let budget = bw(700);
+
+        // Scalable (L1T3): degrade to the base layer rather than pause.
+        q.state.set_decode_target_count(3);
+        let slots = vec![qos_slot("a", 2000, 1, 0, &t, LayerQuality::Low)];
+        let decisions = AllocationEngine::compute(budget, &slots);
+        assert!(
+            matches!(
+                decisions[slots[0].key],
+                AllocationDecision::ForwardBaseLayer(l, _) if l.quality == LayerQuality::Low
+            ),
+            "a scalable stream degrades to its base layer instead of pausing, got {:?}",
+            decisions[slots[0].key]
+        );
+
+        // No Dependency Descriptor: there is no base layer to fall back to, so the
+        // same budget pauses the stream as before — the fallback is preserved.
+        q.state.set_decode_target_count(1);
+        let slots = vec![qos_slot("a", 2000, 1, 0, &t, LayerQuality::Low)];
+        let decisions = AllocationEngine::compute(budget, &slots);
+        assert!(
+            matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
+            "a non-scalable stream still pauses, got {:?}",
+            decisions[slots[0].key]
+        );
+    }
+
     /// Allocation cost comes from bitrate_bps, which is set by the upstream
     /// monitor's RateFilter (smoothing VLA-declared targets). When bitrate_bps
     /// is stable (as it is after the monitor's fast-rise/slow-fall filter
@@ -2156,7 +2264,9 @@ mod allocation_tests {
             let slots = vec![slot("a", 1080, &t, LayerQuality::Medium)];
             let decisions = AllocationEngine::compute(bw(886), &slots);
             match decisions[slots[0].key] {
-                AllocationDecision::Forward(l, _) => Some(l.quality),
+                AllocationDecision::Forward(l, _) | AllocationDecision::ForwardBaseLayer(l, _) => {
+                    Some(l.quality)
+                }
                 AllocationDecision::Pause(..) => None,
             }
         };
