@@ -144,6 +144,7 @@ impl H264Looper {
                 // worth still exercising: not every sender emits the extension.
                 target_bitrate_bps: None,
                 resolution: None,
+                dependency_descriptor: None,
             };
 
             if sender.send(frame).await.is_err() {
@@ -412,6 +413,7 @@ impl VbrLooper {
                         self.step_target(self.is_active(now.duration_since(start))),
                     ),
                     resolution: None,
+                dependency_descriptor: None,
                 };
                 if sender.send(frame).await.is_err() {
                     return;
@@ -465,6 +467,7 @@ impl VbrLooper {
                 is_keyframe: false,
                 target_bitrate_bps: Some(self.step_target(active)),
                 resolution: None,
+                dependency_descriptor: None,
             };
 
             if sender.send(frame).await.is_err() {

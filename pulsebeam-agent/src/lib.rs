@@ -49,6 +49,11 @@ pub struct MediaFrame {
     /// frames rather than pixels under pressure, so its fps moves continuously while its
     /// resolution does not.
     pub resolution: Option<(u16, u16, u8)>,
+    /// The frame's Dependency Descriptor, when the source is scalable and declares
+    /// one. Attached verbatim to egress RTP so the SFU can shed temporal/spatial
+    /// layers by decode target. `None` for a non-scalable source (the SFU then
+    /// falls back to whole-encoding selection).
+    pub dependency_descriptor: Option<pulsebeam_core::dd::RawDependencyDescriptor>,
 }
 
 impl From<MediaData> for MediaFrame {
@@ -65,6 +70,7 @@ impl From<MediaData> for MediaFrame {
             abs_capture_time: value.ext_vals.abs_capture_time.map(|act| act.capture_time),
             target_bitrate_bps: None,
             resolution: None,
+            dependency_descriptor: None,
             contiguous: value.contiguous,
             is_keyframe,
         }

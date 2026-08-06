@@ -737,6 +737,11 @@ impl AgentDriver {
                     {
                         writer = writer.user_extension_value(vla);
                     }
+                    // A scalable source declares each frame's dependency structure;
+                    // forward it so the SFU can shed layers by decode target.
+                    if let Some(dd) = e.frame.dependency_descriptor.clone() {
+                        writer = writer.user_extension_value(dd);
+                    }
                     let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
                 }
             }

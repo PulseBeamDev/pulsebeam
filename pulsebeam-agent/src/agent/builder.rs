@@ -141,6 +141,15 @@ impl AgentBuilder {
                     str0m::rtp::vla::Serializer,
                 ),
             )
+            // Per-frame dependency structure, so a scalable source can tell the SFU
+            // which frames each decode target needs (temporal/spatial shedding).
+            .set_extension(
+                rtp_extensions::DEPENDENCY_DESCRIPTOR,
+                str0m::rtp::Extension::with_serializer(
+                    pulsebeam_core::dd::URI,
+                    pulsebeam_core::dd::Serializer,
+                ),
+            )
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
