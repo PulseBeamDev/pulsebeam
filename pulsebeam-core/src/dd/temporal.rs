@@ -167,6 +167,47 @@ impl TemporalDdGenerator {
     }
 }
 
+/// A ready-to-attach source of encoded Dependency Descriptors for an L1T{N}
+/// stream: pairs a [`TemporalDdGenerator`] with a persistent
+/// [`DependencyDescriptorWriter`] (the writer must persist so delta frames encode
+/// against the structure the keyframe taught it). One call per encoded frame
+/// yields the wire bytes to hang on the packet as a
+/// [`RawDependencyDescriptor`](crate::dd::RawDependencyDescriptor).
+#[derive(Debug)]
+pub struct TemporalDdSource {
+    generator: TemporalDdGenerator,
+    writer: crate::dd::write::DependencyDescriptorWriter,
+}
+
+impl TemporalDdSource {
+    pub fn new(temporal_layers: u8) -> Self {
+        Self {
+            generator: TemporalDdGenerator::new(temporal_layers),
+            writer: crate::dd::write::DependencyDescriptorWriter::new(),
+        }
+    }
+
+    pub fn temporal_layers(&self) -> u8 {
+        self.generator.temporal_layers()
+    }
+
+    pub fn decode_target_count(&self) -> u8 {
+        self.generator.decode_target_count()
+    }
+
+    /// Encode the next frame's descriptor to wire bytes. `None` only if the
+    /// descriptor somehow exceeds the extension's length bound, which the L1T{N}
+    /// structures never do.
+    pub fn next(&mut self, is_keyframe: bool) -> Option<crate::dd::RawDependencyDescriptor> {
+        let dd = self.generator.next(is_keyframe);
+        let mut buf = [0u8; crate::dd::model::MAX_DD_LEN];
+        let n = self.writer.write(&dd, &mut buf).ok()?;
+        Some(crate::dd::RawDependencyDescriptor(
+            buf[..n].iter().copied().collect(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -250,6 +291,33 @@ mod test {
         let mut g = TemporalDdGenerator::new(3);
         assert!(g.next(true).attached_structure.is_some());
         assert!(g.next(false).attached_structure.is_none());
+    }
+
+    #[test]
+    fn source_emits_wire_bytes_a_reader_parses_with_correct_membership() {
+        let mut source = TemporalDdSource::new(3);
+        let mut reader = DependencyDescriptorReader::new();
+
+        // Keyframe (T0) then a full period of deltas: T2, T1, T2.
+        let raws: Vec<_> = [true, false, false, false]
+            .into_iter()
+            .map(|kf| source.next(kf).expect("encodes within the length bound"))
+            .collect();
+
+        let base = reader.read(&raws[0].0).expect("keyframe decodes");
+        assert_eq!(base.temporal_id(), 0);
+        for dt in 0..3 {
+            assert!(base.is_in_decode_target(dt), "base frame absent from dt{dt}");
+        }
+
+        // The two T2 deltas belong only to the top target; the T1 delta to dt1+.
+        let d1 = reader.read(&raws[1].0).unwrap();
+        assert_eq!(d1.temporal_id(), 2);
+        assert!(!d1.is_in_decode_target(0));
+        let d2 = reader.read(&raws[2].0).unwrap();
+        assert_eq!(d2.temporal_id(), 1);
+        assert!(d2.is_in_decode_target(1));
+        assert!(!d2.is_in_decode_target(0));
     }
 
     #[test]
