@@ -154,7 +154,16 @@ impl UpstreamTrackLayer {
             return;
         };
         match self.dd.read(&raw.0) {
-            Ok(dd) => pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd)),
+            Ok(dd) => {
+                pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+                // A scalable keyframe teaches the structure; publish how many decode
+                // targets it offers so the allocator can reason about shedding to them.
+                if let Some(structure) = self.dd.structure() {
+                    self.monitor
+                        .shared_state()
+                        .set_decode_target_count(structure.decode_target_count);
+                }
+            }
             Err(err) => {
                 self.dd_errors += 1;
                 if self.dd_errors.is_power_of_two() {
@@ -1105,6 +1114,31 @@ mod dd_tests {
         let got = pkt.ext_vals.user_values.get::<DependencyDescriptor>();
         assert_eq!(got, Some(&sent));
         assert_eq!(layer.dd_errors, 0);
+    }
+
+    #[test]
+    fn learns_decode_target_count_from_a_scalable_keyframe() {
+        let structure = test_utils::structure_l1t3(); // three decode targets
+        let mut writer = DependencyDescriptorWriter::new();
+        let mut buf = [0u8; MAX_DD_LEN];
+        let mut layer = layer();
+        assert_eq!(
+            layer.monitor.shared_state().decode_target_count(),
+            1,
+            "no structure seen yet, so the encoding is one indivisible rung"
+        );
+
+        let len = writer
+            .write(&test_utils::keyframe(&structure), &mut buf)
+            .unwrap();
+        let mut pkt = packet_carrying(&buf[..len]);
+        layer.process(&mut pkt);
+
+        assert_eq!(
+            layer.monitor.shared_state().decode_target_count(),
+            structure.decode_target_count,
+            "the scalable keyframe's decode-target count is published for the allocator"
+        );
     }
 
     #[test]

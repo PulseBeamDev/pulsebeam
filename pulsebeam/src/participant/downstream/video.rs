@@ -818,6 +818,12 @@ struct LayerSnap {
     stable_bitrate_bps: f64,
     healthy: bool,
     height: u32,
+    /// Decode targets this encoding offers (>= 1). `1` means no scalability, so
+    /// the encoding is one indivisible rung; `> 1` is the number of temporal/
+    /// spatial sub-layers the SFU could shed to. Consumed by the (deferred)
+    /// decode-target allocation decision.
+    #[allow(dead_code)]
+    decode_targets: u8,
 }
 
 /// Allocation computation context. `AllocationEngine::new(slots)` reads every
@@ -845,6 +851,7 @@ impl AllocationEngine {
                     stable_bitrate_bps,
                     healthy: l.state.is_healthy(),
                     height: l.state.height(),
+                    decode_targets: l.state.decode_target_count(),
                 };
                 (l as *const TrackLayer as usize, snap)
             })
@@ -856,6 +863,14 @@ impl AllocationEngine {
         self.snaps
             .get(&(layer as *const TrackLayer as usize))
             .expect("layer must belong to snapshotted slots")
+    }
+
+    /// Decode targets this encoding advertises via its Dependency Descriptor
+    /// (>= 1). `1` means no scalability. Foundation for the deferred decision that
+    /// sheds temporal/spatial layers as finer rungs below a simulcast encoding.
+    #[allow(dead_code)]
+    pub fn decode_target_count(&self, layer: &TrackLayer) -> u8 {
+        self.snap(layer).decode_targets
     }
 }
 
@@ -1252,6 +1267,51 @@ mod assignment_tests {
                 ..SlotConfig::default()
             });
         }
+    }
+
+    #[test]
+    fn allocation_snapshot_exposes_per_encoding_decode_target_count() {
+        let pid = ParticipantId::new(&mut test_rng());
+        let (tx, built) = make_video_track(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("q"), SimulcastLayer::new("h")],
+        );
+        for layer in &built.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        let track = Track {
+            meta: tx.meta.clone(),
+            layers: built.layers,
+        };
+
+        // The "h" encoding advertises three decode targets (L1T3); "q", none.
+        let scalable = track.by_quality(LayerQuality::Medium).unwrap();
+        scalable.state.set_decode_target_count(3);
+        let plain = track.by_quality(LayerQuality::Low).unwrap();
+
+        let mut keys: SlotMap<SlotKey, ()> = SlotMap::with_key();
+        let view = SlotView {
+            key: keys.insert(()),
+            mid: Mid::from("s0"),
+            max_height: 720,
+            min_height: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::Low,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view));
+
+        assert_eq!(
+            engine.decode_target_count(scalable),
+            3,
+            "the allocator sees the scalable encoding's decode targets"
+        );
+        assert_eq!(
+            engine.decode_target_count(plain),
+            1,
+            "a non-scalable encoding is a single rung"
+        );
     }
 
     #[test]

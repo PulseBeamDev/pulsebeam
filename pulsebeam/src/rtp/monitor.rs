@@ -1,7 +1,5 @@
 use pulsebeam_runtime::sync::Arc;
-#[cfg(test)]
-use pulsebeam_runtime::sync::atomic::AtomicU8;
-use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::ops::Deref;
 use std::time::Duration;
 use str0m::bwe::Bitrate;
@@ -152,6 +150,11 @@ pub struct StreamStateInner {
     /// Max representable bitrate = u32::MAX ≈ 4.3 Gbps, far above any real stream.
     bitrates: AtomicU64,
     height: AtomicU32,
+    /// Number of decode targets the encoding advertises via its Dependency
+    /// Descriptor (temporal/spatial sub-layers the SFU can shed to). `1` means no
+    /// scalability structure has been seen — the allocator then treats the
+    /// encoding as a single indivisible rung.
+    decode_targets: AtomicU8,
     #[cfg(test)]
     quality: AtomicU8,
 }
@@ -169,9 +172,21 @@ impl StreamStateInner {
             healthy: AtomicBool::new(!inactive),
             bitrates: AtomicU64::new(Self::pack(bitrate_bps, bitrate_bps)),
             height: AtomicU32::new(height),
+            decode_targets: AtomicU8::new(1),
             #[cfg(test)]
             quality: AtomicU8::new(StreamQuality::Good as u8),
         }
+    }
+
+    /// The number of decode targets the encoding advertises (>= 1).
+    pub fn decode_target_count(&self) -> u8 {
+        self.decode_targets.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Record the decode-target count learned from a Dependency Descriptor
+    /// structure. Written from ingress when a scalable keyframe arrives.
+    pub fn set_decode_target_count(&self, count: u8) {
+        self.decode_targets.store(count.max(1), Ordering::Relaxed);
     }
 
     pub fn is_healthy(&self) -> bool {
