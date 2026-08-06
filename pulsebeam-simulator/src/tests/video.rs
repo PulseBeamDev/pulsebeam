@@ -27,6 +27,52 @@ fn dependency_descriptor_stream_is_forwarded_decodably_test() {
         ]);
 }
 
+/// A single scalable (DD) encoding keeps delivering frames through a downlink
+/// squeeze. With a minimum-height floor the slot cannot be dropped, so a broken DD
+/// forwarding path would starve the subscriber — this asserts it does not. The
+/// precise base-layer-degrade decision and the shed stream's decodability are
+/// pinned by unit tests (`base_layer_degrade_*`, `dd_shedding_to_a_lower_target_*`);
+/// this is the end-to-end smoke that carrying DD never breaks the stream under BWE
+/// pressure.
+#[test]
+fn dependency_descriptor_stream_survives_congestion_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish flow and discover the DD track",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Bob keeps a floor so the slot must forward something, not drop it",
+                participant: "bob",
+                targets: &[("alice", 720, 180, 1)],
+            },
+            Step::Run {
+                description: "Soak at full quality",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetBandwidth {
+                description: "Squeeze the downlink so full quality no longer fits",
+                participant: "bob",
+                bits_per_sec: 350_000,
+            },
+            Step::Run {
+                description: "Let the allocator degrade the scalable stream to its base layer",
+                duration: Duration::from_secs(12),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob keeps receiving renderable frames through the squeeze",
+                participant: "bob",
+                quality: VideoQuality::min_frames(60).allow_gaps(30),
+            },
+        ]);
+}
+
 #[test]
 fn fast_initial_ramp_up_on_good_network_test() {
     LocalNodeSim::new()

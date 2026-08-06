@@ -862,4 +862,88 @@ mod test {
             "at Full target no frame is shed, DD present or not"
         );
     }
+
+    /// Stamp a real Dependency Descriptor (with frame number and dependencies)
+    /// from a temporal generator onto every packet of `frame`.
+    fn stamp_generated_dd(frame: &mut [RtpPacket], dd: &pulsebeam_core::dd::DependencyDescriptor) {
+        for p in frame.iter_mut() {
+            p.ext_vals
+                .user_values
+                .set_arc(std::sync::Arc::new(dd.clone()));
+        }
+    }
+
+    /// Assert the forwarded stream is decodable *at the Dependency Descriptor
+    /// level*: every forwarded frame's declared references (`frame_diffs`) point
+    /// only to frames that were also forwarded. A keyframe (it carries the
+    /// structure) is an entry point with no references. This proves the SFU shed a
+    /// self-consistent set — not merely that egress RTP is well-formed.
+    fn assert_dd_decodable(forwarded: &[RtpPacket]) {
+        use pulsebeam_core::dd::DependencyDescriptor;
+        use std::collections::HashSet;
+
+        let present: HashSet<u16> = forwarded
+            .iter()
+            .filter_map(|p| p.ext_vals.user_values.get::<DependencyDescriptor>())
+            .map(|dd| dd.frame_number)
+            .collect();
+
+        for p in forwarded {
+            let Some(dd) = p.ext_vals.user_values.get::<DependencyDescriptor>() else {
+                continue;
+            };
+            if dd.attached_structure.is_some() {
+                continue; // keyframe: an independently decodable entry point
+            }
+            for diff in &dd.frame_dependencies.frame_diffs {
+                let referenced = dd.frame_number.wrapping_sub(*diff);
+                assert!(
+                    present.contains(&referenced),
+                    "forwarded frame {} references frame {} which was shed — not decodable",
+                    dd.frame_number,
+                    referenced
+                );
+            }
+        }
+    }
+
+    /// Shedding a temporal target must leave a stream that is decodable by its own
+    /// dependency structure, not just one whose RTP is well-formed. Uses the real
+    /// `TemporalDdGenerator` so frames carry genuine `frame_diffs`.
+    #[test]
+    fn dd_shedding_to_a_lower_target_stays_dd_decodable() {
+        use crate::rtp::frame_selector::DecodeTargetSelection;
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
+
+        for target in [
+            DecodeTargetSelection::Target(0),
+            DecodeTargetSelection::Target(1),
+        ] {
+            let (q, _) = two_streams();
+            let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(51));
+            let mut cache = TrackStreamCache::new();
+            let mut b = builder(1);
+            let mut generator = TemporalDdGenerator::new(3);
+            let mut out = Vec::new();
+
+            switcher.switch_to(q);
+            let mut kf = b.keyframe(2);
+            stamp_generated_dd(&mut kf, &generator.next(true));
+            ingest(&mut switcher, q, &mut cache, &kf, &mut out);
+
+            switcher.set_decode_target(target);
+            for _ in 0..24 {
+                let mut frame = b.delta_frame(1);
+                stamp_generated_dd(&mut frame, &generator.next(false));
+                ingest(&mut switcher, q, &mut cache, &frame, &mut out);
+            }
+
+            assert!(
+                out.windows(2).all(|w| *w[1].seq_no == *w[0].seq_no + 1),
+                "egress stays contiguous at {target:?}"
+            );
+            rtp::conformance::assert_decodable(&out, "temporal shed");
+            assert_dd_decodable(&out);
+        }
+    }
 }
