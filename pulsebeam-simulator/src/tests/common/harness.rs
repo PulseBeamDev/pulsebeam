@@ -42,6 +42,9 @@ pub struct Participant {
     /// Make the published payload opaque (simulating SFrame/E2EE), forcing the SFU
     /// to forward on the Dependency Descriptor alone.
     pub opaque_payload: bool,
+    /// Model a legacy peer that never negotiates the Dependency Descriptor
+    /// extension, exercising the marker/deep-inspection fallback for mixed rooms.
+    pub marker_only: bool,
 }
 
 impl Participant {
@@ -57,6 +60,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -72,6 +76,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -87,6 +92,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -103,6 +109,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -127,6 +134,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -187,6 +195,13 @@ impl Participant {
     pub fn with_opaque_dd(mut self, layers: u8) -> Self {
         self.temporal_dd = Some(layers);
         self.opaque_payload = true;
+        self
+    }
+
+    /// Never negotiate the Dependency Descriptor: a legacy marker/deep-inspection
+    /// peer. Used to test mixed rooms (DD on one side, marker-only on the other).
+    pub fn marker_only(mut self) -> Self {
+        self.marker_only = true;
         self
     }
 }
@@ -688,6 +703,10 @@ async fn run_participant(
         } else {
             SimClientBuilder::bind(ip, server_ip).await?
         };
+
+        if config.marker_only {
+            builder = builder.without_dependency_descriptor();
+        }
 
         match config.role {
             Role::Publisher => {

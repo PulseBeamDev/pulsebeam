@@ -28,6 +28,7 @@ pub struct AgentBuilder {
     local_ips: Vec<IpAddr>,
     tcp_server_addr: Option<SocketAddr>,
     manual_sub: bool,
+    negotiate_dependency_descriptor: bool,
 }
 
 impl AgentBuilder {
@@ -39,7 +40,15 @@ impl AgentBuilder {
             local_ips: Vec::new(),
             tcp_server_addr: None,
             manual_sub: false,
+            negotiate_dependency_descriptor: true,
         }
+    }
+
+    /// Do not negotiate the Dependency Descriptor extension, modelling a
+    /// marker/deep-inspection-only peer that predates DD support.
+    pub fn without_dependency_descriptor(mut self) -> Self {
+        self.negotiate_dependency_descriptor = false;
+        self
     }
 
     pub fn video_upstream_slots(
@@ -141,16 +150,19 @@ impl AgentBuilder {
                     str0m::rtp::vla::Serializer,
                 ),
             )
+            .set_stats_interval(Some(Duration::from_millis(200)));
+
+        if self.negotiate_dependency_descriptor {
             // Per-frame dependency structure, so a scalable source can tell the SFU
             // which frames each decode target needs (temporal/spatial shedding).
-            .set_extension(
+            rtc_builder = rtc_builder.set_extension(
                 rtp_extensions::DEPENDENCY_DESCRIPTOR,
                 str0m::rtp::Extension::with_serializer(
                     pulsebeam_core::dd::URI,
                     pulsebeam_core::dd::Serializer,
                 ),
-            )
-            .set_stats_interval(Some(Duration::from_millis(200)));
+            );
+        }
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
         codec_config.enable_h264(true);

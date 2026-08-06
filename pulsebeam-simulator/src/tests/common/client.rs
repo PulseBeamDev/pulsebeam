@@ -116,6 +116,12 @@ impl SimClientBuilder {
         self
     }
 
+    /// Model a marker/deep-inspection-only peer that never negotiates DD.
+    pub fn without_dependency_descriptor(mut self) -> Self {
+        self.agent_builder = self.agent_builder.without_dependency_descriptor();
+        self
+    }
+
     /// Inject a shared `VideoReceiveLog` so the harness can read it externally.
     /// If not called, `connect()` allocates a private one.
     pub fn with_video_rx(mut self, rx: Arc<Mutex<VideoReceiveLog>>) -> Self {

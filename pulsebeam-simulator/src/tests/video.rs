@@ -100,6 +100,56 @@ fn opaque_dependency_descriptor_stream_forwards_on_dd_alone_test() {
         ]);
 }
 
+/// Mixed room: a DD publisher and a marker-only subscriber that never negotiates
+/// the DD extension. The SFU makes its forwarding decisions from the ingress DD and
+/// the subscriber simply receives standard (possibly shed) media — DD support on the
+/// receive leg is not required. Asserts the stream flows end-to-end.
+#[test]
+fn dd_publisher_streams_to_a_marker_only_subscriber_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
+                .with_participant(Participant::subscriber("bob").marker_only()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice publishes a DD stream; a marker-only Bob subscribes",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes without negotiating DD on his receive leg",
+                participant: "bob",
+                quality: VideoQuality::min_frames(150).allow_gaps(3),
+            },
+        ]);
+}
+
+/// Mixed room: a legacy marker-only publisher (no DD) and a DD-capable subscriber.
+/// With no ingress DD the SFU forwards via the marker/deep-inspection path; the
+/// subscriber's DD support is simply unused. Asserts the legacy path is unaffected
+/// by DD being negotiated on the receive side.
+#[test]
+fn marker_only_publisher_streams_to_a_dd_subscriber_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]).marker_only())
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "A marker-only Alice publishes; a DD-capable Bob subscribes",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes the legacy stream end to end",
+                participant: "bob",
+                quality: VideoQuality::min_frames(150).allow_gaps(3),
+            },
+        ]);
+}
+
 #[test]
 fn fast_initial_ramp_up_on_good_network_test() {
     LocalNodeSim::new()
