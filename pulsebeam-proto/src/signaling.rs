@@ -69,8 +69,8 @@ pub struct VideoRequest {
     /// invisible. Update it whenever your layout changes (resize, pin, fullscreen).
     ///    0  = hidden / off-screen → the server sends nothing (frees bandwidth).
     ///    >0 = the server picks the simulcast layer that best matches this size.
-    /// Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
-    /// the streams you are actually looking at.
+    /// > Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
+    /// > the streams you are actually looking at.
     #[prost(uint32, tag = "3")]
     pub target_height: u32,
     /// Relative importance for bandwidth contention — decides the ORDER in which
@@ -112,7 +112,7 @@ pub struct VideoRequest {
     ///    0   = no temporal floor: may be shed to the base temporal layer (lowest
     ///          fps) or paused, per `min_height`.
     ///    >0  = keep at least ~this fps (e.g. motion/teleop streams that must stay
-    ///          smooth even at reduced resolution).
+    /// > smooth even at reduced resolution).
     ///
     /// Examples:
     ///    Teleoperation camera (must stay smooth) : height=720 min_height=180 min_fps=30
