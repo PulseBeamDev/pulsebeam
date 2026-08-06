@@ -1,6 +1,7 @@
 pub mod bits;
 pub mod model;
 pub mod read;
+pub mod temporal;
 pub mod write;
 
 #[cfg(any(test, feature = "test-utils"))]
