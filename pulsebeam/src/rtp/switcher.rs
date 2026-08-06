@@ -8,6 +8,7 @@ use tokio::time::Instant;
 use crate::entity::TrackId;
 use crate::rtp::RtpPacket;
 use crate::rtp::cache::{StreamCache, TrackStreamCache};
+use crate::rtp::frame_selector::{DecodeTargetSelection, DependencyDescriptorSelector, FrameDecision, FrameSelector};
 use crate::rtp::timeline::Timeline;
 use crate::track::StreamId;
 
@@ -65,6 +66,12 @@ struct Tail {
 pub struct Switcher {
     timeline: Timeline,
 
+    /// Intra-encoding frame selection: within the active encoding, which frames to
+    /// forward. At its default `Full` target it forwards everything (identical to
+    /// the pre-DD forwarder); lowered to a decode target it sheds temporal/spatial
+    /// layers frame by frame for fine-grained bitrate control.
+    selector: DependencyDescriptorSelector,
+
     /// The stream currently forwarded, and how far its cache has been read.
     /// `active_cursor` is `Some` whenever `active` is `Some`.
     active: Option<StreamId>,
@@ -110,6 +117,7 @@ impl Switcher {
     pub fn new<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
         Self {
             timeline: Timeline::new(clock_rate, rng),
+            selector: DependencyDescriptorSelector::new(),
             active: None,
             active_cursor: None,
             active_input_holes: BTreeSet::new(),
@@ -229,6 +237,17 @@ impl Switcher {
         self.staging.is_some()
     }
 
+    /// Set which decode target the active encoding is forwarded at. `Full`
+    /// forwards every frame; a lowered target sheds temporal/spatial layers for
+    /// finer bitrate control than dropping a whole simulcast encoding.
+    pub fn set_decode_target(&mut self, target: DecodeTargetSelection) {
+        self.selector.set_target(target);
+    }
+
+    pub fn decode_target(&self) -> DecodeTargetSelection {
+        self.selector.target()
+    }
+
     /// Pull new live packets from the active stream's cache and emit them,
     /// preserving the stream's own sequence structure so upstream loss stays
     /// visible to the subscriber as a gap.
@@ -267,10 +286,19 @@ impl Switcher {
                         self.trim_active_input_holes();
                     }
 
-                    let mut out = pkt.clone();
-                    self.timeline.rewrite(&mut out);
-                    self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
-                    emit(out);
+                    match self.selector.decide(pkt) {
+                        FrameDecision::Drop => {
+                            // Intentional layer shed: renumber around it so the
+                            // subscriber sees a contiguous stream, not loss.
+                            self.timeline.drop_input();
+                        }
+                        FrameDecision::Forward => {
+                            let mut out = pkt.clone();
+                            self.timeline.rewrite(&mut out);
+                            self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
+                            emit(out);
+                        }
+                    }
                 }
 
                 if self.next_expected_input.is_none_or(|e| input_seq >= e) {
@@ -367,6 +395,9 @@ impl Switcher {
         self.active = self.staging.take();
         self.active_cursor = Some(new_cursor);
         self.active_input_holes.clear();
+        // The new encoding has its own decode-target structure; forward it whole
+        // until the allocator chooses a target for it.
+        self.selector.set_target(DecodeTargetSelection::Full);
         // The next live packet the stream owes is the one after the burst.
         self.next_expected_input = Some((*new_cursor).wrapping_add(1));
         self.switch_blocked_since = None;
@@ -734,5 +765,99 @@ mod test {
         }
 
         rtp::conformance::assert_decodable(&out, "subscribe + simulcast switch + soak");
+    }
+
+    /// Stamp a parsed Dependency Descriptor on every packet of `frame`, marking it
+    /// present or absent for decode-target 0 (a temporal-layer shed).
+    fn stamp_dd(frame: &mut [RtpPacket], in_dt0: bool) {
+        use pulsebeam_core::dd::{
+            DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
+        };
+        let dti = if in_dt0 {
+            DecodeTargetIndication::Required
+        } else {
+            DecodeTargetIndication::NotPresent
+        };
+        for p in frame.iter_mut() {
+            let mut dd = DependencyDescriptor::default();
+            dd.frame_dependencies = FrameDependencyTemplate {
+                dtis: [dti].into_iter().collect(),
+                temporal_id: if in_dt0 { 0 } else { 1 },
+                ..Default::default()
+            };
+            p.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+        }
+    }
+
+    #[test]
+    fn dd_target_sheds_temporal_frames_and_keeps_egress_contiguous() {
+        use crate::rtp::frame_selector::DecodeTargetSelection;
+
+        let (q, _) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(41));
+        let mut cache = TrackStreamCache::new();
+        let mut b = builder(1);
+        let mut out = Vec::new();
+
+        switcher.switch_to(q);
+        ingest(&mut switcher, q, &mut cache, &b.keyframe(2), &mut out);
+        let after_keyframe = out.len();
+
+        // Forward only the base temporal layer.
+        switcher.set_decode_target(DecodeTargetSelection::Target(0));
+
+        // Alternate base (kept) and enhancement (shed) delta frames.
+        let mut kept = 0;
+        let mut shed = 0;
+        for i in 0..8 {
+            let in_dt0 = i % 2 == 0;
+            let mut frame = b.delta_frame(1);
+            stamp_dd(&mut frame, in_dt0);
+            ingest(&mut switcher, q, &mut cache, &frame, &mut out);
+            if in_dt0 {
+                kept += 1;
+            } else {
+                shed += 1;
+            }
+        }
+
+        let live = &out[after_keyframe..];
+        assert_eq!(
+            live.len(),
+            kept,
+            "exactly the base-layer frames are forwarded ({kept} kept, {shed} shed)"
+        );
+        assert!(
+            out.windows(2).all(|w| *w[1].seq_no == *w[0].seq_no + 1),
+            "egress stays contiguous across shed frames — no gap the subscriber reads as loss"
+        );
+        rtp::conformance::assert_decodable(&out, "subscribe + temporal shed to dt0");
+    }
+
+    #[test]
+    fn full_target_forwards_every_frame_even_with_dd() {
+        use crate::rtp::frame_selector::DecodeTargetSelection;
+
+        let (q, _) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(42));
+        let mut cache = TrackStreamCache::new();
+        let mut b = builder(1);
+        let mut out = Vec::new();
+
+        switcher.switch_to(q);
+        ingest(&mut switcher, q, &mut cache, &b.keyframe(2), &mut out);
+        assert_eq!(switcher.decode_target(), DecodeTargetSelection::Full);
+        let after_keyframe = out.len();
+
+        for i in 0..6 {
+            let mut frame = b.delta_frame(1);
+            stamp_dd(&mut frame, i % 2 == 0);
+            ingest(&mut switcher, q, &mut cache, &frame, &mut out);
+        }
+        assert_eq!(
+            out.len() - after_keyframe,
+            6,
+            "at Full target no frame is shed, DD present or not"
+        );
     }
 }
