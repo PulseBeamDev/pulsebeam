@@ -148,11 +148,13 @@ impl VideoAllocator {
             let layer = layer.clone();
             slot.max_height = intent.target_height;
             slot.min_height = intent.min_height;
+            slot.min_fps = intent.min_fps;
             slot.priority = intent.priority;
             slot.switch_to(&layer, false);
         } else {
             slot.max_height = 0;
             slot.min_height = 0;
+            slot.min_fps = 0;
             slot.priority = 0;
             slot.stop();
         }
@@ -278,6 +280,7 @@ impl VideoAllocator {
                     mid: s.mid,
                     max_height: s.max_height,
                     min_height: s.min_height,
+                    min_fps: s.min_fps,
                     priority: s.priority,
                     track,
                     current_quality,
@@ -313,7 +316,7 @@ impl VideoAllocator {
                 let quality = match decisions.get(view.key) {
                     Some(
                         AllocationDecision::Forward(layer, _)
-                        | AllocationDecision::ForwardBaseLayer(layer, _),
+                        | AllocationDecision::ForwardTarget(layer, _, _),
                     ) => Some(layer.quality as u8),
                     _ => None,
                 };
@@ -337,9 +340,9 @@ impl VideoAllocator {
                     changed |= slot.switch_to(layer, false);
                     changed |= slot.set_decode_target(DecodeTargetSelection::Full);
                 }
-                AllocationDecision::ForwardBaseLayer(layer, _) => {
+                AllocationDecision::ForwardTarget(layer, target, _) => {
                     changed |= slot.switch_to(layer, false);
-                    changed |= slot.set_decode_target(DecodeTargetSelection::Target(0));
+                    changed |= slot.set_decode_target(*target);
                 }
                 AllocationDecision::Pause(layer, _) => {
                     changed |= slot.pause_at(layer);
@@ -509,6 +512,7 @@ struct Slot {
     rid: Option<Rid>,
     max_height: u32,
     min_height: u32,
+    min_fps: u32,
     priority: u32,
     paused: bool,
 
@@ -535,6 +539,7 @@ impl Slot {
             // With no signaling, we assume users are viewing with 720p playback
             max_height: 720,
             min_height: 0,
+            min_fps: 0,
             priority: 0,
             paused: true,
 
@@ -796,7 +801,7 @@ pub fn log_allocation(
                 };
                 format!("{}:{}({})", slot.mid, q, bw)
             }
-            Some(AllocationDecision::ForwardBaseLayer(l, bw)) => {
+            Some(AllocationDecision::ForwardTarget(l, _, bw)) => {
                 total_used_bps += bw.as_f64();
                 // Lowercase 'b' suffix marks a base-temporal-layer degrade.
                 let q = match l.quality {
@@ -834,6 +839,8 @@ pub struct Intent {
     pub target_height: u32,
     /// Floor render height (px) to keep under contention; `0` = droppable.
     pub min_height: u32,
+    /// Floor frame rate (fps) for a scalable stream; `0` = no temporal floor.
+    pub min_fps: u32,
     /// Contention order; higher wins bandwidth first.
     pub priority: u32,
 }
@@ -849,9 +856,14 @@ struct LayerSnap {
     height: u32,
     /// Decode targets this encoding offers (>= 1). `1` means no scalability, so
     /// the encoding is one indivisible rung; `> 1` is the number of temporal/
-    /// spatial sub-layers the SFU could shed to. Consumed by the (deferred)
-    /// decode-target allocation decision.
+    /// spatial sub-layers the SFU could shed to.
     decode_targets: u8,
+    /// Cumulative cost (bps) of each decode target, from the sender's per-temporal
+    /// VLA. `0` = not declared (the allocator then estimates from `bitrate_bps`).
+    decode_target_bps: [u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
+    /// Full frame rate (fps); `0` = unknown. With `decode_targets` it yields each
+    /// decode target's fps for the `min_fps` floor.
+    full_fps: u32,
 }
 
 /// Allocation computation context. `AllocationEngine::new(slots)` reads every
@@ -874,12 +886,18 @@ impl AllocationEngine {
             .flat_map(|s| s.track.layers.iter())
             .map(|l| {
                 let (bitrate_bps, stable_bitrate_bps) = l.state.bitrates_snapshot();
+                let mut decode_target_bps = [0u64; crate::rtp::monitor::MAX_LADDER_TARGETS];
+                for (dt, cost) in decode_target_bps.iter_mut().enumerate() {
+                    *cost = l.state.decode_target_bps(dt);
+                }
                 let snap = LayerSnap {
                     bitrate_bps,
                     stable_bitrate_bps,
                     healthy: l.state.is_healthy(),
                     height: l.state.height(),
                     decode_targets: l.state.decode_target_count(),
+                    decode_target_bps,
+                    full_fps: l.state.full_fps(),
                 };
                 (l as *const TrackLayer as usize, snap)
             })
@@ -894,10 +912,64 @@ impl AllocationEngine {
     }
 
     /// Decode targets this encoding advertises via its Dependency Descriptor
-    /// (>= 1). `1` means no scalability. Foundation for the deferred decision that
-    /// sheds temporal/spatial layers as finer rungs below a simulcast encoding.
+    /// (>= 1). `1` means no scalability.
     pub fn decode_target_count(&self, layer: &TrackLayer) -> u8 {
         self.snap(layer).decode_targets
+    }
+
+    /// Cost (bps) of forwarding this encoding at decode target `dt`. Uses the
+    /// sender's declared per-temporal VLA when present; otherwise estimates from
+    /// the full cost with a nested fraction (base ~half, top = full).
+    fn decode_target_cost(&self, layer: &TrackLayer, dt: usize) -> f64 {
+        let snap = self.snap(layer);
+        let count = usize::from(snap.decode_targets.max(1));
+        let declared = snap.decode_target_bps.get(dt).copied().unwrap_or(0);
+        if declared > 0 {
+            return declared as f64;
+        }
+        if count <= 1 || dt + 1 >= count {
+            return snap.bitrate_bps;
+        }
+        let frac = 0.5 + 0.5 * (dt as f64) / ((count - 1) as f64);
+        snap.bitrate_bps * frac
+    }
+
+    /// Frame rate of decode target `dt`: each temporal layer roughly halves the
+    /// rate, so `dt` runs at `full_fps >> (count - 1 - dt)`. `0` when unknown.
+    fn decode_target_fps(&self, layer: &TrackLayer, dt: usize) -> u32 {
+        let snap = self.snap(layer);
+        let count = usize::from(snap.decode_targets.max(1));
+        if snap.full_fps == 0 || dt + 1 >= count {
+            return snap.full_fps;
+        }
+        snap.full_fps >> (count - 1 - dt)
+    }
+
+    /// The highest decode target of a scalable encoding that fits `budget` while
+    /// respecting the `min_fps` floor — the finer rung the allocator sheds to
+    /// instead of pausing. `None` when the encoding is not scalable, or when even
+    /// the lowest target meeting `min_fps` does not fit (then the slot pauses
+    /// rather than drop below the floor). Returns the target and its cost.
+    fn best_affordable_decode_target(
+        &self,
+        layer: &TrackLayer,
+        budget: f64,
+        min_fps: u32,
+    ) -> Option<(DecodeTargetSelection, f64)> {
+        let count = usize::from(self.decode_target_count(layer));
+        if count <= 1 {
+            return None;
+        }
+        // Lowest target still meeting the frame-rate floor.
+        let floor_dt = (0..count)
+            .find(|&dt| self.decode_target_fps(layer, dt) >= min_fps)
+            .unwrap_or(count - 1);
+        // Highest affordable target at or above the floor. Skip the top target —
+        // that is "full", handled by the normal (non-degraded) path.
+        (floor_dt..count.saturating_sub(1)).rev().find_map(|dt| {
+            let cost = self.decode_target_cost(layer, dt);
+            (cost <= budget).then_some((DecodeTargetSelection::Target(dt), cost))
+        })
     }
 }
 
@@ -913,6 +985,10 @@ pub struct SlotView<'a> {
     pub min_height: u32,
     /// Contention order; higher wins bandwidth first.
     pub priority: u32,
+    /// Floor frame rate (fps) to keep for a scalable stream under contention;
+    /// `0` = no temporal floor (may shed to the base layer). The temporal analog
+    /// of `min_height`.
+    pub min_fps: u32,
     pub track: &'a Track,
     pub current_quality: LayerQuality,
 }
@@ -921,11 +997,11 @@ pub struct SlotView<'a> {
 pub enum AllocationDecision<'a> {
     /// Forward this encoding at full quality (every frame).
     Forward(&'a TrackLayer, Bitrate),
-    /// Forward only this scalable encoding's base temporal layer — a graceful
-    /// degrade under congestion for a slot that could not otherwise be admitted,
-    /// instead of pausing it outright. Requires the encoding to carry a
-    /// Dependency Descriptor.
-    ForwardBaseLayer(&'a TrackLayer, Bitrate),
+    /// Forward this scalable encoding at a lowered decode target — shedding
+    /// temporal layers to fit the budget, one step at a time, instead of dropping
+    /// to a coarser simulcast encoding or pausing. Requires a Dependency
+    /// Descriptor; the target is a specific decode target (never `Full`).
+    ForwardTarget(&'a TrackLayer, DecodeTargetSelection, Bitrate),
     Pause(&'a TrackLayer, Bitrate),
 }
 
@@ -935,8 +1011,8 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
             AllocationDecision::Forward(layer, bitrate) => {
                 write!(f, "Forward({} @ {})", layer, bitrate)
             }
-            AllocationDecision::ForwardBaseLayer(layer, bitrate) => {
-                write!(f, "ForwardBaseLayer({} @ {})", layer, bitrate)
+            AllocationDecision::ForwardTarget(layer, target, bitrate) => {
+                write!(f, "ForwardTarget({} {:?} @ {})", layer, target, bitrate)
             }
             AllocationDecision::Pause(layer, needed) => {
                 write!(f, "Pause({} needs {})", layer, needed)
@@ -950,11 +1026,6 @@ impl AllocationEngine {
     // A slot keeps its layer until its cost exceeds ~1.33x the budget (1/0.75),
     // giving recoveries a hysteresis dead-band against churn.
     const DOWNGRADE_FACTOR: f64 = 0.75;
-    // Estimated cost of a scalable encoding's base temporal layer relative to the
-    // whole encoding. A conservative fraction pending per-decode-target VLA data:
-    // the base layer of an L1T3 stream is roughly half the full bitrate. Used only
-    // to size the base-layer graceful degrade, never to raise an encoding.
-    const BASE_DECODE_TARGET_COST_FRACTION: f64 = 0.5;
 
     /// Frame height (px) used for spatial gating.
     fn height(&self, layer: &TrackLayer) -> u32 {
@@ -1115,7 +1186,7 @@ impl AllocationEngine {
             .values()
             .filter_map(|decision| match decision {
                 AllocationDecision::Forward(_, bitrate)
-                | AllocationDecision::ForwardBaseLayer(_, bitrate) => Some(bitrate.as_f64()),
+                | AllocationDecision::ForwardTarget(_, _, bitrate) => Some(bitrate.as_f64()),
                 AllocationDecision::Pause(_, _) => None,
             })
             .sum::<f64>();
@@ -1166,9 +1237,10 @@ impl AllocationEngine {
         let mut budget = bwe.as_f64();
         let reserve = budget * Self::RESERVE_FRACTION;
         let mut allocs: Vec<Option<&TrackLayer>> = vec![None; slots.len()];
-        // Slots admitted only at their encoding's base temporal layer (a scalable
-        // graceful degrade instead of a pause).
-        let mut degraded = vec![false; slots.len()];
+        // Slots admitted at a lowered decode target (a scalable temporal degrade
+        // instead of a pause): the chosen target and its cost.
+        let mut degraded_target: Vec<Option<(DecodeTargetSelection, f64)>> =
+            vec![None; slots.len()];
 
         // Pass 1: guarantee each stream's floor, in priority order. A stream we
         // can't afford the floor for is left paused; droppable streams (no floor)
@@ -1190,15 +1262,15 @@ impl AllocationEngine {
                 if threshold <= budget {
                     budget -= cost;
                     allocs[i] = Some(floor);
-                } else if self.decode_target_count(floor) > 1 {
+                } else if let Some((target, dt_cost)) =
+                    self.best_affordable_decode_target(floor, budget, slot.min_fps)
+                {
                     // Can't afford the full floor, but the encoding is scalable:
-                    // forward its base temporal layer rather than pause the stream.
-                    let base_cost = cost * Self::BASE_DECODE_TARGET_COST_FRACTION;
-                    if base_cost <= budget {
-                        budget -= base_cost;
-                        allocs[i] = Some(floor);
-                        degraded[i] = true;
-                    }
+                    // forward the highest temporal decode target that fits and still
+                    // meets the min_fps floor, rather than pause the stream.
+                    budget -= dt_cost;
+                    allocs[i] = Some(floor);
+                    degraded_target[i] = Some((target, dt_cost));
                 }
             }
         }
@@ -1210,7 +1282,7 @@ impl AllocationEngine {
         // later pass once budget covers its floor again.
         let mut upgrade_used = false;
         for (i, slot) in slots.iter().enumerate() {
-            if degraded[i] {
+            if degraded_target[i].is_some() {
                 continue;
             }
             let mut cur = allocs[i];
@@ -1237,9 +1309,8 @@ impl AllocationEngine {
         let mut decisions = SecondaryMap::new();
         for (i, slot) in slots.iter().enumerate() {
             if let Some(layer) = allocs[i] {
-                let decision = if degraded[i] {
-                    let base = self.cost(layer) * Self::BASE_DECODE_TARGET_COST_FRACTION;
-                    AllocationDecision::ForwardBaseLayer(layer, Bitrate::from(base as u64))
+                let decision = if let Some((target, dt_cost)) = degraded_target[i] {
+                    AllocationDecision::ForwardTarget(layer, target, Bitrate::from(dt_cost as u64))
                 } else {
                     AllocationDecision::Forward(layer, Bitrate::from(self.cost(layer) as u64))
                 };
@@ -1358,6 +1429,7 @@ mod assignment_tests {
             mid: Mid::from("s0"),
             max_height: 720,
             min_height: 0,
+            min_fps: 0,
             priority: 0,
             track: &track,
             current_quality: LayerQuality::Low,
@@ -1402,6 +1474,7 @@ mod assignment_tests {
                 track_id: tracks.ids[0],
                 target_height: 720,
                 min_height: 0,
+                min_fps: 0,
                 priority: 0,
             },
         );
@@ -1411,6 +1484,7 @@ mod assignment_tests {
                 track_id: tracks.ids[1],
                 target_height: 720,
                 min_height: 0,
+                min_fps: 0,
                 priority: 0,
             },
         );
@@ -1420,6 +1494,7 @@ mod assignment_tests {
                 track_id: tracks.ids[2],
                 target_height: 720,
                 min_height: 0,
+                min_fps: 0,
                 priority: 0,
             },
         );
@@ -1445,6 +1520,7 @@ mod assignment_tests {
                 track_id: missing_track_id,
                 target_height: 720,
                 min_height: 0,
+                min_fps: 0,
                 priority: 0,
             },
         );
@@ -2051,6 +2127,7 @@ mod allocation_tests {
             mid: Mid::from(mid),
             max_height,
             min_height: 0,
+            min_fps: 0,
             track,
             priority: 0,
             current_quality: current,
@@ -2071,6 +2148,7 @@ mod allocation_tests {
             mid: Mid::from(mid),
             max_height,
             min_height,
+            min_fps: 0,
             track,
             priority,
             current_quality: current,
@@ -2222,7 +2300,7 @@ mod allocation_tests {
         assert!(
             matches!(
                 decisions[slots[0].key],
-                AllocationDecision::ForwardBaseLayer(l, _) if l.quality == LayerQuality::Low
+                AllocationDecision::ForwardTarget(l, _, _) if l.quality == LayerQuality::Low
             ),
             "a scalable stream degrades to its base layer instead of pausing, got {:?}",
             decisions[slots[0].key]
@@ -2237,6 +2315,86 @@ mod allocation_tests {
             matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
             "a non-scalable stream still pauses, got {:?}",
             decisions[slots[0].key]
+        );
+    }
+
+    /// A scalable encoding whose full rate does not fit is shed to the *highest*
+    /// decode target that does — an intermediate temporal rung, not straight to
+    /// the base layer.
+    fn scalable_low_only_track() -> Track {
+        let t = healthy_track();
+        t.by_quality(LayerQuality::High)
+            .unwrap()
+            .state
+            .update_for_test()
+            .inactive(true);
+        t.by_quality(LayerQuality::Medium)
+            .unwrap()
+            .state
+            .update_for_test()
+            .inactive(true);
+        let q = t.by_quality(LayerQuality::Low).unwrap();
+        q.state.update_for_test().bitrate(600_000);
+        q.state.set_decode_target_count(3);
+        // Declared per-temporal ladder: dt0=200k, dt1=300k, dt2(full)=600k @ 30fps
+        // → fps 7/15/30.
+        q.state.set_temporal_ladder(&[200, 300, 600], 30);
+        t
+    }
+
+    fn scalable_slot(t: &Track, min_fps: u32) -> SlotView<'_> {
+        SlotView {
+            key: next_slot_key(),
+            mid: Mid::from("a"),
+            max_height: 2000,
+            min_height: 1,
+            min_fps,
+            priority: 0,
+            track: t,
+            current_quality: LayerQuality::Low,
+        }
+    }
+
+    #[test]
+    fn temporal_ladder_picks_the_highest_affordable_decode_target() {
+        let t = scalable_low_only_track();
+        // 350 kbps: full (600k) does not fit; dt1 (300k) is the highest that does.
+        let view = scalable_slot(&t, 0);
+        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view));
+        assert!(
+            matches!(
+                d[view.key],
+                AllocationDecision::ForwardTarget(_, DecodeTargetSelection::Target(1), _)
+            ),
+            "expected an intermediate temporal target, got {:?}",
+            d[view.key]
+        );
+    }
+
+    #[test]
+    fn min_fps_floor_pauses_rather_than_shed_below_it() {
+        let t = scalable_low_only_track();
+        // min_fps=20: only the full target (30fps) meets it; dt1 is 15fps, dt0 is
+        // 7fps. Full does not fit 350k, so the slot pauses rather than drop below
+        // the frame-rate floor.
+        let view = scalable_slot(&t, 20);
+        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view));
+        assert!(
+            matches!(d[view.key], AllocationDecision::Pause(..)),
+            "expected a pause below the min_fps floor, got {:?}",
+            d[view.key]
+        );
+
+        // min_fps=10: dt1 (15fps) satisfies the floor and fits, so shed to it.
+        let view = scalable_slot(&t, 10);
+        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view));
+        assert!(
+            matches!(
+                d[view.key],
+                AllocationDecision::ForwardTarget(_, DecodeTargetSelection::Target(1), _)
+            ),
+            "expected shed to dt1 above the 10fps floor, got {:?}",
+            d[view.key]
         );
     }
 
@@ -2264,7 +2422,7 @@ mod allocation_tests {
             let slots = vec![slot("a", 1080, &t, LayerQuality::Medium)];
             let decisions = AllocationEngine::compute(bw(886), &slots);
             match decisions[slots[0].key] {
-                AllocationDecision::Forward(l, _) | AllocationDecision::ForwardBaseLayer(l, _) => {
+                AllocationDecision::Forward(l, _) | AllocationDecision::ForwardTarget(l, _, _) => {
                     Some(l.quality)
                 }
                 AllocationDecision::Pause(..) => None,
@@ -2473,6 +2631,7 @@ mod allocation_tests {
             mid: Mid::from("a"),
             max_height: 1080,
             min_height: 0,
+            min_fps: 0,
             track: &t,
             priority: 0,
             current_quality: LayerQuality::High,
@@ -2538,6 +2697,7 @@ mod allocation_tests {
                 mid: Mid::from("h"),
                 max_height: 1080,
                 min_height: 0,
+                min_fps: 0,
                 track: &t,
                 priority: 200,
                 current_quality: LayerQuality::Low,
@@ -2547,6 +2707,7 @@ mod allocation_tests {
                 mid: Mid::from("l"),
                 max_height: 360,
                 min_height: 0,
+                min_fps: 0,
                 track: &t,
                 priority: 0,
                 current_quality: LayerQuality::Low,

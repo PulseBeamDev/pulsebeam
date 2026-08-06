@@ -153,6 +153,7 @@ impl Signaling {
                     track_id,
                     target_height: req.target_height,
                     min_height: req.min_height.min(req.target_height),
+                    min_fps: req.min_fps,
                     priority: req.priority,
                 },
             );
