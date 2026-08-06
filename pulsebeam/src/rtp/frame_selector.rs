@@ -49,16 +49,11 @@ impl FrameSelector for MarkerSelector {
 ///
 /// `Full` forwards every frame (highest quality, the default); `Target(dt)` keeps
 /// only frames that contribute to decode-target index `dt`, shedding the rest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeTargetSelection {
+    #[default]
     Full,
     Target(usize),
-}
-
-impl Default for DecodeTargetSelection {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 /// Forwards frames belonging to the targeted decode target, dropping the rest.
@@ -173,7 +168,11 @@ mod test {
         let t2 = pkt_with_dtis(&[NotPresent, NotPresent, Discardable]);
 
         let mut sel = DependencyDescriptorSelector::with_target(DecodeTargetSelection::Target(0));
-        assert_eq!(sel.decide(&base), FrameDecision::Forward, "base always kept");
+        assert_eq!(
+            sel.decide(&base),
+            FrameDecision::Forward,
+            "base always kept"
+        );
         assert_eq!(sel.decide(&t1), FrameDecision::Drop, "T1 shed at dt0");
         assert_eq!(sel.decide(&t2), FrameDecision::Drop, "T2 shed at dt0");
 

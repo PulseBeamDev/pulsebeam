@@ -413,7 +413,7 @@ impl VbrLooper {
                         self.step_target(self.is_active(now.duration_since(start))),
                     ),
                     resolution: None,
-                dependency_descriptor: None,
+                    dependency_descriptor: None,
                 };
                 if sender.send(frame).await.is_err() {
                     return;

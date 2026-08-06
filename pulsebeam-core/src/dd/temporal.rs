@@ -307,7 +307,10 @@ mod test {
         let base = reader.read(&raws[0].0).expect("keyframe decodes");
         assert_eq!(base.temporal_id(), 0);
         for dt in 0..3 {
-            assert!(base.is_in_decode_target(dt), "base frame absent from dt{dt}");
+            assert!(
+                base.is_in_decode_target(dt),
+                "base frame absent from dt{dt}"
+            );
         }
 
         // The two T2 deltas belong only to the top target; the T1 delta to dt1+.
