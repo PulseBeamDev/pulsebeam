@@ -155,6 +155,11 @@ impl UpstreamTrackLayer {
         };
         match self.dd.read(&raw.0) {
             Ok(dd) => {
+                // Under SFrame/E2EE the media payload is opaque, so the H.264 IDR
+                // probe in from_str0m sees nothing. The Dependency Descriptor rides
+                // in the clear and carries the template structure on every keyframe,
+                // so it is the authoritative keyframe signal whenever present.
+                pkt.is_keyframe = dd.attached_structure.is_some();
                 pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
                 // A scalable keyframe teaches the structure; publish how many decode
                 // targets it offers so the allocator can reason about shedding to them.
@@ -1185,6 +1190,42 @@ mod dd_tests {
             layer.monitor.shared_state().decode_target_count(),
             structure.decode_target_count,
             "the scalable keyframe's decode-target count is published for the allocator"
+        );
+    }
+
+    #[test]
+    fn derives_the_keyframe_flag_from_the_descriptor_under_an_opaque_payload() {
+        // packet_carrying starts from an opaque payload (is_keyframe = false, empty
+        // NAL flags) — the SFrame/E2EE case where from_str0m's H.264 probe sees
+        // nothing. The descriptor's attached structure is then the only keyframe
+        // signal, so ingress must set is_keyframe from it.
+        let structure = test_utils::structure_l1t3();
+        let mut writer = DependencyDescriptorWriter::new();
+        let mut buf = [0u8; MAX_DD_LEN];
+        let mut layer = layer();
+
+        let len = writer
+            .write(&test_utils::keyframe(&structure), &mut buf)
+            .unwrap();
+        let mut kf = packet_carrying(&buf[..len]);
+        assert!(
+            !kf.is_keyframe,
+            "opaque payload gives no keyframe signal on its own"
+        );
+        layer.process(&mut kf);
+        assert!(
+            kf.is_keyframe,
+            "the descriptor's structure marks the keyframe"
+        );
+
+        let len = writer
+            .write(&test_utils::delta(&structure, 1, 1), &mut buf)
+            .unwrap();
+        let mut delta = packet_carrying(&buf[..len]);
+        layer.process(&mut delta);
+        assert!(
+            !delta.is_keyframe,
+            "a descriptor without a structure is a delta frame"
         );
     }
 

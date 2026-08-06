@@ -236,11 +236,34 @@ impl StreamCache {
             return None;
         }
 
-        let mut out = self.parameter_set_prefix(&segment, segment_ts)?;
+        // A Dependency Descriptor keyframe is a decode-target entry point by
+        // contract, so its segment is self-sufficient. It also means the payload
+        // may be opaque (SFrame/E2EE), where the SPS/PPS probe sees nothing and
+        // synthesis is neither possible nor needed — the client's decoder owns the
+        // parameter sets end-to-end. Only synthesize parameter sets for the legacy
+        // deep-inspection path, where the payload is readable.
+        let dd_driven = segment.iter().any(|p| {
+            p.ext_vals
+                .user_values
+                .get::<pulsebeam_core::dd::DependencyDescriptor>()
+                .is_some()
+        });
+
+        let mut out = if dd_driven {
+            Vec::new()
+        } else {
+            self.parameter_set_prefix(&segment, segment_ts)?
+        };
         out.extend(segment);
 
-        debug_assert!(out.iter().any(|p| p.nal.sps()), "replay lacks SPS");
-        debug_assert!(out.iter().any(|p| p.nal.pps()), "replay lacks PPS");
+        debug_assert!(
+            dd_driven || out.iter().any(|p| p.nal.sps()),
+            "replay lacks SPS"
+        );
+        debug_assert!(
+            dd_driven || out.iter().any(|p| p.nal.pps()),
+            "replay lacks PPS"
+        );
         debug_assert!(out.iter().any(|p| p.is_keyframe), "replay lacks a keyframe");
         debug_assert!(
             out.windows(2).all(|w| *w[0].seq_no <= *w[1].seq_no),
@@ -430,6 +453,51 @@ mod test {
             replay.iter().map(|p| p.rtp_ts.numer()).min(),
             Some(kf[0].rtp_ts.numer()),
             "restamped parameter sets must not read as an earlier frame"
+        );
+    }
+
+    #[test]
+    fn a_dd_keyframe_replays_under_an_opaque_payload_without_parameter_sets() {
+        // SFrame/E2EE: the payload is opaque, so no SPS/PPS can ever be probed or
+        // synthesized. RtpPacket::default carries an opaque payload with empty NAL
+        // flags. The keyframe is known only from the Dependency Descriptor, whose
+        // presence makes the segment self-sufficient. Replay must still succeed —
+        // otherwise a switch into an encrypted encoding could never land.
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
+
+        let mut g = TemporalDdGenerator::new(3);
+        let mut cache = StreamCache::new();
+
+        let mut kf = RtpPacket::default();
+        kf.seq_no = SeqNo::from(1u64);
+        kf.rtp_ts = MediaTime::new(1000, kf.rtp_ts.frequency());
+        kf.marker = true;
+        kf.is_keyframe = true;
+        kf.ext_vals
+            .user_values
+            .set_arc(std::sync::Arc::new(g.next(true)));
+        cache.push(&kf);
+
+        let mut delta = RtpPacket::default();
+        delta.seq_no = SeqNo::from(2u64);
+        delta.rtp_ts = MediaTime::new(4000, delta.rtp_ts.frequency());
+        delta.marker = true;
+        delta
+            .ext_vals
+            .user_values
+            .set_arc(std::sync::Arc::new(g.next(false)));
+        cache.push(&delta);
+
+        let replay = cache
+            .replay()
+            .expect("a DD keyframe segment must replay even when the payload is opaque");
+        assert!(
+            replay.iter().any(|p| p.is_keyframe),
+            "replay carries the keyframe"
+        );
+        assert!(
+            replay.iter().all(|p| !p.nal.sps() && !p.nal.pps()),
+            "an opaque/E2EE stream gets no synthesized parameter sets"
         );
     }
 
