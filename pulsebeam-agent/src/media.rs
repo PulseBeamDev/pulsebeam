@@ -77,6 +77,28 @@ impl SharedH264Asset {
     }
 }
 
+/// Rewrite every Annex-B NAL unit type to a non-IDR coded slice (type 1),
+/// preserving the framing so str0m still packetizes and depacketizes the stream
+/// but the SFU's h264::classify finds no IDR, SPS, or PPS. This simulates
+/// SFrame/E2EE, where the media bitstream is opaque to the SFU and the Dependency
+/// Descriptor is the only keyframe signal.
+fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
+    const NON_IDR_SLICE: u8 = 1;
+    let mut out = frame.to_vec();
+    let mut i = 0;
+    while i + 3 < out.len() {
+        if out[i] == 0 && out[i + 1] == 0 && out[i + 2] == 1 {
+            let header = i + 3;
+            // Keep forbidden_zero_bit + nal_ref_idc, replace only the 5-bit type.
+            out[header] = (out[header] & 0xE0) | NON_IDR_SLICE;
+            i = header + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out.into()
+}
+
 pub struct H264Looper {
     asset: Arc<SharedH264Asset>,
     index: usize,
@@ -86,6 +108,10 @@ pub struct H264Looper {
     /// is independent of the (non-scalable) asset — it drives the SFU's DD path,
     /// not real H.264 temporal decodability.
     dd: Option<pulsebeam_core::dd::temporal::TemporalDdSource>,
+    /// Simulate SFrame/E2EE by making the payload opaque before sending: the H.264
+    /// start codes are overwritten so the SFU's payload probe finds no IDR, SPS, or
+    /// PPS, leaving the Dependency Descriptor as the only forwarding signal.
+    opaque_payload: bool,
 }
 
 impl H264Looper {
@@ -96,6 +122,7 @@ impl H264Looper {
             index: 0,
             fps,
             dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -105,6 +132,7 @@ impl H264Looper {
             index: 0,
             fps,
             dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -116,9 +144,20 @@ impl H264Looper {
         self
     }
 
+    /// Make the payload opaque before it is sent, simulating SFrame/E2EE where the
+    /// SFU cannot read the codec bitstream and must rely on the Dependency
+    /// Descriptor alone. Only meaningful alongside `with_temporal_layers`.
+    pub fn with_opaque_payload(mut self) -> Self {
+        self.opaque_payload = true;
+        self
+    }
+
     fn next(&mut self) -> Arc<[u8]> {
         let frame = &self.asset.frames[self.index];
         self.index = (self.index + 1) % self.asset.frames.len();
+        if self.opaque_payload {
+            return opaque_frame(frame);
+        }
         frame.clone()
     }
 

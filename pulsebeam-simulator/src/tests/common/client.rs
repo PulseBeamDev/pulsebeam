@@ -29,6 +29,8 @@ pub struct SimClientBuilder {
     vbr_profile: Option<VbrProfile>,
     /// When set, attach a synthetic L1T{n} temporal Dependency Descriptor per frame.
     temporal_dd: Option<u8>,
+    /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
+    opaque_payload: bool,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -53,6 +55,7 @@ impl SimClientBuilder {
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
+            opaque_payload: false,
         })
     }
 
@@ -75,6 +78,7 @@ impl SimClientBuilder {
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
+            opaque_payload: false,
         })
     }
 
@@ -93,6 +97,12 @@ impl SimClientBuilder {
     /// Attach a synthetic L1T{layers} temporal Dependency Descriptor per frame.
     pub fn with_temporal_dd(mut self, layers: u8) -> Self {
         self.temporal_dd = Some(layers);
+        self
+    }
+
+    /// Make the published payload opaque, simulating SFrame/E2EE.
+    pub fn with_opaque_payload(mut self) -> Self {
+        self.opaque_payload = true;
         self
     }
 
@@ -159,6 +169,9 @@ impl SimClientBuilder {
                         let mut looper = create_h264_looper_for_rid(rid);
                         if let Some(layers) = self.temporal_dd {
                             looper = looper.with_temporal_layers(layers);
+                        }
+                        if self.opaque_payload {
+                            looper = looper.with_opaque_payload();
                         }
                         join_set.spawn(looper.run(sender));
                     }

@@ -73,6 +73,33 @@ fn dependency_descriptor_stream_survives_congestion_test() {
         ]);
 }
 
+/// SFrame/E2EE: the publisher's payload is opaque, so the SFU's H.264 probe finds
+/// no IDR, SPS, or PPS — the Dependency Descriptor is the only forwarding signal.
+/// A subscribe forces a switch-up, which must replay the DD keyframe segment
+/// despite the opaque payload; before the DD-native keyframe/cache path that
+/// replay returned nothing and the subscriber would have been starved. This is the
+/// end-to-end proof that the SFU forwards on DD alone.
+#[test]
+fn opaque_dependency_descriptor_stream_forwards_on_dd_alone_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q"]).with_opaque_dd(3))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice publishes an opaque (E2EE) L1T3 DD stream; Bob subscribes",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob keeps receiving forwarded frames with no readable bitstream",
+                participant: "bob",
+                quality: VideoQuality::min_frames(120).allow_gaps(10),
+            },
+        ]);
+}
+
 #[test]
 fn fast_initial_ramp_up_on_good_network_test() {
     LocalNodeSim::new()

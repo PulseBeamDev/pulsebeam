@@ -39,6 +39,9 @@ pub struct Participant {
     /// Publish a synthetic temporal Dependency Descriptor with this many layers,
     /// so the SFU can exercise decode-target shedding.
     pub temporal_dd: Option<u8>,
+    /// Make the published payload opaque (simulating SFrame/E2EE), forcing the SFU
+    /// to forward on the Dependency Descriptor alone.
+    pub opaque_payload: bool,
 }
 
 impl Participant {
@@ -53,6 +56,7 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -67,6 +71,7 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -81,6 +86,7 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -96,6 +102,7 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -119,6 +126,7 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -170,6 +178,15 @@ impl Participant {
     /// can shed decode targets.
     pub fn with_temporal_dd(mut self, layers: u8) -> Self {
         self.temporal_dd = Some(layers);
+        self
+    }
+
+    /// Publish an L1T{layers} DD stream whose payload is opaque, simulating
+    /// SFrame/E2EE: the SFU cannot inspect the bitstream and must forward on the
+    /// Dependency Descriptor alone.
+    pub fn with_opaque_dd(mut self, layers: u8) -> Self {
+        self.temporal_dd = Some(layers);
+        self.opaque_payload = true;
         self
     }
 }
@@ -685,6 +702,9 @@ async fn run_participant(
                 }
                 if let Some(layers) = config.temporal_dd {
                     builder = builder.with_temporal_dd(layers);
+                }
+                if config.opaque_payload {
+                    builder = builder.with_opaque_payload();
                 }
                 if config.subscribes {
                     builder = builder.receive_video(config.slots.max(1));
