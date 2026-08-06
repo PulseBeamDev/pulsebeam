@@ -199,6 +199,144 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
 }
 
 #[test]
+fn priority_reconfiguration_quality_churn_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_500_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("screen"))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover the camera",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer starts with the camera at low quality",
+                participant: "viewer",
+                targets: &[("camera", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Let the initial camera subscription settle",
+                duration: Duration::from_secs(10),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer adds the screen share at low priority",
+                participant: "viewer",
+                targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Let both subscriptions settle before reconfiguration",
+                duration: Duration::from_secs(15),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer raises the camera to 1080p and keeps the screen share low",
+                participant: "viewer",
+                targets: &[("camera", 1080, 360, 200), ("screen", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Require high quality promptly after reconfiguration",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckForwardedQuality {
+                description: "The screen share must not finish stranded in a paused state",
+                origin: "screen",
+                min_quality: 3,
+            },
+            Step::CheckForwardedQuality {
+                description: "The high-priority camera must finish at its requested top layer",
+                origin: "camera",
+                min_quality: 3,
+            },
+            // These bounds are deliberately just below the current deterministic reproduction:
+            // the screen changes twice/minute and the camera six times/minute. They leave room
+            // for one legitimate transition while making the observed churn a red anchor.
+            Step::Expect {
+                description: "The screen share should not churn while reaching high quality",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "screen",
+                    max: 1,
+                },
+            },
+            Step::Expect {
+                description: "The camera should not oscillate between high and middle layers",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "camera",
+                    max: 5,
+                },
+            },
+            Step::Run {
+                description: "Soak the high-quality allocation before the final hold",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckForwardedQuality {
+                description: "The screen share remains at high quality during the soak",
+                origin: "screen",
+                min_quality: 3,
+            },
+            Step::CheckForwardedQuality {
+                description: "The camera remains at its requested top layer during the soak",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::Report {
+                description: "production priority reconfiguration diagnostic",
+                participant: "viewer",
+            },
+            Step::Expect {
+                description: "The screen share should hold its layer during the soak",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "screen",
+                    max: 1,
+                },
+            },
+            Step::Expect {
+                description: "The camera should hold its top layer during the soak",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "camera",
+                    max: 5,
+                },
+            },
+            Step::Run {
+                description: "Hold the final allocation to prove both streams stay stable",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckForwardedQuality {
+                description: "The screen share stays at high quality during the hold",
+                origin: "screen",
+                min_quality: 3,
+            },
+            Step::CheckForwardedQuality {
+                description: "The camera stays at its requested top layer during the hold",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::Expect {
+                description: "The screen share does not change layer during the hold",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "screen",
+                    max: 0,
+                },
+            },
+            Step::Expect {
+                description: "The camera does not change layer during the hold",
+                participant: "viewer",
+                property: Property::QualityChangesPerMinuteBelow {
+                    origin: "camera",
+                    max: 0,
+                },
+            },
+        ]);
+}
+
+#[test]
 fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
     LocalNodeSim::new()
         .with_room(

@@ -11,3 +11,4 @@ cc 1cf9f1d382008b76b70d3841221da5a8c7733a3de33822762c33f52dcf6c3700 # shrinks to
 cc 88515d0953da2dc29651d4332526ac0f1c231090d4947be45e0d328aeea9d457 # shrinks to scenario = Scenario { capacity_bps: 2454601, screenshare: true, target_height: 720, settle_secs: 45, contended: false, fault: Outage }
 cc be6cb751c1d50a3e6eeaa8062fe81854dde804f3acc01df8c4b4367f45b15a73 # shrinks to scenario = Scenario { capacity_bps: 2869601, screenshare: true, target_height: 180, settle_secs: 58, contended: true, fault: Outage }
 cc dbb2bd535077c71a6b67ca1256a0a3eea4a08d6fdc12f59ff1c40ab72e73af78 # shrinks to scenario = Scenario { capacity_bps: 2632363, screenshare: true, target_height: 360, settle_secs: 35, contended: true, fault: None }
+cc d992ffe1849730d6d8e5ac77f6d96e75b2cfed67f9217222d432915d7d81d8af # shrinks to scenario = Scenario { capacity_bps: 3550698, screenshare: true, target_height: 360, settle_secs: 36, contended: false, fault: BurstLoss }
