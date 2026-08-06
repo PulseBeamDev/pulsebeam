@@ -69,8 +69,8 @@ pub struct VideoRequest {
     /// invisible. Update it whenever your layout changes (resize, pin, fullscreen).
     ///    0  = hidden / off-screen → the server sends nothing (frees bandwidth).
     ///    >0 = the server picks the simulcast layer that best matches this size.
-    /// > Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
-    /// > the streams you are actually looking at.
+    /// Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
+    /// the streams you are actually looking at.
     #[prost(uint32, tag = "3")]
     pub target_height: u32,
     /// Relative importance for bandwidth contention — decides the ORDER in which
@@ -103,6 +103,22 @@ pub struct VideoRequest {
     ///    Conference minimized tile  : height=0
     #[prost(uint32, tag = "5")]
     pub min_height: u32,
+    /// FLOOR: the lowest frame rate to keep for this stream under contention, for
+    /// scalable (Dependency Descriptor) streams. The temporal analog of
+    /// `min_height`: the server sheds temporal layers to save bandwidth, but never
+    /// below the decode target that still delivers at least this many frames per
+    /// second. Ignored for non-scalable streams (they have no temporal layers to
+    /// shed) and when the stream advertises no frame rate.
+    ///    0   = no temporal floor: may be shed to the base temporal layer (lowest
+    ///          fps) or paused, per `min_height`.
+    ///    >0  = keep at least ~this fps (e.g. motion/teleop streams that must stay
+    ///          smooth even at reduced resolution).
+    ///
+    /// Examples:
+    ///    Teleoperation camera (must stay smooth) : height=720 min_height=180 min_fps=30
+    ///    Conference tile (smoothness optional)   : height=360 min_height=90  min_fps=0
+    #[prost(uint32, tag = "6")]
+    pub min_fps: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpstreamIntent {

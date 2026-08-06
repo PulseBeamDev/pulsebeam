@@ -296,6 +296,7 @@ impl RemoteVideo {
             participant: self.participant.clone(),
             height: 720,
             min_height: 0,
+            min_fps: 0,
             priority: 0,
         }
     }
@@ -305,6 +306,7 @@ pub struct VideoSubscriber {
     participant: Participant,
     height: u32,
     min_height: u32,
+    min_fps: u32,
     priority: u32,
 }
 
@@ -316,6 +318,12 @@ impl VideoSubscriber {
 
     pub fn minimum_height(mut self, height: u32) -> Self {
         self.min_height = height;
+        self
+    }
+
+    /// Temporal floor: keep at least this frame rate for a scalable stream.
+    pub fn minimum_fps(mut self, fps: u32) -> Self {
+        self.min_fps = fps;
         self
     }
 
@@ -346,6 +354,7 @@ impl VideoSubscriber {
                         crate::manager::VideoSubscription::new(track_id)
                             .target_height(self.height)
                             .minimum_height(self.min_height)
+                            .minimum_fps(self.min_fps)
                             .priority(self.priority),
                     )
                     .await;

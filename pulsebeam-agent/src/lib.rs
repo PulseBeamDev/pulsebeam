@@ -54,6 +54,10 @@ pub struct MediaFrame {
     /// layers by decode target. `None` for a non-scalable source (the SFU then
     /// falls back to whole-encoding selection).
     pub dependency_descriptor: Option<pulsebeam_core::dd::RawDependencyDescriptor>,
+    /// How many temporal layers this encoding carries, when scalable. Lets the
+    /// sender declare a per-temporal Video Layers Allocation so the SFU can cost
+    /// each decode target instead of estimating. `None` for a non-scalable source.
+    pub temporal_layers: Option<u8>,
 }
 
 impl From<MediaData> for MediaFrame {
@@ -71,6 +75,7 @@ impl From<MediaData> for MediaFrame {
             target_bitrate_bps: None,
             resolution: None,
             dependency_descriptor: None,
+            temporal_layers: None,
             contiguous: value.contiguous,
             is_keyframe,
         }

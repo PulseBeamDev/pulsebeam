@@ -732,8 +732,12 @@ impl AgentDriver {
                     // inferring cost from bytes on the wire, which for screen content is a far
                     // more variable signal (near zero while static, full rate on a scroll).
                     if let Some(target_bps) = e.frame.target_bitrate_bps
-                        && let Some(vla) =
-                            vla_for(slot.encodings.len(), target_bps, e.frame.resolution)
+                        && let Some(vla) = vla_for(
+                            slot.encodings.len(),
+                            target_bps,
+                            e.frame.resolution,
+                            e.frame.temporal_layers,
+                        )
                     {
                         writer = writer.user_extension_value(vla);
                     }
@@ -1198,12 +1202,31 @@ mod tests {
 
     #[test]
     fn vla_is_declared_only_for_single_encoding_tracks() {
-        assert!(vla_for(2, 500_000, None).is_none());
+        assert!(vla_for(2, 500_000, None, None).is_none());
 
-        let allocation = vla_for(1, 500_000, Some((1280, 720, 30))).unwrap();
+        let allocation = vla_for(1, 500_000, Some((1280, 720, 30)), None).unwrap();
         assert_eq!(allocation.current_simulcast_stream_index, 0);
         assert_eq!(allocation.simulcast_streams.len(), 1);
         assert_eq!(allocation.simulcast_streams[0].spatial_layers.len(), 1);
+        // No temporal scalability declared: a single cumulative entry at full rate.
+        let temporal = &allocation.simulcast_streams[0].spatial_layers[0].temporal_layers;
+        assert_eq!(temporal.len(), 1);
+        assert_eq!(temporal[0].cumulative_kbps, 500);
+    }
+
+    #[test]
+    fn vla_declares_a_nested_temporal_ladder_for_scalable_streams() {
+        let allocation = vla_for(1, 600_000, Some((1280, 720, 30)), Some(3)).unwrap();
+        let temporal = &allocation.simulcast_streams[0].spatial_layers[0].temporal_layers;
+        // L1T3: three nested decode targets, base ~half, top = full, strictly rising.
+        assert_eq!(temporal.len(), 3);
+        assert_eq!(temporal[0].cumulative_kbps, 300); // 0.5 * 600
+        assert_eq!(temporal[2].cumulative_kbps, 600); // full
+        assert!(
+            temporal
+                .windows(2)
+                .all(|w| w[1].cumulative_kbps > w[0].cumulative_kbps)
+        );
     }
 }
 
@@ -1211,6 +1234,7 @@ fn vla_for(
     encoding_count: usize,
     target_bps: u64,
     resolution: Option<(u16, u16, u8)>,
+    temporal_layers: Option<u8>,
 ) -> Option<VideoLayersAllocation> {
     if encoding_count != 1 {
         return None;
@@ -1219,9 +1243,7 @@ fn vla_for(
         current_simulcast_stream_index: 0,
         simulcast_streams: vec![SimulcastStreamAllocation {
             spatial_layers: vec![SpatialLayerAllocation {
-                temporal_layers: vec![TemporalLayerAllocation {
-                    cumulative_kbps: target_bps / 1000,
-                }],
+                temporal_layers: temporal_cumulative_kbps(target_bps, temporal_layers),
                 resolution_and_framerate: resolution.map(|(width, height, framerate)| {
                     ResolutionAndFramerate {
                         width,
@@ -1232,4 +1254,31 @@ fn vla_for(
             }],
         }],
     })
+}
+
+/// Per-temporal cumulative bitrate declaration for a scalable stream. A single
+/// entry (the full target) when the stream is not temporally scalable; otherwise
+/// a nested ladder the SFU can cost each decode target against. The split models
+/// a real temporal encoder: the base layer is roughly half the full rate, and each
+/// enhancement layer adds a diminishing share.
+fn temporal_cumulative_kbps(
+    target_bps: u64,
+    temporal_layers: Option<u8>,
+) -> Vec<TemporalLayerAllocation> {
+    let full_kbps = target_bps / 1000;
+    let layers = temporal_layers.unwrap_or(1).max(1);
+    if layers <= 1 {
+        return vec![TemporalLayerAllocation {
+            cumulative_kbps: full_kbps,
+        }];
+    }
+    (0..layers)
+        .map(|k| {
+            // cumulative fraction: 0.5 at the base, 1.0 at the top, linear between.
+            let frac = 0.5 + 0.5 * (k as f64) / ((layers - 1) as f64);
+            TemporalLayerAllocation {
+                cumulative_kbps: ((full_kbps as f64) * frac).round() as u64,
+            }
+        })
+        .collect()
 }

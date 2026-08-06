@@ -149,6 +149,7 @@ impl H264Looper {
             let is_keyframe = self.index == self.asset.first_idr;
             let frame_data = self.next();
             let next_ts = (frame_count * clock_rate) / self.fps as u64;
+            let temporal_layers = self.dd.as_ref().map(|src| src.temporal_layers());
             let dependency_descriptor = self.dd.as_mut().and_then(|src| src.next(is_keyframe));
 
             let frame = MediaFrame {
@@ -166,6 +167,7 @@ impl H264Looper {
                 target_bitrate_bps: None,
                 resolution: None,
                 dependency_descriptor,
+                temporal_layers,
             };
 
             if sender.send(frame).await.is_err() {
@@ -435,6 +437,7 @@ impl VbrLooper {
                     ),
                     resolution: None,
                     dependency_descriptor: None,
+                    temporal_layers: None,
                 };
                 if sender.send(frame).await.is_err() {
                     return;
@@ -489,6 +492,7 @@ impl VbrLooper {
                 target_bitrate_bps: Some(self.step_target(active)),
                 resolution: None,
                 dependency_descriptor: None,
+                temporal_layers: None,
             };
 
             if sender.send(frame).await.is_err() {

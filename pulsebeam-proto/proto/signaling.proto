@@ -109,6 +109,22 @@ message VideoRequest {
   //   Conference other tile      : height=360  priority=10  min_height=90
   //   Conference minimized tile  : height=0
   uint32 min_height = 5;
+
+  // FLOOR: the lowest frame rate to keep for this stream under contention, for
+  // scalable (Dependency Descriptor) streams. The temporal analog of
+  // `min_height`: the server sheds temporal layers to save bandwidth, but never
+  // below the decode target that still delivers at least this many frames per
+  // second. Ignored for non-scalable streams (they have no temporal layers to
+  // shed) and when the stream advertises no frame rate.
+  //   0   = no temporal floor: may be shed to the base temporal layer (lowest
+  //         fps) or paused, per `min_height`.
+  //   >0  = keep at least ~this fps (e.g. motion/teleop streams that must stay
+  //         smooth even at reduced resolution).
+  //
+  // Examples:
+  //   Teleoperation camera (must stay smooth) : height=720 min_height=180 min_fps=30
+  //   Conference tile (smoothness optional)   : height=360 min_height=90  min_fps=0
+  uint32 min_fps = 6;
 }
 
 message UpstreamIntent {
