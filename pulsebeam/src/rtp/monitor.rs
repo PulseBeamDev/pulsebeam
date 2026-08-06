@@ -155,9 +155,21 @@ pub struct StreamStateInner {
     /// scalability structure has been seen — the allocator then treats the
     /// encoding as a single indivisible rung.
     decode_targets: AtomicU8,
+    /// Cumulative bitrate (kbps) of each decode target, from the sender's
+    /// per-temporal Video Layers Allocation. Index `k` = decode target `k` (nested:
+    /// `k` contains temporal layers `0..=k`). `0` = not declared. Lets the allocator
+    /// cost each temporal rung instead of estimating.
+    decode_target_kbps: [AtomicU32; MAX_LADDER_TARGETS],
+    /// The encoding's full frame rate (fps), from VLA. `0` = unknown. With the
+    /// decode-target count it yields each rung's fps for the `min_fps` floor.
+    full_fps: AtomicU32,
     #[cfg(test)]
     quality: AtomicU8,
 }
+
+/// Decode-target rungs the allocator ladder tracks per encoding (L1T3 tops out
+/// at three temporal targets).
+pub const MAX_LADDER_TARGETS: usize = 3;
 
 impl StreamStateInner {
     fn pack(reactive_bps: u64, stable_bps: u64) -> u64 {
@@ -173,6 +185,8 @@ impl StreamStateInner {
             bitrates: AtomicU64::new(Self::pack(bitrate_bps, bitrate_bps)),
             height: AtomicU32::new(height),
             decode_targets: AtomicU8::new(1),
+            decode_target_kbps: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
+            full_fps: AtomicU32::new(0),
             #[cfg(test)]
             quality: AtomicU8::new(StreamQuality::Good as u8),
         }
@@ -187,6 +201,33 @@ impl StreamStateInner {
     /// structure. Written from ingress when a scalable keyframe arrives.
     pub fn set_decode_target_count(&self, count: u8) {
         self.decode_targets.store(count.max(1), Ordering::Relaxed);
+    }
+
+    /// Cumulative bitrate (bps) declared for decode target `dt`, or `0` if the
+    /// sender declared no per-temporal ladder for it.
+    pub fn decode_target_bps(&self, dt: usize) -> u64 {
+        self.decode_target_kbps
+            .get(dt)
+            .map_or(0, |a| u64::from(a.load(Ordering::Relaxed)) * 1000)
+    }
+
+    /// The encoding's full frame rate, or `0` if unknown.
+    pub fn full_fps(&self) -> u32 {
+        self.full_fps.load(Ordering::Relaxed)
+    }
+
+    /// Record the sender's per-temporal cumulative bitrates (kbps) and full frame
+    /// rate from a Video Layers Allocation.
+    pub fn set_temporal_ladder(&self, cumulative_kbps: &[u64], full_fps: u32) {
+        for (i, slot) in self.decode_target_kbps.iter().enumerate() {
+            let v = cumulative_kbps
+                .get(i)
+                .copied()
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            slot.store(v, Ordering::Relaxed);
+        }
+        self.full_fps.store(full_fps, Ordering::Relaxed);
     }
 
     pub fn is_healthy(&self) -> bool {

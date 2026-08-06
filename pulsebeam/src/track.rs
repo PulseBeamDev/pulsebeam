@@ -189,6 +189,16 @@ impl UpstreamTrackLayer {
         let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
         let height = vla_stream_height_px(vla, idx).map(u32::from);
         let first_declaration = self.monitor.apply_vla(target_bps, height);
+
+        // Record the per-decode-target cost ladder and frame rate so the allocator
+        // can cost each temporal rung rather than estimating.
+        let temporal = vla_stream_temporal_cumulative_kbps(vla, idx);
+        let full_fps = vla_stream_framerate(vla, idx).unwrap_or(0);
+        if !temporal.is_empty() {
+            self.monitor
+                .shared_state()
+                .set_temporal_ladder(&temporal, full_fps);
+        }
         if first_declaration {
             tracing::info!(
                 mid = %self.mid,
@@ -228,6 +238,43 @@ pub(crate) fn vla_stream_height_px(
         .spatial_layers
         .iter()
         .filter_map(|sl| sl.resolution_and_framerate.as_ref().map(|r| r.height))
+        .max()
+}
+
+/// Cumulative bitrate (kbps) per decode target for simulcast stream `idx`, from
+/// its first spatial layer's temporal ladder — the per-temporal costs the SFU
+/// allocates each decode target against. Empty when the sender declared none.
+pub(crate) fn vla_stream_temporal_cumulative_kbps(
+    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    idx: usize,
+) -> Vec<u64> {
+    vla.simulcast_streams
+        .get(idx)
+        .and_then(|s| s.spatial_layers.first())
+        .map(|sl| {
+            sl.temporal_layers
+                .iter()
+                .map(|t| t.cumulative_kbps)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Declared full frame rate for simulcast stream `idx`: the highest framerate any
+/// of its spatial layers reports. `None` when the VLA omits resolution/framerate.
+pub(crate) fn vla_stream_framerate(
+    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    idx: usize,
+) -> Option<u32> {
+    let stream = vla.simulcast_streams.get(idx)?;
+    stream
+        .spatial_layers
+        .iter()
+        .filter_map(|sl| {
+            sl.resolution_and_framerate
+                .as_ref()
+                .map(|r| u32::from(r.framerate))
+        })
         .max()
 }
 
@@ -1194,6 +1241,37 @@ mod vla_tests {
         };
         assert_eq!(vla_stream_target_bps(&vla, 0), Some(150_000));
         assert_eq!(vla_stream_target_bps(&vla, 1), Some(800_000));
+    }
+
+    #[test]
+    fn temporal_ladder_and_framerate_flow_into_stream_state() {
+        use super::{vla_stream_framerate, vla_stream_temporal_cumulative_kbps};
+        use crate::rtp::monitor::StreamState;
+        use str0m::rtp::vla::ResolutionAndFramerate;
+
+        let mut s = stream(&[300, 450, 600]);
+        s.spatial_layers[0].resolution_and_framerate = Some(ResolutionAndFramerate {
+            width: 1280,
+            height: 720,
+            framerate: 30,
+        });
+        let vla = VideoLayersAllocation {
+            current_simulcast_stream_index: 0,
+            simulcast_streams: vec![s],
+        };
+
+        assert_eq!(
+            vla_stream_temporal_cumulative_kbps(&vla, 0),
+            vec![300, 450, 600]
+        );
+        assert_eq!(vla_stream_framerate(&vla, 0), Some(30));
+
+        let state = StreamState::new_with_height(false, 0, 720);
+        state.set_temporal_ladder(&vla_stream_temporal_cumulative_kbps(&vla, 0), 30);
+        assert_eq!(state.decode_target_bps(0), 300_000);
+        assert_eq!(state.decode_target_bps(1), 450_000);
+        assert_eq!(state.decode_target_bps(2), 600_000);
+        assert_eq!(state.full_fps(), 30);
     }
 
     #[test]
