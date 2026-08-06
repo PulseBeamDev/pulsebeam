@@ -27,6 +27,8 @@ pub struct SimClientBuilder {
     publishes_video: bool,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
+    /// When set, attach a synthetic L1T{n} temporal Dependency Descriptor per frame.
+    temporal_dd: Option<u8>,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -50,6 +52,7 @@ impl SimClientBuilder {
             video_rx: None,
             publishes_video: false,
             vbr_profile: None,
+            temporal_dd: None,
         })
     }
 
@@ -71,6 +74,7 @@ impl SimClientBuilder {
             video_rx: None,
             publishes_video: false,
             vbr_profile: None,
+            temporal_dd: None,
         })
     }
 
@@ -83,6 +87,12 @@ impl SimClientBuilder {
     /// Publish with a VBR source (see [`VbrProfile`]) rather than the constant-rate looper.
     pub fn with_vbr(mut self, profile: VbrProfile) -> Self {
         self.vbr_profile = Some(profile);
+        self
+    }
+
+    /// Attach a synthetic L1T{layers} temporal Dependency Descriptor per frame.
+    pub fn with_temporal_dd(mut self, layers: u8) -> Self {
+        self.temporal_dd = Some(layers);
         self
     }
 
@@ -146,7 +156,10 @@ impl SimClientBuilder {
                         join_set.spawn(looper.run(sender));
                     }
                     None => {
-                        let looper = create_h264_looper_for_rid(rid);
+                        let mut looper = create_h264_looper_for_rid(rid);
+                        if let Some(layers) = self.temporal_dd {
+                            looper = looper.with_temporal_layers(layers);
+                        }
                         join_set.spawn(looper.run(sender));
                     }
                 }

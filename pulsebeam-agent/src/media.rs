@@ -81,6 +81,11 @@ pub struct H264Looper {
     asset: Arc<SharedH264Asset>,
     index: usize,
     fps: u32,
+    /// When set, attach a synthetic temporal Dependency Descriptor to each frame
+    /// so the SFU can exercise decode-target shedding. The DD's temporal pattern
+    /// is independent of the (non-scalable) asset — it drives the SFU's DD path,
+    /// not real H.264 temporal decodability.
+    dd: Option<pulsebeam_core::dd::temporal::TemporalDdSource>,
 }
 
 impl H264Looper {
@@ -90,6 +95,7 @@ impl H264Looper {
             asset,
             index: 0,
             fps,
+            dd: None,
         }
     }
 
@@ -98,7 +104,16 @@ impl H264Looper {
             asset,
             index: 0,
             fps,
+            dd: None,
         }
+    }
+
+    /// Emit a synthetic L1T{temporal_layers} Dependency Descriptor per frame.
+    pub fn with_temporal_layers(mut self, temporal_layers: u8) -> Self {
+        self.dd = Some(pulsebeam_core::dd::temporal::TemporalDdSource::new(
+            temporal_layers,
+        ));
+        self
     }
 
     fn next(&mut self) -> Arc<[u8]> {
@@ -129,8 +144,12 @@ impl H264Looper {
                 self.index = self.asset.first_idr;
             }
 
+            // The frame at the asset's IDR index is a keyframe; the DD attaches
+            // its structure there.
+            let is_keyframe = self.index == self.asset.first_idr;
             let frame_data = self.next();
             let next_ts = (frame_count * clock_rate) / self.fps as u64;
+            let dependency_descriptor = self.dd.as_mut().and_then(|src| src.next(is_keyframe));
 
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz(next_ts),
@@ -138,13 +157,15 @@ impl H264Looper {
                 capture_time: tick_time,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
-                is_keyframe: false,
+                // Only surfaced when driving DD; the SFU otherwise detects keyframes
+                // from the H.264 payload.
+                is_keyframe: dependency_descriptor.is_some() && is_keyframe,
                 // A constant-rate source has nothing to declare beyond what it is sending, so
                 // leave VLA off and let the SFU measure. That is also the pre-VLA path, which is
                 // worth still exercising: not every sender emits the extension.
                 target_bitrate_bps: None,
                 resolution: None,
-                dependency_descriptor: None,
+                dependency_descriptor,
             };
 
             if sender.send(frame).await.is_err() {

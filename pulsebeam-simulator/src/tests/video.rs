@@ -1,6 +1,32 @@
 use super::common::{LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
 
+/// A publisher that attaches a synthetic L1T3 Dependency Descriptor to every
+/// frame flows end-to-end and the subscriber decodes it — exercising the agent's
+/// DD emission and the SFU's DD-aware forwarder (parse + Full-target forward)
+/// against the egress invariants. Shedding is unit/allocation-tested; here the
+/// point is that carrying DD never breaks the stream.
+#[test]
+fn dependency_descriptor_stream_is_forwarded_decodably_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice publishes an L1T3 DD stream; Bob subscribes and decodes",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes the DD-annotated stream end to end",
+                participant: "bob",
+                quality: VideoQuality::min_frames(150).allow_gaps(3),
+            },
+        ]);
+}
+
 #[test]
 fn fast_initial_ramp_up_on_good_network_test() {
     LocalNodeSim::new()

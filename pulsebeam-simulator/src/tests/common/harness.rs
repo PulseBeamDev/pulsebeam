@@ -36,6 +36,9 @@ pub struct Participant {
     pub subscribes: bool,
     /// Whether a receiving participant subscribes to newly discovered tracks automatically.
     pub auto_subscribe: bool,
+    /// Publish a synthetic temporal Dependency Descriptor with this many layers,
+    /// so the SFU can exercise decode-target shedding.
+    pub temporal_dd: Option<u8>,
 }
 
 impl Participant {
@@ -49,6 +52,7 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
         }
     }
 
@@ -62,6 +66,7 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
         }
     }
 
@@ -75,6 +80,7 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
         }
     }
 
@@ -89,6 +95,7 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
         }
     }
 
@@ -111,6 +118,7 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
         }
     }
 
@@ -155,6 +163,13 @@ impl Participant {
 
     pub fn starts_disconnected(mut self) -> Self {
         self.starts_disconnected = true;
+        self
+    }
+
+    /// Publish a synthetic L1T{layers} temporal Dependency Descriptor so the SFU
+    /// can shed decode targets.
+    pub fn with_temporal_dd(mut self, layers: u8) -> Self {
+        self.temporal_dd = Some(layers);
         self
     }
 }
@@ -667,6 +682,9 @@ async fn run_participant(
                 builder = builder.publish_video(layers);
                 if let Some(profile) = config.vbr {
                     builder = builder.with_vbr(profile);
+                }
+                if let Some(layers) = config.temporal_dd {
+                    builder = builder.with_temporal_dd(layers);
                 }
                 if config.subscribes {
                     builder = builder.receive_video(config.slots.max(1));
