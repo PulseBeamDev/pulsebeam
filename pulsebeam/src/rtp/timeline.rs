@@ -190,6 +190,18 @@ impl Timeline {
         self.seq_base = (*self.max_output).wrapping_sub(*last_input_seq).into();
     }
 
+    /// Renumber past an *intentionally dropped* input packet: the next forwarded
+    /// packet takes the output sequence number the drop vacated, so the subscriber
+    /// sees a contiguous stream rather than a gap.
+    ///
+    /// This is the opposite of [`skip_output_sequence`](Self::skip_output_sequence):
+    /// that burns an output number to *show* damage; this reclaims one to *hide* a
+    /// deliberate layer shed. Genuine upstream loss calls neither, so it still
+    /// surfaces as a gap.
+    pub fn drop_input(&mut self) {
+        self.seq_base = (*self.seq_base).wrapping_sub(1).into();
+    }
+
     fn apply(&mut self, pkt: &mut RtpPacket, output_seq: SeqNo, output_ts: u64) {
         pkt.seq_no = output_seq;
         pkt.rtp_ts = MediaTime::new(output_ts, self.clock_rate);

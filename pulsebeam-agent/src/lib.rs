@@ -4,7 +4,8 @@ use std::time::SystemTime;
 pub use str0m;
 pub use str0m::Candidate;
 pub use str0m::IceConnectionState;
-pub use str0m::media::{MediaData, MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
+pub use str0m::media::{MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
+pub use str0m::rtp::{ExtensionValues, SeqNo};
 use tokio::time::Instant;
 
 pub mod clock;
@@ -15,13 +16,35 @@ pub use agent::{
     Statistics, StatisticsSnapshot, VideoSubscriber,
 };
 pub use clock::wallclock_at;
+pub use pipeline::{FrameReceiver, FrameSender, JitterBuffer};
 
 pub mod actor;
 pub mod agent;
 pub mod api;
 pub(crate) mod manager;
 pub mod media;
+pub mod pipeline;
 pub(crate) mod tcp;
+
+/// One RTP packet — the currency of the agent's media API.
+///
+/// The agent is a pure RTP transport: it forwards these in and out and never
+/// reassembles frames or reads the payload. Frame reassembly, jitter buffering,
+/// and end-to-end encryption are higher-level concerns handled above the agent
+/// (see [`pipeline`]). `ext_vals` carries the negotiated header extensions —
+/// notably the Dependency Descriptor and Video Layers Allocation.
+#[derive(Debug, Clone)]
+pub struct RtpPacket {
+    pub mid: Mid,
+    pub rid: Option<Rid>,
+    pub seq: SeqNo,
+    pub ts: MediaTime,
+    pub marker: bool,
+    pub payload: Arc<[u8]>,
+    pub ext_vals: ExtensionValues,
+    /// When the packet was handed over (arrival on ingress, send time on egress).
+    pub arrival: Instant,
+}
 
 #[derive(Debug, Clone)]
 pub struct MediaFrame {
@@ -49,26 +72,15 @@ pub struct MediaFrame {
     /// frames rather than pixels under pressure, so its fps moves continuously while its
     /// resolution does not.
     pub resolution: Option<(u16, u16, u8)>,
-}
-
-impl From<MediaData> for MediaFrame {
-    fn from(value: MediaData) -> Self {
-        let is_keyframe = match value.codec_extra {
-            str0m::format::CodecExtra::H264(e) => e.is_keyframe,
-            str0m::format::CodecExtra::Vp9(e) => e.is_keyframe,
-            _ => false,
-        };
-        Self {
-            ts: value.time,
-            data: value.data,
-            capture_time: value.network_time.into(),
-            abs_capture_time: value.ext_vals.abs_capture_time.map(|act| act.capture_time),
-            target_bitrate_bps: None,
-            resolution: None,
-            contiguous: value.contiguous,
-            is_keyframe,
-        }
-    }
+    /// The frame's Dependency Descriptor, when the source is scalable and declares
+    /// one. Attached verbatim to egress RTP so the SFU can shed temporal/spatial
+    /// layers by decode target. `None` for a non-scalable source (the SFU then
+    /// falls back to whole-encoding selection).
+    pub dependency_descriptor: Option<pulsebeam_core::dd::RawDependencyDescriptor>,
+    /// How many temporal layers this encoding carries, when scalable. Lets the
+    /// sender declare a per-temporal Video Layers Allocation so the SFU can cost
+    /// each decode target instead of estimating. `None` for a non-scalable source.
+    pub temporal_layers: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

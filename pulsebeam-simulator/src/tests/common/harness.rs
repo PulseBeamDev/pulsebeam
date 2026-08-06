@@ -36,6 +36,15 @@ pub struct Participant {
     pub subscribes: bool,
     /// Whether a receiving participant subscribes to newly discovered tracks automatically.
     pub auto_subscribe: bool,
+    /// Publish a synthetic temporal Dependency Descriptor with this many layers,
+    /// so the SFU can exercise decode-target shedding.
+    pub temporal_dd: Option<u8>,
+    /// Make the published payload opaque (simulating SFrame/E2EE), forcing the SFU
+    /// to forward on the Dependency Descriptor alone.
+    pub opaque_payload: bool,
+    /// Model a legacy peer that never negotiates the Dependency Descriptor
+    /// extension, exercising the marker/deep-inspection fallback for mixed rooms.
+    pub marker_only: bool,
 }
 
 impl Participant {
@@ -49,6 +58,9 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
+            opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -62,6 +74,9 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
+            opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -75,6 +90,9 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
+            opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -89,6 +107,9 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
+            opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -111,6 +132,9 @@ impl Participant {
             vbr: None,
             subscribes: false,
             auto_subscribe: true,
+            temporal_dd: None,
+            opaque_payload: false,
+            marker_only: false,
         }
     }
 
@@ -155,6 +179,29 @@ impl Participant {
 
     pub fn starts_disconnected(mut self) -> Self {
         self.starts_disconnected = true;
+        self
+    }
+
+    /// Publish a synthetic L1T{layers} temporal Dependency Descriptor so the SFU
+    /// can shed decode targets.
+    pub fn with_temporal_dd(mut self, layers: u8) -> Self {
+        self.temporal_dd = Some(layers);
+        self
+    }
+
+    /// Publish an L1T{layers} DD stream whose payload is opaque, simulating
+    /// SFrame/E2EE: the SFU cannot inspect the bitstream and must forward on the
+    /// Dependency Descriptor alone.
+    pub fn with_opaque_dd(mut self, layers: u8) -> Self {
+        self.temporal_dd = Some(layers);
+        self.opaque_payload = true;
+        self
+    }
+
+    /// Never negotiate the Dependency Descriptor: a legacy marker/deep-inspection
+    /// peer. Used to test mixed rooms (DD on one side, marker-only on the other).
+    pub fn marker_only(mut self) -> Self {
+        self.marker_only = true;
         self
     }
 }
@@ -349,6 +396,14 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         quality: VideoQuality,
+    },
+    /// Assert the publisher has received at most `max` keyframe (PLI) requests.
+    /// A constantly climbing count means downstream cannot decode the forwarded
+    /// stream — the signature of a broken DD/reassembly path (the "PLI storm").
+    CheckKeyframeRequests {
+        description: &'static str,
+        participant: &'static str,
+        max: u64,
     },
     /// Assert the participant has an active peer connection.
     CheckConnected {
@@ -558,6 +613,8 @@ struct ParticipantShared {
     tx_bytes: Mutex<u64>,
     rx_bytes: Mutex<u64>,
     connected: Mutex<bool>,
+    /// Cumulative keyframe (PLI) requests this participant's publisher received.
+    keyframe_requests: Mutex<u64>,
     /// Set to Some(...) once the participant has connected for the first time.
     participant_id: Mutex<Option<String>>,
     /// Operations queued by the coordinator; drained on next drive tick.
@@ -575,6 +632,7 @@ impl ParticipantShared {
             tx_bytes: Mutex::new(0),
             rx_bytes: Mutex::new(0),
             connected: Mutex::new(false),
+            keyframe_requests: Mutex::new(0),
             participant_id: Mutex::new(None),
             pending_ops: Mutex::new(Vec::new()),
             data_received: Mutex::new(HashMap::new()),
@@ -605,6 +663,9 @@ impl ParticipantHandle {
     }
     fn rx_bytes(&self) -> u64 {
         *self.shared.rx_bytes.lock().unwrap()
+    }
+    fn keyframe_requests(&self) -> u64 {
+        *self.shared.keyframe_requests.lock().unwrap()
     }
     fn connected(&self) -> bool {
         *self.shared.connected.lock().unwrap()
@@ -657,6 +718,10 @@ async fn run_participant(
             SimClientBuilder::bind(ip, server_ip).await?
         };
 
+        if config.marker_only {
+            builder = builder.without_dependency_descriptor();
+        }
+
         match config.role {
             Role::Publisher => {
                 let layers = if config.rids.is_empty() {
@@ -667,6 +732,12 @@ async fn run_participant(
                 builder = builder.publish_video(layers);
                 if let Some(profile) = config.vbr {
                     builder = builder.with_vbr(profile);
+                }
+                if let Some(layers) = config.temporal_dd {
+                    builder = builder.with_temporal_dd(layers);
+                }
+                if config.opaque_payload {
+                    builder = builder.with_opaque_payload();
                 }
                 if config.subscribes {
                     builder = builder.receive_video(config.slots.max(1));
@@ -908,6 +979,8 @@ async fn run_participant(
                 *shared_clone.tx_bytes.lock().unwrap() = stats.total_tx_bytes();
                 *shared_clone.rx_bytes.lock().unwrap() = stats.total_rx_bytes();
                 *shared_clone.connected.lock().unwrap() = stats.is_connected();
+                *shared_clone.keyframe_requests.lock().unwrap() =
+                    stats.keyframe_requests_received();
                 false
             }));
 
@@ -975,6 +1048,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::DeclareOrderedSubscriber { .. } => "DeclareOrderedSubscriber",
         Step::PublishOrdered { .. } => "PublishOrdered",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
+        Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
@@ -1461,6 +1535,22 @@ async fn execute_plan(
                 assert!(
                     !handle.connected(),
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     no peer connection\n  actual:       connected"
+                );
+            }
+
+            Step::CheckKeyframeRequests {
+                description,
+                participant,
+                max,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, max {max})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let actual = handle.keyframe_requests();
+                assert!(
+                    actual <= *max,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {max} keyframe (PLI) requests\n  actual:       {actual} (a climbing count means downstream cannot decode — PLI storm)"
                 );
             }
 

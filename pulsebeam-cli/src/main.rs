@@ -311,8 +311,8 @@ async fn spawn_agent(
 }
 
 async fn handle_receiving(mut track: RemoteTrack, ctx: AgentContext) {
-    while let Ok(frame) = track.recv().await {
-        if let Some(abs_capture_time) = frame.abs_capture_time {
+    while let Ok(rtp) = track.recv().await {
+        if let Some(abs_capture_time) = rtp.ext_vals.abs_capture_time.map(|a| a.capture_time) {
             let wallclock = wallclock_at(Instant::now());
             if let Ok(latency) = wallclock.duration_since(abs_capture_time) {
                 let _ = ctx.logger.latency.try_send(EventLatency {

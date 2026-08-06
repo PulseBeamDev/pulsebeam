@@ -27,6 +27,10 @@ pub struct SimClientBuilder {
     publishes_video: bool,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
+    /// When set, attach a synthetic L1T{n} temporal Dependency Descriptor per frame.
+    temporal_dd: Option<u8>,
+    /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
+    opaque_payload: bool,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -50,6 +54,8 @@ impl SimClientBuilder {
             video_rx: None,
             publishes_video: false,
             vbr_profile: None,
+            temporal_dd: None,
+            opaque_payload: false,
         })
     }
 
@@ -71,6 +77,8 @@ impl SimClientBuilder {
             video_rx: None,
             publishes_video: false,
             vbr_profile: None,
+            temporal_dd: None,
+            opaque_payload: false,
         })
     }
 
@@ -86,6 +94,18 @@ impl SimClientBuilder {
         self
     }
 
+    /// Attach a synthetic L1T{layers} temporal Dependency Descriptor per frame.
+    pub fn with_temporal_dd(mut self, layers: u8) -> Self {
+        self.temporal_dd = Some(layers);
+        self
+    }
+
+    /// Make the published payload opaque, simulating SFrame/E2EE.
+    pub fn with_opaque_payload(mut self) -> Self {
+        self.opaque_payload = true;
+        self
+    }
+
     pub fn receive_video(mut self, capacity: usize) -> Self {
         self.agent_builder = self.agent_builder.video_downstream_slots(capacity);
         self
@@ -93,6 +113,12 @@ impl SimClientBuilder {
 
     pub fn manual_subscriptions(mut self) -> Self {
         self.agent_builder = self.agent_builder.manual_subscriptions();
+        self
+    }
+
+    /// Model a marker/deep-inspection-only peer that never negotiates DD.
+    pub fn without_dependency_descriptor(mut self) -> Self {
+        self.agent_builder = self.agent_builder.without_dependency_descriptor();
         self
     }
 
@@ -146,7 +172,13 @@ impl SimClientBuilder {
                         join_set.spawn(looper.run(sender));
                     }
                     None => {
-                        let looper = create_h264_looper_for_rid(rid);
+                        let mut looper = create_h264_looper_for_rid(rid);
+                        if let Some(layers) = self.temporal_dd {
+                            looper = looper.with_temporal_layers(layers);
+                        }
+                        if self.opaque_payload {
+                            looper = looper.with_opaque_payload();
+                        }
                         join_set.spawn(looper.run(sender));
                     }
                 }
@@ -404,7 +436,15 @@ impl SimClient {
                             .insert(publication_id.clone(), publication_id);
                         let log = self.ctx.video_rx.clone();
                         self.join_set.spawn(async move {
-                            while let Ok(frame) = track.recv().await {
+                            // The agent forwards RTP; reassemble frames here (the
+                            // "higher layer") before logging QoE.
+                            let mut receiver = pulsebeam_agent::FrameReceiver::new();
+                            while let Ok(rtp) = track.recv().await {
+                                for frame in receiver.push(rtp) {
+                                    log.lock().unwrap().record(&frame);
+                                }
+                            }
+                            for frame in receiver.flush() {
                                 log.lock().unwrap().record(&frame);
                             }
                         });

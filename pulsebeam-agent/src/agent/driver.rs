@@ -1,4 +1,4 @@
-use crate::MediaFrame;
+use crate::RtpPacket;
 use crate::agent::controller::{BitrateController, BitrateControllerConfig, LayerController};
 use crate::agent::handles::{
     DataPublisher, DataSubscriber, LocalEncoding, OrderedTopicPublisher, OrderedTopicSubscriber,
@@ -25,11 +25,7 @@ use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{Direction, MediaAdded, MediaKind, Mid, Rid};
-use str0m::rtp::AbsCaptureTime;
-use str0m::rtp::vla::{
-    ResolutionAndFramerate, SimulcastStreamAllocation, SpatialLayerAllocation,
-    TemporalLayerAllocation, VideoLayersAllocation,
-};
+use str0m::rtp::{RtpWrite, Ssrc};
 use str0m::{
     Event, Input, Output, Rtc,
     net::{Protocol, Receive},
@@ -46,11 +42,21 @@ pub type ParticipantId = String;
 pub struct StatisticsSnapshot {
     pub(crate) peer: Option<str0m::stats::PeerStats>,
     pub(crate) tracks: HashMap<Mid, TrackStats>,
+    /// Cumulative keyframe (PLI/FIR) requests this publisher has received. A
+    /// healthy stream needs only the occasional one (a new subscriber, a switch);
+    /// a constantly climbing count means downstream cannot decode — the signature
+    /// of a broken forwarding/reassembly path.
+    pub(crate) keyframe_requests_received: u64,
 }
 
 impl StatisticsSnapshot {
     pub fn is_connected(&self) -> bool {
         self.peer.is_some()
+    }
+
+    /// Cumulative keyframe requests received (see field docs).
+    pub fn keyframe_requests_received(&self) -> u64 {
+        self.keyframe_requests_received
     }
 
     pub fn bytes_sent(&self) -> u64 {
@@ -224,7 +230,11 @@ struct DataSubsystem {
 }
 
 struct MediaSubsystem {
-    media_targets: HashMap<Mid, mailbox::Sender<MediaFrame>>,
+    media_targets: HashMap<Mid, mailbox::Sender<RtpPacket>>,
+    /// Cache of which (mid, rid) each incoming SSRC belongs to. `Event::RtpPacket`
+    /// carries only the SSRC, so the mapping is resolved once via the DirectApi and
+    /// reused. Mirrors the SFU's `incoming_rtp_routes`.
+    incoming_rtp_routes: HashMap<Ssrc, (Mid, Option<Rid>)>,
     upstream_slots: HashMap<Mid, UpstreamSlot>,
     pending_media_subscriptions:
         HashMap<String, tokio::sync::oneshot::Sender<Result<RemoteTrack, AgentError>>>,
@@ -350,6 +360,7 @@ impl AgentDriver {
             ordered_topics: OrderedTopics::new(),
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
+                incoming_rtp_routes: HashMap::new(),
                 upstream_slots: HashMap::new(),
                 pending_media_subscriptions: HashMap::new(),
                 layer_ctrl: LayerController::new(),
@@ -707,38 +718,43 @@ impl AgentDriver {
                 }
                 let mid = e.lease.mid;
                 let paused = self.media.layer_ctrl.is_paused(mid, e.rid);
-                self.media
-                    .layer_ctrl
-                    .record_frame(mid, e.rid, e.frame.data.len(), Instant::now());
+                self.media.layer_ctrl.record_frame(
+                    mid,
+                    e.rid,
+                    e.packet.payload.len(),
+                    Instant::now(),
+                );
 
                 if paused {
                     return;
                 }
 
-                if let Some(mut writer) = self.rtc.writer(mid) {
-                    let Some(pt) = writer.payload_params().next().map(|p| p.pt()) else {
-                        return;
-                    };
-                    if let Some(rid) = e.rid {
-                        writer = writer.rid(rid);
-                    }
-                    if let Some(abs_capture_time) = e.frame.abs_capture_time {
-                        writer = writer.abs_capture_time(AbsCaptureTime {
-                            capture_time: abs_capture_time,
-                            clock_offset: None,
-                        });
-                    }
-                    // Declare the encoder's target so the SFU allocates against it rather than
-                    // inferring cost from bytes on the wire, which for screen content is a far
-                    // more variable signal (near zero while static, full rate on a scroll).
-                    if let Some(target_bps) = e.frame.target_bitrate_bps
-                        && let Some(vla) =
-                            vla_for(slot.encodings.len(), target_bps, e.frame.resolution)
-                    {
-                        writer = writer.user_extension_value(vla);
-                    }
-                    let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
-                }
+                // The pipeline already packetized the frame and set the DD / VLA /
+                // abs-capture-time extensions on `ext_vals`; the agent just writes
+                // the raw RTP. str0m still owns SRTP, RTX, sender reports, and BWE.
+                let Some(pt) = self
+                    .rtc
+                    .media(mid)
+                    .and_then(|m| m.remote_pts().first().copied())
+                else {
+                    return;
+                };
+                let packet = e.packet;
+                let mut api = self.rtc.direct_api();
+                let Some(stream) = api.stream_tx_by_mid(mid, e.rid) else {
+                    return;
+                };
+                let rtp = RtpWrite::new(
+                    pt,
+                    packet.seq,
+                    packet.ts.numer() as u32,
+                    packet.arrival.into(),
+                    packet.payload,
+                )
+                .marker(packet.marker)
+                .nackable(true)
+                .ext_vals(packet.ext_vals);
+                stream.write_rtp(rtp);
             }
             OutgoingCommand::SetPlayoutDelay(bounds) => {
                 self.set_playout_delay(bounds);
@@ -876,9 +892,29 @@ impl AgentDriver {
                         }
                     }
                     Event::MediaAdded(media) => self.handle_media_added(media),
-                    Event::MediaData(data) => {
-                        if let Some(tx) = self.media.media_targets.get(&data.mid) {
-                            let _ = tx.try_send(data.into());
+                    Event::RtpPacket(rtp) => {
+                        let ssrc = rtp.header.ssrc;
+                        let route = match self.media.incoming_rtp_routes.get(&ssrc).copied() {
+                            Some(route) => Some(route),
+                            None => {
+                                let mut api = self.rtc.direct_api();
+                                api.stream_rx(&ssrc).map(|s| (s.mid(), s.rid()))
+                            }
+                        };
+                        if let Some((mid, rid)) = route {
+                            self.media.incoming_rtp_routes.insert(ssrc, (mid, rid));
+                            if let Some(tx) = self.media.media_targets.get(&mid) {
+                                let _ = tx.try_send(RtpPacket {
+                                    mid,
+                                    rid,
+                                    seq: rtp.seq_no,
+                                    ts: rtp.time,
+                                    marker: rtp.header.marker,
+                                    payload: rtp.payload,
+                                    ext_vals: rtp.header.ext_vals,
+                                    arrival: rtp.timestamp.into(),
+                                });
+                            }
                         }
                     }
                     Event::IceConnectionStateChange(state) => {
@@ -904,6 +940,8 @@ impl AgentDriver {
                         self.emit(AgentEvent::StatsUpdated);
                     }
                     Event::KeyframeRequest(req) => {
+                        self.stats.keyframe_requests_received =
+                            self.stats.keyframe_requests_received.wrapping_add(1);
                         self.media
                             .layer_ctrl
                             .request_keyframe(req.mid, req.rid, req.kind);
@@ -1190,41 +1228,7 @@ mod tests {
         assert!(!slot.deactivate(camera));
         assert!(slot.accepts(screen));
     }
-
-    #[test]
-    fn vla_is_declared_only_for_single_encoding_tracks() {
-        assert!(vla_for(2, 500_000, None).is_none());
-
-        let allocation = vla_for(1, 500_000, Some((1280, 720, 30))).unwrap();
-        assert_eq!(allocation.current_simulcast_stream_index, 0);
-        assert_eq!(allocation.simulcast_streams.len(), 1);
-        assert_eq!(allocation.simulcast_streams[0].spatial_layers.len(), 1);
-    }
 }
 
-fn vla_for(
-    encoding_count: usize,
-    target_bps: u64,
-    resolution: Option<(u16, u16, u8)>,
-) -> Option<VideoLayersAllocation> {
-    if encoding_count != 1 {
-        return None;
-    }
-    Some(VideoLayersAllocation {
-        current_simulcast_stream_index: 0,
-        simulcast_streams: vec![SimulcastStreamAllocation {
-            spatial_layers: vec![SpatialLayerAllocation {
-                temporal_layers: vec![TemporalLayerAllocation {
-                    cumulative_kbps: target_bps / 1000,
-                }],
-                resolution_and_framerate: resolution.map(|(width, height, framerate)| {
-                    ResolutionAndFramerate {
-                        width,
-                        height,
-                        framerate,
-                    }
-                }),
-            }],
-        }],
-    })
-}
+// VLA construction moved to `crate::pipeline` (the frame→RTP layer that now owns
+// header-extension emission).

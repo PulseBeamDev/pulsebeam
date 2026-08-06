@@ -5,7 +5,7 @@ use pulsebeam_proto::rtp_extensions;
 use str0m::{
     Candidate, IceCreds, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
-    format::{Codec, FormatParams},
+    format::{Codec, CodecConfig, FormatParams},
     media::{Direction, Frequency, MediaKind, Pt},
     rtp::Extension,
 };
@@ -88,8 +88,6 @@ impl Negotiator {
         offer: SdpOffer,
         creds: IceCreds,
     ) -> Result<(Rtc, SdpAnswer), NegotiatorError> {
-        const PT_OPUS: Pt = Pt::new_with_value(111);
-
         tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
@@ -125,62 +123,7 @@ impl Negotiator {
         rtc_config.set_initial_stun_rto(Duration::from_millis(200));
         rtc_config.set_max_stun_rto(Duration::from_millis(1500));
         rtc_config.set_max_stun_retransmits(5);
-        let codec_config = rtc_config.codec_config();
-        codec_config.add_config(
-            PT_OPUS,
-            None,
-            Codec::Opus,
-            Frequency::FORTY_EIGHT_KHZ,
-            Some(2),
-            FormatParams {
-                min_p_time: Some(10),
-                use_inband_fec: Some(true),
-                use_dtx: Some(true),
-                stereo: Some(true),
-                sprop_stereo: Some(true),
-                ..Default::default()
-            },
-        );
-        codec_config.enable_h264(true);
-        // codec_config.enable_vp8(true);
-        // h264 as the lowest common denominator due to small clients like
-        // embedded devices, smartphones, OBS only supports H264.
-        // Baseline profile to ensure compatibility with all platforms.
-
-        // Level 3.1 to 4.1. This is mainly to support clients that don't handle
-        // level-asymmetry-allowed=true properly.
-        // let baseline_levels = [0x1f, 0x20, 0x28, 0x29];
-        // let baseline_levels = [0x34]; // 5.2 level matching OpenH264
-        // let mut pt = 96; // start around 96–127 range for dynamic types
-        //
-        // for level in &baseline_levels {
-        //     // // Baseline
-        //     // codec_config.add_h264(
-        //     //     pt.into(),
-        //     //     Some((pt + 1).into()), // RTX PT
-        //     //     true,
-        //     //     0x420000 | level,
-        //     // );
-        //     // pt += 2;
-        //     //
-        //     // Constrained Baseline
-        //     codec_config.add_h264(
-        //         pt.into(),
-        //         Some((pt + 1).into()), // RTX PT
-        //         true,
-        //         0x42e000 | level,
-        //     );
-        //     pt += 2;
-        // }
-        // codec_config.enable_h264(true);
-
-        // TODO: OBS only supports Baseline level 3.1
-        // // ESP32-P4 supports up to 1080p@30fps
-        // // https://components.espressif.com/components/espressif/esp_h264/versions/1.1.3/readme
-        // // Baseline Level 4.0, (pt=127, rtx=121)
-        // codec_config.add_h264(127.into(), Some(121.into()), true, 0x420028);
-        // // Constrained Baseline Level 4.0, (pt=108, rtx=109)
-        // codec_config.add_h264(108.into(), Some(109.into()), true, 0x42e028);
+        configure_room_codecs(rtc_config.codec_config());
 
         // Stamp the ICE credentials with routing metadata before building the Rtc
         // so they are used by str0m's ICE agent from the start.  Using RtcConfig
@@ -278,6 +221,34 @@ impl Negotiator {
 
         Ok(())
     }
+}
+
+/// The codec set every room negotiates. Static for now: the same fixed codecs
+/// apply to all rooms — per-room selection is not yet plumbed through.
+///
+/// H.264 only for now. It is the lowest common denominator for small clients
+/// (embedded devices, smartphones, OBS), so it maximizes compatibility. VP9/AV1
+/// (needed for codec-agnostic E2EE) are intentionally left off until per-room
+/// codec configuration lands.
+fn configure_room_codecs(codec_config: &mut CodecConfig) {
+    const PT_OPUS: Pt = Pt::new_with_value(111);
+
+    codec_config.add_config(
+        PT_OPUS,
+        None,
+        Codec::Opus,
+        Frequency::FORTY_EIGHT_KHZ,
+        Some(2),
+        FormatParams {
+            min_p_time: Some(10),
+            use_inband_fec: Some(true),
+            use_dtx: Some(true),
+            stereo: Some(true),
+            sprop_stereo: Some(true),
+            ..Default::default()
+        },
+    );
+    codec_config.enable_h264(true);
 }
 
 #[cfg(test)]

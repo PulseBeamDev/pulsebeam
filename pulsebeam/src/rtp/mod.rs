@@ -1,6 +1,7 @@
 pub mod cache;
 #[cfg(debug_assertions)]
 pub mod egress_guard;
+pub mod frame_selector;
 pub mod h264;
 pub mod monitor;
 pub mod switcher;

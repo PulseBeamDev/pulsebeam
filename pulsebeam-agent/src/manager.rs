@@ -7,6 +7,8 @@ pub struct VideoSubscription {
     pub track_id: String,
     pub height: u32,
     pub min_height: u32,
+    /// Minimum frame rate to keep for a scalable stream (temporal floor). `0` = none.
+    pub min_fps: u32,
     pub priority: u32,
 }
 
@@ -18,6 +20,7 @@ impl VideoSubscription {
             track_id,
             height: 720,
             min_height: 0,
+            min_fps: 0,
             priority: 0,
         }
     }
@@ -29,6 +32,12 @@ impl VideoSubscription {
 
     pub fn minimum_height(mut self, height: u32) -> Self {
         self.min_height = height;
+        self
+    }
+
+    /// Temporal floor: keep at least this frame rate for a scalable stream.
+    pub fn minimum_fps(mut self, fps: u32) -> Self {
+        self.min_fps = fps;
         self
     }
 
@@ -105,6 +114,7 @@ impl SubscriptionManager {
                     track_id: sub.track_id.clone(),
                     target_height: sub.height,
                     min_height: sub.min_height,
+                    min_fps: sub.min_fps,
                     priority: sub.priority,
                 })
             })

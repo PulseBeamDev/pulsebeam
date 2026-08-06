@@ -154,7 +154,21 @@ impl UpstreamTrackLayer {
             return;
         };
         match self.dd.read(&raw.0) {
-            Ok(dd) => pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd)),
+            Ok(dd) => {
+                // Under SFrame/E2EE the media payload is opaque, so the H.264 IDR
+                // probe in from_str0m sees nothing. The Dependency Descriptor rides
+                // in the clear and carries the template structure on every keyframe,
+                // so it is the authoritative keyframe signal whenever present.
+                pkt.is_keyframe = dd.attached_structure.is_some();
+                pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+                // A scalable keyframe teaches the structure; publish how many decode
+                // targets it offers so the allocator can reason about shedding to them.
+                if let Some(structure) = self.dd.structure() {
+                    self.monitor
+                        .shared_state()
+                        .set_decode_target_count(structure.decode_target_count);
+                }
+            }
             Err(err) => {
                 self.dd_errors += 1;
                 if self.dd_errors.is_power_of_two() {
@@ -180,6 +194,16 @@ impl UpstreamTrackLayer {
         let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
         let height = vla_stream_height_px(vla, idx).map(u32::from);
         let first_declaration = self.monitor.apply_vla(target_bps, height);
+
+        // Record the per-decode-target cost ladder and frame rate so the allocator
+        // can cost each temporal rung rather than estimating.
+        let temporal = vla_stream_temporal_cumulative_kbps(vla, idx);
+        let full_fps = vla_stream_framerate(vla, idx).unwrap_or(0);
+        if !temporal.is_empty() {
+            self.monitor
+                .shared_state()
+                .set_temporal_ladder(&temporal, full_fps);
+        }
         if first_declaration {
             tracing::info!(
                 mid = %self.mid,
@@ -219,6 +243,43 @@ pub(crate) fn vla_stream_height_px(
         .spatial_layers
         .iter()
         .filter_map(|sl| sl.resolution_and_framerate.as_ref().map(|r| r.height))
+        .max()
+}
+
+/// Cumulative bitrate (kbps) per decode target for simulcast stream `idx`, from
+/// its first spatial layer's temporal ladder — the per-temporal costs the SFU
+/// allocates each decode target against. Empty when the sender declared none.
+pub(crate) fn vla_stream_temporal_cumulative_kbps(
+    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    idx: usize,
+) -> Vec<u64> {
+    vla.simulcast_streams
+        .get(idx)
+        .and_then(|s| s.spatial_layers.first())
+        .map(|sl| {
+            sl.temporal_layers
+                .iter()
+                .map(|t| t.cumulative_kbps)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Declared full frame rate for simulcast stream `idx`: the highest framerate any
+/// of its spatial layers reports. `None` when the VLA omits resolution/framerate.
+pub(crate) fn vla_stream_framerate(
+    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    idx: usize,
+) -> Option<u32> {
+    let stream = vla.simulcast_streams.get(idx)?;
+    stream
+        .spatial_layers
+        .iter()
+        .filter_map(|sl| {
+            sl.resolution_and_framerate
+                .as_ref()
+                .map(|r| u32::from(r.framerate))
+        })
         .max()
 }
 
@@ -1108,6 +1169,67 @@ mod dd_tests {
     }
 
     #[test]
+    fn learns_decode_target_count_from_a_scalable_keyframe() {
+        let structure = test_utils::structure_l1t3(); // three decode targets
+        let mut writer = DependencyDescriptorWriter::new();
+        let mut buf = [0u8; MAX_DD_LEN];
+        let mut layer = layer();
+        assert_eq!(
+            layer.monitor.shared_state().decode_target_count(),
+            1,
+            "no structure seen yet, so the encoding is one indivisible rung"
+        );
+
+        let len = writer
+            .write(&test_utils::keyframe(&structure), &mut buf)
+            .unwrap();
+        let mut pkt = packet_carrying(&buf[..len]);
+        layer.process(&mut pkt);
+
+        assert_eq!(
+            layer.monitor.shared_state().decode_target_count(),
+            structure.decode_target_count,
+            "the scalable keyframe's decode-target count is published for the allocator"
+        );
+    }
+
+    #[test]
+    fn derives_the_keyframe_flag_from_the_descriptor_under_an_opaque_payload() {
+        // packet_carrying starts from an opaque payload (is_keyframe = false, empty
+        // NAL flags) — the SFrame/E2EE case where from_str0m's H.264 probe sees
+        // nothing. The descriptor's attached structure is then the only keyframe
+        // signal, so ingress must set is_keyframe from it.
+        let structure = test_utils::structure_l1t3();
+        let mut writer = DependencyDescriptorWriter::new();
+        let mut buf = [0u8; MAX_DD_LEN];
+        let mut layer = layer();
+
+        let len = writer
+            .write(&test_utils::keyframe(&structure), &mut buf)
+            .unwrap();
+        let mut kf = packet_carrying(&buf[..len]);
+        assert!(
+            !kf.is_keyframe,
+            "opaque payload gives no keyframe signal on its own"
+        );
+        layer.process(&mut kf);
+        assert!(
+            kf.is_keyframe,
+            "the descriptor's structure marks the keyframe"
+        );
+
+        let len = writer
+            .write(&test_utils::delta(&structure, 1, 1), &mut buf)
+            .unwrap();
+        let mut delta = packet_carrying(&buf[..len]);
+        layer.process(&mut delta);
+        assert!(
+            !delta.is_keyframe,
+            "a descriptor without a structure is a delta frame"
+        );
+    }
+
+    #[test]
     fn forwards_packets_despite_malformed_descriptor() {
         let mut layer = layer();
         let mut pkt = packet_carrying(&[0xff; 12]);
@@ -1160,6 +1282,37 @@ mod vla_tests {
         };
         assert_eq!(vla_stream_target_bps(&vla, 0), Some(150_000));
         assert_eq!(vla_stream_target_bps(&vla, 1), Some(800_000));
+    }
+
+    #[test]
+    fn temporal_ladder_and_framerate_flow_into_stream_state() {
+        use super::{vla_stream_framerate, vla_stream_temporal_cumulative_kbps};
+        use crate::rtp::monitor::StreamState;
+        use str0m::rtp::vla::ResolutionAndFramerate;
+
+        let mut s = stream(&[300, 450, 600]);
+        s.spatial_layers[0].resolution_and_framerate = Some(ResolutionAndFramerate {
+            width: 1280,
+            height: 720,
+            framerate: 30,
+        });
+        let vla = VideoLayersAllocation {
+            current_simulcast_stream_index: 0,
+            simulcast_streams: vec![s],
+        };
+
+        assert_eq!(
+            vla_stream_temporal_cumulative_kbps(&vla, 0),
+            vec![300, 450, 600]
+        );
+        assert_eq!(vla_stream_framerate(&vla, 0), Some(30));
+
+        let state = StreamState::new_with_height(false, 0, 720);
+        state.set_temporal_ladder(&vla_stream_temporal_cumulative_kbps(&vla, 0), 30);
+        assert_eq!(state.decode_target_bps(0), 300_000);
+        assert_eq!(state.decode_target_bps(1), 450_000);
+        assert_eq!(state.decode_target_bps(2), 600_000);
+        assert_eq!(state.full_fps(), 30);
     }
 
     #[test]

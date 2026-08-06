@@ -77,10 +77,41 @@ impl SharedH264Asset {
     }
 }
 
+/// Rewrite every Annex-B NAL unit type to a non-IDR coded slice (type 1),
+/// preserving the framing so str0m still packetizes and depacketizes the stream
+/// but the SFU's h264::classify finds no IDR, SPS, or PPS. This simulates
+/// SFrame/E2EE, where the media bitstream is opaque to the SFU and the Dependency
+/// Descriptor is the only keyframe signal.
+fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
+    const NON_IDR_SLICE: u8 = 1;
+    let mut out = frame.to_vec();
+    let mut i = 0;
+    while i + 3 < out.len() {
+        if out[i] == 0 && out[i + 1] == 0 && out[i + 2] == 1 {
+            let header = i + 3;
+            // Keep forbidden_zero_bit + nal_ref_idc, replace only the 5-bit type.
+            out[header] = (out[header] & 0xE0) | NON_IDR_SLICE;
+            i = header + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out.into()
+}
+
 pub struct H264Looper {
     asset: Arc<SharedH264Asset>,
     index: usize,
     fps: u32,
+    /// When set, attach a synthetic temporal Dependency Descriptor to each frame
+    /// so the SFU can exercise decode-target shedding. The DD's temporal pattern
+    /// is independent of the (non-scalable) asset — it drives the SFU's DD path,
+    /// not real H.264 temporal decodability.
+    dd: Option<pulsebeam_core::dd::temporal::TemporalDdSource>,
+    /// Simulate SFrame/E2EE by making the payload opaque before sending: the H.264
+    /// start codes are overwritten so the SFU's payload probe finds no IDR, SPS, or
+    /// PPS, leaving the Dependency Descriptor as the only forwarding signal.
+    opaque_payload: bool,
 }
 
 impl H264Looper {
@@ -90,6 +121,8 @@ impl H264Looper {
             asset,
             index: 0,
             fps,
+            dd: None,
+            opaque_payload: false,
         }
     }
 
@@ -98,12 +131,33 @@ impl H264Looper {
             asset,
             index: 0,
             fps,
+            dd: None,
+            opaque_payload: false,
         }
+    }
+
+    /// Emit a synthetic L1T{temporal_layers} Dependency Descriptor per frame.
+    pub fn with_temporal_layers(mut self, temporal_layers: u8) -> Self {
+        self.dd = Some(pulsebeam_core::dd::temporal::TemporalDdSource::new(
+            temporal_layers,
+        ));
+        self
+    }
+
+    /// Make the payload opaque before it is sent, simulating SFrame/E2EE where the
+    /// SFU cannot read the codec bitstream and must rely on the Dependency
+    /// Descriptor alone. Only meaningful alongside `with_temporal_layers`.
+    pub fn with_opaque_payload(mut self) -> Self {
+        self.opaque_payload = true;
+        self
     }
 
     fn next(&mut self) -> Arc<[u8]> {
         let frame = &self.asset.frames[self.index];
         self.index = (self.index + 1) % self.asset.frames.len();
+        if self.opaque_payload {
+            return opaque_frame(frame);
+        }
         frame.clone()
     }
 
@@ -113,8 +167,16 @@ impl H264Looper {
         let mid = sender.mid;
         let rid = sender.rid;
 
+        let temporal_layers = self
+            .dd
+            .as_ref()
+            .map(|src| src.temporal_layers())
+            .unwrap_or(1);
         let mut interval = tokio::time::interval(frame_interval);
         let mut frame_count: u64 = 0;
+        // The pipeline owns Dependency Descriptor generation; the source only
+        // declares its scalability depth and which frames are keyframes.
+        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, temporal_layers);
 
         loop {
             let tick_time = interval.tick().await;
@@ -129,6 +191,7 @@ impl H264Looper {
                 self.index = self.asset.first_idr;
             }
 
+            let is_keyframe = self.index == self.asset.first_idr;
             let frame_data = self.next();
             let next_ts = (frame_count * clock_rate) / self.fps as u64;
 
@@ -138,16 +201,17 @@ impl H264Looper {
                 capture_time: tick_time,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
-                is_keyframe: false,
-                // A constant-rate source has nothing to declare beyond what it is sending, so
-                // leave VLA off and let the SFU measure. That is also the pre-VLA path, which is
-                // worth still exercising: not every sender emits the extension.
+                is_keyframe,
                 target_bitrate_bps: None,
                 resolution: None,
+                dependency_descriptor: None,
+                temporal_layers: None,
             };
 
-            if sender.send(frame).await.is_err() {
-                break;
+            for packet in frame_sender.packetize(&frame) {
+                if sender.send(packet).await.is_err() {
+                    return;
+                }
             }
             frame_count += 1;
         }
@@ -378,6 +442,7 @@ impl VbrLooper {
         let clock_rate = 90_000f64;
         let mid = sender.mid;
         let rid = sender.rid;
+        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, 1);
 
         let start = tokio::time::Instant::now();
         if let Some(frame_times) = self.frame_times.take() {
@@ -407,14 +472,18 @@ impl VbrLooper {
                     capture_time: now,
                     abs_capture_time: Some(crate::clock::capture_wallclock()),
                     contiguous: true,
-                    is_keyframe: false,
+                    is_keyframe: index == self.asset.first_idr,
                     target_bitrate_bps: Some(
                         self.step_target(self.is_active(now.duration_since(start))),
                     ),
                     resolution: None,
+                    dependency_descriptor: None,
+                    temporal_layers: None,
                 };
-                if sender.send(frame).await.is_err() {
-                    return;
+                for packet in frame_sender.packetize(&frame) {
+                    if sender.send(packet).await.is_err() {
+                        return;
+                    }
                 }
                 index += 1;
                 if index == frame_times.len() {
@@ -452,23 +521,29 @@ impl VbrLooper {
             // Derive the timestamp from wall-clock elapsed rather than a frame counter: the frame
             // rate changes between phases, so a counter would drift against real time and the
             // receiver would see the media clock stall during quiet stretches.
+            let is_keyframe = active && self.index == self.asset.first_idr;
+            let data = if active {
+                self.next()
+            } else {
+                self.next_small()
+            };
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz((elapsed.as_secs_f64() * clock_rate) as u64),
-                data: if active {
-                    self.next()
-                } else {
-                    self.next_small()
-                },
+                data,
                 capture_time: now,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
-                is_keyframe: false,
+                is_keyframe,
                 target_bitrate_bps: Some(self.step_target(active)),
                 resolution: None,
+                dependency_descriptor: None,
+                temporal_layers: None,
             };
 
-            if sender.send(frame).await.is_err() {
-                break;
+            for packet in frame_sender.packetize(&frame) {
+                if sender.send(packet).await.is_err() {
+                    return;
+                }
             }
         }
     }
