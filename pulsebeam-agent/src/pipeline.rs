@@ -223,6 +223,22 @@ impl FrameReceiver {
         Self::with_max_wait(DEFAULT_JITTER_MAX_WAIT)
     }
 
+    /// Build a receiver whose jitter buffer holds a gap open for at most
+    /// `max_wait` before declaring it lost.
+    ///
+    /// This is the receiver's only loss-recovery lever: NACK generation and RTX
+    /// retransmission happen in the transport (str0m) *below* this layer, so
+    /// `max_wait` must simply outlast the recovery round-trip. Set it below the
+    /// worst-case NACK+RTX budget and a retransmit will land *after* the gap has
+    /// already been given up on — wasting the recovery and cutting the frame
+    /// anyway. Two things make that budget larger than one RTT:
+    /// - bursty loss needs several NACK rounds (a retransmit can itself be lost
+    ///   and be re-NACKed), each ~1 RTT;
+    /// - high-latency links (cellular) stretch every round.
+    ///
+    /// So trade latency for recovery deliberately: lower `max_wait` only as far
+    /// as your links' worst-case NACK+RTX round-trip. The default
+    /// ([`DEFAULT_JITTER_MAX_WAIT`], 5s) sits comfortably above that.
     pub fn with_max_wait(max_wait: Duration) -> Self {
         Self {
             jitter: JitterBuffer::new(max_wait),
