@@ -163,6 +163,10 @@ impl AgentBuilder {
                 ),
             );
         }
+        // The agent owns packetization/reassembly through the codec-agnostic,
+        // DD-driven framing pipeline, so str0m hands us raw RTP in and out.
+        rtc_builder = rtc_builder.set_rtp_mode(true);
+
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
         codec_config.enable_h264(true);

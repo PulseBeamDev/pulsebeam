@@ -1,4 +1,4 @@
-use super::common::{LocalNodeSim, Participant, Room, Step, VideoQuality};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
 
 /// A publisher that attaches a synthetic L1T3 Dependency Descriptor to every
@@ -95,7 +95,67 @@ fn opaque_dependency_descriptor_stream_forwards_on_dd_alone_test() {
             Step::CheckVideoQuality {
                 description: "Bob keeps receiving forwarded frames with no readable bitstream",
                 participant: "bob",
-                quality: VideoQuality::min_frames(120).allow_gaps(10),
+                // The payload is opaque (encrypted-like), so keyframes carry no
+                // readable SPS/PPS — that is the whole point. The DD still drives
+                // reassembly and keyframe detection.
+                quality: VideoQuality::min_frames(120)
+                    .allow_gaps(10)
+                    .allow_missing_parameter_sets(u64::MAX),
+            },
+            Step::CheckKeyframeRequests {
+                // If the encrypted stream did not forward decodably, the SFU/decoder
+                // would hammer the publisher with PLIs (the fps→1 "storm" seen in
+                // the browser). A healthy stream needs only a handful.
+                description: "no PLI storm on the opaque stream",
+                participant: "alice",
+                max: 10,
+            },
+        ]);
+}
+
+/// The encrypted-frame path under real loss — the conditions that surfaced the
+/// browser's fps→1 collapse and constant-PLI storm. The SFU forwards on the DD
+/// alone (opaque payload), the subscriber reassembles from raw RTP, and both the
+/// frame rate must hold and keyframe requests must stay bounded. This is the sim
+/// guard for the whole class of "DD-only + encrypted" reassembly bugs.
+#[test]
+fn opaque_dependency_descriptor_holds_framerate_under_loss_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::cellular())
+        .with_room(
+            Room::new("room1")
+                .with_participant(
+                    Participant::publisher("alice", &["q", "h", "f"]).with_opaque_dd(3),
+                )
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the opaque stream over lossy cellular",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeAll {
+                description: "Bob subscribes at full quality",
+                participant: "bob",
+                heights: &[720],
+            },
+            Step::Run {
+                description: "Soak: frames must keep flowing, decoder must not stall",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckVideoQuality {
+                // ~30fps over 30s is ~900 frames; a collapse to a few fps would
+                // fall far below this floor. Gaps are generous (cellular loss).
+                description: "frame rate holds — no collapse to a crawl",
+                participant: "bob",
+                quality: VideoQuality::min_frames(500)
+                    .allow_gaps(80)
+                    .allow_missing_parameter_sets(u64::MAX),
+            },
+            Step::CheckKeyframeRequests {
+                description: "no PLI storm even under loss",
+                participant: "alice",
+                max: 40,
             },
         ]);
 }

@@ -167,8 +167,16 @@ impl H264Looper {
         let mid = sender.mid;
         let rid = sender.rid;
 
+        let temporal_layers = self
+            .dd
+            .as_ref()
+            .map(|src| src.temporal_layers())
+            .unwrap_or(1);
         let mut interval = tokio::time::interval(frame_interval);
         let mut frame_count: u64 = 0;
+        // The pipeline owns Dependency Descriptor generation; the source only
+        // declares its scalability depth and which frames are keyframes.
+        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, temporal_layers);
 
         loop {
             let tick_time = interval.tick().await;
@@ -183,13 +191,9 @@ impl H264Looper {
                 self.index = self.asset.first_idr;
             }
 
-            // The frame at the asset's IDR index is a keyframe; the DD attaches
-            // its structure there.
             let is_keyframe = self.index == self.asset.first_idr;
             let frame_data = self.next();
             let next_ts = (frame_count * clock_rate) / self.fps as u64;
-            let temporal_layers = self.dd.as_ref().map(|src| src.temporal_layers());
-            let dependency_descriptor = self.dd.as_mut().and_then(|src| src.next(is_keyframe));
 
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz(next_ts),
@@ -197,20 +201,17 @@ impl H264Looper {
                 capture_time: tick_time,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
-                // Only surfaced when driving DD; the SFU otherwise detects keyframes
-                // from the H.264 payload.
-                is_keyframe: dependency_descriptor.is_some() && is_keyframe,
-                // A constant-rate source has nothing to declare beyond what it is sending, so
-                // leave VLA off and let the SFU measure. That is also the pre-VLA path, which is
-                // worth still exercising: not every sender emits the extension.
+                is_keyframe,
                 target_bitrate_bps: None,
                 resolution: None,
-                dependency_descriptor,
-                temporal_layers,
+                dependency_descriptor: None,
+                temporal_layers: None,
             };
 
-            if sender.send(frame).await.is_err() {
-                break;
+            for packet in frame_sender.packetize(&frame) {
+                if sender.send(packet).await.is_err() {
+                    return;
+                }
             }
             frame_count += 1;
         }
@@ -441,6 +442,7 @@ impl VbrLooper {
         let clock_rate = 90_000f64;
         let mid = sender.mid;
         let rid = sender.rid;
+        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, 1);
 
         let start = tokio::time::Instant::now();
         if let Some(frame_times) = self.frame_times.take() {
@@ -470,7 +472,7 @@ impl VbrLooper {
                     capture_time: now,
                     abs_capture_time: Some(crate::clock::capture_wallclock()),
                     contiguous: true,
-                    is_keyframe: false,
+                    is_keyframe: index == self.asset.first_idr,
                     target_bitrate_bps: Some(
                         self.step_target(self.is_active(now.duration_since(start))),
                     ),
@@ -478,8 +480,10 @@ impl VbrLooper {
                     dependency_descriptor: None,
                     temporal_layers: None,
                 };
-                if sender.send(frame).await.is_err() {
-                    return;
+                for packet in frame_sender.packetize(&frame) {
+                    if sender.send(packet).await.is_err() {
+                        return;
+                    }
                 }
                 index += 1;
                 if index == frame_times.len() {
@@ -517,25 +521,29 @@ impl VbrLooper {
             // Derive the timestamp from wall-clock elapsed rather than a frame counter: the frame
             // rate changes between phases, so a counter would drift against real time and the
             // receiver would see the media clock stall during quiet stretches.
+            let is_keyframe = active && self.index == self.asset.first_idr;
+            let data = if active {
+                self.next()
+            } else {
+                self.next_small()
+            };
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz((elapsed.as_secs_f64() * clock_rate) as u64),
-                data: if active {
-                    self.next()
-                } else {
-                    self.next_small()
-                },
+                data,
                 capture_time: now,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,
-                is_keyframe: false,
+                is_keyframe,
                 target_bitrate_bps: Some(self.step_target(active)),
                 resolution: None,
                 dependency_descriptor: None,
                 temporal_layers: None,
             };
 
-            if sender.send(frame).await.is_err() {
-                break;
+            for packet in frame_sender.packetize(&frame) {
+                if sender.send(packet).await.is_err() {
+                    return;
+                }
             }
         }
     }

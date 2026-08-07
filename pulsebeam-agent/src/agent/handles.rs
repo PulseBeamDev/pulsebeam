@@ -1,4 +1,4 @@
-use crate::MediaFrame;
+use crate::RtpPacket;
 use crate::agent::mailbox;
 use crate::manager::VideoSubscription;
 use pulsebeam_proto::signaling::Track;
@@ -53,12 +53,12 @@ pub(crate) struct SendData {
     pub(crate) payload: Vec<u8>,
 }
 
-/// Payload for sending media.
+/// Payload for sending one RTP packet.
 #[derive(Clone, Debug)]
 pub(crate) struct SendMedia {
     pub(crate) lease: PublicationLease,
     pub(crate) rid: Option<Rid>,
-    pub(crate) frame: MediaFrame,
+    pub(crate) packet: RtpPacket,
 }
 
 #[derive(Clone)]
@@ -238,16 +238,16 @@ impl LocalEncoding {
         self.rid.as_deref()
     }
 
-    pub async fn send(&self, frame: MediaFrame) -> Result<(), mailbox::SendError<MediaFrame>> {
+    pub async fn send(&self, packet: RtpPacket) -> Result<(), mailbox::SendError<RtpPacket>> {
         self.tx
             .send(OutgoingCommand::SendMedia(SendMedia {
                 lease: self.lease,
                 rid: self.rid,
-                frame,
+                packet,
             }))
             .await
             .map_err(|error| match error.0 {
-                OutgoingCommand::SendMedia(media) => mailbox::SendError(media.frame),
+                OutgoingCommand::SendMedia(media) => mailbox::SendError(media.packet),
                 _ => unreachable!(),
             })
     }
@@ -291,11 +291,11 @@ impl Publication {
 
 pub struct RemoteTrack {
     publication: Publication,
-    pub(crate) rx: mailbox::Receiver<MediaFrame>,
+    pub(crate) rx: mailbox::Receiver<RtpPacket>,
 }
 
 impl RemoteTrack {
-    pub(crate) fn new(_mid: Mid, track: Track, rx: mailbox::Receiver<MediaFrame>) -> Self {
+    pub(crate) fn new(_mid: Mid, track: Track, rx: mailbox::Receiver<RtpPacket>) -> Self {
         Self {
             publication: Publication::from_signaling(track),
             rx,
@@ -306,7 +306,10 @@ impl RemoteTrack {
         self.publication.publisher_id()
     }
 
-    pub async fn recv(&mut self) -> Result<MediaFrame, mailbox::RecvError> {
+    /// Receive the next RTP packet for this track. Frame reassembly, jitter
+    /// buffering, and decryption are higher-level concerns — see
+    /// [`crate::pipeline::FrameReceiver`].
+    pub async fn recv(&mut self) -> Result<RtpPacket, mailbox::RecvError> {
         self.rx.recv().await
     }
 }

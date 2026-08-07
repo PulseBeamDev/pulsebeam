@@ -23,6 +23,15 @@ pub struct FrameChunk<'a> {
     pub end_of_frame: bool,
 }
 
+/// A reassembled frame plus the sequence-number span it occupied, so the caller
+/// can judge inter-frame continuity (a gap between frames = a lost/dropped frame).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReassembledFrame {
+    pub data: Vec<u8>,
+    pub first_seq: u64,
+    pub last_seq: u64,
+}
+
 /// Splits an opaque frame into ordered chunks without reading its bytes.
 #[derive(Debug, Clone)]
 pub struct FramePacketizer {
@@ -105,7 +114,7 @@ impl FrameDepacketizer {
         payload: &[u8],
         start_of_frame: bool,
         end_of_frame: bool,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<ReassembledFrame> {
         self.newest = Some(self.newest.map_or(seq, |n| n.max(seq)));
         self.parts.insert(
             seq,
@@ -121,7 +130,7 @@ impl FrameDepacketizer {
 
     /// Assemble the earliest frame whose start packet is buffered and whose run
     /// up to an end-of-frame packet is contiguous. Returns and consumes it.
-    fn try_emit_earliest(&mut self) -> Option<Vec<u8>> {
+    fn try_emit_earliest(&mut self) -> Option<ReassembledFrame> {
         let start_seq = self
             .parts
             .iter()
@@ -139,7 +148,11 @@ impl FrameDepacketizer {
                 for s in start_seq..=seq {
                     self.parts.remove(&s);
                 }
-                return Some(frame);
+                return Some(ReassembledFrame {
+                    data: frame,
+                    first_seq: start_seq,
+                    last_seq: seq,
+                });
             }
             seq += 1;
         }
@@ -205,9 +218,14 @@ mod tests {
 
         let mut out = None;
         for (i, chunk) in p.packetize(&frame).enumerate() {
-            out = d.push(i as u64, chunk.data, chunk.start_of_frame, chunk.end_of_frame);
+            out = d.push(
+                i as u64,
+                chunk.data,
+                chunk.start_of_frame,
+                chunk.end_of_frame,
+            );
         }
-        assert_eq!(out.expect("frame reassembled"), frame);
+        assert_eq!(out.expect("frame reassembled").data, frame);
     }
 
     #[test]
@@ -219,9 +237,12 @@ mod tests {
 
         // Deliver the middle packet last.
         assert!(d.push(0, chunks[0].data, true, false).is_none());
-        assert!(d.push(2, chunks[2].data, false, true).is_none(), "gap: not yet complete");
+        assert!(
+            d.push(2, chunks[2].data, false, true).is_none(),
+            "gap: not yet complete"
+        );
         let out = d.push(1, chunks[1].data, false, false);
-        assert_eq!(out.expect("completes once the gap fills"), frame);
+        assert_eq!(out.expect("completes once the gap fills").data, frame);
     }
 
     #[test]
@@ -247,13 +268,13 @@ mod tests {
         let mut emitted = Vec::new();
         for chunk in p.packetize(&f1) {
             if let Some(f) = d.push(seq, chunk.data, chunk.start_of_frame, chunk.end_of_frame) {
-                emitted.push(f);
+                emitted.push(f.data);
             }
             seq += 1;
         }
         for chunk in p.packetize(&f2) {
             if let Some(f) = d.push(seq, chunk.data, chunk.start_of_frame, chunk.end_of_frame) {
-                emitted.push(f);
+                emitted.push(f.data);
             }
             seq += 1;
         }

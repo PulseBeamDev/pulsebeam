@@ -1,4 +1,4 @@
-use crate::MediaFrame;
+use crate::RtpPacket;
 use crate::agent::controller::{BitrateController, BitrateControllerConfig, LayerController};
 use crate::agent::handles::{
     DataPublisher, DataSubscriber, LocalEncoding, OrderedTopicPublisher, OrderedTopicSubscriber,
@@ -25,11 +25,7 @@ use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{Direction, MediaAdded, MediaKind, Mid, Rid};
-use str0m::rtp::AbsCaptureTime;
-use str0m::rtp::vla::{
-    ResolutionAndFramerate, SimulcastStreamAllocation, SpatialLayerAllocation,
-    TemporalLayerAllocation, VideoLayersAllocation,
-};
+use str0m::rtp::{RtpWrite, Ssrc};
 use str0m::{
     Event, Input, Output, Rtc,
     net::{Protocol, Receive},
@@ -46,11 +42,21 @@ pub type ParticipantId = String;
 pub struct StatisticsSnapshot {
     pub(crate) peer: Option<str0m::stats::PeerStats>,
     pub(crate) tracks: HashMap<Mid, TrackStats>,
+    /// Cumulative keyframe (PLI/FIR) requests this publisher has received. A
+    /// healthy stream needs only the occasional one (a new subscriber, a switch);
+    /// a constantly climbing count means downstream cannot decode — the signature
+    /// of a broken forwarding/reassembly path.
+    pub(crate) keyframe_requests_received: u64,
 }
 
 impl StatisticsSnapshot {
     pub fn is_connected(&self) -> bool {
         self.peer.is_some()
+    }
+
+    /// Cumulative keyframe requests received (see field docs).
+    pub fn keyframe_requests_received(&self) -> u64 {
+        self.keyframe_requests_received
     }
 
     pub fn bytes_sent(&self) -> u64 {
@@ -224,7 +230,11 @@ struct DataSubsystem {
 }
 
 struct MediaSubsystem {
-    media_targets: HashMap<Mid, mailbox::Sender<MediaFrame>>,
+    media_targets: HashMap<Mid, mailbox::Sender<RtpPacket>>,
+    /// Cache of which (mid, rid) each incoming SSRC belongs to. `Event::RtpPacket`
+    /// carries only the SSRC, so the mapping is resolved once via the DirectApi and
+    /// reused. Mirrors the SFU's `incoming_rtp_routes`.
+    incoming_rtp_routes: HashMap<Ssrc, (Mid, Option<Rid>)>,
     upstream_slots: HashMap<Mid, UpstreamSlot>,
     pending_media_subscriptions:
         HashMap<String, tokio::sync::oneshot::Sender<Result<RemoteTrack, AgentError>>>,
@@ -350,6 +360,7 @@ impl AgentDriver {
             ordered_topics: OrderedTopics::new(),
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
+                incoming_rtp_routes: HashMap::new(),
                 upstream_slots: HashMap::new(),
                 pending_media_subscriptions: HashMap::new(),
                 layer_ctrl: LayerController::new(),
@@ -707,47 +718,43 @@ impl AgentDriver {
                 }
                 let mid = e.lease.mid;
                 let paused = self.media.layer_ctrl.is_paused(mid, e.rid);
-                self.media
-                    .layer_ctrl
-                    .record_frame(mid, e.rid, e.frame.data.len(), Instant::now());
+                self.media.layer_ctrl.record_frame(
+                    mid,
+                    e.rid,
+                    e.packet.payload.len(),
+                    Instant::now(),
+                );
 
                 if paused {
                     return;
                 }
 
-                if let Some(mut writer) = self.rtc.writer(mid) {
-                    let Some(pt) = writer.payload_params().next().map(|p| p.pt()) else {
-                        return;
-                    };
-                    if let Some(rid) = e.rid {
-                        writer = writer.rid(rid);
-                    }
-                    if let Some(abs_capture_time) = e.frame.abs_capture_time {
-                        writer = writer.abs_capture_time(AbsCaptureTime {
-                            capture_time: abs_capture_time,
-                            clock_offset: None,
-                        });
-                    }
-                    // Declare the encoder's target so the SFU allocates against it rather than
-                    // inferring cost from bytes on the wire, which for screen content is a far
-                    // more variable signal (near zero while static, full rate on a scroll).
-                    if let Some(target_bps) = e.frame.target_bitrate_bps
-                        && let Some(vla) = vla_for(
-                            slot.encodings.len(),
-                            target_bps,
-                            e.frame.resolution,
-                            e.frame.temporal_layers,
-                        )
-                    {
-                        writer = writer.user_extension_value(vla);
-                    }
-                    // A scalable source declares each frame's dependency structure;
-                    // forward it so the SFU can shed layers by decode target.
-                    if let Some(dd) = e.frame.dependency_descriptor.clone() {
-                        writer = writer.user_extension_value(dd);
-                    }
-                    let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
-                }
+                // The pipeline already packetized the frame and set the DD / VLA /
+                // abs-capture-time extensions on `ext_vals`; the agent just writes
+                // the raw RTP. str0m still owns SRTP, RTX, sender reports, and BWE.
+                let Some(pt) = self
+                    .rtc
+                    .media(mid)
+                    .and_then(|m| m.remote_pts().first().copied())
+                else {
+                    return;
+                };
+                let packet = e.packet;
+                let mut api = self.rtc.direct_api();
+                let Some(stream) = api.stream_tx_by_mid(mid, e.rid) else {
+                    return;
+                };
+                let rtp = RtpWrite::new(
+                    pt,
+                    packet.seq,
+                    packet.ts.numer() as u32,
+                    packet.arrival.into(),
+                    packet.payload,
+                )
+                .marker(packet.marker)
+                .nackable(true)
+                .ext_vals(packet.ext_vals);
+                stream.write_rtp(rtp);
             }
             OutgoingCommand::SetPlayoutDelay(bounds) => {
                 self.set_playout_delay(bounds);
@@ -885,9 +892,29 @@ impl AgentDriver {
                         }
                     }
                     Event::MediaAdded(media) => self.handle_media_added(media),
-                    Event::MediaData(data) => {
-                        if let Some(tx) = self.media.media_targets.get(&data.mid) {
-                            let _ = tx.try_send(data.into());
+                    Event::RtpPacket(rtp) => {
+                        let ssrc = rtp.header.ssrc;
+                        let route = match self.media.incoming_rtp_routes.get(&ssrc).copied() {
+                            Some(route) => Some(route),
+                            None => {
+                                let mut api = self.rtc.direct_api();
+                                api.stream_rx(&ssrc).map(|s| (s.mid(), s.rid()))
+                            }
+                        };
+                        if let Some((mid, rid)) = route {
+                            self.media.incoming_rtp_routes.insert(ssrc, (mid, rid));
+                            if let Some(tx) = self.media.media_targets.get(&mid) {
+                                let _ = tx.try_send(RtpPacket {
+                                    mid,
+                                    rid,
+                                    seq: rtp.seq_no,
+                                    ts: rtp.time,
+                                    marker: rtp.header.marker,
+                                    payload: rtp.payload,
+                                    ext_vals: rtp.header.ext_vals,
+                                    arrival: rtp.timestamp.into(),
+                                });
+                            }
                         }
                     }
                     Event::IceConnectionStateChange(state) => {
@@ -913,6 +940,8 @@ impl AgentDriver {
                         self.emit(AgentEvent::StatsUpdated);
                     }
                     Event::KeyframeRequest(req) => {
+                        self.stats.keyframe_requests_received =
+                            self.stats.keyframe_requests_received.wrapping_add(1);
                         self.media
                             .layer_ctrl
                             .request_keyframe(req.mid, req.rid, req.kind);
@@ -1199,86 +1228,7 @@ mod tests {
         assert!(!slot.deactivate(camera));
         assert!(slot.accepts(screen));
     }
-
-    #[test]
-    fn vla_is_declared_only_for_single_encoding_tracks() {
-        assert!(vla_for(2, 500_000, None, None).is_none());
-
-        let allocation = vla_for(1, 500_000, Some((1280, 720, 30)), None).unwrap();
-        assert_eq!(allocation.current_simulcast_stream_index, 0);
-        assert_eq!(allocation.simulcast_streams.len(), 1);
-        assert_eq!(allocation.simulcast_streams[0].spatial_layers.len(), 1);
-        // No temporal scalability declared: a single cumulative entry at full rate.
-        let temporal = &allocation.simulcast_streams[0].spatial_layers[0].temporal_layers;
-        assert_eq!(temporal.len(), 1);
-        assert_eq!(temporal[0].cumulative_kbps, 500);
-    }
-
-    #[test]
-    fn vla_declares_a_nested_temporal_ladder_for_scalable_streams() {
-        let allocation = vla_for(1, 600_000, Some((1280, 720, 30)), Some(3)).unwrap();
-        let temporal = &allocation.simulcast_streams[0].spatial_layers[0].temporal_layers;
-        // L1T3: three nested decode targets, base ~half, top = full, strictly rising.
-        assert_eq!(temporal.len(), 3);
-        assert_eq!(temporal[0].cumulative_kbps, 300); // 0.5 * 600
-        assert_eq!(temporal[2].cumulative_kbps, 600); // full
-        assert!(
-            temporal
-                .windows(2)
-                .all(|w| w[1].cumulative_kbps > w[0].cumulative_kbps)
-        );
-    }
 }
 
-fn vla_for(
-    encoding_count: usize,
-    target_bps: u64,
-    resolution: Option<(u16, u16, u8)>,
-    temporal_layers: Option<u8>,
-) -> Option<VideoLayersAllocation> {
-    if encoding_count != 1 {
-        return None;
-    }
-    Some(VideoLayersAllocation {
-        current_simulcast_stream_index: 0,
-        simulcast_streams: vec![SimulcastStreamAllocation {
-            spatial_layers: vec![SpatialLayerAllocation {
-                temporal_layers: temporal_cumulative_kbps(target_bps, temporal_layers),
-                resolution_and_framerate: resolution.map(|(width, height, framerate)| {
-                    ResolutionAndFramerate {
-                        width,
-                        height,
-                        framerate,
-                    }
-                }),
-            }],
-        }],
-    })
-}
-
-/// Per-temporal cumulative bitrate declaration for a scalable stream. A single
-/// entry (the full target) when the stream is not temporally scalable; otherwise
-/// a nested ladder the SFU can cost each decode target against. The split models
-/// a real temporal encoder: the base layer is roughly half the full rate, and each
-/// enhancement layer adds a diminishing share.
-fn temporal_cumulative_kbps(
-    target_bps: u64,
-    temporal_layers: Option<u8>,
-) -> Vec<TemporalLayerAllocation> {
-    let full_kbps = target_bps / 1000;
-    let layers = temporal_layers.unwrap_or(1).max(1);
-    if layers <= 1 {
-        return vec![TemporalLayerAllocation {
-            cumulative_kbps: full_kbps,
-        }];
-    }
-    (0..layers)
-        .map(|k| {
-            // cumulative fraction: 0.5 at the base, 1.0 at the top, linear between.
-            let frac = 0.5 + 0.5 * (k as f64) / ((layers - 1) as f64);
-            TemporalLayerAllocation {
-                cumulative_kbps: ((full_kbps as f64) * frac).round() as u64,
-            }
-        })
-        .collect()
-}
+// VLA construction moved to `crate::pipeline` (the frame→RTP layer that now owns
+// header-extension emission).

@@ -436,8 +436,13 @@ impl SimClient {
                             .insert(publication_id.clone(), publication_id);
                         let log = self.ctx.video_rx.clone();
                         self.join_set.spawn(async move {
-                            while let Ok(frame) = track.recv().await {
-                                log.lock().unwrap().record(&frame);
+                            // The agent forwards RTP; reassemble frames here (the
+                            // "higher layer") before logging QoE.
+                            let mut receiver = pulsebeam_agent::FrameReceiver::new();
+                            while let Ok(rtp) = track.recv().await {
+                                if let Some(frame) = receiver.push(&rtp) {
+                                    log.lock().unwrap().record(&frame);
+                                }
                             }
                         });
 
