@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use pulsebeam_core::dd::temporal::TemporalDdSource;
 use pulsebeam_core::dd::{DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory};
@@ -126,11 +126,84 @@ struct PendingFrame {
     abs_capture_time: Option<SystemTime>,
 }
 
-/// Reassembles one incoming stream's RTP back into frames, using the DD's
-/// per-packet start/end-of-frame flags and sequence contiguity. A jitter buffer
-/// stage (future) would sit in front to smooth playout; the bounded reorder
-/// window here already absorbs the reordering that retransmissions cause.
+/// Default upper bound on how long the jitter buffer holds a gap open waiting
+/// for reordered/retransmitted packets. Generous, favouring loss recovery over
+/// latency — a latency-sensitive real-time consumer can lower it (accepting more
+/// residual loss) via [`FrameReceiver::with_max_wait`].
+pub const DEFAULT_JITTER_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// A time-bounded reorder / jitter buffer.
+///
+/// Holds incoming RTP briefly so out-of-order and retransmitted (NACK/RTX)
+/// packets can take their place before a gap is declared lost, then releases
+/// packets strictly in sequence order. `max_wait` bounds both the initial
+/// reordering delay and how long any single gap is held open: larger recovers
+/// more under bursty loss, at the cost of buffering latency.
+pub struct JitterBuffer {
+    buf: BTreeMap<u64, RtpPacket>,
+    next: Option<u64>,
+    latest_arrival: Option<Instant>,
+    max_wait: Duration,
+}
+
+impl JitterBuffer {
+    pub fn new(max_wait: Duration) -> Self {
+        Self {
+            buf: BTreeMap::new(),
+            next: None,
+            latest_arrival: None,
+            max_wait,
+        }
+    }
+
+    pub fn push(&mut self, rtp: RtpPacket) {
+        let arrival = rtp.arrival;
+        self.latest_arrival = Some(self.latest_arrival.map_or(arrival, |l| l.max(arrival)));
+        self.buf.insert(*rtp.seq, rtp);
+    }
+
+    /// Release the next in-order packet that is ready, or `None` while still
+    /// waiting for it to arrive (up to `max_wait` from the head packet's arrival).
+    pub fn pop(&mut self) -> Option<RtpPacket> {
+        let now = self.latest_arrival?;
+        let next = match self.next {
+            Some(n) => n,
+            None => {
+                // Absorb initial reordering before committing to a first sequence.
+                let (&min_seq, min_pkt) = self.buf.iter().next()?;
+                if now.saturating_duration_since(min_pkt.arrival) < self.max_wait {
+                    return None;
+                }
+                min_seq
+            }
+        };
+        if let Some(pkt) = self.buf.remove(&next) {
+            self.next = Some(next.wrapping_add(1));
+            return Some(pkt);
+        }
+        // Gap at `next`: wait up to `max_wait` for it to fill, then skip it (lost).
+        let (&head_seq, head_pkt) = self.buf.iter().next()?;
+        if now.saturating_duration_since(head_pkt.arrival) >= self.max_wait {
+            let pkt = self.buf.remove(&head_seq).unwrap();
+            self.next = Some(head_seq.wrapping_add(1));
+            return Some(pkt);
+        }
+        None
+    }
+
+    /// Release everything still buffered, in sequence order (end of stream).
+    pub fn drain(&mut self) -> impl Iterator<Item = RtpPacket> {
+        std::mem::take(&mut self.buf).into_values()
+    }
+}
+
+/// Reassembles one incoming stream's RTP into frames.
+///
+/// A [`JitterBuffer`] fronts the reassembler: RTP is reordered and gap-recovered
+/// (NACK/RTX) with bounded latency first, then frames are cut from the ordered
+/// stream using the DD's per-packet start/end-of-frame flags.
 pub struct FrameReceiver {
+    jitter: JitterBuffer,
     depacketizer: FrameDepacketizer,
     dd_reader: DependencyDescriptorReader,
     /// Metadata captured at each frame's start packet, keyed by its sequence.
@@ -147,7 +220,12 @@ impl Default for FrameReceiver {
 
 impl FrameReceiver {
     pub fn new() -> Self {
+        Self::with_max_wait(DEFAULT_JITTER_MAX_WAIT)
+    }
+
+    pub fn with_max_wait(max_wait: Duration) -> Self {
         Self {
+            jitter: JitterBuffer::new(max_wait),
             depacketizer: FrameDepacketizer::default(),
             dd_reader: DependencyDescriptorReader::new(),
             pending: BTreeMap::new(),
@@ -155,15 +233,37 @@ impl FrameReceiver {
         }
     }
 
-    /// Feed one RTP packet; returns a reassembled [`MediaFrame`] when a frame
-    /// becomes contiguously complete.
-    pub fn push(&mut self, rtp: &RtpPacket) -> Option<MediaFrame> {
+    /// Feed one RTP packet; returns any frames that became ready (0+). Frames may
+    /// be released now or on a later push once the jitter buffer's delay elapses.
+    pub fn push(&mut self, rtp: RtpPacket) -> Vec<MediaFrame> {
+        self.jitter.push(rtp);
+        let mut frames = Vec::new();
+        while let Some(ordered) = self.jitter.pop() {
+            if let Some(frame) = self.reassemble(ordered) {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    /// Release everything buffered (end of stream): drains the jitter buffer with
+    /// no further wait and reassembles whatever completes.
+    pub fn flush(&mut self) -> Vec<MediaFrame> {
+        let drained: Vec<RtpPacket> = self.jitter.drain().collect();
+        let mut frames = Vec::new();
+        for ordered in drained {
+            if let Some(frame) = self.reassemble(ordered) {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    fn reassemble(&mut self, rtp: RtpPacket) -> Option<MediaFrame> {
         let seq = *rtp.seq;
 
-        // Forward-only: a retransmission that lands after we have already
-        // delivered its frame's position must be dropped, never re-emitted late —
-        // otherwise a very-late RTX reorders the output and regresses the media
-        // clock. This is the role a jitter buffer's playout deadline plays.
+        // Forward-only: the jitter buffer already orders output, but a stray
+        // late packet must never re-emit an already-delivered frame position.
         if let Some(prev) = self.prev_last_seq
             && seq <= prev
         {
@@ -195,8 +295,6 @@ impl FrameReceiver {
                     abs_capture_time: rtp.ext_vals.abs_capture_time.map(|a| a.capture_time),
                 },
             );
-            // Bound the metadata map against frames whose start we saw but whose
-            // completion never came (permanent loss).
             while self.pending.len() > 256 {
                 let oldest = *self.pending.keys().next().unwrap();
                 self.pending.remove(&oldest);
@@ -306,11 +404,12 @@ mod tests {
         assert!(packets.len() > 1, "should split across packets");
         assert!(packets.last().unwrap().marker, "last packet ends the frame");
 
-        let mut out = None;
-        for pkt in &packets {
-            out = receiver.push(pkt);
+        let mut frames = Vec::new();
+        for pkt in packets {
+            frames.extend(receiver.push(pkt));
         }
-        let got = out.expect("frame reassembled");
+        frames.extend(receiver.flush());
+        let got = frames.into_iter().next().expect("frame reassembled");
         assert_eq!(
             &*got.data,
             &payload[..],
@@ -333,13 +432,15 @@ mod tests {
         assert!(packets.len() >= 3);
         packets.reverse();
 
-        let mut out = None;
-        for pkt in &packets {
-            if let Some(f) = receiver.push(pkt) {
-                out = Some(f);
-            }
+        let mut frames = Vec::new();
+        for pkt in packets {
+            frames.extend(receiver.push(pkt));
         }
-        assert_eq!(&*out.expect("reassembled").data, &payload[..]);
+        frames.extend(receiver.flush());
+        assert_eq!(
+            &*frames.into_iter().next().expect("reassembled").data,
+            &payload[..]
+        );
     }
 
     #[test]
@@ -356,14 +457,46 @@ mod tests {
         let mut frames = Vec::new();
         for f in [&kf, &delta] {
             for pkt in sender.packetize(f) {
-                if let Some(out) = receiver.push(&pkt) {
-                    frames.push(out);
-                }
+                frames.extend(receiver.push(pkt));
             }
         }
+        frames.extend(receiver.flush());
         assert_eq!(frames.len(), 2);
         assert!(frames[0].is_keyframe && !frames[1].is_keyframe);
         assert!(frames.iter().all(|f| f.contiguous));
+    }
+
+    #[test]
+    fn jitter_buffer_orders_reordered_packets_and_skips_a_permanent_gap() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload: Arc::from([seq as u8].as_slice()),
+            ext_vals: ExtensionValues::default(),
+            arrival: base + Duration::from_millis(at_ms),
+        };
+
+        let mut jb = JitterBuffer::new(Duration::from_millis(200));
+        // Deliver 0,2,3 out of order; 1 is lost.
+        jb.push(pkt(2, 10));
+        jb.push(pkt(0, 20));
+        jb.push(pkt(3, 30));
+
+        // 0 releases after the startup wait elapses (head aged >= max_wait).
+        assert!(jb.pop().is_none(), "still within the reordering window");
+        jb.push(pkt(3, 300)); // advance 'now' past the 200ms wait
+        let mut seqs = Vec::new();
+        while let Some(p) = jb.pop() {
+            seqs.push(*p.seq);
+        }
+        // 1 was never delivered; after the wait it is skipped and 2,3 follow in order.
+        assert_eq!(seqs, vec![0, 2, 3]);
     }
 
     #[test]

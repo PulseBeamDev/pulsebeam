@@ -16,7 +16,7 @@ pub use agent::{
     Statistics, StatisticsSnapshot, VideoSubscriber,
 };
 pub use clock::wallclock_at;
-pub use pipeline::{FrameReceiver, FrameSender};
+pub use pipeline::{FrameReceiver, FrameSender, JitterBuffer};
 
 pub mod actor;
 pub mod agent;

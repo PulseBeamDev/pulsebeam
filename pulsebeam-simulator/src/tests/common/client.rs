@@ -440,9 +440,12 @@ impl SimClient {
                             // "higher layer") before logging QoE.
                             let mut receiver = pulsebeam_agent::FrameReceiver::new();
                             while let Ok(rtp) = track.recv().await {
-                                if let Some(frame) = receiver.push(&rtp) {
+                                for frame in receiver.push(rtp) {
                                     log.lock().unwrap().record(&frame);
                                 }
+                            }
+                            for frame in receiver.flush() {
+                                log.lock().unwrap().record(&frame);
                             }
                         });
 

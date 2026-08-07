@@ -640,13 +640,7 @@ fn screenshare_and_camera_over_wifi_test() {
 /// that clears in-flight packets, and is therefore unsuitable for a packet-loss profile.
 #[test]
 fn screenshare_and_camera_over_cellular_test() {
-    // The agent now reassembles frames from raw RTP itself (no str0m sample-mode
-    // jitter buffer). Under the cellular profile's residual loss that surfaces a
-    // few more literal sequence gaps than str0m's concealing depacketizer did;
-    // frame rate stays healthy (thousands of frames). A proper jitter buffer /
-    // NACK-recovery stage (planned follow-up above the FrameReceiver) will tighten
-    // this back down.
-    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 40, 2);
+    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 14, 2);
 }
 
 /// Shared plan for the conference tests so the link profile is the only variable.
