@@ -140,8 +140,6 @@ pub enum DisconnectReason {
     RoomClosed,
     #[error("System terminated")]
     SystemTerminated,
-    #[error("Routing collision")]
-    RoutingCollision,
 }
 
 #[derive(Debug)]
@@ -351,15 +349,6 @@ impl ParticipantCore {
     }
 
     pub fn on_tracks_published(&mut self, tracks: &[Track]) {
-        if tracks
-            .iter()
-            .filter(|track| track.meta.origin != self.participant_id)
-            .any(|track| !self.downstream.track_compatible(track))
-        {
-            tracing::error!("conflicting published track metadata");
-            self.disconnect(DisconnectReason::RoutingCollision);
-            return;
-        }
         for track in tracks {
             if track.meta.origin == self.participant_id {
                 continue;
@@ -371,10 +360,7 @@ impl ParticipantCore {
                 origin = %track.meta.origin,
                 "participant received published track"
             );
-            if self.downstream.add_track(track.clone()).is_err() {
-                self.disconnect(DisconnectReason::RoutingCollision);
-                return;
-            }
+            self.downstream.add_track(track.clone());
         }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
@@ -905,23 +891,13 @@ impl ParticipantCore {
                 match intent {
                     DataTrackIntent::InternalSignaling => {
                         plog_info!(self.log_ctx(), "internal media signaling is opened");
-                        if !self.signaling.set_cid(cid) {
-                            self.disconnect(DisconnectReason::RoutingCollision);
-                        }
+                        self.signaling.set_cid(cid);
                     }
 
                     DataTrackIntent::UserTopic(e) => {
                         plog_info!(self.log_ctx(), "{} is opened", e);
-                        if self.signaling.cid == Some(cid) {
-                            self.disconnect(DisconnectReason::RoutingCollision);
-                            return;
-                        }
-                        if let Some(previous) = self.data_topic_channels.get(&cid) {
-                            if previous == &e {
-                                return;
-                            }
-                            self.disconnect(DisconnectReason::RoutingCollision);
-                            return;
+                        if let Some(previous) = self.data_topic_channels.remove(&cid) {
+                            self.release_data_topic_channel(previous, events);
                         }
 
                         if self.data_topic_channels.len() >= MAX_DATA_TOPIC_CHANNELS {
@@ -934,8 +910,7 @@ impl ParticipantCore {
                                 self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
                                 return;
                             }
-                            let previous = self.data_topic_channels.insert(cid, e);
-                            debug_assert!(previous.is_none());
+                            self.data_topic_channels.insert(cid, e);
                             return;
                         }
 
@@ -966,19 +941,15 @@ impl ParticipantCore {
                             return;
                         }
 
-                        let previous = self.data_topic_channels.insert(cid, e.clone());
-                        debug_assert!(previous.is_none());
+                        self.data_topic_channels.insert(cid, e.clone());
                         match e.direction {
                             DataTrackDirection::Publish => {
-                                let previous = self.data_pub_channels.insert(e.topic.clone(), cid);
-                                debug_assert!(previous.is_none());
+                                self.data_pub_channels.insert(e.topic.clone(), cid);
                                 events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
-                                let previous = self
-                                    .data_sub_channels
+                                self.data_sub_channels
                                     .insert((e.topic.clone(), e.scope), cid);
-                                debug_assert!(previous.is_none());
                                 events.subscribe_data_topic(e.topic, e.scope);
                             }
                         }
@@ -987,13 +958,10 @@ impl ParticipantCore {
             }
             Event::ChannelClose(cid) => {
                 let Some(ch) = self.data_topic_channels.remove(&cid) else {
-                    if self.signaling.cid == Some(cid) {
-                        self.signaling.cid = None;
-                    }
                     return;
                 };
                 plog_info!(self.log_ctx(), "{} is closed", ch.topic);
-                self.release_data_topic_channel(cid, ch, events);
+                self.release_data_topic_channel(ch, events);
             }
             Event::ChannelData(data) => {
                 if Some(data.id) == self.signaling.cid
@@ -1278,47 +1246,33 @@ impl ParticipantCore {
         let channels: Vec<_> = self.data_topic_channels.drain().collect();
 
         for (cid, ch) in channels {
-            self.release_data_topic_channel(cid, ch, events);
+            let _ = cid;
+            self.release_data_topic_channel(ch, events);
         }
 
         self.data_pub_channels.clear();
         self.data_sub_channels.clear();
         self.reliable_channels.clear();
-        self.signaling.cid = None;
     }
 
     fn release_data_topic_channel(
         &mut self,
-        cid: ChannelId,
         ch: DataTopicChannel,
         events: &mut impl ParticipantSink,
     ) {
         if ch.lane == DataLane::Reliable {
-            if !self.reliable_channels.close(cid, ch, events) {
-                tracing::error!(?cid, "ignoring stale reliable data channel release");
-                self.disconnect(DisconnectReason::RoutingCollision);
-            }
+            self.reliable_channels.close(ch, events);
             return;
         }
 
         match ch.direction {
             DataTrackDirection::Publish => {
-                if self.data_pub_channels.get(&ch.topic) != Some(&cid) {
-                    tracing::error!(?cid, topic = %ch.topic, "ignoring stale data publisher channel release");
-                    self.disconnect(DisconnectReason::RoutingCollision);
-                    return;
-                }
-                let removed = self.data_pub_channels.remove(&ch.topic);
-                debug_assert_eq!(removed, Some(cid));
+                self.data_pub_channels.remove(&ch.topic);
                 events.unpublish_data_topic(ch.topic);
             }
             DataTrackDirection::Subscribe => {
                 let removed = self.data_sub_channels.remove(&(ch.topic.clone(), ch.scope));
-                if removed != Some(cid) {
-                    tracing::error!(?cid, topic = %ch.topic, "ignoring stale data subscriber channel release");
-                    self.disconnect(DisconnectReason::RoutingCollision);
-                    return;
-                }
+                debug_assert!(removed.is_some());
                 events.unsubscribe_data_topic(ch.topic, ch.scope);
             }
         }

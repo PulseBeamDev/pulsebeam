@@ -53,34 +53,22 @@ impl ReliableChannels {
         Ok(())
     }
 
-    pub(super) fn close(
-        &mut self,
-        channel_id: ChannelId,
-        channel: DataTopicChannel,
-        events: &mut impl ParticipantSink,
-    ) -> bool {
+    pub(super) fn close(&mut self, channel: DataTopicChannel, events: &mut impl ParticipantSink) {
         debug_assert_eq!(channel.lane, crate::track::DataLane::Reliable);
         match channel.direction {
             DataTrackDirection::Publish => {
                 debug_assert!(channel.scope.is_none());
-                if self.publishers.get(&channel.topic) != Some(&channel_id) {
-                    return false;
-                }
                 let removed = self.publishers.remove(&channel.topic);
-                debug_assert_eq!(removed, Some(channel_id));
+                debug_assert!(removed.is_some());
                 events.unpublish_reliable_data_topic(channel.topic);
             }
             DataTrackDirection::Subscribe => {
                 debug_assert!(channel.scope.is_none());
-                if self.subscribers.get(&channel.topic) != Some(&channel_id) {
-                    return false;
-                }
                 let removed = self.subscribers.remove(&channel.topic);
-                debug_assert_eq!(removed, Some(channel_id));
+                debug_assert!(removed.is_some());
                 events.unsubscribe_reliable_data_topic(channel.topic);
             }
         }
-        true
     }
 
     pub(super) fn clear(&mut self) {

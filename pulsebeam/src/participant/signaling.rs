@@ -64,15 +64,8 @@ impl Signaling {
         }
     }
 
-    pub fn set_cid(&mut self, cid: ChannelId) -> bool {
-        match self.cid {
-            None => {
-                self.cid = Some(cid);
-                true
-            }
-            Some(existing) if existing == cid => true,
-            Some(_) => false,
-        }
+    pub fn set_cid(&mut self, cid: ChannelId) {
+        self.cid = Some(cid);
     }
 
     pub fn set_slot_count(&mut self, slot_count: usize) {

@@ -99,12 +99,6 @@ impl IntoResponse for ApiError {
             | ApiError::OfferInvalid(_)
             | ApiError::JoinError(controller::ControllerError::OfferRejected(_))
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::JoinError(controller::ControllerError::ParticipantIdCollision) => {
-                StatusCode::CONFLICT
-            }
-            ApiError::JoinError(controller::ControllerError::ConnectionConflict) => {
-                StatusCode::PRECONDITION_FAILED
-            }
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,

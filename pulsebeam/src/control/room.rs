@@ -21,50 +21,27 @@ impl Room {
         }
     }
 
-    pub fn add_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) -> bool {
-        if self.participants.contains_key(participant_id) {
-            tracing::warn!(%participant_id, "duplicate participant in room");
-            return false;
-        }
+    pub fn add_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
         self.participants.insert(*participant_id, Vec::new());
-        debug_assert!(self.participants.contains_key(participant_id));
         *self.participant_shards.entry(shard_id).or_insert(0) += 1;
-        true
     }
 
-    pub fn remove_participant(
-        &mut self,
-        participant_id: &ParticipantId,
-        shard_id: ShardId,
-    ) -> bool {
-        if self.participants.swap_remove(participant_id).is_none() {
-            tracing::debug!(%participant_id, "removing unknown participant from room");
-            return false;
-        }
+    pub fn remove_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
+        self.participants.swap_remove(participant_id);
         if let Some(count) = self.participant_shards.get_mut(&shard_id) {
-            debug_assert!(*count > 0);
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.participant_shards.remove(&shard_id);
             }
         }
-        true
     }
 
-    pub(super) fn add_track(&mut self, track: Track) -> Result<(), ()> {
+    pub(super) fn add_track(&mut self, track: Track) {
         let tracks = self.participants.entry(track.meta.origin).or_default();
 
-        if let Some(existing) = tracks.iter().find(|t| t.meta.id == track.meta.id) {
-            if existing.meta != track.meta {
-                tracing::error!(track = %track.meta.id, "conflicting track metadata in room");
-                return Err(());
-            }
-            return Ok(());
+        if !tracks.iter().any(|t| t.meta.id == track.meta.id) {
+            tracks.push(track);
         }
-        let track_id = track.meta.id;
-        tracks.push(track);
-        debug_assert!(tracks.iter().any(|candidate| candidate.meta.id == track_id));
-        Ok(())
     }
 
     pub(super) fn remove_track(&mut self, origin: &ParticipantId, track_id: &TrackId) -> bool {

@@ -77,18 +77,13 @@ impl VideoAllocator {
         }
     }
 
-    pub fn add_track(&mut self, track: Track) -> Result<(), ()> {
-        if let Some(existing) = self.tracks.get(&track.meta.id) {
-            if existing.meta != track.meta {
-                tracing::error!(track = %track.meta.id, "conflicting video track metadata");
-                return Err(());
-            }
-            return Ok(());
+    pub fn add_track(&mut self, track: Track) {
+        if self.tracks.contains_key(&track.meta.id) {
+            return;
         }
         plog_info!(self.ctx, track = %track.meta.id, "video track added");
         self.tracks.insert(track.meta.id, track);
         self.rebalance();
-        Ok(())
     }
 
     pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
@@ -1406,7 +1401,7 @@ mod assignment_tests {
             }
 
             ids.push(meta.id);
-            let _ = allocator.add_track(Track {
+            allocator.add_track(Track {
                 meta,
                 layers: track.layers,
             });
@@ -1620,7 +1615,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
         let track_id = tx.meta.id;
-        let _ = allocator.add_track(Track {
+        allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
         });
@@ -1720,7 +1715,7 @@ mod assignment_tests {
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
-        let _ = allocator.add_track(Track {
+        allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
         });
@@ -1995,7 +1990,7 @@ mod assignment_tests {
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
-        let _ = allocator.add_track(Track {
+        allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
         });
@@ -2029,7 +2024,7 @@ mod assignment_tests {
         }
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
-        let _ = allocator.add_track(Track {
+        allocator.add_track(Track {
             meta,
             layers: track.layers,
         });
@@ -2054,7 +2049,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        let _ = allocator.add_track(Track {
+        allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers.clone(),
         });
