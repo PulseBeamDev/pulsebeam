@@ -1114,7 +1114,7 @@ async fn execute_plan(
                 }
                 // Same windowing as the byte baselines, so the checks describe this step.
                 pulsebeam::sim_metrics::reset();
-                pulsebeam_runtime::net::shaper::reset_stats();
+                pulsebeam_runtime::net::shaper::reset_stats_for(name_to_ip.values().copied());
                 window = *duration;
                 tokio::time::sleep(*duration).await;
             }
@@ -1843,6 +1843,14 @@ async fn execute_plan(
         })
         .collect();
 
+    let reversals_by_publisher: BTreeMap<&'static str, u64> = handles
+        .iter()
+        .filter_map(|(name, handle)| {
+            let id = handle.participant_id()?;
+            Some((*name, pulsebeam::sim_metrics::quality_reversals(&id)))
+        })
+        .collect();
+
     let mut names: Vec<_> = handles.keys().copied().collect();
     names.sort_unstable();
     for name in names {
@@ -1860,6 +1868,7 @@ async fn execute_plan(
         let mut report = measure(handle, ip, window);
         report.forwarded_quality = quality_by_publisher.clone();
         report.quality_changes = changes_by_publisher.clone();
+        report.quality_reversals = reversals_by_publisher.clone();
         reports
             .lock()
             .expect("reports poisoned")
@@ -2087,6 +2096,13 @@ pub struct LinkReport {
     /// endpoint, and a stream flipping between two layers many times a second looks perfectly
     /// healthy in all of them - right final layer, right byte count, right estimate.
     pub quality_changes: BTreeMap<&'static str, u64>,
+    /// How many times each publisher's forwarded layer *reversed direction* during the window.
+    ///
+    /// Climbing through layers as bandwidth is discovered is correct, so a raw change count cannot
+    /// separate a healthy ramp from a stream oscillating between two - it counts both. A reversal
+    /// is the part that is never right, which makes it the figure a property can assert on across
+    /// a whole run rather than only after everything has settled.
+    pub quality_reversals: BTreeMap<&'static str, u64>,
     /// Layer last forwarded from each publisher, by participant name. 0 means paused.
     ///
     /// Keyed by the *publisher* rather than folded into the link's numbers, because contention is
@@ -2168,6 +2184,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         link_loss_drops: stats.dropped_loss,
         forwarded_quality: BTreeMap::new(),
         quality_changes: BTreeMap::new(),
+        quality_reversals: BTreeMap::new(),
     }
 }
 

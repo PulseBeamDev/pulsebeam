@@ -325,8 +325,17 @@ pub fn stats(ip: IpAddr) -> Stats {
 }
 
 /// Clear observed behaviour so an assertion describes only the window just run.
-pub fn reset_stats() {
-    stats_map().lock().expect("shaper stats poisoned").clear();
+/// Clear the counters for `ips` only.
+///
+/// The map is process-global and plans run in parallel, so clearing all of it would zero the
+/// counters of every plan currently mid-window - producing a report that describes a fraction of
+/// the traffic that actually flowed, and only when another plan happened to start a step at the
+/// wrong moment.
+pub fn reset_stats_for(ips: impl IntoIterator<Item = IpAddr>) {
+    let mut guard = stats_map().lock().expect("shaper stats poisoned");
+    for ip in ips {
+        guard.remove(&ip);
+    }
 }
 
 /// Drop every configured limit. The registry is process-global, so a plan that sets limits must
