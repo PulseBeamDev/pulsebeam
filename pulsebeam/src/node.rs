@@ -10,7 +10,10 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use tokio::time::Instant;
+
+use crate::clock::WallAnchor;
 use str0m::Candidate;
 use tokio::runtime::LocalOptions;
 use tokio::task::JoinSet;
@@ -321,6 +324,10 @@ impl NodeBuilder {
             .map(|_| rand::Rng::seed_from_u64(rng.next_u64()))
             .collect();
 
+        // One NTP<->Instant anchor for the whole node: read the wall clock once,
+        // here, so every shard shares a timeline and nothing reads it again.
+        let wall_anchor = WallAnchor::new(SystemTime::now(), Instant::now());
+
         let mut shard_contexts = Vec::new();
 
         for (shard_idx, (((udp_sock, tcp_sock), cross_shard_event_rx), shard_rng)) in udp_sockets
@@ -348,6 +355,7 @@ impl NodeBuilder {
                     cross_shard_event_txs,
                     shard_occupancy,
                     shard_rng,
+                    wall_anchor,
                 );
                 join_set.spawn_local(ignore(shard.run()));
             } else {
@@ -378,6 +386,7 @@ impl NodeBuilder {
                                 cross_shard_event_txs,
                                 shard_occupancy,
                                 shard_rng,
+                                wall_anchor,
                             );
                             tokio::task::unconstrained(shard.run()).await;
                         });

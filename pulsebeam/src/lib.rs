@@ -2,6 +2,7 @@
 
 pub mod audio_selector;
 mod bitrate;
+pub mod clock;
 pub mod control;
 pub mod entity;
 pub mod id;
