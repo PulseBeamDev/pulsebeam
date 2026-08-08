@@ -371,6 +371,126 @@ impl fmt::Debug for ConnectionId {
     }
 }
 
+const MAX_OPAQUE_ID_LEN: usize = 64;
+
+fn validate_opaque_string(s: &str, extra: fn(char) -> bool) -> Result<(), IdValidationError> {
+    if s.is_empty() {
+        return Err(IdValidationError::Empty);
+    }
+    if s.len() > MAX_OPAQUE_ID_LEN {
+        return Err(IdValidationError::TooLong(MAX_OPAQUE_ID_LEN));
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || extra(c)) {
+        return Err(IdValidationError::InvalidCharacters);
+    }
+    Ok(())
+}
+
+/// A JWT `kid`. Chosen by whoever issues the token, so it is an opaque string rather than one of
+/// the prefix-encoded UUIDs above.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Display, AsRef, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "&str")]
+#[as_ref(forward)]
+pub struct KeyId(ArrayString<MAX_OPAQUE_ID_LEN>);
+
+impl KeyId {
+    pub fn new(id: &str) -> Result<Self, IdValidationError> {
+        validate_opaque_string(id, |c| matches!(c, '_' | '-' | '.'))?;
+        Ok(Self(ArrayString::from(id).unwrap()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl FromStr for KeyId {
+    type Err = IdValidationError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<&str> for KeyId {
+    type Error = IdValidationError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// An end-user identity, taken verbatim from a token's `sub`. Owned by the application backend;
+/// the SFU never mints or persists one.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Display, AsRef, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "&str")]
+#[as_ref(forward)]
+pub struct Identity(ArrayString<MAX_OPAQUE_ID_LEN>);
+
+impl Identity {
+    pub fn new(id: &str) -> Result<Self, IdValidationError> {
+        validate_opaque_string(id, |c| matches!(c, '_' | '-' | '.' | '@' | ':' | '+'))?;
+        Ok(Self(ArrayString::from(id).unwrap()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl FromStr for Identity {
+    type Err = IdValidationError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<&str> for Identity {
+    type Error = IdValidationError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// Generation counter for a participant's connection, incremented on every join and resume.
+///
+/// `u32` so it fits the bits the ICE ufrag reserves for `connection_seq`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Display,
+    serde::Serialize,
+    serde::Deserialize,
+    ToSchema,
+)]
+#[serde(transparent)]
+pub struct ConnectionEpoch(u32);
+
+impl ConnectionEpoch {
+    pub const ZERO: Self = Self(0);
+
+    pub fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum TrackKind {
     Data,
@@ -865,5 +985,101 @@ mod tests {
         for c in p.derive_track_id(TrackKind::Video, "c").as_str().chars() {
             assert!(c.is_ascii_alphanumeric() || c == '_');
         }
+    }
+
+    #[test]
+    fn key_id_accepts_jwks_style_names() {
+        for valid in ["key-2026-08", "kid_1", "auth.example.com", "AbC123"] {
+            assert!(KeyId::new(valid).is_ok(), "{valid} should be a valid kid");
+        }
+    }
+
+    #[test]
+    fn opaque_ids_reject_empty_oversized_and_hostile_input() {
+        assert_eq!(KeyId::new(""), Err(IdValidationError::Empty));
+        assert_eq!(Identity::new(""), Err(IdValidationError::Empty));
+
+        let long = "a".repeat(MAX_OPAQUE_ID_LEN + 1);
+        assert_eq!(
+            KeyId::new(&long),
+            Err(IdValidationError::TooLong(MAX_OPAQUE_ID_LEN))
+        );
+        assert_eq!(
+            Identity::new(&long),
+            Err(IdValidationError::TooLong(MAX_OPAQUE_ID_LEN))
+        );
+
+        // A kid is echoed into log lines and used as a map key; nothing structural may pass.
+        for hostile in ["a b", "a\nb", "a/b", "a\"b", "a\0b", "../etc", "a{b}"] {
+            assert_eq!(
+                KeyId::new(hostile),
+                Err(IdValidationError::InvalidCharacters),
+                "{hostile:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_accepts_email_and_uri_shaped_subjects() {
+        for valid in [
+            "user_1042",
+            "ada@example.com",
+            "auth0-abc",
+            "oidc:google:12345",
+        ] {
+            assert!(
+                Identity::new(valid).is_ok(),
+                "{valid} should be a valid sub"
+            );
+        }
+        // `@` is meaningful for subjects but never for key ids.
+        assert!(KeyId::new("ada@example.com").is_err());
+    }
+
+    #[test]
+    fn opaque_ids_roundtrip_through_their_string_form() {
+        let kid = KeyId::new("key-2026-08").unwrap();
+        assert_eq!(KeyId::from_str(kid.as_str()).unwrap(), kid);
+        assert_eq!(
+            serde_json::from_str::<KeyId>(&serde_json::to_string(&kid).unwrap()).unwrap(),
+            kid
+        );
+
+        let sub = Identity::new("ada@example.com").unwrap();
+        assert_eq!(Identity::from_str(sub.as_str()).unwrap(), sub);
+        assert_eq!(
+            serde_json::from_str::<Identity>(&serde_json::to_string(&sub).unwrap()).unwrap(),
+            sub
+        );
+    }
+
+    #[test]
+    fn deserializing_an_invalid_opaque_id_fails() {
+        assert!(serde_json::from_str::<KeyId>("\"a b\"").is_err());
+        assert!(serde_json::from_str::<Identity>("\"\"").is_err());
+    }
+
+    #[test]
+    fn connection_epoch_increments_monotonically_and_saturates_safely() {
+        let mut epoch = ConnectionEpoch::ZERO;
+        assert_eq!(epoch.get(), 0);
+        for expected in 1..=100u32 {
+            epoch = epoch.checked_next().unwrap();
+            assert_eq!(epoch.get(), expected);
+        }
+        assert!(ConnectionEpoch::new(u32::MAX).checked_next().is_none());
+    }
+
+    #[test]
+    fn connection_epoch_is_ordered_and_serializes_as_a_bare_number() {
+        assert!(ConnectionEpoch::new(1) < ConnectionEpoch::new(2));
+        assert_eq!(
+            serde_json::to_string(&ConnectionEpoch::new(7)).unwrap(),
+            "7"
+        );
+        assert_eq!(
+            serde_json::from_str::<ConnectionEpoch>("7").unwrap(),
+            ConnectionEpoch::new(7)
+        );
     }
 }
