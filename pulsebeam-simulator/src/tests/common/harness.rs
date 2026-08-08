@@ -2648,8 +2648,17 @@ impl LinkProfile {
 }
 
 impl Default for LinkProfile {
+    /// Wi-Fi, not fibre.
+    ///
+    /// A plan that says nothing about its link is not asking for a perfect one - it is asking for
+    /// a normal one, and normal is a home Wi-Fi path that loses packets in bursts, occasionally
+    /// delivers late, and sometimes delivers twice. Defaulting to fibre meant almost the whole
+    /// suite validated behaviour against conditions no user has, which is how a probe regression
+    /// that only appears under jitter and burst loss passed every plan here. Opt into
+    /// [`LinkProfile::fiber`] when a plan is about signalling or allocation logic and the path is
+    /// deliberately not the variable under test.
     fn default() -> Self {
-        Self::fiber()
+        Self::wifi()
     }
 }
 
