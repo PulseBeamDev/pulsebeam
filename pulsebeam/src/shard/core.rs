@@ -2,6 +2,8 @@ use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
+use crate::clock::WallAnchor;
+
 use super::events::{
     AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
 };
@@ -159,10 +161,16 @@ pub(crate) struct ShardCore {
     udp_send_batch: GsoSendBatch,
     pipeline: EventPipeline,
     rng: Rng,
+    wall: WallAnchor,
 }
 
 impl ShardCore {
-    pub(crate) fn new(shard_id: impl Into<ShardId>, max_gso_segments: usize, rng: Rng) -> Self {
+    pub(crate) fn new(
+        shard_id: impl Into<ShardId>,
+        max_gso_segments: usize,
+        rng: Rng,
+        wall: WallAnchor,
+    ) -> Self {
         let shard_id = shard_id.into();
         Self {
             shard_id,
@@ -173,7 +181,21 @@ impl ShardCore {
             udp_send_batch: GsoSendBatch::preallocated(),
             pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             rng,
+            wall,
         }
+    }
+
+    /// The node's NTP↔`Instant` mapping, captured once at startup and shared by
+    /// every shard so their timelines agree.
+    ///
+    /// This is a *fallback*. A stream's authoritative NTP reference is its
+    /// sender's RTCP Sender Reports, which `Synchronizer` already tracks; this
+    /// only covers streams that have not produced one yet. It is deliberately
+    /// never refreshed: re-anchoring mid-stream would step playout scheduling,
+    /// and reading the wall clock per tick is both a syscall on the packet path
+    /// and a source of nondeterminism under simulation.
+    pub(crate) fn wall(&self) -> &WallAnchor {
+        &self.wall
     }
 
     pub(crate) fn next_timer_deadline(&mut self) -> Option<Instant> {
@@ -770,7 +792,12 @@ mod test {
     }
 
     fn new_core() -> ShardCore {
-        ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42))
+        ShardCore::new(
+            0,
+            1,
+            pulsebeam_runtime::rand::seeded_rng(42),
+            WallAnchor::new(std::time::SystemTime::now(), Instant::now()),
+        )
     }
 
     fn clear_dirty(core: &mut ShardCore) {
