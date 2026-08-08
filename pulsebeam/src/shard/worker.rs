@@ -1,5 +1,7 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
+use crate::clock::WallAnchor;
+
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
@@ -198,8 +200,9 @@ impl ShardWorker {
         cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
         metrics: Arc<ShardMetrics>,
         rng: Rng,
+        wall: WallAnchor,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng);
+        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall);
         let router = ShardRouter {
             shard_id,
             cross_shard_event_txs,

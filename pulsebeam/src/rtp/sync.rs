@@ -1,6 +1,7 @@
+use crate::clock::NtpTime;
 use crate::rtp::RtpPacket;
 use ahash::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use str0m::{
     media::{Frequency, MediaTime},
     rtp::{Ssrc, rtcp::SenderInfo},
@@ -14,7 +15,7 @@ const MAX_RTP_GAP_SECS: f64 = 10.0;
 #[derive(Debug, Clone, Copy)]
 struct ClockReference {
     rtp_time: MediaTime,
-    ntp_time: SystemTime,
+    ntp_time: NtpTime,
     arrival_ts: Instant,
 }
 
@@ -39,7 +40,7 @@ impl ClockReference {
             }
             // other is earlier on the NTP clock: compare the other way round.
             Err(e) => {
-                if other.arrival_ts + e.duration() < self.arrival_ts {
+                if other.arrival_ts + e < self.arrival_ts {
                     other
                 } else {
                     self
@@ -179,7 +180,7 @@ impl Synchronizer {
 
         let current = ClockReference {
             rtp_time: sr.rtp_time,
-            ntp_time: sr.ntp_time,
+            ntp_time: NtpTime::from_system_time(sr.ntp_time),
             arrival_ts: now,
         };
 
