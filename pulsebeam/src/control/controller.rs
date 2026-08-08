@@ -81,6 +81,12 @@ pub enum ControllerError {
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
 
+    #[error("participant id is already in use")]
+    ParticipantIdCollision,
+
+    #[error("participant connection precondition failed")]
+    ConnectionConflict,
+
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
 
@@ -229,6 +235,25 @@ impl ControllerActor {
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         self.core
+            .validate_patch(
+                &state.participant_id,
+                &state.room_id,
+                state
+                    .old_connection_id
+                    .ok_or(ControllerError::ConnectionConflict)?,
+            )
+            .map_err(|err| match err {
+                crate::control::core::ControllerCoreError::ConnectionConflict => {
+                    ControllerError::ConnectionConflict
+                }
+                crate::control::core::ControllerCoreError::ParticipantIdCollision => {
+                    ControllerError::ParticipantIdCollision
+                }
+                crate::control::core::ControllerCoreError::ParticipantNotFound => {
+                    ControllerError::ConnectionConflict
+                }
+            })?;
+        self.core
             .delete_participant(&state.participant_id, &mut self.eq);
         self.handle_create_participant(state, offer)
     }
@@ -276,6 +301,9 @@ impl ControllerActor {
         state: ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
+        if self.core.get_participant(&state.participant_id).is_some() {
+            return Err(ControllerError::ParticipantIdCollision);
+        }
         // Determine shard first so we can encode it into the ICE ufrag.
         let routing_key = self.core.routing_key(&state.room_id);
         let shard_id = self
@@ -295,7 +323,10 @@ impl ControllerActor {
         let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
 
         let (rtc, answer) = self.negotiator.create_answer(offer, creds)?;
-        let cfg = self.core.create_participant(rtc, state, shard_id);
+        let cfg = self
+            .core
+            .create_participant(rtc, state, shard_id)
+            .map_err(|_| ControllerError::ParticipantIdCollision)?;
 
         self.eq.broadcast(ClusterCommand::RegisterParticipant {
             shard_id,

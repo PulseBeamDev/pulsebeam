@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::{
     control::{controller::ParticipantState, registry::RoomRegistry},
-    entity::{ParticipantId, RoomId},
+    entity::{ConnectionId, ParticipantId, RoomId},
     id::ShardId,
     participant::ParticipantConfig,
     shard::worker::{ClusterCommand, ShardCommand, ShardEvent, ShardEventWrapper},
@@ -16,6 +16,16 @@ const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 pub enum ControllerEvent {
     ShardCommandBroadcasted(ClusterCommand),
     ShardCommandSent(ShardId, ShardCommand),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControllerCoreError {
+    #[error("participant id already exists")]
+    ParticipantIdCollision,
+    #[error("participant not found")]
+    ParticipantNotFound,
+    #[error("participant connection precondition failed")]
+    ConnectionConflict,
 }
 
 pub struct ControllerEventQueue {
@@ -67,9 +77,23 @@ impl ControllerCore {
     pub fn process_shard_event(&mut self, e: ShardEventWrapper, eq: &mut ControllerEventQueue) {
         match e.ev {
             ShardEvent::TrackPublished(track) => {
-                let Some((room_id, other_participants)) = self.registry.add_track(track.clone())
-                else {
+                if track.meta.shard_id != e.from_shard_id {
+                    tracing::error!(
+                        track = %track.meta.id,
+                        origin = %track.meta.origin,
+                        source_shard = %e.from_shard_id,
+                        track_shard = %track.meta.shard_id,
+                        "rejecting track publication from unexpected shard"
+                    );
                     return;
+                }
+                let (room_id, other_participants) = match self.registry.add_track(track.clone()) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => return,
+                    Err(_) => {
+                        tracing::error!(track = %track.meta.id, origin = %track.meta.origin, "track routing collision in controller");
+                        return;
+                    }
                 };
 
                 for shard_id in other_participants {
@@ -80,6 +104,19 @@ impl ControllerCore {
                 }
             }
             ShardEvent::TrackUnpublished { origin, track_id } => {
+                if self
+                    .registry
+                    .get_participant(&origin)
+                    .is_none_or(|meta| meta.shard_id != e.from_shard_id)
+                {
+                    tracing::error!(
+                        %origin,
+                        %track_id,
+                        source_shard = %e.from_shard_id,
+                        "rejecting track unpublication from unexpected shard"
+                    );
+                    return;
+                }
                 let Some((room_id, other_participants)) =
                     self.registry.remove_track(origin, track_id)
                 else {
@@ -183,25 +220,61 @@ impl ControllerCore {
         format!("{}-{}", room_id, epoch)
     }
 
+    pub fn get_participant(
+        &self,
+        participant_id: &ParticipantId,
+    ) -> Option<&crate::control::registry::ParticipantMeta> {
+        self.registry.get_participant(participant_id)
+    }
+
     pub fn create_participant(
         &mut self,
         rtc: Rtc,
         state: ParticipantState,
         shard_id: ShardId,
-    ) -> ParticipantConfig {
+    ) -> Result<ParticipantConfig, ControllerCoreError> {
+        if self
+            .registry
+            .get_participant(&state.participant_id)
+            .is_some()
+        {
+            tracing::warn!(participant = %state.participant_id, "duplicate participant creation");
+            return Err(ControllerCoreError::ParticipantIdCollision);
+        }
         let tracks = {
             let room = self.registry.get_or_create_room(state.room_id);
             room.tracks().cloned().collect()
         };
         self.registry
-            .add_participant(state.participant_id, state.room_id, shard_id);
-        ParticipantConfig {
+            .add_participant_with_connection(
+                state.participant_id,
+                state.room_id,
+                shard_id,
+                state.connection_id,
+            )
+            .map_err(|_| ControllerCoreError::ParticipantIdCollision)?;
+        Ok(ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
             participant_id: state.participant_id,
             rtc,
             available_tracks: tracks,
+        })
+    }
+
+    pub fn validate_patch(
+        &self,
+        participant_id: &ParticipantId,
+        room_id: &RoomId,
+        old_connection_id: ConnectionId,
+    ) -> Result<(), ControllerCoreError> {
+        let Some(meta) = self.registry.get_participant(participant_id) else {
+            return Err(ControllerCoreError::ParticipantNotFound);
+        };
+        if meta.room_id != *room_id || meta.connection_id != old_connection_id {
+            return Err(ControllerCoreError::ConnectionConflict);
         }
+        Ok(())
     }
 
     pub fn delete_participant(
@@ -432,6 +505,58 @@ mod tests {
         assert!(eq.pop().is_none());
     }
 
+    #[test]
+    fn track_unpublished_from_wrong_shard_preserves_route() {
+        let mut core = ControllerCore::new();
+        let mut eq = ControllerEventQueue::default();
+        let room = room_id(5);
+        let publisher = pid(50);
+        let subscriber = pid(51);
+        let track_id = publisher.derive_track_id(TrackKind::Audio, "a");
+        let track = crate::track::Track {
+            meta: TrackMeta {
+                shard_id: ShardId::new(0),
+                id: track_id,
+                origin: publisher,
+            },
+            layers: Vec::new(),
+        };
+
+        core.registry
+            .add_participant(publisher, room, ShardId::new(0));
+        core.registry
+            .add_participant(subscriber, room, ShardId::new(1));
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: ShardId::new(0),
+                ev: ShardEvent::TrackPublished(track),
+            },
+            &mut eq,
+        );
+        let _ = eq.pop();
+
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: ShardId::new(1),
+                ev: ShardEvent::TrackUnpublished {
+                    origin: publisher,
+                    track_id,
+                },
+            },
+            &mut eq,
+        );
+
+        assert!(eq.pop().is_none());
+        assert_eq!(
+            core.registry
+                .get_room(&room)
+                .unwrap()
+                .tracks_published_by(&publisher)
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn delete_participant_broadcasts_scoped_unregister() {
         let mut core = ControllerCore::new();
@@ -478,6 +603,7 @@ mod tests {
             .add_participant(publisher, room, ShardId::new(0));
         core.registry
             .add_participant(subscriber, room, ShardId::new(1));
+        core.registry.remove_participant(&subscriber);
         core.registry
             .add_participant(subscriber, room, ShardId::new(2));
 

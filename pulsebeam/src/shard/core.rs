@@ -20,7 +20,9 @@ use crate::{
 };
 use str0m::media::Rid;
 
-use super::router::{self, ParticipantShardMeta, RoutingContext, ShardRoutingTable};
+use super::router::{
+    self, ParticipantShardMeta, RoutingCollision, RoutingContext, ShardRoutingTable,
+};
 
 pub(crate) use super::router::CrossShardSend;
 use super::worker::{ClusterCommand, CrossShardEvent, ShardCommand, ShardEvent};
@@ -150,6 +152,24 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     }
 }
 
+impl ShardCore {
+    fn disconnect_routing_collision(
+        &mut self,
+        participant_id: ParticipantId,
+        collision: RoutingCollision,
+    ) {
+        if let Some((handle, participant)) = self.registry.get_mut_with_handle(&participant_id) {
+            participant.disconnect(crate::participant::DisconnectReason::RoutingCollision);
+            self.dirty.mark(handle, participant);
+        }
+        tracing::error!(
+            %participant_id,
+            kind = ?collision.kind,
+            "participant disconnected after routing collision"
+        );
+    }
+}
+
 pub(crate) struct ShardCore {
     pub(crate) shard_id: ShardId,
     registry: ParticipantRegistry,
@@ -244,8 +264,20 @@ impl ShardCore {
         while let Some(event) = self.pipeline.pop_participant_event() {
             match event {
                 ParticipantEvent::Topology(ev) => {
-                    if let Some(shard_event) = self.routing.handle_topology_event(ev) {
-                        self.pipeline.push_shard_event(shard_event);
+                    let subscriber = match &ev {
+                        super::events::ParticipantTopologyEvent::TrackSubscribed {
+                            subscriber,
+                            ..
+                        }
+                        | super::events::ParticipantTopologyEvent::TrackUnsubscribed {
+                            subscriber,
+                            ..
+                        } => *subscriber,
+                    };
+                    match self.routing.handle_topology_event(ev) {
+                        Ok(Some(shard_event)) => self.pipeline.push_shard_event(shard_event),
+                        Ok(None) => {}
+                        Err(collision) => self.disconnect_routing_collision(subscriber, collision),
                     }
                 }
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
@@ -261,8 +293,12 @@ impl ShardCore {
                         publisher,
                         topic,
                     } => {
-                        self.routing
-                            .register_data_publisher(room_id, publisher, topic);
+                        if let Err(collision) = self
+                            .routing
+                            .register_data_publisher(room_id, publisher, topic)
+                        {
+                            self.disconnect_routing_collision(publisher, collision);
+                        }
                     }
                     ParticipantControlEvent::DataTopicUnpublished {
                         room_id,
@@ -278,18 +314,24 @@ impl ShardCore {
                         topic,
                         publisher,
                     } => {
-                        if self.routing.register_data_subscriber(
+                        match self.routing.register_data_subscriber(
                             room_id,
                             subscriber,
                             topic.clone(),
                             publisher,
                         ) {
-                            self.pipeline
-                                .push_shard_event(ShardEvent::DataTopicSubscribed {
-                                    room_id,
-                                    topic,
-                                    publisher,
-                                });
+                            Ok(true) => {
+                                self.pipeline
+                                    .push_shard_event(ShardEvent::DataTopicSubscribed {
+                                        room_id,
+                                        topic,
+                                        publisher,
+                                    })
+                            }
+                            Ok(false) => {}
+                            Err(collision) => {
+                                self.disconnect_routing_collision(subscriber, collision)
+                            }
                         }
                     }
                     ParticipantControlEvent::DataTopicUnsubscribed {
@@ -315,8 +357,12 @@ impl ShardCore {
                         publisher,
                         topic,
                     } => {
-                        self.routing
-                            .register_reliable_data_publisher(room_id, publisher, topic);
+                        if let Err(collision) = self
+                            .routing
+                            .register_reliable_data_publisher(room_id, publisher, topic)
+                        {
+                            self.disconnect_routing_collision(publisher, collision);
+                        }
                     }
                     ParticipantControlEvent::ReliableDataTopicUnpublished {
                         room_id,
@@ -331,8 +377,15 @@ impl ShardCore {
                         subscriber,
                         topic,
                     } => {
-                        self.routing
-                            .register_reliable_data_subscriber(room_id, subscriber, topic);
+                        match self
+                            .routing
+                            .register_reliable_data_subscriber(room_id, subscriber, topic)
+                        {
+                            Ok(_) => {}
+                            Err(collision) => {
+                                self.disconnect_routing_collision(subscriber, collision)
+                            }
+                        }
                     }
                     ParticipantControlEvent::ReliableDataTopicUnsubscribed {
                         room_id,
@@ -460,13 +513,15 @@ impl ShardCore {
                 room_id,
                 participant_id,
             } => {
-                if shard_id != self.shard_id {
-                    self.routing.register_remote_participant(
+                if shard_id != self.shard_id
+                    && let Err(collision) = self.routing.register_remote_participant(
                         participant_id,
                         room_id,
                         shard_id,
                         &mut self.rng,
-                    );
+                    )
+                {
+                    tracing::error!(?collision, %participant_id, "cluster participant registration collision");
                 }
             }
             ClusterCommand::UnregisterParticipant {
@@ -486,10 +541,12 @@ impl ShardCore {
                     dirty: &mut self.dirty,
                     router,
                 };
-                self.routing.publish_track(track, room_id, &mut ctx);
+                if let Err(collision) = self.routing.publish_track(track, room_id, &mut ctx) {
+                    tracing::error!(?collision, "cluster track publication collision");
+                }
             }
             ClusterCommand::UnpublishTracks {
-                origin: _,
+                origin,
                 room_id,
                 track_ids,
             } => {
@@ -498,14 +555,23 @@ impl ShardCore {
                     dirty: &mut self.dirty,
                     router,
                 };
-                self.routing.unpublish_tracks(room_id, &track_ids, &mut ctx);
+                if let Err(collision) = self
+                    .routing
+                    .unpublish_tracks(room_id, origin, &track_ids, &mut ctx)
+                {
+                    tracing::error!(?collision, "cluster track unpublication collision");
+                }
             }
             ClusterCommand::SubscribeTrack {
                 from_shard_id,
                 track,
             } => {
-                self.routing
-                    .register_remote_subscriber_shard(from_shard_id, track);
+                if let Err(collision) = self
+                    .routing
+                    .register_remote_subscriber_shard(from_shard_id, track)
+                {
+                    tracing::error!(?collision, "cluster track subscription collision");
+                }
             }
             ClusterCommand::UnsubscribeTrack {
                 from_shard_id,
@@ -520,12 +586,14 @@ impl ShardCore {
                 topic,
                 publisher,
             } => {
-                self.routing.register_remote_data_subscriber_shard(
+                if let Err(collision) = self.routing.register_remote_data_subscriber_shard(
                     room_id,
                     from_shard_id,
                     topic,
                     publisher,
-                );
+                ) {
+                    tracing::error!(?collision, "cluster data topic subscription collision");
+                }
             }
             ClusterCommand::UnsubscribeDataTopic {
                 room_id,
@@ -643,15 +711,26 @@ impl ShardCore {
     fn add_participant(&mut self, cfg: ParticipantConfig, router: &impl CrossShardSend) {
         let room_id = cfg.room_id;
         let participant_id = cfg.participant_id;
-        self.remove_participant(&participant_id);
+        if self.registry.contains(&participant_id)
+            || self.routing.participant_route_exists(&participant_id)
+        {
+            tracing::error!(%participant_id, "rejecting duplicate participant route");
+            return;
+        }
         let _ = router; // reserved: re-add currently needs no cross-shard notice
         let participant_id = self.registry.insert(cfg, &mut self.rng);
         let handle = self
             .registry
             .handle(&participant_id)
             .expect("new participant must have a local handle");
-        self.routing
-            .add_local_member(participant_id, handle, room_id, &mut self.rng);
+        if let Err(collision) =
+            self.routing
+                .add_local_member(participant_id, handle, room_id, &mut self.rng)
+        {
+            self.disconnect_routing_collision(participant_id, collision);
+            self.registry.remove(&participant_id);
+            return;
+        }
         let participant = self
             .registry
             .get_mut(&participant_id)
@@ -836,6 +915,7 @@ mod test {
             ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
             &router,
         );
+        core.on_command(ShardCommand::RemoveParticipant(participant), &router);
         core.on_command(
             ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
             &router,
@@ -986,8 +1066,19 @@ mod test {
         );
         assert!(core.dirty.contains(&subscriber));
         clear_dirty(&mut core);
-        core.routing
+        let _ = core
+            .routing
             .register_subscriber(subscriber, video_track(publisher, 1));
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::PublishTrack(
+                crate::track::Track {
+                    meta: video_track(publisher, 1),
+                    layers: Vec::new(),
+                },
+                r,
+            )),
+            &router,
+        );
 
         core.on_cross_shard_event(
             CrossShardEvent::VideoRtpPublished {

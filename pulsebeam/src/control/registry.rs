@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{
     control::room::Room,
-    entity::{ParticipantId, RoomId, TrackId},
+    entity::{ConnectionId, ParticipantId, RoomId, TrackId},
     id::ShardId,
     track::Track,
 };
@@ -14,12 +14,24 @@ const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ParticipantMeta {
     pub shard_id: ShardId,
     pub room_id: RoomId,
+    pub connection_id: ConnectionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticipantRegistrationError {
+    Collision(ParticipantId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackRegistrationError {
+    Collision(TrackId),
 }
 
 pub struct RoomRegistry {
     sweeper: DelayQueue<RoomId>,
     rooms: HashMap<RoomId, Room>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
+    tracks: HashMap<TrackId, (RoomId, ParticipantId, ShardId)>,
 }
 
 impl RoomRegistry {
@@ -28,6 +40,7 @@ impl RoomRegistry {
             sweeper: DelayQueue::with_capacity(1024),
             rooms: HashMap::new(),
             participants: HashMap::new(),
+            tracks: HashMap::new(),
         }
     }
 
@@ -36,43 +49,68 @@ impl RoomRegistry {
     }
 
     pub fn get_or_create_room(&mut self, room_id: RoomId) -> &Room {
-        self.rooms
+        let room = self
+            .rooms
             .entry(room_id)
-            .or_insert_with(|| Room::new(room_id))
+            .or_insert_with(|| Room::new(room_id));
+        debug_assert_eq!(room.room_id, room_id);
+        room
     }
 
-    pub fn room_mut_for(&mut self, participant_id: &ParticipantId) -> Option<&mut Room> {
-        let meta = self.participants.get(participant_id).or_else(|| {
-            tracing::warn!(%participant_id, "participant not found in reigstry, dropping");
-            None
-        })?;
-        self.rooms.get_mut(&meta.room_id).or_else(|| {
-            tracing::warn!(%participant_id, room = %meta.room_id, "room not found in registry, dropping");
-            None
-        })
-    }
-
+    #[cfg(test)]
     pub fn add_participant(
         &mut self,
         participant_id: ParticipantId,
         room_id: RoomId,
         shard_id: ShardId,
     ) {
-        if let Some(previous) = self
-            .participants
-            .insert(participant_id, ParticipantMeta { shard_id, room_id })
-            && let Some(room) = self.rooms.get_mut(&previous.room_id)
-        {
-            room.remove_participant(&participant_id, previous.shard_id);
-            if room.participant_count() == 0 {
-                self.sweeper.insert(previous.room_id, EMPTY_ROOM_TIMEOUT);
-            }
+        let _ = self.add_participant_with_connection(
+            participant_id,
+            room_id,
+            shard_id,
+            ConnectionId::MIN,
+        );
+    }
+
+    pub fn add_participant_with_connection(
+        &mut self,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+        shard_id: ShardId,
+        connection_id: ConnectionId,
+    ) -> Result<(), ParticipantRegistrationError> {
+        if self.participants.contains_key(&participant_id) {
+            tracing::warn!(%participant_id, "duplicate participant registry insertion");
+            return Err(ParticipantRegistrationError::Collision(participant_id));
         }
+
         let room = self
             .rooms
             .entry(room_id)
             .or_insert_with(|| Room::new(room_id));
-        room.add_participant(&participant_id, shard_id);
+        debug_assert_eq!(room.room_id, room_id);
+        let inserted = room.add_participant(&participant_id, shard_id);
+        debug_assert!(inserted);
+        if !inserted {
+            return Err(ParticipantRegistrationError::Collision(participant_id));
+        }
+        self.participants.insert(
+            participant_id,
+            ParticipantMeta {
+                shard_id,
+                room_id,
+                connection_id,
+            },
+        );
+        debug_assert_eq!(
+            self.participants.get(&participant_id).map(|meta| (
+                meta.room_id,
+                meta.shard_id,
+                meta.connection_id
+            )),
+            Some((room_id, shard_id, connection_id))
+        );
+        Ok(())
     }
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
@@ -83,22 +121,58 @@ impl RoomRegistry {
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
         let meta = self.participants.remove(participant_id)?;
         if let Some(room) = self.rooms.get_mut(&meta.room_id) {
-            room.remove_participant(participant_id, meta.shard_id);
+            let removed = room.remove_participant(participant_id, meta.shard_id);
+            debug_assert!(removed);
             if room.participant_count() == 0 {
                 self.sweeper.insert(meta.room_id, EMPTY_ROOM_TIMEOUT);
             }
         }
+        self.tracks
+            .retain(|_, (_, origin, _)| origin != participant_id);
         Some(meta.shard_id)
     }
 
-    pub fn add_track(&mut self, track: Track) -> Option<(RoomId, Vec<ShardId>)> {
-        let origin_shard = self.participants.get(&track.meta.origin)?.shard_id;
-        let room = self.room_mut_for(&track.meta.origin)?;
-        room.add_track(track.clone());
+    pub fn add_track(
+        &mut self,
+        track: Track,
+    ) -> Result<Option<(RoomId, Vec<ShardId>)>, TrackRegistrationError> {
+        let Some(participant) = self.participants.get(&track.meta.origin) else {
+            tracing::warn!(origin = %track.meta.origin, "track publisher not found in registry, dropping");
+            return Ok(None);
+        };
+        let room_id = participant.room_id;
+        let origin_shard = participant.shard_id;
+        if track.meta.shard_id != origin_shard {
+            tracing::error!(
+                track = %track.meta.id,
+                origin = %track.meta.origin,
+                expected_shard = %origin_shard,
+                track_shard = %track.meta.shard_id,
+                "track publication has unexpected owner shard"
+            );
+            return Err(TrackRegistrationError::Collision(track.meta.id));
+        }
+        let owner = (room_id, track.meta.origin, track.meta.shard_id);
+        if let Some(existing) = self.tracks.get(&track.meta.id).copied() {
+            if existing != owner {
+                tracing::error!(track = %track.meta.id, origin = %track.meta.origin, "track id collision in controller registry");
+                return Err(TrackRegistrationError::Collision(track.meta.id));
+            }
+            return Ok(None);
+        }
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            tracing::warn!(%room_id, "track publisher room not found in registry, dropping");
+            return Ok(None);
+        };
+        if room.add_track(track.clone()).is_err() {
+            return Err(TrackRegistrationError::Collision(track.meta.id));
+        }
+        self.tracks.insert(track.meta.id, owner);
+        debug_assert_eq!(self.tracks.get(&track.meta.id), Some(&owner));
         let ids = room.recipient_shard_ids(origin_shard).collect();
         let room_id = room.room_id;
 
-        Some((room_id, ids))
+        Ok(Some((room_id, ids)))
     }
 
     pub fn remove_track(
@@ -106,11 +180,21 @@ impl RoomRegistry {
         origin: ParticipantId,
         track_id: TrackId,
     ) -> Option<(RoomId, Vec<ShardId>)> {
-        let origin_shard = self.participants.get(&origin)?.shard_id;
-        let room = self.room_mut_for(&origin)?;
+        let participant = self.participants.get(&origin)?;
+        let room_id = participant.room_id;
+        let origin_shard = participant.shard_id;
+        if let Some((owner_room, owner, _)) = self.tracks.get(&track_id)
+            && (*owner_room != room_id || *owner != origin)
+        {
+            tracing::warn!(track = %track_id, %origin, "track unpublish owner mismatch");
+            return None;
+        }
+        let room = self.rooms.get_mut(&room_id)?;
         if !room.remove_track(&origin, &track_id) {
             return None;
         }
+
+        self.tracks.remove(&track_id);
 
         let ids = room.recipient_shard_ids(origin_shard).collect();
         let room_id = room.room_id;
@@ -142,7 +226,8 @@ impl RoomRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::ExternalRoomId;
+    use crate::entity::{ExternalRoomId, TrackKind};
+    use crate::track::TrackMeta;
     use pulsebeam_runtime::rand::seeded_rng;
 
     fn room_id(s: &str) -> RoomId {
@@ -200,21 +285,72 @@ mod tests {
         assert_eq!(room.participant_count(), 2);
     }
 
+    #[test]
+    fn conflicting_track_id_does_not_replace_existing_route() {
+        let mut reg = RoomRegistry::new();
+        let room = room_id("track-collision");
+        let first = participant_id();
+        let second = participant_id();
+        let track_id = first.derive_track_id(TrackKind::Video, "camera");
+
+        reg.add_participant(first, room, ShardId::new(0));
+        reg.add_participant(second, room, ShardId::new(1));
+
+        let first_track = Track {
+            meta: TrackMeta {
+                shard_id: ShardId::new(0),
+                id: track_id,
+                origin: first,
+            },
+            layers: Vec::new(),
+        };
+        let conflicting_track = Track {
+            meta: TrackMeta {
+                shard_id: ShardId::new(1),
+                id: track_id,
+                origin: second,
+            },
+            layers: Vec::new(),
+        };
+
+        assert!(reg.add_track(first_track).unwrap().is_some());
+        assert!(matches!(
+            reg.add_track(conflicting_track),
+            Err(TrackRegistrationError::Collision(id)) if id == track_id
+        ));
+        assert_eq!(
+            reg.get_room(&room)
+                .unwrap()
+                .tracks_published_by(&first)
+                .len(),
+            1
+        );
+        assert!(
+            reg.get_room(&room)
+                .unwrap()
+                .tracks_published_by(&second)
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
-    async fn add_participant_moves_existing_participant_to_new_room() {
+    async fn add_participant_rejects_existing_participant_in_new_room() {
         let mut reg = RoomRegistry::new();
         let old_room = room_id("room-b-old");
         let new_room = room_id("room-b-new");
         let pid = participant_id();
 
         reg.add_participant(pid, old_room, ShardId::new(0));
-        reg.add_participant(pid, new_room, ShardId::new(1));
+        assert!(
+            reg.add_participant_with_connection(pid, new_room, ShardId::new(1), ConnectionId::MIN)
+                .is_err()
+        );
 
-        assert_eq!(reg.get_room(&old_room).unwrap().participant_count(), 0);
-        assert_eq!(reg.get_room(&new_room).unwrap().participant_count(), 1);
+        assert_eq!(reg.get_room(&old_room).unwrap().participant_count(), 1);
+        assert!(reg.get_room(&new_room).is_none());
         let meta = reg.get_participant(&pid).unwrap();
-        assert_eq!(meta.room_id, new_room);
-        assert_eq!(meta.shard_id, ShardId::new(1));
+        assert_eq!(meta.room_id, old_room);
+        assert_eq!(meta.shard_id, ShardId::new(0));
     }
 
     #[tokio::test]
