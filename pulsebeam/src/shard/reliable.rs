@@ -37,16 +37,14 @@ impl ReliableRoutes {
     }
 
     pub(super) fn publish(&mut self, publisher: ParticipantId, topic: Topic) {
-        let inserted = self.published.insert(StreamId { publisher, topic });
-        debug_assert!(inserted);
+        self.published.insert(StreamId { publisher, topic });
     }
 
     pub(super) fn unpublish(&mut self, publisher: ParticipantId, topic: &Topic) {
-        let removed = self.published.remove(&StreamId {
+        self.published.remove(&StreamId {
             publisher,
             topic: topic.clone(),
         });
-        debug_assert!(removed);
     }
 
     pub(super) fn subscribe_local(&mut self, subscriber: ParticipantHandle, topic: Topic) -> bool {
@@ -55,7 +53,9 @@ impl ReliableRoutes {
         });
         let was_empty = subscribers.is_empty();
         let inserted = subscribers.insert(subscriber);
-        debug_assert!(inserted);
+        if !inserted {
+            return false;
+        }
         was_empty
     }
 
@@ -65,12 +65,13 @@ impl ReliableRoutes {
         topic: &Topic,
     ) -> bool {
         let Some(subscribers) = self.local_subscribers.get_mut(topic) else {
-            debug_assert!(false, "unsubscribing from an unknown reliable topic");
             return false;
         };
-        let was_last = subscribers.len() == 1;
         let removed = subscribers.swap_remove(&subscriber);
-        debug_assert!(removed);
+        if !removed {
+            return false;
+        }
+        let was_last = subscribers.is_empty();
         if subscribers.is_empty() {
             self.local_subscribers.remove(topic);
         }

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{VecDeque, hash_map::Entry};
 
 use ahash::{HashMap, HashMapExt};
 use indexmap::IndexSet;
@@ -135,7 +135,7 @@ impl AllPublisherSubscriptions {
 pub(crate) struct DataStreamRoute {
     published: bool,
     local_subscribers: FastIndexSet<ParticipantHandle>,
-    remote_subscriber_shards: HashMap<ShardId, usize>,
+    remote_subscriber_shards: FastIndexSet<ShardId>,
 }
 
 impl DataStreamRoute {
@@ -143,7 +143,7 @@ impl DataStreamRoute {
         Self {
             published: false,
             local_subscribers: fast_set_with_capacity(256),
-            remote_subscriber_shards: HashMap::default(),
+            remote_subscriber_shards: fast_set(),
         }
     }
 
@@ -153,40 +153,42 @@ impl DataStreamRoute {
             && self.remote_subscriber_shards.is_empty()
     }
 
-    fn attach_remote_subscriber_shard(&mut self, shard_id: ShardId) {
-        let count = self.remote_subscriber_shards.entry(shard_id).or_insert(0);
-        *count += 1;
-        debug_assert!(*count <= 2);
+    fn attach_remote_subscriber_shard(&mut self, shard_id: ShardId) -> bool {
+        self.remote_subscriber_shards.insert(shard_id)
     }
 
-    fn detach_remote_subscriber_shard(&mut self, shard_id: ShardId) {
-        let Some(count) = self.remote_subscriber_shards.get_mut(&shard_id) else {
-            debug_assert!(false, "detaching an unknown remote subscriber shard");
-            return;
-        };
-        debug_assert!(*count > 0);
-        *count -= 1;
-        if *count == 0 {
-            self.remote_subscriber_shards.remove(&shard_id);
-        }
+    fn detach_remote_subscriber_shard(&mut self, shard_id: ShardId) -> bool {
+        self.remote_subscriber_shards.swap_remove(&shard_id)
     }
 }
 
 pub(crate) struct TrackRoute {
     pub kind: TrackKind,
+    pub origin: ParticipantId,
+    pub publisher_shard: ShardId,
+    pub published: bool,
     pub subscribers: Vec<ParticipantHandle>,
     pub remote_shards: Vec<ShardId>,
     cache: TrackStreamCache,
 }
 
 impl TrackRoute {
-    fn new(kind: TrackKind) -> Self {
+    fn new(track: &TrackMeta) -> Self {
         Self {
-            kind,
+            kind: track.id.kind(),
+            origin: track.origin,
+            publisher_shard: track.shard_id,
+            published: false,
             subscribers: Vec::with_capacity(256),
             remote_shards: Vec::new(),
             cache: TrackStreamCache::new(),
         }
+    }
+
+    fn matches(&self, track: &TrackMeta) -> bool {
+        self.kind == track.id.kind()
+            && self.origin == track.origin
+            && self.publisher_shard == track.shard_id
     }
 }
 
@@ -204,6 +206,38 @@ fn swap_remove_value<T: Eq>(values: &mut Vec<T>, value: &T) -> bool {
     };
     values.swap_remove(index);
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoutingCollisionKind {
+    Participant,
+    Track,
+    DataTopic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RoutingCollision {
+    pub kind: RoutingCollisionKind,
+}
+
+impl RoutingCollision {
+    fn participant() -> Self {
+        Self {
+            kind: RoutingCollisionKind::Participant,
+        }
+    }
+
+    fn track() -> Self {
+        Self {
+            kind: RoutingCollisionKind::Track,
+        }
+    }
+
+    fn data_topic() -> Self {
+        Self {
+            kind: RoutingCollisionKind::DataTopic,
+        }
+    }
 }
 
 /// Pure pub/sub state for a shard: which participants are in which rooms,
@@ -236,15 +270,35 @@ impl ShardRoutingTable {
         handle: ParticipantHandle,
         room_id: RoomId,
         rng: &mut impl rand::RngCore,
-    ) {
+    ) -> Result<(), RoutingCollision> {
         debug_assert_eq!(participant_id, handle.participant_id());
-        let previous = self.local_participants.insert(participant_id, handle);
-        debug_assert!(previous.is_none(), "duplicate local participant route");
+        if let Some(previous) = self.local_participants.get(&participant_id).copied() {
+            if previous == handle {
+                return Ok(());
+            }
+            tracing::error!(%participant_id, "duplicate local participant route");
+            return Err(RoutingCollision::participant());
+        }
+        if self.participant_shards.contains_key(&participant_id) {
+            tracing::error!(%participant_id, "local participant conflicts with remote participant route");
+            return Err(RoutingCollision::participant());
+        }
+        if self.rooms.values().any(|room| {
+            room.members
+                .iter()
+                .any(|member| member.participant_id() == participant_id)
+        }) {
+            tracing::error!(%participant_id, "participant route exists in another room");
+            return Err(RoutingCollision::participant());
+        }
+        self.local_participants.insert(participant_id, handle);
         self.rooms
             .entry(room_id)
             .or_insert_with(|| ShardRoomContext::new(rng))
             .members
             .insert(handle);
+        debug_assert_eq!(self.local_participants.get(&participant_id), Some(&handle));
+        Ok(())
     }
 
     /// Removes a local participant from its room and evicts its audio
@@ -256,12 +310,11 @@ impl ShardRoutingTable {
         room_id: RoomId,
         audio_track_ids: impl IntoIterator<Item = TrackId>,
     ) {
-        let removed_handle = self.local_participants.remove(participant_id);
-        debug_assert!(removed_handle.is_some());
-        let Some(room) = self.rooms.get_mut(&room_id) else {
+        let Some(removed_handle) = self.local_participants.remove(participant_id) else {
+            tracing::debug!(%participant_id, "ignoring stale local participant removal");
             return;
         };
-        let Some(removed_handle) = removed_handle else {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
         room.members.swap_remove(&removed_handle);
@@ -290,6 +343,28 @@ impl ShardRoutingTable {
             .map(|m| m.shard_id)
     }
 
+    pub fn participant_route_exists(&self, participant_id: &ParticipantId) -> bool {
+        self.local_participants.contains_key(participant_id)
+            || self.participant_shards.contains_key(participant_id)
+    }
+
+    fn participant_belongs_to_room(
+        &self,
+        participant_id: &ParticipantId,
+        room_id: &RoomId,
+    ) -> bool {
+        if let Some(handle) = self.local_participants.get(participant_id) {
+            return self
+                .rooms
+                .get(room_id)
+                .is_some_and(|room| room.members.contains(handle));
+        }
+        self.participant_shards
+            .get(participant_id)
+            .map(|meta| meta.room_id == *room_id)
+            .unwrap_or(true)
+    }
+
     // -- remote participant membership (refcounted per room/shard) -------
 
     /// Idempotent: re-registering a participant with the same (room, shard)
@@ -303,15 +378,18 @@ impl ShardRoutingTable {
         room_id: RoomId,
         shard_id: ShardId,
         rng: &mut impl rand::RngCore,
-    ) {
+    ) -> Result<(), RoutingCollision> {
         let meta = ParticipantShardMeta { shard_id, room_id };
 
         if self.participant_shards.get(&participant_id).copied() == Some(meta) {
-            return;
+            return Ok(());
         }
 
-        if let Some(previous) = self.participant_shards.remove(&participant_id) {
-            self.release_remote_count(previous);
+        if self.participant_shards.contains_key(&participant_id)
+            || self.local_participants.contains_key(&participant_id)
+        {
+            tracing::error!(%participant_id, "conflicting remote participant registration");
+            return Err(RoutingCollision::participant());
         }
 
         self.participant_shards.insert(participant_id, meta);
@@ -324,6 +402,13 @@ impl ShardRoutingTable {
             .remote_participant_counts
             .entry((room_id, shard_id))
             .or_insert(0) += 1;
+        debug_assert_eq!(self.participant_shards.get(&participant_id), Some(&meta));
+        debug_assert!(
+            self.remote_participant_counts
+                .get(&(room_id, shard_id))
+                .is_some_and(|count| *count > 0)
+        );
+        Ok(())
     }
 
     pub fn unregister_remote_participant(
@@ -385,19 +470,35 @@ impl ShardRoutingTable {
         &mut self,
         subscriber: ParticipantId,
         track: TrackMeta,
-    ) -> Option<ShardEvent> {
-        let entry = self
-            .tracks
-            .entry(track.id)
-            .or_insert_with(|| TrackRoute::new(track.id.kind()));
-        let handle = *self.local_participants.get(&subscriber)?;
+    ) -> Result<Option<ShardEvent>, RoutingCollision> {
+        let Some(handle) = self.local_participants.get(&subscriber).copied() else {
+            return Ok(None);
+        };
         debug_assert_eq!(handle.participant_id(), subscriber);
+        let entry = match self.tracks.entry(track.id) {
+            Entry::Occupied(entry) => {
+                if !entry.get().matches(&track) {
+                    tracing::error!(track = %track.id, "conflicting track route registration");
+                    return Err(RoutingCollision::track());
+                }
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => entry.insert(TrackRoute::new(&track)),
+        };
         let was_empty = entry.subscribers.is_empty();
         entry
             .subscribers
             .retain(|existing| existing.participant_id() != subscriber);
         entry.subscribers.push(handle);
-        was_empty.then_some(ShardEvent::TrackSubscribed(track))
+        debug_assert_eq!(
+            entry
+                .subscribers
+                .iter()
+                .filter(|existing| existing.participant_id() == subscriber)
+                .count(),
+            1
+        );
+        Ok(was_empty.then_some(ShardEvent::TrackSubscribed(track)))
     }
 
     /// Returns a `ShardEvent` iff this was the *last* local subscriber, so
@@ -406,17 +507,27 @@ impl ShardRoutingTable {
         &mut self,
         subscriber: ParticipantId,
         track: TrackMeta,
-    ) -> Option<ShardEvent> {
-        let entry = self.tracks.get_mut(&track.id)?;
+    ) -> Result<Option<ShardEvent>, RoutingCollision> {
+        let Some(entry) = self.tracks.get_mut(&track.id) else {
+            return Ok(None);
+        };
+        if !entry.matches(&track) {
+            tracing::debug!(track = %track.id, "ignoring stale track unsubscribe with mismatched owner");
+            return Ok(None);
+        }
         let previous_len = entry.subscribers.len();
         entry
             .subscribers
             .retain(|handle| handle.participant_id() != subscriber);
         let removed = entry.subscribers.len() != previous_len;
-        (removed && entry.subscribers.is_empty()).then_some(ShardEvent::TrackUnsubscribed(track))
+        Ok((removed && entry.subscribers.is_empty())
+            .then_some(ShardEvent::TrackUnsubscribed(track)))
     }
 
-    pub fn handle_topology_event(&mut self, ev: ParticipantTopologyEvent) -> Option<ShardEvent> {
+    pub fn handle_topology_event(
+        &mut self,
+        ev: ParticipantTopologyEvent,
+    ) -> Result<Option<ShardEvent>, RoutingCollision> {
         match ev {
             ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
                 self.register_subscriber(subscriber, track)
@@ -432,9 +543,16 @@ impl ShardRoutingTable {
         room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
-    ) {
+    ) -> Result<(), RoutingCollision> {
+        let Some(handle) = self.local_participants.get(&publisher).copied() else {
+            return Err(RoutingCollision::data_topic());
+        };
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
+            return Ok(());
+        };
+        if !room.members.contains(&handle) {
+            tracing::error!(%publisher, %room_id, "data publisher is not a member of the room");
+            return Err(RoutingCollision::data_topic());
         };
         let all_publisher_subscribers = room
             .all_publisher_subscriptions
@@ -452,14 +570,18 @@ impl ShardRoutingTable {
             .data_streams
             .entry(DataStreamId::new(publisher, topic))
             .or_insert_with(DataStreamRoute::new);
-        debug_assert!(!route.published);
+        if route.published {
+            return Ok(());
+        }
         route.published = true;
+        debug_assert!(route.published);
         for subscriber in all_publisher_subscribers {
             route.local_subscribers.insert(subscriber);
         }
         for shard_id in all_publisher_remote_shards {
             route.attach_remote_subscriber_shard(shard_id);
         }
+        Ok(())
     }
 
     pub fn unregister_data_publisher(
@@ -473,10 +595,11 @@ impl ShardRoutingTable {
         };
         let key = DataStreamId::new(publisher, topic.clone());
         let Some(route) = room.data_streams.get_mut(&key) else {
-            debug_assert!(false, "unregistering an unknown data stream");
             return;
         };
-        debug_assert!(route.published);
+        if !route.published {
+            return;
+        }
         route.published = false;
         if let Some(subscribers) = room.all_publisher_subscriptions.local_by_topic.get(topic) {
             for subscriber in subscribers {
@@ -499,12 +622,21 @@ impl ShardRoutingTable {
         subscriber: ParticipantId,
         topic: Topic,
         publisher: Option<ParticipantId>,
-    ) -> bool {
+    ) -> Result<bool, RoutingCollision> {
         let Some(handle) = self.local_participants.get(&subscriber).copied() else {
-            return false;
+            return Err(RoutingCollision::data_topic());
         };
+        if !self.participant_belongs_to_room(&subscriber, &room_id) {
+            tracing::error!(%subscriber, %room_id, "data subscriber is not a member of the room");
+            return Err(RoutingCollision::data_topic());
+        }
+        if let Some(publisher) = publisher
+            && !self.participant_belongs_to_room(&publisher, &room_id)
+        {
+            return Err(RoutingCollision::data_topic());
+        }
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return false;
+            return Ok(false);
         };
         match publisher {
             Some(publisher) => {
@@ -512,9 +644,11 @@ impl ShardRoutingTable {
                     .data_streams
                     .entry(DataStreamId::new(publisher, topic))
                     .or_insert_with(DataStreamRoute::new);
-                let was_empty = route.local_subscribers.is_empty();
-                route.local_subscribers.insert(handle);
-                was_empty
+                if !route.local_subscribers.insert(handle) {
+                    return Ok(false);
+                }
+                debug_assert!(route.local_subscribers.contains(&handle));
+                Ok(route.local_subscribers.len() == 1)
             }
             None => {
                 let subscribers = room
@@ -522,15 +656,17 @@ impl ShardRoutingTable {
                     .local_by_topic
                     .entry(topic.clone())
                     .or_insert_with(fast_set);
-                let was_empty = subscribers.is_empty();
                 let inserted = subscribers.insert(handle);
-                debug_assert!(inserted);
+                if !inserted {
+                    return Ok(false);
+                }
+                debug_assert!(subscribers.contains(&handle));
                 for (stream_id, route) in &mut room.data_streams {
                     if route.published && stream_id.topic == topic {
                         route.local_subscribers.insert(handle);
                     }
                 }
-                was_empty
+                Ok(subscribers.len() == 1)
             }
         }
     }
@@ -593,9 +729,14 @@ impl ShardRoutingTable {
         from_shard_id: ShardId,
         topic: Topic,
         publisher: Option<ParticipantId>,
-    ) {
+    ) -> Result<(), RoutingCollision> {
+        if let Some(publisher) = publisher
+            && !self.participant_belongs_to_room(&publisher, &room_id)
+        {
+            return Err(RoutingCollision::data_topic());
+        }
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
+            return Ok(());
         };
         match publisher {
             Some(publisher) => {
@@ -613,8 +754,14 @@ impl ShardRoutingTable {
                     .or_insert_with(fast_set)
                     .insert(from_shard_id);
                 if !inserted {
-                    return;
+                    return Ok(());
                 }
+                debug_assert!(
+                    room.all_publisher_subscriptions
+                        .remote_by_topic
+                        .get(&topic)
+                        .is_some_and(|shards| shards.contains(&from_shard_id))
+                );
                 for (stream_id, route) in &mut room.data_streams {
                     if route.published && stream_id.topic == topic {
                         route.attach_remote_subscriber_shard(from_shard_id);
@@ -622,6 +769,7 @@ impl ShardRoutingTable {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn unregister_remote_data_subscriber_shard(
@@ -675,43 +823,89 @@ impl ShardRoutingTable {
 
     // -- track subscription topology (remote shards) ---------------------
 
-    pub fn register_remote_subscriber_shard(&mut self, from_shard_id: ShardId, track: TrackMeta) {
-        let route = self
-            .tracks
-            .entry(track.id)
-            .or_insert_with(|| TrackRoute::new(track.id.kind()));
+    pub fn register_remote_subscriber_shard(
+        &mut self,
+        from_shard_id: ShardId,
+        track: TrackMeta,
+    ) -> Result<(), RoutingCollision> {
+        let route = match self.tracks.entry(track.id) {
+            Entry::Occupied(route) => {
+                if !route.get().matches(&track) {
+                    tracing::error!(track = %track.id, "conflicting remote track route registration");
+                    return Err(RoutingCollision::track());
+                }
+                route.into_mut()
+            }
+            Entry::Vacant(route) => route.insert(TrackRoute::new(&track)),
+        };
         insert_unique(&mut route.remote_shards, from_shard_id);
+        debug_assert!(route.remote_shards.contains(&from_shard_id));
+        Ok(())
     }
 
     pub fn unregister_remote_subscriber_shard(&mut self, from_shard_id: ShardId, track: TrackMeta) {
         if let Some(route) = self.tracks.get_mut(&track.id) {
+            if !route.matches(&track) {
+                tracing::debug!(track = %track.id, "ignoring stale remote track unsubscribe with mismatched owner");
+                return;
+            }
             swap_remove_value(&mut route.remote_shards, &from_shard_id);
         }
     }
 
     // -- track publish / unpublish ----------------------------------------
 
-    pub fn publish_track(&self, track: Track, room_id: RoomId, ctx: &mut impl RoutingContext) {
+    pub fn publish_track(
+        &mut self,
+        track: Track,
+        room_id: RoomId,
+        ctx: &mut impl RoutingContext,
+    ) -> Result<(), RoutingCollision> {
         let publisher = track.meta.origin;
         let Some(room) = self.rooms.get(&room_id) else {
             tracing::debug!(%room_id, "publish_track: room missing on this shard");
-            return;
+            return Ok(());
         };
+        let members: Vec<_> = room.members.iter().copied().collect();
+        let route = match self.tracks.entry(track.meta.id) {
+            Entry::Occupied(route) => {
+                if !route.get().matches(&track.meta) {
+                    tracing::error!(track = %track.meta.id, "conflicting published track route");
+                    return Err(RoutingCollision::track());
+                }
+                route.into_mut()
+            }
+            Entry::Vacant(route) => route.insert(TrackRoute::new(&track.meta)),
+        };
+        if route.published {
+            return Ok(());
+        }
+        route.published = true;
         let tracks = std::slice::from_ref(&track);
-        for &participant in &room.members {
+        for participant in members {
             if participant.participant_id() == publisher {
                 continue;
             }
             ctx.notify_tracks_published(participant.participant_id(), tracks);
         }
+        Ok(())
     }
 
     pub fn unpublish_tracks(
         &mut self,
         room_id: RoomId,
+        origin: ParticipantId,
         track_ids: &[TrackId],
         ctx: &mut impl RoutingContext,
-    ) {
+    ) -> Result<(), RoutingCollision> {
+        for track_id in track_ids {
+            if let Some(route) = self.tracks.get(track_id)
+                && route.origin != origin
+            {
+                tracing::warn!(track = %track_id, %origin, "conflicting track unpublish");
+                return Err(RoutingCollision::track());
+            }
+        }
         if let Some(room) = self.rooms.get_mut(&room_id) {
             for &track_id in track_ids {
                 room.audio_selector.remove_track((track_id, None));
@@ -719,11 +913,19 @@ impl ShardRoutingTable {
         }
         let Some(room) = self.rooms.get(&room_id) else {
             tracing::debug!(%room_id, "unpublish_tracks: room missing on this shard");
-            return;
+            return Ok(());
         };
+        for track_id in track_ids {
+            if let Some(route) = self.tracks.get_mut(track_id)
+                && route.origin == origin
+            {
+                route.published = false;
+            }
+        }
         for &participant in &room.members {
             ctx.notify_tracks_unpublished(participant.participant_id(), track_ids);
         }
+        Ok(())
     }
 
     // -- hot-path packet fanout --------------------------------------------
@@ -738,6 +940,10 @@ impl ShardRoutingTable {
         let Some(route) = self.tracks.get_mut(&track_id) else {
             return;
         };
+        if !route.published {
+            return;
+        }
+        debug_assert!(route.published);
         route.cache.push(pkt);
         for &subscriber in &route.subscribers {
             ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache));
@@ -810,13 +1016,17 @@ impl ShardRoutingTable {
         let Some(route) = room.data_streams.get(&stream_id) else {
             return;
         };
-        debug_assert!(route.published);
+        let local_origin = ctx.is_local(&origin);
+        if local_origin && !route.published {
+            return;
+        }
+        debug_assert!(!local_origin || route.published);
         for &subscriber in &route.local_subscribers {
             ctx.forward_sctp(subscriber, origin, topic, pkt);
         }
 
-        if ctx.is_local(&origin) {
-            for &shard_id in route.remote_subscriber_shards.keys() {
+        if local_origin {
+            for &shard_id in &route.remote_subscriber_shards {
                 ctx.send(
                     shard_id,
                     CrossShardEvent::DataSctpPublished {
@@ -835,11 +1045,20 @@ impl ShardRoutingTable {
         room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
-    ) {
-        let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
+    ) -> Result<(), RoutingCollision> {
+        let Some(handle) = self.local_participants.get(&publisher).copied() else {
+            tracing::error!(%publisher, "reliable data publisher is not local");
+            return Err(RoutingCollision::data_topic());
         };
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return Ok(());
+        };
+        if !room.members.contains(&handle) {
+            tracing::error!(%publisher, %room_id, "reliable data publisher is not a member of the room");
+            return Err(RoutingCollision::data_topic());
+        }
         room.reliable.publish(publisher, topic);
+        Ok(())
     }
 
     pub fn unregister_reliable_data_publisher(
@@ -859,14 +1078,18 @@ impl ShardRoutingTable {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: Topic,
-    ) -> bool {
+    ) -> Result<bool, RoutingCollision> {
         let Some(handle) = self.local_participants.get(&subscriber).copied() else {
-            return false;
+            return Err(RoutingCollision::data_topic());
         };
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return false;
+            return Ok(false);
         };
-        room.reliable.subscribe_local(handle, topic)
+        if !room.members.contains(&handle) {
+            tracing::error!(%subscriber, %room_id, "reliable data subscriber is not a member of the room");
+            return Err(RoutingCollision::data_topic());
+        }
+        Ok(room.reliable.subscribe_local(handle, topic))
     }
 
     pub fn unregister_reliable_data_subscriber(
@@ -1010,6 +1233,8 @@ mod tests {
 
     use crate::entity::ExternalRoomId;
     use crate::shard::participants::LocalParticipantKey;
+    use crate::track::DataTrackIntent;
+    use str0m::channel::{ChannelConfig, Reliability};
 
     /// A `RoutingContext` fake that just records calls. No `ParticipantCore`,
     /// no tracing spans, no `ShardCore` — this is the whole point of the
@@ -1143,6 +1368,38 @@ mod tests {
         handle
     }
 
+    fn add_local_member(
+        table: &mut ShardRoutingTable,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+    ) {
+        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+        let key = slots.insert(());
+        let handle = ParticipantHandle::new(key, participant_id, 1);
+        table
+            .add_local_member(
+                participant_id,
+                handle,
+                room_id,
+                &mut pulsebeam_runtime::rand::seeded_rng(1),
+            )
+            .unwrap();
+    }
+
+    fn topic(name: &str) -> Topic {
+        let cfg = ChannelConfig {
+            label: format!("v1/rt/pub/{name}"),
+            ordered: false,
+            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            negotiated: None,
+            protocol: String::new(),
+        };
+        let DataTrackIntent::UserTopic(channel) = DataTrackIntent::try_from(&cfg).unwrap() else {
+            panic!("expected user topic");
+        };
+        channel.topic
+    }
+
     // -- the bug this refactor exists to prevent recurring ------------------
 
     #[test]
@@ -1153,9 +1410,9 @@ mod tests {
         let room = room_id("r1");
         let shard = ShardId::new(1);
 
-        table.register_remote_participant(participant, room, shard, &mut rng);
+        let _ = table.register_remote_participant(participant, room, shard, &mut rng);
         // Redelivered / duplicate register for the exact same (room, shard).
-        table.register_remote_participant(participant, room, shard, &mut rng);
+        let _ = table.register_remote_participant(participant, room, shard, &mut rng);
 
         // A single unregister must be enough to fully release the shard —
         // if the duplicate register above had bumped the refcount, this
@@ -1183,8 +1440,26 @@ mod tests {
         let old_shard = ShardId::new(1);
         let new_shard = ShardId::new(2);
 
-        table.register_remote_participant(participant, room, old_shard, &mut rng);
-        table.register_remote_participant(participant, room, new_shard, &mut rng);
+        table
+            .register_remote_participant(participant, room, old_shard, &mut rng)
+            .unwrap();
+        assert!(matches!(
+            table.register_remote_participant(participant, room, new_shard, &mut rng),
+            Err(RoutingCollision {
+                kind: RoutingCollisionKind::Participant
+            })
+        ));
+        assert_eq!(table.remote_shard_for(&participant), Some(old_shard));
+        table.unregister_remote_participant(
+            participant,
+            ParticipantShardMeta {
+                shard_id: old_shard,
+                room_id: room,
+            },
+        );
+        table
+            .register_remote_participant(participant, room, new_shard, &mut rng)
+            .unwrap();
 
         assert!(!table.rooms[&room].remote_shards.contains(&old_shard));
         assert!(table.rooms[&room].remote_shards.contains(&new_shard));
@@ -1207,10 +1482,13 @@ mod tests {
         add_local_subscriber(&mut table, second);
 
         let ev = table.register_subscriber(first, track.clone());
-        assert!(matches!(ev, Some(ShardEvent::TrackSubscribed(t)) if t == track));
+        assert!(matches!(ev, Ok(Some(ShardEvent::TrackSubscribed(t))) if t == track));
 
         let ev2 = table.register_subscriber(second, track);
-        assert!(ev2.is_none(), "second subscriber must not re-notify");
+        assert!(
+            ev2.unwrap().is_none(),
+            "second subscriber must not re-notify"
+        );
     }
 
     #[test]
@@ -1226,6 +1504,7 @@ mod tests {
         assert!(
             table
                 .register_subscriber(subscriber, track.clone())
+                .unwrap()
                 .is_some()
         );
 
@@ -1233,11 +1512,98 @@ mod tests {
         assert!(
             table
                 .register_subscriber(subscriber, track.clone())
+                .unwrap()
                 .is_none()
         );
 
         assert_eq!(table.tracks[&track.id].subscribers, vec![replacement]);
-        assert!(table.unregister_subscriber(subscriber, track).is_some());
+        assert!(
+            table
+                .unregister_subscriber(subscriber, track)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn conflicting_track_route_preserves_existing_owner() {
+        let mut table = ShardRoutingTable::new();
+        let subscriber = pid();
+        let conflicting_subscriber = pid();
+        let first_origin = pid();
+        let second_origin = pid();
+        let track_id = first_origin.derive_track_id(TrackKind::Video, "camera");
+        let first = TrackMeta {
+            shard_id: ShardId::new(1),
+            id: track_id,
+            origin: first_origin,
+        };
+        let conflicting = TrackMeta {
+            shard_id: ShardId::new(2),
+            id: track_id,
+            origin: second_origin,
+        };
+        add_local_subscriber(&mut table, subscriber);
+        add_local_subscriber(&mut table, conflicting_subscriber);
+
+        assert!(
+            table
+                .register_subscriber(subscriber, first.clone())
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            table.register_subscriber(conflicting_subscriber, conflicting),
+            Err(RoutingCollision {
+                kind: RoutingCollisionKind::Track
+            })
+        ));
+        assert_eq!(table.tracks[&track_id].origin, first_origin);
+        assert_eq!(table.tracks[&track_id].publisher_shard, ShardId::new(1));
+    }
+
+    #[test]
+    fn same_data_topic_can_have_multiple_publishers_and_replays_are_idempotent() {
+        let mut table = ShardRoutingTable::new();
+        let room = room_id("data-topic");
+        let first_publisher = pid();
+        let second_publisher = pid();
+        let subscriber = pid();
+        let topic = topic("events");
+        add_local_member(&mut table, first_publisher, room);
+        add_local_member(&mut table, second_publisher, room);
+        add_local_member(&mut table, subscriber, room);
+
+        assert!(
+            table
+                .register_data_publisher(room, first_publisher, topic.clone())
+                .is_ok()
+        );
+        assert!(
+            table
+                .register_data_publisher(room, first_publisher, topic.clone())
+                .is_ok()
+        );
+        assert!(
+            table
+                .register_data_publisher(room, second_publisher, topic.clone())
+                .is_ok()
+        );
+        assert!(
+            table
+                .register_data_subscriber(room, subscriber, topic.clone(), Some(first_publisher))
+                .unwrap()
+        );
+        assert!(
+            !table
+                .register_data_subscriber(room, subscriber, topic.clone(), Some(first_publisher))
+                .unwrap()
+        );
+        assert!(
+            table
+                .register_data_subscriber(room, subscriber, topic, Some(second_publisher))
+                .unwrap()
+        );
     }
 
     // -- fanout ---------------------------------------------------------------
@@ -1249,7 +1615,7 @@ mod tests {
         let subscriber = pid();
         add_local_subscriber(&mut table, subscriber);
 
-        table.register_subscriber(
+        let _ = table.register_subscriber(
             subscriber,
             TrackMeta {
                 shard_id: ShardId::new(0),
@@ -1257,6 +1623,7 @@ mod tests {
                 origin: pid(),
             },
         );
+        table.tracks.get_mut(&track_id).unwrap().published = true;
         table
             .tracks
             .get_mut(&track_id)

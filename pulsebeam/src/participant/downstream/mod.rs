@@ -1,6 +1,7 @@
 mod audio;
 mod video;
 
+use ahash::{HashMap, HashMapExt};
 use std::time::Duration;
 
 use crate::entity::TrackId;
@@ -12,7 +13,7 @@ use crate::participant::downstream::video::MIN_BANDWIDTH;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
-use crate::track::{StreamWriter, Track, TrackLayer};
+use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
 use pulsebeam_runtime::rand::RngCore;
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
@@ -116,6 +117,7 @@ pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
     pub video: VideoAllocator,
     audio: AudioAllocator,
+    track_metadata: HashMap<TrackId, TrackMeta>,
 
     available_bandwidth: BweFilter,
     last_desired: Bitrate,
@@ -132,6 +134,7 @@ impl DownstreamAllocator {
         Self {
             video: VideoAllocator::new(ctx, manual_sub, rng),
             audio: AudioAllocator::new(ctx),
+            track_metadata: HashMap::new(),
             dirty_allocation: false,
 
             available_bandwidth: BweFilter::new(MIN_BANDWIDTH),
@@ -195,20 +198,43 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn add_track(&mut self, track: Track) {
+    pub fn add_track(&mut self, track: Track) -> Result<(), ()> {
+        if let Some(existing) = self.track_metadata.get(&track.meta.id)
+            && existing != &track.meta
+        {
+            tracing::error!(track = %track.meta.id, "conflicting track metadata");
+            return Err(());
+        }
+        if self.track_metadata.contains_key(&track.meta.id) {
+            return Ok(());
+        }
+        let track_id = track.meta.id;
+        self.track_metadata.insert(track_id, track.meta.clone());
+        debug_assert_eq!(self.track_metadata.get(&track_id), Some(&track.meta));
         if track.meta.id.kind() == TrackKind::Video {
-            self.video.add_track(track);
+            if self.video.add_track(track).is_err() {
+                self.track_metadata.remove(&track_id);
+                return Err(());
+            }
             self.dirty_allocation = true;
         }
         // Audio tracks need no static registration; slots are claimed dynamically.
+        Ok(())
+    }
+
+    pub fn track_compatible(&self, track: &Track) -> bool {
+        self.track_metadata
+            .get(&track.meta.id)
+            .is_none_or(|existing| existing == &track.meta)
     }
 
     pub(super) fn remove_track(&mut self, track_id: &TrackId) -> bool {
         let removed = self.video.remove_track(track_id);
+        let removed_metadata = self.track_metadata.remove(track_id).is_some();
         if removed {
             self.dirty_allocation = true;
         }
-        removed
+        removed || removed_metadata
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
