@@ -1046,6 +1046,13 @@ impl AgentDriver {
                 for track in discovered {
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
                 }
+                for track_id in &removed {
+                    self.subscriptions.sub_manager.remove_track(track_id);
+                }
+                if !removed.is_empty() {
+                    self.subscriptions.pending_deadline = Some(self.now);
+                    self.timers.notifier.notify_one();
+                }
                 for track_id in removed {
                     self.media.pending_media_targets.remove(&track_id);
                     self.emit(AgentEvent::RemoteTrackRemoved(track_id));

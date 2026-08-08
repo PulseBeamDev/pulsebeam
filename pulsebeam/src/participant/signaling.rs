@@ -25,6 +25,23 @@ pub enum SignalingInputEvent {
     UpstreamTrackState { mid: Mid, active: bool },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviousAssignment {
+    track_id: String,
+    paused: bool,
+}
+
+fn assignment_changed(
+    previous: Option<&PreviousAssignment>,
+    current: &signaling::VideoAssignment,
+) -> bool {
+    debug_assert!(!current.mid.is_empty());
+    debug_assert!(!current.track_id.is_empty());
+    previous.is_none_or(|previous| {
+        previous.track_id != current.track_id || previous.paused != current.paused
+    })
+}
+
 pub struct Signaling {
     ctx: LogCtx,
     pub cid: Option<ChannelId>,
@@ -41,8 +58,7 @@ pub struct Signaling {
     // STATE CACHE: Required to calculate removals (deltas)
     // We store the IDs of the objects sent in the last successful update.
     previous_track_ids: HashSet<String>,
-    // Maps mid -> paused so we can detect paused-state changes on existing assignments.
-    previous_assignments: HashMap<String, bool>,
+    previous_assignments: HashMap<String, PreviousAssignment>,
     last_client_intents: Option<HashMap<Mid, Intent>>,
 }
 
@@ -217,11 +233,21 @@ impl Signaling {
         // 2. Identify Keys for Diffing
         let current_track_ids: HashSet<String> =
             current_tracks.iter().map(|t| t.id.clone()).collect();
-        // Maps mid -> paused for the current state.
-        let current_assign_map: HashMap<String, bool> = current_assignments
+        let current_assign_map: HashMap<String, PreviousAssignment> = current_assignments
             .iter()
-            .map(|a| (a.mid.clone(), a.paused))
+            .map(|a| {
+                debug_assert!(!a.mid.is_empty());
+                debug_assert!(!a.track_id.is_empty());
+                (
+                    a.mid.clone(),
+                    PreviousAssignment {
+                        track_id: a.track_id.clone(),
+                        paused: a.paused,
+                    },
+                )
+            })
             .collect();
+        debug_assert_eq!(current_assign_map.len(), current_assignments.len());
 
         // 3. Compute Deltas
         // If snapshot: removals are empty.
@@ -254,14 +280,10 @@ impl Signaling {
                     .into_iter()
                     .filter(|t| track_ids_upsert.contains(&t.id))
                     .collect(),
-                // Upsert when the mid is new OR the paused state changed.
+                // Upsert when the mid, track, or paused state changed.
                 current_assignments
                     .into_iter()
-                    .filter(|a| {
-                        self.previous_assignments
-                            .get(&a.mid)
-                            .is_none_or(|&prev_paused| prev_paused != a.paused)
-                    })
+                    .filter(|a| assignment_changed(self.previous_assignments.get(&a.mid), a))
                     .collect(),
             )
         };
@@ -301,5 +323,40 @@ impl Signaling {
         self.dirty_assignments = false;
         self.pending_snapshot_request = false;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_replacement_is_an_assignment_change() {
+        let previous = PreviousAssignment {
+            track_id: "track-a".to_owned(),
+            paused: false,
+        };
+        let replacement = signaling::VideoAssignment {
+            mid: "7".to_owned(),
+            track_id: "track-b".to_owned(),
+            paused: false,
+        };
+
+        assert!(assignment_changed(Some(&previous), &replacement));
+    }
+
+    #[test]
+    fn paused_transition_is_an_assignment_change() {
+        let previous = PreviousAssignment {
+            track_id: "track-a".to_owned(),
+            paused: true,
+        };
+        let resumed = signaling::VideoAssignment {
+            mid: "7".to_owned(),
+            track_id: "track-a".to_owned(),
+            paused: false,
+        };
+
+        assert!(assignment_changed(Some(&previous), &resumed));
     }
 }

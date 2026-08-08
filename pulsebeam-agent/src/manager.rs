@@ -131,6 +131,14 @@ impl SubscriptionManager {
     pub fn reset_active_assignments(&mut self) {
         self.active_assignments.clear();
     }
+
+    pub fn remove_track(&mut self, track_id: &str) {
+        debug_assert!(!track_id.is_empty());
+        self.desired
+            .retain(|subscription| subscription.track_id != track_id);
+        self.active_assignments
+            .retain(|_, subscription| subscription.track_id != track_id);
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +180,22 @@ mod tests {
 
         assert!(changed);
         assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn removed_track_is_not_reselected() {
+        let mut manager = SubscriptionManager::new(vec![Mid::from("0")]);
+        manager.set_desired(vec![
+            VideoSubscription::new("camera").priority(200),
+            VideoSubscription::new("screen").priority(10),
+        ]);
+        let _ = manager.reconcile();
+
+        manager.remove_track("camera");
+        let (changed, requests) = manager.reconcile();
+
+        assert!(changed);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].track_id, "screen");
     }
 }

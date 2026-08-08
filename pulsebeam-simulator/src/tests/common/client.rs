@@ -217,6 +217,25 @@ pub struct VideoReceiveLog {
     seen_ts: HashSet<u64>,
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoReceiveStats {
+    pub frames: u64,
+    pub keyframes: u64,
+    pub missing_parameter_sets: u64,
+}
+
+impl VideoReceiveStats {
+    pub fn since(self, baseline: Self) -> Self {
+        Self {
+            frames: self.frames.saturating_sub(baseline.frames),
+            keyframes: self.keyframes.saturating_sub(baseline.keyframes),
+            missing_parameter_sets: self
+                .missing_parameter_sets
+                .saturating_sub(baseline.missing_parameter_sets),
+        }
+    }
+}
+
 /// Scans an Annex-B frame for the H.264 NAL unit types it contains, using the
 /// same `pulsebeam_core::h264::classify()` classifier as the production SFU forwarder.
 fn annexb_nalu_types(data: &[u8]) -> Vec<pulsebeam_core::h264::NalFlags> {
@@ -243,6 +262,14 @@ fn annexb_nalu_types(data: &[u8]) -> Vec<pulsebeam_core::h264::NalFlags> {
 }
 
 impl VideoReceiveLog {
+    pub fn stats(&self) -> VideoReceiveStats {
+        VideoReceiveStats {
+            frames: self.frames,
+            keyframes: self.keyframes,
+            missing_parameter_sets: self.missing_parameter_sets,
+        }
+    }
+
     fn record(&mut self, frame: &pulsebeam_agent::MediaFrame) {
         self.frames += 1;
         self.bytes += frame.data.len() as u64;

@@ -91,6 +91,50 @@ fn slots_layout_update_test() {
 }
 
 #[test]
+fn one_slot_track_replacement_keeps_media_flow_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("pub1", &["q"]).with_temporal_dd(3))
+                .with_participant(Participant::publisher("pub2", &["q"]).with_temporal_dd(3))
+                .with_participant(Participant::manual_subscriber("sub", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Publishers establish flow and signal both tracks",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Subscribe the only slot to both publishers with pub1 preferred",
+                participant: "sub",
+                targets: &[("pub1", 720, 0, 100), ("pub2", 720, 0, 10)],
+            },
+            Step::Run {
+                description: "Receive the first publisher through the slot",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckRxBytesInterval {
+                description: "The first assignment carries media",
+                participant: "sub",
+                min_bytes: 1_000,
+            },
+            Step::Disconnect {
+                description: "Remove the publisher occupying the only slot",
+                participant: "pub1",
+            },
+            Step::Run {
+                description: "Assign the same slot to the remaining publisher",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckRxBytesInterval {
+                description: "The replacement assignment carries media",
+                participant: "sub",
+                min_bytes: 100_000,
+            },
+        ]);
+}
+
+#[test]
 fn slots_prioritization_test() {
     LocalNodeSim::new()
         .with_room(

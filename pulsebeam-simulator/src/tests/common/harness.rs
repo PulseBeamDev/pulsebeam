@@ -1,4 +1,4 @@
-use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog};
+use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, VideoReceiveStats};
 use crate::tests::common::{
     reserve_subnet, run_sim_or_timeout, start_sfu_node, start_sfu_node_tcp_only,
     start_sfu_node_tcp_only_multi_shard, subnet_ip,
@@ -648,6 +648,7 @@ struct ParticipantHandle {
     interval_tx_baseline: u64,
     /// RX bytes at the start of the most recent Step::Run (for interval checks).
     interval_rx_baseline: u64,
+    interval_video_baseline: VideoReceiveStats,
 }
 
 impl ParticipantHandle {
@@ -674,6 +675,10 @@ impl ParticipantHandle {
         self.shared.video_rx.lock().unwrap().clone()
     }
 
+    fn video_stats_since_interval(&self) -> VideoReceiveStats {
+        self.video_rx().stats().since(self.interval_video_baseline)
+    }
+
     /// The SFU-side participant id, once connected. Keys the per-subscriber metrics.
     fn participant_id(&self) -> Option<String> {
         self.shared.participant_id.lock().unwrap().clone()
@@ -689,6 +694,7 @@ impl ParticipantHandle {
     fn snapshot_interval(&mut self) {
         self.interval_tx_baseline = self.tx_bytes();
         self.interval_rx_baseline = self.rx_bytes();
+        self.interval_video_baseline = self.video_rx().stats();
     }
 }
 
@@ -1962,6 +1968,8 @@ fn assert_video_quality(
 /// [`Property::EstimateStable`] and [`Property::QueueingDelayBelow`] on scheduled links.
 #[derive(Clone, Copy, Debug)]
 pub enum Property {
+    /// Video frames decoded during the last run after a complete, parameterized keyframe.
+    VideoDecodes,
     /// Delivered throughput was at least this percent of the link's capacity.
     ///
     /// Only meaningful when demand meets or exceeds capacity; a plan whose sources cannot fill
@@ -2326,6 +2334,22 @@ fn check_property(
     };
 
     match *property {
+        Property::VideoDecodes => {
+            let video = handle.video_stats_since_interval();
+            let total = handle.video_rx().stats();
+            if video.frames == 0 {
+                return Err("no video frames were decoded during the run".to_string());
+            }
+            if total.keyframes == 0 {
+                return Err("no video keyframe was decoded".to_string());
+            }
+            if total.missing_parameter_sets != 0 {
+                return Err(format!(
+                    "{} decoded keyframes were missing parameter sets",
+                    total.missing_parameter_sets
+                ));
+            }
+        }
         Property::UtilisationAtLeast(min) => {
             let capacity = capacity()?;
             let received = handle
@@ -2911,6 +2935,7 @@ impl LocalNodeSim {
                         cmd_tx,
                         interval_tx_baseline: 0,
                         interval_rx_baseline: 0,
+                        interval_video_baseline: VideoReceiveStats::default(),
                     },
                 );
 

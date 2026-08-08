@@ -779,6 +779,69 @@ fn screenshare_and_camera_conference_test() {
         ]);
 }
 
+#[test]
+fn late_joiner_receives_earlier_participant_in_both_directions_test() {
+    let mut first = Participant::publisher("first", &["q", "h", "f"])
+        .with_temporal_dd(3)
+        .and_subscribes();
+    first.auto_subscribe = false;
+    let mut second = Participant::publisher("second", &["q", "h", "f"])
+        .with_temporal_dd(3)
+        .and_subscribes();
+    second.auto_subscribe = false;
+    second.starts_disconnected = true;
+
+    LocalNodeSim::new()
+        .with_bandwidth(5_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(first)
+                .with_participant(second),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the first publisher before the second joins",
+                duration: Duration::from_secs(10),
+            },
+            Step::Join {
+                description: "The second participant joins the existing room",
+                participant: "second",
+            },
+            Step::Run {
+                description: "Discover the earlier and later publications",
+                duration: Duration::from_secs(10),
+            },
+            Step::SubscribeToQos {
+                description: "First explicitly subscribes to the late joiner's stream",
+                participant: "first",
+                targets: &[("second", 720, 0, 100)],
+            },
+            Step::Run {
+                description: "Allow the earlier participant's receive direction to start",
+                duration: Duration::from_secs(10),
+            },
+            Step::SubscribeToQos {
+                description: "Second explicitly subscribes to the earlier participant's stream",
+                participant: "second",
+                targets: &[("first", 720, 0, 100)],
+            },
+            Step::Run {
+                description: "Require both directions to become decodable after the late join",
+                duration: Duration::from_secs(30),
+            },
+            Step::Expect {
+                description: "First decodes video from the late joiner",
+                participant: "first",
+                property: Property::VideoDecodes,
+            },
+            Step::Expect {
+                description: "Second decodes video from the earlier participant",
+                participant: "second",
+                property: Property::VideoDecodes,
+            },
+        ]);
+}
+
 /// The same call over home Wi-Fi: 8-16ms jitter and 0.2% loss.
 ///
 /// Jitter is what the delay-based controller measures, so widening the band directly attacks the
@@ -1268,6 +1331,124 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
                 description: "The estimate survives the silence",
                 participant: "viewer",
                 property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+        ]);
+}
+
+#[test]
+fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(500_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::screensharer("screen"))
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish both publishers and the receiver",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Subscribe to both streams with the camera preferred",
+                participant: "viewer",
+                targets: &[("camera", 720, 0, 100), ("screen", 720, 0, 10)],
+            },
+            Step::Run {
+                description: "Force one assignment into the paused state",
+                duration: Duration::from_secs(45),
+            },
+            Step::SetBandwidth {
+                description: "Restore enough downstream capacity for both streams",
+                participant: "viewer",
+                bits_per_sec: 5_000_000,
+            },
+            Step::Run {
+                description: "Let the allocator resume and the switcher receive keyframes",
+                duration: Duration::from_secs(120),
+            },
+            Step::CheckForwardedQuality {
+                description: "The camera assignment is no longer paused",
+                origin: "camera",
+                min_quality: 1,
+            },
+            Step::CheckForwardedQuality {
+                description: "The screen assignment is no longer paused",
+                origin: "screen",
+                min_quality: 1,
+            },
+            Step::CheckVideoQuality {
+                description: "The camera produces decodable video after resuming",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(120).allow_gaps(12),
+            },
+            Step::CheckRxBytesInterval {
+                description: "The resumed streams deliver media in the recovery window",
+                participant: "viewer",
+                min_bytes: 2_000_000,
+            },
+        ]);
+}
+
+#[test]
+fn every_paused_tile_resumes_after_a_busy_link_recovers_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(2_500_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("speaker", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("tile1", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("tile2", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("tile3", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("tile4", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("tile5", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 6)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the gallery and receiver",
+                duration: Duration::from_secs(8),
+            },
+            Step::SubscribeToQos {
+                description: "Keep the speaker large and every tile visible",
+                participant: "viewer",
+                targets: &[
+                    ("speaker", 720, 180, 100),
+                    ("tile1", 180, 180, 10),
+                    ("tile2", 180, 180, 10),
+                    ("tile3", 180, 180, 10),
+                    ("tile4", 180, 180, 10),
+                    ("tile5", 180, 180, 10),
+                ],
+            },
+            Step::Run {
+                description: "Drive the gallery through contention and pauses",
+                duration: Duration::from_secs(60),
+            },
+            Step::SetBandwidth {
+                description: "Restore a link that carries every visible layer",
+                participant: "viewer",
+                bits_per_sec: 8_000_000,
+            },
+            Step::Run {
+                description: "Allow every paused assignment to recover",
+                duration: Duration::from_secs(120),
+            },
+            Step::CheckForwardedQuality {
+                description: "The speaker remains forwarded after recovery",
+                origin: "speaker",
+                min_quality: 1,
+            },
+            Step::CheckForwardedQuality {
+                description: "The last tile is forwarded after recovery",
+                origin: "tile5",
+                min_quality: 1,
+            },
+            Step::CheckRxBytesInterval {
+                description: "The recovered gallery carries media",
+                participant: "viewer",
+                min_bytes: 3_000_000,
             },
         ]);
 }
