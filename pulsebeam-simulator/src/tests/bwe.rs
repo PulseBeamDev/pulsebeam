@@ -1400,9 +1400,15 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
                 participant: "bob",
                 bits_per_sec: 3_000_000,
             },
+            // Rediscovery has to climb from 500 kbps past the 1.25 Mbps top layer over the
+            // default Wi-Fi path, where burst loss and lossy feedback both slow the ramp. Ninety
+            // seconds was enough on the pristine link this plan was written against and is
+            // marginal on this one - observed failing about one run in ten. The claim is that the
+            // subscription climbs back, not that it does so to a stopwatch, so the window is
+            // sized to the slower path rather than the assertion weakened.
             Step::Run {
                 description: "Give the viewer BWE room to re-discover the capacity",
-                duration: Duration::from_secs(90),
+                duration: Duration::from_secs(180),
             },
             Step::CheckForwardedQuality {
                 description: "Bob has actually climbed back to the top layer",
