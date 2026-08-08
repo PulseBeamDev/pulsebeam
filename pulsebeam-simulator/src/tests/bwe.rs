@@ -10,6 +10,15 @@ use super::common::{
 };
 use std::time::Duration;
 
+/// Seeds every tight allocation plan is run under.
+///
+/// Determinism is what makes a failure reproducible; it is not what makes a plan representative.
+/// One seed exercises one interleaving of packet arrival, jitter and loss, and a plan that holds
+/// under exactly one interleaving has demonstrated very little. Re-running the whole plan under
+/// several fixed seeds keeps every failure reproducible while asserting the property is a property
+/// of the implementation rather than of a lucky schedule.
+const QOS_SEEDS: [u64; 4] = [0xDEAD_BEEF, 0x1234_5678, 0x0BAD_F00D, 0xFEED_FACE];
+
 /// Upgrading after a long stretch at low quality must not break the stream.
 ///
 /// This is an end-to-end anchor for the transition from a long low-quality period to an explicit
@@ -226,76 +235,79 @@ fn screen_camera_viewer_room() -> Room {
 /// the background screen pauses.)
 #[test]
 fn priority_reconfiguration_quality_churn_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(3_500_000)
-        .with_room(screen_camera_viewer_room())
-        .run(vec![
-            Step::Run {
-                description: "Establish connections and discover the camera",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer starts with the camera at low quality",
-                participant: "viewer",
-                targets: &[("camera", 180, 90, 10)],
-            },
-            Step::Run {
-                description: "Let the initial camera subscription settle",
-                duration: Duration::from_secs(10),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer adds the screen share at equal low priority",
-                participant: "viewer",
-                targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
-            },
-            Step::Run {
-                description: "Let both subscriptions settle before reconfiguration",
-                duration: Duration::from_secs(15),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer hands focus to the camera; screen share is backgrounded",
-                participant: "viewer",
-                targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
-            },
-            Step::Run {
-                description: "Require the focused camera to reach top quality after reconfiguration",
-                duration: Duration::from_secs(30),
-            },
-            Step::CheckForwardedQuality {
-                description: "The focused high-priority camera reaches its requested top layer",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Run {
-                description: "Soak the focused allocation",
-                duration: Duration::from_secs(30),
-            },
-            Step::Report {
-                description: "priority reconfiguration diagnostic",
-                participant: "viewer",
-            },
-            Step::CheckForwardedQuality {
-                description: "The focused camera holds its top layer through the soak",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Expect {
-                description: "The focused camera settles on one layer without oscillating",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(screen_camera_viewer_room())
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover the camera",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Viewer starts with the camera at low quality",
+                    participant: "viewer",
+                    targets: &[("camera", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Let the initial camera subscription settle",
+                    duration: Duration::from_secs(10),
+                },
+                Step::SubscribeToQos {
+                    description: "Viewer adds the screen share at equal low priority",
+                    participant: "viewer",
+                    targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Let both subscriptions settle before reconfiguration",
+                    duration: Duration::from_secs(15),
+                },
+                Step::SubscribeToQos {
+                    description: "Viewer hands focus to the camera; screen share is backgrounded",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Require the focused camera to reach top quality after reconfiguration",
+                    duration: Duration::from_secs(30),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The focused high-priority camera reaches its requested top layer",
                     origin: "camera",
-                    max: 0,
+                    min_quality: 3,
                 },
-            },
-            Step::Expect {
-                description: "The backgrounded screen yields cleanly rather than flapping",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
-                    origin: "screen",
-                    max: 0,
+                Step::Run {
+                    description: "Soak the focused allocation",
+                    duration: Duration::from_secs(30),
                 },
-            },
-        ]);
+                Step::Report {
+                    description: "priority reconfiguration diagnostic",
+                    participant: "viewer",
+                },
+                Step::CheckForwardedQuality {
+                    description: "The focused camera holds its top layer through the soak",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "The focused camera settles on one layer without oscillating",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
+                },
+                Step::Expect {
+                    description: "The backgrounded screen yields cleanly rather than flapping",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "screen",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
 }
 
 /// `priority` gates `min_height`: a lower-priority stream's floor must not preempt a
@@ -307,33 +319,36 @@ fn priority_reconfiguration_quality_churn_test() {
 /// ruled priority-gate contract the focused camera reaches its top layer and the screen yields.
 #[test]
 fn low_priority_floor_yields_to_high_priority_target_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(3_500_000)
-        .with_room(screen_camera_viewer_room())
-        .run(vec![
-            Step::Run {
-                description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Focused camera (720p, high priority); background screen with a floor",
-                participant: "viewer",
-                targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
-            },
-            Step::Run {
-                description: "Let the allocator resolve the contention",
-                duration: Duration::from_secs(45),
-            },
-            Step::Report {
-                description: "priority-gated floor diagnostic",
-                participant: "viewer",
-            },
-            Step::CheckForwardedQuality {
-                description: "The high-priority camera target beats the low-priority screen floor",
-                origin: "camera",
-                min_quality: 3,
-            },
-        ]);
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(screen_camera_viewer_room())
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover both tracks",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Focused camera (720p, high priority); background screen with a floor",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Let the allocator resolve the contention",
+                    duration: Duration::from_secs(45),
+                },
+                Step::Report {
+                    description: "priority-gated floor diagnostic",
+                    participant: "viewer",
+                },
+                Step::CheckForwardedQuality {
+                    description: "The high-priority camera target beats the low-priority screen floor",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+            ]);
+    }
 }
 
 /// The droppable counterpart to `low_priority_floor_yields_to_high_priority_target`: with the
@@ -342,37 +357,40 @@ fn low_priority_floor_yields_to_high_priority_target_test() {
 /// floor is green here and red there.
 #[test]
 fn droppable_background_yields_to_focused_camera_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(3_500_000)
-        .with_room(screen_camera_viewer_room())
-        .run(vec![
-            Step::Run {
-                description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Focused camera (720p, high priority); droppable background screen",
-                participant: "viewer",
-                targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
-            },
-            Step::Run {
-                description: "Let the allocator resolve the contention",
-                duration: Duration::from_secs(45),
-            },
-            Step::CheckForwardedQuality {
-                description: "The focused camera reaches its top layer over a droppable stream",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Expect {
-                description: "The focused camera holds its top layer without flapping",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
-                    origin: "camera",
-                    max: 0,
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(screen_camera_viewer_room())
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover both tracks",
+                    duration: Duration::from_secs(5),
                 },
-            },
-        ]);
+                Step::SubscribeToQos {
+                    description: "Focused camera (720p, high priority); droppable background screen",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
+                },
+                Step::Run {
+                    description: "Let the allocator resolve the contention",
+                    duration: Duration::from_secs(45),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The focused camera reaches its top layer over a droppable stream",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "The focused camera holds its top layer without flapping",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
 }
 
 /// `target_height=0` means off: the server forwards nothing for a hidden stream and frees its
@@ -382,42 +400,45 @@ fn droppable_background_yields_to_focused_camera_test() {
 /// semantics, not on a variable-bitrate source.
 #[test]
 fn hidden_stream_frees_its_bandwidth_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(4_000_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("hidden", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connections and discover both cameras",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Camera visible at 720p; the other stream hidden (target 0)",
-                participant: "viewer",
-                targets: &[("camera", 720, 90, 100), ("hidden", 0, 0, 10)],
-            },
-            Step::Run {
-                description: "Let the camera claim the bandwidth the hidden stream frees",
-                duration: Duration::from_secs(70),
-            },
-            Step::CheckForwardedQualityReached {
-                description: "The visible camera reaches its top layer once the other is truly off",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Expect {
-                description: "The lone visible camera holds its top layer without flapping",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
-                    origin: "camera",
-                    max: 0,
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(4_000_000)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::publisher("hidden", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 2)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover both cameras",
+                    duration: Duration::from_secs(5),
                 },
-            },
-        ]);
+                Step::SubscribeToQos {
+                    description: "Camera visible at 720p; the other stream hidden (target 0)",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 90, 100), ("hidden", 0, 0, 10)],
+                },
+                Step::Run {
+                    description: "Let the camera claim the bandwidth the hidden stream frees",
+                    duration: Duration::from_secs(70),
+                },
+                Step::CheckForwardedQualityReached {
+                    description: "The visible camera reaches its top layer once the other is truly off",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "The lone visible camera holds its top layer without flapping",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
 }
 
 /// A settled allocation holds its layer: once the viewer's request stops changing and the link is
@@ -425,50 +446,53 @@ fn hidden_stream_frees_its_bandwidth_test() {
 /// and byte-count checks cannot see.
 #[test]
 fn steady_state_allocation_does_not_churn_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(3_500_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the camera",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Camera at 720p with room to spare",
-                participant: "viewer",
-                targets: &[("camera", 720, 360, 100)],
-            },
-            Step::Run {
-                description: "Let the allocation reach steady state",
-                duration: Duration::from_secs(20),
-            },
-            Step::CheckForwardedQuality {
-                description: "The camera settles on its top layer",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Run {
-                description: "Soak the steady allocation",
-                duration: Duration::from_secs(60),
-            },
-            Step::CheckForwardedQuality {
-                description: "The camera holds its top layer through the soak",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Expect {
-                description: "A settled stream does not oscillate on a steady link",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
-                    origin: "camera",
-                    max: 0,
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 1)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connection and discover the camera",
+                    duration: Duration::from_secs(5),
                 },
-            },
-        ]);
+                Step::SubscribeToQos {
+                    description: "Camera at 720p with room to spare",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 100)],
+                },
+                Step::Run {
+                    description: "Let the allocation reach steady state",
+                    duration: Duration::from_secs(20),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The camera settles on its top layer",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Run {
+                    description: "Soak the steady allocation",
+                    duration: Duration::from_secs(60),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The camera holds its top layer through the soak",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "A settled stream does not oscillate on a steady link",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
 }
 
 #[test]
@@ -1813,48 +1837,51 @@ fn a_stream_returns_after_a_total_outage_test() {
 /// path - which on a mobile uplink it usually is, and worse.
 #[test]
 fn estimate_converges_when_feedback_is_lossy_test() {
-    let mut link = LinkProfile::cellular();
-    link.bandwidth_bps = Some(3_000_000);
-    LocalNodeSim::new()
-        .with_link(link)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the camera",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer asks for 720p",
-                participant: "viewer",
-                targets: &[("camera", 720, 180, 100)],
-            },
-            Step::Run {
-                description: "Converge with feedback that is itself being lost and reordered",
-                duration: Duration::from_secs(60),
-            },
-            Step::Expect {
-                description: "The estimate still finds most of the link through lossy feedback",
-                participant: "viewer",
-                property: Property::EstimateMeetsNeed { percent: 60 },
-            },
-            Step::Expect {
-                description: "Degraded feedback does not drive the sender into congestion",
-                participant: "viewer",
-                property: Property::CongestionLossBelow(5),
-            },
-            Step::Expect {
-                description: "The forwarded layer settles rather than oscillating",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
-                    origin: "camera",
-                    max: 2,
+    for seed in QOS_SEEDS {
+        let mut link = LinkProfile::cellular();
+        link.bandwidth_bps = Some(3_000_000);
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_link(link)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 1)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connection and discover the camera",
+                    duration: Duration::from_secs(5),
                 },
-            },
-        ]);
+                Step::SubscribeToQos {
+                    description: "Viewer asks for 720p",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 180, 100)],
+                },
+                Step::Run {
+                    description: "Converge with feedback that is itself being lost and reordered",
+                    duration: Duration::from_secs(60),
+                },
+                Step::Expect {
+                    description: "The estimate still finds most of the link through lossy feedback",
+                    participant: "viewer",
+                    property: Property::EstimateMeetsNeed { percent: 60 },
+                },
+                Step::Expect {
+                    description: "Degraded feedback does not drive the sender into congestion",
+                    participant: "viewer",
+                    property: Property::CongestionLossBelow(5),
+                },
+                Step::Expect {
+                    description: "The forwarded layer settles rather than oscillating",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 2,
+                    },
+                },
+            ]);
+    }
 }
 
 /// Reordering is a normal internet condition, not a fault, and it is the one this suite has never
@@ -1866,53 +1893,56 @@ fn estimate_converges_when_feedback_is_lossy_test() {
 /// delivering frames and keeps its layer, rather than churning keyframes.
 #[test]
 fn a_reordering_path_does_not_churn_keyframes_test() {
-    let mut link = LinkProfile::fiber();
-    link.bandwidth_bps = Some(3_000_000);
-    // Markedly worse than the wifi default, so the assertion is about tolerating reordering rather
-    // than about whether it happened to occur.
-    link.reorder = Reorder {
-        probability: 0.03,
-        delay: Duration::from_millis(40),
-    };
-    link.duplicate = 0.01;
-    LocalNodeSim::new()
-        .with_link(link)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the camera",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer asks for 720p",
-                participant: "viewer",
-                targets: &[("camera", 720, 180, 100)],
-            },
-            Step::Run {
-                description: "Run on a path that reorders and duplicates",
-                duration: Duration::from_secs(60),
-            },
-            Step::CheckForwardedQualityReached {
-                description: "The camera still reaches its top layer despite reordering",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Expect {
-                description: "Late packets are not mistaken for congestion",
-                participant: "viewer",
-                property: Property::CongestionLossBelow(5),
-            },
-            Step::Expect {
-                description: "A late packet does not cost the stream its layer",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
-                    origin: "camera",
-                    max: 1,
+    for seed in QOS_SEEDS {
+        let mut link = LinkProfile::fiber();
+        link.bandwidth_bps = Some(3_000_000);
+        // Markedly worse than the wifi default, so the assertion is about tolerating reordering rather
+        // than about whether it happened to occur.
+        link.reorder = Reorder {
+            probability: 0.03,
+            delay: Duration::from_millis(40),
+        };
+        link.duplicate = 0.01;
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_link(link)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 1)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connection and discover the camera",
+                    duration: Duration::from_secs(5),
                 },
-            },
-        ]);
+                Step::SubscribeToQos {
+                    description: "Viewer asks for 720p",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 180, 100)],
+                },
+                Step::Run {
+                    description: "Run on a path that reorders and duplicates",
+                    duration: Duration::from_secs(60),
+                },
+                Step::CheckForwardedQualityReached {
+                    description: "The camera still reaches its top layer despite reordering",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "Late packets are not mistaken for congestion",
+                    participant: "viewer",
+                    property: Property::CongestionLossBelow(5),
+                },
+                Step::Expect {
+                    description: "A late packet does not cost the stream its layer",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 1,
+                    },
+                },
+            ]);
+    }
 }
