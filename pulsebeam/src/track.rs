@@ -661,6 +661,15 @@ mod data_track {
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct Topic(String);
 
+    impl Topic {
+        /// Production builds a `Topic` only by parsing a channel label; tests
+        /// need one without going through the label grammar.
+        #[cfg(test)]
+        pub fn for_test(topic: &str) -> Self {
+            Self(topic.to_string())
+        }
+    }
+
     impl AsRef<str> for Topic {
         #[inline]
         fn as_ref(&self) -> &str {

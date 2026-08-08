@@ -3,6 +3,7 @@ use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
+use crate::route::{Envelope, RemoteRoute, RouteAction};
 
 use super::events::{
     AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
@@ -25,7 +26,7 @@ use str0m::media::Rid;
 use super::router::{self, ParticipantShardMeta, RoutingContext, ShardRoutingTable};
 
 pub(crate) use super::router::CrossShardSend;
-use super::worker::{ClusterCommand, CrossShardEvent, ShardCommand, ShardEvent};
+use super::worker::{ClusterCommand, CrossShardEvent, MediaPayload, ShardCommand, ShardEvent};
 
 const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 
@@ -33,6 +34,7 @@ struct DispatchCtx<'a, R: CrossShardSend> {
     registry: &'a mut ParticipantRegistry,
     dirty: &'a mut DirtyTracker,
     router: &'a R,
+    wall: &'a WallAnchor,
 }
 
 impl<'a, R: CrossShardSend> CrossShardSend for DispatchCtx<'a, R> {
@@ -126,6 +128,10 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         self.registry.contains(id)
     }
 
+    fn wall(&self) -> &WallAnchor {
+        self.wall
+    }
+
     fn forward_reliable_sctp(
         &mut self,
         subscriber: ParticipantHandle,
@@ -185,6 +191,175 @@ impl ShardCore {
         }
     }
 
+    /// Deliver a frame addressed to one of this shard's routes.
+    ///
+    /// The envelope carries no semantic ids: the route entry is the compiled
+    /// plan, and the lookup is an array index plus an epoch check.
+    fn on_media_frame(
+        &mut self,
+        env: Envelope,
+        payload: MediaPayload,
+        router: &impl CrossShardSend,
+    ) {
+        let entry = match self.routing.routes.resolve(&env) {
+            Ok(entry) => entry,
+            Err(err) => {
+                // A stale epoch is expected after a teardown and must never
+                // reach a recycled route; anything else is a bug.
+                tracing::debug!(shard_id = %self.shard_id, ?err, "dropping frame on an unusable route");
+                return;
+            }
+        };
+        entry.observe(env.link_seq);
+        let playout = match entry.expander.expand(env.playout_ntp32) {
+            Ok(playout) => playout,
+            Err(err) => {
+                tracing::warn!(
+                    shard_id = %self.shard_id,
+                    route = %env.route,
+                    ?err,
+                    "route timeline is ambiguous; needs a fresh NTP reference"
+                );
+                return;
+            }
+        };
+
+        // Copy out only what dispatch needs, rather than cloning the action —
+        // `RouteAction::Sctp` owns a `Topic`, and this runs per frame.
+        enum Target {
+            Video(TrackId),
+            Audio {
+                room_id: crate::entity::RoomId,
+                origin: ParticipantId,
+                track_id: TrackId,
+            },
+            Sctp {
+                room_id: crate::entity::RoomId,
+                origin: ParticipantId,
+                topic: crate::track::Topic,
+            },
+            Reliable {
+                room_id: crate::entity::RoomId,
+                origin: ParticipantId,
+                topic: crate::track::Topic,
+            },
+        }
+        let target = match &entry.action {
+            RouteAction::Video { local_track, .. } => Target::Video(*local_track),
+            RouteAction::Audio {
+                room_id,
+                origin,
+                track_id,
+            } => Target::Audio {
+                room_id: *room_id,
+                origin: *origin,
+                track_id: *track_id,
+            },
+            RouteAction::Sctp {
+                room_id,
+                origin,
+                topic,
+            } => Target::Sctp {
+                room_id: *room_id,
+                origin: *origin,
+                topic: topic.clone(),
+            },
+            RouteAction::Reliable {
+                room_id,
+                origin,
+                topic,
+            } => Target::Reliable {
+                room_id: *room_id,
+                origin: *origin,
+                topic: topic.clone(),
+            },
+            other => {
+                debug_assert!(false, "no media dispatch for route action {other:?}");
+                return;
+            }
+        };
+
+        match (target, payload) {
+            (Target::Video(local_track), MediaPayload::Video(pkt)) => {
+                // Payloads are still typed this pass, so playout also travels in
+                // the packet. Assert the envelope agrees, so the wire value is
+                // proven correct before it becomes the only source under UDP.
+                debug_assert!(
+                    self.wall
+                        .to_ntp(pkt.playout_time)
+                        .units_since(playout)
+                        .unsigned_abs()
+                        <= 1 << 16,
+                    "envelope playout disagrees with the payload beyond middle-32 resolution"
+                );
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    router,
+                    wall: &self.wall,
+                };
+                self.routing.route_video(local_track, &pkt, &mut ctx);
+            }
+            (
+                Target::Audio {
+                    room_id,
+                    origin,
+                    track_id,
+                },
+                MediaPayload::Audio(pkt),
+            ) => {
+                let ev = AudioRtpEvent {
+                    stream_id: (track_id, None),
+                    pkt,
+                    room_id,
+                    origin,
+                };
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    router,
+                    wall: &self.wall,
+                };
+                self.routing.route_audio(ev, &mut ctx);
+            }
+            (
+                Target::Sctp {
+                    room_id,
+                    origin,
+                    topic,
+                },
+                MediaPayload::Sctp(pkt),
+            ) => {
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    router,
+                    wall: &self.wall,
+                };
+                self.routing
+                    .route_data(room_id, origin, &topic, &pkt, &mut ctx);
+            }
+            (
+                Target::Reliable {
+                    room_id,
+                    origin,
+                    topic,
+                },
+                MediaPayload::ReliableSctp(frame),
+            ) => {
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    router,
+                    wall: &self.wall,
+                };
+                self.routing
+                    .route_reliable_data(room_id, origin, &topic, &frame, &mut ctx);
+            }
+            _ => debug_assert!(false, "payload does not match the route action"),
+        }
+    }
+
     /// The node's NTP↔`Instant` mapping, captured once at startup and shared by
     /// every shard so their timelines agree.
     ///
@@ -240,6 +415,7 @@ impl ShardCore {
             registry: &mut self.registry,
             dirty: &mut self.dirty,
             router,
+            wall: &self.wall,
         };
         while let Some(ev) = self.pipeline.pop_audio_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Audio);
@@ -262,129 +438,155 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn flush_participant_events(&mut self, router: &impl CrossShardSend) {
+    pub(crate) fn flush_participant_events(&mut self, now: Instant, router: &impl CrossShardSend) {
         while let Some(event) = self.pipeline.pop_participant_event() {
             match event {
                 ParticipantEvent::Topology(ev) => {
-                    if let Some(shard_event) = self.routing.handle_topology_event(ev) {
+                    if let Some(shard_event) =
+                        self.routing.handle_topology_event(ev, now, &self.wall)
+                    {
                         self.pipeline.push_shard_event(shard_event);
                     }
                 }
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
                     participant_id,
                 }) => {
-                    self.remove_participant(&participant_id);
+                    self.remove_participant(&participant_id, now);
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
-                ParticipantEvent::Control(ev) => match ev {
-                    ParticipantControlEvent::DataTopicPublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => {
-                        self.routing
-                            .register_data_publisher(room_id, publisher, topic);
-                    }
-                    ParticipantControlEvent::DataTopicUnpublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => {
-                        self.routing
-                            .unregister_data_publisher(room_id, publisher, &topic);
-                    }
-                    ParticipantControlEvent::DataTopicSubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                        publisher,
-                    } => {
-                        if self.routing.register_data_subscriber(
+                ParticipantEvent::Control(ev) => {
+                    match ev {
+                        ParticipantControlEvent::DataTopicPublished {
+                            room_id,
+                            publisher,
+                            topic,
+                        } => {
+                            self.routing
+                                .register_data_publisher(room_id, publisher, topic.clone());
+                            self.pipeline
+                                .push_shard_event(ShardEvent::DataTopicPublished {
+                                    room_id,
+                                    publisher,
+                                    topic,
+                                });
+                        }
+                        ParticipantControlEvent::DataTopicUnpublished {
+                            room_id,
+                            publisher,
+                            topic,
+                        } => {
+                            self.routing
+                                .unregister_data_publisher(room_id, publisher, &topic);
+                        }
+                        ParticipantControlEvent::DataTopicSubscribed {
                             room_id,
                             subscriber,
-                            topic.clone(),
+                            topic,
                             publisher,
-                        ) {
+                        } => {
+                            if let Some(ev) = self.routing.register_data_subscriber(
+                                room_id,
+                                subscriber,
+                                topic.clone(),
+                                publisher,
+                                now,
+                                &self.wall,
+                            ) {
+                                self.pipeline.push_shard_event(ev);
+                            }
+                        }
+                        ParticipantControlEvent::DataTopicUnsubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                            publisher,
+                        } => {
+                            if self
+                                .routing
+                                .unregister_data_subscriber(room_id, subscriber, &topic, publisher)
+                            {
+                                self.pipeline
+                                    .push_shard_event(ShardEvent::DataTopicUnsubscribed {
+                                        room_id,
+                                        topic,
+                                        publisher,
+                                    });
+                            }
+                        }
+                        ParticipantControlEvent::ReliableDataTopicPublished {
+                            room_id,
+                            publisher,
+                            topic,
+                        } => {
+                            self.routing.register_reliable_data_publisher(
+                                room_id,
+                                publisher,
+                                topic.clone(),
+                            );
                             self.pipeline
-                                .push_shard_event(ShardEvent::DataTopicSubscribed {
+                                .push_shard_event(ShardEvent::ReliableTopicPublished {
                                     room_id,
-                                    topic,
                                     publisher,
+                                    topic,
                                 });
                         }
-                    }
-                    ParticipantControlEvent::DataTopicUnsubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                        publisher,
-                    } => {
-                        if self
-                            .routing
-                            .unregister_data_subscriber(room_id, subscriber, &topic, publisher)
-                        {
-                            self.pipeline
-                                .push_shard_event(ShardEvent::DataTopicUnsubscribed {
-                                    room_id,
-                                    topic,
-                                    publisher,
-                                });
+                        ParticipantControlEvent::ReliableDataTopicUnpublished {
+                            room_id,
+                            publisher,
+                            topic,
+                        } => {
+                            self.routing
+                                .unregister_reliable_data_publisher(room_id, publisher, &topic);
+                        }
+                        ParticipantControlEvent::ReliableDataTopicSubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                        } => {
+                            if let Some(ev) = self
+                                .routing
+                                .register_reliable_data_subscriber(room_id, subscriber, topic)
+                            {
+                                self.pipeline.push_shard_event(ev);
+                            }
+                        }
+                        ParticipantControlEvent::ReliableDataTopicUnsubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                        } => {
+                            if self.routing.unregister_reliable_data_subscriber(
+                                room_id, subscriber, &topic, now,
+                            ) {
+                                self.pipeline.push_shard_event(
+                                    ShardEvent::ReliableTopicUnsubscribed { room_id, topic },
+                                );
+                            }
+                        }
+                        ParticipantControlEvent::ReliableControlReceived {
+                            publisher,
+                            topic,
+                            bytes,
+                        } => {
+                            let mut ctx = DispatchCtx {
+                                registry: &mut self.registry,
+                                dirty: &mut self.dirty,
+                                router,
+                                wall: &self.wall,
+                            };
+                            self.routing
+                                .route_reliable_control(publisher, &topic, &bytes, &mut ctx);
+                        }
+                        ev => {
+                            router::route_participant_control_event(
+                                ev,
+                                self.pipeline.shard_events_mut(),
+                                router,
+                            );
                         }
                     }
-                    ParticipantControlEvent::ReliableDataTopicPublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => {
-                        self.routing
-                            .register_reliable_data_publisher(room_id, publisher, topic);
-                    }
-                    ParticipantControlEvent::ReliableDataTopicUnpublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => {
-                        self.routing
-                            .unregister_reliable_data_publisher(room_id, publisher, &topic);
-                    }
-                    ParticipantControlEvent::ReliableDataTopicSubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                    } => {
-                        self.routing
-                            .register_reliable_data_subscriber(room_id, subscriber, topic);
-                    }
-                    ParticipantControlEvent::ReliableDataTopicUnsubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                    } => {
-                        self.routing
-                            .unregister_reliable_data_subscriber(room_id, subscriber, &topic);
-                    }
-                    ParticipantControlEvent::ReliableControlReceived {
-                        publisher,
-                        topic,
-                        bytes,
-                    } => {
-                        let mut ctx = DispatchCtx {
-                            registry: &mut self.registry,
-                            dirty: &mut self.dirty,
-                            router,
-                        };
-                        self.routing
-                            .route_reliable_control(publisher, &topic, &bytes, &mut ctx);
-                    }
-                    ev => {
-                        router::route_participant_control_event(
-                            ev,
-                            self.pipeline.shard_events_mut(),
-                            router,
-                        );
-                    }
-                },
+                }
             }
         }
     }
@@ -448,17 +650,18 @@ impl ShardCore {
     pub(crate) fn on_command(
         &mut self,
         cmd: ShardCommand,
+        now: Instant,
         router: &impl CrossShardSend,
     ) -> Option<()> {
         match cmd {
-            ShardCommand::AddParticipant(cfg) => self.add_participant(cfg, router),
+            ShardCommand::AddParticipant(cfg) => self.add_participant(cfg, now, router),
             ShardCommand::RemoveParticipant(participant_id) => {
-                self.remove_participant(&participant_id);
+                self.remove_participant(&participant_id, now);
             }
             ShardCommand::AddTcpConnection { .. } => {
                 // Handled by the shard worker directly; no core action needed.
             }
-            ShardCommand::Cluster(cmd) => self.on_cluster_command(cmd, router)?,
+            ShardCommand::Cluster(cmd) => self.on_cluster_command(cmd, now, router)?,
         }
         Some(())
     }
@@ -466,6 +669,7 @@ impl ShardCore {
     fn on_cluster_command(
         &mut self,
         cmd: ClusterCommand,
+        now: Instant,
         router: &impl CrossShardSend,
     ) -> Option<()> {
         match cmd {
@@ -474,6 +678,7 @@ impl ShardCore {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
+                    wall: &self.wall,
                 };
                 ctx.notify_keyframe_request(req.origin, req.stream_id.0, req.stream_id.1, req.kind);
             }
@@ -507,8 +712,16 @@ impl ShardCore {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
+                    wall: &self.wall,
                 };
-                self.routing.publish_track(track, room_id, &mut ctx);
+                // An audio track published elsewhere makes this shard a
+                // destination, so it installs a route and hands back the handle.
+                if let Some(ev) = self
+                    .routing
+                    .publish_track(track, room_id, now, &self.wall, &mut ctx)
+                {
+                    self.pipeline.push_shard_event(ev);
+                }
             }
             ClusterCommand::UnpublishTracks {
                 origin: _,
@@ -519,15 +732,24 @@ impl ShardCore {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
+                    wall: &self.wall,
                 };
-                self.routing.unpublish_tracks(room_id, &track_ids, &mut ctx);
+                self.routing
+                    .unpublish_tracks(room_id, &track_ids, now, &mut ctx);
             }
             ClusterCommand::SubscribeTrack {
                 from_shard_id,
                 track,
+                route,
+                epoch,
             } => {
-                self.routing
-                    .register_remote_subscriber_shard(from_shard_id, track);
+                // The destination allocated and installed this route in its own
+                // table; receiving the handle is the acknowledgement that lets
+                // media start flowing to it.
+                self.routing.register_remote_subscriber_shard(
+                    RemoteRoute::new(from_shard_id, route, epoch),
+                    track,
+                );
             }
             ClusterCommand::UnsubscribeTrack {
                 from_shard_id,
@@ -541,13 +763,89 @@ impl ShardCore {
                 from_shard_id,
                 topic,
                 publisher,
+                route,
+                epoch,
             } => {
-                self.routing.register_remote_data_subscriber_shard(
+                let remote = route.map(|r| RemoteRoute::new(from_shard_id, r, epoch));
+                // A wildcard destination that arrived after we started
+                // publishing needs to hear about those streams to install
+                // routes for them.
+                let announce = self.routing.register_remote_data_subscriber_shard(
                     room_id,
                     from_shard_id,
-                    topic,
+                    topic.clone(),
                     publisher,
+                    remote,
                 );
+                for publisher in announce {
+                    self.pipeline
+                        .push_shard_event(ShardEvent::DataTopicPublished {
+                            room_id,
+                            publisher,
+                            topic: topic.clone(),
+                        });
+                }
+            }
+            ClusterCommand::SubscribeReliableTopic {
+                room_id,
+                from_shard_id,
+                topic,
+                publisher,
+                route,
+                epoch,
+            } => {
+                let remote = route.map(|r| RemoteRoute::new(from_shard_id, r, epoch));
+                let announce = self.routing.register_remote_reliable_subscriber_shard(
+                    room_id,
+                    from_shard_id,
+                    topic.clone(),
+                    publisher,
+                    remote,
+                );
+                for publisher in announce {
+                    self.pipeline
+                        .push_shard_event(ShardEvent::ReliableTopicPublished {
+                            room_id,
+                            publisher,
+                            topic: topic.clone(),
+                        });
+                }
+            }
+            ClusterCommand::UnsubscribeReliableTopic {
+                room_id,
+                from_shard_id,
+                topic,
+            } => {
+                self.routing.unregister_remote_reliable_subscriber_shard(
+                    room_id,
+                    from_shard_id,
+                    &topic,
+                    None,
+                );
+            }
+            ClusterCommand::ReliableTopicPublished {
+                room_id,
+                publisher,
+                topic,
+            } => {
+                if let Some(ev) = self
+                    .routing
+                    .on_remote_reliable_publisher(room_id, publisher, &topic, now, &self.wall)
+                {
+                    self.pipeline.push_shard_event(ev);
+                }
+            }
+            ClusterCommand::DataTopicPublished {
+                room_id,
+                publisher,
+                topic,
+            } => {
+                if let Some(ev) = self
+                    .routing
+                    .on_remote_data_publisher(room_id, publisher, &topic, now, &self.wall)
+                {
+                    self.pipeline.push_shard_event(ev);
+                }
             }
             ClusterCommand::UnsubscribeDataTopic {
                 room_id,
@@ -573,32 +871,8 @@ impl ShardCore {
         router: &impl CrossShardSend,
     ) {
         match ev {
-            CrossShardEvent::VideoRtpPublished { track_id, pkt } => {
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                };
-                self.routing.route_video(track_id, &pkt, &mut ctx);
-            }
-            CrossShardEvent::AudioRtpPublished {
-                room_id,
-                origin,
-                stream_id,
-                pkt,
-            } => {
-                let ev = AudioRtpEvent {
-                    stream_id,
-                    pkt,
-                    room_id,
-                    origin,
-                };
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                };
-                self.routing.route_audio(ev, &mut ctx);
+            CrossShardEvent::Media { env, payload } => {
+                self.on_media_frame(env, payload, router);
             }
             CrossShardEvent::UdpPacket {
                 participant_id,
@@ -616,36 +890,9 @@ impl ShardCore {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
+                    wall: &self.wall,
                 };
                 ctx.notify_keyframe_request(req.origin, req.stream_id.0, req.stream_id.1, req.kind);
-            }
-            CrossShardEvent::DataSctpPublished {
-                room_id,
-                origin,
-                topic,
-                pkt,
-            } => {
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                };
-                self.routing
-                    .route_data(room_id, origin, &topic, &pkt, &mut ctx);
-            }
-            CrossShardEvent::ReliableDataSctpPublished {
-                room_id,
-                origin,
-                topic,
-                frame,
-            } => {
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                };
-                self.routing
-                    .route_reliable_data(room_id, origin, &topic, &frame, &mut ctx);
             }
             CrossShardEvent::ReliableControlForward {
                 publisher,
@@ -656,17 +903,24 @@ impl ShardCore {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
+                    wall: &self.wall,
                 };
                 ctx.deliver_reliable_control(publisher, &topic, &bytes);
             }
         }
     }
 
-    fn add_participant(&mut self, cfg: ParticipantConfig, router: &impl CrossShardSend) {
+    fn add_participant(
+        &mut self,
+        cfg: ParticipantConfig,
+        now: Instant,
+        router: &impl CrossShardSend,
+    ) {
         let room_id = cfg.room_id;
         let participant_id = cfg.participant_id;
-        self.remove_participant(&participant_id);
+        self.remove_participant(&participant_id, now);
         let _ = router; // reserved: re-add currently needs no cross-shard notice
+        let known_tracks = cfg.available_tracks.clone();
         let participant_id = self.registry.insert(cfg, &mut self.rng);
         let handle = self
             .registry
@@ -679,16 +933,30 @@ impl ShardCore {
             .get_mut(&participant_id)
             .expect("newly inserted participant must be present");
         self.dirty.mark(handle, participant);
+
+        // Tracks already published when this member arrived never went through
+        // `publish_track` here, so their audio routes are installed now.
+        let registry = &self.registry;
+        let events = self.routing.install_known_audio_routes(
+            room_id,
+            &known_tracks,
+            &|id| registry.contains(id),
+            now,
+            &self.wall,
+        );
+        for ev in events {
+            self.pipeline.push_shard_event(ev);
+        }
     }
 
-    fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<()> {
+    fn remove_participant(&mut self, participant_id: &ParticipantId, now: Instant) -> Option<()> {
         if let Some(handle) = self.registry.handle(participant_id) {
             self.timers.cancel(handle);
         }
         let meta = self.registry.remove(participant_id)?;
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
-            .remove_local_member(participant_id, meta.room_id, audio_ids);
+            .remove_local_member(participant_id, meta.room_id, audio_ids, now);
         Some(())
     }
 }
@@ -786,9 +1054,14 @@ mod test {
     ) {
         core.on_command(
             ShardCommand::AddParticipant(make_participant_cfg(participant_id, room_id)),
+            now(),
             router,
         );
         router.take_sent();
+    }
+
+    fn now() -> Instant {
+        Instant::now()
     }
 
     fn new_core() -> ShardCore {
@@ -824,6 +1097,7 @@ mod test {
         let mut core2 = new_core();
         core2.on_command(
             ShardCommand::AddParticipant(make_participant_cfg(p, r)),
+            now(),
             &router,
         );
         assert!(
@@ -840,7 +1114,7 @@ mod test {
         let r = room_id("leave1");
 
         add_participant(&mut core, &router, p, r);
-        core.on_command(ShardCommand::RemoveParticipant(p), &router);
+        core.on_command(ShardCommand::RemoveParticipant(p), now(), &router);
 
         assert!(
             !core.registry.contains(&p),
@@ -861,10 +1135,12 @@ mod test {
 
         core.on_command(
             ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
+            now(),
             &router,
         );
         core.on_command(
             ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
+            now(),
             &router,
         );
 
@@ -899,8 +1175,8 @@ mod test {
 
         // Simulate a redelivered/duplicate RegisterParticipant for the exact
         // same (participant, shard, room).
-        core.on_command(register(), &router);
-        core.on_command(register(), &router);
+        core.on_command(register(), now(), &router);
+        core.on_command(register(), now(), &router);
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
@@ -908,6 +1184,7 @@ mod test {
                 room_id: rid,
                 participant_id: participant,
             }),
+            now(),
             &router,
         );
 
@@ -934,6 +1211,7 @@ mod test {
                     room_id: rid,
                     participant_id: participant,
                 }),
+                now(),
                 &router,
             );
         }
@@ -944,6 +1222,7 @@ mod test {
                 room_id: rid,
                 participant_id: a,
             }),
+            now(),
             &router,
         );
 
@@ -960,6 +1239,7 @@ mod test {
                 room_id: rid,
                 participant_id: b,
             }),
+            now(),
             &router,
         );
 
@@ -986,6 +1266,7 @@ mod test {
                     kind: str0m::media::KeyframeRequestKind::Pli,
                 },
             )),
+            now(),
             &router,
         );
 
@@ -1008,18 +1289,41 @@ mod test {
             ShardCommand::Cluster(ClusterCommand::SubscribeTrack {
                 from_shard_id: ShardId::new(0), // unused by register path directly, see below
                 track: video_track(publisher, 1),
+                route: crate::route::RouteId::new(0),
+                epoch: 0,
             }),
+            now(),
             &router,
         );
         assert!(core.dirty.contains(&subscriber));
         clear_dirty(&mut core);
-        core.routing
-            .register_subscriber(subscriber, video_track(publisher, 1));
+        let subscribed = core
+            .routing
+            .register_subscriber(
+                subscriber,
+                video_track(publisher, 1),
+                tokio::time::Instant::now(),
+                &WallAnchor::new(std::time::SystemTime::now(), Instant::now()),
+            )
+            .expect("first subscriber installs a route");
+        let ShardEvent::TrackSubscribed { route, epoch, .. } = subscribed else {
+            panic!("expected TrackSubscribed");
+        };
 
+        // Address the frame the way a remote publisher would: by the route the
+        // destination just handed out, with no semantic ids on the wire, and
+        // with playout stamped from the sender's NTP timeline.
+        let pkt = crate::rtp::RtpPacket::default();
+        let env = Envelope {
+            epoch,
+            route,
+            link_seq: 0,
+            playout_ntp32: core.wall().to_ntp(pkt.playout_time).middle32(),
+        };
         core.on_cross_shard_event(
-            CrossShardEvent::VideoRtpPublished {
-                track_id: video_stream(publisher).0,
-                pkt: crate::rtp::RtpPacket::default(),
+            CrossShardEvent::Media {
+                env,
+                payload: MediaPayload::Video(pkt),
             },
             tokio::time::Instant::now(),
             &router,
@@ -1043,7 +1347,7 @@ mod test {
         core.fire_timers(tokio::time::Instant::now());
         assert!(!core.dirty.contains(&p));
 
-        core.on_command(ShardCommand::RemoveParticipant(p), &router);
+        core.on_command(ShardCommand::RemoveParticipant(p), now(), &router);
         assert!(!core.registry.contains(&p));
     }
 }

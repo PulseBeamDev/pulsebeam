@@ -9,7 +9,6 @@ use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
-use crate::id::AudioSelectorSlotId;
 use crate::shard::participants::ParticipantHandle;
 use crate::track::Topic;
 
@@ -129,10 +128,47 @@ impl Envelope {
     }
 }
 
+/// A sender-side handle to a route installed at a destination.
+///
+/// Holding one is the *only* way to address a destination, so "media must not
+/// be emitted before the receiver route is installed" is structural: the
+/// handle does not exist until the destination has installed and acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteRoute {
+    pub shard_id: crate::id::ShardId,
+    pub route: RouteId,
+    pub epoch: u16,
+    link_seq: u32,
+}
+
+impl RemoteRoute {
+    pub fn new(shard_id: crate::id::ShardId, route: RouteId, epoch: u16) -> Self {
+        Self {
+            shard_id,
+            route,
+            epoch,
+            link_seq: 0,
+        }
+    }
+
+    /// Build the envelope for the next frame on this route, advancing
+    /// `link_seq`. Wrapping, because `link_seq` is modulo 2^32.
+    pub fn next_envelope(&mut self, playout: NtpTime) -> Envelope {
+        let env = Envelope {
+            epoch: self.epoch,
+            route: self.route,
+            link_seq: self.link_seq,
+            playout_ntp32: playout.middle32(),
+        };
+        self.link_seq = self.link_seq.wrapping_add(1);
+        env
+    }
+}
+
 /// Semantic identity, for logs and assertions only. Never read on the hot path.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteNames {
-    pub room_id: RoomId,
+    pub room_id: Option<RoomId>,
     pub origin: ParticipantId,
     pub track_id: Option<TrackId>,
     pub topic: Option<Topic>,
@@ -151,16 +187,28 @@ pub(crate) enum RouteAction {
         kind: TrackKind,
         nominal_bps: u64,
     },
+    /// One route per (audio stream, destination). Audio is broadcast to a room
+    /// rather than explicitly subscribed, so the destination installs this as
+    /// soon as it learns the track exists and it has members to deliver to.
     Audio {
         room_id: RoomId,
         origin: ParticipantId,
-        selector_slot: Option<AudioSelectorSlotId>,
+        track_id: TrackId,
     },
+    /// One route per (publisher, topic, destination). The destination installs
+    /// it whether the local subscription named a publisher or was a wildcard —
+    /// wildcards resolve to concrete streams as publishers are announced.
     Sctp {
         room_id: RoomId,
         origin: ParticipantId,
         topic: Topic,
-        reliable: bool,
+    },
+    /// Reliable data. A reliable subscription names only a topic, so these
+    /// routes are created as publishers on that topic are announced.
+    Reliable {
+        room_id: RoomId,
+        origin: ParticipantId,
+        topic: Topic,
     },
     Ingress {
         participant: ParticipantHandle,
@@ -486,7 +534,9 @@ mod tests {
 
     fn names() -> RouteNames {
         RouteNames {
-            room_id: RoomId::from_external(&crate::entity::ExternalRoomId::new("room1").unwrap()),
+            room_id: Some(RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("room1").unwrap(),
+            )),
             origin: ParticipantId::from_bytes([7u8; 16]),
             track_id: None,
             topic: None,
@@ -495,9 +545,9 @@ mod tests {
 
     fn action() -> RouteAction {
         RouteAction::Audio {
-            room_id: names().room_id,
+            room_id: names().room_id.unwrap(),
             origin: names().origin,
-            selector_slot: None,
+            track_id: names().origin.derive_track_id(TrackKind::Audio, "a"),
         }
     }
 

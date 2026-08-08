@@ -1,6 +1,7 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
+use crate::route::{Envelope, RouteId};
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -15,7 +16,7 @@ use crate::{
     participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::metrics::ShardMetrics,
-    track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackMeta},
+    track::{GlobalKeyframeRequest, Topic, Track, TrackMeta},
 };
 
 use super::core::{CrossShardSend, ShardCore};
@@ -58,21 +59,58 @@ pub enum ClusterCommand {
         origin: ParticipantId,
         track_ids: Vec<TrackId>,
     },
-    /// Subscriber shard → Publisher shard: begin forwarding this stream to `from_shard_id`.
+    /// Subscriber shard → Publisher shard: the destination installed a route
+    /// and is handing over the sender handle. Only on receiving this may the
+    /// publisher emit media to `from_shard_id`.
     SubscribeTrack {
         from_shard_id: ShardId,
         track: TrackMeta,
+        route: RouteId,
+        epoch: u16,
     },
     /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
     UnsubscribeTrack {
         from_shard_id: ShardId,
         track: TrackMeta,
     },
+    /// Subscriber shard → Publisher shard: the destination installed a route
+    /// for this concrete stream and is handing over the sender handle.
     SubscribeDataTopic {
         room_id: RoomId,
         from_shard_id: ShardId,
         topic: Topic,
         publisher: Option<ParticipantId>,
+        route: Option<RouteId>,
+        epoch: u16,
+    },
+    /// Controller → room shards: a data publisher appeared, so destinations
+    /// holding a wildcard subscription for the topic can install a route.
+    DataTopicPublished {
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    },
+    /// Subscriber shard → Publisher shard: hand over the handle for a reliable
+    /// stream, or (with no publisher) register interest in the topic.
+    SubscribeReliableTopic {
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        topic: Topic,
+        publisher: Option<ParticipantId>,
+        route: Option<RouteId>,
+        epoch: u16,
+    },
+    ReliableTopicPublished {
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    },
+    /// Subscriber shard → Publisher shard: drop every handle held for this
+    /// topic; the destination has retired its routes.
+    UnsubscribeReliableTopic {
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        topic: Topic,
     },
     UnsubscribeDataTopic {
         room_id: RoomId,
@@ -82,16 +120,22 @@ pub enum ClusterCommand {
     },
 }
 
+/// Payload carried under an [`Envelope`]. Still typed this pass; byte
+/// serialization arrives with the UDP transport.
+pub enum MediaPayload {
+    Video(RtpPacket),
+    Audio(RtpPacket),
+    Sctp(Vec<u8>),
+    ReliableSctp(Vec<u8>),
+}
+
 pub enum CrossShardEvent {
-    /// Publisher shard → Subscriber shards: carry a video RTP packet across the shard boundary.
-    /// The encoding (simulcast rid) travels on the packet; the track is the routing unit.
-    VideoRtpPublished { track_id: TrackId, pkt: RtpPacket },
-    /// Publisher shard → all other shards in the same room: carry an audio RTP packet.
-    AudioRtpPublished {
-        room_id: RoomId,
-        origin: ParticipantId,
-        stream_id: StreamId,
-        pkt: RtpPacket,
+    /// Publisher shard → destination shard, addressed by the destination's own
+    /// route. Carries no semantic ids: everything needed to deliver it lives in
+    /// the destination's compiled route entry.
+    Media {
+        env: Envelope,
+        payload: MediaPayload,
     },
     /// Subscriber shard → Publisher shard: keyframe request.
     KeyframeRequested(GlobalKeyframeRequest),
@@ -99,18 +143,6 @@ pub enum CrossShardEvent {
     UdpPacket {
         participant_id: ParticipantId,
         batch: RecvPacketBatch,
-    },
-    DataSctpPublished {
-        room_id: RoomId,
-        origin: ParticipantId,
-        topic: Topic,
-        pkt: Vec<u8>,
-    },
-    ReliableDataSctpPublished {
-        room_id: RoomId,
-        origin: ParticipantId,
-        topic: Topic,
-        frame: Vec<u8>,
     },
     ReliableControlForward {
         publisher: ParticipantId,
@@ -134,14 +166,44 @@ pub enum ShardEvent {
     },
     ParticipantExited(ParticipantId),
     KeyframeRequest(GlobalKeyframeRequest),
-    /// Subscriber shard → Publisher shard: begin forwarding this stream to `from_shard_id`.
-    TrackSubscribed(TrackMeta),
+    /// Subscriber shard → Publisher shard: carries the route the destination
+    /// allocated in its own table.
+    TrackSubscribed {
+        track: TrackMeta,
+        route: RouteId,
+        epoch: u16,
+    },
     /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
     TrackUnsubscribed(TrackMeta),
     DataTopicSubscribed {
         room_id: RoomId,
         topic: Topic,
         publisher: Option<ParticipantId>,
+        route: Option<RouteId>,
+        epoch: u16,
+    },
+    /// Publisher shard → controller: announce a data publisher so wildcard
+    /// destinations can resolve it into a concrete route.
+    DataTopicPublished {
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    },
+    ReliableTopicSubscribed {
+        room_id: RoomId,
+        topic: Topic,
+        publisher: Option<ParticipantId>,
+        route: Option<RouteId>,
+        epoch: u16,
+    },
+    ReliableTopicPublished {
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    },
+    ReliableTopicUnsubscribed {
+        room_id: RoomId,
+        topic: Topic,
     },
     DataTopicUnsubscribed {
         room_id: RoomId,
@@ -282,7 +344,7 @@ impl ShardWorker {
                     }
                 }
                 cmd => {
-                    let _ = self.core.on_command(cmd, &self.router);
+                    let _ = self.core.on_command(cmd, now, &self.router);
                 }
             }
         }
@@ -302,7 +364,7 @@ impl ShardWorker {
         self.core.flush_stream_buffers(&self.router);
         self.core
             .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
-        self.core.flush_participant_events(&self.router);
+        self.core.flush_participant_events(now, &self.router);
 
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);

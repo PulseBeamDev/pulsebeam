@@ -110,12 +110,20 @@ impl ControllerCore {
                 eq.send_cluster(meta.shard_id, ClusterCommand::RequestKeyframe(req))
             }
 
-            ShardEvent::TrackSubscribed(track) => {
+            ShardEvent::TrackSubscribed {
+                track,
+                route,
+                epoch,
+            } => {
+                // Forward the destination's handle to the publisher. This is
+                // the acknowledgement step: only now may media flow.
                 eq.send_cluster(
                     track.shard_id,
                     ClusterCommand::SubscribeTrack {
                         from_shard_id: e.from_shard_id,
                         track,
+                        route,
+                        epoch,
                     },
                 );
             }
@@ -132,6 +140,8 @@ impl ControllerCore {
                 room_id,
                 topic,
                 publisher,
+                route,
+                epoch,
             } => {
                 if let Some(room) = self.registry.get_room(&room_id) {
                     for shard_id in room.recipient_shard_ids(e.from_shard_id) {
@@ -142,6 +152,83 @@ impl ControllerCore {
                                 from_shard_id: e.from_shard_id,
                                 topic: topic.clone(),
                                 publisher,
+                                route,
+                                epoch,
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::ReliableTopicSubscribed {
+                room_id,
+                topic,
+                publisher,
+                route,
+                epoch,
+            } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::SubscribeReliableTopic {
+                                room_id,
+                                from_shard_id: e.from_shard_id,
+                                topic: topic.clone(),
+                                publisher,
+                                route,
+                                epoch,
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::ReliableTopicUnsubscribed { room_id, topic } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::UnsubscribeReliableTopic {
+                                room_id,
+                                from_shard_id: e.from_shard_id,
+                                topic: topic.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::ReliableTopicPublished {
+                room_id,
+                publisher,
+                topic,
+            } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::ReliableTopicPublished {
+                                room_id,
+                                publisher,
+                                topic: topic.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::DataTopicPublished {
+                room_id,
+                publisher,
+                topic,
+            } => {
+                // Wildcard destinations resolve this into a concrete route and
+                // hand the handle back as a DataTopicSubscribed.
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::DataTopicPublished {
+                                room_id,
+                                publisher,
+                                topic: topic.clone(),
                             },
                         );
                     }
@@ -248,6 +335,7 @@ mod tests {
     use super::*;
     use crate::{
         entity::{ExternalRoomId, ParticipantId, RoomId, TrackKind},
+        route::RouteId,
         shard::worker::ClusterCommand,
         track::TrackMeta,
     };
@@ -278,7 +366,11 @@ mod tests {
         core.process_shard_event(
             ShardEventWrapper {
                 from_shard_id: ShardId::new(3),
-                ev: ShardEvent::TrackSubscribed(track.clone()),
+                ev: ShardEvent::TrackSubscribed {
+                    track: track.clone(),
+                    route: RouteId::new(0),
+                    epoch: 0,
+                },
             },
             &mut eq,
         );
@@ -292,8 +384,11 @@ mod tests {
         assert_eq!(shard_id, track.shard_id);
         assert!(matches!(
             cmd,
-            ClusterCommand::SubscribeTrack { from_shard_id, track: routed }
-                if from_shard_id == ShardId::new(3) && routed == track
+            ClusterCommand::SubscribeTrack { from_shard_id, track: routed, route, epoch }
+                if from_shard_id == ShardId::new(3)
+                    && routed == track
+                    && route == RouteId::new(0)
+                    && epoch == 0
         ));
     }
 
