@@ -9,16 +9,35 @@ pub use harness::{
 use pulsebeam_runtime::net::UdpMode;
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 
-static NEXT_SUBNET: AtomicU8 = AtomicU8::new(1);
+static NEXT_SUBNET: AtomicU32 = AtomicU32::new(0);
 
+/// Subnets available to plans. Excludes 0 and 255, and the address space is a byte.
+const SUBNET_CAPACITY: u32 = 200;
+
+/// Hand out a subnet no other plan in this process is using.
+///
+/// The subnet is what isolates a plan: link capacity, loss, reordering and duplication all live in
+/// process-global registries keyed by address, and cargo runs these plans in parallel. Two plans on
+/// one subnet therefore share a network - each silently reconfiguring the other's link, producing a
+/// failure that depends on which plans happen to overlap and reproduces only under load.
+///
+/// Wrapping is refused rather than silently reused. Exhaustion is a real limit that a growing
+/// suite will reach, and the failure it causes is the hardest possible kind to diagnose, so it must
+/// announce itself.
 pub fn reserve_subnet() -> u8 {
-    // Avoid 0 and 255.
     let next = NEXT_SUBNET.fetch_add(1, Ordering::Relaxed);
-    1 + (next % 200)
+    assert!(
+        next < SUBNET_CAPACITY,
+        "simulator subnets exhausted after {SUBNET_CAPACITY} plans in one process: plans would \
+         start sharing a network and silently reconfiguring each other's link. Give the address \
+         space another octet rather than letting the counter wrap."
+    );
+    // Avoid 0 and 255.
+    (1 + next) as u8
 }
 
 pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {

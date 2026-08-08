@@ -295,7 +295,7 @@ pub struct RemoteTrack {
 }
 
 impl RemoteTrack {
-    pub(crate) fn new(_mid: Mid, track: Track, rx: mailbox::Receiver<RtpPacket>) -> Self {
+    pub(crate) fn new(track: Track, rx: mailbox::Receiver<RtpPacket>) -> Self {
         Self {
             publication: Publication::from_signaling(track),
             rx,

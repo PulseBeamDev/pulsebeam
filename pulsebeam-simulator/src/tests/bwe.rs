@@ -5,9 +5,19 @@
 //! probe controller, and the failure modes only appear once both are in the loop.
 
 use super::common::{
-    Capacity, LinkProfile, LocalNodeSim, Loss, Participant, Property, Room, Step, VideoQuality,
+    Capacity, LinkProfile, LinkReport, LocalNodeSim, Loss, Participant, Property, Reorder, Room,
+    Step, VideoQuality,
 };
 use std::time::Duration;
+
+/// Seeds every tight allocation plan is run under.
+///
+/// Determinism is what makes a failure reproducible; it is not what makes a plan representative.
+/// One seed exercises one interleaving of packet arrival, jitter and loss, and a plan that holds
+/// under exactly one interleaving has demonstrated very little. Re-running the whole plan under
+/// several fixed seeds keeps every failure reproducible while asserting the property is a property
+/// of the implementation rather than of a lucky schedule.
+const QOS_SEEDS: [u64; 4] = [0xDEAD_BEEF, 0x1234_5678, 0x0BAD_F00D, 0xFEED_FACE];
 
 /// Upgrading after a long stretch at low quality must not break the stream.
 ///
@@ -198,142 +208,291 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
         ]);
 }
 
+/// The standard QoS contention room: a variable-bitrate screen share (single 2.5 Mbit/s layer),
+/// a three-layer camera (q/h/f ≈ 150 k / 400 k / 1.25 Mbit/s at 180/360/720p), and a viewer with
+/// two manual slots. This is the setup that makes the priority levers of the user-intent protocol
+/// visible: the streams together cost more than a typical link, so `priority`, `min_height`, and
+/// `target_height` actually decide who gets what.
+fn screen_camera_viewer_room() -> Room {
+    Room::new("room1")
+        .with_participant(Participant::screensharer("screen"))
+        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+        .with_participant(Participant::manual_subscriber("viewer", 2))
+}
+
+/// The protocol contract, exercised across a reconfiguration: when the viewer hands focus to the
+/// camera (high `priority`, 720p target), the focused stream must reach and *hold* its top layer,
+/// and the backgrounded screen share must yield cleanly rather than flap.
+///
+/// SPEC / RED under today's allocator. The allocator is floors-first-regardless-of-priority, so
+/// the low-priority screen's `min_height=90` floor — which can only be met by its single 2.5 Mbit/s
+/// layer — is guaranteed ahead of the focused camera's target and starves it at the middle layer.
+/// The ruled contract is *priority-gate floors*: a lower-priority floor yields to a higher-priority
+/// target. This test encodes that; it goes green when `run_compute` gains priority-gating.
+///
+/// (Both streams reaching quality 3 is impossible here on purpose: camera f (1.25M) + screen
+/// (2.5M) = 3.75M exceeds the ~3.0 Mbit/s estimate on a 3.5 Mbit/s link. The focused camera wins;
+/// the background screen pauses.)
 #[test]
 fn priority_reconfiguration_quality_churn_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(3_500_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connections and discover the camera",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer starts with the camera at low quality",
-                participant: "viewer",
-                targets: &[("camera", 180, 90, 10)],
-            },
-            Step::Run {
-                description: "Let the initial camera subscription settle",
-                duration: Duration::from_secs(10),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer adds the screen share at low priority",
-                participant: "viewer",
-                targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
-            },
-            Step::Run {
-                description: "Let both subscriptions settle before reconfiguration",
-                duration: Duration::from_secs(15),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer raises the camera to 1080p and keeps the screen share low",
-                participant: "viewer",
-                targets: &[("camera", 1080, 360, 200), ("screen", 180, 90, 10)],
-            },
-            Step::Run {
-                description: "Require high quality promptly after reconfiguration",
-                duration: Duration::from_secs(30),
-            },
-            Step::CheckForwardedQuality {
-                description: "The screen share must not finish stranded in a paused state",
-                origin: "screen",
-                min_quality: 3,
-            },
-            Step::CheckForwardedQuality {
-                description: "The high-priority camera must finish at its requested top layer",
-                origin: "camera",
-                min_quality: 3,
-            },
-            // These bounds are deliberately just below the current deterministic reproduction:
-            // the screen changes twice/minute and the camera six times/minute. They leave room
-            // for one legitimate transition while making the observed churn a red anchor.
-            Step::Expect {
-                description: "The screen share should not churn while reaching high quality",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "screen",
-                    max: 1,
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(screen_camera_viewer_room())
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover the camera",
+                    duration: Duration::from_secs(5),
                 },
-            },
-            Step::Expect {
-                description: "The camera should not oscillate between high and middle layers",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
+                Step::SubscribeToQos {
+                    description: "Viewer starts with the camera at low quality",
+                    participant: "viewer",
+                    targets: &[("camera", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Let the initial camera subscription settle",
+                    duration: Duration::from_secs(10),
+                },
+                Step::SubscribeToQos {
+                    description: "Viewer adds the screen share at equal low priority",
+                    participant: "viewer",
+                    targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Let both subscriptions settle before reconfiguration",
+                    duration: Duration::from_secs(15),
+                },
+                Step::SubscribeToQos {
+                    description: "Viewer hands focus to the camera; screen share is backgrounded",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Require the focused camera to reach top quality after reconfiguration",
+                    duration: Duration::from_secs(30),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The focused high-priority camera reaches its requested top layer",
                     origin: "camera",
-                    max: 5,
+                    min_quality: 3,
                 },
-            },
-            Step::Run {
-                description: "Soak the high-quality allocation before the final hold",
-                duration: Duration::from_secs(30),
-            },
-            Step::CheckForwardedQuality {
-                description: "The screen share remains at high quality during the soak",
-                origin: "screen",
-                min_quality: 3,
-            },
-            Step::CheckForwardedQuality {
-                description: "The camera remains at its requested top layer during the soak",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Report {
-                description: "production priority reconfiguration diagnostic",
-                participant: "viewer",
-            },
-            Step::Expect {
-                description: "The screen share should hold its layer during the soak",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "screen",
-                    max: 1,
+                Step::Run {
+                    description: "Soak the focused allocation",
+                    duration: Duration::from_secs(30),
                 },
-            },
-            Step::Expect {
-                description: "The camera should hold its top layer during the soak",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
+                Step::Report {
+                    description: "priority reconfiguration diagnostic",
+                    participant: "viewer",
+                },
+                Step::CheckForwardedQuality {
+                    description: "The focused camera holds its top layer through the soak",
                     origin: "camera",
-                    max: 5,
+                    min_quality: 3,
                 },
-            },
-            Step::Run {
-                description: "Hold the final allocation to prove both streams stay stable",
-                duration: Duration::from_secs(15),
-            },
-            Step::CheckForwardedQuality {
-                description: "The screen share stays at high quality during the hold",
-                origin: "screen",
-                min_quality: 3,
-            },
-            Step::CheckForwardedQuality {
-                description: "The camera stays at its requested top layer during the hold",
-                origin: "camera",
-                min_quality: 3,
-            },
-            Step::Expect {
-                description: "The screen share does not change layer during the hold",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "screen",
-                    max: 0,
+                Step::Expect {
+                    description: "The focused camera settles on one layer without oscillating",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
                 },
-            },
-            Step::Expect {
-                description: "The camera does not change layer during the hold",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
+                Step::Expect {
+                    description: "The backgrounded screen yields cleanly rather than flapping",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "screen",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
+}
+
+/// `priority` gates `min_height`: a lower-priority stream's floor must not preempt a
+/// higher-priority stream's target when the two cannot both fit.
+///
+/// SPEC / RED under today's allocator (same root cause as the reconfiguration test, isolated to a
+/// single static subscription). The background screen's oversized 2.5 Mbit/s floor is guaranteed
+/// ahead of the focused camera's 720p target, capping the camera at the middle layer. Under the
+/// ruled priority-gate contract the focused camera reaches its top layer and the screen yields.
+#[test]
+fn low_priority_floor_yields_to_high_priority_target_test() {
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(screen_camera_viewer_room())
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover both tracks",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Focused camera (720p, high priority); background screen with a floor",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+                },
+                Step::Run {
+                    description: "Let the allocator resolve the contention",
+                    duration: Duration::from_secs(45),
+                },
+                Step::Report {
+                    description: "priority-gated floor diagnostic",
+                    participant: "viewer",
+                },
+                Step::CheckForwardedQuality {
+                    description: "The high-priority camera target beats the low-priority screen floor",
                     origin: "camera",
-                    max: 0,
+                    min_quality: 3,
                 },
-            },
-        ]);
+            ]);
+    }
+}
+
+/// The droppable counterpart to `low_priority_floor_yields_to_high_priority_target`: with the
+/// screen explicitly droppable (`min_height=0`), Pass 1 skips it and the focused camera reaches its
+/// top layer today. This isolates the bug to `min_height`: the same scenario differing only in the
+/// floor is green here and red there.
+#[test]
+fn droppable_background_yields_to_focused_camera_test() {
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(screen_camera_viewer_room())
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover both tracks",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Focused camera (720p, high priority); droppable background screen",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
+                },
+                Step::Run {
+                    description: "Let the allocator resolve the contention",
+                    duration: Duration::from_secs(45),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The focused camera reaches its top layer over a droppable stream",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "The focused camera holds its top layer without flapping",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
+}
+
+/// `target_height=0` means off: the server forwards nothing for a hidden stream and frees its
+/// bandwidth for the streams that are actually on screen. The link fits only one camera at its top
+/// layer, so the visible camera reaches `f` only if the hidden one is truly off. A second plain
+/// (constant-rate) camera stands in for the hidden stream so the check turns on the target-0
+/// semantics, not on a variable-bitrate source.
+#[test]
+fn hidden_stream_frees_its_bandwidth_test() {
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(4_000_000)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::publisher("hidden", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 2)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connections and discover both cameras",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Camera visible at 720p; the other stream hidden (target 0)",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 90, 100), ("hidden", 0, 0, 10)],
+                },
+                Step::Run {
+                    description: "Let the camera claim the bandwidth the hidden stream frees",
+                    duration: Duration::from_secs(70),
+                },
+                Step::CheckForwardedQualityReached {
+                    description: "The visible camera reaches its top layer once the other is truly off",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "The lone visible camera holds its top layer without flapping",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
+}
+
+/// A settled allocation holds its layer: once the viewer's request stops changing and the link is
+/// steady, the forwarded layer must not oscillate. This is the instability guard that the endpoint
+/// and byte-count checks cannot see.
+#[test]
+fn steady_state_allocation_does_not_churn_test() {
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_bandwidth(3_500_000)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 1)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connection and discover the camera",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Camera at 720p with room to spare",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 360, 100)],
+                },
+                Step::Run {
+                    description: "Let the allocation reach steady state",
+                    duration: Duration::from_secs(20),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The camera settles on its top layer",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Run {
+                    description: "Soak the steady allocation",
+                    duration: Duration::from_secs(60),
+                },
+                Step::CheckForwardedQuality {
+                    description: "The camera holds its top layer through the soak",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "A settled stream does not oscillate on a steady link",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 0,
+                    },
+                },
+            ]);
+    }
 }
 
 #[test]
@@ -640,7 +799,7 @@ fn screenshare_and_camera_over_wifi_test() {
 /// that clears in-flight packets, and is therefore unsuitable for a packet-loss profile.
 #[test]
 fn screenshare_and_camera_over_cellular_test() {
-    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 14, 2);
+    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 30, 2);
 }
 
 /// Shared plan for the conference tests so the link profile is the only variable.
@@ -1004,6 +1163,17 @@ fn capped_subscription_is_not_over_served_test() {
                 description: "Measurement window",
                 duration: Duration::from_secs(60),
             },
+            // The direct statement of the claim. The byte ceiling below is a good check on the
+            // total cost but cannot distinguish a stream forwarded at the wrong rung from one
+            // forwarded at the right rung with a busier picture; this reads the rung itself.
+            Step::Expect {
+                description: "A 360p request is never served the 720p layer",
+                participant: "bob",
+                property: Property::NeverForwardedAbove {
+                    origin: "alice",
+                    max_quality: 2,
+                },
+            },
             // ~3.4 MB is the h layer itself. Measured against `headroom_factor`: 3.57 MB at
             // 1.0 (shipped), 4.25 MB at 1.2, 5.01 MB at 1.5, against 5.07 MB uncapped. 4.0 MB
             // leaves room for RTCP, retransmits and NAT-keepalive padding.
@@ -1230,9 +1400,15 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
                 participant: "bob",
                 bits_per_sec: 3_000_000,
             },
+            // Rediscovery has to climb from 500 kbps past the 1.25 Mbps top layer over the
+            // default Wi-Fi path, where burst loss and lossy feedback both slow the ramp. Ninety
+            // seconds was enough on the pristine link this plan was written against and is
+            // marginal on this one - observed failing about one run in ten. The claim is that the
+            // subscription climbs back, not that it does so to a stopwatch, so the window is
+            // sized to the slower path rather than the assertion weakened.
             Step::Run {
                 description: "Give the viewer BWE room to re-discover the capacity",
-                duration: Duration::from_secs(90),
+                duration: Duration::from_secs(180),
             },
             Step::CheckForwardedQuality {
                 description: "Bob has actually climbed back to the top layer",
@@ -1664,6 +1840,326 @@ fn a_stream_returns_after_a_total_outage_test() {
                 description: "The estimate recovers what the viewer needs",
                 participant: "bob",
                 property: Property::EstimateMeetsNeed { percent: 70 },
+            },
+        ]);
+}
+
+/// Congestion control is a closed loop, and the return half of it is a network path too.
+///
+/// Every plan that came before this one configured impairment only on the SFU-to-participant
+/// direction, so transport feedback arrived perfectly however bad the forward path was. An
+/// estimator validated that way has been tested against half of a real network: it has never seen
+/// a TWCC report vanish, arrive out of order, or arrive twice. This asserts the estimate still
+/// converges and the stream still holds a layer when the feedback path is as lossy as the media
+/// path - which on a mobile uplink it usually is, and worse.
+#[test]
+fn estimate_converges_when_feedback_is_lossy_test() {
+    for seed in QOS_SEEDS {
+        let mut link = LinkProfile::cellular();
+        link.bandwidth_bps = Some(3_000_000);
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_link(link)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 1)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connection and discover the camera",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Viewer asks for 720p",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 180, 100)],
+                },
+                Step::Run {
+                    description: "Converge with feedback that is itself being lost and reordered",
+                    duration: Duration::from_secs(60),
+                },
+                Step::Expect {
+                    description: "The estimate still finds most of the link through lossy feedback",
+                    participant: "viewer",
+                    property: Property::EstimateMeetsNeed { percent: 60 },
+                },
+                Step::Expect {
+                    description: "Degraded feedback does not drive the sender into congestion",
+                    participant: "viewer",
+                    property: Property::CongestionLossBelow(5),
+                },
+                // Looser than the clean-link plans on purpose. Burst loss in both directions
+                // makes shedding a layer and climbing back the *correct* response, and each such
+                // cycle is a reversal, so demanding near-zero would assert the link is quiet
+                // rather than that the allocator is stable. What must not happen is churn without
+                // end; the convergence and congestion claims above pin the rest.
+                Step::Expect {
+                    description: "The forwarded layer settles rather than churning without end",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 5,
+                    },
+                },
+            ]);
+    }
+}
+
+/// Reordering is a normal internet condition, not a fault, and it is the one this suite has never
+/// modelled: packets arriving late enough to overtake their successors.
+///
+/// The failure it provokes is specific - a receiver that treats a gap as loss will request a
+/// keyframe for a packet that was merely late, and a stream that does that repeatedly never holds
+/// a decodable run. So the assertions here are about *not over-reacting*: the stream keeps
+/// delivering frames and keeps its layer, rather than churning keyframes.
+#[test]
+fn a_reordering_path_does_not_churn_keyframes_test() {
+    for seed in QOS_SEEDS {
+        let mut link = LinkProfile::fiber();
+        link.bandwidth_bps = Some(3_000_000);
+        // Markedly worse than the wifi default, so the assertion is about tolerating reordering rather
+        // than about whether it happened to occur.
+        link.reorder = Reorder {
+            probability: 0.03,
+            delay: Duration::from_millis(40),
+        };
+        link.duplicate = 0.01;
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_link(link)
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::manual_subscriber("viewer", 1)),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Establish connection and discover the camera",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SubscribeToQos {
+                    description: "Viewer asks for 720p",
+                    participant: "viewer",
+                    targets: &[("camera", 720, 180, 100)],
+                },
+                Step::Run {
+                    description: "Run on a path that reorders and duplicates",
+                    duration: Duration::from_secs(60),
+                },
+                Step::CheckForwardedQualityReached {
+                    description: "The camera still reaches its top layer despite reordering",
+                    origin: "camera",
+                    min_quality: 3,
+                },
+                Step::Expect {
+                    description: "Late packets are not mistaken for congestion",
+                    participant: "viewer",
+                    property: Property::CongestionLossBelow(5),
+                },
+                Step::Expect {
+                    description: "A late packet does not cost the stream its layer",
+                    participant: "viewer",
+                    property: Property::QualityReversalsBelow {
+                        origin: "camera",
+                        max: 1,
+                    },
+                },
+            ]);
+    }
+}
+
+/// Determinism is the guarantee every other plan in this suite rests on.
+///
+/// A threshold means nothing if the same plan produces different numbers each run, and a
+/// regression cannot be attributed if a failure might just be this run. The clock and OS
+/// randomness are both overridden process-wide (`sim_clock`, `sim_rand`) precisely so that holds,
+/// but nothing asserted it, so a change that reintroduced a real-clock or real-entropy read would
+/// have shown up only as thresholds slowly becoming unreliable.
+///
+/// This runs one plan twice under the same seed and demands the measurements agree exactly - not
+/// approximately, since any tolerance here would hide the very drift it exists to catch.
+#[test]
+fn a_plan_measures_identically_when_replayed_test() {
+    let first = deterministic_probe_plan(0x5EED_0001);
+    let second = deterministic_probe_plan(0x5EED_0001);
+
+    assert_eq!(
+        deterministic_core(&first),
+        deterministic_core(&second),
+        "the same plan under the same seed produced different measurements, so the simulation is \
+         reading a clock or an entropy source it does not control; every threshold in this suite \
+         is unreliable until that is fixed"
+    );
+}
+
+/// The part of a report that must be reproducible, rendered for comparison.
+///
+/// Everything a plan can assert on is here, including `max_backlog` - the peak queue depth, and so
+/// the figure every bufferbloat claim rests on. It was briefly excluded on the belief that the
+/// shaper drains opportunistically; it does not, it has a timer-driven release task, and the
+/// variance was the globally-cleared stats map wiping a running plan's counters mid-window.
+fn deterministic_core(report: &LinkReport) -> String {
+    format!(
+        "window={:?} received={} forwarded={} samples={} estimate={}/{}/{} drawdown={:.6} \
+         demand={}/{}/{} backlog={:?} delivered={} congestion_drops={} link_loss={} changes={:?} \
+         reversals={:?} quality={:?}",
+        report.window,
+        report.received_bytes,
+        report.forwarded_media_bytes,
+        report.samples,
+        report.estimate_min_bps,
+        report.estimate_last_bps,
+        report.estimate_max_bps,
+        report.worst_drawdown_percent,
+        report.demand_min_bps,
+        report.demand_last_bps,
+        report.demand_max_bps,
+        report.max_backlog,
+        report.delivered_packets,
+        report.congestion_drops,
+        report.link_loss_drops,
+        report.quality_changes,
+        report.quality_reversals,
+        report.forwarded_quality,
+    )
+}
+
+/// The counterpart claim: the seed is actually an input.
+///
+/// If replays agreed because the plan is insensitive to scheduling rather than because it is
+/// controlled, the test above would pass while asserting nothing. Two different seeds must produce
+/// two different networks.
+#[test]
+fn a_different_seed_is_a_different_network_test() {
+    let first = deterministic_probe_plan(0x5EED_0001);
+    let second = deterministic_probe_plan(0x5EED_0002);
+
+    assert_ne!(
+        deterministic_core(&first),
+        deterministic_core(&second),
+        "two seeds produced byte-identical measurements, so the seed is not reaching the \
+         simulation and running plans under several of them proves nothing"
+    );
+}
+
+/// A plan with enough going on - loss, reordering, contention, an allocation decision - that any
+/// uncontrolled input would move at least one of the numbers it reports.
+fn deterministic_probe_plan(seed: u64) -> LinkReport {
+    LocalNodeSim::new()
+        .with_rng_seed(seed)
+        .with_link(LinkProfile::wifi())
+        .with_bandwidth(2_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("cotenant", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run_collecting(vec![
+            Step::Run {
+                description: "Establish connections and discover both cameras",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Both streams wanted, the camera with priority",
+                participant: "viewer",
+                targets: &[("camera", 720, 180, 100), ("cotenant", 360, 0, 10)],
+            },
+            Step::Run {
+                description: "Contend for a link that cannot carry both at full quality",
+                duration: Duration::from_secs(40),
+            },
+        ])
+        .get("viewer")
+        .cloned()
+        .expect("the viewer should have been measured")
+}
+
+/// Allocation with a room bigger than any other plan here exercises.
+///
+/// Every other plan has two or three publishers, and an allocator can be very wrong in ways that
+/// only show up once several streams compete for one budget: a priority comparison that is fine
+/// pairwise but not transitive, a reserve sized per-stream rather than per-link, a waterfall that
+/// spends everything on whoever it happens to reach first. None of that is reachable with two
+/// streams.
+///
+/// The claim is deliberately the weak one - nobody is dropped outright, and nothing oscillates -
+/// because what a fair split between six cameras should look like is a policy question. Being
+/// forgotten entirely is not.
+#[test]
+fn a_busy_room_starves_nobody_test() {
+    const PUBLISHERS: [&str; 6] = ["ann", "ben", "cal", "dee", "eve", "fay"];
+
+    let mut room = Room::new("room1");
+    for name in PUBLISHERS {
+        room = room.with_participant(Participant::publisher(name, &["q", "h", "f"]));
+    }
+    room = room.with_participant(Participant::manual_subscriber("viewer", PUBLISHERS.len()));
+
+    LocalNodeSim::new()
+        // Sized just above what the asserted outcome costs: six 180p floors at 150 kbps plus the
+        // speaker's 1.25 Mbps top layer is 2.15 Mbps. A paused tile here was therefore never
+        // priced out, and six top layers were never affordable, so the allocator has to choose
+        // rather than being handed enough for everything.
+        .with_bandwidth(2_500_000)
+        .with_room(room)
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover six cameras",
+                duration: Duration::from_secs(8),
+            },
+            Step::SubscribeToQos {
+                description: "A gallery view: every tile small, one speaker large",
+                participant: "viewer",
+                targets: &[
+                    ("ann", 720, 180, 100),
+                    ("ben", 180, 180, 10),
+                    ("cal", 180, 180, 10),
+                    ("dee", 180, 180, 10),
+                    ("eve", 180, 180, 10),
+                    ("fay", 180, 180, 10),
+                ],
+            },
+            Step::Run {
+                description: "Settle the gallery",
+                duration: Duration::from_secs(60),
+            },
+            Step::CheckForwardedQualityReached {
+                description: "The speaker reaches the layer it was asked for",
+                origin: "ann",
+                min_quality: 3,
+            },
+            Step::CheckForwardedQuality {
+                description: "Every tile is still being forwarded, not dropped to pay for the speaker",
+                origin: "ben",
+                min_quality: 1,
+            },
+            Step::CheckForwardedQuality {
+                description: "The last tile discovered is served like the first",
+                origin: "fay",
+                min_quality: 1,
+            },
+            Step::Expect {
+                description: "A tile asked for at 180p is never sent a taller layer",
+                participant: "viewer",
+                property: Property::NeverForwardedAbove {
+                    origin: "fay",
+                    max_quality: 1,
+                },
+            },
+            Step::Expect {
+                description: "The speaker settles rather than trading layers with the tiles",
+                participant: "viewer",
+                property: Property::QualityReversalsBelow {
+                    origin: "ann",
+                    max: 1,
+                },
+            },
+            Step::Expect {
+                description: "Six streams do not drive the link into congestion",
+                participant: "viewer",
+                property: Property::CongestionLossBelow(5),
             },
         ]);
 }

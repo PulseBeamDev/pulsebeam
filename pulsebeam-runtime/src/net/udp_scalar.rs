@@ -202,6 +202,9 @@ impl UdpTransportWriter {
             if self.shaper.should_drop_packet(batch.dst.ip()) {
                 return Ok(true);
             }
+            if self.shaper.should_duplicate_packet(batch.dst.ip()) {
+                let _ = self.sock.try_send_to(batch.buf, batch.dst);
+            }
         }
 
         let res = self.sock.try_send_to(batch.buf, batch.dst);
