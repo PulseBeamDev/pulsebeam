@@ -2557,12 +2557,12 @@ pub struct LinkProfile {
     pub loss: f64,
     /// Downlink capacity per participant, in bits per second. `None` leaves the path unlimited.
     ///
-    /// **Only set this when the rate is meant to bind.** The shaper releases queued packets on
-    /// the next send attempt, so release is quantised to event-loop iterations. When the shaped
-    /// rate is the dominant delay that quantisation is lost in the serialisation delay and the
-    /// model is sound; on a link fast enough that serialisation is negligible it becomes the
-    /// largest source of inter-packet jitter, which is precisely the signal GCC measures. Shaping
-    /// a non-binding link therefore manufactures congestion rather than removing an artifact:
+    /// **Only set this when the rate is meant to bind.** Release is timer-driven, but it still
+    /// quantises to the granularity the runtime can schedule at. When the shaped rate is the
+    /// dominant delay that quantisation is lost in the serialisation delay and the model is sound;
+    /// on a link fast enough that serialisation is negligible it becomes the largest source of
+    /// inter-packet jitter, which is precisely the signal GCC measures. Shaping a non-binding link
+    /// therefore manufactures congestion rather than removing an artifact:
     /// measured, a plan delivering 2 MB unshaped delivered 721 kB at both 50 Mbps *and* 1 Gbps —
     /// identical, so the limit was the shaper rather than the link.
     ///

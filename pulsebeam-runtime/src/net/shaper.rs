@@ -468,10 +468,10 @@ impl Shaper {
 
     /// Take every packet whose turn on the wire has come.
     ///
-    /// The caller drains on each send attempt rather than from a timer, so release is quantised
-    /// to how often the event loop sends. While media is flowing that is sub-millisecond; a
-    /// socket that goes completely idle holds its backlog until the next send, which is
-    /// immaterial for a plan that is measuring a link under load.
+    /// Driven by the socket's release task from `next_release`, not by send attempts. Tying
+    /// departure to when the caller next sends would release everything already due back to back,
+    /// destroying the inter-packet spacing a receiver measures - which is the whole signal a probe
+    /// carries.
     pub fn drain_due(&mut self, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         self.with(|st| st.drain_due(now))
     }

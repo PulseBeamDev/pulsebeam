@@ -98,9 +98,7 @@ impl Scenario {
     /// cases ends up asserting over three.
     fn healthy() -> impl Strategy<Value = Scenario> {
         Self::shape()
-            .prop_flat_map(|shape| {
-                (Just(shape), 150u64..400)
-            })
+            .prop_flat_map(|shape| (Just(shape), 150u64..400))
             .prop_map(|(shape, headroom_pct)| {
                 let demand = shape.expected_demand_bps();
                 Scenario {

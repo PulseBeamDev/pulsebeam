@@ -1978,18 +1978,14 @@ fn a_plan_measures_identically_when_replayed_test() {
 
 /// The part of a report that must be reproducible, rendered for comparison.
 ///
-/// `max_backlog` is deliberately excluded. It is the shaper's peak queue occupancy, and the shaper
-/// releases queued packets on the next send attempt rather than from a timer, so its depth is
-/// sampled wherever the event loop happened to look. Measured across two replays of this plan,
-/// every other figure agreed exactly while backlog read 22.032ms and 19.36ms. That makes it a
-/// quantisation artifact rather than evidence of an uncontrolled clock, so it is named here as a
-/// known exclusion instead of being hidden behind a tolerance that would also mask a real drift.
-///
-/// Nothing else may be added to this list without the same kind of evidence.
+/// Everything a plan can assert on is here, including `max_backlog` - the peak queue depth, and so
+/// the figure every bufferbloat claim rests on. It was briefly excluded on the belief that the
+/// shaper drains opportunistically; it does not, it has a timer-driven release task, and the
+/// variance was the globally-cleared stats map wiping a running plan's counters mid-window.
 fn deterministic_core(report: &LinkReport) -> String {
     format!(
         "window={:?} received={} forwarded={} samples={} estimate={}/{}/{} drawdown={:.6} \
-         demand={}/{}/{} delivered={} congestion_drops={} link_loss={} changes={:?} \
+         demand={}/{}/{} backlog={:?} delivered={} congestion_drops={} link_loss={} changes={:?} \
          reversals={:?} quality={:?}",
         report.window,
         report.received_bytes,
@@ -2002,6 +1998,7 @@ fn deterministic_core(report: &LinkReport) -> String {
         report.demand_min_bps,
         report.demand_last_bps,
         report.demand_max_bps,
+        report.max_backlog,
         report.delivered_packets,
         report.congestion_drops,
         report.link_loss_drops,
