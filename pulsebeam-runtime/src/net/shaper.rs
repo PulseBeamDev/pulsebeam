@@ -205,6 +205,38 @@ fn reorder_for(ip: &IpAddr) -> Reorder {
         .unwrap_or(Reorder::NONE)
 }
 
+/// Fraction of datagrams delivered twice, 0.0..=1.0.
+///
+/// Duplication is rare but real - a retransmitting middlebox, an ECMP path that briefly forwards
+/// both ways - and a receiver that has never met it is untested against a normal condition. It is
+/// separated from loss because the failure it provokes is the opposite one: not a gap to recover
+/// from, but a sequence number arriving twice.
+fn duplicates() -> &'static Mutex<HashMap<IpAddr, f64>> {
+    static DUPLICATES: std::sync::OnceLock<Mutex<HashMap<IpAddr, f64>>> =
+        std::sync::OnceLock::new();
+    DUPLICATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_duplicate(ip: IpAddr, probability: f64) {
+    assert!(
+        (0.0..=1.0).contains(&probability),
+        "duplicate probability must be between 0 and 1"
+    );
+    duplicates()
+        .lock()
+        .expect("shaper duplicates poisoned")
+        .insert(ip, probability);
+}
+
+fn duplicate_for(ip: &IpAddr) -> f64 {
+    duplicates()
+        .lock()
+        .expect("shaper duplicates poisoned")
+        .get(ip)
+        .copied()
+        .unwrap_or(0.0)
+}
+
 fn losses() -> &'static Mutex<HashMap<IpAddr, Loss>> {
     static LOSSES: std::sync::OnceLock<Mutex<HashMap<IpAddr, Loss>>> = std::sync::OnceLock::new();
     LOSSES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -221,6 +253,8 @@ pub struct Stats {
     pub dropped_loss: u64,
     /// Delivered behind a packet that was offered after it.
     pub reordered: u64,
+    /// Delivered a second time by the duplication model.
+    pub duplicated: u64,
     /// Deepest queue occupancy seen, as time. This is the bufferbloat measure - a controller that
     /// keeps the link full but the queue shallow is behaving well; one that drives 200ms of
     /// standing queue is not, even if throughput looks fine.
@@ -300,6 +334,11 @@ pub fn reset_stats() {
 pub fn clear() {
     limits().lock().expect("shaper limits poisoned").clear();
     losses().lock().expect("shaper losses poisoned").clear();
+    reorders().lock().expect("shaper reorders poisoned").clear();
+    duplicates()
+        .lock()
+        .expect("shaper duplicates poisoned")
+        .clear();
     reorders().lock().expect("shaper reorders poisoned").clear();
     stats_map().lock().expect("shaper stats poisoned").clear();
 }
@@ -386,6 +425,26 @@ impl Shaper {
     /// Offer a packet to the bottleneck.
     pub fn offer(&mut self, now: Instant, dst: SocketAddr, buf: &[u8]) -> Shaped {
         let Some(bits_per_sec) = capacity_at(dst.ip(), now) else {
+            // No capacity to model, but reordering is a property of the path rather than of its
+            // rate: an uncapped link still delivers out of order. Hold the sampled packet in the
+            // queue so the ones offered behind it genuinely leave first.
+            let reorder = reorder_for(&dst.ip());
+            if reorder.probability > 0.0
+                && self.with(|st| next_uniform(&mut st.loss_counter) < reorder.probability)
+            {
+                record(dst.ip(), |s| s.reordered += 1);
+                self.with(|st| {
+                    st.queue.push_back(Queued {
+                        release_at: now + reorder.delay,
+                        dst,
+                        buf: buf.to_vec(),
+                    });
+                    st.queue
+                        .make_contiguous()
+                        .sort_by_key(|q: &Queued| q.release_at);
+                });
+                return Shaped::Absorbed;
+            }
             return Shaped::PassThrough;
         };
         let max_backlog = limits()
@@ -419,6 +478,19 @@ impl Shaper {
     /// happened to look.
     pub fn next_release(&self) -> Option<Instant> {
         self.with(|st| st.queue.front().map(|q| q.release_at))
+    }
+
+    /// Return whether the next datagram to `ip` should also be sent a second time.
+    pub fn should_duplicate_packet(&mut self, ip: IpAddr) -> bool {
+        let probability = duplicate_for(&ip);
+        if probability == 0.0 {
+            return false;
+        }
+        let duplicate = self.with(|st| next_uniform(&mut st.loss_counter) < probability);
+        if duplicate {
+            record(ip, |s| s.duplicated += 1);
+        }
+        duplicate
     }
 
     /// Return whether the next datagram to `ip` should be dropped by the loss model.
