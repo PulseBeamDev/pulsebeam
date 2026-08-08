@@ -1,3 +1,10 @@
+## [unreleased]
+
+* feat: update str0m fork based on 0.22.0
+* feat: tighter allocation QoS
+* feat: Dependency Descriptor e2e
+* more simulation tests
+
 ## [pulsebeam-v0.4.7] - 2026-08-05
 
 * feat: simpler bwe and explicit current birate
