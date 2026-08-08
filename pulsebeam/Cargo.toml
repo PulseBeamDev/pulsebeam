@@ -26,6 +26,7 @@ derive_more = { workspace = true }
 futures-lite = { workspace = true }
 hyper = "1.10.1"
 indexmap = "2.14.0"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 mimalloc = "0.1.52"
@@ -71,6 +72,7 @@ more-asserts = { workspace = true }
 proptest = "1.11.0"
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 turmoil = { workspace = true }
+base64 = "0.22"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 # jemalloc_pprof = { version = "0.8.2", optional = true, features = ["flamegraph", "symbolize"] }

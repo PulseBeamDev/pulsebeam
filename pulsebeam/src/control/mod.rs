@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod controller;
 mod core;
 mod negotiator;

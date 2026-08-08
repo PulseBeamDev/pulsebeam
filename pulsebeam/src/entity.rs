@@ -47,6 +47,13 @@ fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
     format!("{}_{}", prefix, encoded)
 }
 
+/// Crockford base32 without a prefix, for opaque values that are not entity ids (token `jti`,
+/// generated key ids).
+pub fn encode_opaque_secret(bytes: &[u8]) -> String {
+    debug_assert!(!bytes.is_empty(), "refusing to encode an empty secret");
+    base32::encode(base32::Alphabet::Crockford, bytes)
+}
+
 fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdValidationError> {
     if value.len() > MAX_INTERNAL_ROOM_ID_LEN {
         return Err(IdValidationError::TooLong(MAX_INTERNAL_ROOM_ID_LEN));
