@@ -198,16 +198,36 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
         ]);
 }
 
+/// The standard QoS contention room: a variable-bitrate screen share (single 2.5 Mbit/s layer),
+/// a three-layer camera (q/h/f ≈ 150 k / 400 k / 1.25 Mbit/s at 180/360/720p), and a viewer with
+/// two manual slots. This is the setup that makes the priority levers of the user-intent protocol
+/// visible: the streams together cost more than a typical link, so `priority`, `min_height`, and
+/// `target_height` actually decide who gets what.
+fn screen_camera_viewer_room() -> Room {
+    Room::new("room1")
+        .with_participant(Participant::screensharer("screen"))
+        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+        .with_participant(Participant::manual_subscriber("viewer", 2))
+}
+
+/// The protocol contract, exercised across a reconfiguration: when the viewer hands focus to the
+/// camera (high `priority`, 720p target), the focused stream must reach and *hold* its top layer,
+/// and the backgrounded screen share must yield cleanly rather than flap.
+///
+/// SPEC / RED under today's allocator. The allocator is floors-first-regardless-of-priority, so
+/// the low-priority screen's `min_height=90` floor — which can only be met by its single 2.5 Mbit/s
+/// layer — is guaranteed ahead of the focused camera's target and starves it at the middle layer.
+/// The ruled contract is *priority-gate floors*: a lower-priority floor yields to a higher-priority
+/// target. This test encodes that; it goes green when `run_compute` gains priority-gating.
+///
+/// (Both streams reaching quality 3 is impossible here on purpose: camera f (1.25M) + screen
+/// (2.5M) = 3.75M exceeds the ~3.0 Mbit/s estimate on a 3.5 Mbit/s link. The focused camera wins;
+/// the background screen pauses.)
 #[test]
 fn priority_reconfiguration_quality_churn_test() {
     LocalNodeSim::new()
         .with_bandwidth(3_500_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
-        )
+        .with_room(screen_camera_viewer_room())
         .run(vec![
             Step::Run {
                 description: "Establish connections and discover the camera",
@@ -223,7 +243,7 @@ fn priority_reconfiguration_quality_churn_test() {
                 duration: Duration::from_secs(10),
             },
             Step::SubscribeToQos {
-                description: "Viewer adds the screen share at low priority",
+                description: "Viewer adds the screen share at equal low priority",
                 participant: "viewer",
                 targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
             },
@@ -232,103 +252,217 @@ fn priority_reconfiguration_quality_churn_test() {
                 duration: Duration::from_secs(15),
             },
             Step::SubscribeToQos {
-                description: "Viewer raises the camera to 1080p and keeps the screen share low",
+                description: "Viewer hands focus to the camera; screen share is backgrounded",
                 participant: "viewer",
-                targets: &[("camera", 1080, 360, 200), ("screen", 180, 90, 10)],
+                targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
             },
             Step::Run {
-                description: "Require high quality promptly after reconfiguration",
+                description: "Require the focused camera to reach top quality after reconfiguration",
                 duration: Duration::from_secs(30),
             },
             Step::CheckForwardedQuality {
-                description: "The screen share must not finish stranded in a paused state",
-                origin: "screen",
-                min_quality: 3,
-            },
-            Step::CheckForwardedQuality {
-                description: "The high-priority camera must finish at its requested top layer",
+                description: "The focused high-priority camera reaches its requested top layer",
                 origin: "camera",
                 min_quality: 3,
-            },
-            // These bounds are deliberately just below the current deterministic reproduction:
-            // the screen changes twice/minute and the camera six times/minute. They leave room
-            // for one legitimate transition while making the observed churn a red anchor.
-            Step::Expect {
-                description: "The screen share should not churn while reaching high quality",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "screen",
-                    max: 1,
-                },
-            },
-            Step::Expect {
-                description: "The camera should not oscillate between high and middle layers",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "camera",
-                    max: 5,
-                },
             },
             Step::Run {
-                description: "Soak the high-quality allocation before the final hold",
+                description: "Soak the focused allocation",
                 duration: Duration::from_secs(30),
-            },
-            Step::CheckForwardedQuality {
-                description: "The screen share remains at high quality during the soak",
-                origin: "screen",
-                min_quality: 3,
-            },
-            Step::CheckForwardedQuality {
-                description: "The camera remains at its requested top layer during the soak",
-                origin: "camera",
-                min_quality: 3,
             },
             Step::Report {
-                description: "production priority reconfiguration diagnostic",
+                description: "priority reconfiguration diagnostic",
                 participant: "viewer",
-            },
-            Step::Expect {
-                description: "The screen share should hold its layer during the soak",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "screen",
-                    max: 1,
-                },
-            },
-            Step::Expect {
-                description: "The camera should hold its top layer during the soak",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "camera",
-                    max: 5,
-                },
-            },
-            Step::Run {
-                description: "Hold the final allocation to prove both streams stay stable",
-                duration: Duration::from_secs(15),
             },
             Step::CheckForwardedQuality {
-                description: "The screen share stays at high quality during the hold",
-                origin: "screen",
-                min_quality: 3,
-            },
-            Step::CheckForwardedQuality {
-                description: "The camera stays at its requested top layer during the hold",
+                description: "The focused camera holds its top layer through the soak",
                 origin: "camera",
                 min_quality: 3,
             },
             Step::Expect {
-                description: "The screen share does not change layer during the hold",
+                description: "The focused camera settles on one layer without oscillating",
                 participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "screen",
+                property: Property::QualityReversalsBelow {
+                    origin: "camera",
                     max: 0,
                 },
             },
             Step::Expect {
-                description: "The camera does not change layer during the hold",
+                description: "The backgrounded screen yields cleanly rather than flapping",
                 participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
+                property: Property::QualityReversalsBelow {
+                    origin: "screen",
+                    max: 0,
+                },
+            },
+        ]);
+}
+
+/// `priority` gates `min_height`: a lower-priority stream's floor must not preempt a
+/// higher-priority stream's target when the two cannot both fit.
+///
+/// SPEC / RED under today's allocator (same root cause as the reconfiguration test, isolated to a
+/// single static subscription). The background screen's oversized 2.5 Mbit/s floor is guaranteed
+/// ahead of the focused camera's 720p target, capping the camera at the middle layer. Under the
+/// ruled priority-gate contract the focused camera reaches its top layer and the screen yields.
+#[test]
+fn low_priority_floor_yields_to_high_priority_target_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_500_000)
+        .with_room(screen_camera_viewer_room())
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Focused camera (720p, high priority); background screen with a floor",
+                participant: "viewer",
+                targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+            },
+            Step::Run {
+                description: "Let the allocator resolve the contention",
+                duration: Duration::from_secs(45),
+            },
+            Step::Report {
+                description: "priority-gated floor diagnostic",
+                participant: "viewer",
+            },
+            Step::CheckForwardedQuality {
+                description: "The high-priority camera target beats the low-priority screen floor",
+                origin: "camera",
+                min_quality: 3,
+            },
+        ]);
+}
+
+/// The droppable counterpart to `low_priority_floor_yields_to_high_priority_target`: with the
+/// screen explicitly droppable (`min_height=0`), Pass 1 skips it and the focused camera reaches its
+/// top layer today. This isolates the bug to `min_height`: the same scenario differing only in the
+/// floor is green here and red there.
+#[test]
+fn droppable_background_yields_to_focused_camera_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_500_000)
+        .with_room(screen_camera_viewer_room())
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both tracks",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Focused camera (720p, high priority); droppable background screen",
+                participant: "viewer",
+                targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
+            },
+            Step::Run {
+                description: "Let the allocator resolve the contention",
+                duration: Duration::from_secs(45),
+            },
+            Step::CheckForwardedQuality {
+                description: "The focused camera reaches its top layer over a droppable stream",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::Expect {
+                description: "The focused camera holds its top layer without flapping",
+                participant: "viewer",
+                property: Property::QualityReversalsBelow {
+                    origin: "camera",
+                    max: 0,
+                },
+            },
+        ]);
+}
+
+/// `target_height=0` means off: the server forwards nothing for a hidden stream and frees its
+/// bandwidth for the streams that are actually on screen. The link fits only one camera at its top
+/// layer, so the visible camera reaches `f` only if the hidden one is truly off. A second plain
+/// (constant-rate) camera stands in for the hidden stream so the check turns on the target-0
+/// semantics, not on a variable-bitrate source.
+#[test]
+fn hidden_stream_frees_its_bandwidth_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(4_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("hidden", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover both cameras",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Camera visible at 720p; the other stream hidden (target 0)",
+                participant: "viewer",
+                targets: &[("camera", 720, 90, 100), ("hidden", 0, 0, 10)],
+            },
+            Step::Run {
+                description: "Let the camera claim the bandwidth the hidden stream frees",
+                duration: Duration::from_secs(70),
+            },
+            Step::CheckForwardedQualityReached {
+                description: "The visible camera reaches its top layer once the other is truly off",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::Expect {
+                description: "The lone visible camera holds its top layer without flapping",
+                participant: "viewer",
+                property: Property::QualityReversalsBelow {
+                    origin: "camera",
+                    max: 0,
+                },
+            },
+        ]);
+}
+
+/// A settled allocation holds its layer: once the viewer's request stops changing and the link is
+/// steady, the forwarded layer must not oscillate. This is the instability guard that the endpoint
+/// and byte-count checks cannot see.
+#[test]
+fn steady_state_allocation_does_not_churn_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(3_500_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the camera",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Camera at 720p with room to spare",
+                participant: "viewer",
+                targets: &[("camera", 720, 360, 100)],
+            },
+            Step::Run {
+                description: "Let the allocation reach steady state",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckForwardedQuality {
+                description: "The camera settles on its top layer",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::Run {
+                description: "Soak the steady allocation",
+                duration: Duration::from_secs(60),
+            },
+            Step::CheckForwardedQuality {
+                description: "The camera holds its top layer through the soak",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::Expect {
+                description: "A settled stream does not oscillate on a steady link",
+                participant: "viewer",
+                property: Property::QualityReversalsBelow {
                     origin: "camera",
                     max: 0,
                 },

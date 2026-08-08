@@ -2004,6 +2004,15 @@ pub enum Property {
     /// a handful of times a minute as conditions move; the production failure was doing it
     /// several times a second.
     QualityChangesPerMinuteBelow { origin: &'static str, max: u64 },
+    /// At most this many direction reversals in the origin's forwarded layer.
+    ///
+    /// Climbing through layers as bandwidth is discovered is correct, so a raw change count cannot
+    /// separate a healthy ramp from a stream oscillating between two layers - it fails both. A
+    /// reversal is the part that is never right, which makes this assertable across the whole run
+    /// including the cold-start ramp, where a joining viewer notices flapping most.
+    ///
+    /// A monotonic q -> h -> f climb reports zero however many layers it passes through.
+    QualityReversalsBelow { origin: &'static str, max: u64 },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
@@ -2442,6 +2451,23 @@ fn check_property(
             if rate > max as f64 {
                 return Err(format!(
                     "{origin}'s layer changed {changes} times in {window:?} ({rate:.0}/min);                      expected at most {max}/min. Each change costs a keyframe and stutters the                      picture, so at this rate the stream never holds a layer long enough to                      decode and the viewer sees nothing at all"
+                ));
+            }
+        }
+        Property::QualityReversalsBelow { origin, max } => {
+            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+                return Err(format!(
+                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
+                ));
+            };
+            let reversals = pulsebeam::sim_metrics::quality_reversals(&id);
+            if reversals > max {
+                let changes = pulsebeam::sim_metrics::quality_changes(&id);
+                return Err(format!(
+                    "{origin}'s layer reversed direction {reversals}x in {window:?} \
+                     ({changes} changes total); expected at most {max}. Climbing through layers is \
+                     fine, but reversing means the stream is oscillating rather than settling, and \
+                     every switch costs a keyframe and stutters the picture"
                 ));
             }
         }

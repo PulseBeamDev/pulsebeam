@@ -284,6 +284,7 @@ impl VideoAllocator {
                     priority: s.priority,
                     track,
                     current_quality,
+                    forwarding: !s.paused,
                 })
             })
             .collect();
@@ -991,6 +992,10 @@ pub struct SlotView<'a> {
     pub min_fps: u32,
     pub track: &'a Track,
     pub current_quality: LayerQuality,
+    /// Whether the slot is actually forwarding. A paused slot still reports a
+    /// `current_quality` - the layer it is parked on for a quick resume - so this is what
+    /// separates "already holding this layer" from "wants to start sending it again".
+    pub forwarding: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1144,9 +1149,17 @@ impl AllocationEngine {
             })
     }
 
-    /// Higher priority first, with MID as a deterministic tie-breaker.
+    /// Higher priority first, then guaranteed streams before droppable ones, with MID as a
+    /// deterministic tie-breaker.
+    ///
+    /// The floor tie-break matters because the waterfall serves each slot to completion in turn:
+    /// at equal priority a droppable stream sorted first would consume budget a stream that asked
+    /// to stay visible is relying on.
     pub fn priority_order(a: &SlotView<'_>, b: &SlotView<'_>) -> Ordering {
-        b.priority.cmp(&a.priority).then_with(|| a.mid.cmp(&b.mid))
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| (b.min_height > 0).cmp(&(a.min_height > 0)))
+            .then_with(|| a.mid.cmp(&b.mid))
     }
 
     /// Best layer worth wanting for this slot, irrespective of what the
@@ -1234,92 +1247,97 @@ impl AllocationEngine {
             "compute expects slots sorted by priority_order",
         );
 
+        // Reserve headroom withheld from speculative upgrades so the allocation
+        // never drives the link to 100% (leaving room for probing/AIMD). Guaranteed
+        // floors and retention may spend into it; climbing above the current layer
+        // may not.
+        let reserve = bwe.as_f64() * Self::RESERVE_FRACTION;
         let mut budget = bwe.as_f64();
-        let reserve = budget * Self::RESERVE_FRACTION;
-        let mut allocs: Vec<Option<&TrackLayer>> = vec![None; slots.len()];
-        // Slots admitted at a lowered decode target (a scalable temporal degrade
-        // instead of a pause): the chosen target and its cost.
-        let mut degraded_target: Vec<Option<(DecodeTargetSelection, f64)>> =
-            vec![None; slots.len()];
 
-        // Pass 1: guarantee each stream's floor, in priority order. A stream we
-        // can't afford the floor for is left paused; droppable streams (no floor)
-        // wait for Pass 2.
+        let mut decisions = SecondaryMap::new();
+
+        // Strict-priority waterfall. Serve each stream fully — its `min_height`
+        // floor, then its climb toward `target_height` — before touching the next
+        // lower-priority stream, so a lower-priority floor never preempts a
+        // higher-priority target.
         //
-        // Retention hysteresis: if the slot was already forwarding at or above
-        // the floor layer, apply DOWNGRADE_FACTOR so we keep the floor until
-        // budget < floor_cost × DOWNGRADE_FACTOR rather than dropping it the
-        // moment BWE dips 1% below floor cost. Without this, a tiny BWE dip can
-        // pause a high-priority stream and cause severe underuse oscillation.
-        for (i, slot) in slots.iter().enumerate() {
+        // Stability comes from the inputs, not from damping the output or holding a
+        // timer: budget math uses the *stable* declared layer bitrate
+        // (`stable_cost`), so a variable-bitrate neighbour cannot bounce the
+        // arithmetic, and each layer transition uses an asymmetric threshold — a
+        // Schmitt dead-band — so a budget merely wobbling at a layer boundary does
+        // not flip it. Real congestion still lands immediately: it shows up as a
+        // lower `bwe`, and the very next allocation sheds.
+        for slot in slots {
+            let mut cur: Option<&TrackLayer> = None;
+            let mut degraded: Option<(DecodeTargetSelection, f64)> = None;
+
+            // Floor: guarantee min_height if affordable (retained through the
+            // dead-band once held); else shed temporal layers down to the min_fps
+            // floor; else leave paused.
             if let Some(floor) = self.floor_layer(slot) {
-                let cost = self.cost(floor);
-                let threshold = if slot.current_quality >= floor.quality {
+                let cost = self.stable_cost(floor);
+                let threshold = if slot.forwarding && slot.current_quality >= floor.quality {
                     cost * Self::DOWNGRADE_FACTOR
                 } else {
                     cost
                 };
                 if threshold <= budget {
                     budget -= cost;
-                    allocs[i] = Some(floor);
+                    cur = Some(floor);
                 } else if let Some((target, dt_cost)) =
                     self.best_affordable_decode_target(floor, budget, slot.min_fps)
                 {
-                    // Can't afford the full floor, but the encoding is scalable:
-                    // forward the highest temporal decode target that fits and still
-                    // meets the min_fps floor, rather than pause the stream.
                     budget -= dt_cost;
-                    allocs[i] = Some(floor);
-                    degraded_target[i] = Some((target, dt_cost));
+                    cur = Some(floor);
+                    degraded = Some((target, dt_cost));
                 }
             }
-        }
 
-        // Pass 2: raise toward target in priority order. Retention/recovery up to
-        // the current layer is free (sticky dead-band); climbing above it is a
-        // genuine upgrade, and only one is granted per call. A base-layer-degraded
-        // slot is left as-is: it is under congestion, and it recovers to full in a
-        // later pass once budget covers its floor again.
-        let mut upgrade_used = false;
-        for (i, slot) in slots.iter().enumerate() {
-            if degraded_target[i].is_some() {
-                continue;
-            }
-            let mut cur = allocs[i];
-            while let Some(next) = self.next_layer(slot, cur) {
-                let step = self.cost(next) - cur.map_or(0.0, |l| self.cost(l));
-                let admitted = if next.quality > slot.current_quality {
-                    !upgrade_used && step + reserve <= budget
-                } else {
-                    step * Self::DOWNGRADE_FACTOR <= budget
-                };
-                if !admitted {
-                    break;
+            // Climb toward target. Recovery up to the current layer is a cheap
+            // dead-band; climbing above it is a genuine upgrade that must leave the
+            // reserve intact. A temporally-degraded slot stays put — it is under
+            // congestion and recovers once its floor fits again.
+            if degraded.is_none() {
+                while let Some(next) = self.next_layer(slot, cur) {
+                    let step = self.stable_cost(next) - cur.map_or(0.0, |l| self.stable_cost(l));
+                    // Resuming a paused slot is a genuine upgrade, not retention: it parks on a
+                    // layer it is not sending, so charging it the cheap retention dead-band admits
+                    // a stream the budget cannot actually carry, which overshoots the link and
+                    // squeezes the higher-priority streams already served from this budget.
+                    let resuming = !slot.forwarding;
+                    let admitted = if resuming || next.quality > slot.current_quality {
+                        step + reserve <= budget
+                    } else {
+                        step * Self::DOWNGRADE_FACTOR <= budget
+                    };
+                    if !admitted {
+                        break;
+                    }
+                    budget -= step;
+                    cur = Some(next);
                 }
-                if next.quality > slot.current_quality {
-                    upgrade_used = true;
-                }
-                budget -= step;
-                cur = Some(next);
             }
-            allocs[i] = cur;
-        }
 
-        // Finalize.
-        let mut decisions = SecondaryMap::new();
-        for (i, slot) in slots.iter().enumerate() {
-            if let Some(layer) = allocs[i] {
-                let decision = if let Some((target, dt_cost)) = degraded_target[i] {
-                    AllocationDecision::ForwardTarget(layer, target, Bitrate::from(dt_cost as u64))
+            let decision = if let Some(layer) = cur {
+                if let Some((target, dt_cost)) = degraded {
+                    Some(AllocationDecision::ForwardTarget(
+                        layer,
+                        target,
+                        Bitrate::from(dt_cost as u64),
+                    ))
                 } else {
-                    AllocationDecision::Forward(layer, Bitrate::from(self.cost(layer) as u64))
-                };
+                    Some(AllocationDecision::Forward(
+                        layer,
+                        Bitrate::from(self.cost(layer) as u64),
+                    ))
+                }
+            } else {
+                self.pause_target(slot)
+                    .map(|t| AllocationDecision::Pause(t, Bitrate::from(self.cost(t) as u64)))
+            };
+            if let Some(decision) = decision {
                 decisions.insert(slot.key, decision);
-            } else if let Some(target) = self.pause_target(slot) {
-                decisions.insert(
-                    slot.key,
-                    AllocationDecision::Pause(target, Bitrate::from(self.cost(target) as u64)),
-                );
             }
         }
 
@@ -1433,6 +1451,7 @@ mod assignment_tests {
             priority: 0,
             track: &track,
             current_quality: LayerQuality::Low,
+            forwarding: true,
         };
         let engine = AllocationEngine::new(std::slice::from_ref(&view));
 
@@ -2131,6 +2150,7 @@ mod allocation_tests {
             track,
             priority: 0,
             current_quality: current,
+            forwarding: true,
         }
     }
 
@@ -2152,6 +2172,7 @@ mod allocation_tests {
             track,
             priority,
             current_quality: current,
+            forwarding: true,
         }
     }
 
@@ -2172,24 +2193,23 @@ mod allocation_tests {
     }
 
     #[test]
-    fn at_most_one_genuine_upgrade_per_call() {
+    fn ample_budget_serves_every_slot_to_its_target() {
         let t = healthy_track();
         let high = layer_bps(&t, LayerQuality::High);
-        // Ample budget — several upgrades are affordable, but only one is granted.
         let available = bw((high * 4.0) as u64 / 1_000);
         let slots = sorted(vec![
             qos_slot("a", 1080, 0, 10, &t, LayerQuality::Low),
             qos_slot("b", 1080, 0, 5, &t, LayerQuality::Low),
         ]);
         let decisions = AllocationEngine::compute(available, &slots);
-        let upgrades = slots
-            .iter()
-            .filter(|s| forwarded_quality(&decisions, s.key).is_some_and(|q| q > s.current_quality))
-            .count();
-        assert!(
-            upgrades <= 1,
-            "granted {upgrades} genuine upgrades in one call"
-        );
+        for slot in &slots {
+            assert_eq!(
+                forwarded_quality(&decisions, slot.key),
+                Some(LayerQuality::High),
+                "{} was held below its target despite ample budget",
+                slot.mid
+            );
+        }
     }
 
     #[test]
@@ -2352,6 +2372,7 @@ mod allocation_tests {
             priority: 0,
             track: t,
             current_quality: LayerQuality::Low,
+            forwarding: true,
         }
     }
 
@@ -2635,6 +2656,7 @@ mod allocation_tests {
             track: &t,
             priority: 0,
             current_quality: LayerQuality::High,
+            forwarding: true,
         }];
         let decisions = AllocationEngine::compute(bw(10_000), &slots);
         assert!(
@@ -2701,6 +2723,7 @@ mod allocation_tests {
                 track: &t,
                 priority: 200,
                 current_quality: LayerQuality::Low,
+                forwarding: true,
             },
             SlotView {
                 key: next_slot_key(),
@@ -2711,6 +2734,7 @@ mod allocation_tests {
                 track: &t,
                 priority: 0,
                 current_quality: LayerQuality::Low,
+                forwarding: true,
             },
         ];
 
