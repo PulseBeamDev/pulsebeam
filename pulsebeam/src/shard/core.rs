@@ -25,29 +25,33 @@ use str0m::media::Rid;
 
 use super::router::{self, ParticipantShardMeta, RoutingContext, ShardRoutingTable};
 
-pub(crate) use super::router::CrossShardSend;
+pub(crate) use super::router::ShardTransport;
 use super::worker::{ClusterCommand, CrossShardEvent, MediaPayload, ShardCommand, ShardEvent};
 
 const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 
-struct DispatchCtx<'a, R: CrossShardSend> {
+struct DispatchCtx<'a, R: ShardTransport> {
     registry: &'a mut ParticipantRegistry,
     dirty: &'a mut DirtyTracker,
     router: &'a R,
     wall: &'a WallAnchor,
 }
 
-impl<'a, R: CrossShardSend> CrossShardSend for DispatchCtx<'a, R> {
-    fn send(&self, shard_id: ShardId, ev: CrossShardEvent) {
-        self.router.send(shard_id, ev);
-    }
-
+impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
     fn shard_id(&self) -> ShardId {
         self.router.shard_id()
     }
+
+    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+        self.router.send_media(dst, env, payload);
+    }
+
+    fn send_control(&self, dst: ShardId, ev: CrossShardEvent) {
+        self.router.send_control(dst, ev);
+    }
 }
 
-impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
+impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
     fn forward_video_rtp(
         &mut self,
         subscriber: ParticipantHandle,
@@ -199,7 +203,7 @@ impl ShardCore {
         &mut self,
         env: Envelope,
         payload: MediaPayload,
-        router: &impl CrossShardSend,
+        router: &impl ShardTransport,
     ) {
         let entry = match self.routing.routes.resolve(&env) {
             Ok(entry) => entry,
@@ -391,7 +395,7 @@ impl ShardCore {
     pub(crate) fn on_udp_batch(
         &mut self,
         batch: pulsebeam_runtime::net::RecvPacketBatch,
-        router: &impl CrossShardSend,
+        router: &impl ShardTransport,
     ) {
         let Some(participant_id) = self.registry.demux(&batch) else {
             return;
@@ -400,7 +404,7 @@ impl ShardCore {
             participant.on_ingress(batch);
             self.dirty.mark(handle, participant);
         } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
-            router.send(
+            router.send_control(
                 shard_id,
                 CrossShardEvent::UdpPacket {
                     participant_id,
@@ -410,7 +414,7 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn flush_stream_buffers(&mut self, router: &impl CrossShardSend) {
+    pub(crate) fn flush_stream_buffers(&mut self, router: &impl ShardTransport) {
         let mut ctx = DispatchCtx {
             registry: &mut self.registry,
             dirty: &mut self.dirty,
@@ -438,7 +442,7 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn flush_participant_events(&mut self, now: Instant, router: &impl CrossShardSend) {
+    pub(crate) fn flush_participant_events(&mut self, now: Instant, router: &impl ShardTransport) {
         while let Some(event) = self.pipeline.pop_participant_event() {
             match event {
                 ParticipantEvent::Topology(ev) => {
@@ -651,7 +655,7 @@ impl ShardCore {
         &mut self,
         cmd: ShardCommand,
         now: Instant,
-        router: &impl CrossShardSend,
+        router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
             ShardCommand::AddParticipant(cfg) => self.add_participant(cfg, now, router),
@@ -670,7 +674,7 @@ impl ShardCore {
         &mut self,
         cmd: ClusterCommand,
         now: Instant,
-        router: &impl CrossShardSend,
+        router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
             ClusterCommand::RequestKeyframe(req) => {
@@ -868,7 +872,7 @@ impl ShardCore {
         &mut self,
         ev: CrossShardEvent,
         _now: Instant,
-        router: &impl CrossShardSend,
+        router: &impl ShardTransport,
     ) {
         match ev {
             CrossShardEvent::Media { env, payload } => {
@@ -914,7 +918,7 @@ impl ShardCore {
         &mut self,
         cfg: ParticipantConfig,
         now: Instant,
-        router: &impl CrossShardSend,
+        router: &impl ShardTransport,
     ) {
         let room_id = cfg.room_id;
         let participant_id = cfg.participant_id;
@@ -994,13 +998,19 @@ mod test {
         }
     }
 
-    impl CrossShardSend for TestRouter {
-        fn send(&self, shard_id: ShardId, ev: CrossShardEvent) {
-            self.sent.borrow_mut().push((shard_id, ev));
-        }
-
+    impl ShardTransport for TestRouter {
         fn shard_id(&self) -> ShardId {
             self.shard_id
+        }
+
+        fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+            self.sent
+                .borrow_mut()
+                .push((dst, CrossShardEvent::Media { env, payload }));
+        }
+
+        fn send_control(&self, dst: ShardId, ev: CrossShardEvent) {
+            self.sent.borrow_mut().push((dst, ev));
         }
     }
 

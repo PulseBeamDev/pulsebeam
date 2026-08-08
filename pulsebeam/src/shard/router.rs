@@ -31,14 +31,24 @@ fn fast_set_with_capacity<T>(cap: usize) -> FastIndexSet<T> {
     IndexSet::with_capacity_and_hasher(cap, ahash::RandomState::default())
 }
 
-/// Abstraction over the cross-shard message bus. Implemented by the shard
-/// worker's real router; faked in tests.
-pub(crate) trait CrossShardSend {
-    fn send(&self, shard_id: ShardId, ev: CrossShardEvent);
+/// The seam between the data plane and whatever carries it between shards.
+///
+/// The two lanes are deliberately separate methods, because they become
+/// different transports cross-node: media is disposable and packet-rate and
+/// becomes a UDP datagram, while semantic control is low-rate and
+/// correctness-critical and becomes a reliable gRPC call. Swapping in UDP means
+/// reimplementing `send_media` alone.
+pub(crate) trait ShardTransport {
     fn shard_id(&self) -> ShardId;
+
+    /// Route-addressed media. Lossy by contract.
+    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload);
+
+    /// Reverse and topology control. Must not be dropped.
+    fn send_control(&self, dst: ShardId, ev: CrossShardEvent);
 }
 
-pub(crate) trait RoutingContext: CrossShardSend {
+pub(crate) trait RoutingContext: ShardTransport {
     fn forward_video_rtp(
         &mut self,
         subscriber: ParticipantHandle,
@@ -1167,13 +1177,7 @@ impl ShardRoutingTable {
         }
         for remote in &mut route.remote_routes {
             let env = remote.next_envelope(ctx.wall().to_ntp(pkt.playout_time));
-            ctx.send(
-                remote.shard_id,
-                CrossShardEvent::Media {
-                    env,
-                    payload: MediaPayload::Video(pkt.deep_clone()),
-                },
-            );
+            ctx.send_media(remote.shard_id, env, MediaPayload::Video(pkt.deep_clone()));
         }
     }
 
@@ -1201,12 +1205,10 @@ impl ShardRoutingTable {
         {
             for remote in &mut track.remote_routes {
                 let env = remote.next_envelope(ctx.wall().to_ntp(ev.pkt.playout_time));
-                ctx.send(
+                ctx.send_media(
                     remote.shard_id,
-                    CrossShardEvent::Media {
-                        env,
-                        payload: MediaPayload::Audio(ev.pkt.deep_clone()),
-                    },
+                    env,
+                    MediaPayload::Audio(ev.pkt.deep_clone()),
                 );
             }
         }
@@ -1247,13 +1249,7 @@ impl ShardRoutingTable {
             let playout = ctx.wall().ntp();
             for entry in route.remote_subscriber_shards.values_mut() {
                 let env = entry.remote.next_envelope(playout);
-                ctx.send(
-                    entry.remote.shard_id,
-                    CrossShardEvent::Media {
-                        env,
-                        payload: MediaPayload::Sctp(pkt.to_vec()),
-                    },
-                );
+                ctx.send_media(entry.remote.shard_id, env, MediaPayload::Sctp(pkt.to_vec()));
             }
         }
     }
@@ -1354,13 +1350,7 @@ impl ShardRoutingTable {
                     .map(|remote| (remote.shard_id, remote.next_envelope(playout)))
                     .collect();
                 for (shard_id, env) in frames {
-                    ctx.send(
-                        shard_id,
-                        CrossShardEvent::Media {
-                            env,
-                            payload: MediaPayload::ReliableSctp(frame.to_vec()),
-                        },
-                    );
+                    ctx.send_media(shard_id, env, MediaPayload::ReliableSctp(frame.to_vec()));
                 }
             }
         }
@@ -1377,7 +1367,9 @@ impl ShardRoutingTable {
         if ctx.is_local(&publisher) {
             ctx.deliver_reliable_control(publisher, topic, bytes);
         } else if let Some(shard_id) = self.remote_shard_for(&publisher) {
-            ctx.send(
+            // Reverse semantic control: correctness-critical, so it never rides
+            // the media lane.
+            ctx.send_control(
                 shard_id,
                 CrossShardEvent::ReliableControlForward {
                     publisher,
@@ -1397,7 +1389,7 @@ impl ShardRoutingTable {
 pub(crate) fn route_participant_control_event(
     ev: ParticipantControlEvent,
     shard_events: &mut VecDeque<ShardEvent>,
-    router: &impl CrossShardSend,
+    router: &impl ShardTransport,
 ) {
     match ev {
         ParticipantControlEvent::TrackPublished(track) => {
@@ -1410,7 +1402,7 @@ pub(crate) fn route_participant_control_event(
             if req.shard_id == router.shard_id() {
                 shard_events.push_back(ShardEvent::KeyframeRequest(req));
             } else {
-                router.send(req.shard_id, CrossShardEvent::KeyframeRequested(req));
+                router.send_control(req.shard_id, CrossShardEvent::KeyframeRequested(req));
             }
         }
         ParticipantControlEvent::DataTopicPublished { .. }
@@ -1511,12 +1503,19 @@ mod tests {
         }
     }
 
-    impl CrossShardSend for RecordingCtx {
-        fn send(&self, shard_id: ShardId, ev: CrossShardEvent) {
-            self.sent.borrow_mut().push((shard_id, ev));
-        }
+    impl ShardTransport for RecordingCtx {
         fn shard_id(&self) -> ShardId {
             self.shard_id
+        }
+
+        fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+            self.sent
+                .borrow_mut()
+                .push((dst, CrossShardEvent::Media { env, payload }));
+        }
+
+        fn send_control(&self, dst: ShardId, ev: CrossShardEvent) {
+            self.sent.borrow_mut().push((dst, ev));
         }
     }
 

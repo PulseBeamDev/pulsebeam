@@ -19,7 +19,7 @@ use crate::{
     track::{GlobalKeyframeRequest, Topic, Track, TrackMeta},
 };
 
-use super::core::{CrossShardSend, ShardCore};
+use super::core::{ShardCore, ShardTransport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
@@ -218,21 +218,42 @@ pub struct ShardContext {
     pub metrics: Arc<ShardMetrics>,
 }
 
-struct ShardRouter {
+/// Carries both lanes over in-process channels. Cross-node, `send_media`
+/// becomes a UDP datagram of `[envelope || payload]` while `send_control`
+/// becomes a reliable gRPC call; this is the only implementation until then.
+struct ChannelTransport {
     shard_id: ShardId,
     cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
 }
 
-impl CrossShardSend for ShardRouter {
-    fn send(&self, shard_id: ShardId, ev: CrossShardEvent) {
-        if shard_id == self.shard_id {
-            return;
+impl ChannelTransport {
+    fn enqueue(&self, dst: ShardId, ev: CrossShardEvent) -> bool {
+        if dst == self.shard_id {
+            return true;
         }
-        let _ = self.cross_shard_event_txs[shard_id.index()].try_send(ev);
+        self.cross_shard_event_txs[dst.index()].try_send(ev).is_ok()
     }
+}
 
+impl ShardTransport for ChannelTransport {
     fn shard_id(&self) -> ShardId {
         self.shard_id
+    }
+
+    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+        // Dropping under backpressure is the media contract: this lane is
+        // lossy by design, and `link_seq` makes the loss visible downstream.
+        let _ = self.enqueue(dst, CrossShardEvent::Media { env, payload });
+    }
+
+    fn send_control(&self, dst: ShardId, ev: CrossShardEvent) {
+        if !self.enqueue(dst, ev) {
+            tracing::warn!(
+                from = %self.shard_id,
+                %dst,
+                "dropped a control message; the cross-shard queue is full"
+            );
+        }
     }
 }
 
@@ -244,7 +265,7 @@ pub struct ShardWorker {
     command_rx: mailbox::Receiver<ShardCommand>,
     event_tx: mailbox::Sender<ShardEventWrapper>,
     cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
-    router: ShardRouter,
+    router: ChannelTransport,
     metrics: Arc<ShardMetrics>,
 
     // Mark !Send
@@ -265,7 +286,7 @@ impl ShardWorker {
         wall: WallAnchor,
     ) -> Self {
         let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall);
-        let router = ShardRouter {
+        let router = ChannelTransport {
             shard_id,
             cross_shard_event_txs,
         };
