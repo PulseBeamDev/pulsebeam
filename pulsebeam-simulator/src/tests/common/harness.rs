@@ -2559,6 +2559,47 @@ pub struct LinkProfile {
     /// that under-delivers cannot pull the estimate down. Set it to make congestion real. See
     /// `pulsebeam_runtime::net::shaper`.
     pub bandwidth_bps: Option<u64>,
+    /// Loss model for the path, replacing `loss` when set. Real wireless loses in bursts, and a
+    /// controller tuned against the same average spread evenly is not tested against it.
+    pub loss_model: Option<Loss>,
+    /// Out-of-order delivery on the path.
+    pub reorder: Reorder,
+    /// Fraction of datagrams delivered twice, 0.0..=1.0.
+    pub duplicate: f64,
+    /// Impairment applied to the *client to SFU* direction, which carries transport feedback.
+    ///
+    /// Loss, reordering and duplication are configured per destination, and every plan until now
+    /// only configured the participants' addresses - so feedback reached the SFU perfectly however
+    /// bad the path to the viewer was. Congestion control is a closed loop: an estimator whose
+    /// feedback is assumed lossless has not been tested on a real network. `None` leaves the
+    /// return path clean, which is the right choice only when a plan is deliberately isolating
+    /// the forward direction.
+    pub feedback: Option<FeedbackProfile>,
+}
+
+/// Impairment on the path carrying transport feedback back to the SFU.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FeedbackProfile {
+    pub loss: Option<Loss>,
+    pub reorder: Reorder,
+}
+
+impl FeedbackProfile {
+    /// Feedback degraded about as much as the forward path on the same wireless link.
+    pub fn wifi() -> Self {
+        Self {
+            loss: Some(Loss::wifi()),
+            reorder: Reorder::occasional(),
+        }
+    }
+
+    /// Mobile uplink: feedback is scarcer and later than on the downlink.
+    pub fn cellular() -> Self {
+        Self {
+            loss: Some(Loss::cellular()),
+            reorder: Reorder::occasional(),
+        }
+    }
 }
 
 impl LinkProfile {
@@ -2569,6 +2610,10 @@ impl LinkProfile {
             max_latency: Duration::from_millis(6),
             loss: 0.0,
             bandwidth_bps: None,
+            loss_model: None,
+            reorder: Reorder::NONE,
+            duplicate: 0.0,
+            feedback: None,
         }
     }
 
@@ -2579,6 +2624,10 @@ impl LinkProfile {
             max_latency: Duration::from_millis(13),
             loss: 0.002,
             bandwidth_bps: None,
+            loss_model: Some(Loss::wifi()),
+            reorder: Reorder::occasional(),
+            duplicate: 0.0005,
+            feedback: Some(FeedbackProfile::wifi()),
         }
     }
 
@@ -2590,6 +2639,10 @@ impl LinkProfile {
             max_latency: Duration::from_millis(52),
             loss: 0.01,
             bandwidth_bps: None,
+            loss_model: Some(Loss::cellular()),
+            reorder: Reorder::occasional(),
+            duplicate: 0.001,
+            feedback: Some(FeedbackProfile::cellular()),
         }
     }
 }
@@ -2754,6 +2807,16 @@ impl LocalNodeSim {
         let mut name_to_ip: HashMap<&'static str, IpAddr> = HashMap::new();
         name_to_ip.insert("server", server_ip);
 
+        // Impairment is keyed by destination, so configuring the SFU's address is what degrades
+        // the client-to-SFU direction - the one carrying transport feedback. Leaving it clean
+        // tests congestion control with a return path no real network provides.
+        if let Some(feedback) = self.link.feedback {
+            if let Some(loss) = feedback.loss {
+                pulsebeam_runtime::net::shaper::set_loss(server_ip, loss);
+            }
+            pulsebeam_runtime::net::shaper::set_reorder(server_ip, feedback.reorder);
+        }
+
         let mut ip_counter = 2u8;
         for room in &self.rooms {
             for participant in &room.participants {
@@ -2768,7 +2831,12 @@ impl LocalNodeSim {
                 // State is keyed by unique simulation addresses. Do not clear the process-wide
                 // registry: cargo runs simulator tests in parallel and clearing it would change
                 // the network model of a different test already in flight.
-                pulsebeam_runtime::net::shaper::set_packet_loss(ip, self.link.loss);
+                match self.link.loss_model {
+                    Some(model) => pulsebeam_runtime::net::shaper::set_loss(ip, model),
+                    None => pulsebeam_runtime::net::shaper::set_packet_loss(ip, self.link.loss),
+                }
+                pulsebeam_runtime::net::shaper::set_reorder(ip, self.link.reorder);
+                pulsebeam_runtime::net::shaper::set_duplicate(ip, self.link.duplicate);
 
                 // Shaping is keyed by destination, so this caps what the SFU can push down to
                 // this participant without touching the paths between anyone else.

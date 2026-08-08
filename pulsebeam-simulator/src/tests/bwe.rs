@@ -5,7 +5,8 @@
 //! probe controller, and the failure modes only appear once both are in the loop.
 
 use super::common::{
-    Capacity, LinkProfile, LocalNodeSim, Loss, Participant, Property, Room, Step, VideoQuality,
+    Capacity, LinkProfile, LocalNodeSim, Loss, Participant, Property, Reorder, Room, Step,
+    VideoQuality,
 };
 use std::time::Duration;
 
@@ -774,7 +775,7 @@ fn screenshare_and_camera_over_wifi_test() {
 /// that clears in-flight packets, and is therefore unsuitable for a packet-loss profile.
 #[test]
 fn screenshare_and_camera_over_cellular_test() {
-    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 14, 2);
+    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 30, 2);
 }
 
 /// Shared plan for the conference tests so the link profile is the only variable.
@@ -1798,6 +1799,120 @@ fn a_stream_returns_after_a_total_outage_test() {
                 description: "The estimate recovers what the viewer needs",
                 participant: "bob",
                 property: Property::EstimateMeetsNeed { percent: 70 },
+            },
+        ]);
+}
+
+/// Congestion control is a closed loop, and the return half of it is a network path too.
+///
+/// Every plan that came before this one configured impairment only on the SFU-to-participant
+/// direction, so transport feedback arrived perfectly however bad the forward path was. An
+/// estimator validated that way has been tested against half of a real network: it has never seen
+/// a TWCC report vanish, arrive out of order, or arrive twice. This asserts the estimate still
+/// converges and the stream still holds a layer when the feedback path is as lossy as the media
+/// path - which on a mobile uplink it usually is, and worse.
+#[test]
+fn estimate_converges_when_feedback_is_lossy_test() {
+    let mut link = LinkProfile::cellular();
+    link.bandwidth_bps = Some(3_000_000);
+    LocalNodeSim::new()
+        .with_link(link)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the camera",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer asks for 720p",
+                participant: "viewer",
+                targets: &[("camera", 720, 180, 100)],
+            },
+            Step::Run {
+                description: "Converge with feedback that is itself being lost and reordered",
+                duration: Duration::from_secs(60),
+            },
+            Step::Expect {
+                description: "The estimate still finds most of the link through lossy feedback",
+                participant: "viewer",
+                property: Property::EstimateMeetsNeed { percent: 60 },
+            },
+            Step::Expect {
+                description: "Degraded feedback does not drive the sender into congestion",
+                participant: "viewer",
+                property: Property::CongestionLossBelow(5),
+            },
+            Step::Expect {
+                description: "The forwarded layer settles rather than oscillating",
+                participant: "viewer",
+                property: Property::QualityReversalsBelow {
+                    origin: "camera",
+                    max: 2,
+                },
+            },
+        ]);
+}
+
+/// Reordering is a normal internet condition, not a fault, and it is the one this suite has never
+/// modelled: packets arriving late enough to overtake their successors.
+///
+/// The failure it provokes is specific - a receiver that treats a gap as loss will request a
+/// keyframe for a packet that was merely late, and a stream that does that repeatedly never holds
+/// a decodable run. So the assertions here are about *not over-reacting*: the stream keeps
+/// delivering frames and keeps its layer, rather than churning keyframes.
+#[test]
+fn a_reordering_path_does_not_churn_keyframes_test() {
+    let mut link = LinkProfile::fiber();
+    link.bandwidth_bps = Some(3_000_000);
+    // Markedly worse than the wifi default, so the assertion is about tolerating reordering rather
+    // than about whether it happened to occur.
+    link.reorder = Reorder {
+        probability: 0.03,
+        delay: Duration::from_millis(40),
+    };
+    link.duplicate = 0.01;
+    LocalNodeSim::new()
+        .with_link(link)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the camera",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Viewer asks for 720p",
+                participant: "viewer",
+                targets: &[("camera", 720, 180, 100)],
+            },
+            Step::Run {
+                description: "Run on a path that reorders and duplicates",
+                duration: Duration::from_secs(60),
+            },
+            Step::CheckForwardedQualityReached {
+                description: "The camera still reaches its top layer despite reordering",
+                origin: "camera",
+                min_quality: 3,
+            },
+            Step::Expect {
+                description: "Late packets are not mistaken for congestion",
+                participant: "viewer",
+                property: Property::CongestionLossBelow(5),
+            },
+            Step::Expect {
+                description: "A late packet does not cost the stream its layer",
+                participant: "viewer",
+                property: Property::QualityReversalsBelow {
+                    origin: "camera",
+                    max: 1,
+                },
             },
         ]);
 }
