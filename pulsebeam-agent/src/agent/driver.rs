@@ -803,11 +803,12 @@ impl AgentDriver {
                     self.timers.notifier.notify_one();
                     return;
                 }
+                // Only a caller still blocked on an unresolved subscribe is rejected; re-subscribing
+                // over a resolved one replaces the handle, matching the assigned path above.
                 if self
                     .media
                     .pending_media_subscriptions
                     .contains_key(&track_id)
-                    || self.media.pending_media_targets.contains_key(&track_id)
                 {
                     let _ = response.send(Err(AgentError::Protocol(
                         "media publication is already being subscribed".into(),
