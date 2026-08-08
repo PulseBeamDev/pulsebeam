@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.8] - 2026-08-08
 
 * feat: update str0m fork based on 0.22.0
 * feat: tighter allocation QoS
