@@ -5,8 +5,8 @@
 //! probe controller, and the failure modes only appear once both are in the loop.
 
 use super::common::{
-    Capacity, LinkProfile, LocalNodeSim, Loss, Participant, Property, Reorder, Room, Step,
-    VideoQuality,
+    Capacity, LinkProfile, LinkReport, LocalNodeSim, Loss, Participant, Property, Reorder, Room,
+    Step, VideoQuality,
 };
 use std::time::Duration;
 
@@ -1945,4 +1945,77 @@ fn a_reordering_path_does_not_churn_keyframes_test() {
                 },
             ]);
     }
+}
+
+/// Determinism is the guarantee every other plan in this suite rests on.
+///
+/// A threshold means nothing if the same plan produces different numbers each run, and a
+/// regression cannot be attributed if a failure might just be this run. The clock and OS
+/// randomness are both overridden process-wide (`sim_clock`, `sim_rand`) precisely so that holds,
+/// but nothing asserted it, so a change that reintroduced a real-clock or real-entropy read would
+/// have shown up only as thresholds slowly becoming unreliable.
+///
+/// This runs one plan twice under the same seed and demands the measurements agree exactly - not
+/// approximately, since any tolerance here would hide the very drift it exists to catch.
+#[test]
+fn a_plan_measures_identically_when_replayed_test() {
+    let first = deterministic_probe_plan(0x5EED_0001);
+    let second = deterministic_probe_plan(0x5EED_0001);
+
+    assert_eq!(
+        first, second,
+        "the same plan under the same seed produced different measurements, so the simulation is \
+         reading a clock or an entropy source it does not control; every threshold in this suite \
+         is unreliable until that is fixed"
+    );
+}
+
+/// The counterpart claim: the seed is actually an input.
+///
+/// If replays agreed because the plan is insensitive to scheduling rather than because it is
+/// controlled, the test above would pass while asserting nothing. Two different seeds must produce
+/// two different networks.
+#[test]
+fn a_different_seed_is_a_different_network_test() {
+    let first = deterministic_probe_plan(0x5EED_0001);
+    let second = deterministic_probe_plan(0x5EED_0002);
+
+    assert_ne!(
+        first, second,
+        "two seeds produced byte-identical measurements, so the seed is not reaching the \
+         simulation and running plans under several of them proves nothing"
+    );
+}
+
+/// A plan with enough going on - loss, reordering, contention, an allocation decision - that any
+/// uncontrolled input would move at least one of the numbers it reports.
+fn deterministic_probe_plan(seed: u64) -> LinkReport {
+    LocalNodeSim::new()
+        .with_rng_seed(seed)
+        .with_link(LinkProfile::wifi())
+        .with_bandwidth(2_000_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("cotenant", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
+        )
+        .run_collecting(vec![
+            Step::Run {
+                description: "Establish connections and discover both cameras",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Both streams wanted, the camera with priority",
+                participant: "viewer",
+                targets: &[("camera", 720, 180, 100), ("cotenant", 360, 0, 10)],
+            },
+            Step::Run {
+                description: "Contend for a link that cannot carry both at full quality",
+                duration: Duration::from_secs(40),
+            },
+        ])
+        .get("viewer")
+        .cloned()
+        .expect("the viewer should have been measured")
 }

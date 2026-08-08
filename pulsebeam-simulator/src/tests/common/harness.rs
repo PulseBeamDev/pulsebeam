@@ -2057,7 +2057,7 @@ fn pct(part: f64, whole: f64) -> f64 {
 /// Separate from its formatting on purpose. A property needs to *compute* over these numbers, and
 /// a randomised scenario needs to return them rather than assert inline, so the measurement has
 /// to exist as data. Rendering it for a human is a second, lesser job.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinkReport {
     /// Configured capacity, and whether it held still for the window. Utilisation and the
     /// capacity-relative figures are only meaningful when it did.
