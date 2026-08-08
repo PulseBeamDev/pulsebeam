@@ -305,6 +305,7 @@ impl AgentBuilder {
             resource_uri: resp.resource_uri,
             room_id: room_id.to_string(),
             participant_id: resp.participant_id,
+            connection_id: resp.connection_id,
             medias,
         };
 

@@ -211,6 +211,7 @@ pub(crate) struct DriverInit {
     pub resource_uri: Uri,
     pub room_id: String,
     pub participant_id: String,
+    pub connection_id: Option<String>,
     pub medias: Vec<MediaAdded>,
 }
 
@@ -298,6 +299,7 @@ struct SessionSubsystem {
     resource_uri: Uri,
     room_id: String,
     participant_id: String,
+    connection_id: Option<String>,
     disconnected_reason: Option<String>,
     retry_count: u32,
     is_reconnecting: bool,
@@ -393,6 +395,7 @@ impl AgentDriver {
                 resource_uri: init.resource_uri,
                 room_id: init.room_id,
                 participant_id: init.participant_id,
+                connection_id: init.connection_id,
                 disconnected_reason: None,
                 retry_count: 0,
                 is_reconnecting: false,
@@ -1180,7 +1183,10 @@ impl AgentDriver {
             .api
             .update_participant(
                 self.session.resource_uri.clone(),
-                UpdateParticipantRequest { offer },
+                UpdateParticipantRequest {
+                    offer,
+                    connection_id: self.session.connection_id.clone(),
+                },
             )
             .await?;
 
@@ -1188,6 +1194,10 @@ impl AgentDriver {
             .sdp_api()
             .accept_answer(pending, resp.answer)
             .map_err(AgentError::Rtc)?;
+
+        if resp.connection_id.is_some() {
+            self.session.connection_id = resp.connection_id;
+        }
 
         Ok(())
     }
