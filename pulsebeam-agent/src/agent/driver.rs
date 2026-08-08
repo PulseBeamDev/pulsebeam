@@ -238,6 +238,12 @@ struct MediaSubsystem {
     upstream_slots: HashMap<Mid, UpstreamSlot>,
     pending_media_subscriptions:
         HashMap<String, tokio::sync::oneshot::Sender<Result<RemoteTrack, AgentError>>>,
+    /// Mailboxes handed to a subscriber before the SFU assigned the track a slot.
+    ///
+    /// A hidden subscription (`target_height = 0`) is answered immediately with a `RemoteTrack`
+    /// that carries no media yet; its sender waits here until an assignment arrives, so raising
+    /// the height later starts feeding the handle the subscriber already holds.
+    pending_media_targets: HashMap<String, mailbox::Sender<RtpPacket>>,
     layer_ctrl: LayerController,
     desired_ctrl: BitrateController,
     last_desired: Bitrate,
@@ -363,6 +369,7 @@ impl AgentDriver {
                 incoming_rtp_routes: HashMap::new(),
                 upstream_slots: HashMap::new(),
                 pending_media_subscriptions: HashMap::new(),
+                pending_media_targets: HashMap::new(),
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
                 last_desired: Bitrate::bps(0),
@@ -777,7 +784,7 @@ impl AgentDriver {
                 if let Some((mid, track)) = self.slot_manager.assigned(&track_id) {
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
-                    let _ = response.send(Ok(RemoteTrack::new(mid, track, rx)));
+                    let _ = response.send(Ok(RemoteTrack::new(track, rx)));
                     self.subscriptions
                         .desired_subscriptions
                         .insert(track_id, subscription);
@@ -797,15 +804,28 @@ impl AgentDriver {
                     .media
                     .pending_media_subscriptions
                     .contains_key(&track_id)
+                    || self.media.pending_media_targets.contains_key(&track_id)
                 {
                     let _ = response.send(Err(AgentError::Protocol(
                         "media publication is already being subscribed".into(),
                     )));
                     return;
                 }
-                self.media
-                    .pending_media_subscriptions
-                    .insert(track_id.clone(), response);
+                // The track is known but holds no slot - a hidden subscription, which the SFU is
+                // never going to assign. Answer now with a handle whose mailbox is wired up if and
+                // when the subscriber raises the height, rather than leaving the caller awaiting an
+                // assignment that is not coming.
+                if let Some(track) = self.slot_manager.known(&track_id) {
+                    let (tx, rx) = mailbox::bounded(256);
+                    self.media
+                        .pending_media_targets
+                        .insert(track_id.clone(), tx);
+                    let _ = response.send(Ok(RemoteTrack::new(track, rx)));
+                } else {
+                    self.media
+                        .pending_media_subscriptions
+                        .insert(track_id.clone(), response);
+                }
                 self.subscriptions
                     .desired_subscriptions
                     .insert(track_id, subscription);
@@ -1027,13 +1047,21 @@ impl AgentDriver {
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
                 }
                 for track_id in removed {
+                    self.media.pending_media_targets.remove(&track_id);
                     self.emit(AgentEvent::RemoteTrackRemoved(track_id));
                 }
                 for (mid, track) in assignments {
+                    let track_id = track.id.clone();
+                    // A subscriber already holds the receiving half, from a subscription answered
+                    // before this assignment existed. Wire its sender to the slot rather than
+                    // replacing it, or the handle it is holding would never receive anything.
+                    if let Some(tx) = self.media.pending_media_targets.remove(&track_id) {
+                        self.media.media_targets.insert(mid, tx);
+                        continue;
+                    }
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
-                    let track_id = track.id.clone();
-                    let remote_track = RemoteTrack::new(mid, track, rx);
+                    let remote_track = RemoteTrack::new(track, rx);
                     if let Some(response) = self.media.pending_media_subscriptions.remove(&track_id)
                     {
                         let _ = response.send(Ok(remote_track));

@@ -774,6 +774,7 @@ async fn run_participant(
 
         // Drive until cancelled or a lifecycle command arrives.
         let token = CancellationToken::new();
+        let ops_token = token.clone();
         let cmd = {
             let mut drive_fut = Box::pin(client.drive_until_cancelled(token.clone(), move |ctx| {
                 // 1. Drain pending ops.
@@ -800,20 +801,36 @@ async fn run_participant(
                             for subscription in new_subscriptions {
                                 let agent = ctx.agent.clone();
                                 let incoming_tracks = incoming_tracks.clone();
+                                let token = ops_token.clone();
                                 tokio::spawn(async move {
-                                    let track = agent
-                                        .participant(subscription.participant_id)
-                                        .video()
-                                        .subscribe()
-                                        .target_height(subscription.height)
-                                        .minimum_height(subscription.min_height)
-                                        .priority(subscription.priority)
-                                        .await
-                                        .expect("failed to subscribe to publication");
-                                    incoming_tracks
-                                        .send(track)
-                                        .await
-                                        .expect("client media inbox closed");
+                                    let participant = subscription.participant_id.clone();
+                                    // A subscribe that never resolves would otherwise sit here
+                                    // until the plan ends and the agent closes, then panic during
+                                    // teardown - long after the step that issued it, and pointing
+                                    // at shutdown rather than at the subscription that hung.
+                                    let result = tokio::select! {
+                                        _ = token.cancelled() => {
+                                            panic!(
+                                                "subscribe to {participant} never resolved; it was \
+                                                 still pending when the plan finished"
+                                            );
+                                        }
+                                        result = agent
+                                            .participant(subscription.participant_id)
+                                            .video()
+                                            .subscribe()
+                                            .target_height(subscription.height)
+                                            .minimum_height(subscription.min_height)
+                                            .priority(subscription.priority) => result,
+                                    };
+                                    let track = result.unwrap_or_else(|e| {
+                                        panic!("failed to subscribe to {participant}: {e:?}")
+                                    });
+                                    if incoming_tracks.send(track).await.is_err() {
+                                        // The client is shutting down and no longer reading; the
+                                        // subscription itself succeeded, so this is not a failure.
+                                        return;
+                                    }
                                 });
                             }
                         }
@@ -1097,7 +1114,7 @@ async fn execute_plan(
                 }
                 // Same windowing as the byte baselines, so the checks describe this step.
                 pulsebeam::sim_metrics::reset();
-                pulsebeam_runtime::net::shaper::reset_stats();
+                pulsebeam_runtime::net::shaper::reset_stats_for(name_to_ip.values().copied());
                 window = *duration;
                 tokio::time::sleep(*duration).await;
             }
@@ -1826,6 +1843,14 @@ async fn execute_plan(
         })
         .collect();
 
+    let reversals_by_publisher: BTreeMap<&'static str, u64> = handles
+        .iter()
+        .filter_map(|(name, handle)| {
+            let id = handle.participant_id()?;
+            Some((*name, pulsebeam::sim_metrics::quality_reversals(&id)))
+        })
+        .collect();
+
     let mut names: Vec<_> = handles.keys().copied().collect();
     names.sort_unstable();
     for name in names {
@@ -1843,6 +1868,7 @@ async fn execute_plan(
         let mut report = measure(handle, ip, window);
         report.forwarded_quality = quality_by_publisher.clone();
         report.quality_changes = changes_by_publisher.clone();
+        report.quality_reversals = reversals_by_publisher.clone();
         reports
             .lock()
             .expect("reports poisoned")
@@ -2004,6 +2030,23 @@ pub enum Property {
     /// a handful of times a minute as conditions move; the production failure was doing it
     /// several times a second.
     QualityChangesPerMinuteBelow { origin: &'static str, max: u64 },
+    /// At most this many direction reversals in the origin's forwarded layer.
+    ///
+    /// Climbing through layers as bandwidth is discovered is correct, so a raw change count cannot
+    /// separate a healthy ramp from a stream oscillating between two layers - it fails both. A
+    /// reversal is the part that is never right, which makes this assertable across the whole run
+    /// including the cold-start ramp, where a joining viewer notices flapping most.
+    ///
+    /// A monotonic q -> h -> f climb reports zero however many layers it passes through.
+    QualityReversalsBelow { origin: &'static str, max: u64 },
+    /// The origin's forwarded layer never rose above this rank at any point in the window.
+    ///
+    /// `target_height` is a ceiling as much as a request: a viewer showing a 180p tile is asking
+    /// not to be sent 720p, and sending it anyway wastes the link on pixels nobody will see. Every
+    /// other layer assertion here is a floor, and the byte-rate ceiling that stood in for this one
+    /// cannot tell a stream forwarded at the wrong rung from one forwarded at the right rung with
+    /// a busier picture. This reads the highest rank actually forwarded.
+    NeverForwardedAbove { origin: &'static str, max_quality: u8 },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
@@ -2031,7 +2074,7 @@ fn pct(part: f64, whole: f64) -> f64 {
 /// Separate from its formatting on purpose. A property needs to *compute* over these numbers, and
 /// a randomised scenario needs to return them rather than assert inline, so the measurement has
 /// to exist as data. Rendering it for a human is a second, lesser job.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinkReport {
     /// Configured capacity, and whether it held still for the window. Utilisation and the
     /// capacity-relative figures are only meaningful when it did.
@@ -2061,6 +2104,13 @@ pub struct LinkReport {
     /// endpoint, and a stream flipping between two layers many times a second looks perfectly
     /// healthy in all of them - right final layer, right byte count, right estimate.
     pub quality_changes: BTreeMap<&'static str, u64>,
+    /// How many times each publisher's forwarded layer *reversed direction* during the window.
+    ///
+    /// Climbing through layers as bandwidth is discovered is correct, so a raw change count cannot
+    /// separate a healthy ramp from a stream oscillating between two - it counts both. A reversal
+    /// is the part that is never right, which makes it the figure a property can assert on across
+    /// a whole run rather than only after everything has settled.
+    pub quality_reversals: BTreeMap<&'static str, u64>,
     /// Layer last forwarded from each publisher, by participant name. 0 means paused.
     ///
     /// Keyed by the *publisher* rather than folded into the link's numbers, because contention is
@@ -2142,6 +2192,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         link_loss_drops: stats.dropped_loss,
         forwarded_quality: BTreeMap::new(),
         quality_changes: BTreeMap::new(),
+        quality_reversals: BTreeMap::new(),
     }
 }
 
@@ -2445,6 +2496,46 @@ fn check_property(
                 ));
             }
         }
+        Property::QualityReversalsBelow { origin, max } => {
+            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+                return Err(format!(
+                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
+                ));
+            };
+            let reversals = pulsebeam::sim_metrics::quality_reversals(&id);
+            if reversals > max {
+                let changes = pulsebeam::sim_metrics::quality_changes(&id);
+                return Err(format!(
+                    "{origin}'s layer reversed direction {reversals}x in {window:?} \
+                     ({changes} changes total); expected at most {max}. Climbing through layers is \
+                     fine, but reversing means the stream is oscillating rather than settling, and \
+                     every switch costs a keyframe and stutters the picture"
+                ));
+            }
+        }
+        Property::NeverForwardedAbove {
+            origin,
+            max_quality,
+        } => {
+            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+                return Err(format!(
+                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
+                ));
+            };
+            let Some(peak) = pulsebeam::sim_metrics::max_forwarded_quality(&id) else {
+                return Err(format!(
+                    "no allocation pass recorded {origin}, so nothing was measured and this \
+                     would pass vacuously"
+                ));
+            };
+            if peak > max_quality {
+                return Err(format!(
+                    "{origin} was forwarded at layer {peak}, above the requested ceiling of \
+                     {max_quality}. A viewer asking for a short tile is asking not to be sent a \
+                     taller one; sending it spends the link on pixels that will never be shown"
+                ));
+            }
+        }
         Property::MediaEfficiencyAtLeast(min) => {
             let received = handle
                 .rx_bytes()
@@ -2497,12 +2588,12 @@ pub struct LinkProfile {
     pub loss: f64,
     /// Downlink capacity per participant, in bits per second. `None` leaves the path unlimited.
     ///
-    /// **Only set this when the rate is meant to bind.** The shaper releases queued packets on
-    /// the next send attempt, so release is quantised to event-loop iterations. When the shaped
-    /// rate is the dominant delay that quantisation is lost in the serialisation delay and the
-    /// model is sound; on a link fast enough that serialisation is negligible it becomes the
-    /// largest source of inter-packet jitter, which is precisely the signal GCC measures. Shaping
-    /// a non-binding link therefore manufactures congestion rather than removing an artifact:
+    /// **Only set this when the rate is meant to bind.** Release is timer-driven, but it still
+    /// quantises to the granularity the runtime can schedule at. When the shaped rate is the
+    /// dominant delay that quantisation is lost in the serialisation delay and the model is sound;
+    /// on a link fast enough that serialisation is negligible it becomes the largest source of
+    /// inter-packet jitter, which is precisely the signal GCC measures. Shaping a non-binding link
+    /// therefore manufactures congestion rather than removing an artifact:
     /// measured, a plan delivering 2 MB unshaped delivered 721 kB at both 50 Mbps *and* 1 Gbps —
     /// identical, so the limit was the shaper rather than the link.
     ///
@@ -2516,6 +2607,47 @@ pub struct LinkProfile {
     /// that under-delivers cannot pull the estimate down. Set it to make congestion real. See
     /// `pulsebeam_runtime::net::shaper`.
     pub bandwidth_bps: Option<u64>,
+    /// Loss model for the path, replacing `loss` when set. Real wireless loses in bursts, and a
+    /// controller tuned against the same average spread evenly is not tested against it.
+    pub loss_model: Option<Loss>,
+    /// Out-of-order delivery on the path.
+    pub reorder: Reorder,
+    /// Fraction of datagrams delivered twice, 0.0..=1.0.
+    pub duplicate: f64,
+    /// Impairment applied to the *client to SFU* direction, which carries transport feedback.
+    ///
+    /// Loss, reordering and duplication are configured per destination, and every plan until now
+    /// only configured the participants' addresses - so feedback reached the SFU perfectly however
+    /// bad the path to the viewer was. Congestion control is a closed loop: an estimator whose
+    /// feedback is assumed lossless has not been tested on a real network. `None` leaves the
+    /// return path clean, which is the right choice only when a plan is deliberately isolating
+    /// the forward direction.
+    pub feedback: Option<FeedbackProfile>,
+}
+
+/// Impairment on the path carrying transport feedback back to the SFU.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FeedbackProfile {
+    pub loss: Option<Loss>,
+    pub reorder: Reorder,
+}
+
+impl FeedbackProfile {
+    /// Feedback degraded about as much as the forward path on the same wireless link.
+    pub fn wifi() -> Self {
+        Self {
+            loss: Some(Loss::wifi()),
+            reorder: Reorder::occasional(),
+        }
+    }
+
+    /// Mobile uplink: feedback is scarcer and later than on the downlink.
+    pub fn cellular() -> Self {
+        Self {
+            loss: Some(Loss::cellular()),
+            reorder: Reorder::occasional(),
+        }
+    }
 }
 
 impl LinkProfile {
@@ -2526,6 +2658,10 @@ impl LinkProfile {
             max_latency: Duration::from_millis(6),
             loss: 0.0,
             bandwidth_bps: None,
+            loss_model: None,
+            reorder: Reorder::NONE,
+            duplicate: 0.0,
+            feedback: None,
         }
     }
 
@@ -2536,6 +2672,10 @@ impl LinkProfile {
             max_latency: Duration::from_millis(13),
             loss: 0.002,
             bandwidth_bps: None,
+            loss_model: Some(Loss::wifi()),
+            reorder: Reorder::occasional(),
+            duplicate: 0.0005,
+            feedback: Some(FeedbackProfile::wifi()),
         }
     }
 
@@ -2547,13 +2687,26 @@ impl LinkProfile {
             max_latency: Duration::from_millis(52),
             loss: 0.01,
             bandwidth_bps: None,
+            loss_model: Some(Loss::cellular()),
+            reorder: Reorder::occasional(),
+            duplicate: 0.001,
+            feedback: Some(FeedbackProfile::cellular()),
         }
     }
 }
 
 impl Default for LinkProfile {
+    /// Wi-Fi, not fibre.
+    ///
+    /// A plan that says nothing about its link is not asking for a perfect one - it is asking for
+    /// a normal one, and normal is a home Wi-Fi path that loses packets in bursts, occasionally
+    /// delivers late, and sometimes delivers twice. Defaulting to fibre meant almost the whole
+    /// suite validated behaviour against conditions no user has, which is how a probe regression
+    /// that only appears under jitter and burst loss passed every plan here. Opt into
+    /// [`LinkProfile::fiber`] when a plan is about signalling or allocation logic and the path is
+    /// deliberately not the variable under test.
     fn default() -> Self {
-        Self::fiber()
+        Self::wifi()
     }
 }
 
@@ -2711,6 +2864,16 @@ impl LocalNodeSim {
         let mut name_to_ip: HashMap<&'static str, IpAddr> = HashMap::new();
         name_to_ip.insert("server", server_ip);
 
+        // Impairment is keyed by destination, so configuring the SFU's address is what degrades
+        // the client-to-SFU direction - the one carrying transport feedback. Leaving it clean
+        // tests congestion control with a return path no real network provides.
+        if let Some(feedback) = self.link.feedback {
+            if let Some(loss) = feedback.loss {
+                pulsebeam_runtime::net::shaper::set_loss(server_ip, loss);
+            }
+            pulsebeam_runtime::net::shaper::set_reorder(server_ip, feedback.reorder);
+        }
+
         let mut ip_counter = 2u8;
         for room in &self.rooms {
             for participant in &room.participants {
@@ -2725,7 +2888,12 @@ impl LocalNodeSim {
                 // State is keyed by unique simulation addresses. Do not clear the process-wide
                 // registry: cargo runs simulator tests in parallel and clearing it would change
                 // the network model of a different test already in flight.
-                pulsebeam_runtime::net::shaper::set_packet_loss(ip, self.link.loss);
+                match self.link.loss_model {
+                    Some(model) => pulsebeam_runtime::net::shaper::set_loss(ip, model),
+                    None => pulsebeam_runtime::net::shaper::set_packet_loss(ip, self.link.loss),
+                }
+                pulsebeam_runtime::net::shaper::set_reorder(ip, self.link.reorder);
+                pulsebeam_runtime::net::shaper::set_duplicate(ip, self.link.duplicate);
 
                 // Shaping is keyed by destination, so this caps what the SFU can push down to
                 // this participant without touching the paths between anyone else.

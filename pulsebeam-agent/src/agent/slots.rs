@@ -31,6 +31,17 @@ impl SlotManager {
         });
     }
 
+    /// A track the SFU has told us about, whether or not it currently occupies a slot.
+    ///
+    /// A subscription the viewer has hidden (`target_height = 0`) is never assigned a slot, so
+    /// `assigned` cannot see it, but the publication itself is still known.
+    pub fn known(&self, track_id: &str) -> Option<Track> {
+        self.active_tracks
+            .get(track_id)
+            .or_else(|| self.pending_tracks.get(track_id))
+            .cloned()
+    }
+
     pub fn assigned(&self, track_id: &str) -> Option<(Mid, Track)> {
         let track = self.active_tracks.get(track_id)?.clone();
         let slot = self

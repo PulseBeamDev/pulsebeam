@@ -56,6 +56,16 @@ struct Samples {
     /// production, and why counting the changes catches it where checking the final layer does
     /// not. A settled stream changes a handful of times over a minute.
     quality_changes: HashMap<String, u64>,
+    /// How many times each origin's forwarded layer *reversed direction* since the last reset.
+    ///
+    /// Climbing q -> h -> f as bandwidth is discovered is correct behaviour, so counting raw
+    /// transitions cannot tell a healthy ramp from a stream oscillating between two layers. A
+    /// reversal - an upgrade after a downgrade, or a downgrade after an upgrade - is the thing that
+    /// is never desirable, and it is just as wrong during the cold-start ramp as it is in steady
+    /// state, which is where a viewer notices it most.
+    quality_reversals: HashMap<String, u64>,
+    /// Direction of each origin's last forwarded-layer change: `true` for an upgrade.
+    last_quality_direction: HashMap<String, bool>,
     /// Every downstream estimate as `(elapsed, estimate_bps, desired_bps)`, keyed by the
     /// *subscriber's* participant id.
     ///
@@ -143,10 +153,17 @@ pub fn record_forwarded_quality(origin: &str, quality: Option<u8>) {
     let rank = quality.unwrap_or(0);
     SAMPLES.with_borrow_mut(|s| {
         // Count transitions, not passes: this is called every pass, changed or not.
-        if let Some(previous) = s.forwarded_quality.get(origin)
-            && *previous != rank
+        if let Some(previous) = s.forwarded_quality.get(origin).copied()
+            && previous != rank
         {
             *s.quality_changes.entry(origin.to_string()).or_default() += 1;
+
+            let up = rank > previous;
+            if let Some(was_up) = s.last_quality_direction.insert(origin.to_string(), up)
+                && was_up != up
+            {
+                *s.quality_reversals.entry(origin.to_string()).or_default() += 1;
+            }
         }
         s.forwarded_quality.insert(origin.to_string(), rank);
         s.max_forwarded_quality
@@ -166,6 +183,13 @@ pub fn forwarded_quality(origin: &str) -> Option<u8> {
 /// How many times `origin`'s forwarded layer changed since [`reset`].
 pub fn quality_changes(origin: &str) -> u64 {
     SAMPLES.with_borrow(|s| s.quality_changes.get(origin).copied().unwrap_or(0))
+}
+
+/// How many times `origin`'s forwarded layer reversed direction since [`reset`].
+///
+/// A monotonic ramp reports zero however many layers it climbs through.
+pub fn quality_reversals(origin: &str) -> u64 {
+    SAMPLES.with_borrow(|s| s.quality_reversals.get(origin).copied().unwrap_or(0))
 }
 
 /// Highest forwarded quality rank observed for `origin` since [`reset`]. `None` means no

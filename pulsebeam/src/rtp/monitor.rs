@@ -496,12 +496,18 @@ impl StreamMonitor {
         self.cost_filter.update(now, raw_with_floor);
         self.stable_filter.update(now, raw_with_floor);
 
+        // Invariant: the stable cost is never below the reactive one. The stable
+        // filter rises slowly, so during a genuine rate increase it can momentarily
+        // sit below the measured rate; allocating against a stable cost that
+        // under-reports what the stream actually sends would admit a layer and then
+        // shed it the moment the reactive number caught up. Clamping keeps the
+        // stable cost a safe conservative envelope.
+        let reactive = self.cost_filter.current();
+        let stable = self.stable_filter.current().max(reactive);
+
         // Single packed write — reactive and stable are always observed together.
         self.shared_state.bitrates.store(
-            StreamStateInner::pack(
-                self.cost_filter.current() as u64,
-                self.stable_filter.current() as u64,
-            ),
+            StreamStateInner::pack(reactive as u64, stable as u64),
             Ordering::Relaxed,
         );
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
