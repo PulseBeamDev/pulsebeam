@@ -2039,6 +2039,14 @@ pub enum Property {
     ///
     /// A monotonic q -> h -> f climb reports zero however many layers it passes through.
     QualityReversalsBelow { origin: &'static str, max: u64 },
+    /// The origin's forwarded layer never rose above this rank at any point in the window.
+    ///
+    /// `target_height` is a ceiling as much as a request: a viewer showing a 180p tile is asking
+    /// not to be sent 720p, and sending it anyway wastes the link on pixels nobody will see. Every
+    /// other layer assertion here is a floor, and the byte-rate ceiling that stood in for this one
+    /// cannot tell a stream forwarded at the wrong rung from one forwarded at the right rung with
+    /// a busier picture. This reads the highest rank actually forwarded.
+    NeverForwardedAbove { origin: &'static str, max_quality: u8 },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
@@ -2502,6 +2510,29 @@ fn check_property(
                      ({changes} changes total); expected at most {max}. Climbing through layers is \
                      fine, but reversing means the stream is oscillating rather than settling, and \
                      every switch costs a keyframe and stutters the picture"
+                ));
+            }
+        }
+        Property::NeverForwardedAbove {
+            origin,
+            max_quality,
+        } => {
+            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+                return Err(format!(
+                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
+                ));
+            };
+            let Some(peak) = pulsebeam::sim_metrics::max_forwarded_quality(&id) else {
+                return Err(format!(
+                    "no allocation pass recorded {origin}, so nothing was measured and this \
+                     would pass vacuously"
+                ));
+            };
+            if peak > max_quality {
+                return Err(format!(
+                    "{origin} was forwarded at layer {peak}, above the requested ceiling of \
+                     {max_quality}. A viewer asking for a short tile is asking not to be sent a \
+                     taller one; sending it spends the link on pixels that will never be shown"
                 ));
             }
         }

@@ -1163,6 +1163,17 @@ fn capped_subscription_is_not_over_served_test() {
                 description: "Measurement window",
                 duration: Duration::from_secs(60),
             },
+            // The direct statement of the claim. The byte ceiling below is a good check on the
+            // total cost but cannot distinguish a stream forwarded at the wrong rung from one
+            // forwarded at the right rung with a busier picture; this reads the rung itself.
+            Step::Expect {
+                description: "A 360p request is never served the 720p layer",
+                participant: "bob",
+                property: Property::NeverForwardedAbove {
+                    origin: "alice",
+                    max_quality: 2,
+                },
+            },
             // ~3.4 MB is the h layer itself. Measured against `headroom_factor`: 3.57 MB at
             // 1.0 (shipped), 4.25 MB at 1.2, 5.01 MB at 1.5, against 5.07 MB uncapped. 4.0 MB
             // leaves room for RTCP, retransmits and NAT-keepalive padding.
@@ -2057,4 +2068,92 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
         .get("viewer")
         .cloned()
         .expect("the viewer should have been measured")
+}
+
+/// Allocation with a room bigger than any other plan here exercises.
+///
+/// Every other plan has two or three publishers, and an allocator can be very wrong in ways that
+/// only show up once several streams compete for one budget: a priority comparison that is fine
+/// pairwise but not transitive, a reserve sized per-stream rather than per-link, a waterfall that
+/// spends everything on whoever it happens to reach first. None of that is reachable with two
+/// streams.
+///
+/// The claim is deliberately the weak one - nobody is dropped outright, and nothing oscillates -
+/// because what a fair split between six cameras should look like is a policy question. Being
+/// forgotten entirely is not.
+#[test]
+fn a_busy_room_starves_nobody_test() {
+    const PUBLISHERS: [&str; 6] = ["ann", "ben", "cal", "dee", "eve", "fay"];
+
+    let mut room = Room::new("room1");
+    for name in PUBLISHERS {
+        room = room.with_participant(Participant::publisher(name, &["q", "h", "f"]));
+    }
+    room = room.with_participant(Participant::manual_subscriber("viewer", PUBLISHERS.len()));
+
+    LocalNodeSim::new()
+        // Sized just above what the asserted outcome costs: six 180p floors at 150 kbps plus the
+        // speaker's 1.25 Mbps top layer is 2.15 Mbps. A paused tile here was therefore never
+        // priced out, and six top layers were never affordable, so the allocator has to choose
+        // rather than being handed enough for everything.
+        .with_bandwidth(2_500_000)
+        .with_room(room)
+        .run(vec![
+            Step::Run {
+                description: "Establish connections and discover six cameras",
+                duration: Duration::from_secs(8),
+            },
+            Step::SubscribeToQos {
+                description: "A gallery view: every tile small, one speaker large",
+                participant: "viewer",
+                targets: &[
+                    ("ann", 720, 180, 100),
+                    ("ben", 180, 180, 10),
+                    ("cal", 180, 180, 10),
+                    ("dee", 180, 180, 10),
+                    ("eve", 180, 180, 10),
+                    ("fay", 180, 180, 10),
+                ],
+            },
+            Step::Run {
+                description: "Settle the gallery",
+                duration: Duration::from_secs(60),
+            },
+            Step::CheckForwardedQualityReached {
+                description: "The speaker reaches the layer it was asked for",
+                origin: "ann",
+                min_quality: 3,
+            },
+            Step::CheckForwardedQuality {
+                description: "Every tile is still being forwarded, not dropped to pay for the speaker",
+                origin: "ben",
+                min_quality: 1,
+            },
+            Step::CheckForwardedQuality {
+                description: "The last tile discovered is served like the first",
+                origin: "fay",
+                min_quality: 1,
+            },
+            Step::Expect {
+                description: "A tile asked for at 180p is never sent a taller layer",
+                participant: "viewer",
+                property: Property::NeverForwardedAbove {
+                    origin: "fay",
+                    max_quality: 1,
+                },
+            },
+            Step::Expect {
+                description: "The speaker settles rather than trading layers with the tiles",
+                participant: "viewer",
+                property: Property::QualityReversalsBelow {
+                    origin: "ann",
+                    max: 1,
+                },
+            },
+            Step::Expect {
+                description: "Six streams do not drive the link into congestion",
+                participant: "viewer",
+                property: Property::CongestionLossBelow(5),
+            },
+        ]);
 }
