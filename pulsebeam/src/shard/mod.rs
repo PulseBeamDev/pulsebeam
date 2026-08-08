@@ -3,7 +3,7 @@ pub(crate) mod demux;
 mod dirty;
 mod events;
 pub mod metrics;
-mod participants;
+pub(crate) mod participants;
 mod reliable;
 pub mod router;
 mod timer;
