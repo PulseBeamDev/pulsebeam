@@ -774,6 +774,7 @@ async fn run_participant(
 
         // Drive until cancelled or a lifecycle command arrives.
         let token = CancellationToken::new();
+        let ops_token = token.clone();
         let cmd = {
             let mut drive_fut = Box::pin(client.drive_until_cancelled(token.clone(), move |ctx| {
                 // 1. Drain pending ops.
@@ -800,20 +801,36 @@ async fn run_participant(
                             for subscription in new_subscriptions {
                                 let agent = ctx.agent.clone();
                                 let incoming_tracks = incoming_tracks.clone();
+                                let token = ops_token.clone();
                                 tokio::spawn(async move {
-                                    let track = agent
-                                        .participant(subscription.participant_id)
-                                        .video()
-                                        .subscribe()
-                                        .target_height(subscription.height)
-                                        .minimum_height(subscription.min_height)
-                                        .priority(subscription.priority)
-                                        .await
-                                        .expect("failed to subscribe to publication");
-                                    incoming_tracks
-                                        .send(track)
-                                        .await
-                                        .expect("client media inbox closed");
+                                    let participant = subscription.participant_id.clone();
+                                    // A subscribe that never resolves would otherwise sit here
+                                    // until the plan ends and the agent closes, then panic during
+                                    // teardown - long after the step that issued it, and pointing
+                                    // at shutdown rather than at the subscription that hung.
+                                    let result = tokio::select! {
+                                        _ = token.cancelled() => {
+                                            panic!(
+                                                "subscribe to {participant} never resolved; it was \
+                                                 still pending when the plan finished"
+                                            );
+                                        }
+                                        result = agent
+                                            .participant(subscription.participant_id)
+                                            .video()
+                                            .subscribe()
+                                            .target_height(subscription.height)
+                                            .minimum_height(subscription.min_height)
+                                            .priority(subscription.priority) => result,
+                                    };
+                                    let track = result.unwrap_or_else(|e| {
+                                        panic!("failed to subscribe to {participant}: {e:?}")
+                                    });
+                                    if incoming_tracks.send(track).await.is_err() {
+                                        // The client is shutting down and no longer reading; the
+                                        // subscription itself succeeded, so this is not a failure.
+                                        return;
+                                    }
                                 });
                             }
                         }
