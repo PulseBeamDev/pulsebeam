@@ -9,9 +9,14 @@ Two representations share the same paths. `Content-Type` selects between them.
 | PATCH | `/api/v1/rooms/{room}/participants/{pid}` | re-offer (unchanged) | 415 |
 | DELETE | `/api/v1/rooms/{room}/participants/{pid}` | leave (unchanged) | leave |
 
-The SDP surface is byte-for-byte what it always was, including that it requires a `Content-Type`
-but ignores its value, and that `DELETE` without a credential is unconditional. A golden test suite
-asserts this.
+The SDP surface's HTTP behaviour is byte-for-byte what it always was, including that it requires a
+`Content-Type` but ignores its value, and that `DELETE` without a credential is unconditional. A
+golden test suite asserts this.
+
+One thing does change for existing SDP clients: `TrackId` values differ after upgrading, because
+they are now derived from the m-line ordinal rather than the SDP mid (see below). Track ids are
+ephemeral and re-learned over signaling on every connection, so no client action is needed, but
+anything that recorded a track id will not recognise it.
 
 **Renegotiation is not part of this API.** `PATCH` is delete-then-create internally, so adding or
 removing a track mid-session is not supported by either representation.

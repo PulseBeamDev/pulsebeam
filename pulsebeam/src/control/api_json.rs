@@ -1055,6 +1055,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn require_auth_cannot_be_dodged_by_omitting_the_credential() {
+        // Representation is chosen from headers the caller controls, so "no credential" must not
+        // be a way to reach a path that does not ask for one.
+        let mut cfg = ApiConfig::new("/api/v1", "sfu.test");
+        cfg.auth = Some(Arc::new(auth_config()));
+        cfg.require_auth = true;
+
+        let (tx, mut rx) = mailbox::new::<controller::ControllerCommand>(8);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let controller::ControllerCommand::DeleteParticipant(m) = cmd {
+                    recorder.lock().unwrap().push("delete");
+                    if let Some(reply) = m.reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let h = Harness {
+            router: router(tx, cfg),
+            commands: seen,
+        };
+
+        let participant = ParticipantId::new(&mut seeded_rng(11));
+        let sdp = offer_sdp();
+        let requests = vec![
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/rooms/{ROOM}/participants/{participant}"))
+                .header("host", "sfu.test")
+                .body(Body::empty())
+                .unwrap(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/rooms/{ROOM}/participants"))
+                .header("host", "sfu.test")
+                .header(CONTENT_TYPE, "application/sdp")
+                .body(Body::from(sdp.clone()))
+                .unwrap(),
+            axum::http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/rooms/{ROOM}/participants/{participant}"))
+                .header("host", "sfu.test")
+                .header(CONTENT_TYPE, "application/sdp")
+                .header(IF_MATCH, "c_R5T9K2ND7QW0J4XVA8ZP1MHC3B")
+                .body(Body::from(sdp))
+                .unwrap(),
+        ];
+
+        for req in requests {
+            let method = req.method().clone();
+            let res = send(&h, req).await;
+            assert_eq!(
+                res.status,
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated {method} must be refused when require_auth is set"
+            );
+        }
+        assert!(
+            h.commands.lock().unwrap().is_empty(),
+            "no unauthenticated request may reach the controller"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_without_a_credential_keeps_the_legacy_unconditional_behaviour() {
         // The existing agent sends neither If-Match nor Authorization and must be unaffected.
         let h = harness(Some(auth_config()), false);

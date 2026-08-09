@@ -33,6 +33,9 @@ pub(crate) struct ConnectionBlueprint {
     pub negotiate_dependency_descriptor: bool,
     pub tracks: Vec<TrackRequest>,
     pub tcp_active: bool,
+    /// Part of the session's shape, so a resume re-establishes it rather than silently
+    /// reverting a manual-subscription client to automatic.
+    pub manual_sub: bool,
 }
 
 pub(crate) struct BuiltConnection {
@@ -306,6 +309,7 @@ impl AgentBuilder {
             negotiate_dependency_descriptor: self.negotiate_dependency_descriptor,
             tracks: self.tracks.clone(),
             tcp_active: self.tcp_server_addr.is_some(),
+            manual_sub: self.manual_sub,
         };
 
         // Established before building the Rtc so the TCP candidate it advertises is backed by a

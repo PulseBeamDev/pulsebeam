@@ -1240,7 +1240,7 @@ impl AgentDriver {
                 self.session.resource_uri.clone(),
                 offer,
                 resume_token,
-                false,
+                self.blueprint.manual_sub,
             )
             .await?;
 

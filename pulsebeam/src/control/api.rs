@@ -618,6 +618,13 @@ async fn delete_participant_dispatch(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    // Checked before the representation is chosen. The representation is selected from headers
+    // the caller controls, so gating inside one branch would let a caller opt out of
+    // authentication simply by sending no credential.
+    if let Err(e) = require_auth_if_configured(&s, &headers, &external_room_id) {
+        return e.into_response();
+    }
+
     if api_json::wants_json_delete(&headers) {
         return match api_json::leave(s, external_room_id, participant_id, headers).await {
             Ok(response) => response,
@@ -968,6 +975,34 @@ mod tests {
                 .unwrap()
                 .ends_with("?manual_sub=true")
         );
+    }
+
+    #[tokio::test]
+    async fn a_hostile_forwarded_host_cannot_kill_the_node() {
+        // Location is built from caller-supplied headers and then parsed into a HeaderValue.
+        // Under `panic = "abort"` a panic here is a remote node kill, so every shape that can
+        // reach the parser must produce a response instead.
+        let h = harness(Stub::Answer);
+        let long = "a".repeat(9000);
+        // Control characters are rejected by the header parser before reaching us, so the
+        // interesting cases are values that are valid headers but hostile inside a URL.
+        for host in ["host with spaces", "@@@", "[::1", "a/../b", "x?y#z", &long] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/rooms/{ROOM}/participants"))
+                .header("host", "sfu.test")
+                .header(CONTENT_TYPE, "application/sdp")
+                .header("x-forwarded-host", host)
+                .body(Body::from(offer_sdp()))
+                .unwrap();
+            let res = send(&h, req).await;
+            assert!(
+                res.status.is_success()
+                    || res.status.is_client_error()
+                    || res.status.is_server_error(),
+                "{host:?} produced no response"
+            );
+        }
     }
 
     #[tokio::test]
