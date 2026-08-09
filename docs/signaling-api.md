@@ -65,10 +65,17 @@ needs a JWT minted for your `sub`.
 
 ## What resumption preserves
 
-Media state can never survive a restart; a resume is always a fresh PeerConnection. What survives is
-the participant's **identity in the room**: the same `ParticipantId`, therefore the same `TrackId`s,
-because track ids are derived from the participant id. Subscribers see the publisher's tracks
-reappear rather than churn.
+Media state can never survive a restart; a resume is always a fresh PeerConnection, on both sides.
+What survives is the participant's **identity in the room**: the same `ParticipantId`, therefore the
+same `TrackId`s. Subscribers see the publisher's tracks reappear rather than churn.
+
+Track ids are derived from the participant id and the media line's **ordinal**, not its SDP mid. A
+mid is minted fresh by the peer's SDP engine on every connection, so deriving from it would give a
+resumed participant new tracks and quietly break every existing subscription. SDP fixes m-line order
+across renegotiation, which makes the ordinal stable by construction.
+
+A client resuming must therefore present its media lines in the same order it first did. The bundled
+agent does this automatically: it stores a blueprint at join and rebuilds from it.
 
 `PUT` is create-or-replace at a client-known URI: `201` when nothing was live and the participant
 was genuinely rebuilt, `200` when a live one was replaced.
