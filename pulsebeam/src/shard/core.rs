@@ -3,7 +3,7 @@ use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
-use crate::route::{Envelope, RemoteRoute, RouteAction};
+use crate::route::{MediaEnvelope, RemoteRoute, ReverseEnvelope, RouteAction};
 
 use super::events::{
     AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
@@ -42,7 +42,7 @@ impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
         self.router.shard_id()
     }
 
-    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+    fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
         self.router.send_media(dst, env, payload);
     }
 
@@ -230,7 +230,7 @@ impl ShardCore {
     /// plan, and the lookup is an array index plus an epoch check.
     fn on_media_frame(
         &mut self,
-        env: Envelope,
+        env: MediaEnvelope,
         payload: MediaPayload,
         now: Instant,
         router: &impl ShardTransport,
@@ -626,8 +626,7 @@ impl ShardCore {
                                 router.send_frame(
                                     req.shard_id,
                                     ShardFrame::Reverse {
-                                        route: target.route,
-                                        epoch: target.epoch,
+                                        env: ReverseEnvelope::new(target),
                                         body: Reverse::Keyframe {
                                             layer,
                                             kind: req.kind,
@@ -964,8 +963,8 @@ impl ShardCore {
                     self.dirty.mark(handle, participant);
                 }
             }
-            ShardFrame::Reverse { route, epoch, body } => {
-                self.on_reverse_frame(route, epoch, body, router);
+            ShardFrame::Reverse { env, body } => {
+                self.on_reverse_frame(env, body, router);
             }
         }
     }
@@ -977,11 +976,11 @@ impl ShardCore {
     /// has to say which layer and what it wants.
     fn on_reverse_frame(
         &mut self,
-        route: crate::route::RouteId,
-        epoch: u16,
+        env: ReverseEnvelope,
         body: Reverse,
         router: &impl ShardTransport,
     ) {
+        let (route, epoch) = (env.route, env.epoch);
         use crate::route::ReverseTarget;
 
         // Resolve fully before touching the registry: the target borrows the
@@ -1135,7 +1134,7 @@ mod test {
             self.shard_id
         }
 
-        fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+        fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
             self.sent
                 .borrow_mut()
                 .push((dst, ShardFrame::Media { env, payload }));
@@ -1419,8 +1418,7 @@ mod test {
 
         core.on_shard_frame(
             ShardFrame::Reverse {
-                route: target.route,
-                epoch: target.epoch,
+                env: ReverseEnvelope::new(target),
                 body: Reverse::Keyframe {
                     layer: 0,
                     kind: str0m::media::KeyframeRequestKind::Pli,
@@ -1476,7 +1474,7 @@ mod test {
         // destination just handed out, with no semantic ids on the wire, and
         // with playout stamped from the sender's NTP timeline.
         let pkt = crate::rtp::RtpPacket::default();
-        let env = Envelope {
+        let env = MediaEnvelope {
             epoch,
             route,
             link_seq: 0,

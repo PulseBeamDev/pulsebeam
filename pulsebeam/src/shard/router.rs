@@ -22,8 +22,8 @@ use tokio::time::Instant;
 
 use super::worker::{MediaPayload, Reverse, ShardEvent, ShardFrame, Topology};
 use crate::route::{
-    Envelope, ImportEffect, ImportTable, RemoteRoute, ReverseRoute, ReverseTarget, RouteAction,
-    RouteId, RouteNames, RouteTable,
+    ImportEffect, ImportTable, MediaEnvelope, RemoteRoute, ReverseEnvelope, ReverseRoute,
+    ReverseTarget, RouteAction, RouteId, RouteNames, RouteTable,
 };
 
 type FastIndexSet<T> = IndexSet<T, ahash::RandomState>;
@@ -54,7 +54,7 @@ pub(crate) trait ShardTransport {
     /// Route-addressed payload. Split out from [`Self::send_frame`] only to
     /// keep the per-packet path from building an enum it would immediately
     /// destructure.
-    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload);
+    fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload);
 
     fn send_frame(&self, dst: ShardId, frame: ShardFrame);
 }
@@ -1659,7 +1659,7 @@ impl ShardRoutingTable {
         if local_origin {
             let playout = ctx.wall().ntp();
             if let Some(remotes) = room.reliable.remote_routes_mut(origin, topic) {
-                let frames: Vec<(ShardId, Envelope)> = remotes
+                let frames: Vec<(ShardId, MediaEnvelope)> = remotes
                     .map(|remote| (remote.shard_id, remote.next_envelope(playout)))
                     .collect();
                 for (shard_id, env) in frames {
@@ -1690,8 +1690,7 @@ impl ShardRoutingTable {
             ctx.send_frame(
                 shard_id,
                 ShardFrame::Reverse {
-                    route: target.route,
-                    epoch: target.epoch,
+                    env: ReverseEnvelope::new(*target),
                     body: Reverse::DataAck(bytes.to_vec()),
                 },
             );
@@ -1823,7 +1822,7 @@ mod tests {
             self.shard_id
         }
 
-        fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+        fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
             self.sent
                 .borrow_mut()
                 .push((dst, ShardFrame::Media { env, payload }));
@@ -2634,7 +2633,7 @@ mod tests {
         assert_eq!(table.routes.len(), 0, "the route is retired");
 
         // A frame still in flight for the retired incarnation must not land.
-        let env = Envelope {
+        let env = MediaEnvelope {
             epoch,
             route,
             link_seq: 0,

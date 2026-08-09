@@ -13,13 +13,28 @@ use crate::shard::participants::ParticipantHandle;
 use crate::track::{DataLane, Topic};
 use str0m::media::Rid;
 
-pub const ENVELOPE_LEN: usize = 16;
+pub const MEDIA_ENVELOPE_LEN: usize = 16;
+pub const REVERSE_ENVELOPE_LEN: usize = 8;
 pub const ENVELOPE_VERSION: u8 = 1;
 
-/// No flag bits are defined yet. They are the reserved surface for compatible
-/// v1 extensions, and must be zero until one is defined — a set bit we do not
-/// understand is a bug or a version mismatch, not something to skip past.
-const FLAGS_RESERVED: u8 = 0xFF;
+/// Which direction a frame is travelling, carried in `flags` bit 0.
+///
+/// Both lanes share one socket cross-node, so the receiver has to demux them
+/// before it can know how long the header is. `ver` and `flags` sit at the same
+/// two offsets in both envelopes precisely so this bit can be read first.
+///
+/// This is the first defined flag bit. It is an addition to a field that was
+/// wholly reserved, not a reinterpretation of one that meant something else —
+/// the distinction the version rules turn on.
+const FLAG_LANE: u8 = 0b0000_0001;
+const FLAG_LANE_MEDIA: u8 = 0;
+const FLAG_LANE_REVERSE: u8 = FLAG_LANE;
+
+/// Bits with no meaning yet. They are the reserved surface for further
+/// compatible v1 extensions, and must be zero until one is defined — a set bit
+/// we do not understand is a bug or a version mismatch, not something to skip
+/// past.
+const FLAGS_RESERVED: u8 = !FLAG_LANE;
 
 /// How long a retired slot waits before it can be handed out again.
 ///
@@ -54,22 +69,63 @@ impl std::fmt::Display for RouteId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopeError {
-    Truncated { len: usize },
-    UnsupportedVersion { ver: u8 },
-    ReservedFlags { flags: u8 },
+    Truncated {
+        len: usize,
+    },
+    UnsupportedVersion {
+        ver: u8,
+    },
+    ReservedFlags {
+        flags: u8,
+    },
+    /// Decoded as one lane but the header says the other.
+    WrongLane {
+        want: Lane,
+    },
 }
 
 impl std::fmt::Display for EnvelopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Truncated { len } => write!(f, "envelope truncated: {len} < {ENVELOPE_LEN}"),
+            Self::Truncated { len } => write!(f, "envelope truncated: {len} bytes"),
             Self::UnsupportedVersion { ver } => write!(f, "unsupported envelope version {ver}"),
             Self::ReservedFlags { flags } => write!(f, "reserved envelope flags set: {flags:#04x}"),
+            Self::WrongLane { want } => write!(f, "envelope is not on the {want:?} lane"),
         }
     }
 }
 
-/// The 16-byte header that wraps every media frame crossing a link.
+/// Which lane a frame on the wire belongs to, read before anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Media,
+    Reverse,
+}
+
+/// Read the lane of an encoded frame without committing to a header length.
+///
+/// Cross-node both lanes arrive on one socket, so this is the first thing a
+/// receiver does; the two envelopes deliberately agree on `ver` and `flags`
+/// offsets so it can.
+pub fn peek_lane(buf: &[u8]) -> Result<Lane, EnvelopeError> {
+    let (ver, flags) = match buf {
+        [ver, flags, ..] => (*ver, *flags),
+        _ => return Err(EnvelopeError::Truncated { len: buf.len() }),
+    };
+    if ver != ENVELOPE_VERSION {
+        return Err(EnvelopeError::UnsupportedVersion { ver });
+    }
+    if flags & FLAGS_RESERVED != 0 {
+        return Err(EnvelopeError::ReservedFlags { flags });
+    }
+    Ok(if flags & FLAG_LANE == FLAG_LANE_REVERSE {
+        Lane::Reverse
+    } else {
+        Lane::Media
+    })
+}
+
+/// The 16-byte header on every media frame crossing a link.
 ///
 /// Encoded big-endian at fixed offsets rather than by casting a Rust struct —
 /// `repr(C)` layout is not a portable wire format.
@@ -85,7 +141,7 @@ impl std::fmt::Display for EnvelopeError {
 /// +-------------------------------+-----------------------+
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Envelope {
+pub struct MediaEnvelope {
     pub epoch: u16,
     pub route: RouteId,
     /// Scoped to `(route, epoch)` — a route incarnation. Wrapping `u32`, one
@@ -96,11 +152,11 @@ pub struct Envelope {
     pub playout_ntp32: u32,
 }
 
-impl Envelope {
-    pub fn encode(&self) -> [u8; ENVELOPE_LEN] {
-        let mut out = [0u8; ENVELOPE_LEN];
+impl MediaEnvelope {
+    pub fn encode(&self) -> [u8; MEDIA_ENVELOPE_LEN] {
+        let mut out = [0u8; MEDIA_ENVELOPE_LEN];
         out[0] = ENVELOPE_VERSION;
-        out[1] = 0;
+        out[1] = FLAG_LANE_MEDIA;
         out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
         out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
         out[8..12].copy_from_slice(&self.link_seq.to_be_bytes());
@@ -109,22 +165,71 @@ impl Envelope {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        if buf.len() < ENVELOPE_LEN {
+        if buf.len() < MEDIA_ENVELOPE_LEN {
             return Err(EnvelopeError::Truncated { len: buf.len() });
         }
-        let ver = buf[0];
-        if ver != ENVELOPE_VERSION {
-            return Err(EnvelopeError::UnsupportedVersion { ver });
-        }
-        let flags = buf[1];
-        if flags & FLAGS_RESERVED != 0 {
-            return Err(EnvelopeError::ReservedFlags { flags });
+        if peek_lane(buf)? != Lane::Media {
+            return Err(EnvelopeError::WrongLane { want: Lane::Media });
         }
         Ok(Self {
             epoch: u16::from_be_bytes([buf[2], buf[3]]),
             route: RouteId::new(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
             link_seq: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
             playout_ntp32: u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+        })
+    }
+}
+
+/// The 8-byte header on every frame travelling back toward a publisher.
+///
+/// Half the size of [`MediaEnvelope`] because the reverse lane needs neither of
+/// the two fields that make up the difference. `link_seq` exists to observe
+/// loss on a link, but every reverse body is a request the sender repeats if it
+/// still needs it, so a lost one costs a round trip and there is nothing to
+/// account for. `playout_ntp32` places a packet on a timeline; a request has
+/// none.
+///
+/// ```text
+/// 0       1       2               4                       8
+/// +-------+-------+---------------+-----------------------+
+/// | ver   | flags | epoch         | route (u32)           |
+/// +-------+-------+---------------+-----------------------+
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReverseEnvelope {
+    pub epoch: u16,
+    pub route: RouteId,
+}
+
+impl ReverseEnvelope {
+    pub fn new(handle: ReverseRoute) -> Self {
+        Self {
+            epoch: handle.epoch,
+            route: handle.route,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; REVERSE_ENVELOPE_LEN] {
+        let mut out = [0u8; REVERSE_ENVELOPE_LEN];
+        out[0] = ENVELOPE_VERSION;
+        out[1] = FLAG_LANE_REVERSE;
+        out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
+        out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
+        if buf.len() < REVERSE_ENVELOPE_LEN {
+            return Err(EnvelopeError::Truncated { len: buf.len() });
+        }
+        if peek_lane(buf)? != Lane::Reverse {
+            return Err(EnvelopeError::WrongLane {
+                want: Lane::Reverse,
+            });
+        }
+        Ok(Self {
+            epoch: u16::from_be_bytes([buf[2], buf[3]]),
+            route: RouteId::new(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
         })
     }
 }
@@ -154,8 +259,8 @@ impl RemoteRoute {
 
     /// Build the envelope for the next frame on this route, advancing
     /// `link_seq`. Wrapping, because `link_seq` is modulo 2^32.
-    pub fn next_envelope(&mut self, playout: NtpTime) -> Envelope {
-        let env = Envelope {
+    pub fn next_envelope(&mut self, playout: NtpTime) -> MediaEnvelope {
+        let env = MediaEnvelope {
             epoch: self.epoch,
             route: self.route,
             link_seq: self.link_seq,
@@ -398,7 +503,7 @@ impl RouteTable {
         true
     }
 
-    pub fn resolve(&mut self, env: &Envelope) -> Result<&mut RouteEntry, RouteError> {
+    pub fn resolve(&mut self, env: &MediaEnvelope) -> Result<&mut RouteEntry, RouteError> {
         let idx = env.route.index();
         let Some(slot) = self.slots.get_mut(idx) else {
             return Err(RouteError::OutOfRange { route: env.route });
@@ -414,7 +519,7 @@ impl RouteTable {
 
     /// The compiled action behind a route, if that incarnation is still live.
     ///
-    /// For frames that carry no [`Envelope`] — feedback has neither a timeline
+    /// For frames that carry no [`MediaEnvelope`] — feedback has neither a timeline
     /// nor per-link accounting to keep, so it addresses with `(route, epoch)`
     /// alone.
     pub fn resolve_action(&self, route: RouteId, epoch: u16) -> Option<&RouteAction> {
@@ -621,8 +726,8 @@ mod tests {
         }
     }
 
-    fn envelope(route: RouteId, epoch: u16) -> Envelope {
-        Envelope {
+    fn envelope(route: RouteId, epoch: u16) -> MediaEnvelope {
+        MediaEnvelope {
             epoch,
             route,
             link_seq: 0,
@@ -632,13 +737,13 @@ mod tests {
 
     #[test]
     fn envelope_is_exactly_sixteen_bytes() {
-        assert_eq!(ENVELOPE_LEN, 16);
+        assert_eq!(MEDIA_ENVELOPE_LEN, 16);
         assert_eq!(envelope(RouteId::new(1), 1).encode().len(), 16);
     }
 
     #[test]
     fn envelope_encodes_big_endian_at_documented_offsets() {
-        let env = Envelope {
+        let env = MediaEnvelope {
             epoch: 0x1122,
             route: RouteId::new(0x3344_5566),
             link_seq: 0x7788_99AA,
@@ -669,22 +774,77 @@ mod tests {
     }
 
     #[test]
+    fn reverse_envelope_is_exactly_eight_bytes() {
+        assert_eq!(REVERSE_ENVELOPE_LEN, 8);
+        assert_eq!(
+            ReverseEnvelope {
+                epoch: 1,
+                route: RouteId::new(1),
+            }
+            .encode()
+            .len(),
+            8,
+            "the reverse lane pays for addressing and nothing else"
+        );
+    }
+
+    #[test]
+    fn reverse_envelope_round_trips() {
+        let env = ReverseEnvelope {
+            epoch: u16::MAX,
+            route: RouteId::new(u32::MAX),
+        };
+        assert_eq!(ReverseEnvelope::decode(&env.encode()).unwrap(), env);
+    }
+
+    /// Cross-node both lanes share a socket, so a receiver must be able to tell
+    /// them apart before it knows how long the header is. The lane bit is at a
+    /// fixed offset both envelopes agree on, so peeking never needs the length.
+    #[test]
+    fn the_two_lanes_are_distinguishable_on_the_wire() {
+        let media = envelope(RouteId::new(3), 4).encode();
+        let reverse = ReverseEnvelope {
+            epoch: 4,
+            route: RouteId::new(3),
+        }
+        .encode();
+
+        assert_eq!(peek_lane(&media).unwrap(), Lane::Media);
+        assert_eq!(peek_lane(&reverse).unwrap(), Lane::Reverse);
+
+        // Peeking works on the shorter of the two, so it never over-reads.
+        assert_eq!(peek_lane(&reverse[..2]).unwrap(), Lane::Reverse);
+
+        // And decoding one as the other is refused rather than misread.
+        assert_eq!(
+            MediaEnvelope::decode(&reverse),
+            Err(EnvelopeError::Truncated { len: 8 })
+        );
+        assert_eq!(
+            ReverseEnvelope::decode(&media),
+            Err(EnvelopeError::WrongLane {
+                want: Lane::Reverse
+            })
+        );
+    }
+
+    #[test]
     fn envelope_round_trips() {
-        let env = Envelope {
+        let env = MediaEnvelope {
             epoch: 65_535,
             route: RouteId::new(u32::MAX),
             link_seq: u32::MAX,
             playout_ntp32: u32::MAX,
         };
-        assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
+        assert_eq!(MediaEnvelope::decode(&env.encode()).unwrap(), env);
     }
 
     #[test]
     fn decode_rejects_truncated_input() {
         let full = envelope(RouteId::new(1), 1).encode();
-        for len in 0..ENVELOPE_LEN {
+        for len in 0..MEDIA_ENVELOPE_LEN {
             assert_eq!(
-                Envelope::decode(&full[..len]),
+                MediaEnvelope::decode(&full[..len]),
                 Err(EnvelopeError::Truncated { len })
             );
         }
@@ -695,7 +855,7 @@ mod tests {
         let mut bytes = envelope(RouteId::new(1), 1).encode();
         bytes[0] = ENVELOPE_VERSION + 1;
         assert_eq!(
-            Envelope::decode(&bytes),
+            MediaEnvelope::decode(&bytes),
             Err(EnvelopeError::UnsupportedVersion {
                 ver: ENVELOPE_VERSION + 1
             })
@@ -704,7 +864,7 @@ mod tests {
         let mut bytes = envelope(RouteId::new(1), 1).encode();
         bytes[1] = 0b0000_0010;
         assert_eq!(
-            Envelope::decode(&bytes),
+            MediaEnvelope::decode(&bytes),
             Err(EnvelopeError::ReservedFlags { flags: 0b0000_0010 })
         );
     }

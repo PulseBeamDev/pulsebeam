@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
-use crate::route::{Envelope, ReverseRoute, RouteId};
+use crate::route::{MediaEnvelope, ReverseEnvelope, ReverseRoute, RouteId};
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -145,10 +145,10 @@ pub enum Topology {
 /// both ends have that from the control plane — so a rid never travels.
 ///
 /// ```text
-/// route(4) | epoch(2) | tag(1) | body
-///   Keyframe  layer(1) kind(1)                 ->  9 bytes
-///   Nack      layer(1) pid(2) blp(2)           -> 12 bytes
-///   DataAck   len(2) payload(len)              ->  9 + len
+/// ReverseEnvelope(8) | tag(1) | body
+///   Keyframe  layer(1) kind(1)        -> 11 bytes
+///   Nack      layer(1) pid(2) blp(2)  -> 14 bytes
+///   DataAck   len(2) payload(len)     -> 11 + len
 /// ```
 #[derive(Debug, Clone)]
 pub enum Reverse {
@@ -169,7 +169,7 @@ pub enum Reverse {
     DataAck(Vec<u8>),
 }
 
-/// Payload carried under an [`Envelope`]. Still typed this pass; byte
+/// Payload carried under an [`MediaEnvelope`]. Still typed this pass; byte
 /// serialization arrives with the UDP transport.
 pub enum MediaPayload {
     Video(RtpPacket),
@@ -190,18 +190,14 @@ pub enum ShardFrame {
     /// semantic ids: everything needed to deliver it lives in the destination's
     /// compiled route entry.
     Media {
-        env: Envelope,
+        env: MediaEnvelope,
         payload: MediaPayload,
     },
     /// Anything travelling back toward a publisher, addressed by the reverse
     /// route its shard opened. One variant for all of it because they share a
     /// contract: every one is an idempotent request the sender repeats if it
     /// still needs it, so losing one costs a round trip and nothing else.
-    Reverse {
-        route: RouteId,
-        epoch: u16,
-        body: Reverse,
-    },
+    Reverse { env: ReverseEnvelope, body: Reverse },
     /// A datagram batch that landed on the wrong shard's socket. Node-local
     /// with no cross-node analogue — a node demuxes its own participants — so
     /// it is addressed semantically and never leaves the box.
@@ -262,7 +258,7 @@ impl ShardTransport for ChannelTransport {
         self.shard_id
     }
 
-    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
+    fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
         // Dropping under backpressure is the media contract: this lane is
         // lossy by design, and `link_seq` makes the loss visible downstream.
         let _ = self.enqueue(dst, ShardFrame::Media { env, payload });
@@ -487,8 +483,7 @@ mod reverse_tests {
     /// rather than in a datagram.
     #[test]
     fn reverse_bodies_stay_compact() {
-        /// `route(4) | epoch(2) | tag(1)`
-        const HEADER: usize = 7;
+        const HEADER: usize = crate::route::REVERSE_ENVELOPE_LEN + 1; // envelope + tag
 
         fn wire_len(body: &Reverse) -> usize {
             HEADER
@@ -504,8 +499,8 @@ mod reverse_tests {
                 layer: 0,
                 kind: KeyframeRequestKind::Pli,
             }),
-            9,
-            "a keyframe request must fit the documented 9 bytes"
+            11,
+            "a keyframe request must fit the documented 11 bytes"
         );
         assert_eq!(
             wire_len(&Reverse::Nack {
@@ -513,10 +508,10 @@ mod reverse_tests {
                 pid: 1,
                 blp: 0,
             }),
-            12,
-            "a NACK must fit the documented 12 bytes"
+            14,
+            "a NACK must fit the documented 14 bytes"
         );
-        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 17);
+        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 19);
     }
 
     /// An encoding is named by index, never by rid: the index is derivable from
