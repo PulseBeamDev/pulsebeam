@@ -185,7 +185,10 @@ impl Synchronizer {
         };
 
         if let Some(last) = self.latest_sr {
-            if current.ntp_time <= last.ntp_time
+            // Both comparisons are modular: NTP wraps at the era boundary and
+            // the RTP timestamp wraps at 2^32, so a report that is genuinely
+            // newer can be numerically smaller than its predecessor.
+            if current.ntp_time.units_since(last.ntp_time) <= 0
                 || current.rtp_time.numer().wrapping_sub(last.rtp_time.numer()) as i64 <= 0
             {
                 return;

@@ -78,8 +78,15 @@ pub enum Topology {
         route: RouteId,
         epoch: u16,
     },
-    /// No more local subscribers; stop forwarding.
-    TrackUnsubscribed { track: TrackMeta },
+    /// No more local subscribers; stop forwarding. Carries the route it is
+    /// retiring so teardown is idempotent: a stale unsubscribe overtaken by a
+    /// fresh subscription names the old incarnation and is ignored, instead of
+    /// tearing down the new one.
+    TrackUnsubscribed {
+        track: TrackMeta,
+        route: RouteId,
+        epoch: u16,
+    },
     /// The destination installed a route for this concrete stream, or (with no
     /// publisher) registered a wildcard interest in the topic.
     DataTopicSubscribed {

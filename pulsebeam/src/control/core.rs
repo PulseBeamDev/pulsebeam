@@ -117,7 +117,7 @@ impl ControllerCore {
                 let from = e.from_shard_id;
                 match &topology {
                     Topology::TrackSubscribed { track, .. }
-                    | Topology::TrackUnsubscribed { track } => {
+                    | Topology::TrackUnsubscribed { track, .. } => {
                         // Straight to the publisher's shard. For a subscribe this
                         // is the acknowledgement: only now may media flow.
                         eq.relay(track.shard_id, from, topology);
@@ -291,6 +291,8 @@ mod tests {
                 from_shard_id: ShardId::new(4),
                 ev: ShardEvent::Relay(Topology::TrackUnsubscribed {
                     track: track.clone(),
+                    route: RouteId::new(0),
+                    epoch: 0,
                 }),
             },
             &mut eq,
@@ -311,7 +313,7 @@ mod tests {
         assert_eq!(from_shard_id, ShardId::new(4));
         assert!(matches!(
             topology,
-            Topology::TrackUnsubscribed { track: routed } if routed == track
+            Topology::TrackUnsubscribed { track: routed, .. } if routed == track
         ));
     }
 

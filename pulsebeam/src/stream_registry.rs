@@ -98,6 +98,32 @@ mod test {
         }
     }
 
+    /// A `TrackId` is derived from the participant and the label, so
+    /// republishing the same label reuses it. The registry must hand out the
+    /// new incarnation's handles — keeping the old ones would allocate against
+    /// a monitor nothing writes to any more.
+    #[test]
+    fn republishing_a_track_replaces_its_handles() {
+        let registry = StreamRegistry::new();
+        let id = track_id(3);
+
+        let first = states();
+        registry.publish(id, first.clone());
+        registry.unpublish(&id);
+
+        let second = states();
+        registry.publish(id, second.clone());
+
+        let resolved = registry.states_for(&id);
+        second[0].1.update_for_test().bitrate(999);
+        first[0].1.update_for_test().bitrate(111);
+        assert_eq!(
+            resolved[0].1.bitrate_bps(),
+            999.0,
+            "a resolved handle must alias the live incarnation, not the retired one"
+        );
+    }
+
     #[test]
     fn an_unpublished_track_resolves_to_nothing() {
         let registry = StreamRegistry::new();

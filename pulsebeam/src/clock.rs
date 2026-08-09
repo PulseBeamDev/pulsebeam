@@ -27,7 +27,14 @@ const MAX_EXPANSION_GAP: i64 = 1 << 30;
 /// seconds since 1900, the lower 32 a binary fraction of a second.
 ///
 /// Serializable and portable, unlike `Instant`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// A point on the NTP timeline, 32.32 fixed point.
+///
+/// Deliberately **not** `Ord`. The seconds field is modulo 2^32, so the
+/// timeline wraps at the era boundary and raw integer comparison is wrong
+/// there: a timestamp just past the rollover compares as older than one just
+/// before it. Every comparison must go through [`NtpTime::units_since`], which
+/// is modular, so this omission is what keeps that from being optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct NtpTime(u64);
 
 impl NtpTime {
@@ -68,17 +75,29 @@ impl NtpTime {
         self.0.wrapping_sub(earlier.0) as i64
     }
 
+    /// Elapsed time since `earlier`, or zero when `self` precedes it.
+    ///
+    /// Built on [`units_since`](Self::units_since) so ordering is modular:
+    /// raw integer comparison would read a timestamp just past the era rollover
+    /// as older than one just before it, and produce a 136-year interval.
     pub fn saturating_duration_since(self, earlier: Self) -> Duration {
-        units_to_duration(self.0.saturating_sub(earlier.0))
+        match self.units_since(earlier) {
+            units if units > 0 => units_to_duration(units as u64),
+            _ => Duration::ZERO,
+        }
     }
 
     /// `Ok` with the elapsed time when `self` is at or after `earlier`, `Err`
     /// with the magnitude when it is before — mirroring `SystemTime`.
+    ///
+    /// Modular, like every other comparison here: "after" means within the
+    /// half-era window ahead, not numerically greater.
     pub fn duration_since(self, earlier: Self) -> Result<Duration, Duration> {
-        if self.0 >= earlier.0 {
-            Ok(units_to_duration(self.0 - earlier.0))
+        let units = self.units_since(earlier);
+        if units >= 0 {
+            Ok(units_to_duration(units as u64))
         } else {
-            Err(units_to_duration(earlier.0 - self.0))
+            Err(units_to_duration(units.unsigned_abs()))
         }
     }
 
@@ -177,10 +196,9 @@ impl WallAnchor {
     }
 
     pub fn to_instant(&self, t: NtpTime) -> Instant {
-        if t >= self.ntp {
-            self.mono + t.saturating_duration_since(self.ntp)
-        } else {
-            self.mono - self.ntp.saturating_duration_since(t)
+        match t.units_since(self.ntp) {
+            units if units >= 0 => self.mono + units_to_duration(units as u64),
+            units => self.mono - units_to_duration(units.unsigned_abs()),
         }
     }
 }
@@ -331,6 +349,51 @@ mod tests {
         assert_eq!(got.as_raw() >> MID_SHIFT, target.as_raw() >> MID_SHIFT);
     }
 
+    /// Everything that compares two `NtpTime`s must be modular. The seconds
+    /// field wraps in 2036, and a raw comparison there reads a fresh timestamp
+    /// as 136 years old — which turns a millisecond interval into an enormous
+    /// one and sends `to_instant` the wrong way.
+    #[test]
+    fn comparisons_stay_correct_across_the_era_rollover() {
+        // One second either side of the wrap.
+        let before = ntp(u32::MAX as u64, 0);
+        let after = before.wrapping_add(Duration::from_secs(2));
+
+        assert!(
+            after.units_since(before) > 0,
+            "a timestamp past the rollover must read as later"
+        );
+        assert_eq!(
+            after.saturating_duration_since(before),
+            Duration::from_secs(2),
+            "the interval across the rollover must be the real one"
+        );
+        assert_eq!(before.saturating_duration_since(after), Duration::ZERO);
+        assert_eq!(after.duration_since(before), Ok(Duration::from_secs(2)));
+        assert_eq!(before.duration_since(after), Err(Duration::from_secs(2)));
+    }
+
+    /// `to_instant` must follow the same modular ordering; branching on raw
+    /// integer comparison would subtract a whole era from the anchor.
+    #[test]
+    fn anchor_conversion_stays_correct_across_the_era_rollover() {
+        let before = ntp(u32::MAX as u64, 0);
+        let mono = Instant::now();
+        let anchor = WallAnchor { ntp: before, mono };
+
+        let after = before.wrapping_add(Duration::from_secs(2));
+        assert_eq!(
+            anchor.to_instant(after),
+            mono + Duration::from_secs(2),
+            "a post-rollover timestamp must map ahead of the anchor"
+        );
+        assert_eq!(
+            anchor.to_instant(before.wrapping_sub(Duration::from_secs(2))),
+            mono - Duration::from_secs(2),
+            "a pre-rollover timestamp must map behind it"
+        );
+    }
+
     #[test]
     fn expansion_handles_reordering_backwards() {
         let reference = ntp(3_900_000_000, 0);
@@ -341,7 +404,7 @@ mod tests {
         let reordered = reference.wrapping_add(Duration::from_millis(80));
         let got = exp.expand(reordered.middle32()).unwrap();
         assert!(
-            got < ahead,
+            got.units_since(ahead) < 0,
             "a reordered packet must expand to an earlier instant"
         );
     }

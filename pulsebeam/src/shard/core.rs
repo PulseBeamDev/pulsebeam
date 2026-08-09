@@ -197,6 +197,33 @@ impl ShardCore {
         }
     }
 
+    /// Put an arriving packet on *this* shard's timeline.
+    ///
+    /// `Instant` is meaningless outside the process that produced it, so the
+    /// sender's values are discarded rather than trusted: playout is rebuilt
+    /// from the envelope's portable NTP, and arrival is stamped from our own
+    /// clock, which is also the more correct value — every consumer reads it as
+    /// "when did this get here".
+    ///
+    /// Once payloads are bytes, neither field is on the wire at all and this is
+    /// the only place they are set.
+    fn restamp(&self, pkt: &mut RtpPacket, playout: crate::clock::NtpTime, now: Instant) {
+        // While payloads are still typed, the sender's playout is derivable and
+        // must agree with the envelope: that proves the wire value correct
+        // before it becomes the only source. Same process, so a shared anchor
+        // makes the comparison meaningful; cross-node the field will be gone.
+        debug_assert!(
+            self.wall
+                .to_ntp(pkt.playout_time)
+                .units_since(playout)
+                .unsigned_abs()
+                <= 1 << 16,
+            "envelope playout disagrees with the payload beyond middle-32 resolution"
+        );
+        pkt.playout_time = self.wall.to_instant(playout);
+        pkt.arrival_ts = now;
+    }
+
     /// Deliver a frame addressed to one of this shard's routes.
     ///
     /// The envelope carries no semantic ids: the route entry is the compiled
@@ -205,6 +232,7 @@ impl ShardCore {
         &mut self,
         env: Envelope,
         payload: MediaPayload,
+        now: Instant,
         router: &impl ShardTransport,
     ) {
         let entry = match self.routing.routes.resolve(&env) {
@@ -275,18 +303,8 @@ impl ShardCore {
         };
 
         match (target, payload) {
-            (Target::Video(local_track), MediaPayload::Video(pkt)) => {
-                // Payloads are still typed this pass, so playout also travels in
-                // the packet. Assert the envelope agrees, so the wire value is
-                // proven correct before it becomes the only source under UDP.
-                debug_assert!(
-                    self.wall
-                        .to_ntp(pkt.playout_time)
-                        .units_since(playout)
-                        .unsigned_abs()
-                        <= 1 << 16,
-                    "envelope playout disagrees with the payload beyond middle-32 resolution"
-                );
+            (Target::Video(local_track), MediaPayload::Video(mut pkt)) => {
+                self.restamp(&mut pkt, playout, now);
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
@@ -301,8 +319,9 @@ impl ShardCore {
                     origin,
                     track_id,
                 },
-                MediaPayload::Audio(pkt),
+                MediaPayload::Audio(mut pkt),
             ) => {
+                self.restamp(&mut pkt, playout, now);
                 let ev = AudioRtpEvent {
                     stream_id: (track_id, None),
                     pkt,
@@ -488,10 +507,9 @@ impl ShardCore {
                             topic,
                             publisher,
                         } => {
-                            if self
-                                .routing
-                                .unregister_data_subscriber(room_id, subscriber, &topic, publisher)
-                            {
+                            if self.routing.unregister_data_subscriber(
+                                room_id, subscriber, &topic, publisher, now,
+                            ) {
                                 self.pipeline.push_shard_event(ShardEvent::Relay(
                                     Topology::DataTopicUnsubscribed {
                                         room_id,
@@ -785,9 +803,13 @@ impl ShardCore {
                     track,
                 );
             }
-            Topology::TrackUnsubscribed { track } => {
+            Topology::TrackUnsubscribed {
+                track,
+                route,
+                epoch,
+            } => {
                 self.routing
-                    .unregister_remote_subscriber_shard(from_shard_id, track);
+                    .unregister_remote_subscriber_shard(from_shard_id, track, route, epoch);
             }
             Topology::DataTopicSubscribed {
                 room_id,
@@ -890,10 +912,10 @@ impl ShardCore {
         Some(())
     }
 
-    pub fn on_shard_frame(&mut self, ev: ShardFrame, _now: Instant, router: &impl ShardTransport) {
+    pub fn on_shard_frame(&mut self, ev: ShardFrame, now: Instant, router: &impl ShardTransport) {
         match ev {
             ShardFrame::Media { env, payload } => {
-                self.on_media_frame(env, payload, router);
+                self.on_media_frame(env, payload, now, router);
             }
             ShardFrame::Ingress {
                 participant_id,
@@ -1360,6 +1382,45 @@ mod test {
         assert!(
             core.dirty.contains(&subscriber),
             "forwarded RTP must dirty the subscriber"
+        );
+    }
+
+    /// A sender's `Instant` values mean nothing on the receiving shard, and
+    /// cross-node they will not be on the wire at all. The destination must
+    /// rebuild both from what it owns: playout from the envelope's NTP, arrival
+    /// from its own clock.
+    #[test]
+    fn an_arriving_frame_is_restamped_onto_the_destination_timeline() {
+        let core = new_core();
+        let mut pkt = crate::rtp::RtpPacket::default();
+
+        // A plausible sender playout, and arrival/playout Instants that are
+        // deliberately wrong for this shard.
+        let playout = core
+            .wall()
+            .ntp()
+            .wrapping_add(std::time::Duration::from_millis(120));
+        let bogus = Instant::now() - std::time::Duration::from_secs(3600);
+        pkt.playout_time = core.wall().to_instant(playout);
+        pkt.arrival_ts = bogus;
+
+        let now = Instant::now();
+        core.restamp(&mut pkt, playout, now);
+
+        assert_eq!(pkt.arrival_ts, now, "arrival must be the destination's own");
+        assert_ne!(
+            pkt.arrival_ts, bogus,
+            "the sender's arrival must be discarded"
+        );
+        // Playout survives the NTP round trip within middle-32 resolution.
+        let drift = core
+            .wall()
+            .to_ntp(pkt.playout_time)
+            .units_since(playout)
+            .unsigned_abs();
+        assert!(
+            drift <= 1 << 16,
+            "playout must be rebuilt from the envelope, drifted {drift} units"
         );
     }
 

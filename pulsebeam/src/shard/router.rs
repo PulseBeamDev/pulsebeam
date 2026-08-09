@@ -482,9 +482,13 @@ impl ShardRoutingTable {
         // Resolve the publisher's handles from the node rather than waiting for
         // them to be sent: they are ready before any subscribe can happen, so
         // the fanout is never briefly live with no measurements behind it.
+        // Always take what the registry holds now, never keep what we cached
+        // earlier: a `TrackId` is derived from the participant and the label, so
+        // republishing the same label reuses it. Holding the previous
+        // incarnation's handles would allocate against a monitor nothing writes.
         let states = self.streams.states_for(&track.id);
         let entry = self.tracks.entry(track.id).or_insert_with(TrackRoute::new);
-        if entry.layer_states.is_empty() {
+        if !states.is_empty() {
             entry.layer_states = states;
         }
         let already_subscribed = entry
@@ -549,15 +553,23 @@ impl ShardRoutingTable {
         }
 
         // Retire the destination-side route only when the last local consumer
-        // leaves; everything before that is churn the cluster never sees.
-        if let ImportEffect::Retire { route, .. } = self.imports.unsubscribe(&track.id) {
-            self.routes.retire(route, now);
-            self.imports.on_retired(&track.id);
-        }
-        entry
-            .subscribers
-            .is_empty()
-            .then_some(ShardEvent::Relay(Topology::TrackUnsubscribed { track }))
+        // leaves; everything before that is churn the cluster never sees. The
+        // retired incarnation is named in the unsubscribe so the publisher can
+        // tell it apart from a resubscription that overtook it.
+        let retired = match self.imports.unsubscribe(&track.id) {
+            ImportEffect::Retire { route, epoch } => {
+                self.routes.retire(route, now);
+                self.imports.on_retired(&track.id);
+                Some((route, epoch))
+            }
+            _ => None,
+        };
+        let (route, epoch) = retired?;
+        Some(ShardEvent::Relay(Topology::TrackUnsubscribed {
+            track,
+            route,
+            epoch,
+        }))
     }
 
     pub fn handle_topology_event(
@@ -699,6 +711,7 @@ impl ShardRoutingTable {
         subscriber: ParticipantId,
         topic: &Topic,
         publisher: Option<ParticipantId>,
+        now: Instant,
     ) -> bool {
         let Some(handle) = self.local_participants.get(&subscriber).copied() else {
             return false;
@@ -706,7 +719,10 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        match publisher {
+        // Publishers whose destination route this shard no longer needs. Held
+        // until the room borrow ends, since retiring touches the route table.
+        let mut orphaned: Vec<ParticipantId> = Vec::new();
+        let was_one = match publisher {
             Some(publisher) => {
                 let key = DataStreamId::new(publisher, topic.clone());
                 let Some(route) = room.data_streams.get_mut(&key) else {
@@ -717,6 +733,7 @@ impl ShardRoutingTable {
                 route.local_subscribers.swap_remove(&handle);
                 if route.is_unused() {
                     room.data_streams.remove(&key);
+                    orphaned.push(publisher);
                 }
                 was_one
             }
@@ -735,14 +752,29 @@ impl ShardRoutingTable {
                         .local_by_topic
                         .remove(topic);
                 }
+                // A wildcard resolved into one concrete route per publisher, so
+                // dropping it can orphan several at once.
                 for (stream_id, route) in &mut room.data_streams {
                     if stream_id.topic == *topic {
                         route.local_subscribers.swap_remove(&handle);
+                        if route.is_unused() {
+                            orphaned.push(stream_id.publisher_id);
+                        }
                     }
                 }
+                room.data_streams
+                    .retain(|stream_id, route| stream_id.topic != *topic || !route.is_unused());
                 was_one
             }
+        };
+
+        // Losing the last local consumer is what retires the cluster route —
+        // without this the import stays Active and its slot is never reusable,
+        // so a later subscription cannot allocate a fresh route and epoch.
+        for publisher in orphaned {
+            self.retire_data_route(publisher, topic, now);
         }
+        was_one
     }
 
     /// Record a destination's handle for a concrete stream, or register a
@@ -866,15 +898,39 @@ impl ShardRoutingTable {
         route.remote_routes.push(remote);
     }
 
-    pub fn unregister_remote_subscriber_shard(&mut self, from_shard_id: ShardId, track: TrackMeta) {
-        if let Some(route) = self.tracks.get_mut(&track.id)
-            && let Some(idx) = route
-                .remote_routes
-                .iter()
-                .position(|r| r.shard_id == from_shard_id)
-        {
-            route.remote_routes.swap_remove(idx);
+    /// Drop the sender handle for a destination that has retired its route.
+    ///
+    /// Matches on the route incarnation, not just the shard: an unsubscribe can
+    /// be overtaken by a resubscription from the same shard, and removing by
+    /// shard alone would tear down the new handle and silently stop forwarding.
+    pub fn unregister_remote_subscriber_shard(
+        &mut self,
+        from_shard_id: ShardId,
+        track: TrackMeta,
+        route: RouteId,
+        epoch: u16,
+    ) {
+        let Some(entry) = self.tracks.get_mut(&track.id) else {
+            return;
+        };
+        let Some(idx) = entry
+            .remote_routes
+            .iter()
+            .position(|r| r.shard_id == from_shard_id)
+        else {
+            return;
+        };
+        let held = entry.remote_routes[idx];
+        if held.route != route || held.epoch != epoch {
+            tracing::debug!(
+                %from_shard_id,
+                held = %held.route,
+                stale = %route,
+                "ignoring an unsubscribe for a superseded route"
+            );
+            return;
         }
+        entry.remote_routes.swap_remove(idx);
     }
 
     // -- track publish / unpublish ----------------------------------------
@@ -1908,6 +1964,158 @@ mod tests {
             "local churn must not touch the cluster route"
         );
         assert_eq!(table.routes.len(), 1);
+    }
+
+    /// The destination caches the publisher's handles when it subscribes. On a
+    /// republish the `TrackId` is reused, so a cache that only fills when empty
+    /// would pin the retired incarnation's monitors forever and allocate
+    /// against numbers nothing updates.
+    #[test]
+    fn resubscribing_after_a_republish_picks_up_the_new_handles() {
+        use crate::rtp::monitor::StreamState;
+
+        let streams = std::sync::Arc::new(crate::stream_registry::StreamRegistry::new());
+        let mut table = ShardRoutingTable::new(streams.clone());
+        let mut rng = rand::seeded_rng(77);
+        let room = room_id("republish");
+        let publisher = pid();
+        let track = TrackMeta {
+            shard_id: ShardId::new(0),
+            id: publisher.derive_track_id(TrackKind::Video, "v"),
+            origin: publisher,
+        };
+
+        let subscriber = pid();
+        let handle = ParticipantHandle::new(
+            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+            subscriber,
+            1,
+        );
+        table.add_local_member(subscriber, handle, room, &mut rng);
+
+        let first = vec![(None, StreamState::new(false, 100_000))];
+        streams.publish(track.id, first.clone());
+        table.register_subscriber(subscriber, track.clone(), now(), &wall());
+        table.unregister_subscriber(subscriber, track.clone(), now());
+
+        // Same label, so the same TrackId, but brand new measurement state.
+        let second = vec![(None, StreamState::new(false, 100_000))];
+        streams.publish(track.id, second.clone());
+        table.register_subscriber(subscriber, track.clone(), now(), &wall());
+
+        second[0].1.update_for_test().bitrate(4_321);
+        first[0].1.update_for_test().bitrate(1_000);
+        let cached = table.tracks[&track.id]
+            .state_for(None)
+            .expect("the destination caches a handle for the encoding");
+        assert_eq!(
+            cached.bitrate_bps(),
+            4_321.0,
+            "the destination must follow the live incarnation, not the retired one"
+        );
+    }
+
+    /// Teardown must be idempotent under reordering. An unsubscribe names the
+    /// route incarnation it is retiring, so one overtaken by a resubscription
+    /// from the same shard is ignored rather than silently stopping the media
+    /// the new subscription just asked for.
+    #[test]
+    fn a_stale_unsubscribe_does_not_tear_down_a_newer_route() {
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
+        let publisher = pid();
+        let track = TrackMeta {
+            shard_id: ShardId::new(0),
+            id: publisher.derive_track_id(TrackKind::Video, "v"),
+            origin: publisher,
+        };
+        let subscriber_shard = ShardId::new(1);
+
+        let stale = RouteId::new(7);
+        let fresh = RouteId::new(9);
+
+        // The destination resubscribed on a new route before its old
+        // unsubscribe reached us.
+        table.register_remote_subscriber_shard(
+            RemoteRoute::new(subscriber_shard, fresh, 1),
+            track.clone(),
+        );
+        assert_eq!(table.tracks[&track.id].remote_routes.len(), 1);
+
+        table.unregister_remote_subscriber_shard(subscriber_shard, track.clone(), stale, 0);
+        assert_eq!(
+            table.tracks[&track.id].remote_routes.len(),
+            1,
+            "an unsubscribe naming a superseded route must be ignored"
+        );
+
+        table.unregister_remote_subscriber_shard(subscriber_shard, track.clone(), fresh, 1);
+        assert!(
+            table.tracks[&track.id].remote_routes.is_empty(),
+            "an unsubscribe naming the live route must retire it"
+        );
+    }
+
+    /// Losing the last local consumer must retire the cluster route, not just
+    /// drop the local fanout. Leaving the import Active pins the slot forever,
+    /// so a later subscription can never allocate a fresh route and epoch —
+    /// and the publisher keeps a handle for a destination that wants nothing.
+    #[test]
+    fn the_last_data_unsubscribe_retires_the_route() {
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
+        let mut rng = rand::seeded_rng(41);
+        let room = room_id("data-retire");
+        let publisher = pid();
+        let topic = Topic::for_test("chat");
+
+        let mut subscribe = |table: &mut ShardRoutingTable, who: ParticipantId, rng: &mut _| {
+            let handle = ParticipantHandle::new(
+                SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+                who,
+                1,
+            );
+            table.add_local_member(who, handle, room, rng);
+            table.register_data_subscriber(
+                room,
+                who,
+                topic.clone(),
+                Some(publisher),
+                now(),
+                &wall(),
+            )
+        };
+
+        let a = pid();
+        let b = pid();
+        subscribe(&mut table, a, &mut rng);
+        subscribe(&mut table, b, &mut rng);
+        assert_eq!(table.routes.len(), 1, "one route serves both subscribers");
+
+        table.unregister_data_subscriber(room, a, &topic, Some(publisher), now());
+        assert_eq!(
+            table.routes.len(),
+            1,
+            "churn with a subscriber remaining must not touch the cluster route"
+        );
+
+        table.unregister_data_subscriber(room, b, &topic, Some(publisher), now());
+        assert_eq!(
+            table.routes.len(),
+            0,
+            "the last unsubscribe must retire the route"
+        );
+
+        // And the slot must be usable again: resubscribing installs a new one.
+        let c = pid();
+        subscribe(&mut table, c, &mut rng);
+        assert_eq!(
+            table.routes.len(),
+            1,
+            "a later subscription must be able to install a fresh route"
+        );
     }
 
     /// A wildcard subscription cannot name a stream, so it installs nothing
