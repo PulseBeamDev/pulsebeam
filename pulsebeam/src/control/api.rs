@@ -18,6 +18,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
+    control::auth,
     control::controller::{self},
     entity::ConnectionId,
 };
@@ -64,11 +65,31 @@ pub(crate) struct AppState {
     api_config: ApiConfig,
 }
 
+/// Above any realistic SDP, below axum's 2 MiB default.
+pub const DEFAULT_MAX_SIGNALING_BODY: usize = 256 * 1024;
+
 /// Configuration shared across handlers
 #[derive(Clone)]
 pub struct ApiConfig {
     pub base_path: String,    // e.g. "/api/v1"
     pub default_host: String, // fallback if no Host header, e.g. "localhost:7070"
+    /// `None` disables the JSON surface entirely; the SDP surface is unaffected.
+    pub auth: Option<std::sync::Arc<auth::AuthConfig>>,
+    /// Also require a bearer token on the legacy `application/sdp` endpoints.
+    pub require_auth: bool,
+    pub max_body_bytes: usize,
+}
+
+impl ApiConfig {
+    pub fn new(base_path: impl Into<String>, default_host: impl Into<String>) -> Self {
+        Self {
+            base_path: base_path.into(),
+            default_host: default_host.into(),
+            auth: None,
+            require_auth: false,
+            max_body_bytes: DEFAULT_MAX_SIGNALING_BODY,
+        }
+    }
 }
 
 /// Error type for api operations
@@ -657,13 +678,7 @@ mod tests {
         }
 
         Harness {
-            router: router(
-                tx,
-                ApiConfig {
-                    base_path: "/api/v1".to_string(),
-                    default_host: "sfu.test".to_string(),
-                },
-            ),
+            router: router(tx, ApiConfig::new("/api/v1", "sfu.test")),
             commands,
             _rx: retained,
         }

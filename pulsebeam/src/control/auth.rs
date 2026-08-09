@@ -7,8 +7,10 @@ use jsonwebtoken::{
 use pulsebeam_runtime::rand::RngCore;
 
 use crate::entity::{
-    ConnectionEpoch, ExternalRoomId, Identity, KeyId, ParticipantId, encode_opaque_secret,
+    ConnectionEpoch, ExternalRoomId, Identity, ParticipantId, encode_opaque_secret,
 };
+
+pub use crate::entity::KeyId;
 
 const RESUME_TYP: &str = "pb-resume+jwt";
 const MAX_LEEWAY: Duration = Duration::from_secs(300);

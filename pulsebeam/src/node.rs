@@ -23,6 +23,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
+use crate::control::auth;
 use crate::control::controller::ControllerActor;
 use crate::id::ShardId;
 use crate::shard::ShardContext;
@@ -88,6 +89,71 @@ pub struct NodeBuilder {
     /// to use the TCP path.  Used in simulation tests that exercise TCP-only
     /// connectivity.
     tcp_only: bool,
+
+    auth: AuthSettings,
+}
+
+/// Authentication inputs, folded into an [`auth::AuthConfig`] at `run()`.
+#[derive(Default)]
+pub(crate) struct AuthSettings {
+    jwt_keys: Vec<(auth::KeyId, auth::VerifyingKey)>,
+    audiences: Vec<String>,
+    issuers: Vec<String>,
+    leeway: Option<Duration>,
+    max_token_lifetime: Option<Duration>,
+    resume_keys: Vec<(auth::KeyId, [u8; 32])>,
+    resume_ttl: Option<Duration>,
+    require_auth: bool,
+    max_signaling_body: Option<usize>,
+}
+
+impl AuthSettings {
+    fn build(&self, rng: &mut impl RngCore) -> Option<auth::AuthConfig> {
+        if self.jwt_keys.is_empty() {
+            tracing::info!(
+                "no JWT verification key configured; the JSON signaling API will refuse requests"
+            );
+            return None;
+        }
+
+        let mut builder = auth::AuthConfig::builder();
+        for (kid, key) in &self.jwt_keys {
+            builder = builder.access_key(kid.clone(), key.clone());
+        }
+        for aud in &self.audiences {
+            builder = builder.audience(aud.clone());
+        }
+        for iss in &self.issuers {
+            builder = builder.issuer(iss.clone());
+        }
+        if let Some(leeway) = self.leeway {
+            builder = builder.leeway(leeway);
+        }
+        if let Some(lifetime) = self.max_token_lifetime {
+            builder = builder.max_token_lifetime(lifetime);
+        }
+        if let Some(ttl) = self.resume_ttl {
+            builder = builder.resume_ttl(ttl);
+        }
+
+        match auth::ResumeKeyring::new(self.resume_keys.clone()) {
+            Some(keyring) => builder = builder.resume_keys(keyring),
+            None => tracing::warn!(
+                "no resume key configured; a random one will be generated, so resume tokens will \
+                 not survive a restart and will not work across nodes. Set one with \
+                 NodeBuilder::with_resume_key for any deployment that needs resumption."
+            ),
+        }
+
+        let config = builder.build(rng);
+        if config.is_none() {
+            tracing::error!(
+                "JWT keys are configured but no audience is; refusing to enable auth, because \
+                 without an audience a token minted for another service would verify here"
+            );
+        }
+        config
+    }
 }
 
 impl Default for NodeBuilder {
@@ -108,6 +174,7 @@ impl NodeBuilder {
             internal_metrics: None,
             worker_execution: WorkerExecution::ThreadPerWorker,
             tcp_only: false,
+            auth: AuthSettings::default(),
         }
     }
 
@@ -170,6 +237,78 @@ impl NodeBuilder {
     /// Run shard workers on the current Tokio runtime instead of spawning one thread per worker.
     pub fn with_current_runtime(mut self) -> Self {
         self.worker_execution = WorkerExecution::SharedRuntime;
+        self
+    }
+
+    /// Register a public key for verifying access tokens, keyed by the `kid` in the JWT header.
+    ///
+    /// Repeatable. Only public key material is accepted, so the node can verify tokens but never
+    /// mint one.
+    pub fn with_jwt_key(
+        mut self,
+        kid: &str,
+        alg: auth::JwtAlg,
+        key: auth::JwtKeyBytes,
+    ) -> Result<Self> {
+        let kid = auth::KeyId::new(kid).map_err(|e| anyhow::anyhow!("invalid kid {kid:?}: {e}"))?;
+        let key = auth::VerifyingKey::new(alg, key)
+            .map_err(|e| anyhow::anyhow!("invalid key material for {kid}: {e}"))?;
+        self.auth.jwt_keys.push((kid, key));
+        Ok(self)
+    }
+
+    /// An accepted `aud`. At least one is required before any JSON endpoint will serve: without it
+    /// a token minted for a different service would verify here.
+    pub fn with_jwt_audience(mut self, aud: impl Into<String>) -> Self {
+        self.auth.audiences.push(aud.into());
+        self
+    }
+
+    pub fn with_jwt_issuer(mut self, iss: impl Into<String>) -> Self {
+        self.auth.issuers.push(iss.into());
+        self
+    }
+
+    pub fn with_auth_leeway(mut self, leeway: Duration) -> Self {
+        self.auth.leeway = Some(leeway);
+        self
+    }
+
+    pub fn with_max_token_lifetime(mut self, lifetime: Duration) -> Self {
+        self.auth.max_token_lifetime = Some(lifetime);
+        self
+    }
+
+    /// A cluster-wide resume-token key. The first registered key signs; every registered key
+    /// verifies, so one can be rotated in and the previous drained before removal.
+    ///
+    /// This must be the same across every node and across restarts. Without it resumption cannot
+    /// do the one thing it exists for -- surviving a node restart -- so an unset keyring is a
+    /// development convenience only, and warns.
+    pub fn with_resume_key(mut self, kid: &str, secret: [u8; 32]) -> Result<Self> {
+        let kid = auth::KeyId::new(kid)
+            .map_err(|e| anyhow::anyhow!("invalid resume kid {kid:?}: {e}"))?;
+        anyhow::ensure!(secret != [0u8; 32], "resume key {kid} is all zeroes");
+        self.auth.resume_keys.push((kid, secret));
+        Ok(self)
+    }
+
+    pub fn with_resume_ttl(mut self, ttl: Duration) -> Self {
+        self.auth.resume_ttl = Some(ttl);
+        self
+    }
+
+    /// Require a bearer token on the legacy `application/sdp` endpoints too.
+    ///
+    /// Off by default so existing WHIP deployments keep working; WHIP already permits
+    /// `Authorization: Bearer`, so enabling this needs no client protocol change.
+    pub fn with_require_auth(mut self, require: bool) -> Self {
+        self.auth.require_auth = require;
+        self
+    }
+
+    pub fn with_max_signaling_body(mut self, bytes: usize) -> Self {
+        self.auth.max_signaling_body = Some(bytes);
         self
     }
 
@@ -431,7 +570,17 @@ impl NodeBuilder {
             let local_addr = listener.local_addr().ok();
             tracing::debug!("signaling api listening on {:?}", local_addr);
 
+            let auth_config = self.auth.build(&mut rng);
+            let require_auth = self.auth.require_auth;
+            let max_body_bytes = self
+                .auth
+                .max_signaling_body
+                .unwrap_or(api::DEFAULT_MAX_SIGNALING_BODY);
+
             let api_cfg = api::ApiConfig {
+                auth: auth_config.map(Arc::new),
+                require_auth,
+                max_body_bytes,
                 base_path: "/api/v1".to_string(),
                 // Best effort to guess host if bound randomly
                 default_host: local_addr
