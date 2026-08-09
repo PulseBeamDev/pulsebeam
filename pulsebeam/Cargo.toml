@@ -73,6 +73,8 @@ proptest = "1.11.0"
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 turmoil = { workspace = true }
 base64 = "0.22"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 # jemalloc_pprof = { version = "0.8.2", optional = true, features = ["flamegraph", "symbolize"] }

@@ -2054,7 +2054,10 @@ pub enum Property {
     /// other layer assertion here is a floor, and the byte-rate ceiling that stood in for this one
     /// cannot tell a stream forwarded at the wrong rung from one forwarded at the right rung with
     /// a busier picture. This reads the highest rank actually forwarded.
-    NeverForwardedAbove { origin: &'static str, max_quality: u8 },
+    NeverForwardedAbove {
+        origin: &'static str,
+        max_quality: u8,
+    },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a

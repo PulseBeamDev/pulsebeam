@@ -464,3 +464,417 @@ async fn track_route_duration(req: Request<axum::body::Body>, next: Next) -> Res
         .record(duration);
     response
 }
+
+/// Golden coverage for the `application/sdp` surface.
+///
+/// These assert exact bytes, not shapes. Existing clients depend on this surface verbatim, so any
+/// difference -- a header that stops being emitted, a status that shifts, a body that re-serializes
+/// differently -- must fail here rather than in the field.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use hyper::header::CONTENT_TYPE;
+    use pulsebeam_runtime::mailbox;
+    use str0m::change::SdpAnswer;
+    use tower::ServiceExt;
+
+    const ROOM: &str = "standup";
+    const PARTICIPANT: &str = "pa_8ZQ4W2P0H3RJ6VC1TKXE5N7BMD";
+
+    fn offer_sdp() -> String {
+        pulsebeam_testdata::RAW_CHROME_SDP.to_string()
+    }
+
+    fn answer_sdp() -> SdpAnswer {
+        // str0m has no answer fixture; an offer parsed as an answer is structurally identical and
+        // all these tests need is a stable, non-empty body the handler will serialize.
+        SdpAnswer::from_sdp_string(pulsebeam_testdata::RAW_CHROME_SDP).unwrap()
+    }
+
+    /// How the stub controller should respond, so error paths are reachable without a real actor.
+    enum Stub {
+        Answer,
+        Reject,
+        /// Dropped immediately, so the handler sees `Closed`.
+        Closed,
+        /// Receiver held but never drained, and the single slot pre-filled, so every handler
+        /// `try_send` sees `Full`. Deterministic: no spawning, no waiting for a queue to fill.
+        Saturated,
+    }
+
+    struct Harness {
+        router: Router,
+        commands: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        /// Kept alive so a `Saturated` mailbox reads as full rather than closed.
+        _rx: Option<mailbox::Receiver<controller::ControllerCommand>>,
+    }
+
+    fn harness(stub: Stub) -> Harness {
+        let (tx, mut rx) = mailbox::new::<controller::ControllerCommand>(1);
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut retained = None;
+
+        match stub {
+            Stub::Closed => drop(rx),
+            Stub::Saturated => {
+                tx.try_send(
+                    controller::DeleteParticipant {
+                        room_id: RoomId::from_external(&ExternalRoomId::new(ROOM).unwrap()),
+                        participant_id: PARTICIPANT.parse().unwrap(),
+                    }
+                    .into(),
+                )
+                .expect("the first message fits");
+                retained = Some(rx);
+            }
+            Stub::Answer | Stub::Reject => {
+                let seen = commands.clone();
+                let reject = matches!(stub, Stub::Reject);
+                tokio::spawn(async move {
+                    while let Some(cmd) = rx.recv().await {
+                        match cmd {
+                            controller::ControllerCommand::CreateParticipant(_, reply) => {
+                                seen.lock().unwrap().push("create");
+                                let _ = reply.send(if reject {
+                                    Err(controller::ControllerError::ServiceUnavailable)
+                                } else {
+                                    Ok(controller::CreateParticipantReply {
+                                        answer: answer_sdp(),
+                                    })
+                                });
+                            }
+                            controller::ControllerCommand::PatchParticipant(_, reply) => {
+                                seen.lock().unwrap().push("patch");
+                                let _ = reply.send(if reject {
+                                    Err(controller::ControllerError::ServiceUnavailable)
+                                } else {
+                                    Ok(controller::PatchParticipantReply {
+                                        answer: answer_sdp(),
+                                    })
+                                });
+                            }
+                            controller::ControllerCommand::DeleteParticipant(_) => {
+                                seen.lock().unwrap().push("delete");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        Harness {
+            router: router(
+                tx,
+                ApiConfig {
+                    base_path: "/api/v1".to_string(),
+                    default_host: "sfu.test".to_string(),
+                },
+            ),
+            commands,
+            _rx: retained,
+        }
+    }
+
+    struct Captured {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: String,
+    }
+
+    impl Captured {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers.get(name).and_then(|v| v.to_str().ok())
+        }
+    }
+
+    async fn send(h: &Harness, req: Request<Body>) -> Captured {
+        let response = h.router.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        Captured {
+            status,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    }
+
+    fn post(body: &str, content_type: Option<&str>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/rooms/{ROOM}/participants"))
+            .header("host", "sfu.test");
+        if let Some(ct) = content_type {
+            req = req.header(CONTENT_TYPE, ct);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn patch(body: &str, if_match: Option<&str>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/rooms/{ROOM}/participants/{PARTICIPANT}"))
+            .header("host", "sfu.test")
+            .header(CONTENT_TYPE, "application/sdp");
+        if let Some(etag) = if_match {
+            req = req.header(IF_MATCH, etag);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_returns_201_with_location_etag_and_the_answer_verbatim() {
+        let h = harness(Stub::Answer);
+        let res = send(&h, post(&offer_sdp(), Some("application/sdp"))).await;
+
+        assert_eq!(res.status, StatusCode::CREATED);
+        assert_eq!(res.body, answer_sdp().to_sdp_string());
+
+        let location = res
+            .header("location")
+            .expect("Location is part of the contract");
+        assert!(
+            location.starts_with("http://sfu.test/api/v1/rooms/standup/participants/pa_"),
+            "unexpected Location: {location}"
+        );
+        // No manual_sub means an empty query string, trailing '?' included.
+        assert!(location.ends_with('?'), "unexpected Location: {location}");
+
+        let etag = res.header("etag").expect("ETag is part of the contract");
+        assert!(etag.starts_with("c_"), "unexpected ETag: {etag}");
+        // Emitted unquoted today. Clients parse it as a ConnectionId, so quoting would break them.
+        assert!(!etag.starts_with('"'), "ETag must stay unquoted: {etag}");
+
+        assert_eq!(*h.commands.lock().unwrap(), vec!["create"]);
+    }
+
+    #[tokio::test]
+    async fn post_carries_manual_sub_into_the_location() {
+        let h = harness(Stub::Answer);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/rooms/{ROOM}/participants?manual_sub=true"))
+            .header("host", "sfu.test")
+            .header(CONTENT_TYPE, "application/sdp")
+            .body(Body::from(offer_sdp()))
+            .unwrap();
+        let res = send(&h, req).await;
+
+        assert_eq!(res.status, StatusCode::CREATED);
+        assert!(
+            res.header("location")
+                .unwrap()
+                .ends_with("?manual_sub=true")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_honours_forwarded_scheme_and_host() {
+        let h = harness(Stub::Answer);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/rooms/{ROOM}/participants"))
+            .header("host", "internal:7070")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "edge.example.com")
+            .header(CONTENT_TYPE, "application/sdp")
+            .body(Body::from(offer_sdp()))
+            .unwrap();
+        let res = send(&h, req).await;
+
+        assert!(
+            res.header("location")
+                .unwrap()
+                .starts_with("https://edge.example.com/api/v1/"),
+            "proxy headers must win over Host"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_content_type_is_rejected_before_the_controller() {
+        let h = harness(Stub::Answer);
+        let res = send(&h, post(&offer_sdp(), None)).await;
+
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+        assert!(
+            h.commands.lock().unwrap().is_empty(),
+            "a rejected request must never reach the controller"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_content_type_is_accepted_on_the_legacy_path() {
+        // The handler extracts Content-Type but ignores its value. Documented here because the
+        // JSON dispatcher must preserve exactly this behaviour for non-JSON types.
+        let h = harness(Stub::Answer);
+        let res = send(&h, post(&offer_sdp(), Some("text/plain"))).await;
+        assert_eq!(res.status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_offer_is_a_400_with_a_text_plain_body() {
+        let h = harness(Stub::Answer);
+        let res = send(&h, post("this is not sdp", Some("application/sdp"))).await;
+
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+        assert!(
+            res.body.starts_with("sdp offer is invalid:"),
+            "body: {}",
+            res.body
+        );
+        assert!(h.commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_room_id_is_a_400() {
+        let h = harness(Stub::Answer);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/rooms/not%20a%20room/participants")
+            .header("host", "sfu.test")
+            .header(CONTENT_TYPE, "application/sdp")
+            .body(Body::from(offer_sdp()))
+            .unwrap();
+        let res = send(&h, req).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_offer_surfaces_the_controller_status() {
+        let h = harness(Stub::Reject);
+        let res = send(&h, post(&offer_sdp(), Some("application/sdp"))).await;
+        assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_closed_controller_is_a_503() {
+        let h = harness(Stub::Closed);
+        let res = send(&h, post(&offer_sdp(), Some("application/sdp"))).await;
+        assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_saturated_controller_is_a_429_on_every_verb() {
+        // Backpressure is the only rate limiting the server has; each verb must surface it.
+        for req in [
+            post(&offer_sdp(), Some("application/sdp")),
+            patch(&offer_sdp(), Some("c_R5T9K2ND7QW0J4XVA8ZP1MHC3B")),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/rooms/{ROOM}/participants/{PARTICIPANT}"))
+                .header("host", "sfu.test")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let h = harness(Stub::Saturated);
+            let method = req.method().clone();
+            let res = send(&h, req).await;
+            assert_eq!(
+                res.status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{method} did not surface backpressure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_requires_if_match_and_returns_200_with_a_rotated_etag() {
+        let h = harness(Stub::Answer);
+        let etag = "c_R5T9K2ND7QW0J4XVA8ZP1MHC3B";
+        let res = send(&h, patch(&offer_sdp(), Some(etag))).await;
+
+        assert_eq!(res.status, StatusCode::OK);
+        assert_eq!(res.body, answer_sdp().to_sdp_string());
+        let rotated = res.header("etag").unwrap();
+        assert!(rotated.starts_with("c_"));
+        assert_ne!(rotated, etag, "PATCH mints a fresh connection id");
+        assert_eq!(*h.commands.lock().unwrap(), vec!["patch"]);
+    }
+
+    #[tokio::test]
+    async fn patch_accepts_a_quoted_if_match() {
+        let h = harness(Stub::Answer);
+        let res = send(
+            &h,
+            patch(&offer_sdp(), Some("\"c_R5T9K2ND7QW0J4XVA8ZP1MHC3B\"")),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn patch_without_if_match_is_a_400() {
+        let h = harness(Stub::Answer);
+        let res = send(&h, patch(&offer_sdp(), None)).await;
+
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+        assert_eq!(res.body, "bad request: If-Match header required");
+        assert!(h.commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn patch_with_a_malformed_if_match_is_a_400() {
+        let h = harness(Stub::Answer);
+        let res = send(&h, patch(&offer_sdp(), Some("not-a-connection-id"))).await;
+
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+        assert!(h.commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_is_unconditional_and_returns_204_with_no_body() {
+        // Today DELETE takes no ETag and does not check existence. Captured so the JSON path's
+        // stricter behaviour is visibly a *new* surface rather than a change to this one.
+        let h = harness(Stub::Answer);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/rooms/{ROOM}/participants/{PARTICIPANT}"))
+            .header("host", "sfu.test")
+            .body(Body::empty())
+            .unwrap();
+        let res = send(&h, req).await;
+
+        assert_eq!(res.status, StatusCode::NO_CONTENT);
+        assert_eq!(res.body, "");
+    }
+
+    #[tokio::test]
+    async fn errors_are_plain_text_not_json() {
+        let h = harness(Stub::Answer);
+        let res = send(&h, patch(&offer_sdp(), None)).await;
+        let content_type = res.header("content-type").unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "legacy errors must stay text/plain, got {content_type}"
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&res.body).is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_routes_and_methods_are_not_served() {
+        let h = harness(Stub::Answer);
+        for (method, uri) in [
+            ("GET", format!("/api/v1/rooms/{ROOM}/participants")),
+            (
+                "PUT",
+                format!("/api/v1/rooms/{ROOM}/participants/{PARTICIPANT}"),
+            ),
+            ("POST", format!("/api/v1/rooms/{ROOM}")),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header("host", "sfu.test")
+                .body(Body::empty())
+                .unwrap();
+            let res = send(&h, req).await;
+            assert!(
+                res.status == StatusCode::NOT_FOUND || res.status == StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri} unexpectedly served: {}",
+                res.status
+            );
+        }
+    }
+}
