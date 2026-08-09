@@ -41,6 +41,22 @@ use super::core::{ShardCore, ShardTransport};
 /// it as fatal instead of blocking.
 pub const SHARD_EVENT_CAPACITY: usize = 65_536;
 
+/// Depth of the controller -> shard command queue.
+///
+/// The shard *can* block on this one, so it does not need the headroom its
+/// reverse does; sizing them alike would make an ordinary burst look like the
+/// stalled controller [`SHARD_EVENT_CAPACITY`]'s overflow exists to diagnose.
+///
+/// Both directions must read this from here. Restating the depth at the call
+/// site would let the two drift apart, and the ratio below would then be
+/// asserted about a number nothing uses.
+pub const SHARD_COMMAND_CAPACITY: usize = 1024;
+
+const _: () = assert!(
+    SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
+    "the queue a shard cannot block on must have far more headroom than the one it can"
+);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
     #[error("IO error: {0}")]
@@ -54,7 +70,10 @@ pub enum ShardError {
 /// never send each other any of this.
 #[derive(Debug)]
 pub enum ShardCommand {
-    AddParticipant(ParticipantConfig),
+    /// Boxed because it dwarfs every other variant: an inline
+    /// `ParticipantConfig` would set the size of the enum, and the command
+    /// queue preallocates [`SHARD_COMMAND_CAPACITY`] of them per shard.
+    AddParticipant(Box<ParticipantConfig>),
     RemoveParticipant(ParticipantId),
     AddTcpConnection {
         stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
@@ -278,10 +297,6 @@ impl ChannelTransport {
 }
 
 impl ShardTransport for ChannelTransport {
-    fn shard_id(&self) -> ShardId {
-        self.shard_id
-    }
-
     fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
         // Dropping under backpressure is the media contract: this lane is
         // lossy by design, and `link_seq` makes the loss visible downstream.
@@ -317,6 +332,11 @@ pub struct ShardWorker {
 }
 
 impl ShardWorker {
+    // Every argument is a distinct resource the worker takes ownership of —
+    // two sockets, three channel ends, metrics, RNG, clock. Grouping them into
+    // a parameter struct would move the same list one level out and add a type
+    // whose only purpose is to be destructured here.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_id: ShardId,
         udp_socket: UnifiedSocket,
@@ -488,23 +508,6 @@ mod reverse_tests {
         clippy::float_cmp
     )]
     use super::*;
-
-    /// The shard -> controller queue must stay far larger than the reverse one.
-    ///
-    /// It is the direction that cannot block, so its depth is the entire budget
-    /// for absorbing a controller that is briefly behind — the reverse
-    /// direction can just wait. Sizing them alike would make an ordinary burst
-    /// look like the stalled controller this queue's overflow is meant to
-    /// diagnose.
-    #[test]
-    fn the_non_blocking_direction_has_the_deeper_queue() {
-        const SHARD_COMMAND_CAPACITY: usize = 1024;
-        assert!(
-            SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
-            "the queue a shard cannot block on must have far more headroom \
-             than the one it can"
-        );
-    }
 
     /// The reverse lane is going on a wire, so the documented layout is the
     /// contract: a route already names the stream, so a body may only carry

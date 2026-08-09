@@ -35,7 +35,7 @@ use crate::control::controller::ControllerActor;
 use crate::id::ShardId;
 use crate::shard::ShardContext;
 use crate::shard::metrics::ShardMetrics;
-use crate::shard::worker::{ShardCommand, ShardWorker};
+use crate::shard::worker::ShardWorker;
 
 /// Defines how a service listener is acquired.
 enum ListenerSource {
@@ -381,7 +381,8 @@ impl NodeBuilder {
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
-            let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
+            let (shard_command_tx, shard_command_rx) =
+                mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
             let shard_event_tx = shard_event_tx.clone();
             let frame_txs = frame_txs.clone();
             let occupancy = Arc::new(ShardMetrics::new());
@@ -543,8 +544,6 @@ impl NodeBuilder {
 
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
-
-    shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
 }
 
 async fn bind_udp_sockets(
@@ -757,8 +756,6 @@ mod internal {
         }
 
         pub async fn serve_internal_http(self, shutdown: CancellationToken) -> Result<()> {
-            let addr = self.listener.local_addr().ok();
-
             const INDEX_HTML: &str = r#"
 <ul>
   <li><a href="/healthz">Healthcheck</a></li>
@@ -781,7 +778,10 @@ mod internal {
             };
             let rt_monitor_join = tokio::spawn(rt_background_monitor(self.prometheus));
 
-            tracing::info!("internal metrics listening on {:?}", addr);
+            tracing::info!(
+                "internal metrics listening on {:?}",
+                self.listener.local_addr().ok()
+            );
 
             tokio::select! {
                 res = axum::serve(self.listener, router) => {

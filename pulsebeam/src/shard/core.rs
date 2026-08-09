@@ -38,10 +38,6 @@ struct DispatchCtx<'a, R: ShardTransport> {
 }
 
 impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
-    fn shard_id(&self) -> ShardId {
-        self.router.shard_id()
-    }
-
     fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
         self.router.send_media(dst, env, payload);
     }
@@ -263,6 +259,7 @@ impl ShardCore {
                 tracing::warn!(
                     shard_id = %self.shard_id,
                     route = %env.route,
+                    stream = %entry.names,
                     ?err,
                     "route timeline is ambiguous; needs a fresh NTP reference"
                 );
@@ -309,7 +306,11 @@ impl ShardCore {
                 topic: topic.clone(),
             },
             other => {
-                debug_assert!(false, "no media dispatch for route action {other:?}");
+                debug_assert!(
+                    false,
+                    "no media dispatch for route action {other:?} on {} ({})",
+                    env.route, entry.names
+                );
                 return;
             }
         };
@@ -385,6 +386,7 @@ impl ShardCore {
     /// never refreshed: re-anchoring mid-stream would step playout scheduling,
     /// and reading the wall clock per tick is both a syscall on the packet path
     /// and a source of nondeterminism under simulation.
+    #[cfg(test)]
     pub(crate) fn wall(&self) -> &WallAnchor {
         &self.wall
     }
@@ -765,7 +767,7 @@ impl ShardCore {
         router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
-            ShardCommand::AddParticipant(cfg) => self.add_participant(cfg, now, router),
+            ShardCommand::AddParticipant(cfg) => self.add_participant(*cfg, now, router),
             ShardCommand::RemoveParticipant(participant_id) => {
                 self.remove_participant(&participant_id, now);
             }
@@ -1171,16 +1173,12 @@ mod test {
     };
 
     pub(super) struct TestRouter {
-        pub shard_id: ShardId,
-        pub shard_count: usize,
         pub sent: RefCell<Vec<(ShardId, ShardFrame)>>,
     }
 
     impl TestRouter {
-        pub fn new(shard_id: usize, shard_count: usize) -> Self {
+        pub fn new() -> Self {
             Self {
-                shard_id: ShardId::new(shard_id),
-                shard_count,
                 sent: RefCell::new(Vec::new()),
             }
         }
@@ -1191,10 +1189,6 @@ mod test {
     }
 
     impl ShardTransport for TestRouter {
-        fn shard_id(&self) -> ShardId {
-            self.shard_id
-        }
-
         fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
             self.sent
                 .borrow_mut()
@@ -1215,14 +1209,6 @@ mod test {
         ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(
             COUNTER.fetch_add(1, Ordering::Relaxed),
         ))
-    }
-
-    pub(super) fn video_stream(p: ParticipantId) -> crate::track::StreamId {
-        (p.derive_track_id(TrackKind::Video, "v"), None)
-    }
-
-    pub(super) fn audio_stream(p: ParticipantId) -> crate::track::StreamId {
-        (p.derive_track_id(TrackKind::Audio, "a"), None)
     }
 
     pub(super) fn video_track(origin: ParticipantId, shard_id: usize) -> crate::track::TrackMeta {
@@ -1255,7 +1241,7 @@ mod test {
         room_id: RoomId,
     ) {
         core.on_command(
-            ShardCommand::AddParticipant(make_participant_cfg(participant_id, room_id)),
+            ShardCommand::AddParticipant(Box::new(make_participant_cfg(participant_id, room_id))),
             now(),
             router,
         );
@@ -1287,7 +1273,7 @@ mod test {
 
     #[test]
     fn add_participant_populates_registry_and_marks_dirty() {
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let p = pid();
         let r = room_id("add1");
@@ -1298,7 +1284,7 @@ mod test {
         assert!(core.routing.rooms.contains_key(&r));
         let mut core2 = new_core();
         core2.on_command(
-            ShardCommand::AddParticipant(make_participant_cfg(p, r)),
+            ShardCommand::AddParticipant(Box::new(make_participant_cfg(p, r))),
             now(),
             &router,
         );
@@ -1310,7 +1296,7 @@ mod test {
 
     #[test]
     fn remove_participant_clears_registry_and_room() {
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let p = pid();
         let r = room_id("leave1");
@@ -1330,18 +1316,18 @@ mod test {
 
     #[test]
     fn readding_dirty_participant_ignores_stale_generation() {
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let participant = pid();
         let room = room_id("readd-dirty");
 
         core.on_command(
-            ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
+            ShardCommand::AddParticipant(Box::new(make_participant_cfg(participant, room))),
             now(),
             &router,
         );
         core.on_command(
-            ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
+            ShardCommand::AddParticipant(Box::new(make_participant_cfg(participant, room))),
             now(),
             &router,
         );
@@ -1361,7 +1347,7 @@ mod test {
 
     #[test]
     fn duplicate_register_participant_command_does_not_leak_remote_shard() {
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let participant = pid();
         let rid = room_id("no-leak");
@@ -1397,7 +1383,7 @@ mod test {
 
     #[test]
     fn register_remote_participant_keeps_shard_until_last_peer_leaves() {
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let a = pid();
         let b = pid();
@@ -1453,7 +1439,7 @@ mod test {
     fn keyframe_request_from_a_peer_shard_marks_participant_dirty() {
         // Feedback reaches the publisher's shard directly, never through the
         // controller, so this is the only path a remote keyframe request takes.
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let p = pid();
         let r = room_id("kf1");
@@ -1496,7 +1482,7 @@ mod test {
 
     #[test]
     fn cross_shard_rtp_published_marks_subscriber_dirty() {
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let publisher = pid();
         let subscriber = pid();
@@ -1596,7 +1582,7 @@ mod test {
 
     #[test]
     fn fire_timers_does_not_spuriously_mark_participants() {
-        let router = TestRouter::new(0, 3);
+        let router = TestRouter::new();
         let mut core = new_core();
         let p = pid();
         let r = room_id("timer1");

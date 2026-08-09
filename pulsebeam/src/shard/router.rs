@@ -14,7 +14,6 @@ use crate::audio_selector::TopNAudioSelector;
 use crate::clock::WallAnchor;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
-use crate::rtp::monitor::StreamStats;
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::{DataLane, Topic, Track, TrackMeta};
 use tokio::time::Instant;
@@ -48,8 +47,6 @@ fn fast_set_with_capacity<T>(cap: usize) -> FastIndexSet<T> {
 /// Anything that must not be dropped goes to the controller instead, which is
 /// why there is no third method here.
 pub(crate) trait ShardTransport {
-    fn shard_id(&self) -> ShardId;
-
     /// Route-addressed payload. Split out from [`Self::send_frame`] only to
     /// keep the per-packet path from building an enum it would immediately
     /// destructure.
@@ -265,7 +262,8 @@ pub(crate) struct TrackRoute {
 }
 
 impl TrackRoute {
-    fn state_for(&self, rid: Option<Rid>) -> Option<&StreamStats> {
+    #[cfg(test)]
+    fn state_for(&self, rid: Option<Rid>) -> Option<&crate::rtp::monitor::StreamStats> {
         self.layer_states
             .iter()
             .find(|(r, _)| *r == rid)
@@ -803,25 +801,25 @@ impl ShardRoutingTable {
         if self.imports.subscribe(track.id) != ImportEffect::Install {
             return None;
         }
-        let (route, epoch) = self
-            .routes
-            .install(
-                RouteAction::Video {
-                    local_track: key,
-                    kind: track.id.kind(),
-                    nominal_bps: 0,
-                },
-                RouteNames {
-                    room_id: None,
-                    origin: track.origin,
-                    track_id: Some(track.id),
-                    topic: None,
-                },
-                wall.ntp(),
-                now,
-            )
-            .inspect_err(|err| tracing::error!(?err, "route install failed"))
-            .ok()?;
+        let installed = self.routes.install(
+            RouteAction::Video { local_track: key },
+            RouteNames {
+                room_id: None,
+                origin: track.origin,
+                track_id: Some(track.id),
+                topic: None,
+            },
+            wall.ntp(),
+            now,
+        );
+        let (route, epoch) = match installed {
+            Ok(installed) => installed,
+            Err(err) => {
+                tracing::error!(?err, track_id = %track.id, "video route install failed");
+                self.imports.cancel_install(&track.id);
+                return None;
+            }
+        };
         self.imports.on_installed(&track.id, route, epoch);
         Some(ShardEvent::Relay(Topology::TrackSubscribed {
             track,
@@ -861,12 +859,9 @@ impl ShardRoutingTable {
             }
             _ => None,
         };
-        let (route, epoch) = match retired {
-            Some(retired) => retired,
-            None => {
-                self.release_fanout_if_idle(&track.id);
-                return None;
-            }
+        let Some((route, epoch)) = retired else {
+            self.release_fanout_if_idle(&track.id);
+            return None;
         };
         self.release_fanout_if_idle(&track.id);
         Some(ShardEvent::Relay(Topology::TrackUnsubscribed {
@@ -969,13 +964,22 @@ impl ShardRoutingTable {
                     return None;
                 }
                 // The local fanout entry exists before the route is installed.
-                let installed = self.install_data_route(room_id, publisher, &topic, now, wall);
+                let Some((route, epoch)) =
+                    self.install_data_route(room_id, publisher, &topic, now, wall)
+                else {
+                    // Undo the membership too. `was_empty` is what decides
+                    // whether an install is attempted, so leaving this
+                    // subscriber behind would make every later one look like
+                    // local churn and skip the retry.
+                    self.drop_data_subscriber(room_id, publisher, &topic, handle);
+                    return None;
+                };
                 Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     room_id,
                     topic,
                     publisher: Some(publisher),
-                    route: installed.map(|(r, _)| r),
-                    epoch: installed.map_or(0, |(_, e)| e),
+                    route: Some(route),
+                    epoch,
                 }))
             }
             None => {
@@ -1344,29 +1348,55 @@ impl ShardRoutingTable {
         if self.data_imports.subscribe(key.clone()) != ImportEffect::Install {
             return None;
         }
-        let installed = self
-            .routes
-            .install(
-                RouteAction::Data {
-                    lane: DataLane::Realtime,
-                    room_id,
-                    origin: publisher,
-                    topic: topic.clone(),
-                },
-                RouteNames {
-                    room_id: Some(room_id),
-                    origin: publisher,
-                    track_id: None,
-                    topic: Some(topic.clone()),
-                },
-                wall.ntp(),
-                now,
-            )
-            .inspect_err(|err| tracing::error!(?err, "data route install failed"))
-            .ok()?;
+        let installed = self.routes.install(
+            RouteAction::Data {
+                lane: DataLane::Realtime,
+                room_id,
+                origin: publisher,
+                topic: topic.clone(),
+            },
+            RouteNames {
+                room_id: Some(room_id),
+                origin: publisher,
+                track_id: None,
+                topic: Some(topic.clone()),
+            },
+            wall.ntp(),
+            now,
+        );
+        let installed = match installed {
+            Ok(installed) => installed,
+            Err(err) => {
+                tracing::error!(?err, %topic, "data route install failed");
+                self.data_imports.cancel_install(&key);
+                return None;
+            }
+        };
         self.data_imports
             .on_installed(&key, installed.0, installed.1);
         Some(installed)
+    }
+
+    /// Remove a local data subscriber without touching the cluster route,
+    /// dropping the stream entry if that leaves it referencing nothing.
+    fn drop_data_subscriber(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: &Topic,
+        handle: ParticipantHandle,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let key = DataStreamId::new(publisher, topic.clone());
+        let Some(route) = room.data_streams.get_mut(&key) else {
+            return;
+        };
+        route.local_subscribers.swap_remove(&handle);
+        if route.is_unused() {
+            room.data_streams.remove(&key);
+        }
     }
 
     fn retire_data_route(&mut self, publisher: ParticipantId, topic: &Topic, now: Instant) {
@@ -1431,26 +1461,30 @@ impl ShardRoutingTable {
         if self.reliable_imports.subscribe(key.clone()) != ImportEffect::Install {
             return None;
         }
-        let installed = self
-            .routes
-            .install(
-                RouteAction::Data {
-                    lane: DataLane::Reliable,
-                    room_id,
-                    origin: publisher,
-                    topic: topic.clone(),
-                },
-                RouteNames {
-                    room_id: Some(room_id),
-                    origin: publisher,
-                    track_id: None,
-                    topic: Some(topic.clone()),
-                },
-                wall.ntp(),
-                now,
-            )
-            .inspect_err(|err| tracing::error!(?err, "reliable route install failed"))
-            .ok()?;
+        let installed = self.routes.install(
+            RouteAction::Data {
+                lane: DataLane::Reliable,
+                room_id,
+                origin: publisher,
+                topic: topic.clone(),
+            },
+            RouteNames {
+                room_id: Some(room_id),
+                origin: publisher,
+                track_id: None,
+                topic: Some(topic.clone()),
+            },
+            wall.ntp(),
+            now,
+        );
+        let installed = match installed {
+            Ok(installed) => installed,
+            Err(err) => {
+                tracing::error!(?err, %topic, "reliable route install failed");
+                self.reliable_imports.cancel_install(&key);
+                return None;
+            }
+        };
         self.reliable_imports
             .on_installed(&key, installed.0, installed.1);
         Some(installed)
@@ -1541,25 +1575,29 @@ impl ShardRoutingTable {
         if self.imports.subscribe(meta.id) != ImportEffect::Install {
             return None;
         }
-        let (route, epoch) = self
-            .routes
-            .install(
-                RouteAction::Audio {
-                    room_id,
-                    origin: meta.origin,
-                    track_id: meta.id,
-                },
-                RouteNames {
-                    room_id: Some(room_id),
-                    origin: meta.origin,
-                    track_id: Some(meta.id),
-                    topic: None,
-                },
-                wall.ntp(),
-                now,
-            )
-            .inspect_err(|err| tracing::error!(?err, "audio route install failed"))
-            .ok()?;
+        let installed = self.routes.install(
+            RouteAction::Audio {
+                room_id,
+                origin: meta.origin,
+                track_id: meta.id,
+            },
+            RouteNames {
+                room_id: Some(room_id),
+                origin: meta.origin,
+                track_id: Some(meta.id),
+                topic: None,
+            },
+            wall.ntp(),
+            now,
+        );
+        let (route, epoch) = match installed {
+            Ok(installed) => installed,
+            Err(err) => {
+                tracing::error!(?err, track_id = %meta.id, "audio route install failed");
+                self.imports.cancel_install(&meta.id);
+                return None;
+            }
+        };
         self.imports.on_installed(&meta.id, route, epoch);
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.audio_imports.insert(meta.id);
@@ -1955,7 +1993,6 @@ mod tests {
     /// A `RoutingContext` fake that just records calls. No `ParticipantCore`,
     /// no tracing spans, no `ShardCore` — this is the whole point of the
     /// trait boundary.
-
     fn now() -> Instant {
         Instant::now()
     }
@@ -1969,7 +2006,6 @@ mod tests {
 
     struct RecordingCtx {
         wall: WallAnchor,
-        shard_id: ShardId,
         local: StdHashSet<ParticipantId>,
         sent: RefCell<Vec<(ShardId, ShardFrame)>>,
         forwarded_video: RefCell<Vec<ParticipantId>>,
@@ -1984,7 +2020,6 @@ mod tests {
         fn default() -> Self {
             Self {
                 wall: wall(),
-                shard_id: ShardId::new(0),
                 local: StdHashSet::default(),
                 sent: RefCell::default(),
                 forwarded_video: RefCell::default(),
@@ -1998,10 +2033,6 @@ mod tests {
     }
 
     impl ShardTransport for RecordingCtx {
-        fn shard_id(&self) -> ShardId {
-            self.shard_id
-        }
-
         fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
             self.sent
                 .borrow_mut()
@@ -2361,6 +2392,74 @@ mod tests {
                 .register_data_subscriber(room, second, topic, Some(publisher), now(), &wall())
                 .is_none(),
             "local churn must not touch the cluster route"
+        );
+        assert_eq!(table.routes.len(), 1);
+    }
+
+    /// An install can fail — today only at the table's cap, cross-node whenever
+    /// the peer is unreachable — and the import must come back to Absent when
+    /// it does.
+    ///
+    /// The failure mode this pins is silent and permanent: `subscribe` moves to
+    /// `Installing` before a route exists, and `Installing` absorbs every later
+    /// subscribe and ignores every unsubscribe. Without the rollback the stream
+    /// is undeliverable on this shard for the process's lifetime, so recovery
+    /// once capacity returns is the property, not the error itself.
+    #[test]
+    fn a_failed_install_leaves_the_stream_installable_again() {
+        let mut table = ShardRoutingTable::new();
+        table.routes = crate::route::RouteTable::with_max_slots(0);
+        let mut rng = rand::seeded_rng(23);
+        let room = room_id("data-room");
+        let subscriber = pid();
+        let handle = ParticipantHandle::new(
+            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+            subscriber,
+            1,
+        );
+        table.add_local_member(subscriber, handle, room, &mut rng);
+
+        let publisher = pid();
+        let topic = Topic::for_test("chat");
+        assert!(
+            table
+                .register_data_subscriber(
+                    room,
+                    subscriber,
+                    topic.clone(),
+                    Some(publisher),
+                    now(),
+                    &wall()
+                )
+                .is_none(),
+            "no route, so nothing to announce"
+        );
+        assert_eq!(table.routes.len(), 0);
+
+        table.routes = crate::route::RouteTable::new();
+        let second = pid();
+        let h2 = ParticipantHandle::new(
+            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+            second,
+            1,
+        );
+        table.add_local_member(second, h2, room, &mut rng);
+        assert!(
+            matches!(
+                table.register_data_subscriber(
+                    room,
+                    second,
+                    topic,
+                    Some(publisher),
+                    now(),
+                    &wall()
+                ),
+                Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
+                    route: Some(_),
+                    ..
+                }))
+            ),
+            "the next subscriber retries the install rather than joining a pending one"
         );
         assert_eq!(table.routes.len(), 1);
     }
@@ -2746,7 +2845,6 @@ mod tests {
         };
 
         let mut ctx = RecordingCtx {
-            shard_id: ShardId::new(0),
             ..Default::default()
         };
         let ev = table.publish_track(track, room, now(), &wall(), &mut ctx);
@@ -2783,7 +2881,6 @@ mod tests {
             origin,
         };
         let mut ctx = RecordingCtx {
-            shard_id: ShardId::new(0),
             local: StdHashSet::from_iter([origin]),
             ..Default::default()
         };
@@ -2884,7 +2981,6 @@ mod tests {
 
         let mut ctx = RecordingCtx {
             wall: wall(),
-            shard_id: ShardId::new(0),
             ..Default::default()
         };
         let fanout_key = table

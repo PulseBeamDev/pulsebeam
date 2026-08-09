@@ -341,7 +341,8 @@ impl ControllerActor {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         });
-        self.eq.send(shard_id, ShardCommand::AddParticipant(cfg));
+        self.eq
+            .send(shard_id, ShardCommand::AddParticipant(Box::new(cfg)));
         Ok(answer)
     }
 }

@@ -92,6 +92,16 @@ impl Demuxer {
 
         let ufrag_str = std::str::from_utf8(ufrag_raw).ok()?;
         let decoded = IceUfrag::decode(ufrag_str)?;
+
+        // Drop before the cache is touched, not after. A ufrag naming another
+        // shard reaches us either because `SO_REUSEPORT` hashed it here or
+        // because someone fabricated it; either way this shard does not own
+        // that participant, and caching the address would spend a slot of the
+        // bounded `addr_map` on a mapping it can never serve.
+        if decoded.shard_id.index() != usize::from(self.shard_id) {
+            return None;
+        }
+
         let participant_id = decoded.participant_id;
 
         // Populate the fast-path cache only when within the safety bounds, to
@@ -274,7 +284,6 @@ mod ice {
     ///
     /// Returns `Some(&str)` if the USERNAME attribute is found and contains valid
     /// UTF-8 data, `None` otherwise.
-
     #[inline]
     pub fn parse_stun_remote_ufrag_raw(data: &[u8]) -> Option<&[u8]> {
         find_stun_username_slice(data).and_then(|slice| first_token(slice, b':'))
@@ -859,6 +868,21 @@ mod demux_tests {
         // Second packet uses fast path
         assert_eq!(d.demux(&batch), Some(pid));
         assert_eq!(d.addr_map.len(), 1); // no duplicate
+    }
+
+    /// The shard check the module doc has always promised, which until now was
+    /// documented but not implemented.
+    #[test]
+    fn ufrag_naming_another_shard_is_dropped_before_the_cache() {
+        let mut d = Demuxer::new(3);
+        let (ice, _) = ufrag(4);
+        let batch = make_batch(src(1000), stun_with_ufrag(&ice.encode()));
+
+        assert_eq!(d.demux(&batch), None);
+        assert!(
+            d.addr_map.is_empty(),
+            "a ufrag for another shard must not consume a cache slot"
+        );
     }
 
     #[test]

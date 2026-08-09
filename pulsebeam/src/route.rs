@@ -8,8 +8,7 @@ use std::collections::VecDeque;
 use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
-use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
-use crate::shard::participants::ParticipantHandle;
+use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::shard::router::LocalTrackKey;
 use crate::track::{DataLane, Topic};
 use str0m::media::Rid;
@@ -275,12 +274,33 @@ impl RemoteRoute {
 }
 
 /// Semantic identity, for logs and assertions only. Never read on the hot path.
+///
+/// A route on the wire names nothing, which is the point and also the reason a
+/// route-level fault is otherwise unreadable: `rt41 epoch 3` says nothing about
+/// whose stream stopped. This is the only place that mapping survives, so the
+/// paths that report a fault holding a live entry render it.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteNames {
     pub room_id: Option<RoomId>,
     pub origin: ParticipantId,
     pub track_id: Option<TrackId>,
     pub topic: Option<Topic>,
+}
+
+impl std::fmt::Display for RouteNames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.origin)?;
+        if let Some(room_id) = &self.room_id {
+            write!(f, " in {room_id}")?;
+        }
+        if let Some(track_id) = &self.track_id {
+            write!(f, " track {track_id}")?;
+        }
+        if let Some(topic) = &self.topic {
+            write!(f, " topic {topic}")?;
+        }
+        Ok(())
+    }
 }
 
 /// What the destination does with a frame that arrives on a route.
@@ -296,8 +316,6 @@ pub(crate) enum RouteAction {
         /// Resolving a route hands dispatch something it can use directly,
         /// rather than a `TrackId` it would have to hash back into a map.
         local_track: LocalTrackKey,
-        kind: TrackKind,
-        nominal_bps: u64,
     },
     /// One route per (audio stream, destination). Audio is broadcast to a room
     /// rather than explicitly subscribed, so the destination installs this as
@@ -333,9 +351,6 @@ pub(crate) enum RouteAction {
     Reverse {
         origin: ParticipantId,
         target: ReverseTarget,
-    },
-    Ingress {
-        participant: ParticipantHandle,
     },
 }
 
@@ -439,22 +454,44 @@ enum Slot {
 /// It is deliberately not, because feedback is latest-wins and keeps no
 /// per-link accounting, so a per-sender route would buy nothing and would cost
 /// 32x on a 32-shard node.
-#[derive(Debug, Default)]
+///
+/// [`MAX_ROUTES_PER_SHARD`] enforces that reasoning rather than leaving it as
+/// prose: the families above are all bounded, so passing the cap means one of
+/// them is not behaving as described, and failing the install says so while
+/// there is still a process to say it in.
+#[derive(Debug)]
 pub(crate) struct RouteTable {
     slots: Vec<Slot>,
     epochs: Vec<u16>,
     /// Retired slots, oldest first, with the instant they were retired.
     quarantine: VecDeque<(u32, Instant)>,
+    max_slots: u32,
 }
+
+/// Ceiling on slots one shard's table may grow to.
+///
+/// Sized for headroom, not for fit: every route family is proportional to
+/// participants on this shard, so a healthy shard uses orders of magnitude
+/// fewer. It exists to convert unbounded growth — a reconnect storm churning
+/// routes faster than [`ROUTE_QUARANTINE`] returns them — into a bounded
+/// failure that names itself, instead of an allocator death spiral 4 billion
+/// slots later.
+pub const MAX_ROUTES_PER_SHARD: u32 = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
-    /// No slot is out of quarantine and the table is at capacity.
-    Exhausted,
+    /// No slot is out of quarantine and the table is at its cap.
+    Exhausted { max_slots: u32 },
     /// The envelope named a slot that is free, or an incarnation that is gone.
     Stale { route: RouteId, epoch: u16 },
     /// The envelope named a slot past the end of the table.
     OutOfRange { route: RouteId },
+}
+
+impl Default for RouteTable {
+    fn default() -> Self {
+        Self::with_max_slots(MAX_ROUTES_PER_SHARD)
+    }
 }
 
 impl RouteTable {
@@ -462,6 +499,16 @@ impl RouteTable {
         Self::default()
     }
 
+    pub fn with_max_slots(max_slots: u32) -> Self {
+        Self {
+            slots: Vec::new(),
+            epochs: Vec::new(),
+            quarantine: VecDeque::new(),
+            max_slots,
+        }
+    }
+
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.slots
             .iter()
@@ -469,8 +516,12 @@ impl RouteTable {
             .count()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    #[cfg(test)]
+    pub fn get(&self, id: RouteId) -> Option<&RouteEntry> {
+        match self.slots.get(id.index()) {
+            Some(Slot::Live(entry)) => Some(entry),
+            _ => None,
+        }
     }
 
     /// Allocate and install in one step. The caller hands the resulting
@@ -535,13 +586,6 @@ impl RouteTable {
         }
     }
 
-    pub fn get(&self, id: RouteId) -> Option<&RouteEntry> {
-        match self.slots.get(id.index()) {
-            Some(Slot::Live(entry)) => Some(entry),
-            _ => None,
-        }
-    }
-
     fn allocate(&mut self, now: Instant) -> Result<RouteId, RouteError> {
         // FIFO from the oldest retirement, so a slot is only reused once no
         // datagram addressed to its previous incarnation could still arrive.
@@ -561,7 +605,12 @@ impl RouteTable {
             return Ok(RouteId::new(idx));
         }
 
-        let idx = u32::try_from(self.slots.len()).map_err(|_| RouteError::Exhausted)?;
+        let idx = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+        if idx >= self.max_slots {
+            return Err(RouteError::Exhausted {
+                max_slots: self.max_slots,
+            });
+        }
         self.slots.push(Slot::Free);
         self.epochs.push(0);
         Ok(RouteId::new(idx))
@@ -690,6 +739,31 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
                 ImportEffect::Retire { route, epoch }
             }
             ImportState::Installing | ImportState::Retiring { .. } => ImportEffect::None,
+        }
+    }
+
+    /// The install never happened, so the import returns to Absent.
+    ///
+    /// [`Self::subscribe`] moves to `Installing` before the caller has a route,
+    /// which means a failed install would otherwise leave an entry no later
+    /// subscribe can advance and no unsubscribe can clear — the stream becomes
+    /// permanently undeliverable on this shard. Cross-node an install is a
+    /// request to a peer and failing is ordinary, so this is the normal path,
+    /// not an exceptional one.
+    ///
+    /// Only legal while `Installing`: once a route exists, retirement is the
+    /// way back, and cancelling would leak it.
+    pub fn cancel_install(&mut self, key: &K) {
+        let Some(import) = self.entries.get(key) else {
+            return;
+        };
+        debug_assert_eq!(
+            import.state,
+            ImportState::Installing,
+            "cancel_install on an import that already has a route"
+        );
+        if matches!(import.state, ImportState::Installing) {
+            self.entries.remove(key);
         }
     }
 
@@ -882,6 +956,34 @@ mod tests {
         );
     }
 
+    /// Growth is bounded, so a churn storm fails an install rather than
+    /// consuming the node's memory until the allocator decides for us.
+    #[tokio::test(start_paused = true)]
+    async fn a_table_at_its_cap_refuses_instead_of_growing() {
+        let mut table = RouteTable::with_max_slots(2);
+        let now = Instant::now();
+
+        for _ in 0..2 {
+            table
+                .install(action(), names(), NtpTime::ZERO, now)
+                .expect("within the cap");
+        }
+
+        assert_eq!(
+            table
+                .install(action(), names(), NtpTime::ZERO, now)
+                .unwrap_err(),
+            RouteError::Exhausted { max_slots: 2 },
+        );
+
+        // Quarantine still returns slots, so the cap bounds concurrency rather
+        // than the total number of routes a shard may ever install.
+        table.retire(RouteId::new(0), now);
+        table
+            .install(action(), names(), NtpTime::ZERO, now + ROUTE_QUARANTINE)
+            .expect("a quarantined slot comes back");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_stale_epoch_never_resolves_to_a_recycled_slot() {
         let mut table = RouteTable::new();
@@ -962,8 +1064,6 @@ mod tests {
             .install(
                 RouteAction::Video {
                     local_track: LocalTrackKey::default(),
-                    kind: TrackKind::Video,
-                    nominal_bps: 0,
                 },
                 names(),
                 NtpTime::ZERO,
@@ -1044,6 +1144,54 @@ mod tests {
         );
         assert_eq!(imports.on_retired(&key), ImportEffect::None);
         assert_eq!(imports.state(&key), None);
+    }
+
+    /// A failed install must leave no trace, or the stream is undeliverable on
+    /// this shard forever: `Installing` absorbs later subscribes and ignores
+    /// unsubscribes, so nothing would ever retry.
+    #[test]
+    fn an_install_that_failed_can_be_attempted_again() {
+        let mut imports = ImportTable::new();
+        let key = "trk";
+        assert_eq!(imports.subscribe(key), ImportEffect::Install);
+
+        imports.cancel_install(&key);
+        assert_eq!(imports.state(&key), None, "back to Absent");
+        assert_eq!(imports.subscribers(&key), 0);
+
+        assert_eq!(
+            imports.subscribe(key),
+            ImportEffect::Install,
+            "the next subscriber drives a fresh install"
+        );
+        let (route, epoch) = (RouteId::new(7), 2);
+        assert_eq!(imports.on_installed(&key, route, epoch), ImportEffect::None);
+        assert_eq!(
+            imports.state(&key),
+            Some(ImportState::Active { route, epoch })
+        );
+    }
+
+    /// Without a rollback the entry is stuck: this pins the two transitions
+    /// that would otherwise silently absorb every later attempt.
+    #[test]
+    fn an_import_wedged_in_installing_absorbs_everything() {
+        let mut imports = ImportTable::new();
+        let key = "trk";
+        imports.subscribe(key);
+
+        assert_eq!(
+            imports.subscribe(key),
+            ImportEffect::None,
+            "a later subscriber attaches to the pending install"
+        );
+        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+        assert_eq!(
+            imports.state(&key),
+            Some(ImportState::Installing),
+            "no unsubscribe can clear an import that never installed"
+        );
     }
 
     #[test]
