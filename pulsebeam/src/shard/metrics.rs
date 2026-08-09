@@ -1,3 +1,8 @@
+//! Shared-state exception: SANCTIONED. A fixed, preallocated counter set, one per shard, written by
+//! its own shard and read by the controller for load reporting. Bounded count,
+//! no allocation, and nothing reads two counters expecting them to agree.
+#![allow(clippy::disallowed_types)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 

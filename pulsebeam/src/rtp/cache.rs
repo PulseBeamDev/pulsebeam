@@ -1,3 +1,7 @@
+//! Shared-state exception: Test-only: `Arc::new` builds header extensions for fixtures, matching what
+//! str0m hands us at ingress.
+#![allow(clippy::disallowed_types)]
+
 use crate::rtp::RtpPacket;
 use str0m::media::{MediaTime, Rid};
 use str0m::rtp::SeqNo;

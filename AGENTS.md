@@ -1,5 +1,23 @@
 # Agent Development Guide
 
+## Thread-per-core: read `docs/thread-per-core.md` first
+
+A shard owns its state and reaches other shards only by message. `Arc`, `Mutex`,
+`RwLock` and bare atomics are **denied by `clippy.toml`** in the `pulsebeam`
+crate and need `#[allow(clippy::disallowed_types)]` with a reason.
+
+Two things that keep getting reintroduced, both explained in that file:
+
+- Several atomics read together **do not form a consistent snapshot**, however
+  atomic each read is. Packing two into one `AtomicU64` is not a pattern to
+  copy; it is a symptom.
+- Sharing state across shards is not a performance trade-off to revisit later.
+  It is a design that stops working at the node boundary, where there is no
+  shared memory to reach into.
+
+If a change reintroduces one of these, it is a regression even when the tests
+pass, and even when the profile looks the same.
+
 ## Critical Systems & Defensive Assertions
 
 This project is designed to run in simulation (`pulsebeam-simulator`). To catch subtle bugs early under simulated failure conditions, code changes must include extensive defensive assertions.

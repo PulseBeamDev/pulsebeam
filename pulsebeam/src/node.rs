@@ -1,3 +1,7 @@
+//! Shared-state exception: Startup wiring: one `Arc` per shard for metrics and the stream registry,
+//! handed over before any shard runs.
+#![allow(clippy::disallowed_types)]
+
 use anyhow::{Context, Result};
 use core_affinity::get_core_ids;
 use pulsebeam_core::net::TcpListener;

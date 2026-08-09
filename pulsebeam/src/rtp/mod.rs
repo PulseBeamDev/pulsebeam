@@ -1,3 +1,8 @@
+//! Shared-state exception: str0m's `RtpWrite::new` takes `payload: Arc<[u8]>`, so the packet carries
+//! one. Kept core-local on purpose: `to_transit` copies rather than sharing it
+//! across a shard boundary.
+#![allow(clippy::disallowed_types)]
+
 pub mod cache;
 #[cfg(debug_assertions)]
 pub mod egress_guard;
@@ -131,10 +136,20 @@ impl RtpPacket {
     /// pooled block or `Rc<[u8]>` would cost a second copy on the way out.
     /// Revisit only if the str0m fork stops requiring `Arc<[u8]>`.
     pub fn to_transit(&self) -> Self {
+        let mut ext_vals = self.ext_vals.clone();
+
+        // The sender's Video Layers Allocation describes *its* simulcast set.
+        // The destination never reads it — normalization already ran, once, on
+        // this side — and egress strips it before writing. Carrying it across
+        // is dead weight and one more shared refcount.
+        ext_vals
+            .user_values
+            .remove::<str0m::rtp::vla::VideoLayersAllocation>();
+
         Self {
             ssrc: self.ssrc,
             marker: self.marker,
-            ext_vals: self.ext_vals.clone(),
+            ext_vals,
             header_len: self.header_len,
             seq_no: self.seq_no,
             rtp_ts: self.rtp_ts,
@@ -144,6 +159,31 @@ impl RtpPacket {
             nal: self.nal,
             payload: Arc::from(&self.payload[..]),
         }
+    }
+
+    /// Move the parsed descriptor onto a fresh allocation owned by this core.
+    ///
+    /// Cloning the extension map clones the `Arc<dyn Any>` inside it, so an
+    /// arriving packet's descriptor is still refcounted against the publisher's
+    /// core. Both cores then touch that line on every packet — the publisher
+    /// when it clones for its own subscribers, this core when it clones for
+    /// each of ours — and it ping-pongs between them for as long as the stream
+    /// runs. Copying the payload in [`Self::to_transit`] exists to prevent
+    /// exactly that; the extensions were the hole in it.
+    ///
+    /// Done here rather than in `to_transit` because the publisher pays that
+    /// once per destination while a destination pays it once, and the publisher
+    /// is the busier core: it also normalizes, caches, and fans out locally.
+    pub fn rehome_extensions(&mut self) {
+        let Some(dd) = self
+            .ext_vals
+            .user_values
+            .get::<pulsebeam_core::dd::DependencyDescriptor>()
+        else {
+            return;
+        };
+        let owned = Arc::new(dd.clone());
+        self.ext_vals.user_values.set_arc(owned);
     }
 
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {

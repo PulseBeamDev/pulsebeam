@@ -13,6 +13,9 @@
 //!     currently targeted decode target, read from each packet's parsed
 //!     Dependency Descriptor.
 
+//! Shared-state exception: Test-only, plus str0m's extension map (see `rtp::switcher`).
+#![allow(clippy::disallowed_types)]
+
 use pulsebeam_core::dd::DependencyDescriptor;
 
 use crate::rtp::RtpPacket;

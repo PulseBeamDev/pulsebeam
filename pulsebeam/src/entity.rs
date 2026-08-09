@@ -1,3 +1,6 @@
+//! Shared-state exception: Test-only: a counter for unique ids in fixtures.
+#![allow(clippy::disallowed_types)]
+
 use arrayvec::ArrayString;
 use derive_more::{AsRef, Display};
 use pulsebeam_runtime::rand::RngCore;

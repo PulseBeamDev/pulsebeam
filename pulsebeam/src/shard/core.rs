@@ -1,3 +1,6 @@
+//! Shared-state exception: `Arc<StreamRegistry>`, cloned once per shard at startup.
+#![allow(clippy::disallowed_types)]
+
 use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
@@ -222,6 +225,7 @@ impl ShardCore {
         );
         pkt.playout_time = self.wall.to_instant(playout);
         pkt.arrival_ts = now;
+        pkt.rehome_extensions();
     }
 
     /// Deliver a frame addressed to one of this shard's routes.

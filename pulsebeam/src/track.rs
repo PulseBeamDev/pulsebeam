@@ -1,3 +1,8 @@
+//! Shared-state exception: `Topic` is `Arc<str>`; test-only id counters otherwise. The `Topic` sharing
+//! is on the way out — a dense key in `RouteAction::Data` removes it from the
+//! forwarding path, after which it can go back to an owned `String`.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::VecDeque;
 use std::fmt::{Debug, Display};
 use std::time::Duration;

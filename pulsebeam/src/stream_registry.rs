@@ -11,6 +11,11 @@
 //! remote stream's handle is created locally by the ingress that admits it, so
 //! every shard still finds its measurements on its own node.
 
+//! Shared-state exception: KNOWN VIOLATION. A node-global `RwLock` read at control rate. Correct
+//! shape is a per-shard directory fed by message; this exists because the
+//! handles it hands out are themselves shared (see `rtp::monitor`).
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashMap;
 use std::sync::RwLock;
 

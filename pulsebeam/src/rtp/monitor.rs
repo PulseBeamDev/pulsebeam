@@ -1,3 +1,11 @@
+//! Shared-state exception: KNOWN VIOLATION, not a sanctioned exception. `StreamState` is an `Arc` of
+//! loose atomics shared between the publisher's shard and every subscriber's.
+//! Eight of them are read together to build one allocation snapshot and they do
+//! not form a consistent view — see `docs/thread-per-core.md`. It is here
+//! because relocating measurement was deferred, and it cannot survive the move
+//! to a second node, where no shard can reach another's memory at all.
+#![allow(clippy::disallowed_types)]
+
 use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::ops::Deref;

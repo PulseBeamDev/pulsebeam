@@ -54,6 +54,13 @@ bwe-baseline:
 
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all
+	@$(MAKE) --no-print-directory lint-arch
+
+# Architectural lints, checked rather than fixed: `cargo clippy --fix` above
+# leaves these as warnings, and a warning in a 100-line build log is not a gate.
+# See docs/thread-per-core.md.
+lint-arch:
+	cargo clippy --all-targets -- -D clippy::disallowed_types
 
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam

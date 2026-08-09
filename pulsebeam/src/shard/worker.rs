@@ -1,3 +1,7 @@
+//! Shared-state exception: `Arc<ShardMetrics>` (sanctioned, see `shard::metrics`) and
+//! `Arc<StreamRegistry>`, both cloned once per shard at startup.
+#![allow(clippy::disallowed_types)]
+
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;

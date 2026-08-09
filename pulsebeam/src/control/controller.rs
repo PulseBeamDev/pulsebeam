@@ -1,3 +1,6 @@
+//! Shared-state exception: Startup wiring and test-only counters.
+#![allow(clippy::disallowed_types)]
+
 use std::io;
 use std::time::Duration;
 

@@ -9,6 +9,9 @@
 //! reads the result and never writes to it, so the two can run on different
 //! nodes without either duplicating the other's work.
 
+//! Shared-state exception: str0m's extension map stores `Arc<dyn Any>` (see `rtp::switcher`).
+#![allow(clippy::disallowed_types)]
+
 use str0m::media::{Mid, Rid};
 use str0m::rtp::vla::VideoLayersAllocation;
 

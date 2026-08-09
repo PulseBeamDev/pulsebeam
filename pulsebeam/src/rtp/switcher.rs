@@ -1,3 +1,8 @@
+//! Shared-state exception: str0m's extension map stores `Arc<dyn Any>`, so putting a parsed descriptor
+//! back requires one. Core-local — `RtpPacket::rehome_extensions` re-anchors it
+//! on arrival so no refcount is shared across shards.
+#![allow(clippy::disallowed_types)]
+
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::BTreeSet;
 use std::time::Duration;

@@ -1,3 +1,6 @@
+//! Shared-state exception: Test-only: a counter for unique ids in fixtures.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};

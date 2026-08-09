@@ -3,6 +3,10 @@
 //! Not a criterion suite — the point is a repeatable number for the work one
 //! forwarded packet does, so claims about it can be checked rather than argued.
 
+//! Shared-state exception: a benchmark measuring the cost of the very
+//! primitives the crate restricts.
+#![allow(clippy::disallowed_types)]
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -128,6 +132,13 @@ fn packet_clone(iters: u32) {
     });
 
     println!();
+    println!(
+        "size_of DependencyDescriptor = {}",
+        std::mem::size_of::<pulsebeam_core::dd::DependencyDescriptor>()
+    );
+    println!(
+        "size_of StreamStateInner     = (private)"
+    );
     println!(
         "size_of RtpPacket           = {}",
         std::mem::size_of::<RtpPacket>()

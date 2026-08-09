@@ -1,3 +1,7 @@
+//! Shared-state exception: Test-only id counters, plus `StreamState` handles read by the allocator —
+//! the violation tracked in `rtp::monitor`.
+#![allow(clippy::disallowed_types)]
+
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;

@@ -1,3 +1,7 @@
+//! Shared-state exception: `Arc<StreamRegistry>` held once per shard, and `Topic`'s `Arc<str>`.
+//! Test-only counters otherwise.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::VecDeque;
 
 use ahash::{HashMap, HashMapExt};

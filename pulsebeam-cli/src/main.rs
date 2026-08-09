@@ -1,3 +1,8 @@
+//! Shared-state exception, crate-wide: A command-line tool. Not a shard.
+//! The thread-per-core restriction in `docs/thread-per-core.md` applies to the
+//! `pulsebeam` SFU crate.
+#![allow(clippy::disallowed_types)]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
