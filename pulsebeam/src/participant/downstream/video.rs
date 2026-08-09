@@ -18,7 +18,7 @@ use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
-use crate::track::{LayerQuality, StreamWriter, Track, TrackLayer, TrackMeta};
+use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Maximum number of video slots per participant.
 const VIDEO_MAX_SLOTS: usize = 25;
@@ -876,7 +876,7 @@ struct LayerSnap {
 /// via `new()` and call `run_compute()` + `run_desired()` to share a single
 /// consistent snapshot across both.
 pub struct AllocationEngine {
-    snaps: HashMap<usize, LayerSnap>,
+    snaps: HashMap<StreamId, LayerSnap>,
 }
 
 impl AllocationEngine {
@@ -900,7 +900,7 @@ impl AllocationEngine {
                     decode_target_bps,
                     full_fps: l.state.full_fps(),
                 };
-                (l as *const TrackLayer as usize, snap)
+                (l.stream_id(), snap)
             })
             .collect();
         Self { snaps }
@@ -908,7 +908,7 @@ impl AllocationEngine {
 
     fn snap(&self, layer: &TrackLayer) -> &LayerSnap {
         self.snaps
-            .get(&(layer as *const TrackLayer as usize))
+            .get(&layer.stream_id())
             .expect("layer must belong to snapshotted slots")
     }
 
