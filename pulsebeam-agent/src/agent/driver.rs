@@ -7,7 +7,7 @@ use crate::agent::handles::{
 use crate::agent::mailbox;
 use crate::agent::ordered_topic::OrderedTopics;
 use crate::agent::slots::SlotManager;
-use crate::api::{ApiError, HttpApiClient, UpdateParticipantRequest};
+use crate::api::{ApiError, HttpApiClient, Protocol as ApiProtocol, UpdateParticipantRequest};
 use crate::manager::{SubscriptionManager, VideoSubscription};
 use crate::media::{KeyframeNotifier, KeyframeReceiver};
 use crate::tcp::TcpSession;
@@ -212,6 +212,7 @@ pub(crate) struct DriverInit {
     pub room_id: String,
     pub participant_id: String,
     pub connection_id: Option<String>,
+    pub resume_token: Option<String>,
     pub medias: Vec<MediaAdded>,
 }
 
@@ -300,6 +301,8 @@ struct SessionSubsystem {
     room_id: String,
     participant_id: String,
     connection_id: Option<String>,
+    resume_token: Option<String>,
+    epoch: u32,
     disconnected_reason: Option<String>,
     retry_count: u32,
     is_reconnecting: bool,
@@ -396,6 +399,8 @@ impl AgentDriver {
                 room_id: init.room_id,
                 participant_id: init.participant_id,
                 connection_id: init.connection_id,
+                resume_token: init.resume_token,
+                epoch: 0,
                 disconnected_reason: None,
                 retry_count: 0,
                 is_reconnecting: false,
@@ -1157,6 +1162,17 @@ impl AgentDriver {
                 self.session.retry_count = 0;
                 self.emit(AgentEvent::Connected);
             }
+            Err(AgentError::Api(e)) if e.is_terminal() => {
+                // The credential is finished or never applied here; retrying cannot fix it, and
+                // backing off would hammer a permanently doomed session.
+                self.session.is_reconnecting = false;
+                let reason = e
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| e.to_string());
+                tracing::warn!(reason = %reason, "reconnect is not retryable, giving up");
+                self.emit(AgentEvent::Disconnected(reason));
+            }
             Err(_) => {
                 self.session.is_reconnecting = false;
                 self.schedule_reconnect(Instant::now());
@@ -1165,7 +1181,60 @@ impl AgentDriver {
     }
 
     async fn try_reconnect(&mut self) -> Result<(), AgentError> {
-        self.renegotiate().await
+        match (
+            self.session.api.protocol(),
+            self.session.resume_token.clone(),
+        ) {
+            (ApiProtocol::Json, Some(token)) => self.resume(&token).await,
+            // Legacy mode, or JSON before the first successful join produced a token.
+            _ => self.renegotiate().await,
+        }
+    }
+
+    /// Rebuild this participant under its existing id.
+    ///
+    /// Preserving `participant_id` is the whole point: every `TrackId` is derived from it, so
+    /// subscribers see the tracks reappear rather than churn.
+    async fn resume(&mut self, resume_token: &str) -> Result<(), AgentError> {
+        let (offer, pending) = {
+            let sdp_api = self.rtc.sdp_api();
+            match sdp_api.apply() {
+                Some(pair) => pair,
+                None => return Ok(()),
+            }
+        };
+
+        let resp = self
+            .session
+            .api
+            .resume_json(
+                self.session.resource_uri.clone(),
+                offer,
+                resume_token,
+                false,
+            )
+            .await?;
+
+        debug_assert_eq!(
+            resp.participant_id, self.session.participant_id,
+            "resume must not change the participant id; every derived TrackId depends on it"
+        );
+        debug_assert!(
+            resp.epoch >= self.session.epoch,
+            "resume must not walk the connection epoch backwards"
+        );
+
+        let answer = str0m::change::SdpAnswer::from_sdp_string(&resp.sdp)
+            .map_err(|e| AgentError::Api(ApiError::SdpError(e)))?;
+        self.rtc
+            .sdp_api()
+            .accept_answer(pending, answer)
+            .map_err(AgentError::Rtc)?;
+
+        self.session.connection_id = Some(resp.connection_id);
+        self.session.resume_token = Some(resp.resume_token);
+        self.session.epoch = resp.epoch;
+        Ok(())
     }
 
     async fn renegotiate(&mut self) -> Result<(), AgentError> {

@@ -2809,6 +2809,8 @@ dependencies = [
  "pulsebeam-core",
  "pulsebeam-proto",
  "pulsebeam-testdata",
+ "serde",
+ "serde_json",
  "str0m",
  "thiserror 2.0.19",
  "tokio",

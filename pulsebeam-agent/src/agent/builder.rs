@@ -31,6 +31,15 @@ pub struct AgentBuilder {
     negotiate_dependency_descriptor: bool,
 }
 
+/// The facts a join produces, whichever representation carried it.
+struct JoinedSession {
+    answer: str0m::change::SdpAnswer,
+    resource_uri: http::Uri,
+    participant_id: String,
+    connection_id: Option<String>,
+    resume_token: Option<String>,
+}
+
 impl AgentBuilder {
     pub fn new(api: HttpApiClient, udp_socket: UdpSocket) -> AgentBuilder {
         Self {
@@ -279,17 +288,45 @@ impl AgentBuilder {
             .apply()
             .ok_or_else(|| AgentError::Protocol("SDP apply produced no offer".into()))?;
 
-        let resp = self
-            .api
-            .create_participant(CreateParticipantRequest {
-                room_id: room_id.to_string(),
-                offer,
-                manual_sub: self.manual_sub,
-            })
-            .await?;
+        // The representation is chosen once, on the client; both produce the same session facts.
+        let session = match self.api.protocol() {
+            crate::api::Protocol::Json => {
+                let resp = self.api.join_json(room_id, offer, self.manual_sub).await?;
+                let answer = str0m::change::SdpAnswer::from_sdp_string(&resp.sdp)
+                    .map_err(|e| AgentError::Api(crate::api::ApiError::SdpError(e)))?;
+                JoinedSession {
+                    answer,
+                    resource_uri: resp.resource.parse().map_err(|_| {
+                        AgentError::Api(crate::api::ApiError::Protocol(
+                            "server returned an unusable resource url".to_string(),
+                        ))
+                    })?,
+                    participant_id: resp.participant_id,
+                    connection_id: Some(resp.connection_id),
+                    resume_token: Some(resp.resume_token),
+                }
+            }
+            crate::api::Protocol::Sdp => {
+                let resp = self
+                    .api
+                    .create_participant(CreateParticipantRequest {
+                        room_id: room_id.to_string(),
+                        offer,
+                        manual_sub: self.manual_sub,
+                    })
+                    .await?;
+                JoinedSession {
+                    answer: resp.answer,
+                    resource_uri: resp.resource_uri,
+                    participant_id: resp.participant_id,
+                    connection_id: resp.connection_id,
+                    resume_token: None,
+                }
+            }
+        };
 
         rtc.sdp_api()
-            .accept_answer(pending, resp.answer)
+            .accept_answer(pending, session.answer)
             .map_err(AgentError::Rtc)?;
 
         let init = DriverInit {
@@ -302,10 +339,11 @@ impl AgentBuilder {
                 None => TcpSession::inactive(),
             },
             signaling_cid,
-            resource_uri: resp.resource_uri,
+            resource_uri: session.resource_uri,
             room_id: room_id.to_string(),
-            participant_id: resp.participant_id,
-            connection_id: resp.connection_id,
+            participant_id: session.participant_id,
+            connection_id: session.connection_id,
+            resume_token: session.resume_token,
             medias,
         };
 
