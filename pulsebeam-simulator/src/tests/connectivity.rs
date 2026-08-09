@@ -437,19 +437,10 @@ fn authenticated_join_test() {
 /// the *same* participant, because every TrackId is derived from the participant id -- so
 /// subscribers see the tracks come back rather than a stranger's arrive.
 ///
-/// Ignored: the signalling half works and is what this change delivers. Running it shows the
-/// resume PUT succeeding and the *same* participant id coming back on every attempt. The media
-/// half does not yet recover, and the reason is structural rather than a tuning problem: the
-/// server rebuilds the participant on a brand-new `Rtc` with a fresh DTLS certificate, while the
-/// client only restarts ICE and keeps its existing DTLS session, so the handshake can never
-/// match and the RTC engine errors out roughly 30s later. Finishing this means having the agent
-/// construct a new `Rtc` on resume while retaining its identity and resume token.
-///
-/// Kept rather than deleted because it is the exact reproduction, and it must not be allowed to
-/// pass vacuously: the assertion is deliberately interval-based, since a cumulative frame count
-/// would be satisfied by frames received before the restart.
+/// The assertions are deliberately interval-based. A cumulative frame count would be satisfied by
+/// frames received before the restart and would pass even if nothing ever recovered, which is
+/// exactly how the first version of this test fooled its author.
 #[test]
-#[ignore = "client must rebuild its Rtc on resume; see doc comment"]
 fn resume_across_node_restart_test() {
     LocalNodeSim::new()
         .with_room(
@@ -478,10 +469,21 @@ fn resume_across_node_restart_test() {
                 description: "Clients notice through ICE and resume unaided",
                 duration: Duration::from_secs(180),
             },
+            Step::CheckTxBytesInterval {
+                description: "The publisher sends again on its rebuilt connection",
+                participant: "alice",
+                min_bytes: 20_000,
+            },
             Step::CheckRxBytesInterval {
-                description: "Media flows again in the window after the node was rebuilt",
+                description: "The subscriber receives again in the window after the rebuild",
                 participant: "bob",
                 min_bytes: 20_000,
+            },
+            Step::CheckVideoQuality {
+                description: "And the video it receives is renderable, not just bytes",
+                participant: "bob",
+                // One gap is expected: the restart breaks the egress sequence exactly once.
+                quality: VideoQuality::min_frames(80).allow_gaps(1),
             },
         ]);
 }

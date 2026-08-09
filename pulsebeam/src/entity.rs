@@ -1089,4 +1089,42 @@ mod tests {
             ConnectionEpoch::new(7)
         );
     }
+
+    #[test]
+    fn track_ids_are_stable_for_a_given_participant_and_label() {
+        // The property the whole resume design rests on: a participant that comes back with the
+        // same id and the same media layout publishes the same tracks. Derive from anything
+        // per-connection -- an SDP mid, say -- and a resumed publisher arrives as a stranger.
+        let mut rng = test_rng();
+        let participant = ParticipantId::new(&mut rng);
+
+        let before = participant.derive_track_id(TrackKind::Video, "Video0");
+        let after = participant.derive_track_id(TrackKind::Video, "Video0");
+        assert_eq!(before, after);
+        assert_eq!(before.as_str(), after.as_str());
+    }
+
+    #[test]
+    fn track_ids_separate_participants_kinds_and_ordinals() {
+        let mut rng = test_rng();
+        let a = ParticipantId::new(&mut rng);
+        let b = ParticipantId::new(&mut rng);
+
+        assert_ne!(
+            a.derive_track_id(TrackKind::Video, "Video0"),
+            b.derive_track_id(TrackKind::Video, "Video0"),
+            "two participants must never share a track id"
+        );
+        assert_ne!(
+            a.derive_track_id(TrackKind::Video, "Video0"),
+            a.derive_track_id(TrackKind::Video, "Video1"),
+            "a second media line of the same kind is a different track"
+        );
+        // Audio and video ordinals are distinguished by the label, not only by the kind tag, so
+        // their uuids differ too rather than colliding underneath.
+        let audio = a.derive_track_id(TrackKind::Audio, "Audio0");
+        let video = a.derive_track_id(TrackKind::Video, "Video0");
+        assert_ne!(audio, video);
+        assert_ne!(audio.as_str(), video.as_str());
+    }
 }

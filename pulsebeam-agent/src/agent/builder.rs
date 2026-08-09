@@ -15,10 +15,165 @@ use str0m::{Candidate, Rtc, net::TcpType};
 use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
-struct TrackRequest {
+pub(crate) struct TrackRequest {
     kind: MediaKind,
     direction: TransceiverDirection,
     simulcast_layers: Option<Vec<SimulcastLayer>>,
+}
+
+/// Everything needed to construct this participant's `Rtc` from nothing.
+///
+/// A resume cannot reuse the old `Rtc`: the server rebuilds the participant on a fresh one with a
+/// new DTLS certificate, so the client has to arrive with a new certificate too. Keeping the
+/// blueprint lets the driver rebuild an equivalent connection without re-running the join.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectionBlueprint {
+    pub local_ips: Vec<IpAddr>,
+    pub port: u16,
+    pub negotiate_dependency_descriptor: bool,
+    pub tracks: Vec<TrackRequest>,
+    pub tcp_active: bool,
+}
+
+pub(crate) struct BuiltConnection {
+    pub rtc: Rtc,
+    pub signaling_cid: str0m::channel::ChannelId,
+    pub medias: Vec<MediaAdded>,
+    pub offer: str0m::change::SdpOffer,
+    pub pending: str0m::change::SdpPendingOffer,
+    pub addr: SocketAddr,
+}
+
+/// Build a fresh `Rtc` and its opening offer.
+///
+/// Media lines are added in blueprint order, so a rebuild reproduces the same mids and the
+/// driver's mid-keyed routing stays valid across a resume.
+pub(crate) fn build_connection(
+    blueprint: &ConnectionBlueprint,
+    now: Instant,
+) -> Result<BuiltConnection, AgentError> {
+    let mut rtc_builder = Rtc::builder()
+        .clear_codecs()
+        .enable_bwe(Some(Bitrate::kbps(2000)))
+        .set_extension(
+            rtp_extensions::ABS_CAPTURE_TIME,
+            str0m::rtp::Extension::AbsoluteCaptureTime,
+        )
+        .set_extension(
+            rtp_extensions::VIDEO_LAYERS_ALLOCATION,
+            str0m::rtp::Extension::with_serializer(
+                str0m::rtp::vla::URI,
+                str0m::rtp::vla::Serializer,
+            ),
+        )
+        .set_stats_interval(Some(Duration::from_millis(200)));
+
+    if blueprint.negotiate_dependency_descriptor {
+        // Per-frame dependency structure, so a scalable source can tell the SFU
+        // which frames each decode target needs (temporal/spatial shedding).
+        rtc_builder = rtc_builder.set_extension(
+            rtp_extensions::DEPENDENCY_DESCRIPTOR,
+            str0m::rtp::Extension::with_serializer(
+                pulsebeam_core::dd::URI,
+                pulsebeam_core::dd::Serializer,
+            ),
+        );
+    }
+    // The agent owns packetization/reassembly through the codec-agnostic,
+    // DD-driven framing pipeline, so str0m hands us raw RTP in and out.
+    rtc_builder = rtc_builder.set_rtp_mode(true);
+
+    let codec_config = rtc_builder.codec_config();
+    codec_config.enable_opus(true);
+    codec_config.enable_h264(true);
+
+    let mut rtc = rtc_builder.build(now.into());
+    let mut candidate_count = 0;
+    let mut maybe_addr = None;
+    for ip in &blueprint.local_ips {
+        let addr = SocketAddr::new(*ip, blueprint.port);
+        let Ok(candidate) = Candidate::builder().udp().host(addr).build() else {
+            continue;
+        };
+        rtc.add_local_candidate(candidate);
+        maybe_addr = Some(addr);
+        candidate_count += 1;
+    }
+
+    if blueprint.tcp_active {
+        for ip in &blueprint.local_ips {
+            let tcp_candidate_addr = SocketAddr::new(*ip, 9);
+            if let Ok(c) = Candidate::builder()
+                .tcp()
+                .host(tcp_candidate_addr)
+                .tcptype(TcpType::Active)
+                .build()
+            {
+                rtc.add_local_candidate(c);
+                candidate_count += 1;
+                if maybe_addr.is_none() {
+                    maybe_addr = Some(tcp_candidate_addr);
+                }
+            }
+        }
+    }
+
+    if candidate_count == 0 {
+        return Err(AgentError::NoCandidates);
+    }
+    let Some(addr) = maybe_addr else {
+        return Err(AgentError::NoCandidates);
+    };
+
+    let mut sdp = rtc.sdp_api();
+    let signaling_cfg = ChannelConfig {
+        label: namespace::Signaling::Reliable.as_str().to_string(),
+        ordered: true,
+        reliability: Reliability::Reliable,
+        negotiated: None,
+        protocol: "".to_string(),
+    };
+    let signaling_cid = sdp.add_channel_with_config(signaling_cfg);
+
+    let mut medias = Vec::new();
+    for track in &blueprint.tracks {
+        let (dir, simulcast) = match track.direction {
+            TransceiverDirection::SendOnly => (
+                Direction::SendOnly,
+                track.simulcast_layers.clone().map(|layers| Simulcast {
+                    send: layers,
+                    recv: Vec::new(),
+                }),
+            ),
+            TransceiverDirection::RecvOnly => (
+                Direction::RecvOnly,
+                track.simulcast_layers.clone().map(|layers| Simulcast {
+                    send: Vec::new(),
+                    recv: layers,
+                }),
+            ),
+        };
+        let mid = sdp.add_media(track.kind, dir, None, None, simulcast.clone());
+        medias.push(MediaAdded {
+            mid,
+            kind: track.kind,
+            direction: dir,
+            simulcast,
+        });
+    }
+
+    let (offer, pending) = sdp
+        .apply()
+        .ok_or_else(|| AgentError::Protocol("SDP apply produced no offer".into()))?;
+
+    Ok(BuiltConnection {
+        rtc,
+        signaling_cid,
+        medias,
+        offer,
+        pending,
+        addr,
+    })
 }
 
 pub struct AgentBuilder {
@@ -145,65 +300,16 @@ impl AgentBuilder {
             )
         }
 
-        let mut rtc_builder = Rtc::builder()
-            .clear_codecs()
-            .enable_bwe(Some(Bitrate::kbps(2000)))
-            .set_extension(
-                rtp_extensions::ABS_CAPTURE_TIME,
-                str0m::rtp::Extension::AbsoluteCaptureTime,
-            )
-            .set_extension(
-                rtp_extensions::VIDEO_LAYERS_ALLOCATION,
-                str0m::rtp::Extension::with_serializer(
-                    str0m::rtp::vla::URI,
-                    str0m::rtp::vla::Serializer,
-                ),
-            )
-            .set_stats_interval(Some(Duration::from_millis(200)));
+        let blueprint = ConnectionBlueprint {
+            local_ips: self.local_ips.clone(),
+            port,
+            negotiate_dependency_descriptor: self.negotiate_dependency_descriptor,
+            tracks: self.tracks.clone(),
+            tcp_active: self.tcp_server_addr.is_some(),
+        };
 
-        if self.negotiate_dependency_descriptor {
-            // Per-frame dependency structure, so a scalable source can tell the SFU
-            // which frames each decode target needs (temporal/spatial shedding).
-            rtc_builder = rtc_builder.set_extension(
-                rtp_extensions::DEPENDENCY_DESCRIPTOR,
-                str0m::rtp::Extension::with_serializer(
-                    pulsebeam_core::dd::URI,
-                    pulsebeam_core::dd::Serializer,
-                ),
-            );
-        }
-        // The agent owns packetization/reassembly through the codec-agnostic,
-        // DD-driven framing pipeline, so str0m hands us raw RTP in and out.
-        rtc_builder = rtc_builder.set_rtp_mode(true);
-
-        let codec_config = rtc_builder.codec_config();
-        codec_config.enable_opus(true);
-        codec_config.enable_h264(true);
-        //
-        // let baseline_levels = [0x34];
-        // let mut pt = 96;
-        //
-        // for level in &baseline_levels {
-        //     codec_config.add_h264(pt.into(), Some((pt + 1).into()), true, 0x42e000 | level);
-        //     pt += 2;
-        // }
-
-        let mut rtc = rtc_builder.build(Instant::now().into());
-        let mut candidate_count = 0;
-        let mut maybe_addr = None;
-        for ip in &self.local_ips {
-            let addr = SocketAddr::new(*ip, port);
-            let candidate = match Candidate::builder().udp().host(addr).build() {
-                Ok(candidate) => candidate,
-                Err(_) => {
-                    continue;
-                }
-            };
-            rtc.add_local_candidate(candidate);
-            maybe_addr = Some(addr);
-            candidate_count += 1;
-        }
-
+        // Established before building the Rtc so the TCP candidate it advertises is backed by a
+        // real stream.
         let mut tcp_stream: Option<pulsebeam_core::net::TcpStream> = None;
         let mut tcp_local_addr: Option<SocketAddr> = None;
         let mut tcp_server_addr: Option<SocketAddr> = None;
@@ -211,82 +317,23 @@ impl AgentBuilder {
             match pulsebeam_core::net::TcpStream::connect(server_tcp).await {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
-                    let local = stream.local_addr().ok();
-                    tcp_local_addr = local;
+                    tcp_local_addr = stream.local_addr().ok();
                     tcp_server_addr = Some(server_tcp);
                     tcp_stream = Some(stream);
-
-                    for ip in &self.local_ips {
-                        let tcp_candidate_addr = SocketAddr::new(*ip, 9);
-                        if let Ok(c) = Candidate::builder()
-                            .tcp()
-                            .host(tcp_candidate_addr)
-                            .tcptype(TcpType::Active)
-                            .build()
-                        {
-                            rtc.add_local_candidate(c);
-                            candidate_count += 1;
-                            if maybe_addr.is_none() {
-                                maybe_addr = Some(tcp_candidate_addr);
-                            }
-                        }
-                    }
                 }
-                Err(e) => {
-                    return Err(AgentError::Io(e));
-                }
+                Err(e) => return Err(AgentError::Io(e)),
             }
         }
 
-        if candidate_count == 0 {
-            return Err(AgentError::NoCandidates);
-        }
-
-        let Some(addr) = maybe_addr else {
-            return Err(AgentError::NoCandidates);
-        };
-
-        let mut sdp = rtc.sdp_api();
-
-        let signaling_cfg = ChannelConfig {
-            label: namespace::Signaling::Reliable.as_str().to_string(),
-            ordered: true,
-            reliability: Reliability::Reliable,
-            negotiated: None,
-            protocol: "".to_string(),
-        };
-        let signaling_cid = sdp.add_channel_with_config(signaling_cfg);
-
-        let mut medias = Vec::new();
-        for track in self.tracks.clone() {
-            let (dir, simulcast) = match track.direction {
-                TransceiverDirection::SendOnly => (
-                    Direction::SendOnly,
-                    track.simulcast_layers.map(|layers| Simulcast {
-                        send: layers,
-                        recv: Vec::new(),
-                    }),
-                ),
-                TransceiverDirection::RecvOnly => (
-                    Direction::RecvOnly,
-                    track.simulcast_layers.map(|layers| Simulcast {
-                        send: Vec::new(),
-                        recv: layers,
-                    }),
-                ),
-            };
-            let mid = sdp.add_media(track.kind, dir, None, None, simulcast.clone());
-            medias.push(MediaAdded {
-                mid,
-                kind: track.kind,
-                direction: dir,
-                simulcast,
-            });
-        }
-
-        let (offer, pending) = sdp
-            .apply()
-            .ok_or_else(|| AgentError::Protocol("SDP apply produced no offer".into()))?;
+        let built = build_connection(&blueprint, Instant::now())?;
+        let BuiltConnection {
+            mut rtc,
+            signaling_cid,
+            medias,
+            offer,
+            pending,
+            addr,
+        } = built;
 
         // The representation is chosen once, on the client; both produce the same session facts.
         let session = match self.api.protocol() {
@@ -339,6 +386,7 @@ impl AgentBuilder {
                 None => TcpSession::inactive(),
             },
             signaling_cid,
+            blueprint,
             resource_uri: session.resource_uri,
             room_id: room_id.to_string(),
             participant_id: session.participant_id,

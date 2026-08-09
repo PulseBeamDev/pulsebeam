@@ -181,6 +181,14 @@ pub struct ParticipantCore {
     pub participant_id: entity::ParticipantId,
     last_keyframe_request: HashMap<StreamId, Instant>,
 
+    /// How many upstream media lines of each kind have been seen, in offer order.
+    ///
+    /// The ordinal, not the mid, is what a `TrackId` is derived from. A mid is minted fresh by the
+    /// peer's SDP engine on every connection, so deriving from it would give a participant new
+    /// track ids each time it rebuilt its transport -- and a resumed publisher would arrive as a
+    /// stranger. SDP fixes m-line order across renegotiation, so the ordinal is stable by
+    /// construction.
+    upstream_ordinals: HashMap<entity::TrackKind, u32>,
     published_tracks: HashMap<TrackId, Track>,
     track_availability: HashMap<TrackId, TrackAvailability>,
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
@@ -256,6 +264,7 @@ impl ParticipantCore {
             signaling,
             last_slow_poll: Instant::now(),
             last_keyframe_request: HashMap::new(),
+            upstream_ordinals: HashMap::new(),
             published_tracks: HashMap::new(),
             track_availability: HashMap::new(),
             data_topic_channels: HashMap::new(),
@@ -1080,9 +1089,11 @@ impl ParticipantCore {
     fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
         match media.direction {
             Direction::RecvOnly => {
-                let track_id = self
-                    .participant_id
-                    .derive_track_id(media.kind.into(), &media.mid);
+                let kind: entity::TrackKind = media.kind.into();
+                let ordinal = self.upstream_ordinals.entry(kind).or_insert(0);
+                let label = format!("{kind:?}{ordinal}");
+                *ordinal += 1;
+                let track_id = self.participant_id.derive_track_id(kind, &label);
                 let track_meta = track::TrackMeta {
                     shard_id: self.shard_id,
                     id: track_id,

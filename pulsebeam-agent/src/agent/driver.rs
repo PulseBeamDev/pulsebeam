@@ -1,4 +1,5 @@
 use crate::RtpPacket;
+use crate::agent::builder::{BuiltConnection, ConnectionBlueprint, build_connection};
 use crate::agent::controller::{BitrateController, BitrateControllerConfig, LayerController};
 use crate::agent::handles::{
     DataPublisher, DataSubscriber, LocalEncoding, OrderedTopicPublisher, OrderedTopicSubscriber,
@@ -208,6 +209,7 @@ pub(crate) struct DriverInit {
     pub tcp: TcpSession,
     pub api: HttpApiClient,
     pub signaling_cid: ChannelId,
+    pub blueprint: ConnectionBlueprint,
     pub resource_uri: Uri,
     pub room_id: String,
     pub participant_id: String,
@@ -238,6 +240,14 @@ struct MediaSubsystem {
     /// reused. Mirrors the SFU's `incoming_rtp_routes`.
     incoming_rtp_routes: HashMap<Ssrc, (Mid, Option<Rid>)>,
     upstream_slots: HashMap<Mid, UpstreamSlot>,
+    /// Media lines in blueprint order, so a rebuild can pair its new mids against these.
+    media_order: Vec<Mid>,
+    /// Maps a mid the application still holds in a `PublicationLease` to the live mid.
+    ///
+    /// str0m mints a fresh random mid per media line, so a rebuilt connection never reproduces
+    /// the old ones. Leases outlive connections, so they are translated here rather than being
+    /// invalidated -- which would silently stop a publication that never asked to stop.
+    lease_mids: HashMap<Mid, Mid>,
     pending_media_subscriptions:
         HashMap<String, tokio::sync::oneshot::Sender<Result<RemoteTrack, AgentError>>>,
     /// Mailboxes handed to a subscriber before the SFU assigned the track a slot.
@@ -336,6 +346,8 @@ pub(crate) struct AgentDriver {
     subscriptions: SubscriptionSubsystem,
     session: SessionSubsystem,
     timers: TimerSubsystem,
+    /// How to construct an equivalent connection from nothing, for resume.
+    blueprint: ConnectionBlueprint,
 }
 
 impl AgentDriver {
@@ -375,6 +387,8 @@ impl AgentDriver {
                 upstream_slots: HashMap::new(),
                 pending_media_subscriptions: HashMap::new(),
                 pending_media_targets: HashMap::new(),
+                media_order: Vec::new(),
+                lease_mids: HashMap::new(),
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
                 last_desired: Bitrate::bps(0),
@@ -412,6 +426,7 @@ impl AgentDriver {
                 rtc_deadline: None,
                 bwe_next_tick: now + BWE_SLOW_INTERVAL,
             },
+            blueprint: init.blueprint,
         };
 
         for media in init.medias {
@@ -528,7 +543,8 @@ impl AgentDriver {
     }
 
     fn unpublish_local_track(&mut self, lease: PublicationLease) {
-        let Some(slot) = self.media.upstream_slots.get_mut(&lease.mid) else {
+        let lease_mid = self.live_mid(lease.mid);
+        let Some(slot) = self.media.upstream_slots.get_mut(&lease_mid) else {
             debug_assert!(
                 false,
                 "publication lease references an unknown upstream slot"
@@ -538,7 +554,7 @@ impl AgentDriver {
         if !slot.deactivate(lease) {
             return;
         }
-        self.set_upstream_active(lease.mid, false);
+        self.set_upstream_active(lease_mid, false);
     }
 
     fn set_upstream_active(&mut self, mid: Mid, active: bool) {
@@ -720,7 +736,8 @@ impl AgentDriver {
                 }
             }
             OutgoingCommand::SendMedia(e) => {
-                let Some(slot) = self.media.upstream_slots.get(&e.lease.mid) else {
+                let lease_mid = self.live_mid(e.lease.mid);
+                let Some(slot) = self.media.upstream_slots.get(&lease_mid) else {
                     return;
                 };
                 if !slot.accepts(e.lease) {
@@ -731,7 +748,7 @@ impl AgentDriver {
                 if !encoding_exists {
                     return;
                 }
-                let mid = e.lease.mid;
+                let mid = lease_mid;
                 let paused = self.media.layer_ctrl.is_paused(mid, e.rid);
                 self.media.layer_ctrl.record_frame(
                     mid,
@@ -1005,6 +1022,7 @@ impl AgentDriver {
 
     fn handle_media_added(&mut self, media: MediaAdded) {
         let mid = media.mid;
+        self.media.media_order.push(mid);
         self.stats.tracks.entry(mid).or_default().kind = Some(media.kind);
         match media.direction {
             Direction::SendOnly => {
@@ -1092,6 +1110,11 @@ impl AgentDriver {
 
     fn emit(&mut self, event: AgentEvent) {
         self.pending_events.push_back(event);
+    }
+
+    /// Resolve a possibly-stale mid from a `PublicationLease` to the one the live connection uses.
+    fn live_mid(&self, mid: Mid) -> Mid {
+        self.media.lease_mids.get(&mid).copied().unwrap_or(mid)
     }
 
     fn flush_pending_state(&mut self) {
@@ -1196,21 +1219,19 @@ impl AgentDriver {
     /// Preserving `participant_id` is the whole point: every `TrackId` is derived from it, so
     /// subscribers see the tracks reappear rather than churn.
     async fn resume(&mut self, resume_token: &str) -> Result<(), AgentError> {
-        let (offer, pending) = {
-            let mut sdp_api = self.rtc.sdp_api();
-            // The old transport is gone, so there is nothing to renegotiate -- without an ICE
-            // restart `apply` has no changes to offer and would return None, and the session
-            // would sit disconnected forever.
-            sdp_api.ice_restart(true);
-            match sdp_api.apply() {
-                Some(pair) => pair,
-                None => {
-                    return Err(AgentError::Protocol(
-                        "ice restart produced no offer".to_string(),
-                    ));
-                }
-            }
-        };
+        // An ICE restart is not enough. The server rebuilds the participant on a brand-new `Rtc`
+        // with a fresh DTLS certificate, so a client that kept its old DTLS session could never
+        // complete the handshake. Both sides have to arrive with new certificates, which means
+        // building a new `Rtc` here too.
+        let built = build_connection(&self.blueprint, Instant::now())?;
+        let BuiltConnection {
+            mut rtc,
+            signaling_cid,
+            medias,
+            offer,
+            pending,
+            addr: _,
+        } = built;
 
         let resp = self
             .session
@@ -1234,15 +1255,149 @@ impl AgentDriver {
 
         let answer = str0m::change::SdpAnswer::from_sdp_string(&resp.sdp)
             .map_err(|e| AgentError::Api(ApiError::SdpError(e)))?;
-        self.rtc
-            .sdp_api()
+        rtc.sdp_api()
             .accept_answer(pending, answer)
             .map_err(AgentError::Rtc)?;
+        rtc.bwe().set_current_bitrate(Bitrate::ZERO);
+
+        let previous_mids: Vec<Mid> = self.media.media_order.clone();
+        self.adopt_connection(rtc, signaling_cid, medias, previous_mids);
 
         self.session.connection_id = Some(resp.connection_id);
         self.session.resume_token = Some(resp.resume_token);
         self.session.epoch = resp.epoch;
         Ok(())
+    }
+
+    /// Swap in a freshly negotiated connection, discarding everything the old one owned.
+    ///
+    /// Kept separate from `resume` so the split is explicit: identity and intent survive
+    /// (participant id, resume token, desired subscriptions, and the `RemoteTrack` mailboxes the
+    /// application already holds), while everything the old transport assigned does not (SSRC
+    /// routes, data channels, slot assignments).
+    fn adopt_connection(
+        &mut self,
+        rtc: Rtc,
+        signaling_cid: ChannelId,
+        medias: Vec<MediaAdded>,
+        previous_mids: Vec<Mid>,
+    ) {
+        debug_assert_eq!(
+            medias.len(),
+            self.blueprint.tracks.len(),
+            "a rebuild must reproduce every media line"
+        );
+        debug_assert_eq!(
+            previous_mids.len(),
+            medias.len(),
+            "media lines are rebuilt in blueprint order, so the two sides must pair up"
+        );
+
+        // Pair old and new media lines by position; the blueprint adds them in a fixed order, so
+        // the i-th line is the same logical track on both connections. Existing aliases are
+        // re-pointed as well, so a lease taken out two connections ago still resolves.
+        let mut remap: HashMap<Mid, Mid> = HashMap::new();
+        for (previous, media) in previous_mids.iter().zip(medias.iter()) {
+            for live in self.media.lease_mids.values_mut() {
+                if live == previous {
+                    *live = media.mid;
+                }
+            }
+            self.media.lease_mids.insert(*previous, media.mid);
+            remap.insert(*previous, media.mid);
+        }
+
+        // Re-key the receive mailboxes onto the new mids. The senders themselves are kept: the
+        // application is holding the matching `RemoteTrack`s and never asked for new ones, so
+        // dropping them would leave it holding handles that go silent forever.
+        self.media.media_targets = std::mem::take(&mut self.media.media_targets)
+            .into_iter()
+            .filter_map(|(mid, tx)| remap.get(&mid).map(|live| (*live, tx)))
+            .collect();
+
+        self.rtc = rtc;
+        self.stats = StatisticsSnapshot::default();
+
+        // SSRCs are assigned per connection, so every cached route is now meaningless. Leaving
+        // them would send the new connection's packets to the wrong track.
+        self.media.incoming_rtp_routes.clear();
+        self.media.last_desired = Bitrate::ZERO;
+
+        // A publication the application still holds a lease for must keep working: it never asked
+        // to stop publishing, and the point of a resume is that its track reappears rather than
+        // being replaced. `handle_media_added` rebuilds each slot from scratch, so carry the
+        // lease-bearing state across it.
+        let publications: HashMap<Mid, (u64, bool)> = self
+            .media
+            .upstream_slots
+            .iter()
+            .map(|(mid, slot)| (*mid, (slot.generation, slot.active)))
+            .collect();
+        let publications: HashMap<Mid, (u64, bool)> = publications
+            .into_iter()
+            .map(|(mid, state)| (self.live_mid(mid), state))
+            .collect();
+        self.media.upstream_slots.clear();
+
+        // Rebuilt rather than re-registered. `LayerController::register` appends to its layer
+        // order and seeds each layer paused, so registering onto the existing one would both
+        // duplicate every layer and leave the send side gated on a bandwidth estimate that
+        // collapsed while the old server was unreachable.
+        self.media.layer_ctrl = LayerController::new();
+        self.media.desired_ctrl = BitrateControllerConfig::default().build();
+
+        // Data channels live in the old transport. The topic maps are rebuilt as the application
+        // re-declares, and the signaling channel is re-opened by the new negotiation.
+        self.data.signaling_cid = signaling_cid;
+        self.data.data_channels.clear();
+        self.data.data_pub_topics.clear();
+        self.data.data_sub_topics.clear();
+
+        // Slot assignments are the server's, and the server has forgotten them.
+        self.slot_manager = SlotManager::new();
+
+        self.subscriptions.upstream_active.clear();
+        self.subscriptions.upstream_dirty = true;
+
+        // The subscription manager addresses slots by mid, so it has to be rebuilt on the new
+        // ones. Leaving it would keep asking the SFU to bind tracks to mids that no longer exist.
+        self.subscriptions.sub_manager = SubscriptionManager::new(
+            medias
+                .iter()
+                .filter(|m| m.direction == Direction::RecvOnly)
+                .map(|m| m.mid)
+                .collect(),
+        );
+
+        self.media.media_order.clear();
+        for media in medias {
+            self.handle_media_added(media);
+        }
+
+        for (mid, (generation, active)) in publications {
+            if let Some(slot) = self.media.upstream_slots.get_mut(&mid) {
+                slot.generation = generation;
+                slot.active = active;
+                if active {
+                    // The SFU has no idea this track exists yet; announce it again.
+                    self.subscriptions.upstream_active.insert(mid, true);
+                }
+            }
+        }
+
+        // Re-assert the subscriptions the application still wants; the server has none of them.
+        let desired: Vec<_> = self
+            .subscriptions
+            .desired_subscriptions
+            .values()
+            .cloned()
+            .collect();
+        self.subscriptions.sub_manager.set_desired(desired);
+        // Deliberately no flush here. The signaling channel exists as an id the moment it is
+        // negotiated but is not yet writable, so flushing now would mark the intent clean while
+        // the message went nowhere. `Event::ChannelOpen` re-arms it once the channel is usable.
+        self.subscriptions.pending_deadline = None;
+        self.timers.notifier.notify_one();
     }
 
     async fn renegotiate(&mut self) -> Result<(), AgentError> {
