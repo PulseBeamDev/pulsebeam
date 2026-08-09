@@ -7,3 +7,7 @@ dist
 venv
 workspace.lock.json
 proptest-regressions/
+
+# Captured test/debug output; a stray one of these was once committed at 240MB.
+log.txt
+*.log
