@@ -313,7 +313,7 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.routing.route_video(local_track, &pkt, &mut ctx);
+                self.routing.route_video(local_track, pkt, &mut ctx);
             }
             (
                 Target::Audio {
@@ -430,7 +430,7 @@ impl ShardCore {
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Video);
-            self.routing.route_video(ev.stream_id.0, &ev.pkt, &mut ctx);
+            self.routing.route_video(ev.stream_id.0, ev.pkt, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {

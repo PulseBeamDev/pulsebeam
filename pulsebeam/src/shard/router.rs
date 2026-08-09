@@ -1480,20 +1480,39 @@ impl ShardRoutingTable {
     pub fn route_video(
         &mut self,
         track_id: TrackId,
-        pkt: &RtpPacket,
+        pkt: RtpPacket,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(route) = self.tracks.get_mut(&track_id) else {
             return;
         };
-        route.cache.push(pkt);
-        let state = route.state_for(pkt.ext_vals.rid);
+
+        // Hand the packet to the cache and read it back rather than cloning it
+        // in: the cache stores every packet anyway, so a clone here is a second
+        // copy of the same bytes — and an `RtpPacket` clone heap-allocates,
+        // because str0m's `ExtensionValues` carries a type-keyed map.
+        let (rid, seq) = (pkt.ext_vals.rid, pkt.seq_no);
+        let too_old = route.cache.push(pkt);
+        let Some(pkt) = too_old
+            .as_ref()
+            .or_else(|| route.cache.encoding(rid).and_then(|c| c.get(seq)))
+        else {
+            debug_assert!(false, "a stored packet must be readable back");
+            return;
+        };
+
+        let state = route.state_for(rid);
         for &subscriber in &route.subscribers {
             ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache), state);
         }
-        for remote in &mut route.remote_routes {
-            let env = remote.next_envelope(ctx.wall().to_ntp(pkt.playout_time));
-            ctx.send_media(remote.shard_id, env, MediaPayload::Video(pkt.to_transit()));
+        let playout = ctx.wall().to_ntp(pkt.playout_time);
+        let transit: Vec<(ShardId, MediaEnvelope)> = route
+            .remote_routes
+            .iter_mut()
+            .map(|remote| (remote.shard_id, remote.next_envelope(playout)))
+            .collect();
+        for (shard_id, env) in transit {
+            ctx.send_media(shard_id, env, MediaPayload::Video(pkt.to_transit()));
         }
     }
 
@@ -2692,7 +2711,7 @@ mod tests {
             shard_id: ShardId::new(0),
             ..Default::default()
         };
-        table.route_video(track_id, &RtpPacket::default(), &mut ctx);
+        table.route_video(track_id, RtpPacket::default(), &mut ctx);
 
         assert_eq!(ctx.forwarded_video.borrow().as_slice(), &[subscriber]);
         assert_eq!(ctx.sent.borrow().len(), 1);

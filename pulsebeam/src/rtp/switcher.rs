@@ -626,8 +626,8 @@ mod test {
         for p in packets {
             let mut p = p.clone();
             p.ext_vals.rid = stream.1;
-            cache.push(&p);
             let now = p.arrival_ts;
+            cache.push(p);
             switcher.feed(stream.0, cache, now, &mut |o| out.push(o));
         }
     }

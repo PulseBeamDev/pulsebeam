@@ -71,7 +71,7 @@ impl Forwarder {
         // track cache routes it to the right per-encoding ring.
         let mut pkt = pkt.clone();
         pkt.ext_vals.rid = sid.1;
-        self.cache.push(&pkt);
+        self.cache.push(pkt.clone());
 
         let Forwarder {
             switcher,
@@ -283,7 +283,7 @@ fn cache_segments_on_frames_not_arrival_time() {
 
     let kf = b.keyframe_with_slices(3, 2);
     for p in &kf {
-        cache.push(p);
+        cache.push(p.clone());
     }
     let last = kf.last().unwrap();
     let replay = cache
@@ -1222,11 +1222,11 @@ fn the_cache_does_not_grow_without_bound() {
     let mut cache = StreamCache::default();
 
     for p in b.keyframe(4) {
-        cache.push(&p);
+        cache.push(p.clone());
     }
     for _ in 0..2000 {
         for p in b.delta_frame(8) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
     }
 

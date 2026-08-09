@@ -3457,7 +3457,7 @@ mod slot_switch_tests {
             let track_id = layer.meta.id;
             let mut pkt = pkt.clone();
             pkt.ext_vals.rid = layer.rid;
-            self.cache.push(&pkt);
+            self.cache.push(pkt.clone());
             let promoted = self
                 .slot
                 .on_rtp(track_id, &pkt, Some(&self.cache), &mut self.writer);
