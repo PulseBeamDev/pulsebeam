@@ -1474,15 +1474,9 @@ impl ShardRoutingTable {
             return;
         };
         route.cache.push(pkt);
-        let state = route.state_for(pkt.ext_vals.rid).cloned();
+        let state = route.state_for(pkt.ext_vals.rid);
         for &subscriber in &route.subscribers {
-            ctx.forward_video_rtp(
-                subscriber,
-                track_id,
-                pkt,
-                Some(&route.cache),
-                state.as_ref(),
-            );
+            ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache), state);
         }
         for remote in &mut route.remote_routes {
             let env = remote.next_envelope(ctx.wall().to_ntp(pkt.playout_time));

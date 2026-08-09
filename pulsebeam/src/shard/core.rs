@@ -989,14 +989,14 @@ impl ShardCore {
             Keyframe(TrackId, Option<Rid>, str0m::media::KeyframeRequestKind),
             Data(crate::track::Topic, Vec<u8>),
         }
-        let act = {
-            let Some((_origin, target)) = self.routing.resolve_reverse(route, epoch) else {
+        let (origin, act) = {
+            let Some((origin, target)) = self.routing.resolve_reverse(route, epoch) else {
                 // The stream was unpublished while this was in flight, or the
                 // slot has been recycled. Both are expected under teardown.
                 tracing::debug!(%route, "dropping a reverse frame on an unusable route");
                 return;
             };
-            match (target, body) {
+            let act = match (target, body) {
                 (
                     ReverseTarget::Track {
                         track_id,
@@ -1022,13 +1022,10 @@ impl ShardCore {
                     debug_assert!(false, "reverse body does not match a {target:?} route");
                     return;
                 }
-            }
+            };
+            (origin, act)
         };
 
-        let origin = match self.routing.resolve_reverse(route, epoch) {
-            Some((origin, _)) => origin,
-            None => return,
-        };
         let mut ctx = DispatchCtx {
             registry: &mut self.registry,
             dirty: &mut self.dirty,
