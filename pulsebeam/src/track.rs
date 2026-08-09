@@ -352,33 +352,25 @@ impl TrackMonitor {
     }
 
     pub fn poll(&mut self, now: Instant) {
-        let active_encodings = self.active_encoding_count();
+        // Derive the sibling gate from packet arrivals, never from the encodings'
+        // published `inactive` flags: those flags are what this loop writes, so
+        // reading them back closes a feedback loop. It previously oscillated —
+        // with every encoding silent, all of them paused on one tick, which made
+        // the count zero, which read as "no sibling active" and un-paused them
+        // all on the next, at the poll rate for the whole 1s..3s window between
+        // the pause and dead timeouts.
+        let recent = self
+            .encodings
+            .iter()
+            .filter(|e| e.monitor.has_recent_packets(now))
+            .count();
+        debug_assert!(recent <= self.encodings.len());
 
         for encoding in self.encodings.iter_mut() {
-            let is_current_active = !encoding.monitor.shared_state().is_inactive();
-            let is_any_sibling_active = if is_current_active {
-                active_encodings > 1
-            } else {
-                active_encodings > 0
-            };
-
+            let self_recent = encoding.monitor.has_recent_packets(now);
+            let is_any_sibling_active = recent - usize::from(self_recent) > 0;
             encoding.poll_stats(now, is_any_sibling_active);
         }
-    }
-
-    /// How many of the track's encodings are currently sending.
-    pub fn active_encoding_count(&self) -> usize {
-        self.encodings
-            .iter()
-            .filter(|s| !s.monitor.shared_state().is_inactive())
-            .count()
-    }
-
-    /// Whether any encoding of this track is currently sending.
-    pub fn any_active(&self) -> bool {
-        self.encodings
-            .iter()
-            .any(|s| !s.monitor.shared_state().is_inactive())
     }
 
     /// Aggregate slow-decay demand across every active encoding — the whole
@@ -1333,5 +1325,116 @@ mod vla_tests {
         assert_eq!(super::vla_stream_height_px(&vla, 0), Some(360));
         // Stream 1 carries no resolution → fall back to the height guess.
         assert_eq!(super::vla_stream_height_px(&vla, 1), None);
+    }
+}
+
+#[cfg(test)]
+mod simulcast_pause_tests {
+    use super::*;
+    use crate::entity::ParticipantId;
+    use crate::rtp::RtpPacket;
+    use std::time::Duration;
+    use str0m::media::SimulcastLayer;
+
+    /// A three-encoding video track and a starting instant.
+    fn track() -> (UpstreamTrack, Instant) {
+        let now = Instant::now();
+        let participant = ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(7));
+        let (upstream, _) = test_utils::make_video_track(
+            participant,
+            Mid::from("v"),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        (upstream, now)
+    }
+
+    fn feed(upstream: &mut UpstreamTrack, rid: &str, at: Instant) {
+        let mut pkt = RtpPacket::default();
+        pkt.arrival_ts = at;
+        upstream.monitor.process(Some(&Rid::from(rid)), &mut pkt);
+    }
+
+    fn inactive(upstream: &UpstreamTrack) -> Vec<bool> {
+        upstream
+            .monitor
+            .layer_states()
+            .iter()
+            .map(|(_, s)| s.is_inactive())
+            .collect()
+    }
+
+    /// The whole track going silent must settle, not oscillate.
+    ///
+    /// The sibling gate used to read the very `inactive` flags that `poll`
+    /// writes: all encodings silent paused them together, which then read back
+    /// as "no sibling active" and un-paused them all on the next tick. That ran
+    /// at the poll rate for the entire window between the pause and dead
+    /// timeouts, flapping every subscriber's allocation with it.
+    #[test]
+    fn an_entirely_silent_track_does_not_flap_its_encodings() {
+        let (mut upstream, start) = track();
+        for rid in ["q", "h", "f"] {
+            feed(&mut upstream, rid, start);
+        }
+
+        // Poll across the whole pause..dead window, and past it, at a realistic tick.
+        let mut transitions = 0usize;
+        let mut previous = inactive(&upstream);
+        for tick in 1..=40u32 {
+            let now = start + Duration::from_millis(100) * tick;
+            upstream.poll_stats(now);
+            let current = inactive(&upstream);
+            transitions += previous
+                .iter()
+                .zip(&current)
+                .filter(|(a, b)| a != b)
+                .count();
+            previous = current;
+        }
+
+        assert!(
+            transitions <= 3,
+            "a silent track must settle into inactive once per encoding, saw {transitions} \
+             active/inactive transitions across 3 encodings"
+        );
+        assert!(
+            inactive(&upstream).iter().all(|&i| i),
+            "every encoding of a silent track must end up inactive"
+        );
+    }
+
+    /// The gate still does its real job: a layer the sender dropped while other
+    /// encodings keep sending is paused promptly, without waiting out the much
+    /// longer dead timeout.
+    #[test]
+    fn a_layer_dropped_while_siblings_send_is_paused() {
+        let (mut upstream, start) = track();
+        for rid in ["q", "h", "f"] {
+            feed(&mut upstream, rid, start);
+        }
+
+        // "f" goes quiet; "q" and "h" keep sending past the pause timeout.
+        for tick in 1..=25u32 {
+            let now = start + Duration::from_millis(100) * tick;
+            feed(&mut upstream, "q", now);
+            feed(&mut upstream, "h", now);
+            upstream.poll_stats(now);
+        }
+
+        let states = upstream.monitor.layer_states();
+        let state_of = |rid: &str| {
+            states
+                .iter()
+                .find(|(r, _)| r.as_deref() == Some(rid))
+                .map(|(_, s)| s.is_inactive())
+                .unwrap()
+        };
+        assert!(state_of("f"), "the dropped layer must be paused");
+        assert!(!state_of("q"), "a sending layer must stay active");
+        assert!(!state_of("h"), "a sending layer must stay active");
     }
 }

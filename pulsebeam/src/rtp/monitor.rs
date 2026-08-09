@@ -445,6 +445,16 @@ impl StreamMonitor {
         &self.shared_state
     }
 
+    /// Whether this encoding has produced a packet recently enough to count as a
+    /// live sibling for another encoding's pause decision.
+    ///
+    /// This reads packet arrivals rather than the published `inactive` flag on
+    /// purpose: `poll` is what writes that flag, so a sibling gate derived from
+    /// it feeds this call's own output back into its input.
+    pub fn has_recent_packets(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_packet_at) <= SIMULCAST_LAYER_PAUSE_TIMEOUT
+    }
+
     fn publish_health(&self) {
         let healthy =
             !self.shared_state.is_inactive() && self.current_quality != StreamQuality::Bad;
@@ -534,7 +544,8 @@ impl StreamMonitor {
             if !was_inactive {
                 tracing::debug!(
                     stream_id = %self.stream_id,
-                    "Simulcast layer paused while siblings active; retaining its last loss classification for keyframe-gated reactivation"
+                    reason = if self.vla_inactive { "sender declared it off" } else { "silent while a sibling kept sending" },
+                    "Simulcast layer paused; retaining its last loss classification for keyframe-gated reactivation"
                 );
                 self.quality_transition_since = None;
                 self.quality_transition_target = None;
