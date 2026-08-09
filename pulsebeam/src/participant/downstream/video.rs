@@ -18,6 +18,7 @@ use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
+use crate::rtp::monitor::StreamState;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Maximum number of video slots per participant.
@@ -49,6 +50,7 @@ pub struct VideoAllocator {
     ctx: LogCtx,
     manual_sub: bool,
     tracks: HashMap<TrackId, Track>,
+    layer_states: LayerStates,
     rng: Rng,
     last_reconciled: HashSet<(TrackId, SlotKey)>,
     desired_ctrl: BitrateController,
@@ -65,6 +67,7 @@ impl VideoAllocator {
         }
         .build();
         Self {
+            layer_states: LayerStates::new(),
             ctx,
             manual_sub,
             tracks: HashMap::new(),
@@ -102,17 +105,26 @@ impl VideoAllocator {
         true
     }
 
+    /// Seed measurement handles directly. Production fills these from the
+    /// forward path; tests use this to stand in for media already flowing.
+    #[cfg(test)]
+    pub(crate) fn seed_layer_states(&mut self, states: &LayerStates) {
+        self.layer_states
+            .extend(states.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
 
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
+        let layer_states = &self.layer_states;
         for (_key, slot) in self.slots.iter_mut() {
             let tracks = &mut self.tracks;
             if let Some(intent) = intents.get(&slot.mid) {
-                Self::configure_slot(tracks, slot, Some(intent));
+                Self::configure_slot(tracks, layer_states, slot, Some(intent));
             } else {
-                Self::configure_slot(tracks, slot, None);
+                Self::configure_slot(tracks, layer_states, slot, None);
             }
         }
     }
@@ -121,6 +133,7 @@ impl VideoAllocator {
     /// routing if `track_id` is `None` or `intent.max_height` is 0.
     fn configure_slot(
         tracks: &mut HashMap<TrackId, Track>,
+        layer_states: &LayerStates,
         slot: &mut Slot,
         intent: Option<&Intent>,
     ) -> Option<()> {
@@ -142,7 +155,11 @@ impl VideoAllocator {
             {
                 target
             } else {
-                track_state.lowest_healthy_quality()
+                track_state.lowest_healthy_quality(|l| {
+                    layer_states
+                        .get(&l.stream_id())
+                        .is_some_and(|s| s.is_healthy())
+                })
             };
 
             let layer = layer.clone();
@@ -244,7 +261,10 @@ impl VideoAllocator {
             .filter(|s| s.state() == SlotState::Idle)
         {
             if let Some(track_state) = pending_tracks.next() {
-                let layer = track_state.lowest_healthy_quality();
+                let states = &self.layer_states;
+                let layer = track_state.lowest_healthy_quality(|l| {
+                    states.get(&l.stream_id()).is_some_and(|s| s.is_healthy())
+                });
                 slot.switch_to(layer, true);
                 staged += 1;
             } else {
@@ -293,7 +313,7 @@ impl VideoAllocator {
 
         // Snapshot all layer atomics once so the entire allocation pass is
         // deterministic — no re-reads from concurrent StreamMonitor::poll() writes.
-        let engine = AllocationEngine::new(&views);
+        let engine = AllocationEngine::new(&views, &self.layer_states);
         let decisions = engine.run_compute(available_bandwidth, &views);
         let desired_raw = engine.run_desired(&views);
         self.current_allocation = AllocationEngine::used_bitrate(&decisions);
@@ -377,8 +397,17 @@ impl VideoAllocator {
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&TrackStreamCache>,
+        state: Option<&StreamState>,
         writer: &mut StreamWriter,
     ) -> bool {
+        // Cache the publisher's handle for this encoding the first time we see
+        // it; the allocator reads these instead of a field on TrackLayer.
+        if let Some(state) = state {
+            let stream_id = (track_id, pkt.ext_vals.rid);
+            self.layer_states
+                .entry(stream_id)
+                .or_insert_with(|| state.clone());
+        }
         let Some(&slot_key) = self.routes.get(&track_id) else {
             return false;
         };
@@ -879,28 +908,50 @@ pub struct AllocationEngine {
     snaps: HashMap<StreamId, LayerSnap>,
 }
 
+/// Measurement handles for the encodings this participant can see, cached from
+/// the forward path. The publisher's shard owns the originals; the controller
+/// never sees them.
+pub type LayerStates = HashMap<StreamId, StreamState>;
+
 impl AllocationEngine {
     /// Capture a point-in-time snapshot of every layer reachable from `slots`.
-    pub fn new(slots: &[SlotView<'_>]) -> Self {
+    /// A layer with no handle yet — nothing has been forwarded on it — falls
+    /// back to the seed its quality implies, which is what the publisher
+    /// advertised before its first packet.
+    pub fn new(slots: &[SlotView<'_>], states: &LayerStates) -> Self {
         let snaps = slots
             .iter()
             .flat_map(|s| s.track.layers.iter())
             .map(|l| {
-                let (bitrate_bps, stable_bitrate_bps) = l.state.bitrates_snapshot();
-                let mut decode_target_bps = [0u64; crate::rtp::monitor::MAX_LADDER_TARGETS];
-                for (dt, cost) in decode_target_bps.iter_mut().enumerate() {
-                    *cost = l.state.decode_target_bps(dt);
-                }
-                let snap = LayerSnap {
-                    bitrate_bps,
-                    stable_bitrate_bps,
-                    healthy: l.state.is_healthy(),
-                    height: l.state.height(),
-                    decode_targets: l.state.decode_target_count(),
-                    decode_target_bps,
-                    full_fps: l.state.full_fps(),
+                let stream_id = l.stream_id();
+                let snap = match states.get(&stream_id) {
+                    Some(state) => {
+                        let (bitrate_bps, stable_bitrate_bps) = state.bitrates_snapshot();
+                        let mut decode_target_bps = [0u64; crate::rtp::monitor::MAX_LADDER_TARGETS];
+                        for (dt, cost) in decode_target_bps.iter_mut().enumerate() {
+                            *cost = state.decode_target_bps(dt);
+                        }
+                        LayerSnap {
+                            bitrate_bps,
+                            stable_bitrate_bps,
+                            healthy: state.is_healthy(),
+                            height: state.height(),
+                            decode_targets: state.decode_target_count(),
+                            decode_target_bps,
+                            full_fps: state.full_fps(),
+                        }
+                    }
+                    None => LayerSnap {
+                        bitrate_bps: l.quality.seed_bitrate_bps() as f64,
+                        stable_bitrate_bps: l.quality.seed_bitrate_bps() as f64,
+                        healthy: false,
+                        height: l.quality.fallback_height(),
+                        decode_targets: 1,
+                        decode_target_bps: [0u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
+                        full_fps: 0,
+                    },
                 };
-                (l.stream_id(), snap)
+                (stream_id, snap)
             })
             .collect();
         Self { snaps }
@@ -1180,8 +1231,8 @@ impl AllocationEngine {
     ///
     /// Captures its own snapshot. In `update_allocations()` use `run_desired()`
     /// on a shared engine to avoid a second snapshot.
-    pub fn desired_bitrate(slots: &[SlotView<'_>]) -> Bitrate {
-        Self::new(slots).run_desired(slots)
+    pub fn desired_bitrate(slots: &[SlotView<'_>], states: &LayerStates) -> Bitrate {
+        Self::new(slots, states).run_desired(slots)
     }
 
     pub fn run_desired(&self, slots: &[SlotView<'_>]) -> Bitrate {
@@ -1233,8 +1284,9 @@ impl AllocationEngine {
     pub fn compute<'a>(
         bwe: Bitrate,
         slots: &'a [SlotView<'a>],
+        states: &LayerStates,
     ) -> SecondaryMap<SlotKey, AllocationDecision<'a>> {
-        Self::new(slots).run_compute(bwe, slots)
+        Self::new(slots, states).run_compute(bwe, slots)
     }
 
     pub fn run_compute<'a>(
@@ -1346,7 +1398,53 @@ impl AllocationEngine {
 }
 
 #[cfg(test)]
+mod alloc_test_support {
+    use super::*;
+    use crate::entity::ParticipantId;
+    use crate::track::UpstreamTrack;
+    use crate::track::test_utils::make_video_track;
+    use str0m::media::SimulcastLayer;
+
+    /// Measurement handles standing in for what the publisher's shard would
+    /// have supplied. Seeded active, which is what the old `inactive(false)`
+    /// loops did.
+    pub(super) fn states_for(track: &Track) -> LayerStates {
+        track
+            .layers
+            .iter()
+            .map(|l| {
+                (
+                    l.stream_id(),
+                    StreamState::new_with_height(
+                        false,
+                        l.quality.seed_bitrate_bps(),
+                        l.quality.fallback_height(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn video_track_with_states(
+        pid: ParticipantId,
+        mid: Mid,
+        layers: Vec<SimulcastLayer>,
+    ) -> (UpstreamTrack, Track, LayerStates) {
+        let (tx, track) = make_video_track(pid, mid, layers);
+        let states = states_for(&track);
+        (tx, track, states)
+    }
+
+    pub(super) fn state_of<'a>(states: &'a LayerStates, layer: &TrackLayer) -> &'a StreamState {
+        states
+            .get(&layer.stream_id())
+            .expect("layer must have seeded state")
+    }
+}
+
+#[cfg(test)]
 mod assignment_tests {
+    use super::alloc_test_support::*;
     use super::*;
     use crate::entity::{ParticipantId, TrackId, TrackKind};
     use crate::participant::event::test_utils::MockParticipantSink;
@@ -1392,15 +1490,11 @@ mod assignment_tests {
 
         for i in 0..count {
             let mid = Mid::from(&format!("v{i}")[..]);
-            let (tx, track) = make_video_track(pid, mid, vec![]);
+            let (tx, track, states) = video_track_with_states(pid, mid, vec![]);
             let meta = tx.meta.clone();
 
-            // Ensure tracks are considered "healthy" for allocation tests.
-            for layer in &track.layers {
-                layer.state.update_for_test().inactive(false);
-            }
-
             ids.push(meta.id);
+            allocator.seed_layer_states(&states);
             allocator.add_track(Track {
                 meta,
                 layers: track.layers,
@@ -1423,14 +1517,11 @@ mod assignment_tests {
     #[test]
     fn allocation_snapshot_exposes_per_encoding_decode_target_count() {
         let pid = ParticipantId::new(&mut test_rng());
-        let (tx, built) = make_video_track(
+        let (tx, built, states) = video_track_with_states(
             pid,
             Mid::from("v0"),
             vec![SimulcastLayer::new("q"), SimulcastLayer::new("h")],
         );
-        for layer in &built.layers {
-            layer.state.update_for_test().inactive(false);
-        }
         let track = Track {
             meta: tx.meta.clone(),
             layers: built.layers,
@@ -1438,7 +1529,7 @@ mod assignment_tests {
 
         // The "h" encoding advertises three decode targets (L1T3); "q", none.
         let scalable = track.by_quality(LayerQuality::Medium).unwrap();
-        scalable.state.set_decode_target_count(3);
+        state_of(&states, scalable).set_decode_target_count(3);
         let plain = track.by_quality(LayerQuality::Low).unwrap();
 
         let mut keys: SlotMap<SlotKey, ()> = SlotMap::with_key();
@@ -1453,7 +1544,7 @@ mod assignment_tests {
             current_quality: LayerQuality::Low,
             forwarding: true,
         };
-        let engine = AllocationEngine::new(std::slice::from_ref(&view));
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
 
         assert_eq!(
             engine.decode_target_count(scalable),
@@ -1610,11 +1701,9 @@ mod assignment_tests {
             SimulcastLayer::new("h"),
             SimulcastLayer::new("f"),
         ];
-        let (tx, track) = make_video_track(pid, mid, track_layers);
-        for layer in &track.layers {
-            layer.state.update_for_test().inactive(false);
-        }
+        let (tx, track, states) = video_track_with_states(pid, mid, track_layers);
         let track_id = tx.meta.id;
+        allocator.seed_layer_states(&states);
         allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
@@ -1707,14 +1796,12 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
-        let (tx, track) = make_video_track(
+        let (tx, track, states) = video_track_with_states(
             pid,
             mid,
             vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
         );
-        for layer in &track.layers {
-            layer.state.update_for_test().inactive(false);
-        }
+        allocator.seed_layer_states(&states);
         allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
@@ -1804,7 +1891,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
-        let (_, track) = make_video_track(
+        let (_, track, states) = video_track_with_states(
             pid,
             mid,
             vec![
@@ -1815,7 +1902,7 @@ mod assignment_tests {
         );
         let mut track = track;
         for layer in &mut track.layers {
-            layer.state.update_for_test().inactive(false);
+            state_of(&states, layer).update_for_test().inactive(false);
         }
 
         allocator.add_slot(SlotConfig::default());
@@ -1836,7 +1923,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
-        let (_, track) = make_video_track(
+        let (_, track, states) = video_track_with_states(
             pid,
             mid,
             vec![
@@ -1847,7 +1934,7 @@ mod assignment_tests {
         );
         let mut track = track;
         for layer in &mut track.layers {
-            layer.state.update_for_test().inactive(false);
+            state_of(&states, layer).update_for_test().inactive(false);
         }
 
         allocator.add_slot(SlotConfig::default());
@@ -1869,7 +1956,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
-        let (_, track) = make_video_track(
+        let (_, track, states) = video_track_with_states(
             pid,
             mid,
             vec![
@@ -1880,7 +1967,7 @@ mod assignment_tests {
         );
         let mut track = track;
         for layer in &mut track.layers {
-            layer.state.update_for_test().inactive(false);
+            state_of(&states, layer).update_for_test().inactive(false);
         }
 
         allocator.add_slot(SlotConfig::default());
@@ -1986,10 +2073,8 @@ mod assignment_tests {
 
         // Trigger rebalance with a new incoming track.
         let pid = ParticipantId::new(&mut test_rng());
-        let (tx, track) = make_video_track(pid, Mid::from("late"), vec![]);
-        for layer in &track.layers {
-            layer.state.update_for_test().inactive(false);
-        }
+        let (tx, track, states) = video_track_with_states(pid, Mid::from("late"), vec![]);
+        allocator.seed_layer_states(&states);
         allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
@@ -2018,12 +2103,10 @@ mod assignment_tests {
         add_slots(&mut allocator, 3);
         allocator.remove_track(&tracks.ids[1]);
         let pid = ParticipantId::new(&mut test_rng());
-        let (tx, track) = make_video_track(pid, Mid::from("new_track"), vec![]);
-        for layer in &track.layers {
-            layer.state.update_for_test().inactive(false);
-        }
+        let (tx, track, states) = video_track_with_states(pid, Mid::from("new_track"), vec![]);
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
+        allocator.seed_layer_states(&states);
         allocator.add_track(Track {
             meta,
             layers: track.layers,
@@ -2035,7 +2118,7 @@ mod assignment_tests {
     fn same_slot_switching_same_track_is_not_duplicate_assignment() {
         let mut allocator = setup_allocator();
         let pid = ParticipantId::new(&mut test_rng());
-        let (tx, track) = make_video_track(
+        let (tx, track, states) = video_track_with_states(
             pid,
             Mid::from("t"),
             vec![
@@ -2045,9 +2128,7 @@ mod assignment_tests {
             ],
         );
 
-        for layer in &track.layers {
-            layer.state.update_for_test().inactive(false);
-        }
+        allocator.seed_layer_states(&states);
 
         allocator.add_track(Track {
             meta: tx.meta.clone(),
@@ -2082,6 +2163,7 @@ mod assignment_tests {
 
 #[cfg(test)]
 mod allocation_tests {
+    use super::alloc_test_support::*;
     use super::*;
     use crate::entity::ParticipantId;
     use crate::rtp::monitor::StreamQuality;
@@ -2105,9 +2187,9 @@ mod allocation_tests {
         KEY_SM.with(|sm| sm.borrow_mut().insert(()))
     }
 
-    fn healthy_track() -> Track {
+    fn healthy_track() -> (Track, LayerStates) {
         use str0m::media::SimulcastLayer;
-        let (tx, track) = make_video_track(
+        let (tx, track, states) = video_track_with_states(
             ParticipantId::new(&mut test_rng()),
             Mid::from("t"),
             vec![
@@ -2116,23 +2198,21 @@ mod allocation_tests {
                 SimulcastLayer::new("f"),
             ],
         );
-        for layer in &track.layers {
-            layer.state.update_for_test().inactive(false);
-        }
-        Track {
-            meta: tx.meta,
-            layers: track.layers,
-        }
+        (
+            Track {
+                meta: tx.meta,
+                layers: track.layers,
+            },
+            states,
+        )
     }
 
-    fn track_with_bad_layer(bad: LayerQuality) -> Track {
-        let vt = healthy_track();
-        vt.by_quality(bad)
-            .unwrap()
-            .state
+    fn track_with_bad_layer(bad: LayerQuality) -> (Track, LayerStates) {
+        let (vt, states) = healthy_track();
+        state_of(&states, vt.by_quality(bad).unwrap())
             .update_for_test()
             .quality(StreamQuality::Bad);
-        vt
+        (vt, states)
     }
 
     fn slot<'a>(
@@ -2194,14 +2274,14 @@ mod allocation_tests {
 
     #[test]
     fn ample_budget_serves_every_slot_to_its_target() {
-        let t = healthy_track();
-        let high = layer_bps(&t, LayerQuality::High);
+        let (t, states) = healthy_track();
+        let high = layer_bps(&t, &states, LayerQuality::High);
         let available = bw((high * 4.0) as u64 / 1_000);
         let slots = sorted(vec![
             qos_slot("a", 1080, 0, 10, &t, LayerQuality::Low),
             qos_slot("b", 1080, 0, 5, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
         for slot in &slots {
             assert_eq!(
                 forwarded_quality(&decisions, slot.key),
@@ -2214,15 +2294,15 @@ mod allocation_tests {
 
     #[test]
     fn higher_priority_slot_served_first_under_contention() {
-        let t = healthy_track();
-        let low = layer_bps(&t, LayerQuality::Low);
+        let (t, states) = healthy_track();
+        let low = layer_bps(&t, &states, LayerQuality::Low);
         // Budget fits only one Low layer.
         let available = bw((low as u64) / 1_000 + 5);
         let slots = sorted(vec![
             qos_slot("hi", 1080, 0, 100, &t, LayerQuality::Low),
             qos_slot("lo", 1080, 0, 0, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
         let hi = slots.iter().find(|s| s.priority == 100).unwrap();
         let lo = slots.iter().find(|s| s.priority == 0).unwrap();
         assert!(
@@ -2237,9 +2317,9 @@ mod allocation_tests {
 
     #[test]
     fn pinned_stream_does_not_drop_when_another_joins() {
-        let t = healthy_track();
-        let high_h = t.by_quality(LayerQuality::High).unwrap().state.height();
-        let high_bps = layer_bps(&t, LayerQuality::High);
+        let (t, states) = healthy_track();
+        let high_h = state_of(&states, t.by_quality(LayerQuality::High).unwrap()).height();
+        let high_bps = layer_bps(&t, &states, LayerQuality::High);
         // Enough for the pinned High plus a little — but not for a second High.
         let available = bw((high_bps * 1.3) as u64 / 1_000);
 
@@ -2249,7 +2329,7 @@ mod allocation_tests {
             qos_slot("pin", 1080, high_h, 100, &t, LayerQuality::High),
             qos_slot("bg", 1080, 0, 0, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
         let pin = slots.iter().find(|s| s.mid == Mid::from("pin")).unwrap();
         assert_eq!(
             forwarded_quality(&decisions, pin.key),
@@ -2260,9 +2340,9 @@ mod allocation_tests {
 
     #[test]
     fn droppable_stream_pauses_before_a_floored_one() {
-        let t = healthy_track();
-        let low = layer_bps(&t, LayerQuality::Low);
-        let low_h = t.by_quality(LayerQuality::Low).unwrap().state.height();
+        let (t, states) = healthy_track();
+        let low = layer_bps(&t, &states, LayerQuality::Low);
+        let low_h = state_of(&states, t.by_quality(LayerQuality::Low).unwrap()).height();
         // Budget fits exactly one Low floor.
         let available = bw((low as u64) / 1_000 + 5);
         let slots = sorted(vec![
@@ -2271,7 +2351,7 @@ mod allocation_tests {
             // Floored: must stay visible.
             qos_slot("keep", 1080, low_h, 0, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
         let drop = slots.iter().find(|s| s.mid == Mid::from("drop")).unwrap();
         let keep = slots.iter().find(|s| s.mid == Mid::from("keep")).unwrap();
         assert!(
@@ -2288,35 +2368,31 @@ mod allocation_tests {
         Bitrate::from(kbps * 1_000)
     }
 
-    fn layer_bps(track: &Track, q: LayerQuality) -> f64 {
-        track.by_quality(q).unwrap().state.bitrate_bps()
+    fn layer_bps(track: &Track, states: &LayerStates, q: LayerQuality) -> f64 {
+        state_of(states, track.by_quality(q).unwrap()).bitrate_bps()
     }
 
     #[test]
     fn base_layer_degrade_forwards_dd_base_instead_of_pausing() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         // Leave only "q" healthy, so it is the sole eligible floor.
-        t.by_quality(LayerQuality::High)
-            .unwrap()
-            .state
+        state_of(&states, t.by_quality(LayerQuality::High).unwrap())
             .update_for_test()
             .inactive(true);
-        t.by_quality(LayerQuality::Medium)
-            .unwrap()
-            .state
+        state_of(&states, t.by_quality(LayerQuality::Medium).unwrap())
             .update_for_test()
             .inactive(true);
         let q = t.by_quality(LayerQuality::Low).unwrap();
-        q.state.update_for_test().bitrate(1_000_000); // 1 Mbps at full quality
+        state_of(&states, q).update_for_test().bitrate(1_000_000); // 1 Mbps at full quality
 
         // Budget covers the base temporal layer (0.5 Mbps) but not the full floor
         // (0.75 Mbps after the retention factor).
         let budget = bw(700);
 
         // Scalable (L1T3): degrade to the base layer rather than pause.
-        q.state.set_decode_target_count(3);
+        state_of(&states, q).set_decode_target_count(3);
         let slots = vec![qos_slot("a", 2000, 1, 0, &t, LayerQuality::Low)];
-        let decisions = AllocationEngine::compute(budget, &slots);
+        let decisions = AllocationEngine::compute(budget, &slots, &states);
         assert!(
             matches!(
                 decisions[slots[0].key],
@@ -2328,9 +2404,9 @@ mod allocation_tests {
 
         // No Dependency Descriptor: there is no base layer to fall back to, so the
         // same budget pauses the stream as before — the fallback is preserved.
-        q.state.set_decode_target_count(1);
+        state_of(&states, q).set_decode_target_count(1);
         let slots = vec![qos_slot("a", 2000, 1, 0, &t, LayerQuality::Low)];
-        let decisions = AllocationEngine::compute(budget, &slots);
+        let decisions = AllocationEngine::compute(budget, &slots, &states);
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
             "a non-scalable stream still pauses, got {:?}",
@@ -2341,25 +2417,21 @@ mod allocation_tests {
     /// A scalable encoding whose full rate does not fit is shed to the *highest*
     /// decode target that does — an intermediate temporal rung, not straight to
     /// the base layer.
-    fn scalable_low_only_track() -> Track {
-        let t = healthy_track();
-        t.by_quality(LayerQuality::High)
-            .unwrap()
-            .state
+    fn scalable_low_only_track() -> (Track, LayerStates) {
+        let (t, states) = healthy_track();
+        state_of(&states, t.by_quality(LayerQuality::High).unwrap())
             .update_for_test()
             .inactive(true);
-        t.by_quality(LayerQuality::Medium)
-            .unwrap()
-            .state
+        state_of(&states, t.by_quality(LayerQuality::Medium).unwrap())
             .update_for_test()
             .inactive(true);
         let q = t.by_quality(LayerQuality::Low).unwrap();
-        q.state.update_for_test().bitrate(600_000);
-        q.state.set_decode_target_count(3);
+        state_of(&states, q).update_for_test().bitrate(600_000);
+        state_of(&states, q).set_decode_target_count(3);
         // Declared per-temporal ladder: dt0=200k, dt1=300k, dt2(full)=600k @ 30fps
         // → fps 7/15/30.
-        q.state.set_temporal_ladder(&[200, 300, 600], 30);
-        t
+        state_of(&states, q).set_temporal_ladder(&[200, 300, 600], 30);
+        (t, states)
     }
 
     fn scalable_slot(t: &Track, min_fps: u32) -> SlotView<'_> {
@@ -2378,10 +2450,10 @@ mod allocation_tests {
 
     #[test]
     fn temporal_ladder_picks_the_highest_affordable_decode_target() {
-        let t = scalable_low_only_track();
+        let (t, states) = scalable_low_only_track();
         // 350 kbps: full (600k) does not fit; dt1 (300k) is the highest that does.
         let view = scalable_slot(&t, 0);
-        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view));
+        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view), &states);
         assert!(
             matches!(
                 d[view.key],
@@ -2394,12 +2466,12 @@ mod allocation_tests {
 
     #[test]
     fn min_fps_floor_pauses_rather_than_shed_below_it() {
-        let t = scalable_low_only_track();
+        let (t, states) = scalable_low_only_track();
         // min_fps=20: only the full target (30fps) meets it; dt1 is 15fps, dt0 is
         // 7fps. Full does not fit 350k, so the slot pauses rather than drop below
         // the frame-rate floor.
         let view = scalable_slot(&t, 20);
-        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view));
+        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view), &states);
         assert!(
             matches!(d[view.key], AllocationDecision::Pause(..)),
             "expected a pause below the min_fps floor, got {:?}",
@@ -2408,7 +2480,7 @@ mod allocation_tests {
 
         // min_fps=10: dt1 (15fps) satisfies the floor and fits, so shed to it.
         let view = scalable_slot(&t, 10);
-        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view));
+        let d = AllocationEngine::compute(bw(350), std::slice::from_ref(&view), &states);
         assert!(
             matches!(
                 d[view.key],
@@ -2425,23 +2497,19 @@ mod allocation_tests {
     /// converges), the chosen layer is stable regardless of VBR content bursts.
     #[test]
     fn stable_bitrate_bps_makes_allocation_stable() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
 
         // Decide the forwarded layer with given bitrate_bps values (the
         // smoothed cost signal written by StreamMonitor::poll).
         let decide = |high_bps: u64, med_bps: u64| -> Option<LayerQuality> {
-            t.by_quality(LayerQuality::High)
-                .unwrap()
-                .state
+            state_of(&states, t.by_quality(LayerQuality::High).unwrap())
                 .update_for_test()
                 .bitrate(high_bps);
-            t.by_quality(LayerQuality::Medium)
-                .unwrap()
-                .state
+            state_of(&states, t.by_quality(LayerQuality::Medium).unwrap())
                 .update_for_test()
                 .bitrate(med_bps);
             let slots = vec![slot("a", 1080, &t, LayerQuality::Medium)];
-            let decisions = AllocationEngine::compute(bw(886), &slots);
+            let decisions = AllocationEngine::compute(bw(886), &slots, &states);
             match decisions[slots[0].key] {
                 AllocationDecision::Forward(l, _) | AllocationDecision::ForwardTarget(l, _, _) => {
                     Some(l.quality)
@@ -2473,18 +2541,16 @@ mod allocation_tests {
     /// hard-coded per-quality height guess for spatial gating.
     #[test]
     fn declared_height_overrides_quality_fallback_for_spatial_gate() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         // The High layer is actually only 180p; the sender declares it.
-        t.by_quality(LayerQuality::High)
-            .unwrap()
-            .state
+        state_of(&states, t.by_quality(LayerQuality::High).unwrap())
             .update_for_test()
             .height(180);
 
         // Client caps at 180p. The hard-coded fallback rates High at 720p and
         // would forbid it, but the declared 180p must be allowed.
         let slot = slot("a", 180, &t, LayerQuality::High);
-        let engine = AllocationEngine::new(std::slice::from_ref(&slot));
+        let engine = AllocationEngine::new(std::slice::from_ref(&slot), &states);
         let high = t.by_quality(LayerQuality::High).unwrap();
         assert!(engine.spatially_allowed(&slot, high));
 
@@ -2499,18 +2565,16 @@ mod allocation_tests {
     /// tiers stay eligible and `desired_bitrate` must still be nonzero.
     #[test]
     fn uniform_layer_heights_all_stay_spatially_allowed_below_cap() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         for quality in [LayerQuality::High, LayerQuality::Medium, LayerQuality::Low] {
-            t.by_quality(quality)
-                .unwrap()
-                .state
+            state_of(&states, t.by_quality(quality).unwrap())
                 .update_for_test()
                 .height(1080);
         }
 
         // Client caps at 480p, below the shared 1080p every tier declares.
         let slot = slot("a", 480, &t, LayerQuality::Low);
-        let engine = AllocationEngine::new(std::slice::from_ref(&slot));
+        let engine = AllocationEngine::new(std::slice::from_ref(&slot), &states);
         for quality in [LayerQuality::High, LayerQuality::Medium, LayerQuality::Low] {
             let layer = t.by_quality(quality).unwrap();
             assert!(
@@ -2519,7 +2583,7 @@ mod allocation_tests {
             );
         }
 
-        let desired = AllocationEngine::desired_bitrate(std::slice::from_ref(&slot));
+        let desired = AllocationEngine::desired_bitrate(std::slice::from_ref(&slot), &states);
         assert!(
             desired.as_f64() > 0.0,
             "a slot with an eligible layer must desire nonzero bitrate"
@@ -2530,13 +2594,13 @@ mod allocation_tests {
 
     #[test]
     fn every_slot_gets_a_decision() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 720, &t, LayerQuality::Low),
             slot("c", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots, &states);
         for s in &slots {
             assert!(
                 decisions.contains_key(s.key),
@@ -2550,9 +2614,9 @@ mod allocation_tests {
 
     #[test]
     fn decisions_are_forward_or_pause() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots, &states);
         for (_, d) in &decisions {
             assert!(
                 matches!(
@@ -2569,9 +2633,9 @@ mod allocation_tests {
 
     #[test]
     fn desired_bitrate_is_non_negative() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
-        let desired = AllocationEngine::desired_bitrate(&slots);
+        let desired = AllocationEngine::desired_bitrate(&slots, &states);
         assert!(desired.as_f64() >= 0.0, "desired must be non-negative");
     }
 
@@ -2579,13 +2643,13 @@ mod allocation_tests {
 
     #[test]
     fn unlimited_bandwidth_forwards_all_slots() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 720, &t, LayerQuality::Low),
             slot("c", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(100_000), &slots);
+        let decisions = AllocationEngine::compute(bw(100_000), &slots, &states);
         for s in &slots {
             assert!(
                 matches!(decisions[s.key], AllocationDecision::Forward(..)),
@@ -2599,12 +2663,12 @@ mod allocation_tests {
 
     #[test]
     fn zero_bandwidth_pauses_all_slots() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(0), &slots);
+        let decisions = AllocationEngine::compute(bw(0), &slots, &states);
         for s in &slots {
             assert!(
                 matches!(decisions[s.key], AllocationDecision::Pause(..)),
@@ -2621,12 +2685,12 @@ mod allocation_tests {
 
     #[test]
     fn pause_always_carries_a_resume_receiver() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(0), &slots);
+        let decisions = AllocationEngine::compute(bw(0), &slots, &states);
         for (key, d) in &decisions {
             if let AllocationDecision::Pause(receiver, needed) = d {
                 // The receiver field must point somewhere meaningful (non-null
@@ -2646,7 +2710,7 @@ mod allocation_tests {
 
     #[test]
     fn bad_high_layer_falls_back_rather_than_pausing() {
-        let t = track_with_bad_layer(LayerQuality::High);
+        let (t, states) = track_with_bad_layer(LayerQuality::High);
         let slots = vec![SlotView {
             key: next_slot_key(),
             mid: Mid::from("a"),
@@ -2658,7 +2722,7 @@ mod allocation_tests {
             current_quality: LayerQuality::High,
             forwarding: true,
         }];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots, &states);
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
             "expected Forward fallback when High is bad, got {:?}",
@@ -2670,12 +2734,12 @@ mod allocation_tests {
 
     #[test]
     fn forwarded_layer_is_always_healthy() {
-        let t = track_with_bad_layer(LayerQuality::High);
+        let (t, states) = track_with_bad_layer(LayerQuality::High);
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots, &states);
         if let AllocationDecision::Forward(receiver, _) = &decisions[slots[0].key] {
             assert!(
-                receiver.state.is_healthy(),
+                state_of(&states, receiver).is_healthy(),
                 "engine forwarded to an unhealthy layer: {:?}",
                 receiver.quality
             );
@@ -2684,12 +2748,12 @@ mod allocation_tests {
 
     #[test]
     fn healthy_zero_bitrate_layer_is_never_forwarded() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         for layer in &t.layers {
-            layer.state.update_for_test().bitrate(0);
+            state_of(&states, layer).update_for_test().bitrate(0);
         }
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots, &states);
 
         assert!(
             !matches!(
@@ -2707,8 +2771,8 @@ mod allocation_tests {
 
     #[test]
     fn tight_budget_forwards_higher_priority_slot() {
-        let t = healthy_track();
-        let low_bps = layer_bps(&t, LayerQuality::Low);
+        let (t, states) = healthy_track();
+        let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
         // Budget just fits one Low layer (no headroom for downgrade guard).
         let available = bw((low_bps as u64) / 1_000 + 5);
@@ -2738,7 +2802,7 @@ mod allocation_tests {
             },
         ];
 
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -2754,8 +2818,8 @@ mod allocation_tests {
         #[ignore]
         #[test]
         fn allocation_is_order_independent_for_equal_priority_slots(n in 2usize..=5) {
-            let t = healthy_track();
-            let low_bps = layer_bps(&t, LayerQuality::Low);
+            let (t, states) = healthy_track();
+            let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
             // Budget just barely covers one Low layer.
             let available = bw((low_bps as u64) / 1_000 + 1);
@@ -2767,12 +2831,12 @@ mod allocation_tests {
                 .map(|name| slot(name, priority, &t, LayerQuality::Low))
                 .collect();
 
-            let decisions1 = AllocationEngine::compute(available, &slots);
+            let decisions1 = AllocationEngine::compute(available, &slots, &states);
 
             // Reorder the input slots and verify outcome stays the same.
             let mut reversed = slots.clone();
             reversed.reverse();
-            let decisions2 = AllocationEngine::compute(available, &reversed);
+            let decisions2 = AllocationEngine::compute(available, &reversed, &states);
 
             prop_assert_eq!(decisions1.len(), decisions2.len());
             for s in &slots {
@@ -2792,7 +2856,7 @@ mod allocation_tests {
 
     #[test]
     fn desired_bitrate_equals_sum_of_best_healthy_layers() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 720, &t, LayerQuality::Low),
@@ -2801,14 +2865,14 @@ mod allocation_tests {
         let expected_per_slot = t
             .layers
             .iter()
-            .filter(|l| l.state.is_healthy())
-            .map(|l| l.state.bitrate_bps())
+            .filter(|l| state_of(&states, l).is_healthy())
+            .map(|l| state_of(&states, l).bitrate_bps())
             .fold(0.0_f64, f64::max);
 
         let expected_total =
             expected_per_slot * slots.len() as f64 / (1.0 - AllocationEngine::RESERVE_FRACTION);
 
-        let desired = AllocationEngine::desired_bitrate(&slots);
+        let desired = AllocationEngine::desired_bitrate(&slots, &states);
 
         assert!(
             (desired.as_f64() - expected_total).abs() < 1.0,
@@ -2820,31 +2884,32 @@ mod allocation_tests {
 
     #[test]
     fn desired_bitrate_covers_all_forwarded_layers() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         let slots = vec![
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 180, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(100_000), &slots);
+        let decisions = AllocationEngine::compute(bw(100_000), &slots, &states);
 
         assert!(
-            AllocationEngine::desired_bitrate(&slots) >= AllocationEngine::used_bitrate(&decisions)
+            AllocationEngine::desired_bitrate(&slots, &states)
+                >= AllocationEngine::used_bitrate(&decisions)
         );
     }
 
     #[test]
     fn desired_bitrate_includes_healthy_fallback_above_height_cap() {
-        let t = healthy_track();
-        t.by_quality(LayerQuality::Low)
-            .unwrap()
-            .state
+        let (t, states) = healthy_track();
+        state_of(&states, t.by_quality(LayerQuality::Low).unwrap())
             .update_for_test()
             .inactive(true);
         let slots = vec![slot("a", 180, &t, LayerQuality::Medium)];
 
-        let expected =
-            layer_bps(&t, LayerQuality::Medium) / (1.0 - AllocationEngine::RESERVE_FRACTION);
-        assert!((AllocationEngine::desired_bitrate(&slots).as_f64() - expected).abs() < 1.0);
+        let expected = layer_bps(&t, &states, LayerQuality::Medium)
+            / (1.0 - AllocationEngine::RESERVE_FRACTION);
+        assert!(
+            (AllocationEngine::desired_bitrate(&slots, &states).as_f64() - expected).abs() < 1.0
+        );
     }
 
     proptest! {
@@ -2860,17 +2925,15 @@ mod allocation_tests {
             slot_count in 1usize..=5,
             available_bps in 0u64..=10_000_000,
         ) {
-            let t = healthy_track();
+            let (t, states) = healthy_track();
             let cases = [
                 (LayerQuality::High, high_bps, high_healthy, 720u32),
                 (LayerQuality::Medium, medium_bps, medium_healthy, 360u32),
                 (LayerQuality::Low, low_bps, low_healthy, 180u32),
             ];
             for &(quality, bitrate, healthy, _) in &cases {
-                t.by_quality(quality)
-                    .unwrap()
-                    .state
-                    .update_for_test()
+                state_of(&states, t.by_quality(quality).unwrap())
+                                        .update_for_test()
                     .bitrate(bitrate)
                     .inactive(!healthy);
             }
@@ -2895,11 +2958,11 @@ mod allocation_tests {
             let expected_per_slot = spatial_max.or(fallback).unwrap_or(0);
             let expected = (expected_per_slot as f64 * slot_count as f64
                 / (1.0 - AllocationEngine::RESERVE_FRACTION)) as u64;
-            let desired = AllocationEngine::desired_bitrate(&slots);
+            let desired = AllocationEngine::desired_bitrate(&slots, &states);
 
             prop_assert_eq!(desired.as_u64(), expected);
 
-            let decisions = AllocationEngine::compute(Bitrate::from(available_bps), &slots);
+            let decisions = AllocationEngine::compute(Bitrate::from(available_bps), &slots, &states);
             prop_assert!(desired >= AllocationEngine::used_bitrate(&decisions));
         }
     }
@@ -2912,14 +2975,14 @@ mod allocation_tests {
 
     #[test]
     fn downgrade_hysteresis_absorbs_minor_bandwidth_noise() {
-        let t = healthy_track();
-        let low_bps = layer_bps(&t, LayerQuality::Low);
+        let (t, states) = healthy_track();
+        let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
         // 5% below Low cost — inside the downgrade dead-band; no downgrade should fire.
         let available = bw((low_bps * 0.95) as u64 / 1_000);
 
         let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -2931,13 +2994,13 @@ mod allocation_tests {
 
     #[test]
     fn no_slots_yields_empty_decisions_and_zero_desired() {
-        let decisions = AllocationEngine::compute(bw(1_000), &[]);
+        let decisions = AllocationEngine::compute(bw(1_000), &[], &LayerStates::new());
         assert!(
             decisions.is_empty(),
             "expected no decisions for empty slots"
         );
         assert_eq!(
-            AllocationEngine::desired_bitrate(&[]).as_f64(),
+            AllocationEngine::desired_bitrate(&[], &LayerStates::new()).as_f64(),
             0.0,
             "expected zero desired bitrate for empty slots"
         );
@@ -2947,14 +3010,14 @@ mod allocation_tests {
 
     #[test]
     fn tight_budget_pauses_floored_slot() {
-        let t = healthy_track();
-        let low_bps = layer_bps(&t, LayerQuality::Low);
-        let low_h = t.by_quality(LayerQuality::Low).unwrap().state.height();
+        let (t, states) = healthy_track();
+        let low_bps = layer_bps(&t, &states, LayerQuality::Low);
+        let low_h = state_of(&states, t.by_quality(LayerQuality::Low).unwrap()).height();
 
         let tight = bw((low_bps * 0.5) as u64 / 1_000);
         let slots = vec![qos_slot("a", 1080, low_h, 0, &t, LayerQuality::Low)];
 
-        let decisions = AllocationEngine::compute(tight, &slots);
+        let decisions = AllocationEngine::compute(tight, &slots, &states);
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
             "budget below floor must pause; got {:?}",
@@ -2964,8 +3027,8 @@ mod allocation_tests {
 
     #[test]
     fn tight_budget_pauses_lower_priority_slot() {
-        let t = healthy_track();
-        let low_bps = layer_bps(&t, LayerQuality::Low);
+        let (t, states) = healthy_track();
+        let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
         let available = bw((low_bps as u64) / 1_000 + 5);
         let slots = sorted(vec![
@@ -2973,7 +3036,7 @@ mod allocation_tests {
             qos_slot("lo", 1080, 0, 0, &t, LayerQuality::Low),
         ]);
 
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
         let hi = slots.iter().find(|s| s.priority == 100).unwrap();
         let lo = slots.iter().find(|s| s.priority == 0).unwrap();
 
@@ -2989,9 +3052,9 @@ mod allocation_tests {
 
     #[test]
     fn tight_budget_pauses_all_slots() {
-        let t = healthy_track();
-        let low_bps = layer_bps(&t, LayerQuality::Low);
-        let low_h = t.by_quality(LayerQuality::Low).unwrap().state.height();
+        let (t, states) = healthy_track();
+        let low_bps = layer_bps(&t, &states, LayerQuality::Low);
+        let low_h = state_of(&states, t.by_quality(LayerQuality::Low).unwrap()).height();
 
         let tight = bw((low_bps * 0.3) as u64 / 1_000);
         let slots = sorted(vec![
@@ -2999,7 +3062,7 @@ mod allocation_tests {
             qos_slot("lo", 1080, low_h, 0, &t, LayerQuality::Low),
         ]);
 
-        let decisions = AllocationEngine::compute(tight, &slots);
+        let decisions = AllocationEngine::compute(tight, &slots, &states);
         let hi = slots.iter().find(|s| s.priority == 100).unwrap();
         let lo = slots.iter().find(|s| s.priority == 0).unwrap();
 
@@ -3021,15 +3084,15 @@ mod allocation_tests {
 
     #[test]
     fn floor_hysteresis_retains_forwarding_slot_inside_downgrade_dead_band() {
-        let t = healthy_track();
-        let med_bps = layer_bps(&t, LayerQuality::Medium);
-        let med_h = t.by_quality(LayerQuality::Medium).unwrap().state.height();
+        let (t, states) = healthy_track();
+        let med_bps = layer_bps(&t, &states, LayerQuality::Medium);
+        let med_h = state_of(&states, t.by_quality(LayerQuality::Medium).unwrap()).height();
 
         // Budget is 80% of floor cost — below floor but above DOWNGRADE_FACTOR×floor.
         // The slot is currently forwarding at the floor (current_quality == Medium).
         let available = bw((med_bps * 0.80) as u64 / 1_000);
         let slots = vec![qos_slot("a", 1080, med_h, 0, &t, LayerQuality::Medium)];
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -3043,23 +3106,21 @@ mod allocation_tests {
     #[test]
     fn floor_hysteresis_does_not_apply_to_new_subscriber() {
         // Make only Medium healthy so there's no sub-floor fallback layer.
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         for q in [LayerQuality::High, LayerQuality::Low] {
-            t.by_quality(q)
-                .unwrap()
-                .state
+            state_of(&states, t.by_quality(q).unwrap())
                 .update_for_test()
                 .quality(StreamQuality::Bad);
         }
-        let med_bps = layer_bps(&t, LayerQuality::Medium);
-        let med_h = t.by_quality(LayerQuality::Medium).unwrap().state.height();
+        let med_bps = layer_bps(&t, &states, LayerQuality::Medium);
+        let med_h = state_of(&states, t.by_quality(LayerQuality::Medium).unwrap()).height();
 
         // Budget is 80% of floor cost. current_quality = Low (below floor) so
         // the slot was NOT previously forwarding at the floor → no hysteresis.
         // With no other eligible layer to fall back to, expect Pause.
         let available = bw((med_bps * 0.80) as u64 / 1_000);
         let slots = vec![qos_slot("a", 1080, med_h, 0, &t, LayerQuality::Low)];
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
@@ -3075,11 +3136,9 @@ mod allocation_tests {
     #[test]
     fn desired_bitrate_reads_stable_bitrate_bps_not_reactive() {
         // Use only a single healthy layer so best_healthy is unambiguous.
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         for q in [LayerQuality::Medium, LayerQuality::Low] {
-            t.by_quality(q)
-                .unwrap()
-                .state
+            state_of(&states, t.by_quality(q).unwrap())
                 .update_for_test()
                 .quality(StreamQuality::Bad);
         }
@@ -3088,15 +3147,13 @@ mod allocation_tests {
         let stable_bps: u64 = 900_000;
 
         // Set reactive and stable to different values to distinguish them.
-        t.by_quality(LayerQuality::High)
-            .unwrap()
-            .state
+        state_of(&states, t.by_quality(LayerQuality::High).unwrap())
             .update_for_test()
             .bitrate(reactive_bps) // sets both reactive and stable
             .stable_bitrate(stable_bps); // overrides stable independently
 
         let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
-        let desired = AllocationEngine::desired_bitrate(&slots);
+        let desired = AllocationEngine::desired_bitrate(&slots, &states);
 
         assert!(
             (desired.as_f64() - stable_bps as f64 / (1.0 - AllocationEngine::RESERVE_FRACTION))
@@ -3113,19 +3170,17 @@ mod allocation_tests {
     #[test]
     fn single_slot_single_layer_always_forwards() {
         // Mark Medium and High as bad so only Low is healthy.
-        let t = track_with_bad_layer(LayerQuality::High);
-        t.by_quality(LayerQuality::Medium)
-            .unwrap()
-            .state
+        let (t, states) = track_with_bad_layer(LayerQuality::High);
+        state_of(&states, t.by_quality(LayerQuality::Medium).unwrap())
             .update_for_test()
             .quality(StreamQuality::Bad);
 
-        let low_bps = layer_bps(&t, LayerQuality::Low);
+        let low_bps = layer_bps(&t, &states, LayerQuality::Low);
         let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
 
         // Bandwidth comfortably covers the only healthy layer.
         let available = bw((low_bps * 2.0) as u64 / 1_000);
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -3135,12 +3190,12 @@ mod allocation_tests {
 
     #[test]
     fn always_forward_lowest_layer() {
-        let t = healthy_track();
-        let low_bps = layer_bps(&t, LayerQuality::Low);
+        let (t, states) = healthy_track();
+        let low_bps = layer_bps(&t, &states, LayerQuality::Low);
         let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
         // Budget covers the lowest layer but not the next one up.
         let available = bw((low_bps * 2.0) as u64 / 1_000);
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -3155,20 +3210,18 @@ mod allocation_tests {
     /// (Medium/"h") as the closest-rank fallback.
     #[test]
     fn closest_rank_fallback_when_low_layer_inactive() {
-        let t = healthy_track();
+        let (t, states) = healthy_track();
         // Mark Low/"q" inactive — only High and Medium are publishing.
-        t.by_quality(LayerQuality::Low)
-            .unwrap()
-            .state
+        state_of(&states, t.by_quality(LayerQuality::Low).unwrap())
             .update_for_test()
             .inactive(true);
 
-        let med_bps = layer_bps(&t, LayerQuality::Medium);
+        let med_bps = layer_bps(&t, &states, LayerQuality::Medium);
 
         // Client requests max_height=180 (only the inactive Low would normally fit).
         let slots = sorted(vec![qos_slot("a", 180, 0, 0, &t, LayerQuality::Low)]);
         let available = bw((med_bps * 2.0) as u64 / 1_000);
-        let decisions = AllocationEngine::compute(available, &slots);
+        let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -3177,7 +3230,7 @@ mod allocation_tests {
 
         if let AllocationDecision::Forward(layer, _) = decisions[slots[0].key] {
             assert!(
-                layer.state.is_healthy(),
+                state_of(&states, layer).is_healthy(),
                 "forwarded layer must be healthy; got {:?}",
                 layer.quality
             );
@@ -3186,26 +3239,25 @@ mod allocation_tests {
 
     #[test]
     fn pause_targets_live_h_when_q_is_inactive() {
-        let t = healthy_track();
-        t.by_quality(LayerQuality::Low)
-            .unwrap()
-            .state
+        let (t, states) = healthy_track();
+        state_of(&states, t.by_quality(LayerQuality::Low).unwrap())
             .update_for_test()
             .inactive(true);
 
         let slots = sorted(vec![qos_slot("a", 180, 360, 0, &t, LayerQuality::Low)]);
-        let decisions = AllocationEngine::compute(bw(1), &slots);
+        let decisions = AllocationEngine::compute(bw(1), &slots, &states);
 
         let AllocationDecision::Pause(layer, _) = decisions[slots[0].key] else {
             panic!("insufficient bandwidth must pause the slot");
         };
         assert_eq!(layer.quality, LayerQuality::Medium);
-        assert!(layer.state.is_healthy());
+        assert!(state_of(&states, layer).is_healthy());
     }
 }
 
 #[cfg(test)]
 mod slot_switch_tests {
+    use super::alloc_test_support::*;
     use super::*;
     use crate::entity::ParticipantId;
     use crate::log::LogCtx;
@@ -3243,7 +3295,7 @@ mod slot_switch_tests {
     impl Fixture {
         fn new() -> Self {
             let pid = ParticipantId::new(&mut test_rng());
-            let (_, track) = make_video_track(
+            let (_, track, states) = video_track_with_states(
                 pid,
                 Mid::from("v0"),
                 vec![

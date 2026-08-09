@@ -107,6 +107,16 @@ impl UpstreamAllocator {
         slot.track.process(rid, rtp, sr)
     }
 
+    /// Measurement handles for a published track, to hand along the media path.
+    /// The controller never receives these.
+    pub fn layer_states_for(&self, track_id: TrackId) -> crate::track::TrackStates {
+        self.published_tracks
+            .iter()
+            .find(|t| t.track.meta.id == track_id)
+            .map(|t| t.track.layer_states())
+            .unwrap_or_default()
+    }
+
     pub fn track_id_for_mid(&self, mid: Mid) -> Option<TrackId> {
         self.published_tracks
             .iter()

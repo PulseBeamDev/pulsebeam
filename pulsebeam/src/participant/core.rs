@@ -291,6 +291,7 @@ impl ParticipantCore {
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
+        state: Option<&crate::rtp::monitor::StreamState>,
     ) {
         // Observation for the simulator: media payload actually forwarded to this subscriber,
         // to compare against what it received (i.e. how much of the link was video vs overhead).
@@ -302,7 +303,7 @@ impl ParticipantCore {
         );
         let promoted =
             self.downstream
-                .on_forward_rtp(track_id, pkt, cache, &mut self.stream_writer);
+                .on_forward_rtp(track_id, pkt, cache, state, &mut self.stream_writer);
         if promoted {
             self.signaling.mark_assignments_dirty();
         }
@@ -1052,7 +1053,8 @@ impl ParticipantCore {
             }
 
             if let Some(track) = self.published_tracks.get(&track_id) {
-                events.publish_track(track.clone());
+                let states = self.upstream.layer_states_for(track_id);
+                events.publish_track(track.clone(), states);
                 state.in_topology = true;
             }
             return;

@@ -137,6 +137,14 @@ pub enum CrossShardEvent {
         env: Envelope,
         payload: MediaPayload,
     },
+    /// Publisher shard → destination shard: the measurement handles for a
+    /// track the destination is about to receive. Sent on the control lane
+    /// because it must not be dropped, and shard-to-shard because the
+    /// controller must never hold media-path state.
+    TrackStates {
+        track_id: TrackId,
+        states: crate::track::TrackStates,
+    },
     /// Subscriber shard → Publisher shard: keyframe request.
     KeyframeRequested(GlobalKeyframeRequest),
     /// A UDP packet batch arrived on this shard but the participant lives elsewhere.

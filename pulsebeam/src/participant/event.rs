@@ -5,7 +5,7 @@ use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
 pub trait ParticipantSink {
     fn subscribe(&mut self, track: TrackMeta);
     fn unsubscribe(&mut self, track: TrackMeta);
-    fn publish_track(&mut self, track: Track);
+    fn publish_track(&mut self, track: Track, states: crate::track::TrackStates);
     fn unpublish_track(&mut self, track_id: TrackId);
     fn subscribe_data_topic(
         &mut self,
@@ -72,7 +72,7 @@ pub mod test_utils {
             self.unsubscribe_calls.push(track);
         }
 
-        fn publish_track(&mut self, track: Track) {
+        fn publish_track(&mut self, track: Track, _states: crate::track::TrackStates) {
             self.publish_track_calls.push(track.meta.id);
         }
 

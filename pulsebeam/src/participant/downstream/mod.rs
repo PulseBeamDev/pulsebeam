@@ -319,9 +319,10 @@ impl DownstreamAllocator {
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
+        state: Option<&crate::rtp::monitor::StreamState>,
         writer: &mut StreamWriter,
     ) -> bool {
-        self.video.on_rtp(track_id, pkt, cache, writer)
+        self.video.on_rtp(track_id, pkt, cache, state, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.

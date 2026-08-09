@@ -48,7 +48,7 @@ pub enum ParticipantLifecycleEvent {
 }
 
 pub enum ParticipantControlEvent {
-    TrackPublished(Track),
+    TrackPublished(Track, crate::track::TrackStates),
     TrackUnpublished {
         origin: ParticipantId,
         track_id: TrackId,
@@ -197,11 +197,11 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_track(&mut self, track: Track) {
+    fn publish_track(&mut self, track: Track, states: crate::track::TrackStates) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::TrackPublished(track),
+                ParticipantControlEvent::TrackPublished(track, states),
             ));
     }
 

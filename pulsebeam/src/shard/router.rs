@@ -12,6 +12,7 @@ use crate::audio_selector::TopNAudioSelector;
 use crate::clock::WallAnchor;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
+use crate::rtp::monitor::StreamState;
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::{Topic, Track, TrackMeta};
 use tokio::time::Instant;
@@ -55,6 +56,7 @@ pub(crate) trait RoutingContext: ShardTransport {
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&TrackStreamCache>,
+        state: Option<&StreamState>,
     );
     fn forward_audio_rtp(
         &mut self,
@@ -214,6 +216,10 @@ impl DataStreamRoute {
 
 pub(crate) struct TrackRoute {
     pub subscribers: Vec<ParticipantHandle>,
+    /// Measurement handles for the publisher's encodings. Reaches this shard
+    /// along the media path — from the local publisher, or from the publisher's
+    /// shard on subscribe — never through the controller.
+    layer_states: crate::track::TrackStates,
     /// Acknowledged sender handles, one per destination shard. A destination
     /// only appears here once it has installed its route, so the presence of a
     /// handle is what permits media to flow.
@@ -222,9 +228,17 @@ pub(crate) struct TrackRoute {
 }
 
 impl TrackRoute {
+    fn state_for(&self, rid: Option<Rid>) -> Option<&StreamState> {
+        self.layer_states
+            .iter()
+            .find(|(r, _)| *r == rid)
+            .map(|(_, s)| s)
+    }
+
     fn new() -> Self {
         Self {
             subscribers: Vec::with_capacity(256),
+            layer_states: Vec::new(),
             remote_routes: Vec::new(),
             cache: TrackStreamCache::new(),
         }
@@ -330,6 +344,21 @@ impl ShardRoutingTable {
         if room.members.is_empty() && room.remote_shards.is_empty() {
             self.rooms.remove(&room_id);
         }
+    }
+
+    /// Record measurement handles for a track this shard will deliver.
+    pub fn set_layer_states(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
+        self.tracks
+            .entry(track_id)
+            .or_insert_with(TrackRoute::new)
+            .layer_states = states;
+    }
+
+    pub fn layer_states(&self, track_id: TrackId) -> crate::track::TrackStates {
+        self.tracks
+            .get(&track_id)
+            .map(|r| r.layer_states.clone())
+            .unwrap_or_default()
     }
 
     pub fn remote_shard_for(&self, participant_id: &ParticipantId) -> Option<ShardId> {
@@ -1172,8 +1201,15 @@ impl ShardRoutingTable {
             return;
         };
         route.cache.push(pkt);
+        let state = route.state_for(pkt.ext_vals.rid).cloned();
         for &subscriber in &route.subscribers {
-            ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache));
+            ctx.forward_video_rtp(
+                subscriber,
+                track_id,
+                pkt,
+                Some(&route.cache),
+                state.as_ref(),
+            );
         }
         for remote in &mut route.remote_routes {
             let env = remote.next_envelope(ctx.wall().to_ntp(pkt.playout_time));
@@ -1392,7 +1428,7 @@ pub(crate) fn route_participant_control_event(
     router: &impl ShardTransport,
 ) {
     match ev {
-        ParticipantControlEvent::TrackPublished(track) => {
+        ParticipantControlEvent::TrackPublished(track, _states) => {
             shard_events.push_back(ShardEvent::TrackPublished(track));
         }
         ParticipantControlEvent::TrackUnpublished { origin, track_id } => {
@@ -1530,6 +1566,7 @@ mod tests {
             _track_id: TrackId,
             _pkt: &RtpPacket,
             _cache: Option<&TrackStreamCache>,
+            _state: Option<&StreamState>,
         ) {
             self.forwarded_video
                 .borrow_mut()

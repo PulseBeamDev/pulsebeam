@@ -58,9 +58,10 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
+        state: Option<&crate::rtp::monitor::StreamState>,
     ) {
         if let Some(p) = self.registry.resolve_mut(subscriber) {
-            p.on_forward_rtp(track_id, pkt, cache);
+            p.on_forward_rtp(track_id, pkt, cache, state);
             self.dirty.mark(subscriber, p);
         }
     }
@@ -582,6 +583,13 @@ impl ShardCore {
                             self.routing
                                 .route_reliable_control(publisher, &topic, &bytes, &mut ctx);
                         }
+                        ParticipantControlEvent::TrackPublished(track, states) => {
+                            // Keep the handles on this shard; only the stateless
+                            // descriptor continues to the controller.
+                            self.routing.set_layer_states(track.meta.id, states);
+                            self.pipeline
+                                .push_shard_event(ShardEvent::TrackPublished(track));
+                        }
                         ev => {
                             router::route_participant_control_event(
                                 ev,
@@ -750,10 +758,20 @@ impl ShardCore {
                 // The destination allocated and installed this route in its own
                 // table; receiving the handle is the acknowledgement that lets
                 // media start flowing to it.
+                let track_id = track.id;
                 self.routing.register_remote_subscriber_shard(
                     RemoteRoute::new(from_shard_id, route, epoch),
                     track,
                 );
+                // The destination needs the publisher's measurement handles, and
+                // they must not travel via the controller.
+                let states = self.routing.layer_states(track_id);
+                if !states.is_empty() {
+                    router.send_control(
+                        from_shard_id,
+                        CrossShardEvent::TrackStates { track_id, states },
+                    );
+                }
             }
             ClusterCommand::UnsubscribeTrack {
                 from_shard_id,
@@ -875,6 +893,9 @@ impl ShardCore {
         router: &impl ShardTransport,
     ) {
         match ev {
+            CrossShardEvent::TrackStates { track_id, states } => {
+                self.routing.set_layer_states(track_id, states);
+            }
             CrossShardEvent::Media { env, payload } => {
                 self.on_media_frame(env, payload, router);
             }

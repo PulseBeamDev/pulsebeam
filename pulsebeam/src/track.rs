@@ -285,6 +285,11 @@ impl UpstreamTrack {
     pub fn poll_stats(&mut self, now: Instant) {
         self.monitor.poll(now);
     }
+
+    /// This track's measurement handles, to hand along the media path.
+    pub fn layer_states(&self) -> TrackStates {
+        self.monitor.layer_states()
+    }
 }
 
 /// The whole-track monitor: every simulcast encoding of one upstream track,
@@ -337,6 +342,13 @@ impl TrackMonitor {
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
         self.encodings.iter_mut().find(|s| s.rid == *rid)
+    }
+
+    pub fn layer_states(&self) -> TrackStates {
+        self.encodings
+            .iter()
+            .map(|e| (e.rid, e.monitor.shared_state().clone()))
+            .collect()
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -399,10 +411,10 @@ impl Track {
     /// lowest when no layer is healthy yet. Prefer this over `lowest_quality`
     /// when staging an initial layer so the slot can actually receive a keyframe
     /// (an inactive layer never produces packets and the slot would stall).
-    pub fn lowest_healthy_quality(&self) -> &TrackLayer {
+    pub fn lowest_healthy_quality(&self, is_healthy: impl Fn(&TrackLayer) -> bool) -> &TrackLayer {
         self.layers
             .iter()
-            .filter(|l| l.state.is_healthy())
+            .filter(|l| is_healthy(l))
             .min_by_key(|l| l.quality)
             .unwrap_or_else(|| self.lowest_quality())
     }
@@ -426,14 +438,21 @@ impl Track {
     }
 }
 
+/// A track's shape as it crosses a shard or the control plane: no measurement
+/// handles, so the controller never holds media-path state. Consumers get the
+/// measurements separately, keyed by [`StreamId`].
 #[derive(Clone, Debug)]
 pub struct TrackLayer {
     pub meta: TrackMeta,
     pub rid: Option<Rid>,
     pub quality: LayerQuality,
-    // pub keyframe_requester: KeyframeRequester,
-    pub state: StreamState,
 }
+
+/// The per-encoding measurement handles for one track.
+///
+/// Travels the media path only — participant to its shard, then shard to shard
+/// — never through the controller.
+pub type TrackStates = Vec<(Option<Rid>, StreamState)>;
 
 impl Eq for TrackLayer {}
 
@@ -539,7 +558,6 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             meta: meta.clone(),
             rid,
             quality,
-            state: stream_state,
         });
     }
     senders.sort_by_key(|e| std::cmp::Reverse(e.quality));
