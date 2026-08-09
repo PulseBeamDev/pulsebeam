@@ -303,14 +303,14 @@ impl NodeBuilder {
 
         let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
         let mut shard_handles = Vec::new();
-        let mut cross_shard_event_txs = Vec::new();
-        let mut cross_shard_event_rxs = Vec::new();
+        let mut frame_txs = Vec::new();
+        let mut frame_rxs = Vec::new();
         let use_shared_runtime = matches!(self.worker_execution, WorkerExecution::SharedRuntime);
         for _ in 0..udp_sockets.len() {
             // TODO: should cross shard channel capacities this big?
             let (tx, rx) = mailbox::new(1024);
-            cross_shard_event_txs.push(tx);
-            cross_shard_event_rxs.push(rx);
+            frame_txs.push(tx);
+            frame_rxs.push(rx);
         }
 
         let mut rng = self.rng.ok_or_else(|| {
@@ -335,17 +335,17 @@ impl NodeBuilder {
 
         let mut shard_contexts = Vec::new();
 
-        for (shard_idx, (((udp_sock, tcp_sock), cross_shard_event_rx), shard_rng)) in udp_sockets
+        for (shard_idx, (((udp_sock, tcp_sock), frame_rx), shard_rng)) in udp_sockets
             .into_iter()
             .zip(tcp_sockets.into_iter())
-            .zip(cross_shard_event_rxs)
+            .zip(frame_rxs)
             .zip(shard_rngs)
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
-            let cross_shard_event_txs = cross_shard_event_txs.clone();
+            let frame_txs = frame_txs.clone();
             let occupancy = Arc::new(ShardMetrics::new());
             let shard_occupancy = Arc::new(ShardMetrics::new());
             let shard_streams = streams.clone();
@@ -357,8 +357,8 @@ impl NodeBuilder {
                     tcp_sock,
                     shard_command_rx,
                     shard_event_tx,
-                    cross_shard_event_rx,
-                    cross_shard_event_txs,
+                    frame_rx,
+                    frame_txs,
                     shard_occupancy,
                     shard_rng,
                     wall_anchor,
@@ -389,8 +389,8 @@ impl NodeBuilder {
                                 tcp_sock,
                                 shard_command_rx,
                                 shard_event_tx,
-                                cross_shard_event_rx,
-                                cross_shard_event_txs,
+                                frame_rx,
+                                frame_txs,
                                 shard_occupancy,
                                 shard_rng,
                                 wall_anchor,

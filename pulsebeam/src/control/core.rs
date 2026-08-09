@@ -5,7 +5,7 @@ use crate::{
     entity::{ParticipantId, RoomId},
     id::ShardId,
     participant::ParticipantConfig,
-    shard::worker::{ClusterCommand, ShardCommand, ShardEvent, ShardEventWrapper},
+    shard::worker::{ShardCommand, ShardEvent, ShardEventWrapper, Topology},
 };
 use str0m::Rtc;
 
@@ -14,18 +14,20 @@ const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 
 #[derive(Debug)]
 pub enum ControllerEvent {
-    ShardCommandBroadcasted(ClusterCommand),
     ShardCommandSent(ShardId, ShardCommand),
 }
 
 pub struct ControllerEventQueue {
     queue: VecDeque<ControllerEvent>,
+    shard_count: usize,
 }
 
 impl ControllerEventQueue {
-    pub fn default() -> Self {
+    pub fn new(shard_count: usize) -> Self {
+        debug_assert!(shard_count > 0);
         Self {
             queue: VecDeque::with_capacity(1024),
+            shard_count,
         }
     }
 
@@ -37,18 +39,28 @@ impl ControllerEventQueue {
         self.queue.pop_front()
     }
 
-    pub fn broadcast(&mut self, cmd: ClusterCommand) {
-        self.push(ControllerEvent::ShardCommandBroadcasted(cmd));
+    /// Send one command to every shard, built fresh per shard rather than
+    /// cloned: the targeted variants own an `Rtc` or a socket and cannot be.
+    pub fn broadcast(&mut self, mut build: impl FnMut() -> ShardCommand) {
+        for index in 0..self.shard_count {
+            let cmd = build();
+            self.push(ControllerEvent::ShardCommandSent(ShardId::new(index), cmd));
+        }
     }
 
     pub fn send(&mut self, shard_id: ShardId, cmd: ShardCommand) {
         self.push(ControllerEvent::ShardCommandSent(shard_id, cmd));
     }
 
-    pub fn send_cluster(&mut self, shard_id: ShardId, cmd: ClusterCommand) {
+    /// Relay a topology change to one shard, stamping who raised it. The
+    /// controller adds nothing else — it only decides who hears about it.
+    pub fn relay(&mut self, shard_id: ShardId, from_shard_id: ShardId, topology: Topology) {
         self.push(ControllerEvent::ShardCommandSent(
             shard_id,
-            ShardCommand::Cluster(cmd),
+            ShardCommand::Relay {
+                from_shard_id,
+                topology,
+            },
         ));
     }
 }
@@ -73,10 +85,7 @@ impl ControllerCore {
                 };
 
                 for shard_id in other_participants {
-                    eq.send_cluster(
-                        shard_id,
-                        ClusterCommand::PublishTrack(track.clone(), room_id),
-                    );
+                    eq.send(shard_id, ShardCommand::PublishTrack(track.clone(), room_id));
                 }
             }
             ShardEvent::TrackUnpublished { origin, track_id } => {
@@ -88,9 +97,9 @@ impl ControllerCore {
 
                 let track_ids = vec![track_id];
                 for shard_id in other_participants {
-                    eq.send_cluster(
+                    eq.send(
                         shard_id,
-                        ClusterCommand::UnpublishTracks {
+                        ShardCommand::UnpublishTracks {
                             room_id,
                             origin,
                             track_ids: track_ids.clone(),
@@ -102,154 +111,31 @@ impl ControllerCore {
             ShardEvent::ParticipantExited(participant_id) => {
                 self.delete_participant(&participant_id, eq);
             }
-            ShardEvent::KeyframeRequest(req) => {
-                let Some(meta) = self.registry.get_participant(&req.origin) else {
-                    tracing::warn!(origin = %req.origin, track = ?req.stream_id.0, "KeyframeRequest: origin participant not found in controller");
-                    return;
-                };
-                eq.send_cluster(meta.shard_id, ClusterCommand::RequestKeyframe(req))
-            }
-
-            ShardEvent::TrackSubscribed {
-                track,
-                route,
-                epoch,
-            } => {
-                // Forward the destination's handle to the publisher. This is
-                // the acknowledgement step: only now may media flow.
-                eq.send_cluster(
-                    track.shard_id,
-                    ClusterCommand::SubscribeTrack {
-                        from_shard_id: e.from_shard_id,
-                        track,
-                        route,
-                        epoch,
-                    },
-                );
-            }
-            ShardEvent::TrackUnsubscribed(track) => {
-                eq.send_cluster(
-                    track.shard_id,
-                    ClusterCommand::UnsubscribeTrack {
-                        from_shard_id: e.from_shard_id,
-                        track,
-                    },
-                );
-            }
-            ShardEvent::DataTopicSubscribed {
-                room_id,
-                topic,
-                publisher,
-                route,
-                epoch,
-            } => {
-                if let Some(room) = self.registry.get_room(&room_id) {
-                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
-                        eq.send_cluster(
-                            shard_id,
-                            ClusterCommand::SubscribeDataTopic {
-                                room_id,
-                                from_shard_id: e.from_shard_id,
-                                topic: topic.clone(),
-                                publisher,
-                                route,
-                                epoch,
-                            },
-                        );
+            // Every remaining topology change is relayed verbatim; the only
+            // decision left is who hears it.
+            ShardEvent::Relay(topology) => {
+                let from = e.from_shard_id;
+                match &topology {
+                    Topology::TrackSubscribed { track, .. }
+                    | Topology::TrackUnsubscribed { track } => {
+                        // Straight to the publisher's shard. For a subscribe this
+                        // is the acknowledgement: only now may media flow.
+                        eq.relay(track.shard_id, from, topology);
                     }
-                }
-            }
-            ShardEvent::ReliableTopicSubscribed {
-                room_id,
-                topic,
-                publisher,
-                route,
-                epoch,
-            } => {
-                if let Some(room) = self.registry.get_room(&room_id) {
-                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
-                        eq.send_cluster(
-                            shard_id,
-                            ClusterCommand::SubscribeReliableTopic {
-                                room_id,
-                                from_shard_id: e.from_shard_id,
-                                topic: topic.clone(),
-                                publisher,
-                                route,
-                                epoch,
-                            },
-                        );
-                    }
-                }
-            }
-            ShardEvent::ReliableTopicUnsubscribed { room_id, topic } => {
-                if let Some(room) = self.registry.get_room(&room_id) {
-                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
-                        eq.send_cluster(
-                            shard_id,
-                            ClusterCommand::UnsubscribeReliableTopic {
-                                room_id,
-                                from_shard_id: e.from_shard_id,
-                                topic: topic.clone(),
-                            },
-                        );
-                    }
-                }
-            }
-            ShardEvent::ReliableTopicPublished {
-                room_id,
-                publisher,
-                topic,
-            } => {
-                if let Some(room) = self.registry.get_room(&room_id) {
-                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
-                        eq.send_cluster(
-                            shard_id,
-                            ClusterCommand::ReliableTopicPublished {
-                                room_id,
-                                publisher,
-                                topic: topic.clone(),
-                            },
-                        );
-                    }
-                }
-            }
-            ShardEvent::DataTopicPublished {
-                room_id,
-                publisher,
-                topic,
-            } => {
-                // Wildcard destinations resolve this into a concrete route and
-                // hand the handle back as a DataTopicSubscribed.
-                if let Some(room) = self.registry.get_room(&room_id) {
-                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
-                        eq.send_cluster(
-                            shard_id,
-                            ClusterCommand::DataTopicPublished {
-                                room_id,
-                                publisher,
-                                topic: topic.clone(),
-                            },
-                        );
-                    }
-                }
-            }
-            ShardEvent::DataTopicUnsubscribed {
-                room_id,
-                topic,
-                publisher,
-            } => {
-                if let Some(room) = self.registry.get_room(&room_id) {
-                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
-                        eq.send_cluster(
-                            shard_id,
-                            ClusterCommand::UnsubscribeDataTopic {
-                                room_id,
-                                from_shard_id: e.from_shard_id,
-                                topic: topic.clone(),
-                                publisher,
-                            },
-                        );
+                    Topology::DataTopicSubscribed { room_id, .. }
+                    | Topology::DataTopicUnsubscribed { room_id, .. }
+                    | Topology::DataTopicPublished { room_id, .. }
+                    | Topology::ReliableTopicSubscribed { room_id, .. }
+                    | Topology::ReliableTopicUnsubscribed { room_id, .. }
+                    | Topology::ReliableTopicPublished { room_id, .. } => {
+                        let room_id = *room_id;
+                        let Some(room) = self.registry.get_room(&room_id) else {
+                            return;
+                        };
+                        let recipients: Vec<ShardId> = room.recipient_shard_ids(from).collect();
+                        for shard_id in recipients {
+                            eq.relay(shard_id, from, topology.clone());
+                        }
                     }
                 }
             }
@@ -305,7 +191,7 @@ impl ControllerCore {
         };
         // Collect track IDs before removing from registry so we can notify all shards.
         let tracks: Vec<_> = room.tracks_published_by(participant_id);
-        let track_ids = tracks.iter().map(|t| t.meta.id).collect();
+        let track_ids: Vec<_> = tracks.iter().map(|t| t.meta.id).collect();
         let shard_id = meta.shard_id;
         let room_id = meta.room_id;
 
@@ -315,16 +201,16 @@ impl ControllerCore {
                 ShardCommand::RemoveParticipant(*participant_id),
             );
         }
-        eq.broadcast(ClusterCommand::UnregisterParticipant {
+        eq.broadcast(|| ShardCommand::UnregisterParticipant {
             shard_id,
             room_id,
             participant_id: *participant_id,
         });
         if !tracks.is_empty() {
-            eq.broadcast(ClusterCommand::UnpublishTracks {
+            eq.broadcast(|| ShardCommand::UnpublishTracks {
                 room_id,
                 origin: *participant_id,
-                track_ids,
+                track_ids: track_ids.clone(),
             });
         }
     }
@@ -336,7 +222,6 @@ mod tests {
     use crate::{
         entity::{ExternalRoomId, ParticipantId, RoomId, TrackKind},
         route::RouteId,
-        shard::worker::ClusterCommand,
         track::TrackMeta,
     };
 
@@ -360,70 +245,80 @@ mod tests {
     #[test]
     fn track_subscribed_routes_subscribe_command() {
         let mut core = ControllerCore::new();
-        let mut eq = ControllerEventQueue::default();
+        let mut eq = ControllerEventQueue::new(4);
         let track = track_meta(pid(1), ShardId::new(7));
 
         core.process_shard_event(
             ShardEventWrapper {
                 from_shard_id: ShardId::new(3),
-                ev: ShardEvent::TrackSubscribed {
+                ev: ShardEvent::Relay(Topology::TrackSubscribed {
                     track: track.clone(),
                     route: RouteId::new(0),
                     epoch: 0,
-                },
+                }),
             },
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
-            eq.pop()
+        let Some(ControllerEvent::ShardCommandSent(
+            shard_id,
+            ShardCommand::Relay {
+                from_shard_id,
+                topology,
+            },
+        )) = eq.pop()
         else {
-            panic!("expected one cluster command");
+            panic!("expected one relayed topology change");
         };
 
         assert_eq!(shard_id, track.shard_id);
+        assert_eq!(from_shard_id, ShardId::new(3));
         assert!(matches!(
-            cmd,
-            ClusterCommand::SubscribeTrack { from_shard_id, track: routed, route, epoch }
-                if from_shard_id == ShardId::new(3)
-                    && routed == track
-                    && route == RouteId::new(0)
-                    && epoch == 0
+            topology,
+            Topology::TrackSubscribed { track: routed, route, epoch }
+                if routed == track && route == RouteId::new(0) && epoch == 0
         ));
     }
 
     #[test]
     fn track_unsubscribed_routes_unsubscribe_command() {
         let mut core = ControllerCore::new();
-        let mut eq = ControllerEventQueue::default();
+        let mut eq = ControllerEventQueue::new(4);
         let track = track_meta(pid(2), ShardId::new(9));
 
         core.process_shard_event(
             ShardEventWrapper {
                 from_shard_id: ShardId::new(4),
-                ev: ShardEvent::TrackUnsubscribed(track.clone()),
+                ev: ShardEvent::Relay(Topology::TrackUnsubscribed {
+                    track: track.clone(),
+                }),
             },
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
-            eq.pop()
+        let Some(ControllerEvent::ShardCommandSent(
+            shard_id,
+            ShardCommand::Relay {
+                from_shard_id,
+                topology,
+            },
+        )) = eq.pop()
         else {
-            panic!("expected one cluster command");
+            panic!("expected one relayed topology change");
         };
 
         assert_eq!(shard_id, track.shard_id);
+        assert_eq!(from_shard_id, ShardId::new(4));
         assert!(matches!(
-            cmd,
-            ClusterCommand::UnsubscribeTrack { from_shard_id, track: routed }
-                if from_shard_id == ShardId::new(4) && routed == track
+            topology,
+            Topology::TrackUnsubscribed { track: routed } if routed == track
         ));
     }
 
     #[test]
     fn track_published_targets_existing_participant_shards_once() {
         let mut core = ControllerCore::new();
-        let mut eq = ControllerEventQueue::default();
+        let mut eq = ControllerEventQueue::new(4);
         let room = room_id(1);
         let publisher = pid(10);
         let subscriber_a = pid(11);
@@ -453,15 +348,13 @@ mod tests {
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
-            eq.pop()
-        else {
-            panic!("expected publish cluster command");
+        let Some(ControllerEvent::ShardCommandSent(shard_id, cmd)) = eq.pop() else {
+            panic!("expected a publish command");
         };
 
         assert_eq!(shard_id, ShardId::new(2));
         assert!(
-            matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
+            matches!(cmd, ShardCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
         );
         assert!(eq.pop().is_none());
     }
@@ -469,7 +362,7 @@ mod tests {
     #[test]
     fn track_unpublished_targets_existing_participant_shards_once() {
         let mut core = ControllerCore::new();
-        let mut eq = ControllerEventQueue::default();
+        let mut eq = ControllerEventQueue::new(4);
         let room = room_id(4);
         let publisher = pid(40);
         let subscriber_a = pid(41);
@@ -512,16 +405,14 @@ mod tests {
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
-            eq.pop()
-        else {
-            panic!("expected unpublish cluster command");
+        let Some(ControllerEvent::ShardCommandSent(shard_id, cmd)) = eq.pop() else {
+            panic!("expected an unpublish command");
         };
 
         assert_eq!(shard_id, ShardId::new(2));
         assert!(matches!(
             cmd,
-            ClusterCommand::UnpublishTracks { room_id, origin, track_ids }
+            ShardCommand::UnpublishTracks { room_id, origin, track_ids }
                 if room_id == room && origin == publisher && track_ids == vec![track_id]
         ));
         assert!(eq.pop().is_none());
@@ -530,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn delete_participant_broadcasts_scoped_unregister() {
         let mut core = ControllerCore::new();
-        let mut eq = ControllerEventQueue::default();
+        let mut eq = ControllerEventQueue::new(4);
         let room = room_id(2);
         let participant = pid(20);
 
@@ -548,23 +439,31 @@ mod tests {
         assert_eq!(shard_id, ShardId::new(6));
         assert_eq!(removed, participant);
 
-        let Some(ControllerEvent::ShardCommandBroadcasted(ClusterCommand::UnregisterParticipant {
-            shard_id,
-            room_id,
-            participant_id,
-        })) = eq.pop()
-        else {
-            panic!("expected scoped unregister broadcast");
-        };
-        assert_eq!(shard_id, ShardId::new(6));
-        assert_eq!(room_id, room);
-        assert_eq!(participant_id, participant);
+        // A broadcast is one targeted command per shard now, so every shard
+        // sees the same unregister.
+        for expected in 0..4 {
+            let Some(ControllerEvent::ShardCommandSent(
+                to,
+                ShardCommand::UnregisterParticipant {
+                    shard_id,
+                    room_id,
+                    participant_id,
+                },
+            )) = eq.pop()
+            else {
+                panic!("expected an unregister for every shard");
+            };
+            assert_eq!(to, ShardId::new(expected));
+            assert_eq!(shard_id, ShardId::new(6));
+            assert_eq!(room_id, room);
+            assert_eq!(participant_id, participant);
+        }
     }
 
     #[test]
     fn track_published_targets_latest_subscriber_shard_after_move() {
         let mut core = ControllerCore::new();
-        let mut eq = ControllerEventQueue::default();
+        let mut eq = ControllerEventQueue::new(4);
         let room = room_id(3);
         let publisher = pid(30);
         let subscriber = pid(31);
@@ -593,15 +492,13 @@ mod tests {
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
-            eq.pop()
-        else {
-            panic!("expected publish cluster command");
+        let Some(ControllerEvent::ShardCommandSent(shard_id, cmd)) = eq.pop() else {
+            panic!("expected a publish command");
         };
 
         assert_eq!(shard_id, ShardId::new(2));
         assert!(
-            matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
+            matches!(cmd, ShardCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
         );
         assert!(eq.pop().is_none());
     }

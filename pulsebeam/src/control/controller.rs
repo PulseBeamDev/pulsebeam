@@ -12,7 +12,7 @@ use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},
     shard::{
         ShardContext,
-        worker::{ClusterCommand, ShardCommand, ShardEventWrapper},
+        worker::{ShardCommand, ShardEventWrapper},
     },
 };
 use pulsebeam_runtime::mailbox;
@@ -110,13 +110,14 @@ impl ControllerActor {
         candidates: Vec<Candidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
     ) -> Self {
+        let shard_count = shard_contexts.len();
         let router = ShardRouter::new(shard_contexts, &mut rng);
 
         Self {
             router,
             core: ControllerCore::new(),
             negotiator: Negotiator::new(candidates),
-            eq: ControllerEventQueue::default(),
+            eq: ControllerEventQueue::new(shard_count),
             tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
@@ -215,7 +216,6 @@ impl ControllerActor {
     async fn drain_core_events(&mut self) {
         while let Some(ev) = self.eq.pop() {
             match ev {
-                ControllerEvent::ShardCommandBroadcasted(cmd) => self.router.broadcast(cmd).await,
                 ControllerEvent::ShardCommandSent(shard_id, cmd) => {
                     self.router.send(shard_id, cmd).await
                 }
@@ -297,7 +297,7 @@ impl ControllerActor {
         let (rtc, answer) = self.negotiator.create_answer(offer, creds)?;
         let cfg = self.core.create_participant(rtc, state, shard_id);
 
-        self.eq.broadcast(ClusterCommand::RegisterParticipant {
+        self.eq.broadcast(|| ShardCommand::RegisterParticipant {
             shard_id,
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,

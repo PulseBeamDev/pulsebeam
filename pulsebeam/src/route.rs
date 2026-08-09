@@ -10,7 +10,7 @@ use tokio::time::{Duration, Instant};
 use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::shard::participants::ParticipantHandle;
-use crate::track::Topic;
+use crate::track::{DataLane, Topic};
 
 pub const ENVELOPE_LEN: usize = 16;
 pub const ENVELOPE_VERSION: u8 = 1;
@@ -195,17 +195,16 @@ pub(crate) enum RouteAction {
         origin: ParticipantId,
         track_id: TrackId,
     },
-    /// One route per (publisher, topic, destination). The destination installs
-    /// it whether the local subscription named a publisher or was a wildcard —
-    /// wildcards resolve to concrete streams as publishers are announced.
-    Sctp {
-        room_id: RoomId,
-        origin: ParticipantId,
-        topic: Topic,
-    },
-    /// Reliable data. A reliable subscription names only a topic, so these
-    /// routes are created as publishers on that topic are announced.
-    Reliable {
+    /// One route per (publisher, topic, lane, destination). The destination
+    /// installs it whether the local subscription named a publisher or was a
+    /// wildcard — wildcards resolve to concrete streams as publishers are
+    /// announced.
+    ///
+    /// `lane` is the client's channel semantics and lives only here, in the
+    /// compiled plan. It never rides a frame: the destination already knows it,
+    /// and it says nothing about how this hop is delivered.
+    Data {
+        lane: DataLane,
         room_id: RoomId,
         origin: ParticipantId,
         topic: Topic,

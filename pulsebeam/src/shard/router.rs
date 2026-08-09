@@ -17,10 +17,10 @@ use crate::id::{AudioSelectorSlotId, ShardId};
 use crate::rtp::monitor::StreamState;
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::stream_registry::StreamRegistry;
-use crate::track::{Topic, Track, TrackMeta};
+use crate::track::{DataLane, Topic, Track, TrackMeta};
 use tokio::time::Instant;
 
-use super::worker::{CrossShardEvent, MediaPayload, ShardEvent};
+use super::worker::{MediaPayload, ShardEvent, ShardFrame, Topology};
 use crate::route::{
     Envelope, ImportEffect, ImportTable, RemoteRoute, RouteAction, RouteId, RouteNames, RouteTable,
 };
@@ -42,14 +42,20 @@ fn fast_set_with_capacity<T>(cap: usize) -> FastIndexSet<T> {
 /// becomes a UDP datagram, while semantic control is low-rate and
 /// correctness-critical and becomes a reliable gRPC call. Swapping in UDP means
 /// reimplementing `send_media` alone.
+/// The one way a shard reaches another shard.
+///
+/// Both methods are best-effort — that is the whole contract of this lane.
+/// Anything that must not be dropped goes to the controller instead, which is
+/// why there is no third method here.
 pub(crate) trait ShardTransport {
     fn shard_id(&self) -> ShardId;
 
-    /// Route-addressed media. Lossy by contract.
+    /// Route-addressed payload. Split out from [`Self::send_frame`] only to
+    /// keep the per-packet path from building an enum it would immediately
+    /// destructure.
     fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload);
 
-    /// Reverse and topology control. Must not be dropped.
-    fn send_control(&self, dst: ShardId, ev: CrossShardEvent);
+    fn send_frame(&self, dst: ShardId, frame: ShardFrame);
 }
 
 pub(crate) trait RoutingContext: ShardTransport {
@@ -518,11 +524,11 @@ impl ShardRoutingTable {
             .inspect_err(|err| tracing::error!(?err, "route install failed"))
             .ok()?;
         self.imports.on_installed(&track.id, route, epoch);
-        Some(ShardEvent::TrackSubscribed {
+        Some(ShardEvent::Relay(Topology::TrackSubscribed {
             track,
             route,
             epoch,
-        })
+        }))
     }
 
     /// Returns a `ShardEvent` iff this was the *last* local subscriber, so
@@ -551,7 +557,7 @@ impl ShardRoutingTable {
         entry
             .subscribers
             .is_empty()
-            .then_some(ShardEvent::TrackUnsubscribed(track))
+            .then_some(ShardEvent::Relay(Topology::TrackUnsubscribed { track }))
     }
 
     pub fn handle_topology_event(
@@ -648,13 +654,13 @@ impl ShardRoutingTable {
                 }
                 // The local fanout entry exists before the route is installed.
                 let installed = self.install_data_route(room_id, publisher, &topic, now, wall);
-                Some(ShardEvent::DataTopicSubscribed {
+                Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     room_id,
                     topic,
                     publisher: Some(publisher),
                     route: installed.map(|(r, _)| r),
                     epoch: installed.map_or(0, |(_, e)| e),
-                })
+                }))
             }
             None => {
                 let subscribers = room
@@ -676,13 +682,13 @@ impl ShardRoutingTable {
                 // arrive as announcements once the publisher shard learns of
                 // this wildcard subscription.
                 let _ = already_published;
-                was_empty.then_some(ShardEvent::DataTopicSubscribed {
+                was_empty.then_some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     room_id,
                     topic,
                     publisher: None,
                     route: None,
                     epoch: 0,
-                })
+                }))
             }
         }
     }
@@ -968,7 +974,8 @@ impl ShardRoutingTable {
         let installed = self
             .routes
             .install(
-                RouteAction::Sctp {
+                RouteAction::Data {
+                    lane: DataLane::Realtime,
                     room_id,
                     origin: publisher,
                     topic: topic.clone(),
@@ -1017,13 +1024,13 @@ impl ShardRoutingTable {
             return None;
         }
         let (route, epoch) = self.install_data_route(room_id, publisher, topic, now, wall)?;
-        Some(ShardEvent::DataTopicSubscribed {
+        Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
             room_id,
             topic: topic.clone(),
             publisher: Some(publisher),
             route: Some(route),
             epoch,
-        })
+        }))
     }
 
     fn install_reliable_route(
@@ -1041,7 +1048,8 @@ impl ShardRoutingTable {
         let installed = self
             .routes
             .install(
-                RouteAction::Reliable {
+                RouteAction::Data {
+                    lane: DataLane::Reliable,
                     room_id,
                     origin: publisher,
                     topic: topic.clone(),
@@ -1080,13 +1088,13 @@ impl ShardRoutingTable {
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.reliable.mark_imported(publisher, topic.clone());
         }
-        Some(ShardEvent::ReliableTopicSubscribed {
+        Some(ShardEvent::Relay(Topology::ReliableTopicSubscribed {
             room_id,
             topic: topic.clone(),
             publisher: Some(publisher),
             route: Some(route),
             epoch,
-        })
+        }))
     }
 
     /// Record a destination's handle for a reliable stream, or register its
@@ -1170,11 +1178,11 @@ impl ShardRoutingTable {
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.audio_imports.insert(meta.id);
         }
-        Some(ShardEvent::TrackSubscribed {
+        Some(ShardEvent::Relay(Topology::TrackSubscribed {
             track: meta,
             route,
             epoch,
-        })
+        }))
     }
 
     pub fn unpublish_tracks(
@@ -1298,7 +1306,7 @@ impl ShardRoutingTable {
             let playout = ctx.wall().ntp();
             for entry in route.remote_subscriber_shards.values_mut() {
                 let env = entry.remote.next_envelope(playout);
-                ctx.send_media(entry.remote.shard_id, env, MediaPayload::Sctp(pkt.to_vec()));
+                ctx.send_media(entry.remote.shard_id, env, MediaPayload::Data(pkt.to_vec()));
             }
         }
     }
@@ -1338,13 +1346,13 @@ impl ShardRoutingTable {
         let was_empty = room.reliable.subscribe_local(handle, topic.clone());
         // A reliable subscription names only a topic, so there is no stream to
         // install a route for yet; publishers announce themselves in response.
-        was_empty.then_some(ShardEvent::ReliableTopicSubscribed {
+        was_empty.then_some(ShardEvent::Relay(Topology::ReliableTopicSubscribed {
             room_id,
             topic,
             publisher: None,
             route: None,
             epoch: 0,
-        })
+        }))
     }
 
     pub fn unregister_reliable_data_subscriber(
@@ -1399,7 +1407,7 @@ impl ShardRoutingTable {
                     .map(|remote| (remote.shard_id, remote.next_envelope(playout)))
                     .collect();
                 for (shard_id, env) in frames {
-                    ctx.send_media(shard_id, env, MediaPayload::ReliableSctp(frame.to_vec()));
+                    ctx.send_media(shard_id, env, MediaPayload::Data(frame.to_vec()));
                 }
             }
         }
@@ -1418,9 +1426,9 @@ impl ShardRoutingTable {
         } else if let Some(shard_id) = self.remote_shard_for(&publisher) {
             // Reverse semantic control: correctness-critical, so it never rides
             // the media lane.
-            ctx.send_control(
+            ctx.send_frame(
                 shard_id,
-                CrossShardEvent::ReliableControlForward {
+                ShardFrame::ReverseData {
                     publisher,
                     topic: topic.clone(),
                     bytes: bytes.to_vec(),
@@ -1432,13 +1440,14 @@ impl ShardRoutingTable {
 
 // -- participant-originated control-event routing -------------------------
 
-/// Routes an event a participant raised about itself (published a track,
-/// wants a keyframe, ...) either into the local `shard_events` queue or
-/// across the cluster bus, depending on where it needs to land.
+/// Queues an event a participant raised about itself for the controller.
+///
+/// Everything reaching here is topology, so it all goes to the control plane.
+/// Anything a shard must send another shard directly — feedback, media — is
+/// handled by the caller and never appears in this match.
 pub(crate) fn route_participant_control_event(
     ev: ParticipantControlEvent,
     shard_events: &mut VecDeque<ShardEvent>,
-    router: &impl ShardTransport,
 ) {
     match ev {
         ParticipantControlEvent::TrackPublished(track, _states) => {
@@ -1447,12 +1456,8 @@ pub(crate) fn route_participant_control_event(
         ParticipantControlEvent::TrackUnpublished { origin, track_id } => {
             shard_events.push_back(ShardEvent::TrackUnpublished { origin, track_id });
         }
-        ParticipantControlEvent::KeyframeRequested(req) => {
-            if req.shard_id == router.shard_id() {
-                shard_events.push_back(ShardEvent::KeyframeRequest(req));
-            } else {
-                router.send_control(req.shard_id, CrossShardEvent::KeyframeRequested(req));
-            }
+        ParticipantControlEvent::KeyframeRequested(_) => {
+            debug_assert!(false, "keyframe requests must be handled by shard core");
         }
         ParticipantControlEvent::DataTopicPublished { .. }
         | ParticipantControlEvent::DataTopicUnpublished { .. } => {
@@ -1526,7 +1531,7 @@ mod tests {
         wall: WallAnchor,
         shard_id: ShardId,
         local: StdHashSet<ParticipantId>,
-        sent: RefCell<Vec<(ShardId, CrossShardEvent)>>,
+        sent: RefCell<Vec<(ShardId, ShardFrame)>>,
         forwarded_video: RefCell<Vec<ParticipantId>>,
         forwarded_audio: RefCell<Vec<(ParticipantId, AudioSelectorSlotId)>>,
         forwarded_sctp: RefCell<Vec<ParticipantId>>,
@@ -1560,10 +1565,10 @@ mod tests {
         fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
             self.sent
                 .borrow_mut()
-                .push((dst, CrossShardEvent::Media { env, payload }));
+                .push((dst, ShardFrame::Media { env, payload }));
         }
 
-        fn send_control(&self, dst: ShardId, ev: CrossShardEvent) {
+        fn send_frame(&self, dst: ShardId, ev: ShardFrame) {
             self.sent.borrow_mut().push((dst, ev));
         }
     }
@@ -1751,7 +1756,7 @@ mod tests {
 
         let ev = table.register_subscriber(first, track.clone(), now(), &wall());
         assert!(
-            matches!(ev, Some(ShardEvent::TrackSubscribed { track: t, .. }) if t == track),
+            matches!(ev, Some(ShardEvent::Relay(Topology::TrackSubscribed { track: t, .. })) if t == track),
             "the first subscriber installs a route and hands over the handle"
         );
 
@@ -1817,11 +1822,11 @@ mod tests {
         assert!(
             matches!(
                 ev,
-                Some(ShardEvent::ReliableTopicSubscribed {
+                Some(ShardEvent::Relay(Topology::ReliableTopicSubscribed {
                     publisher: None,
                     route: None,
                     ..
-                })
+                }))
             ),
             "a topic-only subscription has no stream to route yet"
         );
@@ -1832,11 +1837,11 @@ mod tests {
         assert!(
             matches!(
                 resolved,
-                Some(ShardEvent::ReliableTopicSubscribed {
+                Some(ShardEvent::Relay(Topology::ReliableTopicSubscribed {
                     publisher: Some(_),
                     route: Some(_),
                     ..
-                })
+                }))
             ),
             "the announcement resolves it into a concrete route"
         );
@@ -1880,7 +1885,10 @@ mod tests {
         assert!(
             matches!(
                 ev,
-                Some(ShardEvent::DataTopicSubscribed { route: Some(_), .. })
+                Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
+                    route: Some(_),
+                    ..
+                }))
             ),
             "the first subscriber installs a route and hands over the handle"
         );
@@ -1925,11 +1933,11 @@ mod tests {
         assert!(
             matches!(
                 ev,
-                Some(ShardEvent::DataTopicSubscribed {
+                Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     publisher: None,
                     route: None,
                     ..
-                })
+                }))
             ),
             "a wildcard subscription has no stream to install a route for yet"
         );
@@ -1940,11 +1948,11 @@ mod tests {
         assert!(
             matches!(
                 resolved,
-                Some(ShardEvent::DataTopicSubscribed {
+                Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     publisher: Some(_),
                     route: Some(_),
                     ..
-                })
+                }))
             ),
             "the announcement resolves the wildcard into a concrete route"
         );
@@ -1986,7 +1994,7 @@ mod tests {
         };
         let ev = table.publish_track(track, room, now(), &wall(), &mut ctx);
         assert!(
-            matches!(ev, Some(ShardEvent::TrackSubscribed { track: t, .. }) if t == audio),
+            matches!(ev, Some(ShardEvent::Relay(Topology::TrackSubscribed { track: t, .. })) if t == audio),
             "a remote audio publish installs a destination route"
         );
         assert_eq!(table.routes.len(), 1);
@@ -2054,7 +2062,7 @@ mod tests {
         add_local_subscriber(&mut table, first);
         add_local_subscriber(&mut table, second);
 
-        let Some(ShardEvent::TrackSubscribed { route, epoch, .. }) =
+        let Some(ShardEvent::Relay(Topology::TrackSubscribed { route, epoch, .. })) =
             table.register_subscriber(first, track.clone(), now(), &wall())
         else {
             panic!("the first subscriber must install a route");
