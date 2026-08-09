@@ -123,7 +123,14 @@ impl RtpPacket {
         (pkt, sr)
     }
 
-    pub fn deep_clone(&self) -> Self {
+    /// Copy for handoff to another core. The payload copy is deliberate: sharing
+    /// one `Arc` across shards would put the refcount header in the same cache
+    /// line as the payload head, so a remote drop invalidates a line other cores
+    /// are reading. Copying into a fresh `Arc` is also the *cheapest* option, not
+    /// a compromise — str0m's `RtpWrite::new` demands `Arc<[u8]>` at egress, so a
+    /// pooled block or `Rc<[u8]>` would cost a second copy on the way out.
+    /// Revisit only if the str0m fork stops requiring `Arc<[u8]>`.
+    pub fn to_transit(&self) -> Self {
         Self {
             ssrc: self.ssrc,
             marker: self.marker,

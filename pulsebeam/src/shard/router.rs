@@ -1213,7 +1213,7 @@ impl ShardRoutingTable {
         }
         for remote in &mut route.remote_routes {
             let env = remote.next_envelope(ctx.wall().to_ntp(pkt.playout_time));
-            ctx.send_media(remote.shard_id, env, MediaPayload::Video(pkt.deep_clone()));
+            ctx.send_media(remote.shard_id, env, MediaPayload::Video(pkt.to_transit()));
         }
     }
 
@@ -1244,7 +1244,7 @@ impl ShardRoutingTable {
                 ctx.send_media(
                     remote.shard_id,
                     env,
-                    MediaPayload::Audio(ev.pkt.deep_clone()),
+                    MediaPayload::Audio(ev.pkt.to_transit()),
                 );
             }
         }

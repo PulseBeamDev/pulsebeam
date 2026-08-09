@@ -236,32 +236,31 @@ impl StreamCache {
             return None;
         }
 
-        // A Dependency Descriptor keyframe is a decode-target entry point by
-        // contract, so its segment is self-sufficient. It also means the payload
-        // may be opaque (SFrame/E2EE), where the SPS/PPS probe sees nothing and
-        // synthesis is neither possible nor needed — the client's decoder owns the
-        // parameter sets end-to-end. Only synthesize parameter sets for the legacy
-        // deep-inspection path, where the payload is readable.
-        let dd_driven = segment.iter().any(|p| {
-            p.ext_vals
-                .user_values
-                .get::<pulsebeam_core::dd::DependencyDescriptor>()
-                .is_some()
-        });
+        // Only a keyframe the H.264 probe could actually read needs a
+        // parameter-set prefix. Everything else — VP8/VP9/AV1, or H.264 under
+        // SFrame/E2EE — leaves the NAL flags empty, has a self-sufficient
+        // keyframe, and offers no parameter sets to synthesize from.
+        //
+        // Do not key this off the Dependency Descriptor: plain readable H.264
+        // negotiates DD too, and skipping its prefix ships an IDR the decoder
+        // cannot initialize on, which renders as a blank stream with nothing
+        // reporting an error. Do not key it off cached SPS/PPS either — those
+        // can arrive after the IDR under reordering.
+        let needs_parameter_sets = segment.iter().any(|p| p.nal.idr());
 
-        let mut out = if dd_driven {
-            Vec::new()
-        } else {
+        let mut out = if needs_parameter_sets {
             self.parameter_set_prefix(&segment, segment_ts)?
+        } else {
+            Vec::new()
         };
         out.extend(segment);
 
         debug_assert!(
-            dd_driven || out.iter().any(|p| p.nal.sps()),
+            !needs_parameter_sets || out.iter().any(|p| p.nal.sps()),
             "replay lacks SPS"
         );
         debug_assert!(
-            dd_driven || out.iter().any(|p| p.nal.pps()),
+            !needs_parameter_sets || out.iter().any(|p| p.nal.pps()),
             "replay lacks PPS"
         );
         debug_assert!(out.iter().any(|p| p.is_keyframe), "replay lacks a keyframe");
@@ -498,6 +497,41 @@ mod test {
         assert!(
             replay.iter().all(|p| !p.nal.sps() && !p.nal.pps()),
             "an opaque/E2EE stream gets no synthesized parameter sets"
+        );
+    }
+
+    #[test]
+    fn readable_h264_still_gets_parameter_sets_when_it_also_carries_a_descriptor() {
+        // A plain browser H.264 sender negotiates the Dependency Descriptor
+        // alongside a readable payload. Its IDR is useless to a decoder without
+        // SPS/PPS, so the descriptor must not suppress the prefix — doing so
+        // renders as a blank stream with no error anywhere.
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
+
+        let mut g = TemporalDdGenerator::new(3);
+        let mut b = builder(ParameterSetStyle::OnceAtStreamStart);
+        let mut cache = StreamCache::new();
+
+        let mut with_dd = |pkts: Vec<RtpPacket>, keyframe: bool| {
+            for mut p in pkts {
+                p.ext_vals
+                    .user_values
+                    .set_arc(std::sync::Arc::new(g.next(keyframe && p.is_keyframe)));
+                cache.push(&p);
+            }
+        };
+        with_dd(b.keyframe(2), true);
+        with_dd(b.delta_frames(3, 2), false);
+        with_dd(b.keyframe(2), true);
+
+        let replay = cache.replay().expect("replayable");
+        assert!(
+            replay.iter().any(|p| p.nal.sps()),
+            "readable H.264 must carry SPS even when a descriptor is present"
+        );
+        assert!(
+            replay.iter().any(|p| p.nal.pps()),
+            "readable H.264 must carry PPS even when a descriptor is present"
         );
     }
 
