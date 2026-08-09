@@ -5,11 +5,12 @@ use crate::{
     control::{
         core::{ControllerCore, ControllerEvent, ControllerEventQueue},
         negotiator::{Negotiator, NegotiatorError},
+        registry::ConnectionCheck,
         router::ShardRouter,
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
         ufrag::IceUfrag,
     },
-    entity::{ConnectionId, ParticipantId, RoomId},
+    entity::{ConnectionEpoch, ConnectionId, ParticipantId, RoomId},
     shard::{
         ShardContext,
         worker::{ClusterCommand, ShardCommand, ShardEventWrapper},
@@ -30,6 +31,9 @@ pub struct ParticipantState {
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
+    /// Lower bound for this connection's generation. Zero for a fresh join; one past a resume
+    /// token's epoch when reconstructing a participant the registry no longer knows about.
+    pub epoch: ConnectionEpoch,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -42,6 +46,10 @@ pub enum ControllerCommand {
     PatchParticipant(
         PatchParticipant,
         oneshot::Sender<Result<PatchParticipantReply, ControllerError>>,
+    ),
+    ResumeParticipant(
+        ResumeParticipant,
+        oneshot::Sender<Result<ResumeParticipantReply, ControllerError>>,
     ),
 }
 
@@ -60,6 +68,26 @@ pub struct CreateParticipantReply {
 pub struct DeleteParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
+    /// When set, the participant is only removed if this is the live connection. `None` keeps the
+    /// legacy fire-and-forget behaviour of the SDP path.
+    pub connection_id: Option<ConnectionId>,
+    pub reply: Option<oneshot::Sender<Result<(), ControllerError>>>,
+}
+
+/// Re-establish a participant identity, whether or not the registry still knows about it.
+#[derive(Debug)]
+pub struct ResumeParticipant {
+    pub state: ParticipantState,
+    pub offer: SdpOffer,
+}
+
+#[derive(Debug)]
+pub struct ResumeParticipantReply {
+    pub answer: SdpAnswer,
+    /// False when nothing was live under this id, so the participant was rebuilt from scratch.
+    /// Distinguishes a `201` reconstruct from a `200` replace.
+    pub existed: bool,
+    pub epoch: ConnectionEpoch,
 }
 
 #[derive(Debug)]
@@ -83,6 +111,12 @@ pub enum ControllerError {
 
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
+
+    #[error("participant not found")]
+    ParticipantNotFound,
+
+    #[error("connection id does not match the live connection")]
+    ConnectionMismatch,
 
     #[error("unknown error: {0}")]
     Unknown(String),
@@ -200,8 +234,10 @@ impl ControllerActor {
             }
 
             ControllerCommand::DeleteParticipant(m) => {
-                self.core
-                    .delete_participant(&m.participant_id, &mut self.eq);
+                let result = self.handle_delete_participant(&m);
+                if let Some(reply_tx) = m.reply {
+                    let _ = reply_tx.send(result);
+                }
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
@@ -209,7 +245,65 @@ impl ControllerActor {
                     .map(|res| PatchParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
+            ControllerCommand::ResumeParticipant(m, reply_tx) => {
+                let _ = reply_tx.send(self.handle_resume_participant(m.state, m.offer));
+            }
         }
+    }
+
+    fn handle_delete_participant(&mut self, m: &DeleteParticipant) -> Result<(), ControllerError> {
+        if let Some(connection_id) = m.connection_id {
+            match self
+                .core
+                .registry()
+                .verify_connection(&m.participant_id, &connection_id)
+            {
+                Ok(_) => {}
+                Err(ConnectionCheck::NotFound) => return Err(ControllerError::ParticipantNotFound),
+                Err(ConnectionCheck::Mismatch) => {
+                    return Err(ControllerError::ConnectionMismatch);
+                }
+            }
+        }
+        self.core
+            .delete_participant(&m.participant_id, &mut self.eq);
+        Ok(())
+    }
+
+    /// Rebuild a participant under its existing id, whether or not one is currently live.
+    ///
+    /// Media state cannot survive a node restart, so this is always a fresh `Rtc`. What survives is
+    /// the identity: the `ParticipantId` is caller-supplied, so every `TrackId` derived from it is
+    /// unchanged and subscribers see the tracks reappear rather than churn.
+    pub fn handle_resume_participant(
+        &mut self,
+        state: ParticipantState,
+        offer: SdpOffer,
+    ) -> Result<ResumeParticipantReply, ControllerError> {
+        let existed = self
+            .core
+            .registry()
+            .get_participant(&state.participant_id)
+            .is_some();
+        if existed {
+            self.core
+                .delete_participant(&state.participant_id, &mut self.eq);
+        }
+
+        let participant_id = state.participant_id;
+        let answer = self.handle_create_participant(state, offer)?;
+        let epoch = self
+            .core
+            .registry()
+            .get_participant(&participant_id)
+            .map(|meta| meta.epoch)
+            .unwrap_or(ConnectionEpoch::ZERO);
+
+        Ok(ResumeParticipantReply {
+            answer,
+            existed,
+            epoch,
+        })
     }
 
     async fn drain_core_events(&mut self) {

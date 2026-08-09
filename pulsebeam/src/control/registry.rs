@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{
     control::room::Room,
-    entity::{ParticipantId, RoomId, TrackId},
+    entity::{ConnectionEpoch, ConnectionId, ParticipantId, RoomId, TrackId},
     id::ShardId,
     track::Track,
 };
@@ -14,6 +14,17 @@ const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ParticipantMeta {
     pub shard_id: ShardId,
     pub room_id: RoomId,
+    pub connection_id: ConnectionId,
+    pub epoch: ConnectionEpoch,
+}
+
+/// Why a presented `ConnectionId` was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionCheck {
+    /// No live participant by that id: it never existed, it left, or its node restarted.
+    NotFound,
+    /// A live participant exists, but the caller holds a superseded connection.
+    Mismatch,
 }
 
 pub struct RoomRegistry {
@@ -57,15 +68,33 @@ impl RoomRegistry {
         participant_id: ParticipantId,
         room_id: RoomId,
         shard_id: ShardId,
+        connection_id: ConnectionId,
+        epoch: ConnectionEpoch,
     ) {
-        if let Some(previous) = self
-            .participants
-            .insert(participant_id, ParticipantMeta { shard_id, room_id })
-            && let Some(room) = self.rooms.get_mut(&previous.room_id)
-        {
-            room.remove_participant(&participant_id, previous.shard_id);
-            if room.participant_count() == 0 {
-                self.sweeper.insert(previous.room_id, EMPTY_ROOM_TIMEOUT);
+        if let Some(previous) = self.participants.insert(
+            participant_id,
+            ParticipantMeta {
+                shard_id,
+                room_id,
+                connection_id,
+                epoch,
+            },
+        ) {
+            debug_assert_ne!(
+                previous.connection_id, connection_id,
+                "replacing a participant must mint a fresh connection id"
+            );
+            debug_assert!(
+                epoch > previous.epoch,
+                "a replacement connection must advance the epoch: {:?} -> {:?}",
+                previous.epoch,
+                epoch
+            );
+            if let Some(room) = self.rooms.get_mut(&previous.room_id) {
+                room.remove_participant(&participant_id, previous.shard_id);
+                if room.participant_count() == 0 {
+                    self.sweeper.insert(previous.room_id, EMPTY_ROOM_TIMEOUT);
+                }
             }
         }
         let room = self
@@ -77,6 +106,62 @@ impl RoomRegistry {
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
         self.participants.get(participant_id)
+    }
+
+    /// Checks a caller-presented `ConnectionId` against the live one, returning the current epoch.
+    ///
+    /// This map is the authoritative record of who is live, so this is what turns `ConnectionId`
+    /// from a value the server merely echoed into a capability it actually enforces.
+    pub fn verify_connection(
+        &self,
+        participant_id: &ParticipantId,
+        connection_id: &ConnectionId,
+    ) -> Result<ConnectionEpoch, ConnectionCheck> {
+        let meta = self
+            .participants
+            .get(participant_id)
+            .ok_or(ConnectionCheck::NotFound)?;
+        if &meta.connection_id != connection_id {
+            return Err(ConnectionCheck::Mismatch);
+        }
+        Ok(meta.epoch)
+    }
+
+    /// The epoch a new connection for this participant should carry.
+    ///
+    /// A live participant always advances past its current epoch. Otherwise the caller's own
+    /// starting point stands: zero for a fresh join, or one past a resume token's epoch. After a
+    /// node restart nothing is stored, so monotonicity is best-effort by construction -- the token
+    /// carries the only surviving memory of how far the session had got.
+    pub fn next_epoch(
+        &self,
+        participant_id: &ParticipantId,
+        floor: ConnectionEpoch,
+    ) -> ConnectionEpoch {
+        match self.participants.get(participant_id) {
+            Some(meta) => meta.epoch.checked_next().unwrap_or(meta.epoch).max(floor),
+            None => floor,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn add_participant_for_test(
+        &mut self,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+        shard_id: ShardId,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEED: AtomicU64 = AtomicU64::new(1);
+        let mut rng = pulsebeam_runtime::rand::seeded_rng(SEED.fetch_add(1, Ordering::Relaxed));
+        let epoch = self.next_epoch(&participant_id, ConnectionEpoch::ZERO);
+        self.add_participant(
+            participant_id,
+            room_id,
+            shard_id,
+            ConnectionId::new(&mut rng),
+            epoch,
+        );
     }
 
     /// Returns the shard_id that was hosting the participant, if found.
@@ -178,7 +263,7 @@ mod tests {
         let rid = room_id("room-a");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, ShardId::new(0));
+        reg.add_participant_for_test(pid, rid, ShardId::new(0));
 
         reg.get_room(&rid).unwrap();
         let meta = reg.get_participant(&pid).expect("participant should exist");
@@ -193,8 +278,8 @@ mod tests {
         let pid1 = participant_id();
         let pid2 = participant_id();
 
-        reg.add_participant(pid1, rid, ShardId::new(0));
-        reg.add_participant(pid2, rid, ShardId::new(1));
+        reg.add_participant_for_test(pid1, rid, ShardId::new(0));
+        reg.add_participant_for_test(pid2, rid, ShardId::new(1));
 
         let room = reg.get_room(&rid).unwrap();
         assert_eq!(room.participant_count(), 2);
@@ -207,8 +292,8 @@ mod tests {
         let new_room = room_id("room-b-new");
         let pid = participant_id();
 
-        reg.add_participant(pid, old_room, ShardId::new(0));
-        reg.add_participant(pid, new_room, ShardId::new(1));
+        reg.add_participant_for_test(pid, old_room, ShardId::new(0));
+        reg.add_participant_for_test(pid, new_room, ShardId::new(1));
 
         assert_eq!(reg.get_room(&old_room).unwrap().participant_count(), 0);
         assert_eq!(reg.get_room(&new_room).unwrap().participant_count(), 1);
@@ -223,7 +308,7 @@ mod tests {
         let rid = room_id("room-c");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, ShardId::new(3));
+        reg.add_participant_for_test(pid, rid, ShardId::new(3));
         let shard = reg.remove_participant(&pid);
 
         assert_eq!(shard, Some(ShardId::new(3)));
@@ -243,7 +328,7 @@ mod tests {
         let rid = room_id("room-d");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, ShardId::new(0));
+        reg.add_participant_for_test(pid, rid, ShardId::new(0));
         reg.remove_participant(&pid);
 
         // Room still present; deletion is deferred via the sweeper.
@@ -260,7 +345,7 @@ mod tests {
         let rid = room_id("room-e");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, ShardId::new(0));
+        reg.add_participant_for_test(pid, rid, ShardId::new(0));
         reg.remove_participant(&pid);
 
         // Simulate the sweeper firing.
@@ -278,11 +363,11 @@ mod tests {
         let pid1 = participant_id();
         let pid2 = participant_id();
 
-        reg.add_participant(pid1, rid, ShardId::new(0));
+        reg.add_participant_for_test(pid1, rid, ShardId::new(0));
         reg.remove_participant(&pid1);
 
         // A new participant joins before the sweeper fires.
-        reg.add_participant(pid2, rid, ShardId::new(1));
+        reg.add_participant_for_test(pid2, rid, ShardId::new(1));
 
         // Sweeper fires — room should survive because it is not empty.
         reg.maybe_delete_room(&rid);
@@ -297,7 +382,7 @@ mod tests {
         let rid = room_id("room-h");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, ShardId::new(0));
+        reg.add_participant_for_test(pid, rid, ShardId::new(0));
         reg.remove_participant(&pid);
 
         assert!(reg.get_participant(&pid).is_none());
@@ -311,12 +396,110 @@ mod tests {
         let pid1 = participant_id();
         let pid2 = participant_id();
 
-        reg.add_participant(pid1, rid1, ShardId::new(0));
-        reg.add_participant(pid2, rid2, ShardId::new(1));
+        reg.add_participant_for_test(pid1, rid1, ShardId::new(0));
+        reg.add_participant_for_test(pid2, rid2, ShardId::new(1));
         reg.remove_participant(&pid1);
         reg.maybe_delete_room(&rid1);
 
         assert!(reg.get_room(&rid1).is_none());
         assert!(reg.get_room(&rid2).is_some());
+    }
+
+    fn connection_id(seed: u64) -> ConnectionId {
+        ConnectionId::new(&mut pulsebeam_runtime::rand::seeded_rng(seed))
+    }
+
+    #[test]
+    fn a_matching_connection_id_is_accepted_and_a_superseded_one_is_not() {
+        let mut reg = RoomRegistry::new();
+        let rid = room_id("room-verify");
+        let pid = participant_id();
+        let live = connection_id(1);
+
+        reg.add_participant(pid, rid, ShardId::new(0), live, ConnectionEpoch::ZERO);
+
+        assert_eq!(
+            reg.verify_connection(&pid, &live),
+            Ok(ConnectionEpoch::ZERO)
+        );
+        assert_eq!(
+            reg.verify_connection(&pid, &connection_id(2)),
+            Err(ConnectionCheck::Mismatch),
+            "knowing the participant id must not be enough to act on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_departed_participant_is_not_found() {
+        let mut reg = RoomRegistry::new();
+        let rid = room_id("room-gone");
+        let pid = participant_id();
+        let cid = connection_id(3);
+
+        assert_eq!(
+            reg.verify_connection(&pid, &cid),
+            Err(ConnectionCheck::NotFound)
+        );
+
+        reg.add_participant(pid, rid, ShardId::new(0), cid, ConnectionEpoch::ZERO);
+        reg.remove_participant(&pid);
+
+        // NotFound rather than Mismatch: the caller may hold a perfectly good credential for a
+        // participant whose node restarted, which is exactly what resume must be able to rebuild.
+        assert_eq!(
+            reg.verify_connection(&pid, &cid),
+            Err(ConnectionCheck::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_a_connection_invalidates_the_previous_one() {
+        let mut reg = RoomRegistry::new();
+        let rid = room_id("room-replace");
+        let pid = participant_id();
+        let first = connection_id(4);
+        let second = connection_id(5);
+
+        reg.add_participant(pid, rid, ShardId::new(0), first, ConnectionEpoch::ZERO);
+        let next = reg.next_epoch(&pid, ConnectionEpoch::ZERO);
+        reg.add_participant(pid, rid, ShardId::new(0), second, next);
+
+        assert_eq!(reg.verify_connection(&pid, &second), Ok(next));
+        assert_eq!(
+            reg.verify_connection(&pid, &first),
+            Err(ConnectionCheck::Mismatch)
+        );
+    }
+
+    #[test]
+    fn epochs_advance_for_a_live_participant_and_honour_the_floor_otherwise() {
+        let mut reg = RoomRegistry::new();
+        let rid = room_id("room-epoch");
+        let pid = participant_id();
+
+        // Nothing stored: a fresh join starts at zero, a resume starts where its token says.
+        assert_eq!(
+            reg.next_epoch(&pid, ConnectionEpoch::ZERO),
+            ConnectionEpoch::ZERO
+        );
+        assert_eq!(
+            reg.next_epoch(&pid, ConnectionEpoch::new(7)),
+            ConnectionEpoch::new(7),
+            "after a restart the token carries the only surviving memory of the generation"
+        );
+
+        reg.add_participant(
+            pid,
+            rid,
+            ShardId::new(0),
+            connection_id(6),
+            ConnectionEpoch::new(3),
+        );
+        assert_eq!(
+            reg.next_epoch(&pid, ConnectionEpoch::ZERO),
+            ConnectionEpoch::new(4)
+        );
+        // A stale floor never walks the epoch backwards.
+        assert!(reg.next_epoch(&pid, ConnectionEpoch::ZERO) > ConnectionEpoch::new(3));
     }
 }

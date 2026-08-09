@@ -3,7 +3,7 @@ pub mod auth;
 pub mod controller;
 mod core;
 mod negotiator;
-mod registry;
+pub(crate) mod registry;
 mod room;
 mod router;
 pub mod tcp_acceptor;

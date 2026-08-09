@@ -23,7 +23,7 @@ use crate::{
 };
 use crate::{
     control::controller::{ControllerHandle, ParticipantState},
-    entity::{ExternalRoomId, IdValidationError, ParticipantId, RoomId},
+    entity::{ConnectionEpoch, ExternalRoomId, IdValidationError, ParticipantId, RoomId},
 };
 use pulsebeam_runtime::rand::os_rng;
 pub enum HeaderExt {
@@ -102,6 +102,12 @@ impl IntoResponse for ApiError {
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::JoinError(controller::ControllerError::ParticipantNotFound) => {
+                StatusCode::NOT_FOUND
+            }
+            ApiError::JoinError(controller::ControllerError::ConnectionMismatch) => {
+                StatusCode::PRECONDITION_FAILED
+            }
             ApiError::JoinError(controller::ControllerError::Unknown(_))
             | ApiError::JoinError(controller::ControllerError::IOError(_))
             | ApiError::BadUrl
@@ -162,6 +168,9 @@ pub(crate) enum JoinKind {
     Reconnect {
         participant_id: ParticipantId,
         old_connection_id: Option<ConnectionId>,
+        /// Lower bound for the new connection's generation, from a resume token when the registry
+        /// may no longer remember this participant.
+        epoch: ConnectionEpoch,
     },
 }
 
@@ -191,12 +200,17 @@ pub(crate) async fn join_core(
 ) -> Result<JoinOutcome, ApiError> {
     let room_id = RoomId::from_external(external_room_id);
 
-    let (participant_id, old_connection_id) = match kind {
-        JoinKind::Create => (ParticipantId::new(&mut os_rng()), None),
+    let (participant_id, old_connection_id, epoch) = match kind {
+        JoinKind::Create => (
+            ParticipantId::new(&mut os_rng()),
+            None,
+            ConnectionEpoch::ZERO,
+        ),
         JoinKind::Reconnect {
             participant_id,
             old_connection_id,
-        } => (participant_id, old_connection_id),
+            epoch,
+        } => (participant_id, old_connection_id, epoch),
     };
     // A capability token, so it is derived from fresh OS entropy on every join.
     let connection_id = ConnectionId::new(&mut os_rng());
@@ -207,6 +221,7 @@ pub(crate) async fn join_core(
         participant_id,
         connection_id,
         old_connection_id,
+        epoch,
     };
 
     let answer = if old_connection_id.is_some() {
@@ -344,6 +359,8 @@ async fn delete_participant(
             controller::DeleteParticipant {
                 room_id,
                 participant_id,
+                connection_id: None,
+                reply: None,
             }
             .into(),
         )
@@ -409,6 +426,7 @@ async fn patch_participant(
         JoinKind::Reconnect {
             participant_id,
             old_connection_id: Some(old_connection_id),
+            epoch: ConnectionEpoch::ZERO,
         },
         &external_room_id,
         query.manual_sub,
@@ -580,6 +598,8 @@ mod tests {
                     controller::DeleteParticipant {
                         room_id: RoomId::from_external(&ExternalRoomId::new(ROOM).unwrap()),
                         participant_id: PARTICIPANT.parse().unwrap(),
+                        connection_id: None,
+                        reply: None,
                     }
                     .into(),
                 )
@@ -612,8 +632,23 @@ mod tests {
                                     })
                                 });
                             }
-                            controller::ControllerCommand::DeleteParticipant(_) => {
+                            controller::ControllerCommand::DeleteParticipant(m) => {
                                 seen.lock().unwrap().push("delete");
+                                if let Some(reply) = m.reply {
+                                    let _ = reply.send(Ok(()));
+                                }
+                            }
+                            controller::ControllerCommand::ResumeParticipant(_, reply) => {
+                                seen.lock().unwrap().push("resume");
+                                let _ = reply.send(if reject {
+                                    Err(controller::ControllerError::ServiceUnavailable)
+                                } else {
+                                    Ok(controller::ResumeParticipantReply {
+                                        answer: answer_sdp(),
+                                        existed: false,
+                                        epoch: crate::entity::ConnectionEpoch::ZERO,
+                                    })
+                                });
                             }
                         }
                     }
