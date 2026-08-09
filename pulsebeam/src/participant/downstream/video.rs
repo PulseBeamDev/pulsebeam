@@ -1150,6 +1150,26 @@ impl AllocationEngine {
             .min_by_key(|l| l.quality)
     }
 
+    /// No encoding of this track currently measures healthy — the publisher's
+    /// uplink is in trouble, as distinct from the subscriber's downlink being
+    /// short of budget or an encoding simply carrying no bytes.
+    fn nothing_healthy(&self, slot: &SlotView<'_>) -> bool {
+        !slot.track.layers.iter().any(|l| self.snap(l).healthy)
+    }
+
+    /// The bottom rung of the ladder the client's spatial request allows,
+    /// ignoring health and bitrate. Health measures the *publisher's* uplink, so
+    /// it is never a reason to refuse a slot every candidate — it only ranks
+    /// them.
+    fn lowest_ladder<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
+        slot.track
+            .layers
+            .iter()
+            .filter(|layer| self.spatially_allowed(slot, layer))
+            .min_by_key(|layer| layer.quality)
+            .or_else(|| slot.track.layers.iter().min_by_key(|layer| layer.quality))
+    }
+
     /// A legal layer to retain as the pause target even when no layer is
     /// currently healthy enough to forward. Falls back to the lowest healthy
     /// layer (closest rank) when no spatially-allowed layer exists.
@@ -1161,13 +1181,7 @@ impl AllocationEngine {
             .filter(|layer| self.eligible(slot, layer))
             .min_by_key(|layer| layer.quality)
             .or_else(|| self.closest_healthy(slot))
-            .or_else(|| {
-                slot.track
-                    .layers
-                    .iter()
-                    .filter(|layer| self.spatially_allowed(slot, layer))
-                    .min_by_key(|layer| layer.quality)
-            });
+            .or_else(|| self.lowest_ladder(slot));
         debug_assert!(
             self.closest_healthy(slot).is_none()
                 || target.is_some_and(|layer| self.snap(layer).healthy)
@@ -1222,6 +1236,13 @@ impl AllocationEngine {
             .filter(|layer| self.eligible(slot, layer))
             .max_by(|a, b| self.cost(a).total_cmp(&self.cost(b)))
             .or_else(|| self.closest_healthy(slot))
+            // Matches the allocator's last resort: an all-unhealthy track is
+            // still forwarded at its lowest rung, so the demand it places on BWE
+            // must be declared rather than silently dropped from the sum.
+            .or_else(|| {
+                self.nothing_healthy(slot)
+                    .then(|| self.lowest_ladder(slot))?
+            })
     }
 
     /// Aggregate bitrate the SFU would like BWE to grant next: the sum of the
@@ -1368,6 +1389,25 @@ impl AllocationEngine {
                     }
                     budget -= step;
                     cur = Some(next);
+                }
+            }
+
+            // Nothing measured healthy. Health describes the publisher's uplink,
+            // not permission to forward, so an assigned slot still tries the
+            // bottom of the ladder: a struggling publisher must read as
+            // bandwidth-limited, not as a blank tile the SFU never explains.
+            // Budget still governs — a link that cannot carry the lowest rung
+            // pauses exactly as before, and a slot that declined a layer for
+            // budget or `min_fps` reasons is untouched because something was
+            // healthy there.
+            if cur.is_none()
+                && self.nothing_healthy(slot)
+                && let Some(lowest) = self.lowest_ladder(slot)
+            {
+                let cost = self.stable_cost(lowest);
+                if cost <= budget {
+                    budget -= cost;
+                    cur = Some(lowest);
                 }
             }
 
@@ -2730,10 +2770,86 @@ mod allocation_tests {
         );
     }
 
-    // ─── Property: forwarded layer is always a healthy layer ────────────────────
+    // ─── Property: an assigned slot always tries the lowest rung ────────────────
+    //
+    // Health measures the *publisher's* uplink. A publisher whose every encoding
+    // is struggling must render as bandwidth-limited video, never as a blank
+    // tile: pausing there drops the packets that are still arriving and requests
+    // no keyframe, so the subscriber sees nothing and nothing explains why.
+    // Budget remains the only legitimate reason to pause.
+
+    fn track_with_every_layer_bad() -> (Track, LayerStates) {
+        let (t, states) = healthy_track();
+        for layer in &t.layers {
+            state_of(&states, layer)
+                .update_for_test()
+                .quality(StreamQuality::Bad);
+        }
+        (t, states)
+    }
 
     #[test]
-    fn forwarded_layer_is_always_healthy() {
+    fn an_all_unhealthy_track_forwards_its_lowest_rung_rather_than_pausing() {
+        let (t, states) = track_with_every_layer_bad();
+        let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
+        let decisions = AllocationEngine::compute(bw(10_000), &slots, &states);
+        assert_eq!(
+            forwarded_quality(&decisions, slots[0].key),
+            Some(LayerQuality::Low),
+            "a publisher with no healthy encoding must still be forwarded at the \
+             bottom of the ladder, got {:?}",
+            decisions[slots[0].key]
+        );
+    }
+
+    #[test]
+    fn a_track_with_no_measurements_yet_forwards_immediately() {
+        // A slot allocated before its first packet has no measurement handles at
+        // all, so every layer reads unhealthy. It must not open blank and wait.
+        let (t, _) = healthy_track();
+        let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
+        let decisions = AllocationEngine::compute(bw(10_000), &slots, &LayerStates::new());
+        assert_eq!(
+            forwarded_quality(&decisions, slots[0].key),
+            Some(LayerQuality::Low),
+            "a freshly assigned slot must forward before the first measurement, got {:?}",
+            decisions[slots[0].key]
+        );
+    }
+
+    #[test]
+    fn an_all_unhealthy_track_still_pauses_when_the_budget_cannot_carry_it() {
+        // The escape hatch is for health only. Real downlink congestion must
+        // still pause, otherwise the waterfall overspends its budget.
+        let (t, states) = track_with_every_layer_bad();
+        let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
+        let decisions = AllocationEngine::compute(bw(0), &slots, &states);
+        assert!(
+            matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
+            "zero budget must still pause, got {:?}",
+            decisions[slots[0].key]
+        );
+    }
+
+    #[test]
+    fn an_all_unhealthy_track_declares_its_demand_to_bwe() {
+        // The allocator forwards it, so the demand fed to BWE must include it —
+        // otherwise the estimator is asked to shrink a link we are still using.
+        let (t, states) = track_with_every_layer_bad();
+        let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
+        assert!(
+            AllocationEngine::desired_bitrate(&slots, &states).as_f64() > 0.0,
+            "a forwarded slot must contribute to the desired bitrate"
+        );
+    }
+
+    // ─── Property: a healthy layer is preferred whenever one exists ─────────────
+    //
+    // Health ranks candidates while any layer is healthy. The one exception is
+    // when *none* is, which the lowest-rung tests above cover.
+
+    #[test]
+    fn a_healthy_layer_is_preferred_while_one_exists() {
         let (t, states) = track_with_bad_layer(LayerQuality::High);
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
         let decisions = AllocationEngine::compute(bw(10_000), &slots, &states);
@@ -2955,7 +3071,14 @@ mod allocation_tests {
                 .filter(|(_, _, healthy, _)| *healthy)
                 .min_by_key(|(quality, _, _, _)| *quality)
                 .map(|(_, bitrate, _, _)| *bitrate);
-            let expected_per_slot = spatial_max.or(fallback).unwrap_or(0);
+            // Nothing healthy at all: the slot is still forwarded at the bottom of
+            // the ladder rather than blanked, so that rung is what it demands.
+            let lowest_allowed = cases
+                .iter()
+                .filter(|(_, _, _, height)| *height <= max_height)
+                .min_by_key(|(quality, _, _, _)| *quality)
+                .map(|(_, bitrate, _, _)| *bitrate);
+            let expected_per_slot = spatial_max.or(fallback).or(lowest_allowed).unwrap_or(0);
             let expected = (expected_per_slot as f64 * slot_count as f64
                 / (1.0 - AllocationEngine::RESERVE_FRACTION)) as u64;
             let desired = AllocationEngine::desired_bitrate(&slots, &states);
