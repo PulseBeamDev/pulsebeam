@@ -181,12 +181,13 @@ impl ShardCore {
         max_gso_segments: usize,
         rng: Rng,
         wall: WallAnchor,
+        streams: std::sync::Arc<crate::stream_registry::StreamRegistry>,
     ) -> Self {
         let shard_id = shard_id.into();
         Self {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
-            routing: ShardRoutingTable::new(),
+            routing: ShardRoutingTable::new(streams),
             timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
             dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -584,13 +585,19 @@ impl ShardCore {
                                 .route_reliable_control(publisher, &topic, &bytes, &mut ctx);
                         }
                         ParticipantControlEvent::TrackPublished(track, states) => {
-                            // Keep the handles on this shard; only the stateless
-                            // descriptor continues to the controller.
-                            self.routing.set_layer_states(track.meta.id, states);
+                            // Register the handles on the node; only the
+                            // stateless descriptor continues to the controller.
+                            self.routing.publish_local_track(track.meta.id, states);
                             self.pipeline
                                 .push_shard_event(ShardEvent::TrackPublished(track));
                         }
                         ev => {
+                            // The publisher's own shard owns the registry entry,
+                            // so it is the only one that may retract it.
+                            if let ParticipantControlEvent::TrackUnpublished { track_id, .. } = &ev
+                            {
+                                self.routing.unpublish_local_track(track_id);
+                            }
                             router::route_participant_control_event(
                                 ev,
                                 self.pipeline.shard_events_mut(),
@@ -758,20 +765,10 @@ impl ShardCore {
                 // The destination allocated and installed this route in its own
                 // table; receiving the handle is the acknowledgement that lets
                 // media start flowing to it.
-                let track_id = track.id;
                 self.routing.register_remote_subscriber_shard(
                     RemoteRoute::new(from_shard_id, route, epoch),
                     track,
                 );
-                // The destination needs the publisher's measurement handles, and
-                // they must not travel via the controller.
-                let states = self.routing.layer_states(track_id);
-                if !states.is_empty() {
-                    router.send_control(
-                        from_shard_id,
-                        CrossShardEvent::TrackStates { track_id, states },
-                    );
-                }
             }
             ClusterCommand::UnsubscribeTrack {
                 from_shard_id,
@@ -893,9 +890,6 @@ impl ShardCore {
         router: &impl ShardTransport,
     ) {
         match ev {
-            CrossShardEvent::TrackStates { track_id, states } => {
-                self.routing.set_layer_states(track_id, states);
-            }
             CrossShardEvent::Media { env, payload } => {
                 self.on_media_frame(env, payload, router);
             }
@@ -1101,6 +1095,7 @@ mod test {
             1,
             pulsebeam_runtime::rand::seeded_rng(42),
             WallAnchor::new(std::time::SystemTime::now(), Instant::now()),
+            std::sync::Arc::new(crate::stream_registry::StreamRegistry::new()),
         )
     }
 

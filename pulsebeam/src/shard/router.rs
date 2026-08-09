@@ -8,12 +8,15 @@ use str0m::media::{KeyframeRequestKind, Rid};
 use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
 use super::participants::ParticipantHandle;
 use super::reliable::ReliableRoutes;
+use std::sync::Arc;
+
 use crate::audio_selector::TopNAudioSelector;
 use crate::clock::WallAnchor;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
 use crate::rtp::monitor::StreamState;
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
+use crate::stream_registry::StreamRegistry;
 use crate::track::{Topic, Track, TrackMeta};
 use tokio::time::Instant;
 
@@ -264,10 +267,13 @@ pub(crate) struct ShardRoutingTable {
     participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
     local_participants: HashMap<ParticipantId, ParticipantHandle>,
     remote_participant_counts: HashMap<(RoomId, ShardId), usize>,
+    /// Where measurement handles are resolved. Shared by every shard on the
+    /// node so they never have to be sent anywhere.
+    streams: Arc<StreamRegistry>,
 }
 
 impl ShardRoutingTable {
-    pub fn new() -> Self {
+    pub fn new(streams: Arc<StreamRegistry>) -> Self {
         Self {
             rooms: HashMap::new(),
             tracks: HashMap::new(),
@@ -278,6 +284,7 @@ impl ShardRoutingTable {
             participant_shards: HashMap::new(),
             local_participants: HashMap::new(),
             remote_participant_counts: HashMap::new(),
+            streams,
         }
     }
 
@@ -346,19 +353,18 @@ impl ShardRoutingTable {
         }
     }
 
-    /// Record measurement handles for a track this shard will deliver.
-    pub fn set_layer_states(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
+    /// A local participant published a track: register its measurement handles
+    /// on the node so any shard that later subscribes can resolve them.
+    pub fn publish_local_track(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
+        self.streams.publish(track_id, states.clone());
         self.tracks
             .entry(track_id)
             .or_insert_with(TrackRoute::new)
             .layer_states = states;
     }
 
-    pub fn layer_states(&self, track_id: TrackId) -> crate::track::TrackStates {
-        self.tracks
-            .get(&track_id)
-            .map(|r| r.layer_states.clone())
-            .unwrap_or_default()
+    pub fn unpublish_local_track(&mut self, track_id: &TrackId) {
+        self.streams.unpublish(track_id);
     }
 
     pub fn remote_shard_for(&self, participant_id: &ParticipantId) -> Option<ShardId> {
@@ -467,7 +473,14 @@ impl ShardRoutingTable {
     ) -> Option<ShardEvent> {
         let handle = *self.local_participants.get(&subscriber)?;
         debug_assert_eq!(handle.participant_id(), subscriber);
+        // Resolve the publisher's handles from the node rather than waiting for
+        // them to be sent: they are ready before any subscribe can happen, so
+        // the fanout is never briefly live with no measurements behind it.
+        let states = self.streams.states_for(&track.id);
         let entry = self.tracks.entry(track.id).or_insert_with(TrackRoute::new);
+        if entry.layer_states.is_empty() {
+            entry.layer_states = states;
+        }
         let already_subscribed = entry
             .subscribers
             .iter()
@@ -1671,7 +1684,9 @@ mod tests {
 
     #[test]
     fn duplicate_register_remote_participant_does_not_leak_refcount() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant = pid();
         let room = room_id("r1");
@@ -1700,7 +1715,9 @@ mod tests {
 
     #[test]
     fn moving_remote_participant_releases_the_old_shard() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant = pid();
         let room = room_id("r2");
@@ -1718,7 +1735,9 @@ mod tests {
 
     #[test]
     fn first_subscriber_notifies_publisher_shard() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let track = TrackMeta {
             shard_id: ShardId::new(1),
             id: pid().derive_track_id(TrackKind::Video, "v"),
@@ -1742,7 +1761,9 @@ mod tests {
 
     #[test]
     fn replacement_subscriber_evicts_stale_route_without_duplicate_notification() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let subscriber = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(1),
@@ -1778,7 +1799,9 @@ mod tests {
     /// local subscriber.
     #[test]
     fn a_reliable_subscription_resolves_on_publisher_announcement() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let mut rng = rand::seeded_rng(13);
         let room = room_id("reliable-room");
         let subscriber = pid();
@@ -1831,7 +1854,9 @@ mod tests {
     /// the destination installs a route immediately and hands back the handle.
     #[test]
     fn an_explicit_data_subscription_installs_a_route() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let mut rng = rand::seeded_rng(11);
         let room = room_id("data-room");
         let subscriber = pid();
@@ -1881,7 +1906,9 @@ mod tests {
     /// until a publisher is announced — then it resolves to a concrete route.
     #[test]
     fn a_wildcard_data_subscription_resolves_on_publisher_announcement() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let mut rng = rand::seeded_rng(12);
         let room = room_id("data-wildcard");
         let subscriber = pid();
@@ -1929,7 +1956,9 @@ mod tests {
     /// exists and retires when it has nobody left to deliver to.
     #[test]
     fn an_audio_route_is_installed_per_stream_and_retired_with_the_room() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room");
         let local = pid();
@@ -1972,7 +2001,9 @@ mod tests {
 
     #[test]
     fn a_locally_published_audio_track_installs_no_route() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room-local");
         let origin = pid();
@@ -2011,7 +2042,9 @@ mod tests {
     /// and only then does media flow — addressed by route, not by track id.
     #[test]
     fn a_route_is_installed_once_and_retired_with_the_last_subscriber() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let track = TrackMeta {
             shard_id: ShardId::new(1),
             id: pid().derive_track_id(TrackKind::Video, "v"),
@@ -2063,7 +2096,9 @@ mod tests {
 
     #[test]
     fn route_video_forwards_to_subscribers_and_remote_shards() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
         let track_id = pid().derive_track_id(TrackKind::Video, "v");
         let subscriber = pid();
         add_local_subscriber(&mut table, subscriber);

@@ -137,14 +137,6 @@ pub enum CrossShardEvent {
         env: Envelope,
         payload: MediaPayload,
     },
-    /// Publisher shard → destination shard: the measurement handles for a
-    /// track the destination is about to receive. Sent on the control lane
-    /// because it must not be dropped, and shard-to-shard because the
-    /// controller must never hold media-path state.
-    TrackStates {
-        track_id: TrackId,
-        states: crate::track::TrackStates,
-    },
     /// Subscriber shard → Publisher shard: keyframe request.
     KeyframeRequested(GlobalKeyframeRequest),
     /// A UDP packet batch arrived on this shard but the participant lives elsewhere.
@@ -292,8 +284,9 @@ impl ShardWorker {
         metrics: Arc<ShardMetrics>,
         rng: Rng,
         wall: WallAnchor,
+        streams: Arc<crate::stream_registry::StreamRegistry>,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall);
+        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall, streams);
         let router = ChannelTransport {
             shard_id,
             cross_shard_event_txs,
