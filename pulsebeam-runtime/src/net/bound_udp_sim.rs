@@ -20,6 +20,8 @@ impl BoundUdpSocket {
     }
 }
 
+type ReuseportKey = (SocketAddr, Option<SocketAddr>);
+
 thread_local! {
     /// Sockets already bound on this host, so a second bind to the same address
     /// joins them instead of failing.
@@ -28,7 +30,7 @@ thread_local! {
     /// in a simulation binds `0.0.0.0:3478`, and only the advertised address
     /// tells them apart. `Weak`, so a finished simulation's sockets unbind and
     /// the next one starts clean.
-    static REUSEPORT_GROUPS: RefCell<HashMap<(SocketAddr, Option<SocketAddr>), Weak<UdpSocket>>> =
+    static REUSEPORT_GROUPS: RefCell<HashMap<ReuseportKey, Weak<UdpSocket>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -41,11 +43,18 @@ thread_local! {
 /// testing one is testing something else.
 ///
 /// The emulation shares the underlying socket across the group. Each worker
-/// polls it, so a datagram goes to whichever is ready first. Real
-/// `SO_REUSEPORT` is sticky per 4-tuple where this is not, which makes the
-/// simulation the harsher of the two: a session's packets can land on any
-/// worker, so the demuxer's misdelivery path runs constantly rather than only
-/// when a route changes.
+/// polls it, so a datagram goes to whichever is ready first.
+///
+/// That is **not** a harsher version of `SO_REUSEPORT`, it is a broken one, and
+/// it is why multi-shard plans must currently pass `.with_tcp_only()`. Real
+/// `SO_REUSEPORT` is sticky per 4-tuple, and the stickiness is load-bearing
+/// rather than incidental: a session's ICE and DTLS state lives on exactly one
+/// shard, so a client whose datagrams scatter across the group never completes
+/// a handshake and the plan hangs instead of failing.
+///
+/// Fixing it means the group keeps per-member inboxes and whichever worker
+/// reads dispatches on a hash of the source 4-tuple, delivering to itself only
+/// when the hash selects it. Until then multi-shard UDP has no coverage.
 pub async fn bind_udp_socket(
     addr: SocketAddr,
     _mode: UdpMode,

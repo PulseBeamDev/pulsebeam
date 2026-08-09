@@ -356,6 +356,7 @@ fn ordered_topic_continues_after_publisher_reconnect() {
 fn cross_shard_data_channel_forwarding_test() {
     LocalNodeSim::new()
         .with_shards(2)
+        .with_tcp_only()
         .with_room(
             Room::new("room-data-xshard")
                 .with_participant(Participant::data_participant("pub"))

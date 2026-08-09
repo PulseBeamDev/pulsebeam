@@ -140,6 +140,7 @@ fn tcp_simulation_test() {
 fn tcp_multi_shard_simulation_test() {
     LocalNodeSim::new()
         .with_shards(2)
+        .with_tcp_only()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -403,20 +404,25 @@ fn abrupt_exit_chaos_test() {
     ]);
 }
 
-/// Media crossing a shard boundary, end to end.
+/// Media crossing a shard boundary, end to end, over UDP.
 ///
-/// This is the only sim coverage of the route/envelope path. With
-/// `room_shard_slot(1)` the publisher and each subscriber land on *different*
-/// shards, so every forwarded packet is addressed by a route the destination
-/// allocated, wrapped in a `MediaEnvelope`, resolved by index and epoch, and
-/// restamped onto the receiving shard's timeline. A room below the spill
-/// threshold is co-located and reaches none of that — which is why the older
-/// multi-shard test, with four participants and a slot of sixteen, never
+/// With `room_shard_slot(1)` the publisher and each subscriber land on
+/// *different* shards, so every forwarded packet is addressed by a route the
+/// destination allocated, wrapped in a `MediaEnvelope`, resolved by index and
+/// epoch, and restamped onto the receiving shard's timeline. A room below the
+/// spill threshold is co-located and reaches none of that — which is why the
+/// older multi-shard test, with four participants and a slot of sixteen, never
 /// exercised it despite the name.
+///
+/// Still TCP-only, and not by choice: multi-shard over UDP does not converge
+/// because the `SO_REUSEPORT` emulation is not sticky per 4-tuple. The harness
+/// refuses that combination and explains why. So cross-shard forwarding is
+/// covered, and the transport carrying almost all real media is not.
 #[test]
 fn cross_shard_video_is_forwarded_decodably_test() {
     LocalNodeSim::new()
         .with_shards(2)
+        .with_tcp_only()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
