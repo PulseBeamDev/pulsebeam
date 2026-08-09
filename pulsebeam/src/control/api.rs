@@ -18,6 +18,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
+    control::api_json,
     control::auth,
     control::controller::{self},
     entity::ConnectionId,
@@ -61,8 +62,8 @@ impl ParticipantResponseHeaders {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    controller: ControllerHandle,
-    api_config: ApiConfig,
+    pub(crate) controller: ControllerHandle,
+    pub(crate) api_config: ApiConfig,
 }
 
 /// Above any realistic SDP, below axum's 2 MiB default.
@@ -110,16 +111,30 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("{0}")]
+    Unauthorized(#[from] auth::AuthError),
+    #[error("forbidden: {0}")]
+    Forbidden(&'static str),
+    #[error("request body is not valid json: {0}")]
+    InvalidJson(String),
+    #[error("unsupported media type")]
+    UnsupportedMediaType,
+    #[error("{0}")]
     Unknown(String),
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> axum::response::Response {
-        let status = match self {
+impl ApiError {
+    pub fn status(&self) -> StatusCode {
+        match self {
             ApiError::IdValidation(_)
             | ApiError::OfferInvalid(_)
             | ApiError::JoinError(controller::ControllerError::OfferRejected(_))
+            | ApiError::InvalidJson(_)
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized(e) if e.is_forbidden() => StatusCode::FORBIDDEN,
+            ApiError::Unauthorized(e) if e.is_unavailable() => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ApiError::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -133,9 +148,37 @@ impl IntoResponse for ApiError {
             | ApiError::JoinError(controller::ControllerError::IOError(_))
             | ApiError::BadUrl
             | ApiError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        }
+    }
 
-        (status, self.to_string()).into_response()
+    /// Stable machine-readable code for the JSON envelope.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApiError::IdValidation(_) => "invalid_id",
+            ApiError::OfferInvalid(_) => "invalid_sdp",
+            ApiError::InvalidJson(_) => "invalid_json",
+            ApiError::BadRequest(_) => "bad_request",
+            ApiError::Unauthorized(e) => e.code(),
+            ApiError::Forbidden(code) => code,
+            ApiError::UnsupportedMediaType => "unsupported_media_type",
+            ApiError::RateLimited => "rate_limited",
+            ApiError::ServiceUnavailable => "service_unavailable",
+            ApiError::BadUrl | ApiError::Unknown(_) => "internal",
+            ApiError::JoinError(e) => match e {
+                controller::ControllerError::OfferRejected(_) => "invalid_sdp",
+                controller::ControllerError::ServiceUnavailable => "service_unavailable",
+                controller::ControllerError::ParticipantNotFound => "participant_not_found",
+                controller::ControllerError::ConnectionMismatch => "connection_mismatch",
+                controller::ControllerError::IOError(_)
+                | controller::ControllerError::Unknown(_) => "internal",
+            },
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (self.status(), self.to_string()).into_response()
     }
 }
 
@@ -145,6 +188,15 @@ fn build_location(
     cfg: &ApiConfig,
     path: &str,
     state: &ParticipantState,
+) -> Result<String, ApiError> {
+    build_location_for(headers, cfg, path, state.manual_sub)
+}
+
+pub(crate) fn build_location_for(
+    headers: &HeaderMap,
+    cfg: &ApiConfig,
+    path: &str,
+    manual_sub: bool,
 ) -> Result<String, ApiError> {
     let scheme = headers
         .get("x-forwarded-proto")
@@ -159,7 +211,7 @@ fn build_location(
 
     // TODO: Can these keys be strongly typed?
     let mut params = BTreeMap::new();
-    if state.manual_sub {
+    if manual_sub {
         params.insert("manual_sub".to_string(), "true".to_string());
     }
 
@@ -467,6 +519,134 @@ async fn patch_participant(
     ))
 }
 
+/// `Content-Type` selects the representation; anything that is not JSON falls through to the
+/// legacy SDP handler untouched, including the 400 for a missing `Content-Type`.
+async fn create_participant_dispatch(
+    Path(external_room_id): Path<ExternalRoomId>,
+    Query(query): Query<CreateParticipantQuery>,
+    State(s): State<AppState>,
+    content_type: Option<TypedHeader<ContentType>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    debug_assert!(body.len() <= s.api_config.max_body_bytes);
+
+    if api_json::is_json(&headers) {
+        return match api_json::join(s, external_room_id, headers, body).await {
+            Ok(response) => response,
+            Err(e) => e.into_response(),
+        };
+    }
+
+    // Preserved verbatim: the legacy handler requires a Content-Type but ignores its value.
+    if content_type.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Header of type `content-type` was missing",
+        )
+            .into_response();
+    }
+    let Ok(raw_offer) = String::from_utf8(body.to_vec()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Request body didn't contain valid UTF-8",
+        )
+            .into_response();
+    };
+
+    if let Err(e) = require_auth_if_configured(&s, &headers, &external_room_id) {
+        return e.into_response();
+    }
+
+    create_participant(
+        Path(external_room_id),
+        Query(query),
+        State(s),
+        content_type.unwrap(),
+        headers,
+        raw_offer,
+    )
+    .await
+    .into_response()
+}
+
+async fn patch_participant_dispatch(
+    Path((external_room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    Query(query): Query<PatchParticipantQuery>,
+    State(s): State<AppState>,
+    content_type: Option<TypedHeader<ContentType>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // PATCH has no JSON meaning: renegotiation is not part of this surface.
+    if api_json::is_json(&headers) {
+        return api_json::JsonApiError(ApiError::UnsupportedMediaType).into_response();
+    }
+    if content_type.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Header of type `content-type` was missing",
+        )
+            .into_response();
+    }
+    let Ok(raw_offer) = String::from_utf8(body.to_vec()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Request body didn't contain valid UTF-8",
+        )
+            .into_response();
+    };
+
+    if let Err(e) = require_auth_if_configured(&s, &headers, &external_room_id) {
+        return e.into_response();
+    }
+
+    patch_participant(
+        Path((external_room_id, participant_id)),
+        Query(query),
+        State(s),
+        content_type.unwrap(),
+        headers,
+        raw_offer,
+    )
+    .await
+    .into_response()
+}
+
+async fn delete_participant_dispatch(
+    Path((external_room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if api_json::wants_json_delete(&headers) {
+        return match api_json::leave(s, external_room_id, participant_id, headers).await {
+            Ok(response) => response,
+            Err(e) => e.into_response(),
+        };
+    }
+
+    delete_participant(Path((external_room_id, participant_id)), State(s))
+        .await
+        .into_response()
+}
+
+/// Bearer auth on the legacy SDP surface, off unless the operator opts in.
+fn require_auth_if_configured(
+    s: &AppState,
+    headers: &HeaderMap,
+    room: &ExternalRoomId,
+) -> Result<(), ApiError> {
+    if !s.api_config.require_auth {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    api_json::authorize(&s.api_config, headers, room, now)?;
+    Ok(())
+}
+
 /// Build OpenAPI spec with dynamic server configuration
 fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
     use utoipa::openapi::{ContactBuilder, InfoBuilder, OpenApi as OpenApiSpec, ServerBuilder};
@@ -509,12 +689,21 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
         create_participant,
         patch_participant,
         delete_participant,
+        api_json::join,
+        api_json::resume,
     ),
     components(
-        schemas(ParticipantResponseHeaders)
+        schemas(
+            ParticipantResponseHeaders,
+            api_json::JoinRequest,
+            api_json::ResumeRequest,
+            api_json::SessionResponse,
+            api_json::ErrorResponse,
+        )
     ),
     tags(
-        (name = "participants", description = "Participant management endpoints"),
+        (name = "participants", description = "Participant management endpoints (application/sdp)"),
+        (name = "participants-json", description = "Participant management endpoints (application/json)"),
     )
 )]
 struct ApiDoc;
@@ -523,15 +712,19 @@ struct ApiDoc;
 pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Router {
     let openapi = build_openapi(&cfg.base_path);
 
+    let max_body = cfg.max_body_bytes;
     let api = Router::new()
         .route(
             "/rooms/{external_room_id}/participants",
-            post(create_participant),
+            post(create_participant_dispatch),
         )
         .route(
             "/rooms/{external_room_id}/participants/{participant_id}",
-            patch(patch_participant).delete(delete_participant),
+            patch(patch_participant_dispatch)
+                .put(api_json::resume)
+                .delete(delete_participant_dispatch),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn(track_route_duration));
 
     Router::new()
@@ -962,12 +1155,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_routes_and_methods_are_not_served() {
         let h = harness(Stub::Answer);
+        // PUT is deliberately absent from this list: it is the resume verb, added by the JSON
+        // surface. Everything else stays unserved.
         for (method, uri) in [
             ("GET", format!("/api/v1/rooms/{ROOM}/participants")),
-            (
-                "PUT",
-                format!("/api/v1/rooms/{ROOM}/participants/{PARTICIPANT}"),
-            ),
+            ("HEAD", format!("/api/v1/rooms/{ROOM}/participants")),
             ("POST", format!("/api/v1/rooms/{ROOM}")),
         ] {
             let req = Request::builder()
