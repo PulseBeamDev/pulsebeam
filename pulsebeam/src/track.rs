@@ -5,13 +5,13 @@ use std::time::Duration;
 use crate::entity::TrackId;
 use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
+use crate::rtp::normalize::StreamNormalizer;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
     sync::TrackSynchronizer,
 };
 pub use data_track::*;
-use pulsebeam_core::dd::{DependencyDescriptorReader, RawDependencyDescriptor};
 pub use pulsebeam_core::simulcast::LayerQuality;
 use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::Ssrc;
@@ -104,20 +104,18 @@ pub struct TrackMeta {
     pub origin: crate::entity::ParticipantId,
 }
 
+/// One encoding's ingest: normalize the packet, then measure it.
+///
+/// The two halves are deliberately separate objects. Normalization is the
+/// once-per-node work a future UDP ingress reuses verbatim; measurement is what
+/// the whole node shares through `StreamState`.
 #[derive(Debug)]
 pub struct UpstreamTrackLayer {
     pub mid: Mid,
     pub rid: Option<Rid>,
     pub quality: LayerQuality,
+    normalizer: StreamNormalizer,
     pub monitor: StreamMonitor,
-    /// The Video Layers Allocation simulcast-stream index this layer is sent on,
-    /// learned from its own packets. Used to read this layer's state out of a
-    /// VLA carried on any sibling's packet.
-    vla_index: Option<u8>,
-    /// Per-RTP-stream dependency descriptor state; templates only arrive on
-    /// keyframes and are referenced by later packets.
-    dd: DependencyDescriptorReader,
-    dd_errors: u64,
 }
 
 impl PartialEq for UpstreamTrackLayer {
@@ -134,61 +132,24 @@ impl UpstreamTrackLayer {
     }
 
     pub fn process(&mut self, pkt: &mut RtpPacket) -> bool {
+        // Normalize first, measure second: only the first stage writes to the
+        // packet, and the monitor reads none of what it writes.
+        let facts = self.normalizer.normalize(pkt);
         self.monitor.process_packet(pkt);
-        // Learn which VLA simulcast-stream index this layer is sent on, so a VLA
-        // carried on any sibling's packet can address this layer's state.
-        if let Some(vla) = pkt
-            .ext_vals
-            .user_values
-            .get::<str0m::rtp::vla::VideoLayersAllocation>()
-        {
-            self.vla_index = Some(vla.current_simulcast_stream_index);
+        // A scalable keyframe teaches the structure; publish how many decode
+        // targets it offers so the allocator can reason about shedding to them.
+        if let Some(count) = facts.decode_targets {
+            self.monitor.shared_state().set_decode_target_count(count);
         }
-        self.parse_dependency_descriptor(pkt);
         // audio will only be filtered at the centralized audio_selector
         true
-    }
-
-    fn parse_dependency_descriptor(&mut self, pkt: &mut RtpPacket) {
-        let Some(raw) = pkt.ext_vals.user_values.get::<RawDependencyDescriptor>() else {
-            return;
-        };
-        match self.dd.read(&raw.0) {
-            Ok(dd) => {
-                // Under SFrame/E2EE the media payload is opaque, so the H.264 IDR
-                // probe in from_str0m sees nothing. The Dependency Descriptor rides
-                // in the clear and carries the template structure on every keyframe,
-                // so it is the authoritative keyframe signal whenever present.
-                pkt.is_keyframe = dd.attached_structure.is_some();
-                pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
-                // A scalable keyframe teaches the structure; publish how many decode
-                // targets it offers so the allocator can reason about shedding to them.
-                if let Some(structure) = self.dd.structure() {
-                    self.monitor
-                        .shared_state()
-                        .set_decode_target_count(structure.decode_target_count);
-                }
-            }
-            Err(err) => {
-                self.dd_errors += 1;
-                if self.dd_errors.is_power_of_two() {
-                    tracing::warn!(
-                        mid = %self.mid,
-                        rid = ?self.rid,
-                        errors = self.dd_errors,
-                        %err,
-                        "dependency descriptor parse failed"
-                    );
-                }
-            }
-        }
     }
 
     /// Apply a (track-wide) Video Layers Allocation to this layer using its
     /// learned stream index: the sender's declared target bitrate, resolution,
     /// and active/inactive state.
     fn apply_vla(&mut self, vla: &str0m::rtp::vla::VideoLayersAllocation) {
-        let Some(idx) = self.vla_index.map(usize::from) else {
+        let Some(idx) = self.normalizer.vla_index().map(usize::from) else {
             return;
         };
         let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
@@ -517,10 +478,8 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             mid,
             rid: None,
             quality: LayerQuality::Low,
+            normalizer: StreamNormalizer::new(mid, None),
             monitor,
-            vla_index: None,
-            dd: DependencyDescriptorReader::new(),
-            dd_errors: 0,
         }]),
     };
     (
@@ -573,10 +532,8 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             mid,
             rid,
             quality,
+            normalizer: StreamNormalizer::new(mid, rid),
             monitor,
-            vla_index: None,
-            dd: DependencyDescriptorReader::new(),
-            dd_errors: 0,
         });
         layers.push(TrackLayer {
             meta: meta.clone(),
@@ -1131,10 +1088,8 @@ mod dd_tests {
             mid: Mid::from("0"),
             rid: None,
             quality: LayerQuality::High,
+            normalizer: StreamNormalizer::new(Mid::from("0"), None),
             monitor: StreamMonitor::new(TrackKind::Video, "test".to_string(), state),
-            vla_index: None,
-            dd: DependencyDescriptorReader::new(),
-            dd_errors: 0,
         }
     }
 
@@ -1142,7 +1097,9 @@ mod dd_tests {
         let mut pkt = RtpPacket::default();
         pkt.ext_vals
             .user_values
-            .set(RawDependencyDescriptor(bytes.iter().copied().collect()));
+            .set(pulsebeam_core::dd::RawDependencyDescriptor(
+                bytes.iter().copied().collect(),
+            ));
         pkt
     }
 
@@ -1174,7 +1131,7 @@ mod dd_tests {
 
         let got = pkt.ext_vals.user_values.get::<DependencyDescriptor>();
         assert_eq!(got, Some(&sent));
-        assert_eq!(layer.dd_errors, 0);
+        assert_eq!(layer.normalizer.dd_errors(), 0);
     }
 
     #[test]
@@ -1250,7 +1207,7 @@ mod dd_tests {
                 .get::<DependencyDescriptor>()
                 .is_none()
         );
-        assert_eq!(layer.dd_errors, 1);
+        assert_eq!(layer.normalizer.dd_errors(), 1);
     }
 
     #[test]
@@ -1259,7 +1216,7 @@ mod dd_tests {
         let mut pkt = RtpPacket::default();
 
         assert!(layer.process(&mut pkt));
-        assert_eq!(layer.dd_errors, 0);
+        assert_eq!(layer.normalizer.dd_errors(), 0);
     }
 }
 
