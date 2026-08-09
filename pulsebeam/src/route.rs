@@ -10,6 +10,7 @@ use tokio::time::{Duration, Instant};
 use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::shard::participants::ParticipantHandle;
+use crate::shard::router::LocalTrackKey;
 use crate::track::{DataLane, Topic};
 use str0m::media::Rid;
 
@@ -289,7 +290,10 @@ pub(crate) struct RouteNames {
 #[derive(Debug, Clone)]
 pub(crate) enum RouteAction {
     Video {
-        local_track: TrackId,
+        /// The destination's own fanout handle — a dense index, not a name.
+        /// Resolving a route hands dispatch something it can use directly,
+        /// rather than a `TrackId` it would have to hash back into a map.
+        local_track: LocalTrackKey,
         kind: TrackKind,
         nominal_bps: u64,
     },
@@ -948,7 +952,7 @@ mod tests {
         let (id, epoch) = table
             .install(
                 RouteAction::Video {
-                    local_track: names().origin.derive_track_id(TrackKind::Video, "0"),
+                    local_track: LocalTrackKey::default(),
                     kind: TrackKind::Video,
                     nominal_bps: 0,
                 },

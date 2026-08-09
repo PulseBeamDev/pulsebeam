@@ -634,14 +634,21 @@ mod data_track {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    pub struct Topic(String);
+    /// A data-channel topic name.
+    ///
+    /// `Arc<str>` rather than `String` because a topic is immutable once parsed
+    /// and gets cloned to build lookup keys on the forwarding path — twice per
+    /// cross-shard data frame. As a `String` each of those was a malloc and a
+    /// copy; as an `Arc<str>` it is a refcount bump. The sharing is within one
+    /// shard on the hot path, so the refcount stays in that core's cache.
+    pub struct Topic(std::sync::Arc<str>);
 
     impl Topic {
         /// Production builds a `Topic` only by parsing a channel label; tests
         /// need one without going through the label grammar.
         #[cfg(test)]
         pub fn for_test(topic: &str) -> Self {
-            Self(topic.to_string())
+            Self(topic.into())
         }
     }
 
@@ -853,7 +860,7 @@ mod data_track {
 
                     let topic = DataTopicChannel {
                         direction,
-                        topic: Topic(topic_slice.to_string()),
+                        topic: Topic(topic_slice.into()),
                         scope,
                         lane,
                     };
@@ -986,7 +993,7 @@ mod data_track {
         fn test_reliable_display() {
             let pub_ch = DataTopicChannel {
                 direction: DataTrackDirection::Publish,
-                topic: Topic("chat".to_string()),
+                topic: Topic("chat".into()),
                 scope: None,
                 lane: DataLane::Reliable,
             };
@@ -994,7 +1001,7 @@ mod data_track {
 
             let sub_ch = DataTopicChannel {
                 direction: DataTrackDirection::Subscribe,
-                topic: Topic("chat".to_string()),
+                topic: Topic("chat".into()),
                 scope: None,
                 lane: DataLane::Reliable,
             };

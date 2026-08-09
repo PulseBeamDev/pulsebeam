@@ -263,7 +263,7 @@ impl ShardCore {
         // Copy out only what dispatch needs, rather than cloning the action —
         // `RouteAction::Data` owns a `Topic`, and this runs per frame.
         enum Target {
-            Video(TrackId),
+            Video(crate::shard::router::LocalTrackKey),
             Audio {
                 room_id: crate::entity::RoomId,
                 origin: ParticipantId,
@@ -430,7 +430,13 @@ impl ShardCore {
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Video);
-            self.routing.route_video(ev.stream_id.0, ev.pkt, &mut ctx);
+            // A locally published track still costs one lookup to reach its
+            // fanout: the publishing participant does not hold the key yet.
+            // Everything downstream of here is index-addressed.
+            let Some(fanout) = self.routing.fanout_of(&ev.stream_id.0) else {
+                continue;
+            };
+            self.routing.route_video(fanout, ev.pkt, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {
