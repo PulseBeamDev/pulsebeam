@@ -18,7 +18,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    control::controller::{self, CreateParticipantReply},
+    control::controller::{self},
     entity::ConnectionId,
 };
 use crate::{
@@ -59,7 +59,7 @@ impl ParticipantResponseHeaders {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     controller: ControllerHandle,
     api_config: ApiConfig,
 }
@@ -156,6 +156,107 @@ pub struct CreateParticipantQuery {
     pub manual_sub: bool,
 }
 
+/// Which participant a join is for: a fresh one, or an existing identity being re-established.
+pub(crate) enum JoinKind {
+    Create,
+    Reconnect {
+        participant_id: ParticipantId,
+        old_connection_id: Option<ConnectionId>,
+    },
+}
+
+pub(crate) struct JoinOutcome {
+    pub state: ParticipantState,
+    pub answer: str0m::change::SdpAnswer,
+    pub location: String,
+}
+
+fn to_api_error(e: TrySendError<controller::ControllerCommand>) -> ApiError {
+    match e {
+        TrySendError::Full(_) => ApiError::RateLimited,
+        TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+    }
+}
+
+/// The path every representation shares: mint ids, hand the offer to the controller, await the
+/// answer, and build the resource URL. Both the SDP handlers and the JSON handlers go through here
+/// so the two can never drift on what reaches the controller.
+pub(crate) async fn join_core(
+    s: &AppState,
+    headers: &HeaderMap,
+    kind: JoinKind,
+    external_room_id: &ExternalRoomId,
+    manual_sub: bool,
+    offer: SdpOffer,
+) -> Result<JoinOutcome, ApiError> {
+    let room_id = RoomId::from_external(external_room_id);
+
+    let (participant_id, old_connection_id) = match kind {
+        JoinKind::Create => (ParticipantId::new(&mut os_rng()), None),
+        JoinKind::Reconnect {
+            participant_id,
+            old_connection_id,
+        } => (participant_id, old_connection_id),
+    };
+    // A capability token, so it is derived from fresh OS entropy on every join.
+    let connection_id = ConnectionId::new(&mut os_rng());
+
+    let state = ParticipantState {
+        manual_sub,
+        room_id,
+        participant_id,
+        connection_id,
+        old_connection_id,
+    };
+
+    let answer = if old_connection_id.is_some() {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let msg = controller::PatchParticipant {
+            offer,
+            state: state.clone(),
+        };
+        s.controller
+            .try_send((msg, reply_tx).into())
+            .map_err(to_api_error)?;
+        reply_rx
+            .await
+            .map_err(|_| controller::ControllerError::ServiceUnavailable)??
+            .answer
+    } else {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let msg = controller::CreateParticipant {
+            offer,
+            state: state.clone(),
+        };
+        s.controller
+            .try_send((msg, reply_tx).into())
+            .map_err(to_api_error)?;
+        reply_rx
+            .await
+            .map_err(|_| controller::ControllerError::ServiceUnavailable)??
+            .answer
+    };
+
+    let path = format!(
+        "/rooms/{}/participants/{}",
+        external_room_id, &participant_id
+    );
+    let location = build_location(headers, &s.api_config, &path, &state)?;
+
+    debug_assert_eq!(state.participant_id, participant_id);
+    debug_assert!(location.starts_with("http"));
+    debug_assert!(
+        state.old_connection_id != Some(state.connection_id),
+        "a reconnect must mint a connection id distinct from the one it replaces"
+    );
+
+    Ok(JoinOutcome {
+        state,
+        answer,
+        location,
+    })
+}
+
 /// Create a new participant in a room
 ///
 /// Creates a new participant by processing a WebRTC offer and returning an answer.
@@ -191,52 +292,27 @@ async fn create_participant(
     headers: HeaderMap,
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    let room_id = RoomId::from_external(&external_room_id);
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
-    let (participant_id, connection_id) = {
-        let mut rng = os_rng();
-        (ParticipantId::new(&mut rng), ConnectionId::new(&mut rng))
-    };
-
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let state = ParticipantState {
-        manual_sub: query.manual_sub,
-        room_id,
-        participant_id,
-        connection_id,
-        old_connection_id: None,
-    };
-    let msg = controller::CreateParticipant {
-        state: state.clone(),
+    let outcome = join_core(
+        &s,
+        &headers,
+        JoinKind::Create,
+        &external_room_id,
+        query.manual_sub,
         offer,
-    };
-    s.controller
-        .try_send((msg, reply_tx).into())
-        .map_err(|e| match e {
-            TrySendError::Full(_) => ApiError::RateLimited,
-            TrySendError::Closed(_) => ApiError::ServiceUnavailable,
-        })?;
-
-    let reply: CreateParticipantReply = reply_rx
-        .await
-        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
-
-    let path = format!(
-        "/rooms/{}/participants/{}",
-        &external_room_id, &participant_id
-    );
-    let location_url = build_location(&headers, &s.api_config, &path, &state)?;
+    )
+    .await?;
 
     let response_headers = ParticipantResponseHeaders {
-        location: location_url,
-        etag: state.connection_id,
+        location: outcome.location,
+        etag: outcome.state.connection_id,
     };
 
     Ok((
         StatusCode::CREATED,
         response_headers.to_header_map(),
-        reply.answer.to_sdp_string(),
+        outcome.answer.to_sdp_string(),
     ))
 }
 
@@ -318,7 +394,6 @@ async fn patch_participant(
     headers: HeaderMap,
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    let room_id = RoomId::from_external(&external_room_id);
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
     let old_connection_id: ConnectionId = headers
@@ -328,46 +403,28 @@ async fn patch_participant(
         .ok_or(ApiError::BadRequest("If-Match header required".into()))?
         .try_into()?;
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let outcome = join_core(
+        &s,
+        &headers,
+        JoinKind::Reconnect {
+            participant_id,
+            old_connection_id: Some(old_connection_id),
+        },
+        &external_room_id,
+        query.manual_sub,
+        offer,
+    )
+    .await?;
 
-    // TODO: merge this logic with POST
-    let path = format!(
-        "/rooms/{}/participants/{}",
-        &external_room_id, &participant_id
-    );
-    // ConnectionId is a capability token — derive from fresh OS entropy.
-    let connection_id = {
-        let mut rng = os_rng();
-        ConnectionId::new(&mut rng)
-    };
-    let state = ParticipantState {
-        manual_sub: query.manual_sub,
-        room_id,
-        participant_id,
-        connection_id,
-        old_connection_id: Some(old_connection_id),
-    };
-    let location_url = build_location(&headers, &s.api_config, &path, &state)?;
     let response_headers = ParticipantResponseHeaders {
-        location: location_url,
-        etag: state.connection_id,
+        location: outcome.location,
+        etag: outcome.state.connection_id,
     };
-    let msg = controller::PatchParticipant { offer, state };
-    s.controller
-        .try_send((msg, reply_tx).into())
-        .map_err(|e| match e {
-            TrySendError::Full(_) => ApiError::RateLimited,
-            TrySendError::Closed(_) => ApiError::ServiceUnavailable,
-        })?;
-
-    let reply = reply_rx
-        .await
-        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
     Ok((
         StatusCode::OK,
         response_headers.to_header_map(),
-        reply.answer.to_sdp_string(),
+        outcome.answer.to_sdp_string(),
     ))
 }
 
