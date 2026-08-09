@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::rand;

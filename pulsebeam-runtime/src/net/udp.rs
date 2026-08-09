@@ -8,9 +8,6 @@
 //!
 //! Linux only: `recvmmsg`/`sendmmsg`, `UDP_GRO`, and `UDP_SEGMENT` are all
 //! Linux-specific, so this file simply doesn't compile anywhere else.
-
-#![forbid(unsafe_code)]
-
 use crate::net::{Transport, UdpMode};
 use crate::sync::Arc;
 

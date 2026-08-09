@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
 pub use bytes::Bytes;
 use std::sync::Arc;
 use std::time::SystemTime;

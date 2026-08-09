@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
 pub mod collections;
 pub mod mailbox;
 pub mod net;

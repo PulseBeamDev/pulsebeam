@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
 pub mod audio_selector;
 mod bitrate;
 pub mod control;
