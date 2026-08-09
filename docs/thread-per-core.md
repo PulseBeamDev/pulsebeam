@@ -139,14 +139,27 @@ Three places, deliberately:
   re-litigated from scratch.
 - **Module-level `#![allow]`** — every exception, next to the code it excuses.
 
-### Determinism is part of this
+### Determinism is not enforced here, on purpose
 
-The simulator substitutes the clock and seeds every RNG so a failing plan
-replays exactly. Code reading the real clock or an unseeded RNG opts out of
-that silently: the plan still passes, it just stops meaning anything. That is
-why `SystemTime::now`, `std::time::Instant::now`, `rand::thread_rng` and
-`std::thread::sleep` are denied rather than discouraged — the failure is
-invisible in review.
+An early version of this config denied `SystemTime::now`,
+`std::time::Instant::now` and `thread_rng` on determinism grounds. That was
+wrong, and it is worth recording why so it does not come back.
 
-There is exactly one sanctioned wall-clock read, in `node.rs`, feeding the
-node's single `WallAnchor`. Everything else converts through it.
+`pulsebeam-simulator` overrides `clock_gettime` (both `CLOCK_REALTIME` and
+`CLOCK_MONOTONIC`) and `getrandom(2)` for the whole process. Under a plan those
+calls already return simulated time and seeded bytes. The shim is *stronger*
+than a lint could be, because it also reaches inside dependencies — tracing,
+hashers, DTLS key generation — which no rule about our own source can touch.
+That is the entire reason `sim_clock.rs` and `sim_rand.rs` exist.
+
+So banning the calls would forbid something the harness has already made safe,
+and would still not cover the case the harness was written for. Read those two
+modules before proposing a lint here.
+
+`std::thread::sleep` is denied, but on blocking grounds rather than
+determinism: it parks the shard, and under simulation it burns real time
+turmoil was about to skip.
+
+`node.rs` still reads the wall clock once, for the node's single `WallAnchor`.
+That is an architectural convention — one timeline per node — not something the
+lint enforces.

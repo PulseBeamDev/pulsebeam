@@ -1,9 +1,10 @@
 # Architectural lints. See `docs/thread-per-core.md`; `make lint-check` gates on
 # these, so a violation fails rather than scrolling past in a build log.
 #
-# Two tables below. `disallowed-types` keeps shared state out of the shards;
-# `disallowed-methods` keeps the clock, the RNG and blocking calls out of code
-# that has to be deterministic and non-blocking.
+# Two tables below, both thread-per-core rules: `disallowed-types` keeps shared
+# state out of the shards, `disallowed-methods` keeps blocking calls out of
+# them. Determinism is *not* enforced here — see the note above the second
+# table for why the simulator handles it better.
 #
 # ---------------------------------------------------------------------------
 # Shared-state primitives.
@@ -34,24 +35,25 @@ disallowed-types = [
 ]
 
 # ---------------------------------------------------------------------------
-# Ambient clock, ambient randomness, and blocking.
+# Blocking.
 #
-# The test strategy is deterministic replay: the simulator substitutes the clock
-# (`sim_clock.rs` overrides CLOCK_REALTIME process-wide) and seeds every RNG, so
-# a plan that fails reproduces exactly. Code that reads the *real* clock or an
-# unseeded RNG opts out of that quietly — the plan still passes, it just stops
-# meaning anything. That is a correctness failure, not a style preference, and
-# it is invisible in review, which is why it is a lint.
+# A shard runs on a current-thread runtime and owns every participant on it, so
+# a call that parks the thread stalls all of them — not just the one being
+# served. Under simulation it is worse: real sleeping blocks the simulated world
+# and burns wall time turmoil was about to skip.
 #
-# Blocking is the thread-per-core half: a shard that parks its thread stalls
-# every participant it owns, not just the one it is serving.
+# Note what is *not* here: the clock and the RNG.
+#
+# `SystemTime::now`, `std::time::Instant::now`, `thread_rng` and friends are
+# fine. `pulsebeam-simulator` overrides `clock_gettime` (CLOCK_REALTIME and
+# CLOCK_MONOTONIC) and `getrandom(2)` for the whole process, so under a plan
+# they already return simulated time and seeded bytes. That shim is strictly
+# better than a lint could be, because it also reaches inside dependencies —
+# tracing, hashers, DTLS key generation — which no rule about our own source can
+# touch. Banning the calls would forbid something the harness has already made
+# safe. See `sim_clock.rs` and `sim_rand.rs` for why they exist.
 disallowed-methods = [
-    { path = "std::time::SystemTime::now", reason = "read once per node into a WallAnchor and threaded down; see clock.rs. A second reader gets a different timeline, and under simulation gets a real one." },
-    { path = "std::time::Instant::now", reason = "use tokio::time::Instant, which the simulator controls. std's is the host clock and makes a run irreproducible." },
-    { path = "rand::random", reason = "unseeded. Take an Rng from the caller so a failing plan replays." },
-    { path = "rand::thread_rng", reason = "as rand::random." },
-    { path = "rand::rngs::ThreadRng::default", reason = "as rand::random." },
-    { path = "std::thread::sleep", reason = "blocks the whole shard, and in a test it waits on the wall clock rather than simulated time. Use tokio::time::sleep or a deterministic tick." },
+    { path = "std::thread::sleep", reason = "blocks the whole shard. In a test it also blocks the simulated world and waits on real time, which is what makes a plan slow and flaky rather than deterministic. Use tokio::time::sleep or a deterministic tick." },
     { path = "tokio::task::block_in_place", reason = "a shard runs on a current-thread runtime; there is no pool to hand the work to." },
     { path = "futures::executor::block_on", reason = "blocks the shard's own executor. Restricted to runtime startup." },
 ]

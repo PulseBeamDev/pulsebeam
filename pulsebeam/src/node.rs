@@ -369,12 +369,6 @@ impl NodeBuilder {
 
         // One NTP<->Instant anchor for the whole node: read the wall clock once,
         // here, so every shard shares a timeline and nothing reads it again.
-        //
-        // The sanctioned reader. Everything downstream converts through this
-        // anchor; a second `SystemTime::now()` anywhere would be a *different*
-        // timeline, and under simulation would be the host's rather than the
-        // simulated one.
-        #[allow(clippy::disallowed_methods)]
         let wall_anchor = WallAnchor::new(SystemTime::now(), Instant::now());
 
         let mut shard_contexts = Vec::new();

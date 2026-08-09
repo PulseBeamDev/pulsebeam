@@ -1450,8 +1450,7 @@ impl AllocationEngine {
 #[cfg(test)]
 mod alloc_test_support {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
@@ -1514,8 +1513,7 @@ mod alloc_test_support {
 #[cfg(test)]
 mod assignment_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
@@ -2247,8 +2245,7 @@ mod assignment_tests {
 #[cfg(test)]
 mod allocation_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
@@ -3448,8 +3445,7 @@ mod allocation_tests {
 #[cfg(test)]
 mod slot_switch_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,

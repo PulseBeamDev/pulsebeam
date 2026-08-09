@@ -221,8 +221,7 @@ fn decayed_power(power: f32, last_arrival_ts: Option<Instant>, now: Instant) -> 
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,

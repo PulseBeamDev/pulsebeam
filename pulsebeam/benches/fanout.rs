@@ -5,11 +5,7 @@
 
 //! Exceptions: this measures the cost of the very primitives the crate
 //! restricts, and printing the numbers is the entire output.
-#![allow(
-    clippy::disallowed_types,
-    clippy::disallowed_methods,
-    clippy::print_stdout
-)]
+#![allow(clippy::disallowed_types, clippy::print_stdout)]
 
 use std::hint::black_box;
 use std::time::Instant;

@@ -4,9 +4,13 @@
 
 A shard owns its state and reaches other shards only by message. Denied by
 `clippy.toml` and gated by `make lint-check` (which CI runs): `Arc`, `Mutex`,
-`RwLock`, bare atomics, the ambient clock (`SystemTime::now`,
-`std::time::Instant::now`), unseeded randomness, and blocking calls. Each needs
-an `#[allow]` with a reason if you genuinely need it.
+`RwLock`, bare atomics, and blocking calls (`std::thread::sleep`,
+`block_in_place`). Each needs an `#[allow]` with a reason if you genuinely need
+one.
+
+The clock and the RNG are **not** linted: the simulator shims `clock_gettime`
+and `getrandom` process-wide, so `SystemTime::now` and `thread_rng` are already
+deterministic under a plan — and the shim covers dependencies a lint cannot.
 
 Two things that keep getting reintroduced, both explained in that file:
 

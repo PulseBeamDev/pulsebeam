@@ -1,9 +1,12 @@
-//! Printing exception: this module reports that the runtime is *blocked*. The
-//! tracing pipeline is asynchronous, so at exactly the moment this has
-//! something to say it may be the thing that cannot make progress. stderr is
-//! the only channel that still works, which is why the rest of the codebase
-//! denies it and this does not.
-#![allow(clippy::print_stderr)]
+//! Two exceptions, both because this module watches the runtime from outside it
+//! rather than running inside a shard:
+//!
+//! - It sleeps between samples on its own monitor thread. Blocking there is the
+//!   design, not a mistake — it is what makes the sampling periodic.
+//! - It reports on stderr. The tracing pipeline is asynchronous, so at exactly
+//!   the moment this has something to say, tracing may be the thing that cannot
+//!   make progress.
+#![allow(clippy::print_stderr, clippy::disallowed_methods)]
 // NOTE: This file is heavily modified from https://github.com/facebookexperimental/rust-shed/blob/main/shed/tokio-detectors/src/detectors.rs
 // to avoid a dependency link and for easier local maintenance.
 

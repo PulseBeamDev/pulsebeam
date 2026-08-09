@@ -580,8 +580,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
 #[cfg(test)]
 pub mod test_utils {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
@@ -1122,8 +1121,7 @@ mod data_track {
 #[cfg(test)]
 mod dd_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
@@ -1275,8 +1273,7 @@ mod dd_tests {
 #[cfg(test)]
 mod vla_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
@@ -1381,8 +1378,7 @@ mod vla_tests {
 #[cfg(test)]
 mod simulcast_pause_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core and a fixture may read the host clock.
-    // See docs/thread-per-core.md.
+    // cross-core. See docs/thread-per-core.md.
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
