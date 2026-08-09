@@ -45,9 +45,25 @@ pub struct Participant {
     /// Model a legacy peer that never negotiates the Dependency Descriptor
     /// extension, exercising the marker/deep-inspection fallback for mixed rooms.
     pub marker_only: bool,
+    /// Join over the authenticated JSON API as this subject, rather than plain SDP.
+    pub authenticate_as: Option<&'static str>,
+    /// Present this token verbatim instead of one minted for the joined room.
+    pub override_token: Option<&'static str>,
 }
 
 impl Participant {
+    /// Join over the authenticated JSON API as `subject`.
+    pub fn authenticated_as(mut self, subject: &'static str) -> Self {
+        self.authenticate_as = Some(subject);
+        self
+    }
+
+    /// Present a token verbatim, whatever room it names.
+    pub fn with_token(mut self, token: &'static str) -> Self {
+        self.override_token = Some(token);
+        self
+    }
+
     pub fn publisher(name: &'static str, rids: &[&'static str]) -> Self {
         Self {
             name,
@@ -61,6 +77,8 @@ impl Participant {
             temporal_dd: None,
             opaque_payload: false,
             marker_only: false,
+            authenticate_as: None,
+            override_token: None,
         }
     }
 
@@ -77,6 +95,8 @@ impl Participant {
             temporal_dd: None,
             opaque_payload: false,
             marker_only: false,
+            authenticate_as: None,
+            override_token: None,
         }
     }
 
@@ -93,6 +113,8 @@ impl Participant {
             temporal_dd: None,
             opaque_payload: false,
             marker_only: false,
+            authenticate_as: None,
+            override_token: None,
         }
     }
 
@@ -110,6 +132,8 @@ impl Participant {
             temporal_dd: None,
             opaque_payload: false,
             marker_only: false,
+            authenticate_as: None,
+            override_token: None,
         }
     }
 
@@ -135,6 +159,8 @@ impl Participant {
             temporal_dd: None,
             opaque_payload: false,
             marker_only: false,
+            authenticate_as: None,
+            override_token: None,
         }
     }
 
@@ -314,6 +340,11 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
     },
+    /// Cold-restart the SFU: the host is torn down and started again with no participant state.
+    ///
+    /// Clients are not told. They discover it through ICE and recover on their own, which is the
+    /// path a real restart takes.
+    RestartNode { description: &'static str },
 
     // ── Subscriptions ─────────────────────────────────────────────────────
     /// Call driver.set_subscriptions(). Processed on next drive tick.
@@ -720,6 +751,10 @@ async fn run_participant(
     loop {
         let mut builder = if tcp_only {
             SimClientBuilder::bind_tcp(ip, server_ip).await?
+        } else if let Some(token) = config.override_token {
+            SimClientBuilder::bind_with_token(ip, server_ip, token.to_string()).await?
+        } else if let Some(subject) = config.authenticate_as {
+            SimClientBuilder::bind_authenticated(ip, server_ip, room_name, subject).await?
         } else {
             SimClientBuilder::bind(ip, server_ip).await?
         };
@@ -1060,6 +1095,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Disconnect { .. } => "Disconnect",
         Step::AbruptExit { .. } => "AbruptExit",
         Step::Reconnect { .. } => "Reconnect",
+        Step::RestartNode { .. } => "RestartNode",
         Step::SetSubscriptions { .. } => "SetSubscriptions",
         Step::SubscribeAll { .. } => "SubscribeAll",
         Step::SubscribeTo { .. } => "SubscribeTo",
@@ -1281,6 +1317,11 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
                 handle.send_command(ParticipantCmd::Reconnect);
+            }
+
+            Step::RestartNode { description } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\"");
+                super::request_node_restart();
             }
 
             Step::SetSubscriptions {
@@ -2963,7 +3004,8 @@ impl LocalNodeSim {
         });
 
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);
-        run_sim_or_timeout(&mut sim, wall_budget).expect("simulation failed");
+        super::run_sim_or_timeout_with_restarts(&mut sim, wall_budget, Some(server_ip))
+            .expect("simulation failed");
 
         let out = reports.lock().expect("reports poisoned").clone();
         out

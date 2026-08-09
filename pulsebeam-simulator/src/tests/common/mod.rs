@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod client;
 pub mod harness;
 
@@ -50,17 +51,30 @@ pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> an
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
-    pulsebeam::node::NodeBuilder::new()
+    let builder = pulsebeam::node::NodeBuilder::new()
         .workers(1)
         .local_addr(local_addr)
         .external_addrs(vec![external_addr])
         .rng(rng)
         .with_udp_mode(UdpMode::Scalar)
         .with_http_api(http_api_addr)
-        .with_current_runtime()
+        .with_current_runtime();
+    with_test_auth(builder)?
         .run(tokio_util::sync::CancellationToken::new())
         .await?;
     Ok(())
+}
+
+/// Configure the pinned test keys. The resume key is fixed, so a node that restarts still
+/// verifies tokens it minted before the restart.
+pub fn with_test_auth(
+    builder: pulsebeam::node::NodeBuilder,
+) -> anyhow::Result<pulsebeam::node::NodeBuilder> {
+    Ok(builder
+        .with_jwt_key(auth::KID, auth::alg(), auth::verifying_key())?
+        .with_jwt_audience(auth::AUDIENCE)
+        .with_jwt_issuer(auth::ISSUER)
+        .with_resume_key(auth::RESUME_KID, auth::RESUME_SECRET)?)
 }
 
 /// Same as `start_sfu_node` but with UDP candidates suppressed so that
@@ -123,10 +137,41 @@ pub async fn start_sfu_node_tcp_only_multi_shard(
 ///
 /// The timeout is enforced by periodically stepping the simulation and checking the
 /// wall clock.
+/// Set by `Step::RestartNode` and consumed by the driver loop below.
+///
+/// A step runs inside a turmoil client task and cannot reach `&mut Sim`, but `bounce` must be
+/// called from the loop that owns it. nextest gives each plan its own process, so a static is
+/// per-plan state.
+pub static RESTART_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn request_node_restart() {
+    RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn run_sim_or_timeout(sim: &mut turmoil::Sim<'_>, timeout: Duration) -> turmoil::Result<()> {
+    run_sim_or_timeout_with_restarts(sim, timeout, None)
+}
+
+/// Drives the simulation, bouncing `server_ip` whenever a step asked for a restart.
+///
+/// Bouncing tears the host down and runs its factory again: a genuinely cold node with no
+/// participant state, which is what resumption has to survive.
+pub fn run_sim_or_timeout_with_restarts(
+    sim: &mut turmoil::Sim<'_>,
+    timeout: Duration,
+    server_ip: Option<IpAddr>,
+) -> turmoil::Result<()> {
     let start = Instant::now();
 
     loop {
+        if let Some(ip) = server_ip
+            && RESTART_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::info!("bouncing sfu node at {ip}");
+            sim.bounce(ip);
+        }
+
         if start.elapsed() > timeout {
             return Err(format!(
                 "Simulation did not complete within {:?} (wall-clock); aborting.",

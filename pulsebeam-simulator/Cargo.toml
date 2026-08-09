@@ -34,6 +34,8 @@ tower = { version = "0.5.3", features = ["util"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 turmoil.workspace = true
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+serde = { workspace = true, features = ["derive"] }
 
 [features]
 default = ["parking_lot"]

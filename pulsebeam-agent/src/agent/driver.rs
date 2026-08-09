@@ -1197,10 +1197,18 @@ impl AgentDriver {
     /// subscribers see the tracks reappear rather than churn.
     async fn resume(&mut self, resume_token: &str) -> Result<(), AgentError> {
         let (offer, pending) = {
-            let sdp_api = self.rtc.sdp_api();
+            let mut sdp_api = self.rtc.sdp_api();
+            // The old transport is gone, so there is nothing to renegotiate -- without an ICE
+            // restart `apply` has no changes to offer and would return None, and the session
+            // would sit disconnected forever.
+            sdp_api.ice_restart(true);
             match sdp_api.apply() {
                 Some(pair) => pair,
-                None => return Ok(()),
+                None => {
+                    return Err(AgentError::Protocol(
+                        "ice restart produced no offer".to_string(),
+                    ));
+                }
             }
         };
 

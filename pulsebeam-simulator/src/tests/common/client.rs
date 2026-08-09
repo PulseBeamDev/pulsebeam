@@ -42,9 +42,49 @@ fn http_base_uri(ip: IpAddr, port: u16) -> String {
 
 impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
+        Self::bind_with_auth(ip, server_ip, None).await
+    }
+
+    /// Bind a client that authenticates and speaks JSON.
+    ///
+    /// `subject` is the end-user identity the session -- and therefore any later resume -- is
+    /// bound to.
+    pub async fn bind_authenticated(
+        ip: IpAddr,
+        server_ip: IpAddr,
+        room: &str,
+        subject: &str,
+    ) -> anyhow::Result<Self> {
+        Self::bind_with_auth(
+            ip,
+            server_ip,
+            Some(super::auth::mint_access_token(room, subject)),
+        )
+        .await
+    }
+
+    /// Bind a client whose token names a different room, to prove the server refuses it.
+    pub async fn bind_with_token(
+        ip: IpAddr,
+        server_ip: IpAddr,
+        token: String,
+    ) -> anyhow::Result<Self> {
+        Self::bind_with_auth(ip, server_ip, Some(token)).await
+    }
+
+    async fn bind_with_auth(
+        ip: IpAddr,
+        server_ip: IpAddr,
+        token: Option<String>,
+    ) -> anyhow::Result<Self> {
         let client = create_http_client();
         let server_base_uri = http_base_uri(server_ip, 7070);
-        let api = HttpApiClient::new(client, &server_base_uri)?;
+        let mut api = HttpApiClient::new(client, &server_base_uri)?;
+        if let Some(token) = token {
+            api = api
+                .with_token_source(Box::new(pulsebeam_agent::api::StaticToken(token)))
+                .with_json_protocol();
+        }
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
 

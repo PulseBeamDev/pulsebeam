@@ -402,3 +402,86 @@ fn abrupt_exit_chaos_test() {
         },
     ]);
 }
+
+/// Media flows for a participant that joined over the authenticated JSON API.
+///
+/// Proves the JSON join is a complete substitute for the SDP one: real HTTP, real ICE, real DTLS,
+/// real RTP, differing only in how the offer and answer were carried.
+#[test]
+fn authenticated_join_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(
+                    Participant::single_publisher("alice").authenticated_as("user_alice"),
+                )
+                .with_participant(Participant::subscriber("bob").authenticated_as("user_bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Authenticated publisher and subscriber establish flow",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob renders Alice's video after a JSON join",
+                participant: "bob",
+                quality: VideoQuality::min_frames(50),
+            },
+        ]);
+}
+
+/// A participant that survives a cold restart of the SFU keeps its identity.
+///
+/// The node is torn down and started again with no memory of anyone. The client is not told; it
+/// discovers the loss through ICE and resumes on its own. What must hold afterwards is that it is
+/// the *same* participant, because every TrackId is derived from the participant id -- so
+/// subscribers see the tracks come back rather than a stranger's arrive.
+///
+/// Ignored: the signalling half works and is what this change delivers. Running it shows the
+/// resume PUT succeeding and the *same* participant id coming back on every attempt. The media
+/// half does not yet recover, and the reason is structural rather than a tuning problem: the
+/// server rebuilds the participant on a brand-new `Rtc` with a fresh DTLS certificate, while the
+/// client only restarts ICE and keeps its existing DTLS session, so the handshake can never
+/// match and the RTC engine errors out roughly 30s later. Finishing this means having the agent
+/// construct a new `Rtc` on resume while retaining its identity and resume token.
+///
+/// Kept rather than deleted because it is the exact reproduction, and it must not be allowed to
+/// pass vacuously: the assertion is deliberately interval-based, since a cumulative frame count
+/// would be satisfied by frames received before the restart.
+#[test]
+#[ignore = "client must rebuild its Rtc on resume; see doc comment"]
+fn resume_across_node_restart_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(
+                    Participant::single_publisher("alice").authenticated_as("user_alice"),
+                )
+                .with_participant(Participant::subscriber("bob").authenticated_as("user_bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish flow before the restart",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob renders video before the restart",
+                participant: "bob",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::RestartNode {
+                description: "Cold-restart the SFU; nobody is told",
+            },
+            // The interval form is essential here: a cumulative frame count would be satisfied by
+            // frames received before the restart and would pass even if nothing ever recovered.
+            Step::Run {
+                description: "Clients notice through ICE and resume unaided",
+                duration: Duration::from_secs(180),
+            },
+            Step::CheckRxBytesInterval {
+                description: "Media flows again in the window after the node was rebuilt",
+                participant: "bob",
+                min_bytes: 20_000,
+            },
+        ]);
+}
