@@ -1177,3 +1177,56 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod openapi_tests {
+    use super::*;
+
+    #[test]
+    fn the_openapi_document_describes_both_representations() {
+        let spec = build_openapi("/api/v1");
+        let json = serde_json::to_value(&spec).unwrap();
+        let paths = &json["paths"];
+
+        let participant = "/rooms/{external_room_id}/participants/{participant_id}";
+        assert!(paths["/rooms/{external_room_id}/participants"]["post"].is_object());
+        assert!(paths[participant]["patch"].is_object());
+        assert!(paths[participant]["delete"].is_object());
+        // The resume verb must be documented, not just routed.
+        assert!(
+            paths[participant]["put"].is_object(),
+            "PUT is the resume verb and belongs in the spec"
+        );
+
+        // The 401/412 responses were documented long before anything could produce them; now that
+        // they are real, they must still be described.
+        let patch_responses = &paths[participant]["patch"]["responses"];
+        assert!(patch_responses["401"].is_object());
+        assert!(patch_responses["412"].is_object());
+
+        let put_responses = &paths[participant]["put"]["responses"];
+        assert!(
+            put_responses["200"].is_object(),
+            "replaced a live participant"
+        );
+        assert!(
+            put_responses["201"].is_object(),
+            "reconstructed one that was gone"
+        );
+    }
+
+    #[test]
+    fn the_json_schemas_are_published() {
+        let spec = build_openapi("/api/v1");
+        let json = serde_json::to_value(&spec).unwrap();
+        let schemas = &json["components"]["schemas"];
+        for name in [
+            "JoinRequest",
+            "ResumeRequest",
+            "SessionResponse",
+            "ErrorResponse",
+        ] {
+            assert!(schemas[name].is_object(), "{name} missing from components");
+        }
+    }
+}
