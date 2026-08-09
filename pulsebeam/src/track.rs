@@ -1,8 +1,3 @@
-//! Shared-state exception: `Topic` is `Arc<str>`; test-only id counters otherwise. The `Topic` sharing
-//! is on the way out — a dense key in `RouteAction::Data` removes it from the
-//! forwarding path, after which it can go back to an owned `String`.
-#![allow(clippy::disallowed_types)]
-
 use std::collections::VecDeque;
 use std::fmt::{Debug, Display};
 use std::time::Duration;
@@ -13,7 +8,7 @@ use crate::id::ShardId;
 use crate::rtp::normalize::StreamNormalizer;
 use crate::rtp::{
     self, RtpPacket,
-    monitor::{StreamMonitor, StreamState},
+    monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
 pub use data_track::*;
@@ -113,7 +108,7 @@ pub struct TrackMeta {
 ///
 /// The two halves are deliberately separate objects. Normalization is the
 /// once-per-node work a future UDP ingress reuses verbatim; measurement is what
-/// the whole node shares through `StreamState`.
+/// the whole node shares through `StreamStats`.
 #[derive(Debug)]
 pub struct UpstreamTrackLayer {
     pub mid: Mid,
@@ -144,7 +139,7 @@ impl UpstreamTrackLayer {
         // A scalable keyframe teaches the structure; publish how many decode
         // targets it offers so the allocator can reason about shedding to them.
         if let Some(count) = facts.decode_targets {
-            self.monitor.shared_state().set_decode_target_count(count);
+            self.monitor.set_decode_target_count(count);
         }
         // audio will only be filtered at the centralized audio_selector
         true
@@ -166,16 +161,14 @@ impl UpstreamTrackLayer {
         let temporal = vla_stream_temporal_cumulative_kbps(vla, idx);
         let full_fps = vla_stream_framerate(vla, idx).unwrap_or(0);
         if !temporal.is_empty() {
-            self.monitor
-                .shared_state()
-                .set_temporal_ladder(&temporal, full_fps);
+            self.monitor.set_temporal_ladder(&temporal, full_fps);
         }
         if first_declaration {
             tracing::info!(
                 mid = %self.mid,
                 rid = ?self.rid,
                 target_kbps = target_bps / 1000,
-                height = self.monitor.shared_state().height(),
+                height = self.monitor.stats().height(),
                 "VLA: sender declared layer target bitrate; allocating on it"
             );
         }
@@ -258,7 +251,7 @@ pub struct UpstreamTrack {
     /// One monitor for the whole track. It owns every simulcast encoding's
     /// ingest state and all cross-encoding reasoning (VLA fan-out, sibling
     /// activity, aggregate demand), while each encoding keeps its own
-    /// `StreamState` so the downstream allocator still sees per-layer metadata.
+    /// `StreamStats` so the downstream allocator still sees per-layer metadata.
     pub monitor: TrackMonitor,
 }
 
@@ -299,7 +292,7 @@ impl UpstreamTrack {
 
 /// The whole-track monitor: every simulcast encoding of one upstream track,
 /// mashed into a single unit. Per-encoding metrics stay separated (each
-/// `UpstreamTrackLayer` owns its own `StreamState`) so the allocator keeps its
+/// `UpstreamTrackLayer` owns its own `StreamStats`) so the allocator keeps its
 /// fine-grained per-layer view, but the cross-encoding decisions — a VLA on one
 /// encoding describing all of them, whether a layer has a live sibling, the
 /// track's aggregate demand — are made here where the whole ladder is visible.
@@ -352,7 +345,7 @@ impl TrackMonitor {
     pub fn layer_states(&self) -> TrackStates {
         self.encodings
             .iter()
-            .map(|e| (e.rid, e.monitor.shared_state().clone()))
+            .map(|e| (e.rid, e.monitor.stats()))
             .collect()
     }
 
@@ -384,8 +377,8 @@ impl TrackMonitor {
     pub fn aggregate_stable_bitrate_bps(&self) -> f64 {
         self.encodings
             .iter()
-            .filter(|s| !s.monitor.shared_state().is_inactive())
-            .map(|s| s.monitor.shared_state().stable_bitrate_bps())
+            .filter(|s| !s.monitor.stats().is_inactive())
+            .map(|s| s.monitor.stats().stable_bitrate_bps())
             .sum()
     }
 }
@@ -455,7 +448,7 @@ pub struct TrackLayer {
 ///
 /// Travels the media path only — participant to its shard, then shard to shard
 /// — never through the controller.
-pub type TrackStates = Vec<(Option<Rid>, StreamState)>;
+pub type TrackStates = Vec<(Option<Rid>, StreamStats)>;
 
 impl Eq for TrackLayer {}
 
@@ -489,9 +482,9 @@ impl Display for TrackLayer {
 pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
     debug_assert_eq!(meta.id.kind(), TrackKind::Audio);
     let bitrate = 64_000;
-    let stream_state = StreamState::new(true, bitrate);
+    let stream_state = StreamStats::new(true, bitrate, 0);
     let stream_id = format!("{}:_", meta.id);
-    let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());
+    let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state);
 
     let sender = UpstreamTrack {
         meta: meta.clone(),
@@ -547,9 +540,9 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
         let quality = LayerQuality::from_rid(rid.as_deref());
         let bitrate = quality.seed_bitrate_bps();
         let fallback_height = quality.fallback_height();
-        let stream_state = StreamState::new_with_height(true, bitrate, fallback_height);
+        let stream_state = StreamStats::new(true, bitrate, fallback_height);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
-        let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());
+        let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state);
 
         senders.push(UpstreamTrackLayer {
             mid,
@@ -586,6 +579,9 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
 
 #[cfg(test)]
 pub mod test_utils {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     pub fn make_video_track(
@@ -641,19 +637,23 @@ mod data_track {
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     /// A data-channel topic name.
     ///
-    /// `Arc<str>` rather than `String` because a topic is immutable once parsed
-    /// and gets cloned to build lookup keys on the forwarding path — twice per
-    /// cross-shard data frame. As a `String` each of those was a malloc and a
-    /// copy; as an `Arc<str>` it is a refcount bump. The sharing is within one
-    /// shard on the hot path, so the refcount stays in that core's cache.
-    pub struct Topic(std::sync::Arc<str>);
+    /// An owned `String`, deliberately. `Arc<str>` would make the two clones
+    /// per cross-shard data frame refcount bumps instead of allocations, but a
+    /// topic travels between shards on the control plane, so those bumps would
+    /// land on a count another core holds — trading a core-local malloc for
+    /// cross-core traffic, which is the wrong direction.
+    ///
+    /// The clones are not inherent: they exist only to build lookup keys, and a
+    /// dense key in `RouteAction::Data` removes them the way `LocalTrackKey`
+    /// did for video. Fix the cause, not the symptom.
+    pub struct Topic(String);
 
     impl Topic {
         /// Production builds a `Topic` only by parsing a channel label; tests
         /// need one without going through the label grammar.
         #[cfg(test)]
         pub fn for_test(topic: &str) -> Self {
-            Self(topic.into())
+            Self(topic.to_string())
         }
     }
 
@@ -865,7 +865,7 @@ mod data_track {
 
                     let topic = DataTopicChannel {
                         direction,
-                        topic: Topic(topic_slice.into()),
+                        topic: Topic(topic_slice.to_string()),
                         scope,
                         lane,
                     };
@@ -878,6 +878,9 @@ mod data_track {
 
     #[cfg(test)]
     mod test {
+        // Convenience only: a test is not a shard, so nothing here is
+        // cross-core. See docs/thread-per-core.md.
+        #![allow(clippy::disallowed_types)]
         use std::ops::Deref;
 
         use super::*;
@@ -998,7 +1001,7 @@ mod data_track {
         fn test_reliable_display() {
             let pub_ch = DataTopicChannel {
                 direction: DataTrackDirection::Publish,
-                topic: Topic("chat".into()),
+                topic: Topic("chat".to_string()),
                 scope: None,
                 lane: DataLane::Reliable,
             };
@@ -1006,7 +1009,7 @@ mod data_track {
 
             let sub_ch = DataTopicChannel {
                 direction: DataTrackDirection::Subscribe,
-                topic: Topic("chat".into()),
+                topic: Topic("chat".to_string()),
                 scope: None,
                 lane: DataLane::Reliable,
             };
@@ -1107,13 +1110,16 @@ mod data_track {
 
 #[cfg(test)]
 mod dd_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use pulsebeam_core::dd::{
         DependencyDescriptor, DependencyDescriptorWriter, MAX_DD_LEN, test_utils,
     };
 
     fn layer() -> UpstreamTrackLayer {
-        let state = StreamState::new_with_height(true, 500_000, 360);
+        let state = StreamStats::new(true, 500_000, 360);
         UpstreamTrackLayer {
             mid: Mid::from("0"),
             rid: None,
@@ -1171,7 +1177,7 @@ mod dd_tests {
         let mut buf = [0u8; MAX_DD_LEN];
         let mut layer = layer();
         assert_eq!(
-            layer.monitor.shared_state().decode_target_count(),
+            layer.monitor.stats().decode_target_count(),
             1,
             "no structure seen yet, so the encoding is one indivisible rung"
         );
@@ -1183,7 +1189,7 @@ mod dd_tests {
         layer.process(&mut pkt);
 
         assert_eq!(
-            layer.monitor.shared_state().decode_target_count(),
+            layer.monitor.stats().decode_target_count(),
             structure.decode_target_count,
             "the scalable keyframe's decode-target count is published for the allocator"
         );
@@ -1252,6 +1258,9 @@ mod dd_tests {
 
 #[cfg(test)]
 mod vla_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::vla_stream_target_bps;
     use str0m::rtp::vla::{
         SimulcastStreamAllocation, SpatialLayerAllocation, TemporalLayerAllocation,
@@ -1283,7 +1292,7 @@ mod vla_tests {
     #[test]
     fn temporal_ladder_and_framerate_flow_into_stream_state() {
         use super::{vla_stream_framerate, vla_stream_temporal_cumulative_kbps};
-        use crate::rtp::monitor::StreamState;
+        use crate::rtp::monitor::StreamStats;
         use str0m::rtp::vla::ResolutionAndFramerate;
 
         let mut s = stream(&[300, 450, 600]);
@@ -1303,7 +1312,7 @@ mod vla_tests {
         );
         assert_eq!(vla_stream_framerate(&vla, 0), Some(30));
 
-        let state = StreamState::new_with_height(false, 0, 720);
+        let mut state = StreamStats::new(false, 0, 720);
         state.set_temporal_ladder(&vla_stream_temporal_cumulative_kbps(&vla, 0), 30);
         assert_eq!(state.decode_target_bps(0), 300_000);
         assert_eq!(state.decode_target_bps(1), 450_000);
@@ -1350,6 +1359,9 @@ mod vla_tests {
 
 #[cfg(test)]
 mod simulcast_pause_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use crate::entity::ParticipantId;
     use crate::rtp::RtpPacket;

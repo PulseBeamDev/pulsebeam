@@ -273,6 +273,9 @@ impl TimerWheel {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use crate::entity::ParticipantId;
     use slotmap::SlotMap;

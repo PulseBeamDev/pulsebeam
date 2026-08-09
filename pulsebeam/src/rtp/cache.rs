@@ -1,7 +1,3 @@
-//! Shared-state exception: Test-only: `Arc::new` builds header extensions for fixtures, matching what
-//! str0m hands us at ingress.
-#![allow(clippy::disallowed_types)]
-
 use crate::rtp::RtpPacket;
 use str0m::media::{MediaTime, Rid};
 use str0m::rtp::SeqNo;
@@ -419,6 +415,9 @@ const MAX_SIMULCAST_ENCODINGS: usize = 4;
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use std::time::Duration;
@@ -580,7 +579,7 @@ mod test {
         }
         let arrived = kf.last().unwrap().arrival_ts;
 
-        let much_later = arrived + Duration::from_secs(30);
+        let _much_later = arrived + Duration::from_secs(30);
         assert!(
             cache.replay().is_some(),
             "a still screen must not be withheld just because it has been still"

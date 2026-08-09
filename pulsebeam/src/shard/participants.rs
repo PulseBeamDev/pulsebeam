@@ -1,6 +1,3 @@
-//! Shared-state exception: Test-only: a counter for unique ids in fixtures.
-#![allow(clippy::disallowed_types)]
-
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
@@ -212,6 +209,9 @@ impl ParticipantRegistry {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

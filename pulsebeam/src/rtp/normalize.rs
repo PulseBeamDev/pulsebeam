@@ -8,8 +8,9 @@
 //! Normalizing is the **only** stage allowed to mutate a packet. Measurement
 //! reads the result and never writes to it, so the two can run on different
 //! nodes without either duplicating the other's work.
-
-//! Shared-state exception: str0m's extension map stores `Arc<dyn Any>` (see `rtp::switcher`).
+//! Shared-state exception, imposed by str0m: the parsed descriptor goes
+//! back into an extension map that stores `Arc<dyn Any>`. Core-local; see
+//! `rtp` for the full note.
 #![allow(clippy::disallowed_types)]
 
 use str0m::media::{Mid, Rid};

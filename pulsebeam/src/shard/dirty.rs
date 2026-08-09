@@ -84,6 +84,9 @@ impl DirtyTracker {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     fn id(value: u8) -> ParticipantId {

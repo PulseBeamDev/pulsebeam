@@ -1,12 +1,9 @@
-//! Shared-state exception: `Arc<StreamRegistry>`, cloned once per shard at startup.
-#![allow(clippy::disallowed_types)]
-
 use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
-use crate::route::{MediaEnvelope, RemoteRoute, ReverseEnvelope, RouteAction};
+use crate::route::{MediaEnvelope, RemoteRoute, RouteAction, RouteEnvelope};
 
 use super::events::{
     AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
@@ -61,11 +58,21 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
-        state: Option<&crate::rtp::monitor::StreamState>,
     ) {
         if let Some(p) = self.registry.resolve_mut(subscriber) {
-            p.on_forward_rtp(track_id, pkt, cache, state);
+            p.on_forward_rtp(track_id, pkt, cache);
             self.dirty.mark(subscriber, p);
+        }
+    }
+
+    fn update_layer_states(
+        &mut self,
+        subscriber: ParticipantHandle,
+        track_id: TrackId,
+        states: &crate::track::TrackStates,
+    ) {
+        if let Some(p) = self.registry.resolve_mut(subscriber) {
+            p.update_layer_states(track_id, states);
         }
     }
 
@@ -184,13 +191,12 @@ impl ShardCore {
         max_gso_segments: usize,
         rng: Rng,
         wall: WallAnchor,
-        streams: std::sync::Arc<crate::stream_registry::StreamRegistry>,
     ) -> Self {
         let shard_id = shard_id.into();
         Self {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
-            routing: ShardRoutingTable::new(streams),
+            routing: ShardRoutingTable::new(),
             timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
             dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -613,6 +619,29 @@ impl ShardCore {
                             self.pipeline
                                 .push_shard_event(ShardEvent::TrackPublished(track));
                         }
+                        // Measurements go straight to the shards holding a
+                        // route for the track. The controller has nothing to add
+                        // and must not accumulate media state.
+                        ParticipantControlEvent::TrackStatsUpdated { track_id, states } => {
+                            let mut ctx = DispatchCtx {
+                                registry: &mut self.registry,
+                                dirty: &mut self.dirty,
+                                router,
+                                wall: &self.wall,
+                            };
+                            for (shard_id, env) in
+                                self.routing
+                                    .publish_stats(track_id, states.clone(), &mut ctx)
+                            {
+                                router.send_frame(
+                                    shard_id,
+                                    ShardFrame::Stats {
+                                        env,
+                                        stats: states.clone(),
+                                    },
+                                );
+                            }
+                        }
                         // A keyframe request is upstream feedback, so it goes
                         // straight to the shard that owns the publisher — never
                         // through the controller, which has nothing to add and
@@ -638,7 +667,7 @@ impl ShardCore {
                                 router.send_frame(
                                     req.shard_id,
                                     ShardFrame::Reverse {
-                                        env: ReverseEnvelope::new(target),
+                                        env: RouteEnvelope::new(target),
                                         body: Reverse::Keyframe {
                                             layer,
                                             kind: req.kind,
@@ -978,6 +1007,22 @@ impl ShardCore {
             ShardFrame::Reverse { env, body } => {
                 self.on_reverse_frame(env, body, router);
             }
+            ShardFrame::Stats { env, stats } => {
+                let Some(RouteAction::Video { local_track, .. }) =
+                    self.routing.routes.resolve_action(env.route, env.epoch)
+                else {
+                    // The route was retired while this was in flight.
+                    return;
+                };
+                let fanout = *local_track;
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    router,
+                    wall: &self.wall,
+                };
+                self.routing.apply_stats(fanout, stats, &mut ctx);
+            }
         }
     }
 
@@ -988,7 +1033,7 @@ impl ShardCore {
     /// has to say which layer and what it wants.
     fn on_reverse_frame(
         &mut self,
-        env: ReverseEnvelope,
+        env: RouteEnvelope,
         body: Reverse,
         router: &impl ShardTransport,
     ) {
@@ -1107,6 +1152,9 @@ impl ShardCore {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use std::{
         cell::RefCell,
         sync::atomic::{AtomicU64, Ordering},
@@ -1220,7 +1268,6 @@ mod test {
             1,
             pulsebeam_runtime::rand::seeded_rng(42),
             WallAnchor::new(std::time::SystemTime::now(), Instant::now()),
-            std::sync::Arc::new(crate::stream_registry::StreamRegistry::new()),
         )
     }
 
@@ -1427,7 +1474,7 @@ mod test {
 
         core.on_shard_frame(
             ShardFrame::Reverse {
-                env: ReverseEnvelope::new(target),
+                env: RouteEnvelope::new(target),
                 body: Reverse::Keyframe {
                     layer: 0,
                     kind: str0m::media::KeyframeRequestKind::Pli,

@@ -1,8 +1,3 @@
-//! Shared-state exception: str0m's extension map stores `Arc<dyn Any>`, so putting a parsed descriptor
-//! back requires one. Core-local — `RtpPacket::rehome_extensions` re-anchors it
-//! on arrival so no refcount is shared across shards.
-#![allow(clippy::disallowed_types)]
-
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -599,6 +594,9 @@ impl Switcher {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp;

@@ -15,7 +15,7 @@ use crate::track::{DataLane, Topic};
 use str0m::media::Rid;
 
 pub const MEDIA_ENVELOPE_LEN: usize = 16;
-pub const REVERSE_ENVELOPE_LEN: usize = 8;
+pub const ROUTE_ENVELOPE_LEN: usize = 8;
 pub const ENVELOPE_VERSION: u8 = 1;
 
 /// Which direction a frame is travelling, carried in `flags` bit 0.
@@ -181,10 +181,12 @@ impl MediaEnvelope {
     }
 }
 
-/// The 8-byte header on every frame travelling back toward a publisher.
+/// The 8-byte header on every frame that carries no timeline.
 ///
-/// Half the size of [`MediaEnvelope`] because the reverse lane needs neither of
-/// the two fields that make up the difference. `link_seq` exists to observe
+/// Used by both directions that need addressing without one: upstream requests
+/// travelling back to a publisher, and forward telemetry travelling out to a
+/// destination. Half the size of [`MediaEnvelope`] because neither needs the
+/// two fields that make up the difference. `link_seq` exists to observe
 /// loss on a link, but every reverse body is a request the sender repeats if it
 /// still needs it, so a lost one costs a round trip and there is nothing to
 /// account for. `playout_ntp32` places a packet on a timeline; a request has
@@ -197,12 +199,12 @@ impl MediaEnvelope {
 /// +-------+-------+---------------+-----------------------+
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReverseEnvelope {
+pub struct RouteEnvelope {
     pub epoch: u16,
     pub route: RouteId,
 }
 
-impl ReverseEnvelope {
+impl RouteEnvelope {
     pub fn new(handle: ReverseRoute) -> Self {
         Self {
             epoch: handle.epoch,
@@ -210,8 +212,8 @@ impl ReverseEnvelope {
         }
     }
 
-    pub fn encode(&self) -> [u8; REVERSE_ENVELOPE_LEN] {
-        let mut out = [0u8; REVERSE_ENVELOPE_LEN];
+    pub fn encode(&self) -> [u8; ROUTE_ENVELOPE_LEN] {
+        let mut out = [0u8; ROUTE_ENVELOPE_LEN];
         out[0] = ENVELOPE_VERSION;
         out[1] = FLAG_LANE_REVERSE;
         out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
@@ -220,7 +222,7 @@ impl ReverseEnvelope {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        if buf.len() < REVERSE_ENVELOPE_LEN {
+        if buf.len() < ROUTE_ENVELOPE_LEN {
             return Err(EnvelopeError::Truncated { len: buf.len() });
         }
         if peek_lane(buf)? != Lane::Reverse {
@@ -708,6 +710,9 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use crate::entity::TrackKind;
 
@@ -779,9 +784,9 @@ mod tests {
 
     #[test]
     fn reverse_envelope_is_exactly_eight_bytes() {
-        assert_eq!(REVERSE_ENVELOPE_LEN, 8);
+        assert_eq!(ROUTE_ENVELOPE_LEN, 8);
         assert_eq!(
-            ReverseEnvelope {
+            RouteEnvelope {
                 epoch: 1,
                 route: RouteId::new(1),
             }
@@ -794,11 +799,11 @@ mod tests {
 
     #[test]
     fn reverse_envelope_round_trips() {
-        let env = ReverseEnvelope {
+        let env = RouteEnvelope {
             epoch: u16::MAX,
             route: RouteId::new(u32::MAX),
         };
-        assert_eq!(ReverseEnvelope::decode(&env.encode()).unwrap(), env);
+        assert_eq!(RouteEnvelope::decode(&env.encode()).unwrap(), env);
     }
 
     /// Cross-node both lanes share a socket, so a receiver must be able to tell
@@ -807,7 +812,7 @@ mod tests {
     #[test]
     fn the_two_lanes_are_distinguishable_on_the_wire() {
         let media = envelope(RouteId::new(3), 4).encode();
-        let reverse = ReverseEnvelope {
+        let reverse = RouteEnvelope {
             epoch: 4,
             route: RouteId::new(3),
         }
@@ -825,7 +830,7 @@ mod tests {
             Err(EnvelopeError::Truncated { len: 8 })
         );
         assert_eq!(
-            ReverseEnvelope::decode(&media),
+            RouteEnvelope::decode(&media),
             Err(EnvelopeError::WrongLane {
                 want: Lane::Reverse
             })

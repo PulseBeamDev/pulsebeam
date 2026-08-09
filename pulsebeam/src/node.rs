@@ -1,5 +1,5 @@
-//! Shared-state exception: Startup wiring: one `Arc` per shard for metrics and the stream registry,
-//! handed over before any shard runs.
+//! Shared-state exception: `Arc<ShardMetrics>`, one per shard, handed over
+//! before any shard runs. See `shard::metrics`.
 #![allow(clippy::disallowed_types)]
 
 use anyhow::{Context, Result};
@@ -367,11 +367,6 @@ impl NodeBuilder {
         // here, so every shard shares a timeline and nothing reads it again.
         let wall_anchor = WallAnchor::new(SystemTime::now(), Instant::now());
 
-        // Measurement handles are shared atomics: unroutable through the
-        // control plane and unserializable on the data plane, so every shard
-        // resolves them from one node-local directory instead.
-        let streams = Arc::new(crate::stream_registry::StreamRegistry::new());
-
         let mut shard_contexts = Vec::new();
 
         for (shard_idx, (((udp_sock, tcp_sock), frame_rx), shard_rng)) in udp_sockets
@@ -387,7 +382,6 @@ impl NodeBuilder {
             let frame_txs = frame_txs.clone();
             let occupancy = Arc::new(ShardMetrics::new());
             let shard_occupancy = Arc::new(ShardMetrics::new());
-            let shard_streams = streams.clone();
 
             if use_shared_runtime {
                 let shard = ShardWorker::new(
@@ -401,7 +395,6 @@ impl NodeBuilder {
                     shard_occupancy,
                     shard_rng,
                     wall_anchor,
-                    shard_streams,
                 );
                 join_set.spawn_local(ignore(shard.run()));
             } else {
@@ -433,7 +426,6 @@ impl NodeBuilder {
                                 shard_occupancy,
                                 shard_rng,
                                 wall_anchor,
-                                shard_streams,
                             );
                             tokio::task::unconstrained(shard.run()).await;
                         });

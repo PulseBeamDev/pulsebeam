@@ -30,6 +30,9 @@ const FU_START_MASK: u8 = 0x80;
 
 #[cfg(test)]
 pub mod test_utils {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     /// A single NAL unit packet of the given type, padded to `len` bytes.
@@ -89,6 +92,9 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::test_utils::*;
     use super::*;
 

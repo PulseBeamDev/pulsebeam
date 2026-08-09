@@ -137,11 +137,14 @@ impl ShardRouter {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     // Helper to generate a minimal testing router with artificial capacity
     fn setup_test_router(shard_count: usize) -> ShardRouter {
-        let rng = pulsebeam_runtime::rand::seeded_rng(42);
+        let _rng = pulsebeam_runtime::rand::seeded_rng(42);
         ShardRouter {
             hasher_config: ahash::RandomState::with_seeds(1, 2, 3, 4),
             shard_contexts: vec![], // Omitted to keep tests pure-functional on routing math

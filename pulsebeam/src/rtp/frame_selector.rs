@@ -13,9 +13,6 @@
 //!     currently targeted decode target, read from each packet's parsed
 //!     Dependency Descriptor.
 
-//! Shared-state exception: Test-only, plus str0m's extension map (see `rtp::switcher`).
-#![allow(clippy::disallowed_types)]
-
 use pulsebeam_core::dd::DependencyDescriptor;
 
 use crate::rtp::RtpPacket;
@@ -113,6 +110,9 @@ impl FrameSelector for DependencyDescriptorSelector {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use pulsebeam_core::dd::{
         DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,

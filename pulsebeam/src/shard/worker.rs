@@ -1,11 +1,12 @@
-//! Shared-state exception: `Arc<ShardMetrics>` (sanctioned, see `shard::metrics`) and
-//! `Arc<StreamRegistry>`, both cloned once per shard at startup.
+//! Shared-state exception: `Arc<ShardMetrics>`, one per shard, cloned at
+//! startup and never again. Carries the sanctioned exception in
+//! `shard::metrics`; nothing else here may share.
 #![allow(clippy::disallowed_types)]
 
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
-use crate::route::{MediaEnvelope, ReverseEnvelope, ReverseRoute, RouteId};
+use crate::route::{MediaEnvelope, ReverseRoute, RouteEnvelope, RouteId};
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -149,7 +150,7 @@ pub enum Topology {
 /// both ends have that from the control plane — so a rid never travels.
 ///
 /// ```text
-/// ReverseEnvelope(8) | tag(1) | body
+/// RouteEnvelope(8) | tag(1) | body
 ///   Keyframe  layer(1) kind(1)        -> 11 bytes
 ///   Nack      layer(1) pid(2) blp(2)  -> 14 bytes
 ///   DataAck   len(2) payload(len)     -> 11 + len
@@ -201,7 +202,22 @@ pub enum ShardFrame {
     /// route its shard opened. One variant for all of it because they share a
     /// contract: every one is an idempotent request the sender repeats if it
     /// still needs it, so losing one costs a round trip and nothing else.
-    Reverse { env: ReverseEnvelope, body: Reverse },
+    Reverse { env: RouteEnvelope, body: Reverse },
+    /// Forward telemetry: what a publisher's encodings currently measure,
+    /// addressed by the destination's own route.
+    ///
+    /// A value, not a handle. Measurements used to be an `Arc` of atomics the
+    /// subscriber's shard read directly, which shared a refcount across cores
+    /// and — worse — never gave a coherent view, since eight independent atomic
+    /// reads can straddle a writer. One message is one consistent snapshot, and
+    /// it is the only shape that works when the destination is another node.
+    ///
+    /// Latest-wins: losing one costs a slightly stale allocation and nothing
+    /// else, so it belongs on the best-effort lane.
+    Stats {
+        env: RouteEnvelope,
+        stats: crate::track::TrackStates,
+    },
     /// A datagram batch that landed on the wrong shard's socket. Node-local
     /// with no cross-node analogue — a node demuxes its own participants — so
     /// it is addressed semantically and never leaves the box.
@@ -308,9 +324,8 @@ impl ShardWorker {
         metrics: Arc<ShardMetrics>,
         rng: Rng,
         wall: WallAnchor,
-        streams: Arc<crate::stream_registry::StreamRegistry>,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall, streams);
+        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall);
         let router = ChannelTransport {
             shard_id,
             frame_txs,
@@ -461,6 +476,9 @@ impl ShardWorker {
 
 #[cfg(test)]
 mod reverse_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     /// The shard -> controller queue must stay far larger than the reverse one.
@@ -487,7 +505,7 @@ mod reverse_tests {
     /// rather than in a datagram.
     #[test]
     fn reverse_bodies_stay_compact() {
-        const HEADER: usize = crate::route::REVERSE_ENVELOPE_LEN + 1; // envelope + tag
+        const HEADER: usize = crate::route::ROUTE_ENVELOPE_LEN + 1; // envelope + tag
 
         fn wire_len(body: &Reverse) -> usize {
             HEADER

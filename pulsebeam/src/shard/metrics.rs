@@ -1,6 +1,10 @@
-//! Shared-state exception: SANCTIONED. A fixed, preallocated counter set, one per shard, written by
-//! its own shard and read by the controller for load reporting. Bounded count,
-//! no allocation, and nothing reads two counters expecting them to agree.
+//! Shard load counters.
+//!
+//! **The one sanctioned shared-state exception.** A fixed, preallocated
+//! counter set — one per shard, written only by that shard, read by the
+//! controller for load reporting. Bounded, allocation-free, and nothing
+//! reads two counters expecting them to agree, which is the property that
+//! made the stream monitors wrong. See `docs/thread-per-core.md`.
 #![allow(clippy::disallowed_types)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +79,9 @@ impl MetricsSnapshot {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     #[test]

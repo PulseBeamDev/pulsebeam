@@ -23,7 +23,6 @@ pub mod rtp;
 pub mod shard;
 #[cfg(feature = "sim")]
 pub mod sim_metrics;
-pub mod stream_registry;
 pub mod track;
 
 #[cfg(test)]

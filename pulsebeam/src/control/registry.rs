@@ -1,6 +1,3 @@
-//! Shared-state exception: Test-only: a counter for unique ids in fixtures.
-#![allow(clippy::disallowed_types)]
-
 use std::{collections::HashMap, time::Duration};
 
 use crate::{
@@ -144,6 +141,9 @@ impl RoomRegistry {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use crate::entity::ExternalRoomId;
     use pulsebeam_runtime::rand::seeded_rng;

@@ -1,6 +1,3 @@
-//! Shared-state exception: Test-only: a counter for unique ids in fixtures.
-#![allow(clippy::disallowed_types)]
-
 use arrayvec::ArrayString;
 use derive_more::{AsRef, Display};
 use pulsebeam_runtime::rand::RngCore;
@@ -476,6 +473,9 @@ impl fmt::Debug for TrackId {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use pulsebeam_runtime::rand::seeded_rng;
     use std::collections::{HashMap, HashSet};

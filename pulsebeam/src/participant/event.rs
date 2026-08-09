@@ -6,6 +6,12 @@ pub trait ParticipantSink {
     fn subscribe(&mut self, track: TrackMeta);
     fn unsubscribe(&mut self, track: TrackMeta);
     fn publish_track(&mut self, track: Track, states: crate::track::TrackStates);
+    /// A published track's latest measurements. Sent, not shared.
+    fn publish_track_stats(
+        &mut self,
+        track_id: crate::entity::TrackId,
+        states: crate::track::TrackStates,
+    );
     fn unpublish_track(&mut self, track_id: TrackId);
     fn subscribe_data_topic(
         &mut self,
@@ -35,6 +41,9 @@ pub trait ParticipantSink {
 
 #[cfg(test)]
 pub mod test_utils {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     #[derive(Debug, Default)]
@@ -70,6 +79,13 @@ pub mod test_utils {
 
         fn unsubscribe(&mut self, track: TrackMeta) {
             self.unsubscribe_calls.push(track);
+        }
+
+        fn publish_track_stats(
+            &mut self,
+            _track_id: crate::entity::TrackId,
+            _states: crate::track::TrackStates,
+        ) {
         }
 
         fn publish_track(&mut self, track: Track, _states: crate::track::TrackStates) {

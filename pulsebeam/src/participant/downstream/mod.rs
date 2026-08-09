@@ -314,15 +314,18 @@ impl DownstreamAllocator {
     }
 
     #[inline]
+    pub fn update_layer_states(&mut self, track_id: TrackId, states: &crate::track::TrackStates) {
+        self.video.update_layer_states(track_id, states);
+    }
+
     pub fn on_forward_rtp(
         &mut self,
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
-        state: Option<&crate::rtp::monitor::StreamState>,
         writer: &mut StreamWriter,
     ) -> bool {
-        self.video.on_rtp(track_id, pkt, cache, state, writer)
+        self.video.on_rtp(track_id, pkt, cache, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.
@@ -343,6 +346,9 @@ impl DownstreamAllocator {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     fn expected(initial: f64, target: f64, elapsed: Duration, time_constant: Duration) -> f64 {

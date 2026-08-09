@@ -43,18 +43,20 @@ cloning str0m's extension map clones the `Arc<dyn Any>` inside it.
 This is the failure mode that keeps getting rediscovered, so it is worth being
 precise.
 
-`rtp::monitor::StreamStateInner` holds a stream's measurements as separate
-atomics. `AllocationEngine::new` reads eight of them to build one `LayerSnap`.
-Each read is individually atomic. **The set is not.** A writer can land between
-any two of them, so the allocator can decide against a state that never existed:
-`decode_targets` from a new Dependency Descriptor structure paired with
-`decode_target_kbps` from the previous one, and a rung costed against a ladder
-that does not have it.
+It bit this codebase, so the example is real rather than hypothetical.
+`StreamStateInner` held a stream's measurements as separate atomics, and
+`AllocationEngine::new` read eight of them to build one `LayerSnap`. Each read
+was individually atomic. **The set was not.** A writer landing between any two
+let the allocator decide against a state that never existed: `decode_targets`
+from a new Dependency Descriptor structure paired with a `decode_target_kbps`
+ladder from the previous one, costing a rung that did not exist.
 
-The field comment on `bitrates` shows the shape of the trap — two values were
-packed into one `AtomicU64` precisely because a torn read between them was
-found. That fix does not generalise: it works for 64 bits of state and there is
-more than that.
+The trap is that the local fix looks like it works. Two of those fields —
+reactive and stable bitrate — *were* packed into one `AtomicU64`, with a comment
+explaining that a torn read between them had been found. That is a correct fix
+for one pair and no help at all for the other six, and it does not generalise
+past 64 bits. If you find yourself packing fields to make a snapshot atomic, the
+snapshot wants to be a value.
 
 Atomics are fine when nothing reads two of them expecting agreement.
 `ShardMetrics` qualifies: a fixed, preallocated counter set, written by its own
@@ -71,27 +73,45 @@ Message-passing is not the slower option here. It is the only option that scales
 past one box, and it gives consistent snapshots for free, because a message is
 one coherent value.
 
-## Known violations
+## How measurements actually move
 
-Both are annotated at their definitions and both are on the way out. They are
-listed here so nobody mistakes them for precedent.
+Worth reading before proposing a shortcut, because the obvious one was tried.
 
-| Where | What | Why it is wrong |
-|---|---|---|
-| `rtp::monitor::StreamState` | `Arc` of eight loose atomics, shared publisher-shard → every subscriber shard | Torn snapshots (above); cross-core refcount; cannot cross a node |
-| `stream_registry::StreamRegistry` | node-global `RwLock<HashMap>` | A shard reaching into shared state to find those handles |
+Measurements used to be `StreamState`: an `Arc` of eight atomics that a
+publisher's shard wrote and every subscriber's shard read directly, plus a
+node-global `RwLock` registry to hand the handles out. That was wrong three
+ways — the refcount crossed cores on a per-packet path, the eight reads never
+formed a snapshot, and none of it can work when the subscriber is on another
+node.
 
-The fix for both is the same and is the cross-node design anyway: the
-publisher's shard periodically sends each destination an immutable
-`StreamStats` value on the best-effort lane — route-addressed, latest-wins,
-losing one just means a slightly stale estimate. One message is one consistent
-snapshot, the refcount problem disappears with the handle, and the registry has
-nothing left to hold.
+Now:
+
+- `StreamMonitor` keeps its measurements as **plain fields** and produces a
+  `StreamStats` **value** on demand. It is `Copy`; there is nothing to share.
+- On the slow poll a publishing participant hands its own shard a snapshot per
+  track (`ParticipantControlEvent::TrackStatsUpdated`). Within one shard, so
+  still no sharing.
+- The shard applies it locally and sends `ShardFrame::Stats` to every
+  destination holding a route for that track — route-addressed, best-effort,
+  latest-wins. Losing one costs a slightly stale allocation and nothing else.
+- A destination replaces its `layer_states` wholesale. **One message is one
+  coherent view**, which is the property eight atomics could not give.
+
+The same path works unchanged when the destination is another node, because it
+was never reading memory it did not own.
+
+Do not reintroduce a shared handle to make this cheaper. It is a control-rate
+message carrying a small value; the cost is not where the pressure is.
 
 ## Escape hatches
 
-`#[allow(clippy::disallowed_types)]` with a comment saying which of these it is:
+`#[allow(clippy::disallowed_types)]` with a comment saying which of these it is.
+The list is short on purpose, and it is closed — if a use does not fit one of
+these, it is rule 1 and the answer is a message.
 
+- **Tests.** A test is not a shard; a counter for unique ids is convenience, not
+  architecture. Allowed at the test module, not the file, so it cannot drift
+  over production code in the same file.
 - **Startup wiring.** One `Arc` per shard, cloned before any shard runs, never
   touched again (`Arc<ShardMetrics>`).
 - **Fixed preallocated counters.** `ShardMetrics`, per the rule above.
@@ -102,4 +122,6 @@ nothing left to hold.
   built from. Nothing there licenses an `Arc` inside a shard.
 - **Not a shard.** The agent, simulator and CLI are ordinary async programs.
 
-If a use does not fit one of those, it is rule 1 and the answer is a message.
+Enforced by `make lint-arch`, which fails rather than warns. `cargo clippy
+--fix` leaves these as warnings, and a warning in a hundred-line build log is
+not a gate.

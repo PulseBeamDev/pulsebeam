@@ -1,6 +1,9 @@
-//! Shared-state exception: str0m's `RtpWrite::new` takes `payload: Arc<[u8]>`, so the packet carries
-//! one. Kept core-local on purpose: `to_transit` copies rather than sharing it
-//! across a shard boundary.
+//! Shared-state exception, imposed by str0m: `RtpWrite::new` takes
+//! `payload: Arc<[u8]>`, so a packet carries one, and its extension map
+//! stores `Arc<dyn Any>`. Neither can be removed without changing the fork.
+//! Both are kept core-local — `to_transit` copies the payload and
+//! `rehome_extensions` re-anchors the descriptor — so no refcount is ever
+//! shared across shards. See `docs/thread-per-core.md`.
 #![allow(clippy::disallowed_types)]
 
 pub mod cache;
@@ -194,6 +197,9 @@ impl RtpPacket {
 
 #[cfg(test)]
 pub mod test_utils {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use std::time::Duration;
 
     use super::*;
@@ -217,7 +223,7 @@ pub mod test_utils {
                 new_packet.rtp_ts.frequency(),
             );
 
-            new_packet.playout_time = new_packet.playout_time + playout_time_delta;
+            new_packet.playout_time += playout_time_delta;
             if let Some(at) = new_packet.arrival_ts.checked_add(playout_time_delta) {
                 new_packet.arrival_ts = at;
             }

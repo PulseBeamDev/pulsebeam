@@ -253,6 +253,9 @@ fn configure_room_codecs(codec_config: &mut CodecConfig) {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
 
     fn chrome_like_offer() -> SdpOffer {

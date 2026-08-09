@@ -1,7 +1,3 @@
-//! Shared-state exception: `Arc<StreamRegistry>` held once per shard, and `Topic`'s `Arc<str>`.
-//! Test-only counters otherwise.
-#![allow(clippy::disallowed_types)]
-
 use std::collections::VecDeque;
 
 use ahash::{HashMap, HashMapExt};
@@ -13,22 +9,20 @@ use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyE
 use super::participants::ParticipantHandle;
 use super::reliable::ReliableRoutes;
 use slotmap::{SlotMap, new_key_type};
-use std::sync::Arc;
 
 use crate::audio_selector::TopNAudioSelector;
 use crate::clock::WallAnchor;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
-use crate::rtp::monitor::StreamState;
+use crate::rtp::monitor::StreamStats;
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
-use crate::stream_registry::StreamRegistry;
 use crate::track::{DataLane, Topic, Track, TrackMeta};
 use tokio::time::Instant;
 
 use super::worker::{MediaPayload, Reverse, ShardEvent, ShardFrame, Topology};
 use crate::route::{
-    ImportEffect, ImportTable, MediaEnvelope, RemoteRoute, ReverseEnvelope, ReverseRoute,
-    ReverseTarget, RouteAction, RouteId, RouteNames, RouteTable,
+    ImportEffect, ImportTable, MediaEnvelope, RemoteRoute, ReverseRoute, ReverseTarget,
+    RouteAction, RouteEnvelope, RouteId, RouteNames, RouteTable,
 };
 
 type FastIndexSet<T> = IndexSet<T, ahash::RandomState>;
@@ -71,7 +65,17 @@ pub(crate) trait RoutingContext: ShardTransport {
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&TrackStreamCache>,
-        state: Option<&StreamState>,
+    );
+    /// Hand a subscriber a track's latest measurements.
+    ///
+    /// Pushed when the snapshot changes rather than carried on packets: an
+    /// allocation pass that lands between a new snapshot and the next arriving
+    /// packet would otherwise decide against the previous one.
+    fn update_layer_states(
+        &mut self,
+        subscriber: ParticipantHandle,
+        track_id: TrackId,
+        states: &crate::track::TrackStates,
     );
     fn forward_audio_rtp(
         &mut self,
@@ -261,7 +265,7 @@ pub(crate) struct TrackRoute {
 }
 
 impl TrackRoute {
-    fn state_for(&self, rid: Option<Rid>) -> Option<&StreamState> {
+    fn state_for(&self, rid: Option<Rid>) -> Option<&StreamStats> {
         self.layer_states
             .iter()
             .find(|(r, _)| *r == rid)
@@ -307,9 +311,6 @@ pub(crate) struct ShardRoutingTable {
     participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
     local_participants: HashMap<ParticipantId, ParticipantHandle>,
     remote_participant_counts: HashMap<(RoomId, ShardId), usize>,
-    /// Where measurement handles are resolved. Shared by every shard on the
-    /// node so they never have to be sent anywhere.
-    streams: Arc<StreamRegistry>,
     /// Reverse routes this shard opened for the streams it publishes, so they
     /// can be retired when those streams go away.
     track_reverse_routes: HashMap<TrackId, RouteId>,
@@ -356,7 +357,7 @@ impl ShardRoutingTable {
         }
     }
 
-    pub fn new(streams: Arc<StreamRegistry>) -> Self {
+    pub fn new() -> Self {
         Self {
             rooms: HashMap::new(),
             tracks: SlotMap::with_key(),
@@ -368,7 +369,6 @@ impl ShardRoutingTable {
             participant_shards: HashMap::new(),
             local_participants: HashMap::new(),
             remote_participant_counts: HashMap::new(),
-            streams,
             track_reverse_routes: HashMap::new(),
             topic_reverse_routes: HashMap::new(),
             topic_reverse_targets: HashMap::new(),
@@ -606,16 +606,69 @@ impl ShardRoutingTable {
         Some((handle, u8::try_from(layer).ok()?))
     }
 
+    /// Record the measurements a publisher's shard sent for a track this shard
+    /// receives. Wholesale, because a snapshot only means anything intact.
+    pub fn apply_stats(
+        &mut self,
+        fanout: LocalTrackKey,
+        stats: crate::track::TrackStates,
+        ctx: &mut impl RoutingContext,
+    ) {
+        let Some(route) = self.tracks.get_mut(fanout) else {
+            return;
+        };
+        route.layer_states = stats;
+        let track_id = route.track_id;
+        for &subscriber in &route.subscribers {
+            ctx.update_layer_states(subscriber, track_id, &route.layer_states);
+        }
+    }
+
+    /// Refresh a locally published track's measurements, and hand back the
+    /// destinations that need telling.
+    ///
+    /// The publisher's shard is the only one that measures; every other shard
+    /// learns by message. That is what lets the measurements be a plain value
+    /// rather than shared atomics.
+    pub fn publish_stats(
+        &mut self,
+        track_id: TrackId,
+        stats: crate::track::TrackStates,
+        ctx: &mut impl RoutingContext,
+    ) -> Vec<(ShardId, RouteEnvelope)> {
+        let Some(&key) = self.track_keys.get(&track_id) else {
+            return Vec::new();
+        };
+        let Some(route) = self.tracks.get_mut(key) else {
+            return Vec::new();
+        };
+        route.layer_states = stats;
+        for &subscriber in &route.subscribers {
+            ctx.update_layer_states(subscriber, track_id, &route.layer_states);
+        }
+        route
+            .remote_routes
+            .iter()
+            .map(|remote| {
+                (
+                    remote.shard_id,
+                    RouteEnvelope {
+                        route: remote.route,
+                        epoch: remote.epoch,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// A local participant published a track: register its measurement handles
     /// on the node so any shard that later subscribes can resolve them.
     pub fn publish_local_track(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
-        self.streams.publish(track_id, states.clone());
         let key = self.fanout_key(track_id);
         self.tracks[key].layer_states = states;
     }
 
     pub fn unpublish_local_track(&mut self, track_id: &TrackId) {
-        self.streams.unpublish(track_id);
         self.release_fanout_if_idle(track_id);
     }
 
@@ -728,16 +781,11 @@ impl ShardRoutingTable {
         // Resolve the publisher's handles from the node rather than waiting for
         // them to be sent: they are ready before any subscribe can happen, so
         // the fanout is never briefly live with no measurements behind it.
-        // Always take what the registry holds now, never keep what we cached
-        // earlier: a `TrackId` is derived from the participant and the label, so
-        // republishing the same label reuses it. Holding the previous
-        // incarnation's handles would allocate against a monitor nothing writes.
-        let states = self.streams.states_for(&track.id);
+        // Measurements arrive by message from the publisher's shard, so a fresh
+        // fanout simply starts empty and fills on the next snapshot. Nothing is
+        // read out of another shard's memory to seed it.
         let key = self.fanout_key(track.id);
         let entry = &mut self.tracks[key];
-        if !states.is_empty() {
-            entry.layer_states = states;
-        }
         let already_subscribed = entry
             .subscribers
             .iter()
@@ -1584,9 +1632,8 @@ impl ShardRoutingTable {
             return;
         };
 
-        let state = route.state_for(rid);
         for &subscriber in &route.subscribers {
-            ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache), state);
+            ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache));
         }
         let playout = ctx.wall().to_ntp(pkt.playout_time);
         let transit: Vec<(ShardId, MediaEnvelope)> = route
@@ -1814,7 +1861,7 @@ impl ShardRoutingTable {
             ctx.send_frame(
                 shard_id,
                 ShardFrame::Reverse {
-                    env: ReverseEnvelope::new(*target),
+                    env: RouteEnvelope::new(*target),
                     body: Reverse::DataAck(bytes.to_vec()),
                 },
             );
@@ -1840,8 +1887,12 @@ pub(crate) fn route_participant_control_event(
         ParticipantControlEvent::TrackUnpublished { origin, track_id } => {
             shard_events.push_back(ShardEvent::TrackUnpublished { origin, track_id });
         }
-        ParticipantControlEvent::KeyframeRequested(_) => {
-            debug_assert!(false, "keyframe requests must be handled by shard core");
+        ParticipantControlEvent::KeyframeRequested(_)
+        | ParticipantControlEvent::TrackStatsUpdated { .. } => {
+            debug_assert!(
+                false,
+                "handled by shard core, never routed to the controller"
+            );
         }
         ParticipantControlEvent::DataTopicPublished { .. }
         | ParticipantControlEvent::DataTopicUnpublished { .. } => {
@@ -1888,6 +1939,9 @@ pub(crate) fn route_participant_control_event(
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use slotmap::SlotMap;
     use std::cell::RefCell;
@@ -1962,13 +2016,20 @@ mod tests {
             &self.wall
         }
 
+        fn update_layer_states(
+            &mut self,
+            _subscriber: ParticipantHandle,
+            _track_id: TrackId,
+            _states: &crate::track::TrackStates,
+        ) {
+        }
+
         fn forward_video_rtp(
             &mut self,
             subscriber: ParticipantHandle,
             _track_id: TrackId,
             _pkt: &RtpPacket,
             _cache: Option<&TrackStreamCache>,
-            _state: Option<&StreamState>,
         ) {
             self.forwarded_video
                 .borrow_mut()
@@ -2093,9 +2154,7 @@ mod tests {
 
     #[test]
     fn duplicate_register_remote_participant_does_not_leak_refcount() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant = pid();
         let room = room_id("r1");
@@ -2124,9 +2183,7 @@ mod tests {
 
     #[test]
     fn moving_remote_participant_releases_the_old_shard() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant = pid();
         let room = room_id("r2");
@@ -2144,9 +2201,7 @@ mod tests {
 
     #[test]
     fn first_subscriber_notifies_publisher_shard() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let track = TrackMeta {
             shard_id: ShardId::new(1),
             id: pid().derive_track_id(TrackKind::Video, "v"),
@@ -2170,9 +2225,7 @@ mod tests {
 
     #[test]
     fn replacement_subscriber_evicts_stale_route_without_duplicate_notification() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let subscriber = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(1),
@@ -2208,9 +2261,7 @@ mod tests {
     /// local subscriber.
     #[test]
     fn a_reliable_subscription_resolves_on_publisher_announcement() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(13);
         let room = room_id("reliable-room");
         let subscriber = pid();
@@ -2263,9 +2314,7 @@ mod tests {
     /// the destination installs a route immediately and hands back the handle.
     #[test]
     fn an_explicit_data_subscription_installs_a_route() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(11);
         let room = room_id("data-room");
         let subscriber = pid();
@@ -2314,16 +2363,15 @@ mod tests {
         assert_eq!(table.routes.len(), 1);
     }
 
-    /// The destination caches the publisher's handles when it subscribes. On a
-    /// republish the `TrackId` is reused, so a cache that only fills when empty
-    /// would pin the retired incarnation's monitors forever and allocate
-    /// against numbers nothing updates.
+    /// A destination's measurements arrive whole, by message, and replace what
+    /// was there. There is no handle to go stale: a republished track under the
+    /// same `TrackId` simply gets the next snapshot, and until it does the
+    /// fanout has none rather than the previous incarnation's.
     #[test]
-    fn resubscribing_after_a_republish_picks_up_the_new_handles() {
-        use crate::rtp::monitor::StreamState;
+    fn a_stats_snapshot_replaces_what_the_fanout_held() {
+        use crate::rtp::monitor::StreamStats;
 
-        let streams = std::sync::Arc::new(crate::stream_registry::StreamRegistry::new());
-        let mut table = ShardRoutingTable::new(streams.clone());
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(77);
         let room = room_id("republish");
         let publisher = pid();
@@ -2332,7 +2380,6 @@ mod tests {
             id: publisher.derive_track_id(TrackKind::Video, "v"),
             origin: publisher,
         };
-
         let subscriber = pid();
         let handle = ParticipantHandle::new(
             SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
@@ -2340,26 +2387,40 @@ mod tests {
             1,
         );
         table.add_local_member(subscriber, handle, room, &mut rng);
-
-        let first = vec![(None, StreamState::new(false, 100_000))];
-        streams.publish(track.id, first.clone());
-        table.register_subscriber(subscriber, track.clone(), now(), &wall());
-        table.unregister_subscriber(subscriber, track.clone(), now());
-
-        // Same label, so the same TrackId, but brand new measurement state.
-        let second = vec![(None, StreamState::new(false, 100_000))];
-        streams.publish(track.id, second.clone());
         table.register_subscriber(subscriber, track.clone(), now(), &wall());
 
-        second[0].1.update_for_test().bitrate(4_321);
-        first[0].1.update_for_test().bitrate(1_000);
-        let cached = fanout(&table, &track.id)
-            .state_for(None)
-            .expect("the destination caches a handle for the encoding");
+        let fanout_key = table.fanout_of(&track.id).expect("subscribing creates it");
+        assert!(
+            fanout(&table, &track.id).state_for(None).is_none(),
+            "a fresh fanout has no measurements until a snapshot arrives"
+        );
+
+        table.apply_stats(
+            fanout_key,
+            vec![(None, StreamStats::new(false, 100_000, 0))],
+            &mut RecordingCtx::default(),
+        );
         assert_eq!(
-            cached.bitrate_bps(),
-            4_321.0,
-            "the destination must follow the live incarnation, not the retired one"
+            fanout(&table, &track.id)
+                .state_for(None)
+                .expect("snapshot applied")
+                .bitrate_bps(),
+            100_000.0
+        );
+
+        // A later snapshot replaces it wholesale — no field survives from the
+        // previous one, which is what makes the view coherent.
+        table.apply_stats(
+            fanout_key,
+            vec![(None, StreamStats::new(false, 4_321, 0))],
+            &mut RecordingCtx::default(),
+        );
+        assert_eq!(
+            fanout(&table, &track.id)
+                .state_for(None)
+                .expect("snapshot applied")
+                .bitrate_bps(),
+            4_321.0
         );
     }
 
@@ -2369,9 +2430,7 @@ mod tests {
     /// kilobytes each, and it grows for as long as the shard runs.
     #[test]
     fn an_ended_track_releases_its_fanout() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(53);
         let room = room_id("fanout-release");
         let publisher = pid();
@@ -2403,6 +2462,44 @@ mod tests {
         );
     }
 
+    /// A reliable topic gets a reverse route on the same terms as a track: one
+    /// per published stream, resolving to the publisher and topic so an ack
+    /// names neither.
+    #[test]
+    fn a_reliable_topic_gets_one_reverse_route() {
+        let mut table = ShardRoutingTable::new();
+        let mut rng = rand::seeded_rng(91);
+        let room = room_id("reliable-reverse");
+        let publisher = pid();
+        let topic = Topic::for_test("chat");
+        let handle = ParticipantHandle::new(
+            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+            publisher,
+            1,
+        );
+        table.add_local_member(publisher, handle, room, &mut rng);
+
+        let target = table
+            .register_reliable_data_publisher(room, publisher, topic.clone(), now(), &wall())
+            .expect("publishing a reliable topic opens its reverse route");
+        assert_eq!(table.routes.len(), 1);
+        assert!(
+            matches!(
+                table.resolve_reverse(target.route, target.epoch),
+                Some((origin, ReverseTarget::Topic { topic: t, .. }))
+                    if origin == publisher && *t == topic
+            ),
+            "an ack resolves to its publisher and topic through the route alone"
+        );
+
+        table.unregister_reliable_data_publisher(room, publisher, &topic, now());
+        assert_eq!(
+            table.routes.len(),
+            0,
+            "unpublishing must free the reverse route"
+        );
+    }
+
     /// The reverse direction must cost one route per track, not one per
     /// (track x subscribing shard). Route ids are 32 bits and the forward
     /// direction already pays per destination; letting feedback do the same
@@ -2410,9 +2507,7 @@ mod tests {
     /// it is latest-wins and keeps no per-link state.
     #[test]
     fn feedback_costs_one_route_per_track_regardless_of_subscribers() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let publisher = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(0),
@@ -2451,53 +2546,11 @@ mod tests {
         );
     }
 
-    /// A reliable topic gets a reverse route on the same terms as a track: one
-    /// per published stream, resolving to the publisher and topic so an ack
-    /// names neither.
-    #[test]
-    fn a_reliable_topic_gets_one_reverse_route() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
-        let mut rng = rand::seeded_rng(91);
-        let room = room_id("reliable-reverse");
-        let publisher = pid();
-        let topic = Topic::for_test("chat");
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            publisher,
-            1,
-        );
-        table.add_local_member(publisher, handle, room, &mut rng);
-
-        let target = table
-            .register_reliable_data_publisher(room, publisher, topic.clone(), now(), &wall())
-            .expect("publishing a reliable topic opens its reverse route");
-        assert_eq!(table.routes.len(), 1);
-        assert!(
-            matches!(
-                table.resolve_reverse(target.route, target.epoch),
-                Some((origin, ReverseTarget::Topic { topic: t, .. }))
-                    if origin == publisher && *t == topic
-            ),
-            "an ack resolves to its publisher and topic through the route alone"
-        );
-
-        table.unregister_reliable_data_publisher(room, publisher, &topic, now());
-        assert_eq!(
-            table.routes.len(),
-            0,
-            "unpublishing must free the reverse route"
-        );
-    }
-
     /// A request already in flight when the track was unpublished must not land
     /// on whatever later takes that slot.
     #[test]
     fn feedback_on_a_retired_route_is_dropped() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let publisher = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(0),
@@ -2522,9 +2575,7 @@ mod tests {
     /// the new subscription just asked for.
     #[test]
     fn a_stale_unsubscribe_does_not_tear_down_a_newer_route() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let publisher = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(0),
@@ -2564,15 +2615,13 @@ mod tests {
     /// and the publisher keeps a handle for a destination that wants nothing.
     #[test]
     fn the_last_data_unsubscribe_retires_the_route() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(41);
         let room = room_id("data-retire");
         let publisher = pid();
         let topic = Topic::for_test("chat");
 
-        let mut subscribe = |table: &mut ShardRoutingTable, who: ParticipantId, rng: &mut _| {
+        let subscribe = |table: &mut ShardRoutingTable, who: ParticipantId, rng: &mut _| {
             let handle = ParticipantHandle::new(
                 SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
                 who,
@@ -2623,9 +2672,7 @@ mod tests {
     /// until a publisher is announced — then it resolves to a concrete route.
     #[test]
     fn a_wildcard_data_subscription_resolves_on_publisher_announcement() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(12);
         let room = room_id("data-wildcard");
         let subscriber = pid();
@@ -2673,9 +2720,7 @@ mod tests {
     /// exists and retires when it has nobody left to deliver to.
     #[test]
     fn an_audio_route_is_installed_per_stream_and_retired_with_the_room() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room");
         let local = pid();
@@ -2719,9 +2764,7 @@ mod tests {
 
     #[test]
     fn a_locally_published_audio_track_installs_no_route() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room-local");
         let origin = pid();
@@ -2761,9 +2804,7 @@ mod tests {
     /// and only then does media flow — addressed by route, not by track id.
     #[test]
     fn a_route_is_installed_once_and_retired_with_the_last_subscriber() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let track = TrackMeta {
             shard_id: ShardId::new(1),
             id: pid().derive_track_id(TrackKind::Video, "v"),
@@ -2815,9 +2856,7 @@ mod tests {
 
     #[test]
     fn route_video_forwards_to_subscribers_and_remote_shards() {
-        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
-            crate::stream_registry::StreamRegistry::new(),
-        ));
+        let mut table = ShardRoutingTable::new();
         let track_id = pid().derive_track_id(TrackKind::Video, "v");
         let subscriber = pid();
         add_local_subscriber(&mut table, subscriber);

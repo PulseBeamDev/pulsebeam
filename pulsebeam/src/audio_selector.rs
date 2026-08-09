@@ -1,6 +1,3 @@
-//! Shared-state exception: Test-only: a counter for unique ids in fixtures.
-#![allow(clippy::disallowed_types)]
-
 use std::time::Duration;
 
 use pulsebeam_runtime::rand::RngCore;
@@ -223,6 +220,9 @@ fn decayed_power(power: f32, last_arrival_ts: Option<Instant>, now: Instant) -> 
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use std::time::Duration;
 

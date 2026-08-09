@@ -285,7 +285,7 @@ fn cache_segments_on_frames_not_arrival_time() {
     for p in &kf {
         cache.push(p.clone());
     }
-    let last = kf.last().unwrap();
+    let _last = kf.last().unwrap();
     let replay = cache
         .replay()
         .expect("a complete keyframe must be replayable");

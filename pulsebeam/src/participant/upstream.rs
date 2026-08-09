@@ -16,6 +16,8 @@ pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
 struct UpstreamSlot {
     mid: Mid,
     track: UpstreamTrack,
+    /// What was last handed to the shard, so only changes are published.
+    last_published_stats: crate::track::TrackStates,
 }
 
 impl PartialEq for UpstreamSlot {
@@ -72,7 +74,11 @@ impl UpstreamAllocator {
             TrackKind::Data => todo!("add upstream data track"),
         }
 
-        let slot = UpstreamSlot { mid, track };
+        let slot = UpstreamSlot {
+            mid,
+            track,
+            last_published_stats: Vec::new(),
+        };
         self.published_tracks.push(slot);
         true
     }
@@ -142,5 +148,28 @@ impl UpstreamAllocator {
         self.published_tracks
             .iter_mut()
             .for_each(|slot| slot.track.poll_stats(now));
+    }
+
+    /// Snapshots that have moved since they were last handed out.
+    ///
+    /// Emitted on change rather than on a schedule. The rate filters only move
+    /// on the slow poll, but `process_packet` flips activity and health per
+    /// packet — a shared handle showed that instantly, and publishing only
+    /// every slow tick delayed it by up to that interval. That lag is enough to
+    /// change an allocation decision: a viewer reconfiguring priorities reached
+    /// a lower layer and the estimate collapsed with it.
+    ///
+    /// The check is a handful of `Copy` comparisons per published track, so it
+    /// is cheap enough to run on the fast path where the change happens.
+    pub fn take_changed_stats(&mut self) -> Vec<(TrackId, crate::track::TrackStates)> {
+        let mut changed = Vec::new();
+        for slot in self.published_tracks.iter_mut() {
+            let current = slot.track.layer_states();
+            if slot.last_published_stats != current {
+                slot.last_published_stats.clone_from(&current);
+                changed.push((slot.track.meta.id, current));
+            }
+        }
+        changed
     }
 }

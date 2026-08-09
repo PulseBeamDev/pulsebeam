@@ -1,6 +1,3 @@
-//! Shared-state exception: Startup wiring and test-only counters.
-#![allow(clippy::disallowed_types)]
-
 use std::io;
 use std::time::Duration;
 
@@ -361,6 +358,9 @@ async fn recv_command_paced(
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use crate::id::ShardId;
     use crate::{

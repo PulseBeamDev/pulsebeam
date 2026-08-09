@@ -136,9 +136,7 @@ fn packet_clone(iters: u32) {
         "size_of DependencyDescriptor = {}",
         std::mem::size_of::<pulsebeam_core::dd::DependencyDescriptor>()
     );
-    println!(
-        "size_of StreamStateInner     = (private)"
-    );
+    println!("size_of StreamStateInner     = (private)");
     println!(
         "size_of RtpPacket           = {}",
         std::mem::size_of::<RtpPacket>()

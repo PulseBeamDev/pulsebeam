@@ -286,12 +286,16 @@ impl ParticipantCore {
     }
 
     #[inline]
+    /// A track's latest measurements, pushed by the shard when they change.
+    pub fn update_layer_states(&mut self, track_id: TrackId, states: &crate::track::TrackStates) {
+        self.downstream.update_layer_states(track_id, states);
+    }
+
     pub fn on_forward_rtp(
         &mut self,
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
-        state: Option<&crate::rtp::monitor::StreamState>,
     ) {
         // Observation for the simulator: media payload actually forwarded to this subscriber,
         // to compare against what it received (i.e. how much of the link was video vs overhead).
@@ -303,7 +307,7 @@ impl ParticipantCore {
         );
         let promoted =
             self.downstream
-                .on_forward_rtp(track_id, pkt, cache, state, &mut self.stream_writer);
+                .on_forward_rtp(track_id, pkt, cache, &mut self.stream_writer);
         if promoted {
             self.signaling.mark_assignments_dirty();
         }
@@ -439,12 +443,25 @@ impl ParticipantCore {
         });
     }
 
+    /// Hand the shard any measurement that has moved.
+    ///
+    /// On the fast path as well as the slow poll, because `process_packet`
+    /// flips activity and health per packet and the allocator acts on those.
+    fn publish_changed_stats(&mut self, events: &mut impl ParticipantSink) {
+        for (track_id, states) in self.upstream.take_changed_stats() {
+            events.publish_track_stats(track_id, states);
+        }
+    }
+
     fn poll_slow(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        // Measure before allocating: the monitors produce this tick's numbers,
+        // and running the allocator first would decide against last tick's.
+        self.upstream.poll_slow(now);
+        self.publish_changed_stats(events);
         let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         if assignments_changed {
             self.signaling.mark_assignments_dirty();
         }
-        self.upstream.poll_slow(now);
     }
 
     /// Converts one routed item into zero or more deferred `Rtc` mutations.
@@ -691,6 +708,8 @@ impl ParticipantCore {
                 self.rtc_needs_drain = true;
                 continue;
             }
+
+            self.publish_changed_stats(events);
 
             if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
                 self.poll_slow(now, events);
