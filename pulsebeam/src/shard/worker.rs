@@ -1,13 +1,14 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
-use crate::route::{Envelope, RouteId};
+use crate::route::{Envelope, ReverseRoute, RouteId};
 
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
     rand::Rng,
 };
+use str0m::media::KeyframeRequestKind;
 use tokio::time::{Instant, Sleep};
 
 use crate::{
@@ -16,10 +17,20 @@ use crate::{
     participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::metrics::ShardMetrics,
-    track::{GlobalKeyframeRequest, Topic, Track, TrackMeta},
+    track::{Topic, Track, TrackMeta},
 };
 
 use super::core::{ShardCore, ShardTransport};
+
+/// Depth of the shard -> controller topology queue.
+///
+/// Deliberately large and preallocated. Every entry is one topology change
+/// (publish, subscribe, teardown, participant lifecycle) — control-rate events,
+/// not per-packet — so a healthy node never comes close. It is sized this way
+/// so that filling it is unambiguous evidence of a stalled controller rather
+/// than a burst, which is what lets [`ShardWorker::flush_shard_events`] treat
+/// it as fatal instead of blocking.
+pub const SHARD_EVENT_CAPACITY: usize = 65_536;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
@@ -121,7 +132,41 @@ pub enum Topology {
         room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
+        /// Where subscribers send this topic's application-level acks.
+        reverse: Option<ReverseRoute>,
     },
+}
+
+/// What a subscriber sends back to a publisher.
+///
+/// Kept compact because it is going on a wire: the reverse route already
+/// identifies the stream, so a body names only what the destination cannot
+/// derive. Encodings are named by their index in the track's declared order —
+/// both ends have that from the control plane — so a rid never travels.
+///
+/// ```text
+/// route(4) | epoch(2) | tag(1) | body
+///   Keyframe  layer(1) kind(1)                 ->  9 bytes
+///   Nack      layer(1) pid(2) blp(2)           -> 12 bytes
+///   DataAck   len(2) payload(len)              ->  9 + len
+/// ```
+#[derive(Debug, Clone)]
+pub enum Reverse {
+    /// Ask for a keyframe on one encoding.
+    Keyframe {
+        layer: u8,
+        kind: KeyframeRequestKind,
+    },
+    /// RTP loss report in the RTCP generic-NACK shape: `pid` is the first lost
+    /// sequence number and `blp` a bitmask of the 16 that follow. Not raised
+    /// yet — this is the slot it goes in.
+    #[allow(dead_code)]
+    Nack { layer: u8, pid: u16, blp: u16 },
+    /// The application's own reliability protocol for a reliable data topic:
+    /// the subscriber telling the publisher what it is missing. Opaque here —
+    /// the SFU relays it without interpreting it, which is what keeps
+    /// end-to-end reliability an endpoint concern rather than a hop guarantee.
+    DataAck(Vec<u8>),
 }
 
 /// Payload carried under an [`Envelope`]. Still typed this pass; byte
@@ -148,15 +193,14 @@ pub enum ShardFrame {
         env: Envelope,
         payload: MediaPayload,
     },
-    /// Upstream feedback toward the publisher. Latest-wins: a newer request for
-    /// the same stream supersedes an older one, so both dropping and
-    /// superseding one are free.
-    Feedback(GlobalKeyframeRequest),
-    /// Reverse payload on a data topic, delivered back to its publisher.
-    ReverseData {
-        publisher: ParticipantId,
-        topic: Topic,
-        bytes: Vec<u8>,
+    /// Anything travelling back toward a publisher, addressed by the reverse
+    /// route its shard opened. One variant for all of it because they share a
+    /// contract: every one is an idempotent request the sender repeats if it
+    /// still needs it, so losing one costs a round trip and nothing else.
+    Reverse {
+        route: RouteId,
+        epoch: u16,
+        body: Reverse,
     },
     /// A datagram batch that landed on the wrong shard's socket. Node-local
     /// with no cross-node analogue — a node demuxes its own participants — so
@@ -304,7 +348,7 @@ impl ShardWorker {
             self.metrics.record_idle(busy_start - loop_start);
 
             self.tick(busy_start);
-            self.flush_shard_events().await?;
+            self.flush_shard_events()?;
 
             // TODO: record forwarding latency
             let busy_end = Instant::now();
@@ -372,18 +416,125 @@ impl ShardWorker {
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
     }
 
-    async fn flush_shard_events(&mut self) -> Result<(), ShardError> {
+    /// Hand this tick's topology events to the controller.
+    ///
+    /// **Never await here.** The controller awaits when it sends a shard a
+    /// command, so a shard that awaits sending an event closes a cycle: with
+    /// both channels full, the controller blocks on a shard that is blocked on
+    /// the controller and neither ever drains. The shard side is the one that
+    /// must not block, because a shard that never blocks is what makes the
+    /// controller's await safe — its commands are always drained.
+    ///
+    /// So this is `try_send`, and a full queue is fatal rather than handled:
+    /// [`SHARD_EVENT_CAPACITY`] is sized far above any rate real topology churn
+    /// can produce, so reaching it means the controller has stopped consuming
+    /// and the cluster's view of the topology is already wrong. Continuing from
+    /// there would silently drop subscriptions and teardowns.
+    fn flush_shard_events(&mut self) -> Result<(), ShardError> {
         while let Some(event) = self.core.pop_shard_event() {
             let wrapped = ShardEventWrapper {
                 from_shard_id: self.router.shard_id,
                 ev: event,
             };
-            if let Err(err) = self.event_tx.send(wrapped).await {
-                tracing::warn!("shard event channel is closed, exiting: {}", err);
-                return Err(ShardError::ManagerDisconnected);
+            match self.event_tx.try_send(wrapped) {
+                Ok(()) => {}
+                Err(mailbox::TrySendError::Closed(_)) => {
+                    tracing::warn!("shard event channel is closed, exiting");
+                    return Err(ShardError::ManagerDisconnected);
+                }
+                Err(mailbox::TrySendError::Full(ev)) => {
+                    panic!(
+                        "shard {} filled the {SHARD_EVENT_CAPACITY}-slot control queue to the \
+                         controller and cannot block on it without deadlocking (the controller \
+                         awaits on the reverse channel). The controller has stopped draining \
+                         topology events, so cluster routing state is already diverging. \
+                         Dropped: {:?}",
+                        self.router.shard_id, ev.ev
+                    );
+                }
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::*;
+
+    /// The shard -> controller queue must stay far larger than the reverse one.
+    ///
+    /// It is the direction that cannot block, so its depth is the entire budget
+    /// for absorbing a controller that is briefly behind — the reverse
+    /// direction can just wait. Sizing them alike would make an ordinary burst
+    /// look like the stalled controller this queue's overflow is meant to
+    /// diagnose.
+    #[test]
+    fn the_non_blocking_direction_has_the_deeper_queue() {
+        const SHARD_COMMAND_CAPACITY: usize = 1024;
+        assert!(
+            SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
+            "the queue a shard cannot block on must have far more headroom \
+             than the one it can"
+        );
+    }
+
+    /// The reverse lane is going on a wire, so the documented layout is the
+    /// contract: a route already names the stream, so a body may only carry
+    /// what the destination cannot derive. This pins the sizes the doc comment
+    /// on [`Reverse`] promises, so a field added without thinking shows up here
+    /// rather than in a datagram.
+    #[test]
+    fn reverse_bodies_stay_compact() {
+        /// `route(4) | epoch(2) | tag(1)`
+        const HEADER: usize = 7;
+
+        fn wire_len(body: &Reverse) -> usize {
+            HEADER
+                + match body {
+                    Reverse::Keyframe { .. } => 2,              // layer, kind
+                    Reverse::Nack { .. } => 5,                  // layer, pid, blp
+                    Reverse::DataAck(bytes) => 2 + bytes.len(), // len prefix
+                }
+        }
+
+        assert_eq!(
+            wire_len(&Reverse::Keyframe {
+                layer: 0,
+                kind: KeyframeRequestKind::Pli,
+            }),
+            9,
+            "a keyframe request must fit the documented 9 bytes"
+        );
+        assert_eq!(
+            wire_len(&Reverse::Nack {
+                layer: 0,
+                pid: 1,
+                blp: 0,
+            }),
+            12,
+            "a NACK must fit the documented 12 bytes"
+        );
+        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 17);
+    }
+
+    /// An encoding is named by index, never by rid: the index is derivable from
+    /// the track descriptor both ends already hold, and a rid is a variable
+    /// length string that has no business on a per-request lane.
+    #[test]
+    fn an_encoding_is_named_by_index_not_by_rid() {
+        let body = Reverse::Keyframe {
+            layer: 2,
+            kind: KeyframeRequestKind::Pli,
+        };
+        assert_eq!(
+            std::mem::size_of_val(&match body {
+                Reverse::Keyframe { layer, .. } => layer,
+                _ => unreachable!(),
+            }),
+            1,
+            "an encoding selector must be one byte"
+        );
     }
 }

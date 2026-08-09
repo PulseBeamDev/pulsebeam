@@ -389,6 +389,12 @@ impl TrackMonitor {
 pub struct Track {
     pub meta: TrackMeta,
     pub layers: Vec<TrackLayer>,
+    /// Where subscribing shards send everything that flows back toward this
+    /// track's publisher — keyframe requests today, NACKs later. Stamped by the
+    /// publisher's shard when it publishes, then carried to every other shard
+    /// by the control plane: the compiled reverse plan, so the data plane never
+    /// has to name the track to ask for anything.
+    pub reverse: Option<crate::route::ReverseRoute>,
 }
 
 impl Track {
@@ -498,6 +504,7 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
         Track {
             meta,
             layers: Vec::with_capacity(MAX_SIMULCAST_LAYERS),
+            reverse: None,
         },
     )
 }
@@ -559,6 +566,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     let track = Track {
         meta: meta.clone(),
         layers,
+        reverse: None,
     };
 
     (

@@ -1538,6 +1538,7 @@ mod assignment_tests {
             allocator.add_track(Track {
                 meta,
                 layers: track.layers,
+                reverse: None,
             });
             senders.push(tx);
         }
@@ -1565,6 +1566,7 @@ mod assignment_tests {
         let track = Track {
             meta: tx.meta.clone(),
             layers: built.layers,
+            reverse: None,
         };
 
         // The "h" encoding advertises three decode targets (L1T3); "q", none.
@@ -1747,6 +1749,7 @@ mod assignment_tests {
         allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
+            reverse: None,
         });
         add_slots(&mut allocator, 1);
 
@@ -1845,6 +1848,7 @@ mod assignment_tests {
         allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
+            reverse: None,
         });
         add_slots(&mut allocator, 1);
 
@@ -2118,6 +2122,7 @@ mod assignment_tests {
         allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers,
+            reverse: None,
         });
 
         assert!(
@@ -2150,6 +2155,7 @@ mod assignment_tests {
         allocator.add_track(Track {
             meta,
             layers: track.layers,
+            reverse: None,
         });
         assert_eq!(allocator.slots().count(), 3);
     }
@@ -2173,6 +2179,7 @@ mod assignment_tests {
         allocator.add_track(Track {
             meta: tx.meta.clone(),
             layers: track.layers.clone(),
+            reverse: None,
         });
         add_slots(&mut allocator, 1);
 
@@ -2242,6 +2249,7 @@ mod allocation_tests {
             Track {
                 meta: tx.meta,
                 layers: track.layers,
+                reverse: None,
             },
             states,
         )

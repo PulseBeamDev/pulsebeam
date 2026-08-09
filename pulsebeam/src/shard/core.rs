@@ -26,7 +26,7 @@ use str0m::media::Rid;
 use super::router::{self, ParticipantShardMeta, RoutingContext, ShardRoutingTable};
 
 pub(crate) use super::router::ShardTransport;
-use super::worker::{MediaPayload, ShardCommand, ShardEvent, ShardFrame, Topology};
+use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame, Topology};
 
 const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 
@@ -524,16 +524,19 @@ impl ShardCore {
                             publisher,
                             topic,
                         } => {
-                            self.routing.register_reliable_data_publisher(
+                            let reverse = self.routing.register_reliable_data_publisher(
                                 room_id,
                                 publisher,
                                 topic.clone(),
+                                now,
+                                &self.wall,
                             );
                             self.pipeline.push_shard_event(ShardEvent::Relay(
                                 Topology::ReliableTopicPublished {
                                     room_id,
                                     publisher,
                                     topic,
+                                    reverse,
                                 },
                             ));
                         }
@@ -542,8 +545,9 @@ impl ShardCore {
                             publisher,
                             topic,
                         } => {
-                            self.routing
-                                .unregister_reliable_data_publisher(room_id, publisher, &topic);
+                            self.routing.unregister_reliable_data_publisher(
+                                room_id, publisher, &topic, now,
+                            );
                         }
                         ParticipantControlEvent::ReliableDataTopicSubscribed {
                             room_id,
@@ -584,10 +588,16 @@ impl ShardCore {
                             self.routing
                                 .route_reliable_control(publisher, &topic, &bytes, &mut ctx);
                         }
-                        ParticipantControlEvent::TrackPublished(track, states) => {
+                        ParticipantControlEvent::TrackPublished(mut track, states) => {
                             // Register the handles on the node; only the
                             // stateless descriptor continues to the controller.
                             self.routing.publish_local_track(track.meta.id, states);
+                            // Open the reverse path now and stamp it on the
+                            // descriptor: by the time any shard can subscribe,
+                            // it already knows where to ask for a keyframe.
+                            track.reverse = self
+                                .routing
+                                .open_track_reverse_route(&track, now, &self.wall);
                             self.pipeline
                                 .push_shard_event(ShardEvent::TrackPublished(track));
                         }
@@ -609,8 +619,28 @@ impl ShardCore {
                                     req.stream_id.1,
                                     req.kind,
                                 );
+                            } else if let Some((target, layer)) = self
+                                .routing
+                                .track_reverse_target(&req.stream_id.0, req.stream_id.1)
+                            {
+                                router.send_frame(
+                                    req.shard_id,
+                                    ShardFrame::Reverse {
+                                        route: target.route,
+                                        epoch: target.epoch,
+                                        body: Reverse::Keyframe {
+                                            layer,
+                                            kind: req.kind,
+                                        },
+                                    },
+                                );
                             } else {
-                                router.send_frame(req.shard_id, ShardFrame::Feedback(req));
+                                // The reverse route arrives with the track, so a
+                                // subscription cannot predate it.
+                                debug_assert!(
+                                    false,
+                                    "no reverse route for a remotely published track"
+                                );
                             }
                         }
                         ev => {
@@ -619,6 +649,7 @@ impl ShardCore {
                             if let ParticipantControlEvent::TrackUnpublished { track_id, .. } = &ev
                             {
                                 self.routing.unpublish_local_track(track_id);
+                                self.routing.close_track_reverse_route(track_id, now);
                             }
                             router::route_participant_control_event(
                                 ev,
@@ -855,11 +886,13 @@ impl ShardCore {
                     remote,
                 );
                 for publisher in announce {
+                    let reverse = self.routing.topic_reverse_handle(publisher, &topic);
                     self.pipeline.push_shard_event(ShardEvent::Relay(
                         Topology::ReliableTopicPublished {
                             room_id,
                             publisher,
                             topic: topic.clone(),
+                            reverse,
                         },
                     ));
                 }
@@ -876,7 +909,10 @@ impl ShardCore {
                 room_id,
                 publisher,
                 topic,
+                reverse,
             } => {
+                self.routing
+                    .learn_topic_reverse_target(publisher, &topic, reverse);
                 if let Some(ev) = self
                     .routing
                     .on_remote_reliable_publisher(room_id, publisher, &topic, now, &self.wall)
@@ -928,27 +964,84 @@ impl ShardCore {
                     self.dirty.mark(handle, participant);
                 }
             }
-            ShardFrame::Feedback(req) => {
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                    wall: &self.wall,
-                };
-                ctx.notify_keyframe_request(req.origin, req.stream_id.0, req.stream_id.1, req.kind);
+            ShardFrame::Reverse { route, epoch, body } => {
+                self.on_reverse_frame(route, epoch, body, router);
             }
-            ShardFrame::ReverseData {
-                publisher,
-                topic,
-                bytes,
-            } => {
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                    wall: &self.wall,
-                };
-                ctx.deliver_reliable_control(publisher, &topic, &bytes);
+        }
+    }
+
+    /// Act on a frame travelling back toward one of this shard's publishers.
+    ///
+    /// The route is the whole address: it names the publisher and the stream,
+    /// and for a track it carries the encoding order, so the frame itself only
+    /// has to say which layer and what it wants.
+    fn on_reverse_frame(
+        &mut self,
+        route: crate::route::RouteId,
+        epoch: u16,
+        body: Reverse,
+        router: &impl ShardTransport,
+    ) {
+        use crate::route::ReverseTarget;
+
+        // Resolve fully before touching the registry: the target borrows the
+        // route table, and dispatch needs the rest of `self` mutably.
+        enum Act {
+            Keyframe(TrackId, Option<Rid>, str0m::media::KeyframeRequestKind),
+            Data(crate::track::Topic, Vec<u8>),
+        }
+        let act = {
+            let Some((_origin, target)) = self.routing.resolve_reverse(route, epoch) else {
+                // The stream was unpublished while this was in flight, or the
+                // slot has been recycled. Both are expected under teardown.
+                tracing::debug!(%route, "dropping a reverse frame on an unusable route");
+                return;
+            };
+            match (target, body) {
+                (
+                    ReverseTarget::Track {
+                        track_id,
+                        encodings,
+                    },
+                    Reverse::Keyframe { layer, kind },
+                ) => {
+                    let Some(rid) = encodings.get(usize::from(layer)).copied() else {
+                        debug_assert!(false, "a reverse frame named an encoding the track lacks");
+                        return;
+                    };
+                    Act::Keyframe(*track_id, rid, kind)
+                }
+                (ReverseTarget::Track { .. }, Reverse::Nack { .. }) => {
+                    // Nothing raises these yet; the route resolves, so the only
+                    // missing piece is the retransmission path itself.
+                    return;
+                }
+                (ReverseTarget::Topic { topic, .. }, Reverse::DataAck(bytes)) => {
+                    Act::Data(topic.clone(), bytes)
+                }
+                (target, _) => {
+                    debug_assert!(false, "reverse body does not match a {target:?} route");
+                    return;
+                }
+            }
+        };
+
+        let origin = match self.routing.resolve_reverse(route, epoch) {
+            Some((origin, _)) => origin,
+            None => return,
+        };
+        let mut ctx = DispatchCtx {
+            registry: &mut self.registry,
+            dirty: &mut self.dirty,
+            router,
+            wall: &self.wall,
+        };
+        match act {
+            Act::Keyframe(track_id, rid, kind) => {
+                ctx.notify_keyframe_request(origin, track_id, rid, kind);
+            }
+            Act::Data(topic, bytes) => {
+                ctx.deliver_reliable_control(origin, &topic, &bytes);
             }
         }
     }
@@ -1307,13 +1400,32 @@ mod test {
         let r = room_id("kf1");
         add_participant(&mut core, &router, p, r);
 
+        // The publisher's shard opens the reverse route; the frame carries only
+        // that route, so nothing on the wire names the participant or track.
+        let meta = video_track(p, 0);
+        let descriptor = crate::track::Track {
+            meta: meta.clone(),
+            layers: vec![crate::track::TrackLayer {
+                meta,
+                rid: None,
+                quality: crate::track::LayerQuality::High,
+            }],
+            reverse: None,
+        };
+        let target = core
+            .routing
+            .open_track_reverse_route(&descriptor, now(), &core.wall)
+            .expect("a published track opens a reverse route");
+
         core.on_shard_frame(
-            ShardFrame::Feedback(crate::track::GlobalKeyframeRequest {
-                origin: p,
-                stream_id: video_stream(p),
-                shard_id: ShardId::new(0),
-                kind: str0m::media::KeyframeRequestKind::Pli,
-            }),
+            ShardFrame::Reverse {
+                route: target.route,
+                epoch: target.epoch,
+                body: Reverse::Keyframe {
+                    layer: 0,
+                    kind: str0m::media::KeyframeRequestKind::Pli,
+                },
+            },
             now(),
             &router,
         );

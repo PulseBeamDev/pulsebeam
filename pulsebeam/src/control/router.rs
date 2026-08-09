@@ -110,6 +110,15 @@ impl ShardRouter {
         best_index
     }
 
+    /// Awaiting here is safe *only* because the shard never awaits on the
+    /// reverse channel.
+    ///
+    /// The two directions form a cycle: if a shard blocked sending the
+    /// controller an event while the controller blocked sending that shard a
+    /// command, neither would drain. The shard side breaks it — it `try_send`s
+    /// its events and treats a full queue as fatal — so a shard always reaches
+    /// the top of its loop and drains this queue. Do not make the shard side
+    /// await, and do not rely on that guarantee from anywhere else.
     pub async fn send(&mut self, shard_id: ShardId, cmd: ShardCommand) {
         self.get_mut(shard_id)
             .send(cmd)

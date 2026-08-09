@@ -340,6 +340,7 @@ mod tests {
                 origin: publisher,
             },
             layers: Vec::new(),
+            reverse: None,
         };
 
         core.process_shard_event(
@@ -385,6 +386,7 @@ mod tests {
                 origin: publisher,
             },
             layers: Vec::new(),
+            reverse: None,
         };
 
         core.process_shard_event(
@@ -484,6 +486,7 @@ mod tests {
                 origin: publisher,
             },
             layers: Vec::new(),
+            reverse: None,
         };
 
         core.process_shard_event(

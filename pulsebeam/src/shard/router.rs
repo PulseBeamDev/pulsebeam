@@ -20,9 +20,10 @@ use crate::stream_registry::StreamRegistry;
 use crate::track::{DataLane, Topic, Track, TrackMeta};
 use tokio::time::Instant;
 
-use super::worker::{MediaPayload, ShardEvent, ShardFrame, Topology};
+use super::worker::{MediaPayload, Reverse, ShardEvent, ShardFrame, Topology};
 use crate::route::{
-    Envelope, ImportEffect, ImportTable, RemoteRoute, RouteAction, RouteId, RouteNames, RouteTable,
+    Envelope, ImportEffect, ImportTable, RemoteRoute, ReverseRoute, ReverseTarget, RouteAction,
+    RouteId, RouteNames, RouteTable,
 };
 
 type FastIndexSet<T> = IndexSet<T, ahash::RandomState>;
@@ -233,6 +234,12 @@ pub(crate) struct TrackRoute {
     /// only appears here once it has installed its route, so the presence of a
     /// handle is what permits media to flow.
     pub remote_routes: Vec<RemoteRoute>,
+    /// Where to send keyframe requests for this track, when it is published on
+    /// another shard. `None` for a locally published track: its requests are
+    /// dispatched in-process and never addressed.
+    reverse: Option<ReverseRoute>,
+    /// Encoding order for this track, so a reverse frame can name one by index.
+    encodings: Vec<Option<Rid>>,
     cache: TrackStreamCache,
 }
 
@@ -248,6 +255,8 @@ impl TrackRoute {
         Self {
             subscribers: Vec::with_capacity(256),
             layer_states: Vec::new(),
+            reverse: None,
+            encodings: Vec::new(),
             remote_routes: Vec::new(),
             cache: TrackStreamCache::new(),
         }
@@ -276,6 +285,13 @@ pub(crate) struct ShardRoutingTable {
     /// Where measurement handles are resolved. Shared by every shard on the
     /// node so they never have to be sent anywhere.
     streams: Arc<StreamRegistry>,
+    /// Reverse routes this shard opened for the streams it publishes, so they
+    /// can be retired when those streams go away.
+    track_reverse_routes: HashMap<TrackId, RouteId>,
+    topic_reverse_routes: HashMap<DataStreamId, ReverseRoute>,
+    /// Handles for reverse routes *other* shards opened, learned from publisher
+    /// announcements — the addresses this shard sends acks to.
+    topic_reverse_targets: HashMap<DataStreamId, ReverseRoute>,
 }
 
 impl ShardRoutingTable {
@@ -291,6 +307,9 @@ impl ShardRoutingTable {
             local_participants: HashMap::new(),
             remote_participant_counts: HashMap::new(),
             streams,
+            track_reverse_routes: HashMap::new(),
+            topic_reverse_routes: HashMap::new(),
+            topic_reverse_targets: HashMap::new(),
         }
     }
 
@@ -357,6 +376,172 @@ impl ShardRoutingTable {
         if room.members.is_empty() && room.remote_shards.is_empty() {
             self.rooms.remove(&room_id);
         }
+    }
+
+    /// Open the reverse path for a track this shard publishes, returning the
+    /// handle to stamp on the descriptor the control plane distributes.
+    ///
+    /// One route per track, not per subscribing shard: every subscriber sends
+    /// its requests to the same id, which keeps the reverse direction's share
+    /// of the 32-bit space proportional to streams rather than streams x
+    /// shards. The encoding list travels into the entry so a frame can name a
+    /// layer by index instead of carrying a rid.
+    pub fn open_track_reverse_route(
+        &mut self,
+        track: &Track,
+        now: Instant,
+        wall: &WallAnchor,
+    ) -> Option<ReverseRoute> {
+        let handle = self.open_reverse_route(
+            track.meta.origin,
+            ReverseTarget::Track {
+                track_id: track.meta.id,
+                encodings: track.layers.iter().map(|l| l.rid).collect(),
+            },
+            RouteNames {
+                room_id: None,
+                origin: track.meta.origin,
+                track_id: Some(track.meta.id),
+                topic: None,
+            },
+            now,
+            wall,
+        )?;
+        self.track_reverse_routes
+            .insert(track.meta.id, handle.route);
+        Some(handle)
+    }
+
+    /// The same, for a reliable data topic this shard publishes. Its reverse
+    /// traffic is the application's own retransmission protocol.
+    pub fn open_topic_reverse_route(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+        now: Instant,
+        wall: &WallAnchor,
+    ) -> Option<ReverseRoute> {
+        let key = DataStreamId::new(publisher, topic.clone());
+        let handle = self.open_reverse_route(
+            publisher,
+            ReverseTarget::Topic {
+                room_id,
+                topic: topic.clone(),
+            },
+            RouteNames {
+                room_id: Some(room_id),
+                origin: publisher,
+                track_id: None,
+                topic: Some(topic),
+            },
+            now,
+            wall,
+        )?;
+        self.topic_reverse_routes.insert(key, handle);
+        Some(handle)
+    }
+
+    fn open_reverse_route(
+        &mut self,
+        origin: ParticipantId,
+        target: ReverseTarget,
+        names: RouteNames,
+        now: Instant,
+        wall: &WallAnchor,
+    ) -> Option<ReverseRoute> {
+        let (route, epoch) = self
+            .routes
+            .install(
+                RouteAction::Reverse { origin, target },
+                names,
+                wall.ntp(),
+                now,
+            )
+            .inspect_err(|err| tracing::error!(?err, "reverse route install failed"))
+            .ok()?;
+        Some(ReverseRoute { route, epoch })
+    }
+
+    /// Close a track's reverse path when its publisher goes away.
+    pub fn close_track_reverse_route(&mut self, track_id: &TrackId, now: Instant) {
+        if let Some(route) = self.track_reverse_routes.remove(track_id) {
+            self.routes.retire(route, now);
+        }
+    }
+
+    pub fn close_topic_reverse_route(
+        &mut self,
+        publisher: ParticipantId,
+        topic: &Topic,
+        now: Instant,
+    ) {
+        let key = DataStreamId::new(publisher, topic.clone());
+        if let Some(handle) = self.topic_reverse_routes.remove(&key) {
+            self.routes.retire(handle.route, now);
+        }
+    }
+
+    /// The reverse handle this shard opened for a topic it publishes, so a
+    /// late-arriving subscriber can be told about it.
+    pub fn topic_reverse_handle(
+        &self,
+        publisher: ParticipantId,
+        topic: &Topic,
+    ) -> Option<ReverseRoute> {
+        self.topic_reverse_routes
+            .get(&DataStreamId::new(publisher, topic.clone()))
+            .copied()
+    }
+
+    /// Learn where to send acks for a topic another shard publishes.
+    pub fn learn_topic_reverse_target(
+        &mut self,
+        publisher: ParticipantId,
+        topic: &Topic,
+        reverse: Option<ReverseRoute>,
+    ) {
+        let key = DataStreamId::new(publisher, topic.clone());
+        match reverse {
+            Some(handle) => {
+                self.topic_reverse_targets.insert(key, handle);
+            }
+            None => {
+                self.topic_reverse_targets.remove(&key);
+            }
+        }
+    }
+
+    /// Resolve an arriving feedback frame to the publisher it is aimed at.
+    ///
+    /// The epoch check is what makes a recycled slot safe: a request in flight
+    /// when a track was unpublished must not land on whatever took its place.
+    pub fn resolve_reverse(
+        &self,
+        route: RouteId,
+        epoch: u16,
+    ) -> Option<(ParticipantId, &ReverseTarget)> {
+        match self.routes.resolve_action(route, epoch)? {
+            RouteAction::Reverse { origin, target } => Some((*origin, target)),
+            other => {
+                debug_assert!(false, "a reverse frame arrived on a {other:?} route");
+                None
+            }
+        }
+    }
+
+    /// Where this shard sends reverse traffic for a track it subscribes to,
+    /// and the index it must use to name `rid` — both from the descriptor the
+    /// control plane handed it.
+    pub fn track_reverse_target(
+        &self,
+        track_id: &TrackId,
+        rid: Option<Rid>,
+    ) -> Option<(ReverseRoute, u8)> {
+        let entry = self.tracks.get(track_id)?;
+        let handle = entry.reverse?;
+        let layer = entry.encodings.iter().position(|r| *r == rid)?;
+        Some((handle, u8::try_from(layer).ok()?))
     }
 
     /// A local participant published a track: register its measurement handles
@@ -944,8 +1129,19 @@ impl ShardRoutingTable {
         ctx: &mut impl RoutingContext,
     ) -> Option<ShardEvent> {
         let publisher = track.meta.origin;
-        let Some(room) = self.rooms.get(&room_id) else {
+        let Some(_room) = self.rooms.get(&room_id) else {
             tracing::debug!(%room_id, "publish_track: room missing on this shard");
+            return None;
+        };
+        if let Some(reverse) = track.reverse {
+            let entry = self
+                .tracks
+                .entry(track.meta.id)
+                .or_insert_with(TrackRoute::new);
+            entry.reverse = Some(reverse);
+            entry.encodings = track.layers.iter().map(|l| l.rid).collect();
+        }
+        let Some(room) = self.rooms.get(&room_id) else {
             return None;
         };
         let tracks = std::slice::from_ref(&track);
@@ -1367,16 +1563,19 @@ impl ShardRoutingTable {
         }
     }
 
+    /// Register a local reliable publisher and open the reverse path
+    /// subscribers use to drive the application's retransmission protocol.
     pub fn register_reliable_data_publisher(
         &mut self,
         room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
-    ) {
-        let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
-        };
-        room.reliable.publish(publisher, topic);
+        now: Instant,
+        wall: &WallAnchor,
+    ) -> Option<ReverseRoute> {
+        let room = self.rooms.get_mut(&room_id)?;
+        room.reliable.publish(publisher, topic.clone());
+        self.open_topic_reverse_route(room_id, publisher, topic, now, wall)
     }
 
     pub fn unregister_reliable_data_publisher(
@@ -1384,11 +1583,12 @@ impl ShardRoutingTable {
         room_id: RoomId,
         publisher: ParticipantId,
         topic: &Topic,
+        now: Instant,
     ) {
-        let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
-        };
-        room.reliable.unpublish(publisher, topic);
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            room.reliable.unpublish(publisher, topic);
+        }
+        self.close_topic_reverse_route(publisher, topic, now);
     }
 
     pub fn register_reliable_data_subscriber(
@@ -1480,14 +1680,19 @@ impl ShardRoutingTable {
         if ctx.is_local(&publisher) {
             ctx.deliver_reliable_control(publisher, topic, bytes);
         } else if let Some(shard_id) = self.remote_shard_for(&publisher) {
-            // Reverse semantic control: correctness-critical, so it never rides
-            // the media lane.
+            let key = DataStreamId::new(publisher, topic.clone());
+            let Some(target) = self.topic_reverse_targets.get(&key) else {
+                // The handle arrives with the publisher announcement, so a
+                // subscription cannot predate it.
+                debug_assert!(false, "no reverse route for a remote reliable publisher");
+                return;
+            };
             ctx.send_frame(
                 shard_id,
-                ShardFrame::ReverseData {
-                    publisher,
-                    topic: topic.clone(),
-                    bytes: bytes.to_vec(),
+                ShardFrame::Reverse {
+                    route: target.route,
+                    epoch: target.epoch,
+                    body: Reverse::DataAck(bytes.to_vec()),
                 },
             );
         }
@@ -1713,6 +1918,19 @@ mod tests {
 
     fn room_id(s: &str) -> RoomId {
         RoomId::from_external(&ExternalRoomId::new(s).unwrap())
+    }
+
+    /// A single-encoding descriptor for `meta`, enough to open a reverse route.
+    fn video_track_with(meta: &TrackMeta) -> Track {
+        Track {
+            meta: meta.clone(),
+            layers: vec![crate::track::TrackLayer {
+                meta: meta.clone(),
+                rid: None,
+                quality: crate::track::LayerQuality::High,
+            }],
+            reverse: None,
+        }
     }
 
     fn pid() -> ParticipantId {
@@ -2015,6 +2233,119 @@ mod tests {
         );
     }
 
+    /// The reverse direction must cost one route per track, not one per
+    /// (track x subscribing shard). Route ids are 32 bits and the forward
+    /// direction already pays per destination; letting feedback do the same
+    /// would make it the largest consumer in the table for no benefit, since
+    /// it is latest-wins and keeps no per-link state.
+    #[test]
+    fn feedback_costs_one_route_per_track_regardless_of_subscribers() {
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
+        let publisher = pid();
+        let track = TrackMeta {
+            shard_id: ShardId::new(0),
+            id: publisher.derive_track_id(TrackKind::Video, "v"),
+            origin: publisher,
+        };
+
+        let target = table
+            .open_track_reverse_route(&video_track_with(&track), now(), &wall())
+            .expect("publishing opens the reverse route");
+        assert_eq!(table.routes.len(), 1);
+
+        // Every subscribing shard addresses the same id.
+        for shard in 1..8u8 {
+            let _ = shard;
+            assert!(
+                matches!(
+                    table.resolve_reverse(target.route, target.epoch),
+                    Some((origin, ReverseTarget::Track { track_id, .. }))
+                        if origin == publisher && *track_id == track.id
+                ),
+                "every subscriber resolves through the one route"
+            );
+        }
+        assert_eq!(
+            table.routes.len(),
+            1,
+            "subscriber count must not grow the reverse table"
+        );
+
+        table.close_track_reverse_route(&track.id, now());
+        assert_eq!(
+            table.routes.len(),
+            0,
+            "unpublishing must free the reverse route"
+        );
+    }
+
+    /// A reliable topic gets a reverse route on the same terms as a track: one
+    /// per published stream, resolving to the publisher and topic so an ack
+    /// names neither.
+    #[test]
+    fn a_reliable_topic_gets_one_reverse_route() {
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
+        let mut rng = rand::seeded_rng(91);
+        let room = room_id("reliable-reverse");
+        let publisher = pid();
+        let topic = Topic::for_test("chat");
+        let handle = ParticipantHandle::new(
+            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+            publisher,
+            1,
+        );
+        table.add_local_member(publisher, handle, room, &mut rng);
+
+        let target = table
+            .register_reliable_data_publisher(room, publisher, topic.clone(), now(), &wall())
+            .expect("publishing a reliable topic opens its reverse route");
+        assert_eq!(table.routes.len(), 1);
+        assert!(
+            matches!(
+                table.resolve_reverse(target.route, target.epoch),
+                Some((origin, ReverseTarget::Topic { topic: t, .. }))
+                    if origin == publisher && *t == topic
+            ),
+            "an ack resolves to its publisher and topic through the route alone"
+        );
+
+        table.unregister_reliable_data_publisher(room, publisher, &topic, now());
+        assert_eq!(
+            table.routes.len(),
+            0,
+            "unpublishing must free the reverse route"
+        );
+    }
+
+    /// A request already in flight when the track was unpublished must not land
+    /// on whatever later takes that slot.
+    #[test]
+    fn feedback_on_a_retired_route_is_dropped() {
+        let mut table = ShardRoutingTable::new(std::sync::Arc::new(
+            crate::stream_registry::StreamRegistry::new(),
+        ));
+        let publisher = pid();
+        let track = TrackMeta {
+            shard_id: ShardId::new(0),
+            id: publisher.derive_track_id(TrackKind::Video, "v"),
+            origin: publisher,
+        };
+
+        let stale = table
+            .open_track_reverse_route(&video_track_with(&track), now(), &wall())
+            .unwrap();
+        table.close_track_reverse_route(&track.id, now());
+
+        assert!(
+            table.resolve_reverse(stale.route, stale.epoch).is_none(),
+            "a reverse frame for an unpublished track must not resolve"
+        );
+    }
+
     /// Teardown must be idempotent under reordering. An unsubscribe names the
     /// route incarnation it is retiring, so one overtaken by a resubscription
     /// from the same shard is ignored rather than silently stopping the media
@@ -2194,6 +2525,7 @@ mod tests {
         let track = Track {
             meta: audio.clone(),
             layers: Vec::new(),
+            reverse: None,
         };
 
         let mut ctx = RecordingCtx {
@@ -2244,6 +2576,7 @@ mod tests {
             Track {
                 meta: audio,
                 layers: Vec::new(),
+                reverse: None,
             },
             room,
             now(),

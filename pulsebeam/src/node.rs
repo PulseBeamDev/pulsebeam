@@ -301,7 +301,8 @@ impl NodeBuilder {
             }
         }
 
-        let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
+        let (shard_event_tx, shard_event_rx) =
+            mailbox::new(crate::shard::worker::SHARD_EVENT_CAPACITY);
         let mut shard_handles = Vec::new();
         let mut frame_txs = Vec::new();
         let mut frame_rxs = Vec::new();

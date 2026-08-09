@@ -11,6 +11,7 @@ use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::shard::participants::ParticipantHandle;
 use crate::track::{DataLane, Topic};
+use str0m::media::Rid;
 
 pub const ENVELOPE_LEN: usize = 16;
 pub const ENVELOPE_VERSION: u8 = 1;
@@ -209,9 +210,47 @@ pub(crate) enum RouteAction {
         origin: ParticipantId,
         topic: Topic,
     },
+    /// The reverse path for one published stream, resolving at the shard that
+    /// owns the publisher.
+    ///
+    /// Exactly one of these exists per published stream, shared by every
+    /// subscribing shard rather than allocated per sender the way media routes
+    /// are. Everything on the reverse lane is an idempotent request the sender
+    /// repeats if it still needs it, so there is no per-link bookkeeping a
+    /// per-sender route would protect — and with a 32-bit id space, paying
+    /// `streams x shards` here would make it the largest consumer in the table.
+    Reverse {
+        origin: ParticipantId,
+        target: ReverseTarget,
+    },
     Ingress {
         participant: ParticipantHandle,
     },
+}
+
+/// What a reverse route points at, holding everything the destination needs to
+/// act on a frame that names nothing but the route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReverseTarget {
+    Track {
+        track_id: TrackId,
+        /// Encodings in declared order. A frame names one by index, so the rid
+        /// itself never travels; both ends order them from the same track
+        /// descriptor the control plane distributed.
+        encodings: Vec<Option<Rid>>,
+    },
+    Topic {
+        room_id: RoomId,
+        topic: Topic,
+    },
+}
+
+/// A sender-side handle to a reverse route, handed out with the stream it
+/// belongs to by the control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReverseRoute {
+    pub route: RouteId,
+    pub epoch: u16,
 }
 
 #[derive(Debug)]
@@ -269,6 +308,26 @@ enum Slot {
 }
 
 /// Destination-owned table of installed routes.
+///
+/// # Id budget
+///
+/// [`RouteId`] is 32 bits and slots grow monotonically until a retired one
+/// clears [`ROUTE_QUARANTINE`], so the table's size is peak concurrent routes
+/// plus whatever churned in the last quarantine window. What matters is that
+/// every route family stays proportional to something bounded:
+///
+/// | family    | count per shard        |
+/// |-----------|------------------------|
+/// | video     | imported tracks        |
+/// | audio     | imported audio streams |
+/// | data      | imported (publisher, topic, lane) |
+/// | feedback  | *published* tracks     |
+///
+/// Feedback is the one that could easily have been `tracks x shards`: a route
+/// per subscribing shard is the obvious symmetry with the forward direction.
+/// It is deliberately not, because feedback is latest-wins and keeps no
+/// per-link accounting, so a per-sender route would buy nothing and would cost
+/// 32x on a 32-shard node.
 #[derive(Debug, Default)]
 pub(crate) struct RouteTable {
     slots: Vec<Slot>,
@@ -350,6 +409,18 @@ impl RouteTable {
                 route: env.route,
                 epoch: env.epoch,
             }),
+        }
+    }
+
+    /// The compiled action behind a route, if that incarnation is still live.
+    ///
+    /// For frames that carry no [`Envelope`] — feedback has neither a timeline
+    /// nor per-link accounting to keep, so it addresses with `(route, epoch)`
+    /// alone.
+    pub fn resolve_action(&self, route: RouteId, epoch: u16) -> Option<&RouteAction> {
+        match self.slots.get(route.index()) {
+            Some(Slot::Live(entry)) if entry.epoch == epoch => Some(&entry.action),
+            _ => None,
         }
     }
 
