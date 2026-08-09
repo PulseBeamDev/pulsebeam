@@ -126,33 +126,41 @@ box_collection = "deny"
 rc_buffer = "deny"
 large_stack_arrays = "deny"
 result_large_err = "deny"
-large_enum_variant = "warn"     # a big variant makes every value of the enum big
+large_enum_variant = "deny"     # a big variant makes every value of the enum big
 mutex_atomic = "deny"
 
 # -- readability -------------------------------------------------------------
 manual_clamp = "deny"
 question_mark = "deny"
-manual_let_else = "warn"
-match_same_arms = "warn"
-semicolon_if_nothing_returned = "warn"
-uninlined_format_args = "warn"
-explicit_iter_loop = "warn"
-redundant_closure_for_method_calls = "warn"
-items_after_statements = "warn"
-empty_line_after_doc_comments = "warn"
-too_many_arguments = "warn"
+manual_let_else = "deny"
+match_same_arms = "deny"
+semicolon_if_nothing_returned = "deny"
+uninlined_format_args = "deny"
+explicit_iter_loop = "deny"
+redundant_closure_for_method_calls = "deny"
+empty_line_after_doc_comments = "deny"
+too_many_arguments = "deny"
 
 # Deliberately NOT enabled, so nobody re-litigates it from scratch:
 #
+#   items_after_statements  Enabled on the assumption its hits were sloppiness.
+#                      They were not: every one is an enum or const deliberately
+#                      scoped to the function that uses it — `Target` and `Act`
+#                      in shard/core.rs exist so a dispatch shape cannot be
+#                      referenced from anywhere else. Satisfying the lint means
+#                      hoisting private types to module scope, which is worse.
 #   indexing_slicing   246 production sites. Bounds are asserted with
 #                      debug_assert! per CLAUDE.md; 246 allows would bury the
 #                      signal this table exists to carry.
 #   unwrap_used        48 production sites. Worth doing, but as its own change.
-#   cast_*             203 production sites, and the one that actually matters:
-#                      a u64 -> u32 truncation was a real bug in StreamStats.
-#                      Blanket-enabling is impractical, so the plan is a checked
-#                      saturating helper plus a module-scoped deny in clock.rs,
-#                      rtp/sync.rs and rtp/timeline.rs — 54 sites, not 203.
+#   cast_*             The 203 is all four cast lints together, and it is
+#                      mostly `cast_precision_loss` on counters going into f64
+#                      for metrics — harmless. `cast_possible_truncation` alone
+#                      is 77, of which ~30 are production, and every u64 -> u32
+#                      among them already clamps by hand. An earlier note here
+#                      claimed a truncation was a real StreamStats bug; it was
+#                      not — that bug was a stale ladder rung. Worth a pass, but
+#                      a small one, and not the highest-value thing left.
 #   must_use_candidate,
 #   missing_panics_doc  pedantic noise for a crate with no external consumers.
 
