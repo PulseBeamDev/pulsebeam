@@ -1266,15 +1266,28 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ShardEvent> {
-        let room = self.rooms.get(&room_id)?;
-        let has_wildcard = room
+        let room = self.rooms.get_mut(&room_id)?;
+        let wildcard_subscribers = room
             .all_publisher_subscriptions
             .local_by_topic
             .get(topic)
-            .is_some_and(|s| !s.is_empty());
-        if !has_wildcard {
-            return None;
+            .filter(|s| !s.is_empty())?
+            .clone();
+
+        // Materialise the shard-local fanout *before* installing the route, so
+        // an installed route always resolves to something that exists. The
+        // wildcard named a topic, not a stream, so its subscribers live under
+        // `all_publisher_subscriptions` until a publisher makes the stream
+        // concrete — which is now. Without this the route resolves to an empty
+        // fanout and the frame is delivered to nobody, silently.
+        let fanout = room
+            .data_streams
+            .entry(DataStreamId::new(publisher, topic.clone()))
+            .or_insert_with(DataStreamRoute::new);
+        for subscriber in wildcard_subscribers {
+            fanout.local_subscribers.insert(subscriber);
         }
+
         let (route, epoch) = self.install_data_route(room_id, publisher, topic, now, wall)?;
         Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
             room_id,
@@ -1543,7 +1556,15 @@ impl ShardRoutingTable {
         let Some(route) = room.data_streams.get_mut(&stream_id) else {
             return;
         };
-        debug_assert!(route.published);
+        // `published` marks the shard that hosts the publisher, and only that
+        // shard sets it. A destination reaches here too — with a route it
+        // installed for the stream and a publisher that is not its own — so the
+        // flag tracks locality rather than being universally true.
+        debug_assert_eq!(
+            route.published,
+            ctx.is_local(&origin),
+            "the published flag must mean 'this shard hosts the publisher'"
+        );
         for &subscriber in &route.local_subscribers {
             ctx.forward_sctp(subscriber, origin, topic, pkt);
         }

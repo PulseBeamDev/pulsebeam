@@ -88,6 +88,13 @@ pub struct NodeBuilder {
     /// to use the TCP path.  Used in simulation tests that exercise TCP-only
     /// connectivity.
     tcp_only: bool,
+
+    /// How many participants of one room share a shard before the next join
+    /// spills to another.
+    room_shard_slot: usize,
+
+    /// How a spilled room chooses its next shard.
+    room_placement: crate::control::core::RoomPlacement,
 }
 
 impl Default for NodeBuilder {
@@ -108,7 +115,34 @@ impl NodeBuilder {
             internal_metrics: None,
             worker_execution: WorkerExecution::ThreadPerWorker,
             tcp_only: false,
+            room_shard_slot: crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
+            room_placement: crate::control::core::RoomPlacement::Hashed,
         }
+    }
+
+    /// Place a room's slots round-robin instead of by hash.
+    ///
+    /// For simulations that must actually cross a shard boundary: hashing picks
+    /// independently per slot, so a small room lands co-located often enough
+    /// that a plan depending on the split would pass without ever running the
+    /// path it claims to cover.
+    pub fn round_robin_rooms(mut self) -> Self {
+        self.room_placement = crate::control::core::RoomPlacement::RoundRobin;
+        self
+    }
+
+    /// Spill a room onto another shard after this many participants.
+    ///
+    /// Lowering it is how a test reaches the cross-shard media path without
+    /// needing a room large enough to spill naturally: below the threshold a
+    /// room is co-located and its fanout never leaves one core.
+    pub fn room_shard_slot(mut self, participants: usize) -> Self {
+        assert!(
+            participants > 0,
+            "a shard slot must hold at least one participant"
+        );
+        self.room_shard_slot = participants;
+        self
     }
 
     /// Set the number of UDP workers (default: 1).
@@ -416,8 +450,14 @@ impl NodeBuilder {
             tune_current_control_thread();
         }
 
-        let controller =
-            ControllerActor::new(controller_rng, shard_contexts, candidates, tcp_listener);
+        let controller = ControllerActor::with_placement(
+            controller_rng,
+            shard_contexts,
+            candidates,
+            tcp_listener,
+            self.room_shard_slot,
+            self.room_placement,
+        );
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);
@@ -522,10 +562,13 @@ async fn bind_udp_sockets(
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
             }
             Err(e) => {
+                // Shedding workers here is not a capacity trade-off: a
+                // single-shard node never executes a cross-shard path at all.
                 tracing::warn!(
-                    "SO_REUSEPORT not supported or failed after first bind, proceeding with {} workers: {}",
-                    sockets.len(),
-                    e
+                    requested = workers,
+                    running = sockets.len(),
+                    "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
+                     workers than requested: {e}"
                 );
                 break;
             }

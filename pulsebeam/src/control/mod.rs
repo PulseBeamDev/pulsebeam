@@ -1,6 +1,6 @@
 pub mod api;
 pub mod controller;
-mod core;
+pub(crate) mod core;
 mod negotiator;
 mod registry;
 mod room;

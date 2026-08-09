@@ -82,6 +82,10 @@ impl ShardRouter {
         }
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.shard_loads.len()
+    }
+
     pub fn try_route<K: Hash>(&self, key: &K) -> Option<ShardId> {
         let mut best_index = None;
         let mut max_hash = -1.0;

@@ -88,12 +88,14 @@ pub async fn start_sfu_node_tcp_only(
     Ok(())
 }
 
-/// Same as `start_sfu_node_tcp_only` but with two worker shards.
+/// Same as `start_sfu_node_tcp_only` but with two worker shards, and a room
+/// that spills onto the second one after a single participant.
 ///
-/// Using two shards maximises the probability that `hash(peer_addr)` (used for
-/// TCP routing) and `hash(room_id)` (used for participant routing) disagree on
-/// which shard should own a connection, which is exactly the cross-shard TCP
-/// egress scenario we want to exercise.
+/// Both halves matter. Two shards make `hash(peer_addr)` and `hash(room_id)`
+/// disagree, which is the cross-shard TCP egress case. The slot of one is what
+/// puts a room's participants on *different* shards — without it a room of
+/// fewer than sixteen is co-located and its media never leaves a core, so none
+/// of the route, envelope or reverse-lane machinery is reached.
 pub async fn start_sfu_node_tcp_only_multi_shard(
     ip: IpAddr,
     rng: pulsebeam_runtime::rand::Rng,
@@ -105,6 +107,8 @@ pub async fn start_sfu_node_tcp_only_multi_shard(
 
     pulsebeam::node::NodeBuilder::new()
         .workers(2)
+        .room_shard_slot(1)
+        .round_robin_rooms()
         .local_addr(local_addr)
         .external_addrs(vec![external_addr])
         .rng(rng)

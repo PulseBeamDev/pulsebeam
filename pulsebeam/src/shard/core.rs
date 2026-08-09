@@ -245,6 +245,8 @@ impl ShardCore {
             }
         };
         entry.observe(env.link_seq);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_cross_shard_media();
         let playout = match entry.expander.expand(env.playout_ntp32) {
             Ok(playout) => playout,
             Err(err) => {

@@ -421,6 +421,15 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
+    /// At least this many media frames actually crossed a shard boundary.
+    ///
+    /// Guards a cross-shard plan against passing by accident. Placement is a
+    /// hash, so a room can land co-located; delivery then looks identical while
+    /// reaching none of the route or envelope code the plan exists to cover.
+    CheckCrossShardMedia {
+        description: &'static str,
+        min_frames: u64,
+    },
     /// Cumulative bytes sent ≥ min_bytes.
     CheckTxBytes {
         description: &'static str,
@@ -1075,6 +1084,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
+        Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
         Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
@@ -1593,6 +1603,20 @@ async fn execute_plan(
                 );
             }
 
+            Step::CheckCrossShardMedia {
+                description,
+                min_frames,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" (min {min_frames} frames)"
+                );
+                let actual = pulsebeam::sim_metrics::cross_shard_media_frames();
+                assert!(
+                    actual >= *min_frames,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     ≥ {min_frames} frames resolved from another shard\n  actual:       {actual}\n  note:         zero means the room was co-located, so no cross-shard\n                path ran at all — the plan proved nothing"
+                );
+            }
+
             Step::CheckTxBytes {
                 description,
                 participant,
@@ -2054,7 +2078,10 @@ pub enum Property {
     /// other layer assertion here is a floor, and the byte-rate ceiling that stood in for this one
     /// cannot tell a stream forwarded at the wrong rung from one forwarded at the right rung with
     /// a busier picture. This reads the highest rank actually forwarded.
-    NeverForwardedAbove { origin: &'static str, max_quality: u8 },
+    NeverForwardedAbove {
+        origin: &'static str,
+        max_quality: u8,
+    },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a

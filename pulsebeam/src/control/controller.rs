@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::{
     control::{
-        core::{ControllerCore, ControllerEvent, ControllerEventQueue},
+        core::{ControllerCore, ControllerEvent, ControllerEventQueue, RoomPlacement},
         negotiator::{Negotiator, NegotiatorError},
         router::ShardRouter,
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
@@ -105,17 +105,51 @@ pub struct ControllerActor {
 
 impl ControllerActor {
     pub fn new(
+        rng: pulsebeam_runtime::rand::Rng,
+        shard_contexts: Vec<ShardContext>,
+        candidates: Vec<Candidate>,
+        tcp_listener: pulsebeam_core::net::TcpListener,
+    ) -> Self {
+        Self::with_room_shard_slot(
+            rng,
+            shard_contexts,
+            candidates,
+            tcp_listener,
+            crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
+        )
+    }
+
+    pub fn with_room_shard_slot(
+        rng: pulsebeam_runtime::rand::Rng,
+        shard_contexts: Vec<ShardContext>,
+        candidates: Vec<Candidate>,
+        tcp_listener: pulsebeam_core::net::TcpListener,
+        room_shard_slot: usize,
+    ) -> Self {
+        Self::with_placement(
+            rng,
+            shard_contexts,
+            candidates,
+            tcp_listener,
+            room_shard_slot,
+            RoomPlacement::Hashed,
+        )
+    }
+
+    pub fn with_placement(
         mut rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<Candidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
+        room_shard_slot: usize,
+        placement: RoomPlacement,
     ) -> Self {
         let shard_count = shard_contexts.len();
         let router = ShardRouter::new(shard_contexts, &mut rng);
 
         Self {
             router,
-            core: ControllerCore::new(),
+            core: ControllerCore::with_placement(room_shard_slot, placement),
             negotiator: Negotiator::new(candidates),
             eq: ControllerEventQueue::new(shard_count),
             tcp_listener: Some(tcp_listener),
@@ -277,11 +311,16 @@ impl ControllerActor {
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         // Determine shard first so we can encode it into the ICE ufrag.
-        let routing_key = self.core.routing_key(&state.room_id);
-        let shard_id = self
-            .router
-            .try_route(&routing_key)
-            .ok_or(ControllerError::ServiceUnavailable)?;
+        let (slot, placement) = self.core.room_slot(&state.room_id);
+        let shard_id = match placement {
+            RoomPlacement::Hashed => {
+                let routing_key = format!("{}-{}", state.room_id, slot);
+                self.router
+                    .try_route(&routing_key)
+                    .ok_or(ControllerError::ServiceUnavailable)?
+            }
+            RoomPlacement::RoundRobin => crate::id::ShardId::new(slot % self.router.shard_count()),
+        };
 
         // Encode routing metadata into the ICE ufrag.  The shard worker and
         // demuxer can decode shard_id / participant_id directly from STUN

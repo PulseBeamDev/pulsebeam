@@ -9,8 +9,15 @@ use crate::{
 };
 use str0m::Rtc;
 
-/// Maximum participants allowed per "slot" before hashing to a new shard epoch.
-const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
+/// How many participants of one room share a shard before the next join hashes
+/// to a different one.
+///
+/// Co-locating a room is what keeps its media on one core: below this, fanout
+/// is pointer-passing between participants on the same shard and no route,
+/// envelope or cross-shard queue is involved at all. Above it a room spills,
+/// and that spill is the only thing that produces cross-shard media — which is
+/// why the simulator lowers it rather than needing rooms of seventeen.
+pub const DEFAULT_ROOM_SHARD_SLOT: usize = 16;
 
 #[derive(Debug)]
 pub enum ControllerEvent {
@@ -65,15 +72,53 @@ impl ControllerEventQueue {
     }
 }
 
+/// How a room's participants are spread over shards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomPlacement {
+    /// Rendezvous-hash each `(room, slot)` key. Keeps a room's shard stable as
+    /// the cluster resizes, which is what production wants.
+    Hashed,
+    /// Walk the shards in order, one slot each.
+    ///
+    /// For tests that must reach the cross-shard path. Hashing chooses
+    /// independently per slot, so a small room lands on one shard often enough
+    /// that a plan relying on it is not a test but a coin flip — and one that
+    /// passes when it comes up co-located.
+    RoundRobin,
+}
+
 pub struct ControllerCore {
     registry: RoomRegistry,
+    room_shard_slot: usize,
+    placement: RoomPlacement,
 }
 
 impl ControllerCore {
     pub fn new() -> Self {
+        Self::with_room_shard_slot(DEFAULT_ROOM_SHARD_SLOT)
+    }
+
+    pub fn with_room_shard_slot(room_shard_slot: usize) -> Self {
+        Self::with_placement(room_shard_slot, RoomPlacement::Hashed)
+    }
+
+    pub fn with_placement(room_shard_slot: usize, placement: RoomPlacement) -> Self {
+        debug_assert!(room_shard_slot > 0);
         Self {
             registry: RoomRegistry::new(),
+            room_shard_slot,
+            placement,
         }
+    }
+
+    /// Which slot the next join of this room falls in, and how to place it.
+    pub fn room_slot(&self, room_id: &RoomId) -> (usize, RoomPlacement) {
+        let count = self
+            .registry
+            .get_room(room_id)
+            .map(|r| r.participant_count())
+            .unwrap_or_default();
+        (count / self.room_shard_slot, self.placement)
     }
 
     pub fn process_shard_event(&mut self, e: ShardEventWrapper, eq: &mut ControllerEventQueue) {
@@ -152,7 +197,7 @@ impl ControllerCore {
             .get_room(room_id)
             .map(|r| r.participant_count())
             .unwrap_or_default();
-        let epoch = count / MAX_PARTICIPANTS_PER_SHARD_SLOT;
+        let epoch = count / self.room_shard_slot;
         format!("{}-{}", room_id, epoch)
     }
 

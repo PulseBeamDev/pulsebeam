@@ -51,7 +51,16 @@ pub fn from_socket(
     socket: UdpSocket,
     external_addr: Option<SocketAddr>,
 ) -> io::Result<UdpTransport> {
-    let socket = Arc::new(socket);
+    from_shared(Arc::new(socket), external_addr)
+}
+
+/// Build a transport over a socket that may already have other transports on
+/// it. Several readers on one socket is what `SO_REUSEPORT` looks like from
+/// above: a datagram goes to whichever is ready for it.
+pub fn from_shared(
+    socket: Arc<UdpSocket>,
+    external_addr: Option<SocketAddr>,
+) -> io::Result<UdpTransport> {
     let local_addr = external_addr.unwrap_or(socket.local_addr()?);
 
     let reader = UdpTransportReader {
