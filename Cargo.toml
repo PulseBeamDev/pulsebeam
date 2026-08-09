@@ -82,3 +82,81 @@ overflow-checks = true
 
 # Enough symbols for useful backtraces/profiling.
 debug = 1
+
+# Lints shared by every hand-written crate. `make lint-check` gates on these.
+#
+# Three tiers, and the tiering is measured rather than guessed — the counts came
+# from a clippy JSON run over `pulsebeam/src`, split at each file's first
+# `#[cfg(test)]`:
+#
+#   deny     already clean, so the gate stays green and a regression is loud.
+#   warn     small, mostly auto-fixable; promoted to deny once they settle.
+#   absent   deliberately not enabled — see the note at the bottom. A lint that
+#            fires 246 times is not a rule, it is a background hum.
+#
+# Architectural rules (Arc/Mutex/atomics, wall clock, blocking) live in
+# clippy.toml, because they need a `reason` string per entry.
+[workspace.lints.clippy]
+
+# -- architecture (configured in clippy.toml, levelled here) -----------------
+# Shared state, ambient clock, blocking. Each entry there carries a `reason`.
+disallowed_types = "deny"
+disallowed_methods = "deny"
+
+# -- correctness -------------------------------------------------------------
+float_cmp = "deny"              # bitrates and loss ratios are compared all over
+mem_forget = "deny"
+unimplemented = "deny"
+todo = "deny"
+
+# -- debug output must not reach a release build -----------------------------
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"           # tracing, not eprintln; a stray one survived a
+                                # debugging session more than once
+
+# -- allocation and copying on the forwarding path ---------------------------
+# The costs this codebase keeps having to find by hand.
+redundant_clone = "deny"
+assigning_clones = "deny"
+or_fun_call = "deny"            # eager allocation in an `unwrap_or`
+needless_collect = "deny"
+inefficient_to_string = "deny"
+box_collection = "deny"
+rc_buffer = "deny"
+large_stack_arrays = "deny"
+result_large_err = "deny"
+large_enum_variant = "warn"     # a big variant makes every value of the enum big
+mutex_atomic = "deny"
+
+# -- readability -------------------------------------------------------------
+manual_clamp = "deny"
+question_mark = "deny"
+manual_let_else = "warn"
+match_same_arms = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+explicit_iter_loop = "warn"
+redundant_closure_for_method_calls = "warn"
+items_after_statements = "warn"
+empty_line_after_doc_comments = "warn"
+too_many_arguments = "warn"
+
+# Deliberately NOT enabled, so nobody re-litigates it from scratch:
+#
+#   indexing_slicing   246 production sites. Bounds are asserted with
+#                      debug_assert! per CLAUDE.md; 246 allows would bury the
+#                      signal this table exists to carry.
+#   unwrap_used        48 production sites. Worth doing, but as its own change.
+#   cast_*             203 production sites, and the one that actually matters:
+#                      a u64 -> u32 truncation was a real bug in StreamStats.
+#                      Blanket-enabling is impractical, so the plan is a checked
+#                      saturating helper plus a module-scoped deny in clock.rs,
+#                      rtp/sync.rs and rtp/timeline.rs — 54 sites, not 203.
+#   must_use_candidate,
+#   missing_panics_doc  pedantic noise for a crate with no external consumers.
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+# Not enabled: `unreachable_pub` (179 hits). Visibility hygiene worth having,
+# but not at that volume in the same change as everything else.

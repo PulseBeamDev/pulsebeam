@@ -364,7 +364,7 @@ impl TrackMonitor {
             .count();
         debug_assert!(recent <= self.encodings.len());
 
-        for encoding in self.encodings.iter_mut() {
+        for encoding in &mut self.encodings {
             let self_recent = encoding.monitor.has_recent_packets(now);
             let is_any_sibling_active = recent - usize::from(self_recent) > 0;
             encoding.poll_stats(now, is_any_sibling_active);
@@ -580,8 +580,13 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
 #[cfg(test)]
 pub mod test_utils {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     pub fn make_video_track(
@@ -879,8 +884,14 @@ mod data_track {
     #[cfg(test)]
     mod test {
         // Convenience only: a test is not a shard, so nothing here is
-        // cross-core. See docs/thread-per-core.md.
-        #![allow(clippy::disallowed_types)]
+        // cross-core, and a fixture may read the host clock. Allowed at the
+        // module, never the file, so it cannot drift over production code
+        // sharing it. See docs/thread-per-core.md.
+        #![allow(
+            clippy::disallowed_types,
+            clippy::disallowed_methods,
+            clippy::float_cmp
+        )]
         use std::ops::Deref;
 
         use super::*;
@@ -1111,8 +1122,13 @@ mod data_track {
 #[cfg(test)]
 mod dd_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use pulsebeam_core::dd::{
         DependencyDescriptor, DependencyDescriptorWriter, MAX_DD_LEN, test_utils,
@@ -1259,8 +1275,13 @@ mod dd_tests {
 #[cfg(test)]
 mod vla_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::vla_stream_target_bps;
     use str0m::rtp::vla::{
         SimulcastStreamAllocation, SpatialLayerAllocation, TemporalLayerAllocation,
@@ -1360,8 +1381,13 @@ mod vla_tests {
 #[cfg(test)]
 mod simulcast_pause_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::entity::ParticipantId;
     use crate::rtp::RtpPacket;

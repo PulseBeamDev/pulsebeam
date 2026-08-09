@@ -95,14 +95,14 @@ impl TryFrom<Response<Vec<u8>>> for CreateParticipantResponse {
             .headers()
             .get(HeaderExt::ParticipantId.as_str())
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             // Fall back to parsing from the Location header if the header is missing.
             .or_else(|| {
                 resource_uri
                     .path()
                     .rsplit('/')
                     .next()
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
             })
             .unwrap_or_default();
 
@@ -126,7 +126,7 @@ pub struct HttpApiClient {
 
 impl HttpApiClient {
     pub fn new(http_client: Box<dyn AsyncHttpClient>, base_uri: &str) -> Result<Self, ApiError> {
-        let base_uri = format!("{}/api/v1", base_uri).parse()?;
+        let base_uri = format!("{base_uri}/api/v1").parse()?;
         Ok(Self {
             http_client,
             base_uri,

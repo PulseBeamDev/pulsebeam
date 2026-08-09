@@ -325,7 +325,7 @@ async fn patch_participant(
         .get(IF_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim_matches('"'))
-        .ok_or(ApiError::BadRequest("If-Match header required".into()))?
+        .ok_or_else(|| ApiError::BadRequest("If-Match header required".into()))?
         .try_into()?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

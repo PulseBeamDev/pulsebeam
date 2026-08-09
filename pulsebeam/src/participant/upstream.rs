@@ -71,7 +71,11 @@ impl UpstreamAllocator {
                     return false;
                 }
             }
-            TrackKind::Data => todo!("add upstream data track"),
+            // Unreachable: an `UpstreamTrack` only comes from `new_video` or
+            // `new_audio`, each of which asserts its own kind, and both callers
+            // of this function pass one of those. Data channels never become an
+            // upstream track at all — they go through `DataTrackIntent`.
+            TrackKind::Data => unreachable!("data channels do not create upstream tracks"),
         }
 
         let slot = UpstreamSlot {
@@ -163,7 +167,7 @@ impl UpstreamAllocator {
     /// is cheap enough to run on the fast path where the change happens.
     pub fn take_changed_stats(&mut self) -> Vec<(TrackId, crate::track::TrackStates)> {
         let mut changed = Vec::new();
-        for slot in self.published_tracks.iter_mut() {
+        for slot in &mut self.published_tracks {
             let current = slot.track.layer_states();
             if slot.last_published_stats != current {
                 slot.last_published_stats.clone_from(&current);

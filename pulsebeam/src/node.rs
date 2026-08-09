@@ -1,6 +1,10 @@
 //! Shared-state exception: `Arc<ShardMetrics>`, one per shard, handed over
 //! before any shard runs. See `shard::metrics`.
-#![allow(clippy::disallowed_types)]
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::float_cmp
+)]
 
 use anyhow::{Context, Result};
 use core_affinity::get_core_ids;
@@ -365,6 +369,12 @@ impl NodeBuilder {
 
         // One NTP<->Instant anchor for the whole node: read the wall clock once,
         // here, so every shard shares a timeline and nothing reads it again.
+        //
+        // The sanctioned reader. Everything downstream converts through this
+        // anchor; a second `SystemTime::now()` anywhere would be a *different*
+        // timeline, and under simulation would be the host's rather than the
+        // simulated one.
+        #[allow(clippy::disallowed_methods)]
         let wall_anchor = WallAnchor::new(SystemTime::now(), Instant::now());
 
         let mut shard_contexts = Vec::new();
@@ -403,7 +413,7 @@ impl NodeBuilder {
                 } else {
                     cpu_cores.get(shard_idx % cpu_cores.len()).copied()
                 };
-                let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
+                let builder = std::thread::Builder::new().name(format!("pb-w-{shard_id}"));
                 let handle = builder
                     .spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()

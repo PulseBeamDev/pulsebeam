@@ -254,8 +254,13 @@ impl NtpExpander {
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     fn ntp(secs: u64, frac: u64) -> NtpTime {

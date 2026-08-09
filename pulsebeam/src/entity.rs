@@ -44,7 +44,7 @@ pub enum IdValidationError {
 
 fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
     let encoded = base32::encode(base32::Alphabet::Crockford, bytes);
-    format!("{}_{}", prefix, encoded)
+    format!("{prefix}_{encoded}")
 }
 
 fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdValidationError> {
@@ -474,8 +474,13 @@ impl fmt::Debug for TrackId {
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use pulsebeam_runtime::rand::seeded_rng;
     use std::collections::{HashMap, HashSet};

@@ -893,13 +893,12 @@ impl AgentDriver {
                         } else if let Some((_direction, topic, scope)) =
                             parse_data_track_label(&label)
                         {
-                            self.data
-                                .data_channels
-                                .entry(cid)
-                                .or_insert(DataTrackBinding {
+                            self.data.data_channels.entry(cid).or_insert_with(|| {
+                                DataTrackBinding {
                                     topic: topic.to_string(),
                                     scope: scope.clone(),
-                                });
+                                }
+                            });
                         } else {
                             self.ordered_topics.open_channel(cid, &label);
                         }
@@ -975,7 +974,7 @@ impl AgentDriver {
                     return Some(t.into());
                 }
                 Err(e) => {
-                    self.session.disconnected_reason = Some(format!("RTC Error: {:?}", e));
+                    self.session.disconnected_reason = Some(format!("RTC Error: {e:?}"));
                     self.rtc.disconnect();
                     return None;
                 }

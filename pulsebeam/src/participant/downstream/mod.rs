@@ -347,8 +347,13 @@ impl DownstreamAllocator {
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     fn expected(initial: f64, target: f64, elapsed: Duration, time_constant: Duration) -> f64 {

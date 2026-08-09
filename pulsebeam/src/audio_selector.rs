@@ -221,8 +221,13 @@ fn decayed_power(power: f32, last_arrival_ts: Option<Instant>, now: Instant) -> 
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use std::time::Duration;
 
@@ -532,7 +537,7 @@ mod tests {
         // Manually set last_arrival_ts to a time >DEAD_TIMEOUT ago.
         let long_ago = Instant::now()
             .checked_sub(DEAD_TIMEOUT + Duration::from_millis(1))
-            .unwrap_or(Instant::now());
+            .unwrap_or_else(Instant::now);
         for slot in &mut sel.slots {
             if slot.owner == Some(id) {
                 slot.last_arrival_ts = Some(long_ago);

@@ -52,8 +52,8 @@ pub async fn bind_udp_socket(
     external_addr: Option<SocketAddr>,
 ) -> io::Result<BoundUdpSocket> {
     let key = (addr, external_addr);
-    let existing =
-        REUSEPORT_GROUPS.with(|groups| groups.borrow().get(&key).and_then(|weak| weak.upgrade()));
+    let existing = REUSEPORT_GROUPS
+        .with(|groups| groups.borrow().get(&key).and_then(std::sync::Weak::upgrade));
 
     let socket = match existing {
         Some(socket) => socket,

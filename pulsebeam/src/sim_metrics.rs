@@ -150,7 +150,7 @@ pub fn record_forwarded_media(subscriber: &str, bytes: u64) {
     SAMPLES.with_borrow_mut(|s| {
         *s.forwarded_media_bytes
             .entry(subscriber.to_string())
-            .or_default() += bytes
+            .or_default() += bytes;
     });
 }
 

@@ -214,7 +214,9 @@ struct LayerState {
 impl LayerController {
     pub fn new() -> Self {
         Self {
-            available_bps: f64::MAX,
+            // No estimate yet: unlimited. Infinity rather than MAX so the
+            // check below is `is_infinite()` and not a float equality.
+            available_bps: f64::INFINITY,
             last_keyframe_request: HashMap::new(),
             order: Vec::new(),
             states: HashMap::new(),
@@ -292,7 +294,7 @@ impl LayerController {
             .map(|s| s.bps)
             .sum();
 
-        if self.available_bps == f64::MAX {
+        if self.available_bps.is_infinite() {
             return desired;
         }
 

@@ -133,7 +133,7 @@ impl AgentBuilder {
                     .into_iter()
                     .filter(|i| !i.is_loopback())
                     .map(|i| i.ip()),
-            )
+            );
         }
 
         let mut rtc_builder = Rtc::builder()

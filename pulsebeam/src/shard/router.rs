@@ -1264,9 +1264,7 @@ impl ShardRoutingTable {
             entry.reverse = Some(reverse);
             entry.encodings = track.layers.iter().map(|l| l.rid).collect();
         }
-        let Some(room) = self.rooms.get(&room_id) else {
-            return None;
-        };
+        let room = self.rooms.get(&room_id)?;
         let tracks = std::slice::from_ref(&track);
         let has_members = !room.members.is_empty();
         for &participant in &room.members {
@@ -1940,8 +1938,13 @@ pub(crate) fn route_participant_control_event(
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use slotmap::SlotMap;
     use std::cell::RefCell;
@@ -2837,9 +2840,7 @@ mod tests {
         assert_eq!(table.routes.len(), 1, "still one consumer left");
 
         assert!(
-            table
-                .unregister_subscriber(second, track.clone(), now())
-                .is_some(),
+            table.unregister_subscriber(second, track, now()).is_some(),
             "the last subscriber leaving tells the publisher to stop"
         );
         assert_eq!(table.routes.len(), 0, "the route is retired");

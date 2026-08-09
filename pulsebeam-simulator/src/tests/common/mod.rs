@@ -41,13 +41,13 @@ pub fn reserve_subnet() -> u8 {
 }
 
 pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {
-    format!("192.168.{}.{}", subnet, host).parse().unwrap()
+    format!("192.168.{subnet}.{host}").parse().unwrap()
 }
 
 pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
-    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
+    let local_addr: SocketAddr = format!("0.0.0.0:{rtc_port}").parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
     pulsebeam::node::NodeBuilder::new()
@@ -71,7 +71,7 @@ pub async fn start_sfu_node_tcp_only(
 ) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
-    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
+    let local_addr: SocketAddr = format!("0.0.0.0:{rtc_port}").parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
     pulsebeam::node::NodeBuilder::new()
@@ -102,7 +102,7 @@ pub async fn start_sfu_node_tcp_only_multi_shard(
 ) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
-    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
+    let local_addr: SocketAddr = format!("0.0.0.0:{rtc_port}").parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
     pulsebeam::node::NodeBuilder::new()
@@ -133,8 +133,7 @@ pub fn run_sim_or_timeout(sim: &mut turmoil::Sim<'_>, timeout: Duration) -> turm
     loop {
         if start.elapsed() > timeout {
             return Err(format!(
-                "Simulation did not complete within {:?} (wall-clock); aborting.",
-                timeout
+                "Simulation did not complete within {timeout:?} (wall-clock); aborting."
             )
             .into());
         }

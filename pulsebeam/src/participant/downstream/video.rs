@@ -129,7 +129,7 @@ impl VideoAllocator {
 
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
         let layer_states = &self.layer_states;
-        for (_key, slot) in self.slots.iter_mut() {
+        for (_key, slot) in &mut self.slots {
             let tracks = &mut self.tracks;
             if let Some(intent) = intents.get(&slot.mid) {
                 Self::configure_slot(tracks, layer_states, slot, Some(intent));
@@ -168,7 +168,7 @@ impl VideoAllocator {
                 track_state.lowest_healthy_quality(|l| {
                     layer_states
                         .get(&l.stream_id())
-                        .is_some_and(|s| s.is_healthy())
+                        .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
                 })
             };
 
@@ -273,7 +273,9 @@ impl VideoAllocator {
             if let Some(track_state) = pending_tracks.next() {
                 let states = &self.layer_states;
                 let layer = track_state.lowest_healthy_quality(|l| {
-                    states.get(&l.stream_id()).is_some_and(|s| s.is_healthy())
+                    states
+                        .get(&l.stream_id())
+                        .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
                 });
                 slot.switch_to(layer, true);
                 staged += 1;
@@ -437,7 +439,7 @@ impl VideoAllocator {
     }
 
     fn retry_keyframe_requests(&mut self, now: Instant, events: &mut impl ParticipantSink) {
-        for (_, slot) in self.slots.iter_mut() {
+        for (_, slot) in &mut self.slots {
             slot.pli_retry(now, events);
         }
     }
@@ -503,7 +505,7 @@ impl VideoAllocator {
     /// and corrupt the routing table.
     fn no_duplicate_slot_assignments(&self) -> bool {
         let mut seen: HashMap<TrackId, SlotKey> = HashMap::new();
-        for (slot_key, slot) in self.slots.iter() {
+        for (slot_key, slot) in &self.slots {
             if let Some(layer) = slot.desired.as_ref() {
                 if let Some(existing_slot) = seen.get(&layer.meta.id) {
                     if existing_slot != &slot_key {
@@ -807,8 +809,8 @@ impl Slot {
     fn set_roles_for_test(&mut self, active: Option<&TrackLayer>, staging: Option<&TrackLayer>) {
         self.desired = staging.or(active).cloned();
         self.switcher.test_set_roles(
-            active.map(|l| l.stream_id()),
-            staging.map(|l| l.stream_id()),
+            active.map(crate::track::TrackLayer::stream_id),
+            staging.map(crate::track::TrackLayer::stream_id),
         );
     }
 
@@ -1073,13 +1075,13 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AllocationDecision::Forward(layer, bitrate) => {
-                write!(f, "Forward({} @ {})", layer, bitrate)
+                write!(f, "Forward({layer} @ {bitrate})")
             }
             AllocationDecision::ForwardTarget(layer, target, bitrate) => {
-                write!(f, "ForwardTarget({} {:?} @ {})", layer, target, bitrate)
+                write!(f, "ForwardTarget({layer} {target:?} @ {bitrate})")
             }
             AllocationDecision::Pause(layer, needed) => {
-                write!(f, "Pause({} needs {})", layer, needed)
+                write!(f, "Pause({layer} needs {needed})")
             }
         }
     }
@@ -1448,8 +1450,13 @@ impl AllocationEngine {
 #[cfg(test)]
 mod alloc_test_support {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::entity::ParticipantId;
     use crate::track::UpstreamTrack;
@@ -1507,8 +1514,13 @@ mod alloc_test_support {
 #[cfg(test)]
 mod assignment_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::alloc_test_support::*;
     use super::*;
     use crate::entity::{ParticipantId, TrackId, TrackKind};
@@ -1589,7 +1601,7 @@ mod assignment_tests {
             vec![SimulcastLayer::new("q"), SimulcastLayer::new("h")],
         );
         let track = Track {
-            meta: tx.meta.clone(),
+            meta: tx.meta,
             layers: built.layers,
             reverse: None,
         };
@@ -1772,7 +1784,7 @@ mod assignment_tests {
         let track_id = tx.meta.id;
         allocator.seed_layer_states(&states);
         allocator.add_track(Track {
-            meta: tx.meta.clone(),
+            meta: tx.meta,
             layers: track.layers,
             reverse: None,
         });
@@ -2120,8 +2132,7 @@ mod assignment_tests {
             assert_eq!(
                 assignment_count(id),
                 1,
-                "track {:?} was assigned to more than one slot",
-                id
+                "track {id:?} was assigned to more than one slot"
             );
         }
     }
@@ -2145,7 +2156,7 @@ mod assignment_tests {
         let (tx, track, states) = video_track_with_states(pid, Mid::from("late"), vec![]);
         allocator.seed_layer_states(&states);
         allocator.add_track(Track {
-            meta: tx.meta.clone(),
+            meta: tx.meta,
             layers: track.layers,
             reverse: None,
         });
@@ -2162,7 +2173,7 @@ mod assignment_tests {
                 .values()
                 .filter(|s| s.desired.as_ref().is_some_and(|l| l.meta.id == *id))
                 .count();
-            assert_eq!(count, 1, "existing track {:?} was double-assigned", id);
+            assert_eq!(count, 1, "existing track {id:?} was double-assigned");
         }
     }
 
@@ -2202,7 +2213,7 @@ mod assignment_tests {
         allocator.seed_layer_states(&states);
 
         allocator.add_track(Track {
-            meta: tx.meta.clone(),
+            meta: tx.meta,
             layers: track.layers.clone(),
             reverse: None,
         });
@@ -2236,8 +2247,13 @@ mod assignment_tests {
 #[cfg(test)]
 mod allocation_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::alloc_test_support::*;
     use super::*;
     use crate::entity::ParticipantId;
@@ -2710,8 +2726,7 @@ mod allocation_tests {
                     d,
                     AllocationDecision::Forward(..) | AllocationDecision::Pause(..)
                 ),
-                "unexpected variant: {:?}",
-                d
+                "unexpected variant: {d:?}"
             );
         }
     }
@@ -2785,7 +2800,7 @@ mod allocation_tests {
                 let _ = receiver; // just asserting it exists via pattern match
                 assert!(needed.as_f64() > 0.0, "Pause bitrate must be positive");
             } else if matches!(d, AllocationDecision::Pause(..)) {
-                panic!("Pause for {:?} is missing its resume receiver", key);
+                panic!("Pause for {key:?} is missing its resume receiver");
             }
         }
     }
@@ -2986,7 +3001,7 @@ mod allocation_tests {
             let available = bw((low_bps as u64) / 1_000 + 1);
             let priority = 720;
 
-            let mid_names: Vec<String> = (0..n).map(|i| format!("m{}", i)).collect();
+            let mid_names: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
             let slots: Vec<SlotView> = mid_names
                 .iter()
                 .map(|name| slot(name, priority, &t, LayerQuality::Low))
@@ -3433,8 +3448,13 @@ mod allocation_tests {
 #[cfg(test)]
 mod slot_switch_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::alloc_test_support::*;
     use super::*;
     use crate::entity::ParticipantId;

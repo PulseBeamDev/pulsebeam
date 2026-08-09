@@ -1,4 +1,12 @@
-# Shared-state primitives are denied by default. See `docs/thread-per-core.md`.
+# Architectural lints. See `docs/thread-per-core.md`; `make lint-check` gates on
+# these, so a violation fails rather than scrolling past in a build log.
+#
+# Two tables below. `disallowed-types` keeps shared state out of the shards;
+# `disallowed-methods` keeps the clock, the RNG and blocking calls out of code
+# that has to be deterministic and non-blocking.
+#
+# ---------------------------------------------------------------------------
+# Shared-state primitives.
 #
 # This is a thread-per-core SFU: a shard owns its participants, its routes and
 # its packet buffers outright, and reaches other shards only by message. Cross-
@@ -24,3 +32,30 @@ disallowed-types = [
     { path = "std::sync::atomic::AtomicU64", reason = "as AtomicBool." },
     { path = "std::sync::atomic::AtomicUsize", reason = "as AtomicBool." },
 ]
+
+# ---------------------------------------------------------------------------
+# Ambient clock, ambient randomness, and blocking.
+#
+# The test strategy is deterministic replay: the simulator substitutes the clock
+# (`sim_clock.rs` overrides CLOCK_REALTIME process-wide) and seeds every RNG, so
+# a plan that fails reproduces exactly. Code that reads the *real* clock or an
+# unseeded RNG opts out of that quietly — the plan still passes, it just stops
+# meaning anything. That is a correctness failure, not a style preference, and
+# it is invisible in review, which is why it is a lint.
+#
+# Blocking is the thread-per-core half: a shard that parks its thread stalls
+# every participant it owns, not just the one it is serving.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "read once per node into a WallAnchor and threaded down; see clock.rs. A second reader gets a different timeline, and under simulation gets a real one." },
+    { path = "std::time::Instant::now", reason = "use tokio::time::Instant, which the simulator controls. std's is the host clock and makes a run irreproducible." },
+    { path = "rand::random", reason = "unseeded. Take an Rng from the caller so a failing plan replays." },
+    { path = "rand::thread_rng", reason = "as rand::random." },
+    { path = "rand::rngs::ThreadRng::default", reason = "as rand::random." },
+    { path = "std::thread::sleep", reason = "blocks the whole shard, and in a test it waits on the wall clock rather than simulated time. Use tokio::time::sleep or a deterministic tick." },
+    { path = "tokio::task::block_in_place", reason = "a shard runs on a current-thread runtime; there is no pool to hand the work to." },
+    { path = "futures::executor::block_on", reason = "blocks the shard's own executor. Restricted to runtime startup." },
+]
+# Not listed: `tokio::runtime::Runtime::block_on`. `#[tokio::test]` expands to
+# it, so the rule fires on every async test and cannot be satisfied. The two
+# real uses (`main.rs`, `node.rs`) are runtime startup and would be allowed
+# anyway.

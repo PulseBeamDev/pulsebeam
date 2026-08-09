@@ -251,7 +251,7 @@ impl ControllerActor {
         while let Some(ev) = self.eq.pop() {
             match ev {
                 ControllerEvent::ShardCommandSent(shard_id, cmd) => {
-                    self.router.send(shard_id, cmd).await
+                    self.router.send(shard_id, cmd).await;
                 }
             }
         }
@@ -359,8 +359,13 @@ async fn recv_command_paced(
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::id::ShardId;
     use crate::{

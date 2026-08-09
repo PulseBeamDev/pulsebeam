@@ -170,7 +170,7 @@ impl H264Looper {
         let temporal_layers = self
             .dd
             .as_ref()
-            .map(|src| src.temporal_layers())
+            .map(pulsebeam_core::dd::temporal::TemporalDdSource::temporal_layers)
             .unwrap_or(1);
         let mut interval = tokio::time::interval(frame_interval);
         let mut frame_count: u64 = 0;

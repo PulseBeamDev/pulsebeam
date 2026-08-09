@@ -116,7 +116,7 @@ impl ControllerCore {
         let count = self
             .registry
             .get_room(room_id)
-            .map(|r| r.participant_count())
+            .map(super::room::Room::participant_count)
             .unwrap_or_default();
         (count / self.room_shard_slot, self.placement)
     }
@@ -195,10 +195,10 @@ impl ControllerCore {
         let count = self
             .registry
             .get_room(room_id)
-            .map(|r| r.participant_count())
+            .map(super::room::Room::participant_count)
             .unwrap_or_default();
         let epoch = count / self.room_shard_slot;
-        format!("{}-{}", room_id, epoch)
+        format!("{room_id}-{epoch}")
     }
 
     pub fn create_participant(
@@ -264,8 +264,13 @@ impl ControllerCore {
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::{
         entity::{ExternalRoomId, ParticipantId, RoomId, TrackKind},

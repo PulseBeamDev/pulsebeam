@@ -844,7 +844,6 @@ async fn run_participant(
                                     if incoming_tracks.send(track).await.is_err() {
                                         // The client is shutting down and no longer reading; the
                                         // subscription itself succeeded, so this is not a failure.
-                                        return;
                                     }
                                 });
                             }
@@ -1317,7 +1316,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
                 );
                 let mut subs: Vec<VideoSubscription> = Vec::new();
-                for (name, height) in targets.iter() {
+                for (name, height) in *targets {
                     let pub_handle = get_handle(handles, name, description)?;
                     let id = pub_handle.shared.participant_id.lock().unwrap().clone();
                     let id = id.ok_or_else(|| {
@@ -1350,7 +1349,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
                 );
                 let mut subs: Vec<VideoSubscription> = Vec::new();
-                for (name, height, min_height, priority) in targets.iter() {
+                for (name, height, min_height, priority) in *targets {
                     let pub_handle = get_handle(handles, name, description)?;
                     let id = pub_handle.shared.participant_id.lock().unwrap().clone();
                     let id = id.ok_or_else(|| {
@@ -1794,13 +1793,12 @@ async fn execute_plan(
                 let data_received = handle.shared.data_received.lock().unwrap();
                 let received = data_received
                     .get(*topic)
-                    .map(|v| v.as_slice())
+                    .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
                 let expected_vec = expected.to_vec();
                 assert!(
                     received.contains(&expected_vec),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {:?} in received list\n  actual:       {received:?}",
-                    expected
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {expected:?} in received list\n  actual:       {received:?}"
                 );
             }
 
@@ -1817,13 +1815,12 @@ async fn execute_plan(
                 let data_received = handle.shared.data_received.lock().unwrap();
                 let received = data_received
                     .get(*topic)
-                    .map(|v| v.as_slice())
+                    .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
                 let excluded_vec = excluded.to_vec();
                 assert!(
                     !received.contains(&excluded_vec),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {:?} NOT in received list\n  actual:       {received:?}",
-                    excluded
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {excluded:?} NOT in received list\n  actual:       {received:?}"
                 );
             }
 
@@ -1913,8 +1910,8 @@ async fn execute_plan(
     Ok(())
 }
 
-fn resolve<'a>(
-    map: &'a HashMap<&'static str, IpAddr>,
+fn resolve(
+    map: &HashMap<&'static str, IpAddr>,
     name: &str,
     step_desc: &str,
 ) -> anyhow::Result<IpAddr> {
@@ -2530,7 +2527,10 @@ fn check_property(
         Property::QualityChangesPerMinuteBelow { origin, max } => {
             // Resolved here rather than read off the report: the report's map is filled by the
             // end-of-plan scoreboard, which has not run yet mid-plan.
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2548,7 +2548,10 @@ fn check_property(
             }
         }
         Property::QualityReversalsBelow { origin, max } => {
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2568,7 +2571,10 @@ fn check_property(
             origin,
             max_quality,
         } => {
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2989,7 +2995,6 @@ impl LocalNodeSim {
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);
         run_sim_or_timeout(&mut sim, wall_budget).expect("simulation failed");
 
-        let out = reports.lock().expect("reports poisoned").clone();
-        out
+        reports.lock().expect("reports poisoned").clone()
     }
 }

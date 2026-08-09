@@ -752,7 +752,7 @@ impl ShardCore {
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
     ) {
-        for addr in self.registry.drain_pending_close().collect::<Vec<_>>() {
+        for addr in self.registry.drain_pending_close() {
             udp_socket.close_peer(&addr);
             tcp_socket.close_peer(&addr);
         }
@@ -1153,8 +1153,13 @@ impl ShardCore {
 #[cfg(test)]
 mod test {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use std::{
         cell::RefCell,
         sync::atomic::{AtomicU64, Ordering},

@@ -71,7 +71,7 @@ impl Forwarder {
         // track cache routes it to the right per-encoding ring.
         let mut pkt = pkt.clone();
         pkt.ext_vals.rid = sid.1;
-        self.cache.push(pkt.clone());
+        self.cache.push(pkt);
 
         let Forwarder {
             switcher,
@@ -678,14 +678,13 @@ fn a_reordered_marker_does_not_look_like_a_frame_boundary() {
     assert!(fwd.switched());
     assert_decodable(fwd.emitted(), "switch after a reordered marker");
 
-    let forwarded: Vec<_> = fwd
+    let forwarded = fwd
         .emitted()
         .iter()
         .filter(|p| p.rtp_ts.numer() == frame_ts)
-        .collect();
+        .count();
     assert_eq!(
-        forwarded.len(),
-        3,
+        forwarded, 3,
         "the switch must wait for the in-flight packet rather than abandon it"
     );
     assert_eq!(

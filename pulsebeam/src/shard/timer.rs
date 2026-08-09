@@ -274,8 +274,13 @@ impl TimerWheel {
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::entity::ParticipantId;
     use slotmap::SlotMap;
@@ -303,11 +308,11 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_micros(1_999), |entry| {
-            expired.push(entry.participant_id())
+            expired.push(entry.participant_id());
         });
         assert!(expired.is_empty());
         wheel.drain_expired(start + Duration::from_millis(2), |entry| {
-            expired.push(entry.participant_id())
+            expired.push(entry.participant_id());
         });
         assert_eq!(expired, vec![handle.participant_id()]);
         assert_eq!(wheel.next_deadline(), None);
@@ -324,14 +329,14 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_millis(10), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         assert_eq!(
             expired,
             vec![(handle.participant_id(), handle.generation())]
         );
         wheel.drain_expired(start + Duration::from_millis(50), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         assert_eq!(expired.len(), 1);
     }
@@ -350,7 +355,7 @@ mod tests {
         );
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_millis(10), |entry| {
-            expired.push(entry.participant_id())
+            expired.push(entry.participant_id());
         });
         assert_eq!(expired, vec![handle.participant_id()]);
     }
@@ -366,7 +371,7 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_millis(10), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         assert_eq!(
             expired,
@@ -385,7 +390,7 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_secs(1), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         expired.sort_unstable();
         let mut expected = handles

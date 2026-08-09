@@ -353,7 +353,7 @@ impl StreamCache {
     }
 
     pub fn clear(&mut self) {
-        for slot in self.ring.iter_mut() {
+        for slot in &mut self.ring {
             *slot = None;
         }
         self.newest_seq = None;
@@ -416,8 +416,13 @@ const MAX_SIMULCAST_ENCODINGS: usize = 4;
 #[cfg(test)]
 mod test {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use std::time::Duration;
@@ -863,7 +868,7 @@ mod test {
         let mut late_frag = kf.last().unwrap().clone();
         late_frag.seq_no = (delta_last_seq + 1).into();
         // seq = delta_last_seq+1 is still within the keyframe's segment (same ts=T0).
-        cache.push(late_frag.clone());
+        cache.push(late_frag);
 
         // The burst is now [kf_seqs..., delta_seqs..., late_frag_seq] sorted by
         // seq_no, with timestamps [T0, ..., T1, ..., T0] — non-monotonic.

@@ -1,7 +1,7 @@
 //! Shared-state exception, crate-wide: The simulator harness. Not a shard.
 //! The thread-per-core restriction in `docs/thread-per-core.md` applies to the
 //! `pulsebeam` SFU crate.
-#![allow(clippy::disallowed_types)]
+#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
 
 // Determinism shims. These override libc symbols for the whole process, so they must be linked
 // into the test binary rather than living in a helper crate.

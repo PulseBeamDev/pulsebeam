@@ -1,7 +1,11 @@
 //! Shared-state exception: `Arc<ShardMetrics>`, one per shard, cloned at
 //! startup and never again. Carries the sanctioned exception in
 //! `shard::metrics`; nothing else here may share.
-#![allow(clippy::disallowed_types)]
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::float_cmp
+)]
 
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
@@ -477,8 +481,13 @@ impl ShardWorker {
 #[cfg(test)]
 mod reverse_tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     /// The shard -> controller queue must stay far larger than the reverse one.

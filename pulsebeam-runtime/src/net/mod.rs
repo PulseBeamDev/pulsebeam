@@ -217,7 +217,7 @@ fn fmt_bytes(b: usize) -> String {
     } else if b >= KB {
         format!("{}KB", b / KB)
     } else {
-        format!("{}B", b)
+        format!("{b}B")
     }
 }
 

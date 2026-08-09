@@ -5,7 +5,11 @@
 //! controller for load reporting. Bounded, allocation-free, and nothing
 //! reads two counters expecting them to agree, which is the property that
 //! made the stream monitors wrong. See `docs/thread-per-core.md`.
-#![allow(clippy::disallowed_types)]
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::float_cmp
+)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -72,7 +76,7 @@ impl MetricsSnapshot {
         if total_delta <= 0.0 {
             0.0
         } else {
-            (busy_delta / total_delta).min(1.0).max(0.0)
+            (busy_delta / total_delta).clamp(0.0, 1.0)
         }
     }
 }
@@ -80,8 +84,13 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     #[test]

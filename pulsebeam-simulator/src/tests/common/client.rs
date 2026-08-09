@@ -35,8 +35,8 @@ pub struct SimClientBuilder {
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
     match ip {
-        IpAddr::V4(v4) => format!("http://{}:{}", v4, port),
-        IpAddr::V6(v6) => format!("http://[{}]:{}", v6, port),
+        IpAddr::V4(v4) => format!("http://{v4}:{port}"),
+        IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
     }
 }
 
@@ -511,7 +511,7 @@ pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
 }
 
 pub fn create_vbr_looper_for_rid(rid: Option<&str>, profile: VbrProfile) -> VbrLooper {
-    debug_assert_eq!(rid.map(|rid| rid.as_ref()), Some("f"));
+    debug_assert_eq!(rid.map(|rid| rid), Some("f"));
     VbrLooper::new_scheduled(
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,

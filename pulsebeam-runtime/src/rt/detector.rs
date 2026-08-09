@@ -1,3 +1,9 @@
+//! Printing exception: this module reports that the runtime is *blocked*. The
+//! tracing pipeline is asynchronous, so at exactly the moment this has
+//! something to say it may be the thing that cannot make progress. stderr is
+//! the only channel that still works, which is why the rest of the codebase
+//! denies it and this does not.
+#![allow(clippy::print_stderr)]
 // NOTE: This file is heavily modified from https://github.com/facebookexperimental/rust-shed/blob/main/shed/tokio-detectors/src/detectors.rs
 // to avoid a dependency link and for easier local maintenance.
 
@@ -145,7 +151,7 @@ struct StdErrBlockingActionHandler;
 /// BlockingActionHandler implementation that writes blocker details to standard error.
 impl BlockingActionHandler for StdErrBlockingActionHandler {
     fn blocking_detected(&self, workers: &[ThreadInfo]) {
-        eprintln!("Detected blocking in worker threads: {:?}", workers);
+        eprintln!("Detected blocking in worker threads: {workers:?}");
     }
 }
 
@@ -626,7 +632,7 @@ pub mod unix {
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or(f.as_str());
-                    format!("{}:{}", short, l)
+                    format!("{short}:{l}")
                 }
                 (Some(f), None) => f.clone(),
                 _ => String::new(),
@@ -664,7 +670,7 @@ pub mod unix {
                     filename: sym
                         .filename()
                         .and_then(|p| p.to_str())
-                        .map(|s| s.to_owned()),
+                        .map(std::borrow::ToOwned::to_owned),
                     lineno: sym.lineno(),
                 });
             });
@@ -678,7 +684,7 @@ pub mod unix {
 
             // Strip leading signal-machinery IPs before the first user frame.
             if !found_user_code {
-                let is_machinery = syms.iter().all(|s| s.is_internal());
+                let is_machinery = syms.iter().all(SymbolData::is_internal);
                 if is_machinery {
                     continue; // skip signal handler / trampoline / OS frames
                 }
@@ -719,7 +725,7 @@ pub mod unix {
         for ti in targets {
             let rc = unsafe { libc::pthread_kill(*ti.pthread_id(), signal) };
             if rc != 0 {
-                eprintln!("[detector] Failed to send signal to thread: errno={}", rc);
+                eprintln!("[detector] Failed to send signal to thread: errno={rc}");
                 // Prevent the collector from hanging on this thread.
                 let s = unsafe { &*session_ptr };
                 s.remaining.fetch_sub(1, Ordering::SeqCst);
@@ -750,7 +756,7 @@ pub mod unix {
         // Retake ownership and resolve IPs on this (non-signal) thread.
         let session = unsafe { Box::from_raw(session_ptr) };
         let mut result = HashMap::new();
-        for slot in session.slots.iter() {
+        for slot in &session.slots {
             // Acquire load pairs with the Release store in the signal handler,
             // ensuring the IPs written before len.store are visible here.
             let len = slot.len.load(Ordering::Acquire);
@@ -874,7 +880,7 @@ pub mod unix {
                 }
             }
         }
-        format!("thread-{}", tid)
+        format!("thread-{tid}")
     }
 
     // ── report formatting ────────────────────────────────────────────────────
@@ -893,8 +899,7 @@ pub mod unix {
 
         let mut out = String::new();
         out.push_str(&format!(
-            "\n╔══ BLOCKING DETECTED ══ {} ({}) ══ blocked for {:.1?} ══ #{} ══\n",
-            tname, tid, blocked_for, hit_count
+            "\n╔══ BLOCKING DETECTED ══ {tname} ({tid}) ══ blocked for {blocked_for:.1?} ══ #{hit_count} ══\n"
         ));
 
         match culprit {
@@ -902,9 +907,9 @@ pub mod unix {
                 let sym = c.name.as_deref().unwrap_or("<unknown>");
                 let loc = c.short_location();
                 if loc.is_empty() {
-                    out.push_str(&format!("║  >>> CULPRIT: {}\n", sym));
+                    out.push_str(&format!("║  >>> CULPRIT: {sym}\n"));
                 } else {
-                    out.push_str(&format!("║  >>> CULPRIT: {}  ({})\n", sym, loc));
+                    out.push_str(&format!("║  >>> CULPRIT: {sym}  ({loc})\n"));
                 }
             }
             None => {
@@ -934,18 +939,17 @@ pub mod unix {
                 };
 
                 if loc.is_empty() {
-                    out.push_str(&format!("║  {:>4}: {}{}\n", frame_idx, sym_name, marker));
+                    out.push_str(&format!("║  {frame_idx:>4}: {sym_name}{marker}\n"));
                 } else {
                     out.push_str(&format!(
-                        "║  {:>4}: {}{}\n║        at {}\n",
-                        frame_idx, sym_name, marker, loc
+                        "║  {frame_idx:>4}: {sym_name}{marker}\n║        at {loc}\n"
                     ));
                 }
                 frame_idx += 1;
             }
         }
 
-        out.push_str(&format!("╚══ END {} ══\n", tname));
+        out.push_str(&format!("╚══ END {tname} ══\n"));
         out
     }
 
@@ -1024,7 +1028,7 @@ pub mod unix {
                 entries.sort_by(|a, b| b.1.cmp(&a.1));
                 eprintln!("\n┌── Blocking episode summary (top culprits by hit count) ──");
                 for (sym, hits) in &entries {
-                    eprintln!("│  {:>5}×  {}", hits, sym);
+                    eprintln!("│  {hits:>5}×  {sym}");
                 }
                 eprintln!("└──────────────────────────────────────────────────────────");
             }
@@ -1044,7 +1048,10 @@ pub mod unix {
             let blocked_for = blocked_since.elapsed();
 
             for (&tid, full_frames) in &full_map {
-                let stuck_frames = stuck_map.get(&tid).map(|v| v.as_slice()).unwrap_or(&[]);
+                let stuck_frames = stuck_map
+                    .get(&tid)
+                    .map(std::vec::Vec::as_slice)
+                    .unwrap_or(&[]);
                 let culprit = identify_culprit(stuck_frames, full_frames);
                 let culprit_key = culprit
                     .and_then(|s| s.name.as_deref())
@@ -1080,7 +1087,7 @@ pub mod unix {
                         blocked_for,
                         hit_count,
                     );
-                    eprintln!("{}", report);
+                    eprintln!("{report}");
                 } else {
                     let tname = thread_name(tid);
                     eprintln!(

@@ -22,5 +22,5 @@ pub async fn yield_now() {
 }
 
 pub async fn sleep(duration: Duration) {
-    tokio::time::sleep(duration).await
+    tokio::time::sleep(duration).await;
 }

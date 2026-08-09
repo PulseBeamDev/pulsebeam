@@ -11,7 +11,11 @@
 //! Shared-state exception, imposed by str0m: the parsed descriptor goes
 //! back into an extension map that stores `Arc<dyn Any>`. Core-local; see
 //! `rtp` for the full note.
-#![allow(clippy::disallowed_types)]
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::float_cmp
+)]
 
 use str0m::media::{Mid, Rid};
 use str0m::rtp::vla::VideoLayersAllocation;

@@ -534,7 +534,7 @@ impl ParticipantCore {
             } => {
                 if let Some(cid) = self.reliable_channels.subscriber_channel(&topic) {
                     let delivery = RelDelivery {
-                        publisher_id: origin.as_str().to_string(),
+                        publisher_id: origin.as_str(),
                         frame,
                     };
                     self.write_to_data_channel(cid, &topic, &delivery.encode_to_vec());
@@ -881,7 +881,7 @@ impl ParticipantCore {
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                self.downstream.update_bitrate(now, available)
+                self.downstream.update_bitrate(now, available);
             }
             Event::MediaEgressStats(stats) => {
                 if let Some(remote) = stats.remote {

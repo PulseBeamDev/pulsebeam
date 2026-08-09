@@ -1,7 +1,12 @@
 //! Shared-state exception, crate-wide: A command-line tool. Not a shard.
 //! The thread-per-core restriction in `docs/thread-per-core.md` applies to the
 //! `pulsebeam` SFU crate.
-#![allow(clippy::disallowed_types)]
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -201,7 +206,7 @@ async fn spawn_room(
     logger: Logger,
     assets: VideoAssets,
 ) {
-    let room_name = format!("bench-room-{}", room_id);
+    let room_name = format!("bench-room-{room_id}");
 
     for user_id in 0..config.users_per_room {
         let delay_ms = rand::random_range(0u64..(config.join_spread_secs * 1_000).max(1));

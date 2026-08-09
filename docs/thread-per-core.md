@@ -122,6 +122,31 @@ these, it is rule 1 and the answer is a message.
   built from. Nothing there licenses an `Arc` inside a shard.
 - **Not a shard.** The agent, simulator and CLI are ordinary async programs.
 
-Enforced by `make lint-arch`, which fails rather than warns. `cargo clippy
---fix` leaves these as warnings, and a warning in a hundred-line build log is
-not a gate.
+## Enforcement
+
+`make lint-check` fails rather than warns, and CI runs it as its own job.
+`cargo clippy --fix` leaves everything as a warning, and a warning in a
+hundred-line build log is not a gate.
+
+Three places, deliberately:
+
+- **`clippy.toml`** — the architectural rules, one `reason` string each:
+  `disallowed-types` (shared state) and `disallowed-methods` (ambient clock,
+  unseeded randomness, blocking).
+- **`[workspace.lints]` in `Cargo.toml`** — the levels, plus the correctness,
+  allocation and readability tiers. Tiered by *measured* violation count, with
+  a note on what is deliberately left out and why, so it does not get
+  re-litigated from scratch.
+- **Module-level `#![allow]`** — every exception, next to the code it excuses.
+
+### Determinism is part of this
+
+The simulator substitutes the clock and seeds every RNG so a failing plan
+replays exactly. Code reading the real clock or an unseeded RNG opts out of
+that silently: the plan still passes, it just stops meaning anything. That is
+why `SystemTime::now`, `std::time::Instant::now`, `rand::thread_rng` and
+`std::thread::sleep` are denied rather than discouraged — the failure is
+invisible in review.
+
+There is exactly one sanctioned wall-clock read, in `node.rs`, feeding the
+node's single `WallAnchor`. Everything else converts through it.

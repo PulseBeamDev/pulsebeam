@@ -3,9 +3,13 @@
 //! Not a criterion suite — the point is a repeatable number for the work one
 //! forwarded packet does, so claims about it can be checked rather than argued.
 
-//! Shared-state exception: a benchmark measuring the cost of the very
-//! primitives the crate restricts.
-#![allow(clippy::disallowed_types)]
+//! Exceptions: this measures the cost of the very primitives the crate
+//! restricts, and printing the numbers is the entire output.
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::print_stdout
+)]
 
 use std::hint::black_box;
 use std::time::Instant;

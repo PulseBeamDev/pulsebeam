@@ -4,7 +4,11 @@
 //! Both are kept core-local — `to_transit` copies the payload and
 //! `rehome_extensions` re-anchors the descriptor — so no refcount is ever
 //! shared across shards. See `docs/thread-per-core.md`.
-#![allow(clippy::disallowed_types)]
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::float_cmp
+)]
 
 pub mod cache;
 #[cfg(debug_assertions)]
@@ -198,8 +202,13 @@ impl RtpPacket {
 #[cfg(test)]
 pub mod test_utils {
     // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    #![allow(clippy::disallowed_types)]
+    // cross-core and a fixture may read the host clock.
+    // See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use std::time::Duration;
 
     use super::*;

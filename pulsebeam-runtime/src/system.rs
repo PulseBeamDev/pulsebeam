@@ -41,7 +41,7 @@ pub async fn wait_for_signal_impl() {
 /// Registers signal handlers and waits for a signal that
 /// indicates a shutdown request.
 pub async fn wait_for_signal() {
-    wait_for_signal_impl().await
+    wait_for_signal_impl().await;
 }
 
 pub fn select_host_addresses(forced_interface: Option<&str>) -> Vec<IpAddr> {

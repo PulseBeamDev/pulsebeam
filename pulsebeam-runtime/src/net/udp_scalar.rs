@@ -102,7 +102,7 @@ pub fn from_shared(
     }
 
     let writer = UdpTransportWriter {
-        sock: socket.clone(),
+        sock: socket,
         local_addr,
         drop_count: 0,
         #[cfg(feature = "sim")]

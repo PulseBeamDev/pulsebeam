@@ -2,9 +2,11 @@
 
 ## Thread-per-core: read `docs/thread-per-core.md` first
 
-A shard owns its state and reaches other shards only by message. `Arc`, `Mutex`,
-`RwLock` and bare atomics are **denied by `clippy.toml`** in the `pulsebeam`
-crate and need `#[allow(clippy::disallowed_types)]` with a reason.
+A shard owns its state and reaches other shards only by message. Denied by
+`clippy.toml` and gated by `make lint-check` (which CI runs): `Arc`, `Mutex`,
+`RwLock`, bare atomics, the ambient clock (`SystemTime::now`,
+`std::time::Instant::now`), unseeded randomness, and blocking calls. Each needs
+an `#[allow]` with a reason if you genuinely need it.
 
 Two things that keep getting reintroduced, both explained in that file:
 

@@ -110,7 +110,7 @@ pub async fn run(
         .copied()
         .map(|ip| SocketAddr::new(ip, rtc_port))
         .collect();
-    let local_addr: SocketAddr = format!("[::]:{}", rtc_port).parse().unwrap();
+    let local_addr: SocketAddr = format!("[::]:{rtc_port}").parse().unwrap();
     let http_api_addr: SocketAddr = "[::]:7070".parse().unwrap();
     let metrics_addr: SocketAddr = "[::]:6060".parse().unwrap();
 

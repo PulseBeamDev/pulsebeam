@@ -152,7 +152,7 @@ fn read_frame_dependencies(
         .ok_or(DdReadError::UnknownTemplateId(mandatory.template_id))?;
 
     if fields.custom_dtis() {
-        for dti in deps.dtis.iter_mut() {
+        for dti in &mut deps.dtis {
             *dti = DecodeTargetIndication::from_bits(r.read_bits(2)?);
         }
     }
@@ -170,7 +170,7 @@ fn read_frame_dependencies(
     }
 
     if fields.custom_chains() {
-        for chain_diff in deps.chain_diffs.iter_mut() {
+        for chain_diff in &mut deps.chain_diffs {
             *chain_diff = r.read_bits(8)? as u8;
         }
     }
@@ -251,7 +251,7 @@ fn read_template_dtis(
     s: &mut TemplateDependencyStructure,
 ) -> Result<(), DdReadError> {
     let dt_cnt = usize::from(s.decode_target_count);
-    for t in s.templates.iter_mut() {
+    for t in &mut s.templates {
         for _ in 0..dt_cnt {
             let dti = DecodeTargetIndication::from_bits(r.read_bits(2)?);
             debug_assert!(t.dtis.len() < MAX_DECODE_TARGETS);
@@ -265,7 +265,7 @@ fn read_template_fdiffs(
     r: &mut BitReader,
     s: &mut TemplateDependencyStructure,
 ) -> Result<(), DdReadError> {
-    for t in s.templates.iter_mut() {
+    for t in &mut s.templates {
         while r.read_bit()? != 0 {
             let fdiff = r.read_bits(4)? as u16 + 1;
             t.frame_diffs
@@ -294,7 +294,7 @@ fn read_template_chains(
         s.decode_target_protected_by.push(protected_by);
     }
 
-    for t in s.templates.iter_mut() {
+    for t in &mut s.templates {
         for _ in 0..chain_count {
             let diff = r.read_bits(4)? as u8;
             debug_assert!(t.chain_diffs.len() < MAX_CHAINS);
