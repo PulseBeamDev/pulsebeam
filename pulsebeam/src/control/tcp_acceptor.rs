@@ -201,26 +201,6 @@ mod tests {
         pulsebeam_runtime::testing::test_host_ip("192.168.250.11")
     }
 
-    /// Accept one server-side TCP stream from a dedicated loopback listener.
-    /// Returns (client, server, peer_addr) keeping both sides alive.
-    async fn accept_one() -> (
-        pulsebeam_core::net::TcpStream,
-        pulsebeam_core::net::TcpStream,
-        SocketAddr,
-    ) {
-        let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (client, accepted) = tokio::join!(
-            pulsebeam_core::net::TcpStream::connect(addr),
-            listener.accept()
-        );
-        let client = client.unwrap();
-        let (server, peer_addr) = accepted.unwrap();
-        (client, server, peer_addr)
-    }
-
     // ── pending cap ──────────────────────────────────────────────────────────
 
     /// The acceptor drops connections when `MAX_PENDING_TCP` is already reached.
@@ -255,10 +235,7 @@ mod tests {
             // never wrote anything).  The excess connection produces no event.
             // We just verify that no MORE than MAX_PENDING_TCP events arrive
             // within a short window.
-            let mut count = 0;
-            while let Ok(Some(_)) = timeout(Duration::from_millis(10), event_rx.recv()).await {
-                count += 1;
-            }
+            while let Ok(Some(_)) = timeout(Duration::from_millis(10), event_rx.recv()).await {}
             // All connections eventually time out (TCP_FIRST_FRAME_TIMEOUT) and
             // produce a None result.  We mainly care that the cap was enforced.
             drop(clients);
@@ -332,7 +309,7 @@ mod tests {
     #[test]
     fn test_per_ip_cap_enforced() {
         // This test only makes sense if per-IP limit < global limit.
-        assert!(MAX_PENDING_TCP_PER_IP < MAX_PENDING_TCP);
+        const { assert!(MAX_PENDING_TCP_PER_IP < MAX_PENDING_TCP) };
 
         run_local(async {
             let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))

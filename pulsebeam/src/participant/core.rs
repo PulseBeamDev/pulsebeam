@@ -50,10 +50,6 @@ impl TrackAvailability {
     fn unpublished() -> Self {
         Self { in_topology: false }
     }
-
-    fn published() -> Self {
-        Self { in_topology: true }
-    }
 }
 
 #[derive(Clone, Copy)]

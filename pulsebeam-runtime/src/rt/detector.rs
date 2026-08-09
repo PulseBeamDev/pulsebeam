@@ -538,14 +538,11 @@ pub mod unix {
         let my_tid = unsafe { libc::pthread_self() };
 
         // Locate our pre-allocated slot (linear scan; worker count is tiny).
-        let slot = match session.slots.iter().find(|s| s.tid == my_tid) {
-            Some(s) => s,
-            None => {
-                // We were not among the intended targets; just decrement so the
-                // collector does not hang.
-                session.remaining.fetch_sub(1, Ordering::SeqCst);
-                return;
-            }
+        let Some(slot) = session.slots.iter().find(|s| s.tid == my_tid) else {
+            // We were not among the intended targets; just decrement so the
+            // collector does not hang.
+            session.remaining.fetch_sub(1, Ordering::SeqCst);
+            return;
         };
 
         // Walk the stack and store raw IPs into our pre-allocated buffer.

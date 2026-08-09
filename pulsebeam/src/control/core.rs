@@ -94,12 +94,9 @@ pub struct ControllerCore {
 }
 
 impl ControllerCore {
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_room_shard_slot(DEFAULT_ROOM_SHARD_SLOT)
-    }
-
-    pub fn with_room_shard_slot(room_shard_slot: usize) -> Self {
-        Self::with_placement(room_shard_slot, RoomPlacement::Hashed)
+        Self::with_placement(DEFAULT_ROOM_SHARD_SLOT, RoomPlacement::Hashed)
     }
 
     pub fn with_placement(room_shard_slot: usize, placement: RoomPlacement) -> Self {
@@ -189,16 +186,6 @@ impl ControllerCore {
 
     pub async fn next_expired(&mut self) {
         self.registry.next_expired().await;
-    }
-
-    pub fn routing_key(&self, room_id: &RoomId) -> String {
-        let count = self
-            .registry
-            .get_room(room_id)
-            .map(super::room::Room::participant_count)
-            .unwrap_or_default();
-        let epoch = count / self.room_shard_slot;
-        format!("{room_id}-{epoch}")
     }
 
     pub fn create_participant(

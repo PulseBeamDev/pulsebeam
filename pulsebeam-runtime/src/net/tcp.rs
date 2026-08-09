@@ -423,11 +423,8 @@ impl TcpTransport {
         }
 
         // Drain any further events that arrived since readable() was called.
-        loop {
-            match self.event_rx.try_recv() {
-                Ok(event) => self.handle_event(event, out, local_addr),
-                Err(_) => break,
-            }
+        while let Ok(event) = self.event_rx.try_recv() {
+            self.handle_event(event, out, local_addr);
         }
 
         if out.is_empty() {

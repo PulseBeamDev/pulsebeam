@@ -1398,9 +1398,11 @@ mod test {
     }
 
     fn make_packet(now: Instant, size_bytes: usize) -> RtpPacket {
-        let mut pkt = RtpPacket::default();
-        pkt.arrival_ts = now;
-        pkt.playout_time = now;
+        let mut pkt = RtpPacket {
+            arrival_ts: now,
+            playout_time: now,
+            ..Default::default()
+        };
         let payload_len = size_bytes.saturating_sub(pkt.header_len);
         pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
         pkt
@@ -1791,7 +1793,6 @@ mod test {
         for i in 0..10u64 {
             monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
         }
-        seq += 10;
         t += Duration::from_millis(600);
         monitor.poll(t, false);
         assert_eq!(

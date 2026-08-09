@@ -398,7 +398,6 @@ async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File)
 fn get_looper(rid: Option<&str>, assets: &VideoAssets) -> H264Looper {
     let data = match rid {
         Some("f") => &assets.full,
-        Some("h") => &assets.half,
         Some("q") => &assets.quarter,
         _ => &assets.half,
     };

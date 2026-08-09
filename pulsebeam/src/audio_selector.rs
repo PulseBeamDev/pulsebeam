@@ -43,8 +43,7 @@ impl SlotState {
     #[inline]
     fn is_dead(&self, now: Instant) -> bool {
         match (self.owner, self.last_arrival_ts) {
-            (None, _) => true,
-            (Some(_), None) => true,
+            (None, _) | (Some(_), None) => true,
             (Some(_), Some(ts)) => now.duration_since(ts) > DEAD_TIMEOUT,
         }
     }
@@ -259,8 +258,10 @@ mod tests {
 
     /// Build a packet with the given audio level arriving at `arrival_ts`.
     fn pkt_at(base: Instant, offset_ms: u64, level: i8) -> RtpPacket {
-        let mut ext_vals = ExtensionValues::default();
-        ext_vals.audio_level = Some(level);
+        let ext_vals = ExtensionValues {
+            audio_level: Some(level),
+            ..Default::default()
+        };
         RtpPacket {
             ext_vals,
             arrival_ts: base + Duration::from_millis(offset_ms),

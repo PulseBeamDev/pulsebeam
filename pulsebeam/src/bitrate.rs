@@ -129,8 +129,10 @@ mod tests {
 
     #[test]
     fn test_hysteresis_deadband_allows_deep_drop() {
-        let mut config = BitrateControllerConfig::default();
-        config.down_smoothing = 0.90;
+        let config = BitrateControllerConfig {
+            down_smoothing: 0.90,
+            ..Default::default()
+        };
         let mut ctrl = config.build();
 
         // Push target to 800k via default headroom + quantization.
@@ -190,9 +192,11 @@ mod tests {
 
     #[test]
     fn test_maximum_cap_hold_while_still_clamped() {
-        let mut config = BitrateControllerConfig::default();
-        config.max_bitrate = Bitrate::mbps(5);
-        config.down_smoothing = 0.90;
+        let config = BitrateControllerConfig {
+            max_bitrate: Bitrate::mbps(5),
+            down_smoothing: 0.90,
+            ..Default::default()
+        };
         let mut ctrl = config.build();
 
         // Demand above the configured maximum clamps to the cap.

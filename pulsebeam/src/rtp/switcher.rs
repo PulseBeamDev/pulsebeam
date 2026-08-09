@@ -788,10 +788,12 @@ mod test {
             DecodeTargetIndication::NotPresent
         };
         for p in frame.iter_mut() {
-            let mut dd = DependencyDescriptor::default();
-            dd.frame_dependencies = FrameDependencyTemplate {
-                dtis: [dti].into_iter().collect(),
-                temporal_id: if in_dt0 { 0 } else { 1 },
+            let dd = DependencyDescriptor {
+                frame_dependencies: FrameDependencyTemplate {
+                    dtis: [dti].into_iter().collect(),
+                    temporal_id: if in_dt0 { 0 } else { 1 },
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             p.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));

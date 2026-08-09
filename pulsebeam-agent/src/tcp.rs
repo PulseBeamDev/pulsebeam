@@ -5,7 +5,6 @@ use str0m::{
     Input, Rtc,
     net::{Protocol, Receive},
 };
-use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
 /// RFC 4571 framing over a single active TCP connection (RFC 6544 client role).
@@ -107,19 +106,6 @@ impl TcpSession {
             Err(e) => {
                 tracing::warn!(error = ?e, "TCP read error, closing stream");
                 self.close();
-            }
-        }
-    }
-
-    /// RFC 4571-frame `payload` and write it to the stream.  Closes the
-    /// stream on write failure.
-    pub(crate) async fn send(&mut self, payload: &[u8]) {
-        if let Some(stream) = &mut self.stream {
-            let header = (payload.len() as u16).to_be_bytes();
-            if stream.write_all(&header).await.is_err() || stream.write_all(payload).await.is_err()
-            {
-                tracing::warn!("TCP write failed, closing stream");
-                self.stream = None;
             }
         }
     }

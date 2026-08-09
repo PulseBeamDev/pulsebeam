@@ -184,11 +184,8 @@ impl AgentBuilder {
         let mut maybe_addr = None;
         for ip in &self.local_ips {
             let addr = SocketAddr::new(*ip, port);
-            let candidate = match Candidate::builder().udp().host(addr).build() {
-                Ok(candidate) => candidate,
-                Err(_) => {
-                    continue;
-                }
+            let Ok(candidate) = Candidate::builder().udp().host(addr).build() else {
+                continue;
             };
             rtc.add_local_candidate(candidate);
             maybe_addr = Some(addr);

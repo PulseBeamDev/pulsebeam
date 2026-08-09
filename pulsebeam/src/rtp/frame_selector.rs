@@ -125,9 +125,11 @@ mod test {
 
     /// A packet whose frame declares the given per-decode-target indications.
     fn pkt_with_dtis(dtis: &[DecodeTargetIndication]) -> RtpPacket {
-        let mut dd = DependencyDescriptor::default();
-        dd.frame_dependencies = FrameDependencyTemplate {
-            dtis: dtis.iter().copied().collect(),
+        let dd = DependencyDescriptor {
+            frame_dependencies: FrameDependencyTemplate {
+                dtis: dtis.iter().copied().collect(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut pkt = RtpPacket::default();

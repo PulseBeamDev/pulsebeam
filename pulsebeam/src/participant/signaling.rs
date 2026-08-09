@@ -148,12 +148,9 @@ impl Signaling {
         let mut intents = HashMap::with_capacity(intent.downstream_requests.len());
         for req in intent.downstream_requests {
             let track_id_str = req.track_id.clone();
-            let track_id = match TrackId::try_from(track_id_str.clone()) {
-                Ok(id) => id,
-                Err(_) => {
-                    plog_warn!(self.ctx, track_id = %track_id_str, "invalid track_id in client intent");
-                    continue;
-                }
+            let Ok(track_id) = TrackId::try_from(track_id_str.clone()) else {
+                plog_warn!(self.ctx, track_id = %track_id_str, "invalid track_id in client intent");
+                continue;
             };
 
             // `Mid` is a fixed-size (16-byte) identifier and will truncate longer strings.

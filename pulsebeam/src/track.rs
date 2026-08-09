@@ -850,8 +850,9 @@ mod data_track {
                         (_, DataTrackDirection::Publish, Some(_)) => {
                             return Err(DataTrackIntentError::ScopeNotAllowedForPublish);
                         }
-                        (_, DataTrackDirection::Publish, None) => None,
-                        (_, DataTrackDirection::Subscribe, None) => None,
+                        (_, DataTrackDirection::Publish | DataTrackDirection::Subscribe, None) => {
+                            None
+                        }
                         (DataLane::Reliable, DataTrackDirection::Subscribe, Some(_)) => {
                             return Err(DataTrackIntentError::ScopeNotAllowedForReliableSubscribe);
                         }
@@ -1407,8 +1408,10 @@ mod simulcast_pause_tests {
     }
 
     fn feed(upstream: &mut UpstreamTrack, rid: &str, at: Instant) {
-        let mut pkt = RtpPacket::default();
-        pkt.arrival_ts = at;
+        let mut pkt = RtpPacket {
+            arrival_ts: at,
+            ..Default::default()
+        };
         upstream.monitor.process(Some(&Rid::from(rid)), &mut pkt);
     }
 

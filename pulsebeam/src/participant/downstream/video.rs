@@ -1262,6 +1262,7 @@ impl AllocationEngine {
     ///
     /// Captures its own snapshot. In `update_allocations()` use `run_desired()`
     /// on a shared engine to avoid a second snapshot.
+    #[cfg(test)]
     pub fn desired_bitrate(slots: &[SlotView<'_>], states: &LayerStates) -> Bitrate {
         Self::new(slots, states).run_desired(slots)
     }
@@ -1312,6 +1313,7 @@ impl AllocationEngine {
     ///
     /// Captures its own snapshot. In `update_allocations()` use `run_compute()`
     /// on a shared engine to avoid a second snapshot.
+    #[cfg(test)]
     pub fn compute<'a>(
         bwe: Bitrate,
         slots: &'a [SlotView<'a>],
@@ -1533,11 +1535,6 @@ mod assignment_tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
-
-    #[derive(Default)]
-    struct FakeRouter {
-        subscribed: std::collections::HashSet<crate::track::StreamId>,
     }
 
     struct TestTracks {
@@ -1896,8 +1893,10 @@ mod assignment_tests {
         slot.set_roles_for_test(Some(&high), Some(&medium));
         slot.paused = false;
 
-        let mut pkt = RtpPacket::default();
-        pkt.seq_no = 1.into();
+        let pkt = RtpPacket {
+            seq_no: 1.into(),
+            ..Default::default()
+        };
 
         let mut writer = crate::track::StreamWriter::new();
         slot.on_rtp(high.meta.id, &pkt, None, &mut writer);

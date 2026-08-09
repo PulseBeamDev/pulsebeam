@@ -1,8 +1,5 @@
 use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, VideoReceiveStats};
-use crate::tests::common::{
-    reserve_subnet, run_sim_or_timeout, start_sfu_node, start_sfu_node_tcp_only,
-    start_sfu_node_tcp_only_multi_shard, subnet_ip,
-};
+use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
@@ -1988,6 +1985,12 @@ fn assert_video_quality(
 /// would be exactly the kind of quietly-wrong assertion this type exists to remove. Use
 /// [`Property::EstimateStable`] and [`Property::QueueingDelayBelow`] on scheduled links.
 #[derive(Clone, Copy, Debug)]
+// A vocabulary of assertions a plan may make, not a set of call sites. Each
+// variant is implemented and documented with the regime it is fair in; a
+// variant no current plan happens to use is a claim available to the next one,
+// which is the opposite of dead code. Deleting the unused ones would leave the
+// suite able to express only what it already asserts.
+#[allow(dead_code)]
 pub enum Property {
     /// Video frames decoded during the last run after a complete, parameterized keyframe.
     VideoDecodes,
@@ -2170,6 +2173,7 @@ impl LinkReport {
 
     /// Media payload as a percentage of bytes received. Exceeds 100% under loss - see
     /// [`Property::MediaEfficiencyAtLeast`].
+    #[allow(dead_code)] // Report accessor, kept alongside the rest of the surface.
     pub fn media_percent(&self) -> f64 {
         pct(
             self.forwarded_media_bytes as f64,
@@ -2842,10 +2846,13 @@ impl LocalNodeSim {
         self
     }
 
-    /// Use N worker shards (implies tcp_only).
+    /// Spread the node across N worker shards.
+    ///
+    /// No longer implies [`Self::with_tcp_only`], so the two are stated
+    /// separately — but multi-shard currently *requires* it, and `run` fails
+    /// loudly if it is missing rather than hanging. See the note there.
     pub fn with_shards(mut self, n: usize) -> Self {
         self.num_shards = n;
-        self.tcp_only = true;
         self
     }
 
@@ -2902,19 +2909,29 @@ impl LocalNodeSim {
         let tcp_only = self.tcp_only;
         let num_shards = self.num_shards;
 
+        // Multi-shard over UDP does not converge, and fails as a ten-minute
+        // hang rather than an error, so refuse it here instead.
+        //
+        // `SO_REUSEPORT` is emulated by sharing one socket across the group
+        // (`bound_udp_sim.rs`) and a datagram goes to whichever worker polls
+        // first. That was written off as "harsher than reality". It is not
+        // harsher, it is wrong: real `SO_REUSEPORT` is sticky per 4-tuple, and
+        // the stickiness is load-bearing — a session's DTLS and ICE state lives
+        // on one shard, so scattering its datagrams means no handshake ever
+        // completes. Making this reachable means giving the group per-member
+        // inboxes and dispatching on a hash of the source 4-tuple.
+        assert!(
+            num_shards <= 1 || tcp_only,
+            "multi-shard simulation needs .with_tcp_only(): the SO_REUSEPORT \
+             emulation is not sticky per 4-tuple, so a participant's datagrams \
+             scatter across shards and DTLS never completes"
+        );
+
         sim.host(server_ip, move || async move {
             let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-            if tcp_only && num_shards > 1 {
-                start_sfu_node_tcp_only_multi_shard(server_ip, rng)
-                    .await
-                    .map_err(Into::into)
-            } else if tcp_only {
-                start_sfu_node_tcp_only(server_ip, rng)
-                    .await
-                    .map_err(Into::into)
-            } else {
-                start_sfu_node(server_ip, rng).await.map_err(Into::into)
-            }
+            start_sfu_node_with(server_ip, rng, num_shards, tcp_only)
+                .await
+                .map_err(Into::into)
         });
 
         let mut handles: HashMap<&'static str, ParticipantHandle> = HashMap::new();

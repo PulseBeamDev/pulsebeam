@@ -305,6 +305,8 @@ impl VideoReceiveLog {
     }
 }
 
+type SubscribedTopics = Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>;
+
 pub struct ClientContext {
     pub ip: IpAddr,
     pub agent: Agent,
@@ -321,7 +323,7 @@ pub struct ClientContext {
     pub remote_tracks: HashMap<String, String>,
     pub(crate) requested_tracks: HashSet<String>,
     pub published_topics: Arc<Mutex<HashMap<String, DataPublisher>>>,
-    pub subscribed_topics: Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>,
+    pub subscribed_topics: SubscribedTopics,
     pub ordered_publishers: Arc<Mutex<HashMap<String, OrderedTopicPublisher>>>,
     pub ordered_subscribers: Arc<Mutex<HashMap<String, OrderedTopicSubscriber>>>,
     /// Data channel payloads received by topic.
@@ -505,13 +507,13 @@ pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
     let data = match rid {
         Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
         Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
-        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
     };
     H264Looper::new(data, 30)
 }
 
 pub fn create_vbr_looper_for_rid(rid: Option<&str>, profile: VbrProfile) -> VbrLooper {
-    debug_assert_eq!(rid.map(|rid| rid), Some("f"));
+    debug_assert_eq!(rid, Some("f"));
     VbrLooper::new_scheduled(
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
