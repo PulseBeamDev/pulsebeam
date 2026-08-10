@@ -7,3 +7,8 @@ dist
 venv
 workspace.lock.json
 proptest-regressions/
+
+# Scratch logs and dumps. A 421 MB capture reached a commit once, so the rule
+# is blanket; bwe-baseline.txt is a committed artifact and is exempted.
+*.txt
+!bwe-baseline.txt

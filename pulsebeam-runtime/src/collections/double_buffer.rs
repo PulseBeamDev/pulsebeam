@@ -35,7 +35,7 @@ impl<T> DoubleBuffer<T> {
     /// Returns the total number of items pending across both buffers
     #[inline]
     pub fn len(&self) -> usize {
-        self.accumulate.len() + self.send.len()
+        self.accumulate.len().saturating_add(self.send.len())
     }
 
     /// Prepares items for sending and returns a slice to send.
@@ -118,6 +118,14 @@ impl<T> Default for DoubleBuffer<T> {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
     use super::*;
 
     #[test]

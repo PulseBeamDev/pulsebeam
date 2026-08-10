@@ -109,7 +109,11 @@ impl RuntimeSpawner {
 
         let target = self
             .data_txs
-            .get(worker % self.data_txs.len())
+            .get(
+                worker
+                    .checked_rem(self.data_txs.len())
+                    .ok_or(SpawnError::TargetUnavailable)?,
+            )
             .ok_or(SpawnError::TargetUnavailable)?;
         target
             .send(req)
@@ -121,7 +125,13 @@ impl RuntimeSpawner {
         if thread == 0 || self.data_txs.is_empty() {
             self.spawn_control(factory)
         } else {
-            self.spawn_data((thread - 1) % self.data_txs.len(), factory)
+            self.spawn_data(
+                thread
+                    .saturating_sub(1)
+                    .checked_rem(self.data_txs.len())
+                    .unwrap_or(0),
+                factory,
+            )
         }
     }
 }

@@ -82,7 +82,10 @@ impl<T> Sender<T> {
     ///
     /// Returns a `SendError` only if the receiving actor has terminated.
     pub async fn send(&self, message: T) -> Result<(), SendError<T>> {
-        self.sender.send(message).await.map_err(|e| e.into())
+        self.sender
+            .send(message)
+            .await
+            .map_err(std::convert::Into::into)
     }
 
     /// Attempts to immediately send a message.
@@ -90,7 +93,9 @@ impl<T> Sender<T> {
     /// Returns a `TrySendError` if the mailbox is full or if the
     /// receiving actor has terminated.
     pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        self.sender.try_send(message).map_err(|e| e.into())
+        self.sender
+            .try_send(message)
+            .map_err(std::convert::Into::into)
     }
 }
 
@@ -154,6 +159,14 @@ pub fn new<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
     use crate::mailbox;
     use std::time::Duration;
 

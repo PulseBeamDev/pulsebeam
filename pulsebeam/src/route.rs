@@ -15,16 +15,6 @@
 //! the correct answer.
 #![deny(clippy::arithmetic_side_effects)]
 
-//!
-//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
-//! range does not stop — it yields a plausible-looking number that the pacer,
-//! the allocator or the jitter estimator then treats as a measurement. This is
-//! timestamp and sequence arithmetic, where that number is the whole output, so
-//! every operation says which behaviour it wants: `saturating_` to clamp,
-//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
-//! the correct answer.
-#![deny(clippy::arithmetic_side_effects)]
-
 use std::collections::VecDeque;
 use tokio::time::{Duration, Instant};
 

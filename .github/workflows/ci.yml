@@ -11,6 +11,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Separate from the test job on purpose: a lint failure and a test failure are
+  # different problems, and the architectural rules (shared state, ambient
+  # clock, blocking — see docs/thread-per-core.md) are the ones most likely to
+  # be waved through if they only ever appear as a warning inside a test log.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.10
+    - run: rustup component add clippy rustfmt
+    # Formatting first, and not for tidiness: `pulsebeam-proto/build.rs` emits
+    # into `src/`, so any build rewrites `signaling.rs` in prost's own layout,
+    # which rustfmt does not agree with. Checking after a build would compare
+    # generated output against rustfmt and fail on code nobody wrote.
+    - name: Formatting
+      run: cargo fmt --all --check
+    - name: Lint
+      run: make lint-check
+
   build:
     runs-on: ubuntu-latest
     steps:

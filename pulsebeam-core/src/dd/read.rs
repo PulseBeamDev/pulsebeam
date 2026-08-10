@@ -222,7 +222,8 @@ fn read_template_layers(
             })
             .map_err(|_| DdReadError::TooManyTemplates)?;
 
-        match r.read_bits(2)? {
+        let next_layer_idc = r.read_bits(2)?;
+        match next_layer_idc {
             SAME_LAYER => {}
             NEXT_TEMPORAL => {
                 temporal_id = temporal_id.saturating_add(1);
@@ -237,10 +238,13 @@ fn read_template_layers(
                     return Err(DdReadError::TooManySpatialLayers);
                 }
             }
-            // `read_bits(2)` yields 0..4 and the four values are covered
-            // above, so this is the compiler's exhaustiveness check rather than
-            // a reachable state.
-            NO_MORE | _ => break,
+            _ => {
+                debug_assert_eq!(
+                    next_layer_idc, NO_MORE,
+                    "read_bits(2) yields 0..4 and the other three are matched above"
+                );
+                break;
+            }
         }
     }
 

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
 use std::{future::Future, net::IpAddr};
 
 pub fn test_host_ip(sim_host_ip: &str) -> IpAddr {
@@ -49,7 +56,7 @@ where
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
+            .unwrap_or_else(|err| crate::fatal!("test runtime unavailable: {err}"));
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, test);
     }

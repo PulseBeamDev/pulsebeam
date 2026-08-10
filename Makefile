@@ -54,6 +54,17 @@ bwe-baseline:
 
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all
+	@$(MAKE) --no-print-directory lint-check
+
+# The gate. Fails rather than warns, which is the whole point: `cargo clippy
+# --fix` above leaves everything as a warning, and a warning in a 100-line build
+# log is not a gate.
+#
+# The deny tier lives in [workspace.lints] in Cargo.toml; the architectural
+# rules (shared state, ambient clock, blocking) live in clippy.toml with a
+# reason string each. See docs/thread-per-core.md.
+lint-check:
+	cargo clippy --all-targets --workspace
 
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam

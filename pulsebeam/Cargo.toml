@@ -13,6 +13,10 @@ license.workspace = true
 tag-prefix = "pulsebeam-v"
 changelog = "CHANGELOG.md"
 
+
+[lints]
+workspace = true
+
 [dependencies]
 ahash = "0.8.12"
 anyhow = { workspace = true }
@@ -90,3 +94,7 @@ unpace = []
 deep-metrics = ["pulsebeam-runtime/deep-metrics"]
 parking_lot = ["pulsebeam-runtime/parking_lot"]
 sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim"]
+
+[[bench]]
+name = "fanout"
+harness = false
