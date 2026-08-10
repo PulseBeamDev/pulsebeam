@@ -147,7 +147,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

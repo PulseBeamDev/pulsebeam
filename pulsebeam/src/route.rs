@@ -182,11 +182,33 @@ impl MediaEnvelope {
         if peek_lane(buf)? != Lane::Media {
             return Err(EnvelopeError::WrongLane { want: Lane::Media });
         }
+        let [
+            _,
+            _,
+            e0,
+            e1,
+            r0,
+            r1,
+            r2,
+            r3,
+            s0,
+            s1,
+            s2,
+            s3,
+            p0,
+            p1,
+            p2,
+            p3,
+            ..,
+        ] = *buf
+        else {
+            return Err(EnvelopeError::Truncated { len: buf.len() });
+        };
         Ok(Self {
-            epoch: u16::from_be_bytes([buf[2], buf[3]]),
-            route: RouteId::new(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
-            link_seq: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            playout_ntp32: u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            epoch: u16::from_be_bytes([e0, e1]),
+            route: RouteId::new(u32::from_be_bytes([r0, r1, r2, r3])),
+            link_seq: u32::from_be_bytes([s0, s1, s2, s3]),
+            playout_ntp32: u32::from_be_bytes([p0, p1, p2, p3]),
         })
     }
 }
@@ -240,9 +262,12 @@ impl RouteEnvelope {
                 want: Lane::Reverse,
             });
         }
+        let [_, _, e0, e1, r0, r1, r2, r3, ..] = *buf else {
+            return Err(EnvelopeError::Truncated { len: buf.len() });
+        };
         Ok(Self {
-            epoch: u16::from_be_bytes([buf[2], buf[3]]),
-            route: RouteId::new(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
+            epoch: u16::from_be_bytes([e0, e1]),
+            route: RouteId::new(u32::from_be_bytes([r0, r1, r2, r3])),
         })
     }
 }
@@ -421,7 +446,8 @@ impl RouteEntry {
             self.last_link_seq = Some(link_seq);
             return;
         };
-        let delta = link_seq.wrapping_sub(last) as i32;
+        // The link sequence is modular; the wrap is how reordering reads as negative.
+        let delta = link_seq.wrapping_sub(last).cast_signed();
         match delta {
             0 => self.stats.duplicated = self.stats.duplicated.saturating_add(1),
             d if d > 0 => {
@@ -548,8 +574,14 @@ impl RouteTable {
         now: Instant,
     ) -> Result<(RouteId, u16), RouteError> {
         let id = self.allocate(now)?;
-        let epoch = self.epochs[id.index()];
-        self.slots[id.index()] = Slot::Live(Box::new(RouteEntry {
+        let epoch = self.epochs.get(id.index()).copied().unwrap_or(0);
+        let Some(slot) = self.slots.get_mut(id.index()) else {
+            debug_assert!(false, "allocate() returned a slot outside the table");
+            return Err(RouteError::Exhausted {
+                max_slots: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
+            });
+        };
+        *slot = Slot::Live(Box::new(RouteEntry {
             epoch,
             action,
             names,
@@ -608,14 +640,15 @@ impl RouteTable {
         {
             self.quarantine.pop_front();
             debug_assert!(
-                matches!(self.slots[idx as usize], Slot::Free),
+                matches!(self.slots.get(idx as usize), Some(Slot::Free)),
                 "a quarantined slot must still be free"
             );
-            let epoch = &mut self.epochs[idx as usize];
-            if *epoch == u16::MAX {
-                tracing::warn!(route = idx, "route epoch wrapped");
+            if let Some(epoch) = self.epochs.get_mut(idx as usize) {
+                if *epoch == u16::MAX {
+                    tracing::warn!(route = idx, "route epoch wrapped");
+                }
+                *epoch = epoch.wrapping_add(1);
             }
-            *epoch = epoch.wrapping_add(1);
             return Ok(RouteId::new(idx));
         }
 
@@ -803,7 +836,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

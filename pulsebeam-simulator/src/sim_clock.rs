@@ -4,7 +4,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 //! Make the process clock the *simulated* clock, so runs are reproducible.
 //!
@@ -83,8 +84,9 @@ fn sim_elapsed() -> Duration {
 
 fn timespec(secs: u64, nanos: u32) -> libc::timespec {
     libc::timespec {
-        tv_sec: secs as libc::time_t,
-        tv_nsec: nanos as libc::c_long,
+        // Simulated time starts at zero and never approaches the sign bit.
+        tv_sec: libc::time_t::try_from(secs).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::from(nanos),
     }
 }
 

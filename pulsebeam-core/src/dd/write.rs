@@ -175,7 +175,10 @@ fn write_structure(w: &mut BitWriter, s: &TemplateDependencyStructure) -> Result
     {
         return Err(DdWriteError::Inconsistent);
     }
-    if s.templates[0].spatial_id != 0 || s.templates[0].temporal_id != 0 {
+    let Some(first) = s.templates.first() else {
+        return Err(DdWriteError::Inconsistent);
+    };
+    if first.spatial_id != 0 || first.temporal_id != 0 {
         return Err(DdWriteError::Inconsistent);
     }
 
@@ -204,7 +207,10 @@ fn write_template_layers(
     s: &TemplateDependencyStructure,
 ) -> Result<(), DdWriteError> {
     for pair in s.templates.windows(2) {
-        let (prev, next) = (&pair[0], &pair[1]);
+        let [prev, next] = pair else {
+            debug_assert!(false, "windows(2) always yields pairs");
+            break;
+        };
         let idc = if next.spatial_id == prev.spatial_id && next.temporal_id == prev.temporal_id {
             NEXT_LAYER_SAME
         } else if next.spatial_id == prev.spatial_id

@@ -120,8 +120,14 @@ impl Synchronizer {
             _ => self.reset_baseline(packet.rtp_ts, packet.arrival_ts),
         };
 
-        let rtp_delta = (packet.rtp_ts.numer() as i64).wrapping_sub(base_rtp.numer() as i64);
-        let max_ticks = (MAX_RTP_GAP_SECS * self.clock_rate.get() as f64) as i64;
+        let rtp_delta = packet
+            .rtp_ts
+            .numer()
+            .cast_signed()
+            .wrapping_sub(base_rtp.numer().cast_signed());
+        let max_ticks =
+            crate::bitrate::saturating_bps(MAX_RTP_GAP_SECS * f64::from(self.clock_rate.get()))
+                .cast_signed();
 
         // Auto-reset on massive RTP leaps to prevent timeline corruption
         if rtp_delta.abs() > max_ticks {
@@ -136,8 +142,11 @@ impl Synchronizer {
         // 1. If we have SR info, we can calculate the NTP time of this packet and use it for alignment.
         let mut ntp_expected_playout = None;
         if let Some(latest) = self.latest_sr {
-            let rtp_delta =
-                (packet.rtp_ts.numer() as i64).wrapping_sub(latest.rtp_time.numer() as i64);
+            let rtp_delta = packet
+                .rtp_ts
+                .numer()
+                .cast_signed()
+                .wrapping_sub(latest.rtp_time.numer().cast_signed());
             let ntp_delta_secs = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
             let ntp_pkt = offset_ntp(latest.ntp_time, ntp_delta_secs);
 
@@ -218,7 +227,12 @@ impl Synchronizer {
             // the RTP timestamp wraps at 2^32, so a report that is genuinely
             // newer can be numerically smaller than its predecessor.
             if current.ntp_time.units_since(last.ntp_time) <= 0
-                || current.rtp_time.numer().wrapping_sub(last.rtp_time.numer()) as i64 <= 0
+                || current
+                    .rtp_time
+                    .numer()
+                    .wrapping_sub(last.rtp_time.numer())
+                    .cast_signed()
+                    <= 0
             {
                 return;
             }
@@ -257,7 +271,8 @@ impl Synchronizer {
         let sender_rtp_delta = current
             .rtp_time
             .numer()
-            .wrapping_sub(first.rtp_time.numer()) as i64;
+            .wrapping_sub(first.rtp_time.numer())
+            .cast_signed();
         let sender_ntp_delta_secs = current
             .ntp_time
             .duration_since(first.ntp_time)
@@ -369,7 +384,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
@@ -472,8 +488,16 @@ mod tests {
             );
         }
 
-        assert_eq!(sync_perfect.estimated_clock_drift_ppm.round() as i64, 0);
-        assert_eq!(sync_drifting.estimated_clock_drift_ppm.round() as i64, 1000);
+        assert_eq!(
+            crate::bitrate::saturating_bps(sync_perfect.estimated_clock_drift_ppm.round())
+                .cast_signed(),
+            0
+        );
+        assert_eq!(
+            crate::bitrate::saturating_bps(sync_drifting.estimated_clock_drift_ppm.round())
+                .cast_signed(),
+            1000
+        );
 
         let event_time = base_time + Duration::from_secs(10);
 

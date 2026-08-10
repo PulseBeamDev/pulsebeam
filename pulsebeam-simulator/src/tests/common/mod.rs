@@ -4,7 +4,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 pub mod client;
 pub mod harness;
@@ -45,7 +46,7 @@ pub fn reserve_subnet() -> u8 {
          space another octet rather than letting the counter wrap."
     );
     // Avoid 0 and 255.
-    (1 + next) as u8
+    u8::try_from(1 + next).expect("the assertion above bounds this below 255")
 }
 
 pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {

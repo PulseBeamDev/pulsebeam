@@ -663,7 +663,10 @@ impl ShardRoutingTable {
     /// on the node so any shard that later subscribes can resolve them.
     pub fn publish_local_track(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
         let key = self.fanout_key(track_id);
-        self.tracks[key].layer_states = states;
+        let Some(entry) = self.tracks.get_mut(key) else {
+            pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+        };
+        entry.layer_states = states;
     }
 
     pub fn unpublish_local_track(&mut self, track_id: &TrackId) {
@@ -784,7 +787,9 @@ impl ShardRoutingTable {
         // fanout simply starts empty and fills on the next snapshot. Nothing is
         // read out of another shard's memory to seed it.
         let key = self.fanout_key(track.id);
-        let entry = &mut self.tracks[key];
+        let Some(entry) = self.tracks.get_mut(key) else {
+            pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+        };
         let already_subscribed = entry
             .subscribers
             .iter()
@@ -1193,7 +1198,9 @@ impl ShardRoutingTable {
     /// would double every frame.
     pub fn register_remote_subscriber_shard(&mut self, remote: RemoteRoute, track: TrackMeta) {
         let key = self.fanout_key(track.id);
-        let route = &mut self.tracks[key];
+        let Some(route) = self.tracks.get_mut(key) else {
+            pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+        };
         if let Some(existing) = route
             .remote_routes
             .iter_mut()
@@ -1235,7 +1242,10 @@ impl ShardRoutingTable {
         else {
             return;
         };
-        let held = entry.remote_routes[idx];
+        let Some(held) = entry.remote_routes.get(idx).copied() else {
+            debug_assert!(false, "position() returned an index the list does not hold");
+            return;
+        };
         if held.route != route || held.epoch != epoch {
             tracing::debug!(
                 %from_shard_id,
@@ -1265,7 +1275,9 @@ impl ShardRoutingTable {
         };
         if let Some(reverse) = track.reverse {
             let key = self.fanout_key(track.meta.id);
-            let entry = &mut self.tracks[key];
+            let Some(entry) = self.tracks.get_mut(key) else {
+                pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+            };
             entry.reverse = Some(reverse);
             entry.encodings = track.layers.iter().map(|l| l.rid).collect();
         }
@@ -1981,7 +1993,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // A fixture that overflows should fail the test, not clamp into a pass.
     #![allow(clippy::arithmetic_side_effects)]

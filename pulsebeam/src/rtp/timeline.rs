@@ -120,7 +120,11 @@ impl Timeline {
 
     #[inline]
     fn ticks(&self, d: Duration) -> u64 {
-        ((d.as_nanos().saturating_mul(self.clock_rate.get() as u128)) / 1_000_000_000u128) as u64
+        let ticks = d
+            .as_nanos()
+            .saturating_mul(u128::from(self.clock_rate.get()))
+            / 1_000_000_000u128;
+        u64::try_from(ticks).unwrap_or(u64::MAX)
     }
 
     /// Re-aligns the timeline to a new source stream starting with `packet`.
@@ -250,7 +254,8 @@ mod test {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
@@ -386,11 +391,12 @@ mod test {
         let first = first_out.unwrap();
         let last = last.unwrap();
         let ts_elapsed = last.rtp_ts.numer() - first.rtp_ts.numer();
-        let wall_ticks = (last
-            .playout_time
-            .duration_since(first.playout_time)
-            .as_secs_f64()
-            * 90_000.0) as u64;
+        let wall_ticks = crate::bitrate::saturating_bps(
+            last.playout_time
+                .duration_since(first.playout_time)
+                .as_secs_f64()
+                * 90_000.0,
+        );
         let skew_ms = ts_elapsed.abs_diff(wall_ticks) as f64 / 90.0;
         assert!(
             skew_ms < 50.0,

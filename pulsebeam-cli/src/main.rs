@@ -284,7 +284,7 @@ async fn spawn_agent(
                 let rx_bytes = stats.bytes_received();
                 let rtt_us = stats
                     .round_trip_time()
-                    .map(|rtt| rtt.as_micros() as u64)
+                    .map(|rtt| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX))
                     .unwrap_or(0);
                 let loss_pct = stats.receive_loss().unwrap_or(0.0);
 
@@ -331,7 +331,7 @@ async fn handle_receiving(mut track: RemoteTrack, ctx: AgentContext) {
                     captured_at: Instant::now(),
                     room_id: ctx.room_id,
                     agent_id: ctx.agent_id,
-                    delay_us: latency.as_micros() as u64,
+                    delay_us: u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
                 });
             }
         }

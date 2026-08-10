@@ -3,7 +3,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 #![allow(clippy::arithmetic_side_effects)] // plan generators, not production code
 //! Invariants that must hold across randomly generated networks.

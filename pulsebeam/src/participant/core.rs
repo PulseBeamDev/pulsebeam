@@ -650,7 +650,7 @@ impl ParticipantCore {
         let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
-            pkt.rtp_ts.numer() as u32,
+            u32::try_from(pkt.rtp_ts.numer() & u64::from(u32::MAX)).unwrap_or(0),
             now.into(),
             pkt.payload,
         )

@@ -148,7 +148,7 @@ impl Default for StreamStats {
 
 impl StreamStats {
     pub fn new(inactive: bool, bitrate_bps: u64, height: u32) -> Self {
-        let bps = bitrate_bps.min(u32::MAX as u64) as u32;
+        let bps = u32::try_from(bitrate_bps).unwrap_or(u32::MAX);
         Self {
             inactive,
             healthy: !inactive,
@@ -229,7 +229,7 @@ impl StreamStats {
 
     #[cfg(test)]
     pub fn bitrate(&mut self, bps: u64) -> &mut Self {
-        let v = bps.min(u32::MAX as u64) as u32;
+        let v = u32::try_from(bps).unwrap_or(u32::MAX);
         self.bitrate_bps = v;
         self.stable_bitrate_bps = v;
         self
@@ -237,7 +237,7 @@ impl StreamStats {
 
     #[cfg(test)]
     pub fn stable_bitrate(&mut self, bps: u64) -> &mut Self {
-        self.stable_bitrate_bps = bps.min(u32::MAX as u64) as u32;
+        self.stable_bitrate_bps = u32::try_from(bps).unwrap_or(u32::MAX);
         self
     }
 
@@ -275,11 +275,7 @@ impl StreamStats {
     /// rungs it no longer has.
     pub fn set_temporal_ladder(&mut self, cumulative_kbps: &[u64], full_fps: u32) {
         for (i, slot) in self.decode_target_kbps.iter_mut().enumerate() {
-            *slot = cumulative_kbps
-                .get(i)
-                .copied()
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32;
+            *slot = u32::try_from(cumulative_kbps.get(i).copied().unwrap_or(0)).unwrap_or(u32::MAX);
         }
         self.full_fps = full_fps;
     }
@@ -320,7 +316,7 @@ pub struct StreamMonitor {
 impl StreamMonitor {
     pub fn new(kind: TrackKind, stream_id: String, stats: StreamStats) -> Self {
         let now = Instant::now();
-        let nominal_bitrate_bps = stats.bitrate_bps() as u64;
+        let nominal_bitrate_bps = crate::bitrate::saturating_bps(stats.bitrate_bps());
         let audio_monitor = match kind {
             TrackKind::Audio => Some(AudioMonitor::new()),
             TrackKind::Video | TrackKind::Data => None,
@@ -374,7 +370,7 @@ impl StreamMonitor {
                     self.nominal_bitrate_bps
                 };
                 if activation_bitrate > 0 {
-                    let bps = activation_bitrate.min(u32::MAX as u64) as u32;
+                    let bps = u32::try_from(activation_bitrate).unwrap_or(u32::MAX);
                     self.stats.bitrate_bps = bps;
                     self.stats.stable_bitrate_bps = bps;
                     debug_assert_ne!(self.stats.bitrate_bps, 0);
@@ -501,8 +497,10 @@ impl StreamMonitor {
 
         // Both signals move together. They are fields of one value now, so that
         // is structural rather than something the packing arranged.
-        self.stats.bitrate_bps = (reactive as u64).min(u32::MAX as u64) as u32;
-        self.stats.stable_bitrate_bps = (stable as u64).min(u32::MAX as u64) as u32;
+        self.stats.bitrate_bps =
+            u32::try_from(crate::bitrate::saturating_bps(reactive)).unwrap_or(u32::MAX);
+        self.stats.stable_bitrate_bps =
+            u32::try_from(crate::bitrate::saturating_bps(stable)).unwrap_or(u32::MAX);
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             audio_monitor.poll(now);
         }
@@ -1426,7 +1424,10 @@ mod test {
 
     fn send_tick(bwe: &mut BitrateEstimate, now: &mut Instant, tick_dur: Duration, bps: f64) {
         *now += tick_dur;
-        let bytes = (bps * tick_dur.as_secs_f64() / 8.0) as usize;
+        let bytes = usize::try_from(crate::bitrate::saturating_bps(
+            bps * tick_dur.as_secs_f64() / 8.0,
+        ))
+        .unwrap_or(usize::MAX);
         bwe.record(&make_packet(*now, bytes));
         bwe.poll(*now);
     }

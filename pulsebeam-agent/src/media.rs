@@ -56,19 +56,23 @@ impl SharedH264Asset {
     fn frame_has_idr(frame: &[u8]) -> bool {
         let mut i = 0usize;
         while i.saturating_add(3) < frame.len() {
-            if frame[i] == 0 && frame[i.saturating_add(1)] == 0 {
-                let header_pos = if frame[i.saturating_add(2)] == 1 {
+            let (Some(&b0), Some(&b1), Some(&b2)) = (
+                frame.get(i),
+                frame.get(i.saturating_add(1)),
+                frame.get(i.saturating_add(2)),
+            ) else {
+                break;
+            };
+            if b0 == 0 && b1 == 0 {
+                let header_pos = if b2 == 1 {
                     i.saturating_add(3)
-                } else if i.saturating_add(4) < frame.len()
-                    && frame[i.saturating_add(2)] == 0
-                    && frame[i.saturating_add(3)] == 1
-                {
+                } else if b2 == 0 && frame.get(i.saturating_add(3)) == Some(&1) {
                     i.saturating_add(4)
                 } else {
                     i = i.saturating_add(1);
                     continue;
                 };
-                if header_pos < frame.len() && (frame[header_pos] & 0x1F) == 5 {
+                if frame.get(header_pos).is_some_and(|&b| b & 0x1F == 5) {
                     return true;
                 }
                 i = header_pos;
@@ -77,6 +81,24 @@ impl SharedH264Asset {
             }
         }
         false
+    }
+}
+
+/// Convert a computed rate or timestamp to an integer without letting a NaN or
+/// a negative silently become a plausible value — `as u64` yields 0 for both,
+/// which reads downstream as "no bitrate" or "time zero".
+pub(crate) fn saturating_u64_from_f64(v: f64) -> u64 {
+    debug_assert!(v.is_finite(), "{v} is not a finite quantity");
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to a positive, finite value below u64::MAX above"
+    )]
+    {
+        v.min(u64::MAX as f64) as u64
     }
 }
 
@@ -90,10 +112,15 @@ fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
     let mut out = frame.to_vec();
     let mut i = 0usize;
     while i.saturating_add(3) < out.len() {
-        if out[i] == 0 && out[i.saturating_add(1)] == 0 && out[i.saturating_add(2)] == 1 {
+        let start_code = out.get(i) == Some(&0)
+            && out.get(i.saturating_add(1)) == Some(&0)
+            && out.get(i.saturating_add(2)) == Some(&1);
+        if start_code {
             let header = i.saturating_add(3);
             // Keep forbidden_zero_bit + nal_ref_idc, replace only the 5-bit type.
-            out[header] = (out[header] & 0xE0) | NON_IDR_SLICE;
+            if let Some(byte) = out.get_mut(header) {
+                *byte = (*byte & 0xE0) | NON_IDR_SLICE;
+            }
             i = header.saturating_add(1);
         } else {
             i = i.saturating_add(1);
@@ -156,7 +183,17 @@ impl H264Looper {
     }
 
     fn next(&mut self) -> Arc<[u8]> {
-        let frame = &self.asset.frames[self.index];
+        debug_assert!(
+            self.index < self.asset.frames.len(),
+            "frame cursor left the asset"
+        );
+        let frame = self
+            .asset
+            .frames
+            .get(self.index)
+            .cloned()
+            .unwrap_or_default();
+        let frame = &frame;
         self.index = self
             .index
             .saturating_add(1)
@@ -385,7 +422,7 @@ impl VbrLooper {
             self.profile.idle_target_bps
         } as f64;
         self.declared_bps += (goal - self.declared_bps) * self.profile.target_step;
-        self.declared_bps.round() as u64
+        saturating_u64_from_f64(self.declared_bps.round())
     }
 
     pub fn new(data: &[u8], profile: VbrProfile) -> Self {
@@ -416,7 +453,11 @@ impl VbrLooper {
             .collect();
         debug_assert!(!frame_times.is_empty());
         debug_assert_eq!(looper.asset.frames.len(), frame_times.len());
-        debug_assert!(frame_times.windows(2).all(|pair| pair[0] < pair[1]));
+        debug_assert!(
+            frame_times
+                .windows(2)
+                .all(|pair| matches!(pair, [a, b] if a < b))
+        );
         looper.frame_times = Some(frame_times);
         looper
     }
@@ -427,13 +468,24 @@ impl VbrLooper {
         if self.small.is_empty() {
             return self.next();
         }
-        let idx = self.small[self.small_index.checked_rem(self.small.len()).unwrap_or(0)];
+        let slot = self.small_index.checked_rem(self.small.len()).unwrap_or(0);
+        let idx = self.small.get(slot).copied().unwrap_or(0);
         self.small_index = self.small_index.wrapping_add(1);
-        self.asset.frames[idx].clone()
+        self.asset.frames.get(idx).cloned().unwrap_or_default()
     }
 
     fn next(&mut self) -> Arc<[u8]> {
-        let frame = &self.asset.frames[self.index];
+        debug_assert!(
+            self.index < self.asset.frames.len(),
+            "frame cursor left the asset"
+        );
+        let frame = self
+            .asset
+            .frames
+            .get(self.index)
+            .cloned()
+            .unwrap_or_default();
+        let frame = &frame;
         self.index = self
             .index
             .saturating_add(1)
@@ -452,10 +504,13 @@ impl VbrLooper {
         if cycle.is_zero() {
             return true;
         }
-        let phase = elapsed
-            .as_nanos()
-            .checked_rem(cycle.as_nanos())
-            .unwrap_or(0) as u64;
+        let phase = u64::try_from(
+            elapsed
+                .as_nanos()
+                .checked_rem(cycle.as_nanos())
+                .unwrap_or(0),
+        )
+        .unwrap_or(u64::MAX);
         Duration::from_nanos(phase) < self.profile.active
     }
 
@@ -477,8 +532,9 @@ impl VbrLooper {
             let mut index = 0usize;
             loop {
                 debug_assert!(index < frame_times.len());
-                let due = loop_start
-                    .checked_add(frame_times[index])
+                let due = frame_times
+                    .get(index)
+                    .and_then(|offset| loop_start.checked_add(*offset))
                     .unwrap_or(loop_start);
                 tokio::time::sleep_until(due).await;
                 let now = tokio::time::Instant::now();
@@ -489,10 +545,10 @@ impl VbrLooper {
                 }
                 debug_assert!(index < self.asset.frames.len());
                 let frame = MediaFrame {
-                    ts: MediaTime::from_90khz(
-                        (now.duration_since(start).as_secs_f64() * clock_rate) as u64,
-                    ),
-                    data: self.asset.frames[index].clone(),
+                    ts: MediaTime::from_90khz(saturating_u64_from_f64(
+                        now.duration_since(start).as_secs_f64() * clock_rate,
+                    )),
+                    data: self.asset.frames.get(index).cloned().unwrap_or_default(),
                     capture_time: now,
                     abs_capture_time: Some(crate::clock::capture_wallclock()),
                     contiguous: true,
@@ -554,7 +610,9 @@ impl VbrLooper {
                 self.next_small()
             };
             let frame = MediaFrame {
-                ts: MediaTime::from_90khz((elapsed.as_secs_f64() * clock_rate) as u64),
+                ts: MediaTime::from_90khz(saturating_u64_from_f64(
+                    elapsed.as_secs_f64() * clock_rate,
+                )),
                 data,
                 capture_time: now,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
@@ -580,6 +638,19 @@ pub struct H264FrameSlicer<'a> {
     pos: usize,
 }
 
+/// Where the NAL header begins if an Annex-B start code (3- or 4-byte) sits at
+/// `at`, otherwise `None`.
+fn start_code_at(data: &[u8], at: usize) -> Option<usize> {
+    if data.get(at) != Some(&0) || data.get(at.saturating_add(1)) != Some(&0) {
+        return None;
+    }
+    match data.get(at.saturating_add(2)) {
+        Some(&1) => Some(at.saturating_add(3)),
+        Some(&0) if data.get(at.saturating_add(3)) == Some(&1) => Some(at.saturating_add(4)),
+        _ => None,
+    }
+}
+
 impl<'a> H264FrameSlicer<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
@@ -588,34 +659,21 @@ impl<'a> H264FrameSlicer<'a> {
     fn next_nalu_bounds(&self, start: usize) -> Option<(usize, usize, u8)> {
         let mut i = start;
         while i.saturating_add(3) < self.data.len() {
-            if self.data[i] == 0
-                && self.data[i.saturating_add(1)] == 0
-                && (self.data[i.saturating_add(2)] == 1
-                    || (self.data[i.saturating_add(2)] == 0 && self.data[i.saturating_add(3)] == 1))
-            {
-                let nalu_start = i;
-                let header_pos = if self.data[i.saturating_add(2)] == 1 {
-                    i.saturating_add(3)
-                } else {
-                    i.saturating_add(4)
-                };
-                let nalu_type = self.data[header_pos] & 0x1F;
+            let Some(header_pos) = start_code_at(self.data, i) else {
+                i = i.saturating_add(1);
+                continue;
+            };
+            let nalu_start = i;
+            let nalu_type = self.data.get(header_pos).map_or(0, |b| b & 0x1F);
 
-                let mut next = header_pos;
-                while next.saturating_add(3) < self.data.len() {
-                    if self.data[next] == 0
-                        && self.data[next.saturating_add(1)] == 0
-                        && (self.data[next.saturating_add(2)] == 1
-                            || (self.data[next.saturating_add(2)] == 0
-                                && self.data[next.saturating_add(3)] == 1))
-                    {
-                        return Some((nalu_start, next, nalu_type));
-                    }
-                    next = next.saturating_add(1);
+            let mut next = header_pos;
+            while next.saturating_add(3) < self.data.len() {
+                if start_code_at(self.data, next).is_some() {
+                    return Some((nalu_start, next, nalu_type));
                 }
-                return Some((nalu_start, self.data.len(), nalu_type));
+                next = next.saturating_add(1);
             }
-            i = i.saturating_add(1);
+            return Some((nalu_start, self.data.len(), nalu_type));
         }
         None
     }
@@ -624,17 +682,11 @@ impl<'a> H264FrameSlicer<'a> {
         match nalu_type {
             6..=9 => true,
             1 | 5 => {
-                let header_pos = if self.data[nalu_start.saturating_add(2)] == 1 {
-                    nalu_start.saturating_add(3)
-                } else {
-                    nalu_start.saturating_add(4)
-                };
-
-                if self.data.len() > header_pos.saturating_add(1) {
-                    let first_byte_of_slice_header = self.data[header_pos.saturating_add(1)];
-                    return (first_byte_of_slice_header & 0x80) != 0;
-                }
-                false
+                let header_pos = start_code_at(self.data, nalu_start)
+                    .unwrap_or_else(|| nalu_start.saturating_add(3));
+                self.data.get(header_pos.saturating_add(1)).is_some_and(
+                    |first_byte_of_slice_header| (first_byte_of_slice_header & 0x80) != 0,
+                )
             }
             _ => false,
         }
@@ -657,7 +709,7 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
         while let Some((n_start, n_end, n_type)) = self.next_nalu_bounds(search_pos) {
             if has_vcl && self.is_new_access_unit(n_type, n_start, n_end) {
                 self.pos = n_start;
-                return Some(&self.data[start_pos..n_start]);
+                return self.data.get(start_pos..n_start);
             }
 
             if n_type == 1 || n_type == 5 {
@@ -670,7 +722,7 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
 
         self.pos = self.data.len();
         if end_pos > start_pos {
-            Some(&self.data[start_pos..end_pos])
+            self.data.get(start_pos..end_pos)
         } else {
             None
         }

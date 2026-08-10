@@ -160,76 +160,54 @@ mod ice {
             return None;
         }
 
-        // 2. Check Message Type indicator (first two bits must be 00)
-        if data[0] & 0b1100_0000 != 0 {
+        // Message type: the first two bits must be 00.
+        if data.first()? & 0b1100_0000 != 0 {
             return None;
         }
 
-        // 3. Check Magic Cookie (bytes 4-7)
-        // We know data.len() >= 20, so slicing data[4..8] is safe.
-        if data[4..8] != MAGIC_COOKIE_BYTES {
+        if data.get(4..8) != Some(MAGIC_COOKIE_BYTES.as_slice()) {
             return None;
         }
 
-        // 4. Read Message Length (bytes 2-3) - Big Endian
-        // This is the length of the attributes *only*.
-        let message_length = u16::from_be_bytes([data[2], data[3]]) as usize;
+        // Message length covers the attributes only.
+        let message_length = usize::from(u16::from_be_bytes([*data.get(2)?, *data.get(3)?]));
 
-        // 5. Validate overall length
-        // The total expected size (header + attributes) must not exceed the buffer size.
+        // The declared total must actually be present, and a message with no
+        // attributes cannot carry a username.
         let expected_total_len = MIN_STUN_HEADER_SIZE.checked_add(message_length)?;
-        if data.len() < expected_total_len {
-            // Not enough data in the buffer according to the header's length field.
+        if data.len() < expected_total_len || message_length == 0 {
             return None;
         }
 
-        // Optimization: If message_length is 0, no attributes exist.
-        if message_length == 0 {
-            return None;
-        }
-
-        // --- Attribute Parsing ---
         let mut current_pos = MIN_STUN_HEADER_SIZE;
-        // Define the boundary for attribute data based *only* on the declared message_length.
-        // We trust message_length (after the data.len() check above) to define the attribute region.
-        let attributes_end = expected_total_len; // MIN_STUN_HEADER_SIZE + message_length;
+        // The attribute region is bounded by the declared length, which the
+        // check above proved is within the buffer.
+        let attributes_end = expected_total_len;
 
         while current_pos < attributes_end {
-            // Check if there's enough space for the attribute header (Type + Length)
-            // Need at least 4 bytes remaining *within the declared attribute region*.
             if current_pos.checked_add(ATTRIBUTE_HEADER_SIZE)? > attributes_end {
-                // Malformed: Not enough space left for an attribute header
-                // This could happen if the last attribute's padding calculation was wrong
-                // or if message_length implied space but the data buffer was actually shorter
-                // (although the earlier `data.len() < expected_total_len` check should catch the latter)
-                // or if the message_length is non-zero but doesn't even cover a single attribute header.
                 return None;
             }
 
-            let attr_type =
-                u16::from_be_bytes([data[current_pos], data[current_pos.saturating_add(1)]]);
-            let attr_value_len = u16::from_be_bytes([
-                data[current_pos.saturating_add(2)],
-                data[current_pos.saturating_add(3)],
-            ]) as usize;
+            let attr_type = u16::from_be_bytes([
+                *data.get(current_pos)?,
+                *data.get(current_pos.saturating_add(1))?,
+            ]);
+            let attr_value_len = usize::from(u16::from_be_bytes([
+                *data.get(current_pos.saturating_add(2))?,
+                *data.get(current_pos.saturating_add(3))?,
+            ]));
 
-            // Calculate start position of the attribute value
             let value_pos = current_pos.saturating_add(ATTRIBUTE_HEADER_SIZE);
 
-            // Check if the attribute value (based on its *own* length field) fits
-            // within the bounds defined by the *message* length field.
+            // An attribute may not claim more than the message length allows.
             let end_of_value = value_pos.checked_add(attr_value_len)?;
             if end_of_value > attributes_end {
-                // Malformed: Attribute claims to be longer than the remaining message length allows
                 return None;
             }
 
-            // *** Check if this is the USERNAME attribute ***
             if attr_type == USERNAME_ATTRIBUTE_TYPE {
-                // Found it! Return a slice pointing to the value.
-                // Slicing is safe because we checked:
-                // value_pos + attr_value_len <= attributes_end <= data.len()
-                return Some(&data[value_pos..end_of_value]);
+                return data.get(value_pos..end_of_value);
             }
 
             // Move to the next attribute.
@@ -275,12 +253,8 @@ mod ice {
 
     #[inline]
     fn first_token(input: &[u8], delimiter: u8) -> Option<&[u8]> {
-        for (i, &b) in input.iter().enumerate() {
-            if b == delimiter {
-                return Some(&input[..i]);
-            }
-        }
-        None
+        let i = input.iter().position(|&b| b == delimiter)?;
+        input.get(..i)
     }
 
     // --- Robust Test Suite ---
@@ -291,7 +265,8 @@ mod ice {
             clippy::expect_used,
             clippy::panic,
             clippy::unreachable,
-            clippy::string_slice
+            clippy::string_slice,
+            clippy::indexing_slicing
         )]
         // Convenience only: a test is not a shard, so nothing here is
         // cross-core, and a fixture may read the host clock. Allowed at the
@@ -336,7 +311,11 @@ mod ice {
                 );
 
                 buf.extend_from_slice(&attr_type.to_be_bytes());
-                buf.extend_from_slice(&(attr_value_len as u16).to_be_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(attr_value_len)
+                        .expect("fixture attr fits")
+                        .to_be_bytes(),
+                );
                 buf.extend_from_slice(attr_value);
 
                 // Add padding
@@ -355,7 +334,11 @@ mod ice {
             );
 
             // Write the actual message length (attribute part only)
-            buf[2..4].copy_from_slice(&(total_attr_len as u16).to_be_bytes());
+            buf[2..4].copy_from_slice(
+                &u16::try_from(total_attr_len)
+                    .expect("fixture length fits")
+                    .to_be_bytes(),
+            );
 
             buf
         }
@@ -522,7 +505,8 @@ mod ice {
                 &[(USERNAME_ATTRIBUTE_TYPE, username)], // Length should be 4+4=8
             );
             // Manually set message length to something larger than actual data size
-            let declared_len: u16 = (msg.len() - MIN_STUN_HEADER_SIZE + 1) as u16;
+            let declared_len: u16 =
+                u16::try_from(msg.len() - MIN_STUN_HEADER_SIZE + 1).expect("fixture length fits");
             msg[2..4].copy_from_slice(&declared_len.to_be_bytes());
 
             assert_eq!(find_stun_username_slice(&msg), None);
@@ -784,7 +768,8 @@ mod demux_tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // A fixture that overflows should fail the test, not clamp into a pass.
     #![allow(clippy::arithmetic_side_effects)]
@@ -818,12 +803,20 @@ mod demux_tests {
 
         let mut buf = Vec::with_capacity(20 + attr_total);
         buf.extend_from_slice(&BINDING_REQUEST);
-        buf.extend_from_slice(&(attr_total as u16).to_be_bytes()); // message length
+        buf.extend_from_slice(
+            &u16::try_from(attr_total)
+                .expect("fixture attr total fits")
+                .to_be_bytes(),
+        ); // message length
         buf.extend_from_slice(&MAGIC_COOKIE);
         buf.extend_from_slice(&[0u8; 12]); // transaction ID
         // USERNAME attribute
         buf.extend_from_slice(&USERNAME_TYPE);
-        buf.extend_from_slice(&(value_len as u16).to_be_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(value_len)
+                .expect("fixture value fits")
+                .to_be_bytes(),
+        );
         buf.extend_from_slice(value);
         buf.extend_from_slice(&vec![0u8; padded_len - value_len]); // padding
         buf
@@ -916,7 +909,7 @@ mod demux_tests {
         let encoded = ice.encode();
 
         // Fill up to the cap
-        for port in 0..MAX_ADDRS_PER_PARTICIPANT as u16 {
+        for port in 0..u16::try_from(MAX_ADDRS_PER_PARTICIPANT).expect("addr cap fits a u16") {
             let batch = make_batch(src(port), stun_with_ufrag(&encoded));
             assert_eq!(d.demux(&batch), Some(pid), "port {port} should route");
         }

@@ -69,22 +69,18 @@ impl NalFlags {
 
 impl std::fmt::Debug for NalFlags {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = [""; 3];
-        let mut n = 0;
-        for (present, name) in [
+        let parts: Vec<&str> = [
             (self.sps(), "sps"),
             (self.pps(), "pps"),
             (self.idr(), "idr"),
-        ] {
-            if present {
-                parts[n] = name;
-                n = n.saturating_add(1);
-            }
-        }
-        if n == 0 {
+        ]
+        .into_iter()
+        .filter_map(|(present, name)| present.then_some(name))
+        .collect();
+        if parts.is_empty() {
             f.write_str("NalFlags(-)")
         } else {
-            write!(f, "NalFlags({})", parts[..n].join("+"))
+            write!(f, "NalFlags({})", parts.join("+"))
         }
     }
 }
@@ -106,13 +102,20 @@ pub fn classify(payload: &[u8]) -> NalFlags {
         STAPA_NALU_TYPE => {
             let mut offset = STAPA_HEADER_SIZE;
             while offset.saturating_add(STAPA_NALU_LENGTH_SIZE) <= payload.len() {
-                let size =
-                    ((payload[offset] as usize) << 8) | payload[offset.saturating_add(1)] as usize;
+                let (Some(&hi), Some(&lo)) =
+                    (payload.get(offset), payload.get(offset.saturating_add(1)))
+                else {
+                    break;
+                };
+                let size = (usize::from(hi) << 8) | usize::from(lo);
                 offset = offset.saturating_add(STAPA_NALU_LENGTH_SIZE);
                 if size == 0 || offset.saturating_add(size) > payload.len() {
                     break;
                 }
-                flags.note_nalu_type(payload[offset] & NALU_TYPE_MASK);
+                let Some(&nalu) = payload.get(offset) else {
+                    break;
+                };
+                flags.note_nalu_type(nalu & NALU_TYPE_MASK);
                 offset = offset.saturating_add(size);
             }
         }
@@ -126,7 +129,9 @@ pub fn classify(payload: &[u8]) -> NalFlags {
             if payload.len() < header_size {
                 return flags;
             }
-            let fu_header = payload[1];
+            let Some(&fu_header) = payload.get(1) else {
+                return flags;
+            };
             if fu_header & FU_START_MASK != 0 {
                 flags.note_nalu_type(fu_header & NALU_TYPE_MASK);
             }
@@ -140,13 +145,20 @@ pub fn classify(payload: &[u8]) -> NalFlags {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )] // tests assert by panicking
     use super::*;
 
     /// A STAP-A aggregate: header byte, then `(u16 length, payload)` pairs.
     fn stapa(units: &[&[u8]]) -> Vec<u8> {
         let mut v = vec![STAPA_NALU_TYPE];
         for u in units {
-            v.extend_from_slice(&(u.len() as u16).to_be_bytes());
+            let len = u16::try_from(u.len()).expect("test NAL unit fits a STAP-A length field");
+            v.extend_from_slice(&len.to_be_bytes());
             v.extend_from_slice(u);
         }
         v
@@ -255,13 +267,13 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            let len = (state % 24) as usize;
+            let len = usize::try_from(state % 24).expect("a value below 24 fits usize");
             let buf: Vec<u8> = (0..len)
                 .map(|_| {
                     state ^= state << 13;
                     state ^= state >> 7;
                     state ^= state << 17;
-                    (state >> 32) as u8
+                    u8::try_from((state >> 32) & 0xff).expect("masked to one byte")
                 })
                 .collect();
             let _ = classify(&buf);

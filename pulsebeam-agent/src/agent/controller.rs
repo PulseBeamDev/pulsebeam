@@ -64,7 +64,7 @@ impl BitrateEstimate {
     fn advance_time(&mut self, time: Instant) {
         let current_tick = *self.tick_start.get_or_insert(time);
 
-        let tick = Duration::from_millis(Self::TICK_MS as u64);
+        let tick = Duration::from_millis(crate::media::saturating_u64_from_f64(Self::TICK_MS));
         if time < current_tick.checked_add(tick).unwrap_or(current_tick) {
             return;
         }
@@ -72,8 +72,11 @@ impl BitrateEstimate {
         let elapsed = time.saturating_duration_since(current_tick);
         let ticks_passed = elapsed
             .as_millis()
-            .checked_div(Self::TICK_MS as u128)
-            .unwrap_or(1) as usize;
+            .checked_div(u128::from(crate::media::saturating_u64_from_f64(
+                Self::TICK_MS,
+            )))
+            .and_then(|t| usize::try_from(t).ok())
+            .unwrap_or(1);
 
         let instant_bps = (self.accumulated_bytes as f64 * 8.0 * 1000.0) / Self::TICK_MS;
         self.push_tick(instant_bps);
@@ -87,7 +90,9 @@ impl BitrateEstimate {
         self.tick_start = Some(
             current_tick
                 .checked_add(Duration::from_millis(
-                    (ticks_passed as u64).saturating_mul(Self::TICK_MS as u64),
+                    u64::try_from(ticks_passed)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(crate::media::saturating_u64_from_f64(Self::TICK_MS)),
                 ))
                 .unwrap_or(current_tick),
         );
@@ -110,10 +115,13 @@ impl BitrateEstimate {
 
         let recent_len = self.raw_ticks.len();
         if recent_len >= 3 {
-            let a = self.raw_ticks[recent_len.saturating_sub(1)];
-            let b = self.raw_ticks[recent_len.saturating_sub(2)];
-            let c = self.raw_ticks[recent_len.saturating_sub(3)];
-            self.fast_trend_bps = a.max(b.min(c)).min(b.max(c));
+            let a = self.raw_ticks.get(recent_len.saturating_sub(1)).copied();
+            let b = self.raw_ticks.get(recent_len.saturating_sub(2)).copied();
+            let c = self.raw_ticks.get(recent_len.saturating_sub(3)).copied();
+            self.fast_trend_bps = match (a, b, c) {
+                (Some(a), Some(b), Some(c)) => a.max(b.min(c)).min(b.max(c)),
+                _ => 0.0,
+            };
         } else {
             self.fast_trend_bps = 0.0;
         }

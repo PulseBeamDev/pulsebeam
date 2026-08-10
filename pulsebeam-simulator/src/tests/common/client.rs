@@ -4,7 +4,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};

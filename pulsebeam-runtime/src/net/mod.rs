@@ -70,7 +70,7 @@ impl RecvPacketBatch {
     #[inline]
     pub fn data(&self) -> &[u8] {
         debug_assert!(self.len <= self.buf.len());
-        &self.buf[..self.len]
+        self.buf.get(..self.len).unwrap_or_default()
     }
 
     // https://stackoverflow.com/questions/68606470/how-to-return-a-reference-when-implementing-an-iterator
@@ -87,7 +87,7 @@ impl RecvPacketBatch {
         let tail = self.len.min(self.offset.saturating_add(self.stride));
         debug_assert!(tail > self.offset);
 
-        let buf = &self.buf[self.offset..tail];
+        let buf = self.buf.get(self.offset..tail)?;
         self.offset = tail;
         Some(buf)
     }
@@ -229,7 +229,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     use super::*;
     use std::net::SocketAddr;

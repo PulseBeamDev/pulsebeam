@@ -33,15 +33,20 @@ impl From<Truncated> for DdReadError {
 }
 
 pub fn read_mandatory(buf: &[u8]) -> Result<MandatoryFields, DdReadError> {
-    if buf.len() < MANDATORY_LEN {
+    const _: () = assert!(
+        MANDATORY_LEN == 3,
+        "the slice pattern below reads three bytes"
+    );
+
+    let [flags, frame_hi, frame_lo, ..] = *buf else {
         return Err(DdReadError::Truncated);
-    }
+    };
 
     Ok(MandatoryFields {
-        start_of_frame: buf[0] & 0b1000_0000 != 0,
-        end_of_frame: buf[0] & 0b0100_0000 != 0,
-        template_id: buf[0] & 0b0011_1111,
-        frame_number: u16::from_be_bytes([buf[1], buf[2]]),
+        start_of_frame: flags & 0b1000_0000 != 0,
+        end_of_frame: flags & 0b0100_0000 != 0,
+        template_id: flags & 0b0011_1111,
+        frame_number: u16::from_be_bytes([frame_hi, frame_lo]),
     })
 }
 
@@ -161,7 +166,9 @@ fn read_frame_dependencies(
         deps.frame_diffs.clear();
         let mut size = r.read_bits(2)?;
         while size > 0 {
-            let fdiff = (r.read_bits(4u32.saturating_mul(size))? as u16).saturating_add(1);
+            let fdiff = r
+                .read_bits_u16(4u32.saturating_mul(size))?
+                .saturating_add(1);
             deps.frame_diffs
                 .try_push(fdiff)
                 .map_err(|_| DdReadError::TooManyFrameDiffs)?;
@@ -171,7 +178,7 @@ fn read_frame_dependencies(
 
     if fields.custom_chains() {
         for chain_diff in &mut deps.chain_diffs {
-            *chain_diff = r.read_bits(8)? as u8;
+            *chain_diff = r.read_bits_u8(8)?;
         }
     }
 
@@ -179,8 +186,8 @@ fn read_frame_dependencies(
 }
 
 fn read_structure(r: &mut BitReader) -> Result<TemplateDependencyStructure, DdReadError> {
-    let template_id_offset = r.read_bits(6)? as u8;
-    let decode_target_count = (r.read_bits(5)? as u8).saturating_add(1);
+    let template_id_offset = r.read_bits_u8(6)?;
+    let decode_target_count = r.read_bits_u8(5)?.saturating_add(1);
     debug_assert!(decode_target_count as usize <= MAX_DECODE_TARGETS);
 
     let mut s = TemplateDependencyStructure {
@@ -273,7 +280,7 @@ fn read_template_fdiffs(
 ) -> Result<(), DdReadError> {
     for t in &mut s.templates {
         while r.read_bit()? != 0 {
-            let fdiff = (r.read_bits(4)? as u16).saturating_add(1);
+            let fdiff = r.read_bits_u16(4)?.saturating_add(1);
             t.frame_diffs
                 .try_push(fdiff)
                 .map_err(|_| DdReadError::TooManyFrameDiffs)?;
@@ -287,22 +294,22 @@ fn read_template_chains(
     s: &mut TemplateDependencyStructure,
 ) -> Result<(), DdReadError> {
     let dt_cnt = u32::from(s.decode_target_count);
-    let chain_count = r.read_ns(dt_cnt.saturating_add(1))?;
-    debug_assert!(chain_count <= dt_cnt);
-    s.chain_count = chain_count as u8;
+    let chain_count = r.read_ns_u8(dt_cnt.saturating_add(1))?;
+    debug_assert!(u32::from(chain_count) <= dt_cnt);
+    s.chain_count = chain_count;
     if chain_count == 0 {
         return Ok(());
     }
 
     for _ in 0..dt_cnt {
-        let protected_by = r.read_ns(chain_count)? as u8;
+        let protected_by = r.read_ns_u8(u32::from(chain_count))?;
         debug_assert!(s.decode_target_protected_by.len() < MAX_DECODE_TARGETS);
         s.decode_target_protected_by.push(protected_by);
     }
 
     for t in &mut s.templates {
         for _ in 0..chain_count {
-            let diff = r.read_bits(4)? as u8;
+            let diff = r.read_bits_u8(4)?;
             debug_assert!(t.chain_diffs.len() < MAX_CHAINS);
             t.chain_diffs.push(diff);
         }

@@ -4,7 +4,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, VideoReceiveStats};
 use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};

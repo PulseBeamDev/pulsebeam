@@ -205,7 +205,7 @@ impl UdpTransportReader {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf: self.arena[..n].to_vec(),
+                    buf: self.arena.get(..n).unwrap_or_default().to_vec(),
                     stride: n,
                     len: n,
                     offset: 0,

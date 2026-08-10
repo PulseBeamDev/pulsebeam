@@ -8,7 +8,8 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::unreachable
+    clippy::unreachable,
+    clippy::indexing_slicing
 )]
 
 use arrayvec::ArrayVec;
@@ -145,7 +146,8 @@ pub fn delta(
 ) -> DependencyDescriptor {
     let deps = structure.templates[template_index].clone();
     let template_id =
-        ((template_index + usize::from(structure.template_id_offset)) % MAX_TEMPLATES) as u8;
+        u8::try_from((template_index + usize::from(structure.template_id_offset)) % MAX_TEMPLATES)
+            .expect("reduced mod MAX_TEMPLATES, which is 64");
     DependencyDescriptor {
         start_of_frame: true,
         end_of_frame: true,

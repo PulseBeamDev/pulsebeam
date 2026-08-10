@@ -86,7 +86,7 @@ pub unsafe extern "C" fn getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> 
     if !served && fill_with_dev_urandom(dest).is_err() {
         return -1;
     }
-    buflen as isize
+    isize::try_from(buflen).unwrap_or(isize::MAX)
 }
 
 /// # Safety

@@ -202,7 +202,7 @@ impl RtpPacket {
 #[cfg(test)]
 pub mod test_utils {
     // A fixture that overflows should fail the test, not clamp into a pass.
-    #![allow(clippy::arithmetic_side_effects)]
+    #![allow(clippy::arithmetic_side_effects, clippy::expect_used)]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     #![allow(
@@ -362,7 +362,8 @@ pub mod test_utils {
         }
 
         fn packet(&mut self, payload: Vec<u8>, marker: bool, offset: usize) -> RtpPacket {
-            let at = self.clock + INTRA_FRAME_ARRIVAL * offset as u32;
+            let at = self.clock
+                + INTRA_FRAME_ARRIVAL * u32::try_from(offset).expect("offset fits a u32");
             let nal = crate::rtp::h264::classify(&payload);
             let pkt = RtpPacket {
                 ssrc: self.ssrc,

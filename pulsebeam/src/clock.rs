@@ -90,13 +90,20 @@ impl NtpTime {
 
     /// Bits 47..16 — what the envelope carries.
     pub const fn middle32(self) -> u32 {
-        (self.0 >> MID_SHIFT) as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the middle 32 bits are the wire format; the truncation is the encoding"
+        )]
+        {
+            (self.0 >> MID_SHIFT) as u32
+        }
     }
 
     /// Signed distance to `earlier`, in NTP 32.32 units. Positive when `self` is
     /// later.
     pub const fn units_since(self, earlier: Self) -> i64 {
-        self.0.wrapping_sub(earlier.0) as i64
+        // NTP differences are modular; the wrap is what carries the sign.
+        self.0.wrapping_sub(earlier.0).cast_signed()
     }
 
     /// Elapsed time since `earlier`, or zero when `self` precedes it.
@@ -280,12 +287,15 @@ impl NtpExpander {
     }
 
     pub fn expand(&mut self, mid: u32) -> Result<NtpTime, ExpandError> {
-        let gap = i64::from(mid.wrapping_sub(self.reference.middle32()) as i32);
+        // An era boundary must read as a negative gap, not a huge positive one.
+        let gap = i64::from(mid.wrapping_sub(self.reference.middle32()).cast_signed());
         if gap.abs() >= MAX_EXPANSION_GAP {
             return Err(ExpandError::Ambiguous { gap });
         }
 
-        let steps = ((self.reference.as_raw() >> MID_SHIFT) as i64).saturating_add(gap);
+        let steps = (self.reference.as_raw() >> MID_SHIFT)
+            .cast_signed()
+            .saturating_add(gap);
         debug_assert!(steps >= 0, "expansion underflowed the NTP epoch: {steps}");
         let expanded = NtpTime::from_raw((steps as u64) << MID_SHIFT);
         debug_assert_eq!(
@@ -307,7 +317,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

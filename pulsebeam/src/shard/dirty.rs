@@ -34,7 +34,10 @@ impl DirtyTracker {
             return;
         }
         debug_assert!(
-            !self.participants[self.cursor..]
+            !self
+                .participants
+                .get(self.cursor..)
+                .unwrap_or_default()
                 .iter()
                 .any(|entry| entry.handle == handle)
         );
@@ -76,7 +79,9 @@ impl DirtyTracker {
 
     #[cfg(test)]
     pub fn contains(&self, id: &ParticipantId) -> bool {
-        self.participants[self.cursor..]
+        self.participants
+            .get(self.cursor..)
+            .unwrap_or_default()
             .iter()
             .any(|entry| entry.handle.participant_id() == *id)
     }
@@ -89,7 +94,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

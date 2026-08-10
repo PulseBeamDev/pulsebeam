@@ -342,8 +342,8 @@ impl VideoAllocator {
         if !views.is_empty() {
             crate::sim_metrics::record_downstream_bwe(
                 &self.ctx.participant_id.to_string(),
-                available_bandwidth.as_f64() as u64,
-                desired.as_f64() as u64,
+                crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
+                crate::bitrate::saturating_bps(desired.as_f64()),
             );
             for view in &views {
                 let quality = match decisions.get(view.key) {
@@ -861,7 +861,7 @@ pub fn log_allocation(
     plog_info!(
         ctx,
         %bwe,
-        used = %Bitrate::from(total_used_bps as u64),
+        used = %Bitrate::from(crate::bitrate::saturating_bps(total_used_bps)),
         want = %desired,
         streams = %reports.join(" "),
         "downstream"
@@ -1277,7 +1277,9 @@ impl AllocationEngine {
             .map(|l| self.stable_cost(l))
             .sum();
         debug_assert!((0.0..1.0).contains(&Self::RESERVE_FRACTION));
-        Bitrate::from((total / (1.0 - Self::RESERVE_FRACTION)) as u64)
+        Bitrate::from(crate::bitrate::saturating_bps(
+            total / (1.0 - Self::RESERVE_FRACTION),
+        ))
     }
 
     fn used_bitrate(decisions: &SecondaryMap<SlotKey, AllocationDecision<'_>>) -> Bitrate {
@@ -1289,7 +1291,7 @@ impl AllocationEngine {
                 AllocationDecision::Pause(_, _) => None,
             })
             .sum::<f64>();
-        Bitrate::from(total as u64)
+        Bitrate::from(crate::bitrate::saturating_bps(total))
     }
 
     /// The layer that satisfies a slot's `min_height` floor: the lowest eligible
@@ -1431,17 +1433,21 @@ impl AllocationEngine {
                     Some(AllocationDecision::ForwardTarget(
                         layer,
                         target,
-                        Bitrate::from(dt_cost as u64),
+                        Bitrate::from(crate::bitrate::saturating_bps(dt_cost)),
                     ))
                 } else {
                     Some(AllocationDecision::Forward(
                         layer,
-                        Bitrate::from(self.cost(layer) as u64),
+                        Bitrate::from(crate::bitrate::saturating_bps(self.cost(layer))),
                     ))
                 }
             } else {
-                self.pause_target(slot)
-                    .map(|t| AllocationDecision::Pause(t, Bitrate::from(self.cost(t) as u64)))
+                self.pause_target(slot).map(|t| {
+                    AllocationDecision::Pause(
+                        t,
+                        Bitrate::from(crate::bitrate::saturating_bps(self.cost(t))),
+                    )
+                })
             };
             if let Some(decision) = decision {
                 decisions.insert(slot.key, decision);
@@ -1460,7 +1466,8 @@ mod alloc_test_support {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
@@ -1532,7 +1539,8 @@ mod assignment_tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
@@ -2269,7 +2277,8 @@ mod allocation_tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
@@ -2392,7 +2401,7 @@ mod allocation_tests {
     fn ample_budget_serves_every_slot_to_its_target() {
         let (t, states) = healthy_track();
         let high = layer_bps(&t, &states, LayerQuality::High);
-        let available = bw((high * 4.0) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(high * 4.0) / 1_000);
         let slots = sorted(vec![
             qos_slot("a", 1080, 0, 10, &t, LayerQuality::Low),
             qos_slot("b", 1080, 0, 5, &t, LayerQuality::Low),
@@ -2413,7 +2422,7 @@ mod allocation_tests {
         let (t, states) = healthy_track();
         let low = layer_bps(&t, &states, LayerQuality::Low);
         // Budget fits only one Low layer.
-        let available = bw((low as u64) / 1_000 + 5);
+        let available = bw(crate::bitrate::saturating_bps(low) / 1_000 + 5);
         let slots = sorted(vec![
             qos_slot("hi", 1080, 0, 100, &t, LayerQuality::Low),
             qos_slot("lo", 1080, 0, 0, &t, LayerQuality::Low),
@@ -2437,7 +2446,7 @@ mod allocation_tests {
         let high_h = state_of(&states, t.by_quality(LayerQuality::High).unwrap()).height();
         let high_bps = layer_bps(&t, &states, LayerQuality::High);
         // Enough for the pinned High plus a little — but not for a second High.
-        let available = bw((high_bps * 1.3) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(high_bps * 1.3) / 1_000);
 
         // Pinned: min_height == its High layer's height (floor == target), already
         // forwarding High. A lower-priority background stream joins.
@@ -2460,7 +2469,7 @@ mod allocation_tests {
         let low = layer_bps(&t, &states, LayerQuality::Low);
         let low_h = state_of(&states, t.by_quality(LayerQuality::Low).unwrap()).height();
         // Budget fits exactly one Low floor.
-        let available = bw((low as u64) / 1_000 + 5);
+        let available = bw(crate::bitrate::saturating_bps(low) / 1_000 + 5);
         let slots = sorted(vec![
             // Droppable (min_height 0), same priority as the floored one.
             qos_slot("drop", 1080, 0, 0, &t, LayerQuality::Low),
@@ -2976,7 +2985,7 @@ mod allocation_tests {
         let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
         // Budget just fits one Low layer (no headroom for downgrade guard).
-        let available = bw((low_bps as u64) / 1_000 + 5);
+        let available = bw(crate::bitrate::saturating_bps(low_bps) / 1_000 + 5);
 
         let slots = vec![
             SlotView {
@@ -3023,7 +3032,7 @@ mod allocation_tests {
             let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
             // Budget just barely covers one Low layer.
-            let available = bw((low_bps as u64) / 1_000 + 1);
+            let available = bw(crate::bitrate::saturating_bps(low_bps) / 1_000 + 1);
             let priority = 720;
 
             let mid_names: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
@@ -3165,8 +3174,10 @@ mod allocation_tests {
                 .min_by_key(|(quality, _, _, _)| *quality)
                 .map(|(_, bitrate, _, _)| *bitrate);
             let expected_per_slot = spatial_max.or(fallback).or(lowest_allowed).unwrap_or(0);
-            let expected = (expected_per_slot as f64 * slot_count as f64
-                / (1.0 - AllocationEngine::RESERVE_FRACTION)) as u64;
+            let expected = crate::bitrate::saturating_bps(
+                expected_per_slot as f64 * slot_count as f64
+                    / (1.0 - AllocationEngine::RESERVE_FRACTION),
+            );
             let desired = AllocationEngine::desired_bitrate(&slots, &states);
 
             prop_assert_eq!(desired.as_u64(), expected);
@@ -3188,7 +3199,7 @@ mod allocation_tests {
         let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
         // 5% below Low cost — inside the downgrade dead-band; no downgrade should fire.
-        let available = bw((low_bps * 0.95) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(low_bps * 0.95) / 1_000);
 
         let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
         let decisions = AllocationEngine::compute(available, &slots, &states);
@@ -3223,7 +3234,7 @@ mod allocation_tests {
         let low_bps = layer_bps(&t, &states, LayerQuality::Low);
         let low_h = state_of(&states, t.by_quality(LayerQuality::Low).unwrap()).height();
 
-        let tight = bw((low_bps * 0.5) as u64 / 1_000);
+        let tight = bw(crate::bitrate::saturating_bps(low_bps * 0.5) / 1_000);
         let slots = vec![qos_slot("a", 1080, low_h, 0, &t, LayerQuality::Low)];
 
         let decisions = AllocationEngine::compute(tight, &slots, &states);
@@ -3239,7 +3250,7 @@ mod allocation_tests {
         let (t, states) = healthy_track();
         let low_bps = layer_bps(&t, &states, LayerQuality::Low);
 
-        let available = bw((low_bps as u64) / 1_000 + 5);
+        let available = bw(crate::bitrate::saturating_bps(low_bps) / 1_000 + 5);
         let slots = sorted(vec![
             qos_slot("hi", 1080, 0, 100, &t, LayerQuality::Low),
             qos_slot("lo", 1080, 0, 0, &t, LayerQuality::Low),
@@ -3265,7 +3276,7 @@ mod allocation_tests {
         let low_bps = layer_bps(&t, &states, LayerQuality::Low);
         let low_h = state_of(&states, t.by_quality(LayerQuality::Low).unwrap()).height();
 
-        let tight = bw((low_bps * 0.3) as u64 / 1_000);
+        let tight = bw(crate::bitrate::saturating_bps(low_bps * 0.3) / 1_000);
         let slots = sorted(vec![
             qos_slot("hi", 1080, low_h, 100, &t, LayerQuality::Low),
             qos_slot("lo", 1080, low_h, 0, &t, LayerQuality::Low),
@@ -3299,7 +3310,7 @@ mod allocation_tests {
 
         // Budget is 80% of floor cost — below floor but above DOWNGRADE_FACTOR×floor.
         // The slot is currently forwarding at the floor (current_quality == Medium).
-        let available = bw((med_bps * 0.80) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(med_bps * 0.80) / 1_000);
         let slots = vec![qos_slot("a", 1080, med_h, 0, &t, LayerQuality::Medium)];
         let decisions = AllocationEngine::compute(available, &slots, &states);
 
@@ -3326,7 +3337,7 @@ mod allocation_tests {
         // Budget is 80% of floor cost. current_quality = Low (below floor) so
         // the slot was NOT previously forwarding at the floor → no hysteresis.
         // With no other eligible layer to fall back to, expect Pause.
-        let available = bw((med_bps * 0.80) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(med_bps * 0.80) / 1_000);
         let slots = vec![qos_slot("a", 1080, med_h, 0, &t, LayerQuality::Low)];
         let decisions = AllocationEngine::compute(available, &slots, &states);
 
@@ -3390,7 +3401,7 @@ mod allocation_tests {
         let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
 
         // Bandwidth comfortably covers the only healthy layer.
-        let available = bw((low_bps * 2.0) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(low_bps * 2.0) / 1_000);
         let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
@@ -3405,7 +3416,7 @@ mod allocation_tests {
         let low_bps = layer_bps(&t, &states, LayerQuality::Low);
         let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
         // Budget covers the lowest layer but not the next one up.
-        let available = bw((low_bps * 2.0) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(low_bps * 2.0) / 1_000);
         let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
@@ -3433,7 +3444,7 @@ mod allocation_tests {
 
         // Client requests max_height=180 (only the inactive Low would normally fit).
         let slots = sorted(vec![qos_slot("a", 180, 0, 0, &t, LayerQuality::Low)]);
-        let available = bw((med_bps * 2.0) as u64 / 1_000);
+        let available = bw(crate::bitrate::saturating_bps(med_bps * 2.0) / 1_000);
         let decisions = AllocationEngine::compute(available, &slots, &states);
 
         assert!(
@@ -3477,7 +3488,8 @@ mod slot_switch_tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

@@ -82,7 +82,8 @@ fn member_for(src: SocketAddr, dst: SocketAddr, members: usize) -> usize {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     src.hash(&mut hasher);
     dst.hash(&mut hasher);
-    hasher.finish().checked_rem(members as u64).unwrap_or(0) as usize
+    let idx = hasher.finish().checked_rem(members as u64).unwrap_or(0);
+    usize::try_from(idx).unwrap_or(0)
 }
 
 impl ReuseportGroup {
@@ -93,7 +94,10 @@ impl ReuseportGroup {
             return;
         }
         let idx = member_for(src, dst, members);
-        let inbox = &mut inboxes[idx];
+        let Some(inbox) = inboxes.get_mut(idx) else {
+            debug_assert!(false, "member_for chose {idx} of {members} members");
+            return;
+        };
         inbox.queue.push_back((payload, src));
         let ready = inbox.ready.clone();
         // Release the borrow before waking: the woken member reads the same
@@ -115,10 +119,16 @@ impl ReuseportMember {
         loop {
             let ready = {
                 let inboxes = self.group.inboxes.borrow();
-                if !inboxes[self.index].queue.is_empty() {
+                let Some(inbox) = inboxes.get(self.index) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "this socket's reuseport slot is gone",
+                    ));
+                };
+                if !inbox.queue.is_empty() {
                     return Ok(());
                 }
-                inboxes[self.index].ready.clone()
+                inbox.ready.clone()
             };
             ready.notified().await;
         }
@@ -127,9 +137,11 @@ impl ReuseportMember {
     /// Take the next datagram, or `WouldBlock` — the readiness contract the
     /// caller already expects from a socket.
     pub(crate) fn try_recv(&self) -> io::Result<(Vec<u8>, SocketAddr)> {
-        self.group.inboxes.borrow_mut()[self.index]
-            .queue
-            .pop_front()
+        self.group
+            .inboxes
+            .borrow_mut()
+            .get_mut(self.index)
+            .and_then(|inbox| inbox.queue.pop_front())
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "reuseport inbox is empty"))
     }
 }
@@ -173,7 +185,10 @@ fn spawn_pump(group: &Rc<ReuseportGroup>) {
             // datagram behind can park the pump with work outstanding.
             loop {
                 match socket.try_recv_from(&mut buf) {
-                    Ok((n, src)) => group.deliver(src, dst, buf[..n].to_vec()),
+                    Ok((n, src)) => match buf.get(..n) {
+                        Some(datagram) => group.deliver(src, dst, datagram.to_vec()),
+                        None => return,
+                    },
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => return,
                 }
@@ -237,7 +252,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     use super::member_for;
     use std::net::SocketAddr;

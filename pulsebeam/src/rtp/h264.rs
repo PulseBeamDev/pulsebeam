@@ -37,7 +37,9 @@ pub mod test_utils {
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
-        clippy::float_cmp
+        clippy::float_cmp,
+        clippy::indexing_slicing,
+        clippy::expect_used
     )]
     use super::*;
 
@@ -67,8 +69,8 @@ pub mod test_utils {
         let mut payload = vec![STAPA_NALU_TYPE];
         for &(ty, len) in nalus {
             assert!(len >= 1);
-            payload.push((len >> 8) as u8);
-            payload.push(len as u8);
+            let len16 = u16::try_from(len).expect("fixture NAL fits a length prefix");
+            payload.extend_from_slice(&len16.to_be_bytes());
             payload.push(ty & NALU_TYPE_MASK);
             payload.extend(std::iter::repeat_n(0u8, len - 1));
         }
@@ -103,7 +105,8 @@ mod test {
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
-        clippy::float_cmp
+        clippy::float_cmp,
+        clippy::indexing_slicing
     )]
     use super::test_utils::*;
     use super::*;

@@ -79,7 +79,11 @@ pub fn new_v8_sha3(namespace: &Uuid, name: &[u8]) -> Uuid {
 
     // Take the first 16 bytes of the SHA3-256 hash
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash[..16]);
+    if let Some(prefix) = hash.get(..16) {
+        bytes.copy_from_slice(prefix);
+    } else {
+        debug_assert!(false, "SHA3-256 produced fewer than 16 bytes");
+    }
 
     // Set Version to 8
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
@@ -481,7 +485,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

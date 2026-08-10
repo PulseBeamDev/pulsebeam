@@ -72,12 +72,20 @@ impl TcpSession {
                 self.close();
             }
             Ok(n) => {
-                self.recv_accum.extend_from_slice(&self.buf[..n]);
+                let Some(chunk) = self.buf.get(..n) else {
+                    debug_assert!(false, "recv reported {n} bytes into a smaller buffer");
+                    return;
+                };
+                self.recv_accum.extend_from_slice(chunk);
                 loop {
                     if self.recv_accum.len() < 2 {
                         break;
                     }
-                    let len = u16::from_be_bytes([self.recv_accum[0], self.recv_accum[1]]) as usize;
+                    let (Some(&hi), Some(&lo)) = (self.recv_accum.first(), self.recv_accum.get(1))
+                    else {
+                        break;
+                    };
+                    let len = usize::from(u16::from_be_bytes([hi, lo]));
                     if len == 0 || len > Self::MAX_FRAME {
                         tracing::warn!(len, "invalid TCP frame length, closing stream");
                         self.close();
@@ -121,7 +129,11 @@ impl TcpSession {
             return;
         }
 
-        let header = (length as u16).to_be_bytes();
+        let Ok(header_len) = u16::try_from(length) else {
+            tracing::error!("TCP payload exceeds 64KB RFC limit");
+            return;
+        };
+        let header = header_len.to_be_bytes();
 
         let mut packet = Vec::with_capacity(header.len().saturating_add(payload.len()));
         packet.extend_from_slice(&header);

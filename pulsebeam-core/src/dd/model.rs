@@ -207,6 +207,12 @@ impl DependencyDescriptor {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )] // tests assert by panicking
     use super::*;
 
     #[test]
@@ -233,7 +239,8 @@ mod tests {
         s.decode_target_count = 5;
         assert_eq!(s.all_decode_targets_bitmask(), 0b11111);
 
-        s.decode_target_count = MAX_DECODE_TARGETS as u8;
+        s.decode_target_count =
+            u8::try_from(MAX_DECODE_TARGETS).expect("MAX_DECODE_TARGETS fits a u8");
         assert_eq!(s.all_decode_targets_bitmask(), u32::MAX);
     }
 

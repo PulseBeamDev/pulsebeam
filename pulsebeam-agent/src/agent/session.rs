@@ -473,6 +473,12 @@ fn participant_availability(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )] // tests assert by panicking
     use super::*;
     use pulsebeam_proto::signaling::Track;
 

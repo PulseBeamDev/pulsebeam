@@ -595,7 +595,7 @@ impl AgentDriver {
                 _ = self.timers.notifier.notified() => {}
                 res = self.network.socket.recv_from(&mut self.network.buf) => {
                     if let Ok((n, source)) = res {
-                        match self.network.buf[..n].try_into() {
+                        match self.network.buf.get(..n).unwrap_or_default().try_into() {
                             Ok(contents) => {
                                 let _ = self.rtc.handle_input(Input::Receive(
                                     Instant::now().into(),
@@ -690,7 +690,8 @@ impl AgentDriver {
 
         while now >= self.timers.bwe_next_tick {
             let desired_bps = self.media.layer_ctrl.tick(now);
-            let desired_bitrate = Bitrate::from(desired_bps.max(0.0) as u64);
+            let desired_bitrate =
+                Bitrate::from(crate::media::saturating_u64_from_f64(desired_bps.max(0.0)));
             let filtered_bitrate = self.media.desired_ctrl.update(desired_bitrate);
             if filtered_bitrate != self.media.last_desired {
                 self.media.last_desired = filtered_bitrate;
@@ -760,7 +761,7 @@ impl AgentDriver {
                 let rtp = RtpWrite::new(
                     pt,
                     packet.seq,
-                    packet.ts.numer() as u32,
+                    u32::try_from(packet.ts.numer() & u64::from(u32::MAX)).unwrap_or(0),
                     packet.arrival.into(),
                     packet.payload,
                 )

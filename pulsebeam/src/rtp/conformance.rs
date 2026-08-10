@@ -3,7 +3,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 //! Overflow is allowed here: this module is `#[cfg(test)]`-only, and a check
 //! whose own arithmetic overflows should fail loudly rather than clamp into a

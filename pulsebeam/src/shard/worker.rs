@@ -302,7 +302,15 @@ impl ChannelTransport {
         if dst == self.shard_id {
             return true;
         }
-        self.frame_txs[dst.index()].try_send(ev).is_ok()
+        let Some(tx) = self.frame_txs.get(dst.index()) else {
+            debug_assert!(
+                false,
+                "shard {} is not in this node's frame table",
+                dst.index()
+            );
+            return false;
+        };
+        tx.try_send(ev).is_ok()
     }
 }
 
@@ -517,7 +525,8 @@ mod reverse_tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

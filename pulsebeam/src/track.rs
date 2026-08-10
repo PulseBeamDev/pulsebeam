@@ -586,7 +586,8 @@ pub mod test_utils {
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
-        clippy::float_cmp
+        clippy::float_cmp,
+        clippy::indexing_slicing
     )]
     use super::*;
 
@@ -890,7 +891,8 @@ mod data_track {
             clippy::expect_used,
             clippy::panic,
             clippy::unreachable,
-            clippy::string_slice
+            clippy::string_slice,
+            clippy::indexing_slicing
         )]
         // Convenience only: a test is not a shard, so nothing here is
         // cross-core, and a fixture may read the host clock. Allowed at the
@@ -1135,7 +1137,8 @@ mod dd_tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
@@ -1294,7 +1297,9 @@ mod vla_tests {
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
-        clippy::float_cmp
+        clippy::float_cmp,
+        clippy::expect_used,
+        clippy::indexing_slicing
     )]
     use super::vla_stream_target_bps;
     use str0m::rtp::vla::{
@@ -1331,7 +1336,10 @@ mod vla_tests {
         use str0m::rtp::vla::ResolutionAndFramerate;
 
         let mut s = stream(&[300, 450, 600]);
-        s.spatial_layers[0].resolution_and_framerate = Some(ResolutionAndFramerate {
+        s.spatial_layers
+            .first_mut()
+            .expect("fixture has a spatial layer")
+            .resolution_and_framerate = Some(ResolutionAndFramerate {
             width: 1280,
             height: 720,
             framerate: 30,
@@ -1399,7 +1407,8 @@ mod simulcast_pause_tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

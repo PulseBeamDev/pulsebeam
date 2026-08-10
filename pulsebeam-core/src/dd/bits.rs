@@ -54,6 +54,7 @@ impl<'a> BitReader<'a> {
         let mut pos = self.pos;
         while left > 0 {
             let byte = *self.buf.get(pos >> 3).ok_or(Truncated)?;
+            #[allow(clippy::cast_possible_truncation, reason = "`& 7` bounds it to 0..=7")]
             let bit_in_byte = (pos & 7) as u32;
             let avail = 8u32.saturating_sub(bit_in_byte);
             let take = avail.min(left);
@@ -70,6 +71,42 @@ impl<'a> BitReader<'a> {
 
         self.pos = pos;
         Ok(out)
+    }
+
+    /// Read `n` bits as a byte. `n` above 8 is a caller bug, not bad input, so
+    /// it is asserted rather than reported; the read is clamped so a release
+    /// build cannot silently drop the high bits.
+    pub fn read_bits_u8(&mut self, n: u32) -> Result<u8, Truncated> {
+        debug_assert!(n <= 8, "read_bits_u8({n}) cannot fit in a u8");
+        let v = self.read_bits(n.min(8))?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "at most 8 bits were read, so the value is 0..=255"
+        )]
+        Ok(v as u8)
+    }
+
+    /// Read `n` bits as a `u16`, under the same contract as [`Self::read_bits_u8`].
+    pub fn read_bits_u16(&mut self, n: u32) -> Result<u16, Truncated> {
+        debug_assert!(n <= 16, "read_bits_u16({n}) cannot fit in a u16");
+        let v = self.read_bits(n.min(16))?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "at most 16 bits were read, so the value is 0..=65535"
+        )]
+        Ok(v as u16)
+    }
+
+    /// [`Self::read_ns`] where the caller has bounded `n` to 256, so every
+    /// value in `0..n` is a byte.
+    pub fn read_ns_u8(&mut self, n: u32) -> Result<u8, Truncated> {
+        debug_assert!(n <= 256, "read_ns_u8({n}) can decode above a u8");
+        let v = self.read_ns(n.min(256))?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "read_ns yields values below n, and n is at most 256"
+        )]
+        Ok(v as u8)
     }
 
     /// AV1 non-symmetric encoding (`ns(n)`): values in `0..n` in `floor_log2(n)`
@@ -143,11 +180,17 @@ impl<'a> BitWriter<'a> {
         let mut pos = self.pos;
         while left > 0 {
             let byte = self.buf.get_mut(pos >> 3).ok_or(Overflow)?;
+            #[allow(clippy::cast_possible_truncation, reason = "`& 7` bounds it to 0..=7")]
             let bit_in_byte = (pos & 7) as u32;
             let avail = 8u32.saturating_sub(bit_in_byte);
             let take = avail.min(left);
             let chunk = (v >> left.saturating_sub(take)) & (1u32 << take).saturating_sub(1);
-            *byte |= (chunk as u8) << avail.saturating_sub(take);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "`take` is at most 8, so the mask leaves at most one byte"
+            )]
+            let chunk = chunk as u8;
+            *byte |= chunk << avail.saturating_sub(take);
             pos = pos.saturating_add(take as usize);
             left = left.saturating_sub(take);
         }
@@ -196,7 +239,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     use super::*;
     use proptest::prelude::*;

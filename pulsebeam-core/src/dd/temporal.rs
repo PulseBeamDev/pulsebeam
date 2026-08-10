@@ -34,6 +34,12 @@ fn dti(spec: &str) -> arrayvec::ArrayVec<DecodeTargetIndication, 32> {
 }
 
 fn template(temporal_id: u8, dti_spec: &str, frame_diff: &[u16]) -> FrameDependencyTemplate {
+    let chain_diff = frame_diff.first().copied().unwrap_or(0);
+    debug_assert!(
+        chain_diff <= u16::from(u8::MAX),
+        "chain diff {chain_diff} exceeds the 8-bit wire field"
+    );
+
     FrameDependencyTemplate {
         spatial_id: 0,
         temporal_id,
@@ -41,7 +47,7 @@ fn template(temporal_id: u8, dti_spec: &str, frame_diff: &[u16]) -> FrameDepende
         frame_diffs: frame_diff.iter().copied().collect(),
         // One chain protecting the base layer; enough for the SFU to reason about
         // temporal targets, whose membership is carried by the DTIs.
-        chain_diffs: [frame_diff.first().copied().unwrap_or(0) as u8]
+        chain_diffs: [u8::try_from(chain_diff).unwrap_or(u8::MAX)]
             .into_iter()
             .collect(),
     }
@@ -137,7 +143,11 @@ impl TemporalDdGenerator {
 
     /// The temporal id the next frame will carry.
     pub fn next_temporal_id(&self) -> u8 {
-        self.pattern[self.position]
+        debug_assert!(
+            self.position < self.pattern.len(),
+            "position left the pattern"
+        );
+        self.pattern.get(self.position).copied().unwrap_or(0)
     }
 
     /// Build the descriptor for the next frame. A keyframe restarts the pattern
@@ -146,8 +156,21 @@ impl TemporalDdGenerator {
         if is_keyframe {
             self.position = 0;
         }
-        let template_index = usize::from(self.pattern[self.position]);
-        let deps = self.structure.templates[template_index].clone();
+        let template_index = usize::from(self.next_temporal_id());
+        debug_assert!(
+            template_index < self.structure.templates.len(),
+            "temporal id {template_index} has no template"
+        );
+        let deps = self
+            .structure
+            .templates
+            .get(template_index)
+            .cloned()
+            .unwrap_or_default();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "reduced mod MAX_TEMPLATES, which is 64"
+        )]
         let template_id = ((template_index
             .saturating_add(usize::from(self.structure.template_id_offset)))
             % crate::dd::model::MAX_TEMPLATES) as u8;
@@ -210,7 +233,7 @@ impl TemporalDdSource {
         let mut buf = [0u8; crate::dd::model::MAX_DD_LEN];
         let n = self.writer.write(&dd, &mut buf).ok()?;
         Some(crate::dd::RawDependencyDescriptor(
-            buf[..n].iter().copied().collect(),
+            buf.get(..n)?.iter().copied().collect(),
         ))
     }
 }
@@ -223,7 +246,8 @@ mod test {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     use super::*;
     use crate::dd::read::DependencyDescriptorReader;

@@ -1,5 +1,23 @@
 use str0m::bwe::Bitrate;
 
+/// Convert a computed bitrate to an integer without letting a NaN or a negative
+/// silently become a plausible rate — `as u64` yields 0 for both, which the
+/// allocator then reads as "this stream costs nothing".
+pub fn saturating_bps(v: f64) -> u64 {
+    debug_assert!(v.is_finite(), "computed bitrate {v} is not finite");
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to a positive, finite value below u64::MAX above"
+    )]
+    {
+        v.min(u64::MAX as f64) as u64
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BitrateControllerConfig {
     pub min_bitrate: Bitrate,

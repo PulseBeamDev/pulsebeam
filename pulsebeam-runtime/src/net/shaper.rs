@@ -4,7 +4,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 //! A bottleneck link for the simulator: capacity, queueing delay, loss, and tail drop.
 //!
@@ -66,6 +67,24 @@ pub enum Capacity {
 }
 
 impl Capacity {
+    /// Interpolated bitrates arrive as `f64`. `as u64` on a NaN yields 0 and on
+    /// a negative yields 0 silently, so the clamp is explicit and the
+    /// non-finite case is asserted rather than absorbed.
+    fn bps_from_f64(v: f64) -> u64 {
+        debug_assert!(v.is_finite(), "interpolated bitrate {v} is not finite");
+        if !v.is_finite() || v <= 0.0 {
+            return 0;
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to a positive, finite value below u64::MAX above"
+        )]
+        {
+            v.min(u64::MAX as f64) as u64
+        }
+    }
+
     fn bits_per_sec_at(&self, elapsed: Duration) -> u64 {
         match *self {
             Capacity::Fixed(bps) => bps,
@@ -74,7 +93,7 @@ impl Capacity {
                     return to;
                 }
                 let t = elapsed.as_secs_f64() / over.as_secs_f64();
-                (from as f64 + (to as f64 - from as f64) * t) as u64
+                Self::bps_from_f64(from as f64 + (to as f64 - from as f64) * t)
             }
             Capacity::Oscillate { min, max, period } => {
                 if period.is_zero() {
@@ -87,7 +106,7 @@ impl Capacity {
                 } else {
                     (1.0 - phase) * 2.0
                 };
-                (min as f64 + (max as f64 - min as f64) * t) as u64
+                Self::bps_from_f64(min as f64 + (max as f64 - min as f64) * t)
             }
         }
     }

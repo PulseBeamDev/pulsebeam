@@ -102,7 +102,7 @@ impl BweFilter {
     }
 
     fn current(&self) -> Bitrate {
-        Bitrate::from(self.filtered_bps as u64)
+        Bitrate::from(crate::bitrate::saturating_bps(self.filtered_bps))
     }
 }
 
@@ -372,16 +372,19 @@ mod tests {
         let start = Instant::now();
         let initial = 300_000.0;
         let target = 1_300_000.0;
-        let mut filter = BweFilter::new(Bitrate::from(initial as u64));
+        let mut filter = BweFilter::new(Bitrate::from(crate::bitrate::saturating_bps(initial)));
 
-        filter.update(start, Bitrate::from(initial as u64));
+        filter.update(
+            start,
+            Bitrate::from(crate::bitrate::saturating_bps(initial)),
+        );
         filter.update(
             start + Duration::from_millis(100),
-            Bitrate::from(target as u64),
+            Bitrate::from(crate::bitrate::saturating_bps(target)),
         );
         filter.update(
             start + Duration::from_millis(200),
-            Bitrate::from(target as u64),
+            Bitrate::from(crate::bitrate::saturating_bps(target)),
         );
 
         assert_close(
@@ -400,16 +403,19 @@ mod tests {
         let start = Instant::now();
         let initial = 2_000_000.0;
         let target = 300_000.0;
-        let mut filter = BweFilter::new(Bitrate::from(initial as u64));
+        let mut filter = BweFilter::new(Bitrate::from(crate::bitrate::saturating_bps(initial)));
 
-        filter.update(start, Bitrate::from(initial as u64));
+        filter.update(
+            start,
+            Bitrate::from(crate::bitrate::saturating_bps(initial)),
+        );
         filter.update(
             start + Duration::from_millis(100),
-            Bitrate::from(target as u64),
+            Bitrate::from(crate::bitrate::saturating_bps(target)),
         );
         filter.update(
             start + Duration::from_millis(200),
-            Bitrate::from(target as u64),
+            Bitrate::from(crate::bitrate::saturating_bps(target)),
         );
 
         assert_close(
@@ -428,12 +434,15 @@ mod tests {
         let start = Instant::now();
         let initial = 300_000.0;
         let target = 4_200_000.0;
-        let mut filter = BweFilter::new(Bitrate::from(initial as u64));
+        let mut filter = BweFilter::new(Bitrate::from(crate::bitrate::saturating_bps(initial)));
 
-        filter.update(start, Bitrate::from(initial as u64));
+        filter.update(
+            start,
+            Bitrate::from(crate::bitrate::saturating_bps(initial)),
+        );
         filter.update(
             start + Duration::from_millis(100),
-            Bitrate::from(target as u64),
+            Bitrate::from(crate::bitrate::saturating_bps(target)),
         );
         for elapsed_ms in (200..=1_000).step_by(100) {
             filter.tick(start + Duration::from_millis(elapsed_ms));

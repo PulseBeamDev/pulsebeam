@@ -136,9 +136,13 @@ impl GsoSendBatch {
             debug_assert!(packet.start < packet.end);
             debug_assert!(packet.end <= self.arena.len());
             debug_assert_ne!(packet.segment_size, 0);
+            let Some(buf) = self.arena.get(packet.start..packet.end) else {
+                debug_assert!(false, "queued packet escapes the arena");
+                continue;
+            };
             packets.push(net::SendPacket {
                 dst: packet.dst,
-                buf: &self.arena[packet.start..packet.end],
+                buf,
                 segment_size: packet.segment_size,
             });
         }
@@ -387,7 +391,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

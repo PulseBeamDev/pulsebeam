@@ -104,8 +104,7 @@ impl TopNAudioSelector {
 
         // Step 2: Owner fast-path — update timestamps and forward.
         let owner_slot = self.slots.iter().position(|s| s.owner == Some(stream_id));
-        if let Some(idx) = owner_slot {
-            let slot = &mut self.slots[idx];
+        if let Some((idx, slot)) = owner_slot.and_then(|i| self.slots.get_mut(i).map(|s| (i, s))) {
             slot.last_arrival_ts = Some(now);
             // Peak-hold with decay: a single quiet packet must not instantly demote rank.
             slot.last_power = slot.last_power.max(power);
@@ -150,7 +149,7 @@ impl TopNAudioSelector {
 
         // Step 5: Execute the steal.
         let victim_idx = victim?;
-        let slot = &mut self.slots[victim_idx];
+        let slot = self.slots.get_mut(victim_idx)?;
         slot.owner = Some(stream_id);
         slot.last_arrival_ts = Some(now);
         slot.immunity_expiry = now.checked_add(NEWBORN_IMMUNITY).unwrap_or(now);
@@ -225,7 +224,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

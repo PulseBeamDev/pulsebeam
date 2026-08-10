@@ -169,10 +169,9 @@ async fn tcp_read_task(
     'outer: loop {
         // Decode all complete frames currently in the buffer before waiting.
         loop {
-            if recv_buf.len() < 2 {
+            let Some(len) = frame_len_at(&recv_buf, 0) else {
                 break;
-            }
-            let len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+            };
             if len == 0 || len > MAX_FRAME_SIZE {
                 tracing::warn!(%peer_addr, len, "Invalid TCP frame length, closing connection");
                 break 'outer;
@@ -222,7 +221,10 @@ async fn tcp_read_task(
         let mut tmp = [0u8; 4096];
         match read.try_read(&mut tmp) {
             Ok(0) => break, // EOF
-            Ok(n) => recv_buf.put_slice(&tmp[..n]),
+            Ok(n) => match tmp.get(..n) {
+                Some(chunk) => recv_buf.put_slice(chunk),
+                None => break,
+            },
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => {
                 tracing::warn!(%peer_addr, error = ?e, "TCP read error");
@@ -349,10 +351,9 @@ impl TcpTransport {
             let mut pos = BytesMut::from(pending.as_ref());
             pending.clear();
             loop {
-                if pos.len() < 2 {
+                let Some(len) = frame_len_at(&pos, 0) else {
                     break;
-                }
-                let len = u16::from_be_bytes([pos[0], pos[1]]) as usize;
+                };
                 if len == 0 || len > MAX_FRAME_SIZE || pos.len() < len.saturating_add(2) {
                     break;
                 }
@@ -504,8 +505,15 @@ impl TcpTransport {
             let end = offset
                 .saturating_add(batch.segment_size)
                 .min(batch.buf.len());
-            let seg = &batch.buf[offset..end];
-            buf.put_u16(seg.len() as u16);
+            let Some(seg) = batch.buf.get(offset..end) else {
+                debug_assert!(false, "segment {offset}..{end} escapes the batch");
+                break;
+            };
+            let Ok(seg_len) = u16::try_from(seg.len()) else {
+                debug_assert!(false, "segment of {} bytes has no 16-bit length", seg.len());
+                break;
+            };
+            buf.put_u16(seg_len);
             buf.put_slice(seg);
             offset = end;
         }
@@ -525,7 +533,9 @@ impl TcpTransport {
                         if self.drop_count.is_multiple_of(100) {
                             tracing::warn!("udp dropped a packet due to full socket");
                         }
-                        self.drop_count = self.drop_count.saturating_add(dropped as usize);
+                        self.drop_count = self
+                            .drop_count
+                            .saturating_add(usize::try_from(dropped).unwrap_or(usize::MAX));
                     }
                     break;
                 }
@@ -540,6 +550,14 @@ impl TcpTransport {
     }
 }
 
+/// The RFC 4571 big-endian length prefix at `offset`, or `None` if fewer than
+/// two bytes remain there.
+fn frame_len_at(buf: &[u8], offset: usize) -> Option<usize> {
+    let hi = *buf.get(offset)?;
+    let lo = *buf.get(offset.saturating_add(1))?;
+    Some(usize::from(u16::from_be_bytes([hi, lo])))
+}
+
 /// How many RFC 4571 frames a buffer holds, counting a trailing incomplete one.
 ///
 /// Feeds the dropped-packet counter, so an over-count reports congestion that
@@ -550,7 +568,9 @@ fn count_rfc4571_frames(buf: &[u8]) -> u64 {
     let mut count = 0u64;
     let mut offset = 0usize;
     while offset.saturating_add(2) <= buf.len() {
-        let len = u16::from_be_bytes([buf[offset], buf[offset.saturating_add(1)]]) as usize;
+        let Some(len) = frame_len_at(buf, offset) else {
+            return count.saturating_add(1);
+        };
         if len == 0 {
             return count.saturating_add(1);
         }
@@ -575,7 +595,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     use super::*;
     use pulsebeam_core::net::TcpListener;
@@ -663,7 +684,7 @@ mod tests {
             for cut in 0..=full.len() {
                 let n = count_rfc4571_frames(&full[..cut]);
                 assert!(
-                    n as usize <= full.len(),
+                    usize::try_from(n).expect("count fits usize") <= full.len(),
                     "prefix of {cut} reported {n} frames"
                 );
             }
@@ -682,11 +703,11 @@ mod tests {
                         state ^= state << 13;
                         state ^= state >> 7;
                         state ^= state << 17;
-                        (state >> 24) as u8
+                        u8::try_from((state >> 24) & 0xff).expect("masked to a byte")
                     })
                     .collect();
                 let n = count_rfc4571_frames(&buf);
-                assert!(n as usize <= buf.len().max(1));
+                assert!(usize::try_from(n).expect("count fits usize") <= buf.len().max(1));
             }
         }
     }
@@ -728,7 +749,8 @@ mod tests {
             let p2 = b"packet2-longer";
             let mut frame_bytes = Vec::new();
             for p in [p1.as_slice(), p2.as_slice()] {
-                frame_bytes.extend_from_slice(&(p.len() as u16).to_be_bytes());
+                let plen = u16::try_from(p.len()).expect("test frame fits a length prefix");
+                frame_bytes.extend_from_slice(&plen.to_be_bytes());
                 frame_bytes.extend_from_slice(p);
             }
             client.write_all(&frame_bytes).await.unwrap();
@@ -785,8 +807,8 @@ mod tests {
             // Build the RFC 4571-framed wire bytes (length header + payload) exactly
             // as read_first_tcp_frame would produce them.
             let mut wire = Vec::with_capacity(2 + payload.len());
-            wire.push((payload.len() >> 8) as u8);
-            wire.push(payload.len() as u8);
+            let plen = u16::try_from(payload.len()).expect("test frame fits a length prefix");
+            wire.extend_from_slice(&plen.to_be_bytes());
             wire.extend_from_slice(&payload);
 
             sock.add_connection(

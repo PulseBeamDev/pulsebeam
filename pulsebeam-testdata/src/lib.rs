@@ -3,6 +3,12 @@
 //! Overflow is explicit here, denied workspace-wide, so
 //! the start-code scan states its bounds rather than relying on the `while`
 //! guard three lines up.
+//!
+//! Indexing exception, crate-wide: this crate only ever parses the fixture
+//! files compiled into it, and it is only ever linked by tests. An index that
+//! leaves the buffer is a broken fixture, and failing the test run is the
+//! reporting mechanism — unlike the SFU, there is no session here to protect.
+#![allow(clippy::indexing_slicing)]
 
 pub const RAW_H264_FULL_CBR: &[u8] = include_bytes!("full_f_cbr.h264");
 pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");
@@ -110,7 +116,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     use super::*;
 

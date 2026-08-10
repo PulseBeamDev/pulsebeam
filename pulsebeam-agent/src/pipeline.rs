@@ -385,7 +385,7 @@ fn temporal_cumulative_kbps(
         .map(|k| {
             let frac = 0.5 + 0.5 * (k as f64) / (layers.saturating_sub(1) as f64);
             TemporalLayerAllocation {
-                cumulative_kbps: ((full_kbps as f64) * frac).round() as u64,
+                cumulative_kbps: crate::media::saturating_u64_from_f64((full_kbps as f64) * frac),
             }
         })
         .collect()
@@ -399,7 +399,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     use super::*;
 
@@ -424,7 +425,9 @@ mod tests {
         let mut sender = FrameSender::new(mid, None, 1, 1);
         let mut receiver = FrameReceiver::new();
 
-        let payload: Vec<u8> = (0..3000u32).map(|i| (i * 5 + 1) as u8).collect();
+        let payload: Vec<u8> = (0..3000u32)
+            .map(|i| u8::try_from((i * 5 + 1) % 256).expect("masked to a byte"))
+            .collect();
         let packets = sender.packetize(&frame(payload.clone(), true));
         assert!(packets.len() > 1, "should split across packets");
         assert!(packets.last().unwrap().marker, "last packet ends the frame");
@@ -452,7 +455,9 @@ mod tests {
         let mut sender = FrameSender::new(mid, None, 1, 1);
         let mut receiver = FrameReceiver::new();
 
-        let payload: Vec<u8> = (0..3000u32).map(|i| (i * 5 + 1) as u8).collect();
+        let payload: Vec<u8> = (0..3000u32)
+            .map(|i| u8::try_from((i * 5 + 1) % 256).expect("masked to a byte"))
+            .collect();
         let mut packets = sender.packetize(&frame(payload.clone(), true));
         assert!(packets.len() >= 3);
         packets.reverse();
@@ -502,7 +507,7 @@ mod tests {
             seq: SeqNo::from(seq),
             ts: MediaTime::from_90khz(seq * 3000),
             marker: true,
-            payload: Arc::from([seq as u8].as_slice()),
+            payload: Arc::from([u8::try_from(seq % 256).expect("masked to a byte")].as_slice()),
             ext_vals: ExtensionValues::default(),
             arrival: base + Duration::from_millis(at_ms),
         };

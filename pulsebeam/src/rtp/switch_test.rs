@@ -3,7 +3,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unreachable,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::indexing_slicing
 )] // test / simulation support
 #![allow(clippy::arithmetic_side_effects)] // test harness; an overflow here should fail the test
 //! End-to-end stream-switching tests.
@@ -402,7 +403,9 @@ fn repeated_switching_does_not_drift_the_output_clock() {
     let wall_elapsed = last
         .playout_time
         .saturating_duration_since(first.playout_time);
-    let wall_ticks = (wall_elapsed.as_secs_f64() * rtp::VIDEO_FREQUENCY.get() as f64) as u64;
+    let wall_ticks = crate::bitrate::saturating_bps(
+        wall_elapsed.as_secs_f64() * f64::from(rtp::VIDEO_FREQUENCY.get()),
+    );
 
     let skew_ticks = ts_elapsed.abs_diff(wall_ticks);
     let skew_ms = skew_ticks as f64 / 90.0;
@@ -529,7 +532,7 @@ fn switching_mid_gop_does_not_walk_the_output_clock_away_from_real_time() {
     // the resulting PLI.
     const SWITCHES: usize = 25;
     for round in 0..SWITCHES {
-        let target = (round % 2) as LayerId;
+        let target = LayerId::try_from(round % 2).expect("layer index fits");
 
         // A few frames into the GOP, the allocator decides to move.
         for _ in 0..4 {
@@ -576,7 +579,8 @@ fn switching_mid_gop_does_not_walk_the_output_clock_away_from_real_time() {
     let wall = last
         .playout_time
         .saturating_duration_since(first.playout_time);
-    let wall_ticks = (wall.as_secs_f64() * rtp::VIDEO_FREQUENCY.get() as f64) as u64;
+    let wall_ticks =
+        crate::bitrate::saturating_bps(wall.as_secs_f64() * f64::from(rtp::VIDEO_FREQUENCY.get()));
     let skew_ms = ts_elapsed.abs_diff(wall_ticks) as f64 / 90.0;
 
     assert!(
@@ -724,7 +728,7 @@ fn run_switch_workload(seed: u64, switches: usize, gap_frames: usize) -> Forward
             fwd.ingest_all(1, &f);
         }
 
-        let target = (round % 2) as LayerId;
+        let target = LayerId::try_from(round % 2).expect("layer index fits");
         fwd.switch_to(target);
         let kf = if target == 0 {
             pubr.high.keyframe(3)

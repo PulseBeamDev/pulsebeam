@@ -43,9 +43,16 @@ impl ShardRouter {
         let mut total_load = 0f64;
 
         for shard_idx in 0..shard_count {
-            let snapshot = self.shard_contexts[shard_idx].metrics.snapshot();
-            let load = snapshot.delta_load(&self.shard_occupancy_snapshots[shard_idx]);
-            self.shard_occupancy_snapshots[shard_idx] = snapshot;
+            let (Some(ctx), Some(previous)) = (
+                self.shard_contexts.get(shard_idx),
+                self.shard_occupancy_snapshots.get_mut(shard_idx),
+            ) else {
+                debug_assert!(false, "shard {shard_idx} has no context or snapshot");
+                continue;
+            };
+            let snapshot = ctx.metrics.snapshot();
+            let load = snapshot.delta_load(previous);
+            *previous = snapshot;
             let load = self.update_load(shard_idx, load);
             peak_load = peak_load.max(load);
             total_load += load;
@@ -90,9 +97,7 @@ impl ShardRouter {
         let mut best_index = None;
         let mut max_hash = -1.0;
 
-        for i in 0..self.shard_loads.len() {
-            let load = self.shard_loads[i];
-
+        for (i, &load) in self.shard_loads.iter().enumerate() {
             // Protect core real-time execution deadlines
             if load >= MAX_LOAD {
                 continue;
@@ -132,7 +137,13 @@ impl ShardRouter {
     }
 
     fn get_mut(&mut self, shard_id: ShardId) -> &mut mailbox::Sender<ShardCommand> {
-        &mut self.shard_contexts[shard_id.index()].command_tx
+        let Some(ctx) = self.shard_contexts.get_mut(shard_id.index()) else {
+            pulsebeam_runtime::fatal!(
+                "shard {} is not in this node's shard table",
+                shard_id.index()
+            )
+        };
+        &mut ctx.command_tx
     }
 }
 
@@ -144,7 +155,8 @@ mod tests {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

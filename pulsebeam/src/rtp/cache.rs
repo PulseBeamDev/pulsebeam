@@ -104,8 +104,9 @@ impl StreamCache {
     /// The packet occupying `seq`'s slot, if that slot actually holds `seq`.
     #[inline]
     fn slot(&self, seq: u64) -> Option<&RtpPacket> {
-        self.ring[(seq & CACHE_MASK) as usize]
-            .as_ref()
+        self.ring
+            .get((seq & CACHE_MASK) as usize)
+            .and_then(Option::as_ref)
             .filter(|p| *p.seq_no == seq)
     }
 
@@ -140,7 +141,12 @@ impl StreamCache {
 
         // Placing the packet naturally evicts whatever occupied its slot
         // `CAPACITY` positions ago — no eviction loop needed.
-        self.ring[(seq & CACHE_MASK) as usize] = Some(pkt);
+        if let Some(slot) = self.ring.get_mut((seq & CACHE_MASK) as usize) {
+            *slot = Some(pkt);
+        } else {
+            debug_assert!(false, "CACHE_MASK produced an index outside the ring");
+            return None;
+        }
         self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
 
         if is_keyframe && self.segment_ts != Some(frame_ts) {
@@ -222,7 +228,7 @@ impl StreamCache {
         // Refuse the replay; a fresh PLI-driven keyframe will be clean.
         if segment
             .windows(2)
-            .any(|w| w[1].rtp_ts.numer() < w[0].rtp_ts.numer())
+            .any(|w| matches!(w, [a, b] if b.rtp_ts.numer() < a.rtp_ts.numer()))
         {
             return None;
         }
@@ -248,7 +254,7 @@ impl StreamCache {
             return None;
         }
 
-        let clock_rate = segment[0].rtp_ts.frequency().get() as u64;
+        let clock_rate = u64::from(segment.first()?.rtp_ts.frequency().get());
         let span = seen_ts.unwrap_or(segment_ts).saturating_sub(segment_ts);
         if span > clock_rate.saturating_mul(MAX_REPLAY_SPAN_MS) / 1000 {
             return None;
@@ -283,7 +289,8 @@ impl StreamCache {
         );
         debug_assert!(out.iter().any(|p| p.is_keyframe), "replay lacks a keyframe");
         debug_assert!(
-            out.windows(2).all(|w| *w[0].seq_no <= *w[1].seq_no),
+            out.windows(2)
+                .all(|w| matches!(w, [a, b] if *a.seq_no <= *b.seq_no)),
             "replay must be ordered by sequence number"
         );
         Some(out)
@@ -417,7 +424,10 @@ impl TrackStreamCache {
                 self.encodings.len().saturating_sub(1)
             }
         };
-        &mut self.encodings[pos].1
+        let Some((_, cache)) = self.encodings.get_mut(pos) else {
+            pulsebeam_runtime::fatal!("encoding slot {pos} vanished after being pushed")
+        };
+        cache
     }
 }
 
@@ -432,7 +442,8 @@ mod test {
         clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
-        clippy::string_slice
+        clippy::string_slice,
+        clippy::indexing_slicing
     )]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.

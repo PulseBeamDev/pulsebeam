@@ -6,9 +6,28 @@ use super::participants::{LocalParticipantKey, ParticipantHandle};
 
 const SLOT_COUNT: usize = 256;
 const OCCUPANCY_WORDS: usize = SLOT_COUNT / u64::BITS as usize;
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "SLOT_COUNT is 256, asserted below"
+)]
 const DUE_LOCATION: u16 = SLOT_COUNT as u16;
+const _: () = assert!(SLOT_COUNT == 256, "slot_of() relies on a 256-slot wheel");
 const DISARMED_LOCATION: u16 = DUE_LOCATION + 1;
 const MAX_DEADLINE_TICKS: u64 = 101;
+
+/// The wheel slot a tick falls in.
+///
+/// The wheel has exactly `SLOT_COUNT` slots, so this is the tick modulo the
+/// wheel size. The wrap is the addressing scheme, not a lost value.
+fn slot_of(tick: u64) -> u8 {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "SLOT_COUNT is 256, so the low byte is the slot index"
+    )]
+    {
+        tick as u8
+    }
+}
 
 #[derive(Clone, Copy)]
 struct TimerNode {
@@ -75,7 +94,7 @@ impl TimerWheel {
                 self.current_tick
                     .saturating_add((SLOT_COUNT as u64).saturating_sub(1)),
             );
-            (u16::from(deadline_tick as u8), deadline_tick)
+            (u16::from(slot_of(deadline_tick)), deadline_tick)
         };
 
         if let Some(node) = self.nodes.get(handle.key()) {
@@ -117,7 +136,7 @@ impl TimerWheel {
         let mut offset = 1;
         while offset < SLOT_COUNT {
             let tick = self.current_tick.saturating_add(offset as u64);
-            if self.slot_occupied(tick as u8) {
+            if self.slot_occupied(usize::from(slot_of(tick))) {
                 return Some(
                     self.epoch
                         .checked_add(Duration::from_millis(tick))
@@ -137,12 +156,12 @@ impl TimerWheel {
         if target_tick.saturating_sub(self.current_tick) >= SLOT_COUNT as u64 {
             self.current_tick = target_tick;
             for slot in 0..SLOT_COUNT {
-                self.drain_location(slot as u16, &mut f);
+                self.drain_location(u16::try_from(slot).unwrap_or(DISARMED_LOCATION), &mut f);
             }
         } else {
             while self.current_tick < target_tick {
                 self.current_tick = self.current_tick.saturating_add(1);
-                self.drain_location(u16::from(self.current_tick as u8), &mut f);
+                self.drain_location(u16::from(slot_of(self.current_tick)), &mut f);
             }
         }
         debug_assert_eq!(self.current_tick, target_tick);
@@ -154,7 +173,7 @@ impl TimerWheel {
             let id = if location == DUE_LOCATION {
                 self.due_head
             } else {
-                self.heads[location as usize]
+                self.heads.get(usize::from(location)).copied().flatten()
             };
             let Some(id) = id else {
                 break;
@@ -181,7 +200,7 @@ impl TimerWheel {
         let old_head = if location == DUE_LOCATION {
             self.due_head
         } else {
-            self.heads[location as usize]
+            self.heads.get(usize::from(location)).copied().flatten()
         };
 
         {
@@ -210,9 +229,13 @@ impl TimerWheel {
         if location == DUE_LOCATION {
             self.due_head = Some(id);
         } else {
-            let slot = location as usize;
-            self.heads[slot] = Some(id);
-            self.set_occupied(slot as u8);
+            let slot = usize::from(location);
+            if let Some(head) = self.heads.get_mut(slot) {
+                *head = Some(id);
+                self.set_occupied(slot);
+            } else {
+                debug_assert!(false, "link target {location} is not a wheel slot");
+            }
         }
     }
 
@@ -236,9 +259,13 @@ impl TimerWheel {
             debug_assert_eq!(self.due_head.map(|v| v == id), Some(true));
             self.due_head = node.next;
         } else {
-            let slot = node.location as usize;
-            debug_assert_eq!(self.heads[slot].map(|v| v == id), Some(true));
-            self.heads[slot] = node.next;
+            let slot = usize::from(node.location);
+            if let Some(head) = self.heads.get_mut(slot) {
+                debug_assert_eq!(head.map(|v| v == id), Some(true));
+                *head = node.next;
+            } else {
+                debug_assert!(false, "unlink target {slot} is not a wheel slot");
+            }
         }
 
         if let Some(next) = node.next {
@@ -253,9 +280,9 @@ impl TimerWheel {
         }
 
         if node.location != DUE_LOCATION {
-            let slot = node.location as usize;
-            if self.heads[slot].is_none() {
-                self.clear_occupied(slot as u8);
+            let slot = usize::from(node.location);
+            if self.heads.get(slot).copied().flatten().is_none() {
+                self.clear_occupied(slot);
             }
         }
 
@@ -280,19 +307,22 @@ impl TimerWheel {
         u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
 
-    fn slot_occupied(&self, slot: u8) -> bool {
-        let slot = slot as usize;
-        self.occupied[slot / 64] & (1 << (slot % 64)) != 0
+    fn slot_occupied(&self, slot: usize) -> bool {
+        self.occupied
+            .get(slot / 64)
+            .is_some_and(|word| word & (1 << (slot % 64)) != 0)
     }
 
-    fn set_occupied(&mut self, slot: u8) {
-        let slot = slot as usize;
-        self.occupied[slot / 64] |= 1 << (slot % 64);
+    fn set_occupied(&mut self, slot: usize) {
+        if let Some(word) = self.occupied.get_mut(slot / 64) {
+            *word |= 1 << (slot % 64);
+        }
     }
 
-    fn clear_occupied(&mut self, slot: u8) {
-        let slot = slot as usize;
-        self.occupied[slot / 64] &= !(1 << (slot % 64));
+    fn clear_occupied(&mut self, slot: usize) {
+        if let Some(word) = self.occupied.get_mut(slot / 64) {
+            *word &= !(1 << (slot % 64));
+        }
     }
 }
 
@@ -303,7 +333,8 @@ mod tests {
     #![allow(
         clippy::disallowed_types,
         clippy::disallowed_methods,
-        clippy::float_cmp
+        clippy::float_cmp,
+        clippy::indexing_slicing
     )]
     use super::*;
     use crate::entity::ParticipantId;
