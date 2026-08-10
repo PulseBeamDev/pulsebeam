@@ -230,8 +230,8 @@ impl DataStreamRoute {
             debug_assert!(false, "detaching an unknown remote subscriber shard");
             return;
         };
-        debug_assert!(entry.refs > 0);
-        entry.refs -= 1;
+        debug_assert!(entry.refs > 0, "refcount underflow would leak this route");
+        entry.refs = entry.refs.saturating_sub(1);
         if entry.refs == 0 {
             self.remote_subscriber_shards.remove(&shard_id);
         }

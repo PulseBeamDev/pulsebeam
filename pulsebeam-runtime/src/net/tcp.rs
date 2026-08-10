@@ -322,7 +322,9 @@ impl TcpTransport {
 
         if let Err(e) = stream.set_nodelay(true) {
             if let Some(count) = self.ip_counts.get_mut(&peer_ip) {
-                *count -= 1;
+                // Wrapping here would pin the per-IP count near u32::MAX and
+                // lock that address out of the node for good.
+                *count = count.saturating_sub(1);
             } else {
                 debug_assert!(false, "per-IP count vanished between insert and rollback");
             }

@@ -166,10 +166,28 @@ too_many_arguments = "deny"
 #                      in shard/core.rs exist so a dispatch shape cannot be
 #                      referenced from anywhere else. Satisfying the lint means
 #                      hoisting private types to module scope, which is worse.
-#   indexing_slicing   246 production sites. Bounds are asserted with
-#                      debug_assert! per CLAUDE.md; 246 allows would bury the
+#   indexing_slicing   177 production sites. Bounds are asserted with
+#                      debug_assert! per CLAUDE.md; 177 allows would bury the
 #                      signal this table exists to carry.
-#   unwrap_used        48 production sites. Worth doing, but as its own change.
+#   arithmetic_side_effects
+#                      271 production sites, and the one that most deserves to
+#                      be on. `overflow-checks` is off in release, so an
+#                      underflowing `a - b` on an unsigned does not stop — it
+#                      yields ~1.8e19 and the allocator, pacer or jitter
+#                      estimator treats it as a measurement. There is no
+#                      assertion in the build where it matters.
+#
+#                      Every subtraction reachable from the media path was read
+#                      when this note was written and all were guarded, so this
+#                      is about the next one, not a bug on the floor today. Two
+#                      refcount decrements were made saturating anyway, because
+#                      their wrap does not crash, it leaks: the count never
+#                      reaches zero and the route or the per-IP ban outlives
+#                      what it was counting.
+#
+#                      Turn it on per module, starting where wrap-around
+#                      semantics are load-bearing — clock.rs, rtp/sync.rs,
+#                      rtp/timeline.rs, route.rs — rather than workspace-wide.
 #   cast_*             The 203 is all four cast lints together, and it is
 #                      mostly `cast_precision_loss` on counters going into f64
 #                      for metrics — harmless. `cast_possible_truncation` alone
