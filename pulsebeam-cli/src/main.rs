@@ -1,3 +1,13 @@
+//! Shared-state exception, crate-wide: A command-line tool. Not a shard.
+//! The thread-per-core restriction in `docs/thread-per-core.md` applies to the
+//! `pulsebeam` SFU crate.
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
@@ -140,7 +150,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
     let latency_writer_handle = tokio::spawn(latency_writer_task(latency_rx, latency_csv));
     let snapshot_writer_handle = tokio::spawn(snapshot_writer_task(snapshot_rx, snapshots_csv));
 
-    let mut total_rooms = 0;
+    let mut total_rooms = 0usize;
     for room_id in 0..config.rooms {
         spawn_room(
             &mut join_set,
@@ -151,7 +161,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
             assets.clone(),
         )
         .await;
-        total_rooms += 1;
+        total_rooms = total_rooms.saturating_add(1);
     }
 
     // Monitor for room generation loops alongside early manual interruption signals
@@ -169,7 +179,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
                 tokio::time::sleep(delay).await;
 
                 spawn_room(&mut join_set, &api_url, total_rooms, &config, logger.clone(), assets.clone()).await;
-                total_rooms += 1;
+                total_rooms = total_rooms.saturating_add(1);
             }
             // Keep running inside this block until all active agents complete their session schedules
             while join_set.join_next().await.is_some() {}
@@ -196,17 +206,18 @@ async fn spawn_room(
     logger: Logger,
     assets: VideoAssets,
 ) {
-    let room_name = format!("bench-room-{}", room_id);
+    let room_name = format!("bench-room-{room_id}");
 
     for user_id in 0..config.users_per_room {
-        let delay_ms = rand::random_range(0u64..(config.join_spread_secs * 1_000).max(1));
+        let delay_ms =
+            rand::random_range(0u64..config.join_spread_secs.saturating_mul(1_000).max(1));
         let session_duration = Duration::from_secs(config.session_duration);
         let simulcast = config.simulcast;
 
         let ctx = AgentContext {
             api_url: api_url.to_string(),
             room_id,
-            agent_id: room_id * 1000 + user_id,
+            agent_id: room_id.saturating_mul(1000).saturating_add(user_id),
             logger: logger.clone(),
             assets: assets.clone(),
         };
@@ -227,7 +238,8 @@ async fn spawn_agent(
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &ctx.api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
+    let mut builder =
+        AgentBuilder::new(api, socket).with_local_ip(std::net::Ipv4Addr::LOCALHOST.into());
 
     if simulcast {
         builder = builder.video_upstream_slots(
@@ -331,7 +343,7 @@ async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -
     let _ = writer
         .write_all("elapsed_ms,room_id,agent_id,delay_us\n".as_bytes())
         .await;
-    let mut count = 0;
+    let mut count = 0usize;
 
     while let Ok(e) = rx.recv().await {
         let _ = writer
@@ -346,7 +358,7 @@ async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -
                 .as_bytes(),
             )
             .await;
-        count += 1;
+        count = count.saturating_add(1);
 
         if count >= 1000 {
             let _ = writer.flush().await;
@@ -388,7 +400,6 @@ async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File)
 fn get_looper(rid: Option<&str>, assets: &VideoAssets) -> H264Looper {
     let data = match rid {
         Some("f") => &assets.full,
-        Some("h") => &assets.half,
         Some("q") => &assets.quarter,
         _ => &assets.half,
     };

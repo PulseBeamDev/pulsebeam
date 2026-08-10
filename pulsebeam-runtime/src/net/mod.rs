@@ -217,12 +217,20 @@ fn fmt_bytes(b: usize) -> String {
     } else if b >= KB {
         format!("{}KB", b / KB)
     } else {
-        format!("{}B", b)
+        format!("{b}B")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
     use super::*;
     use std::net::SocketAddr;
 

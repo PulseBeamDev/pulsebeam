@@ -1,4 +1,8 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
+//! Shared-state exception, crate-wide: The test/reference client. Not a shard — it is an ordinary async program.
+//! The thread-per-core restriction in `docs/thread-per-core.md` applies to the
+//! `pulsebeam` SFU crate.
+#![allow(clippy::disallowed_types)]
 
 pub use bytes::Bytes;
 use std::sync::Arc;

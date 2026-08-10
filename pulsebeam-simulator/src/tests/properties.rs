@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
+#![allow(clippy::arithmetic_side_effects)] // plan generators, not production code
 //! Invariants that must hold across randomly generated networks.
 //!
 //! The hand-written plans in `bwe.rs` each pin one scenario someone thought of. That is worth

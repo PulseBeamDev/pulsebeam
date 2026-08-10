@@ -1,3 +1,16 @@
+//! Fixtures for the Dependency Descriptor tests.
+//!
+//! Overflow is allowed here, unlike the code under test: a fixture that
+//! overflows should fail the test loudly rather than clamp into a value that
+//! makes it pass.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
+
 use arrayvec::ArrayVec;
 
 use super::model::*;

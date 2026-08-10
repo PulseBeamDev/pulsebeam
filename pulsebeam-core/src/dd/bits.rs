@@ -1,3 +1,10 @@
+//! Bitstream primitives for the AV1 Dependency Descriptor.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`.
+//! This parses attacker-supplied bytes, and `overflow-checks` is off in
+//! release, so a wrapped offset or width would not stop — it would read the
+//! wrong bits and hand up a descriptor that looks valid.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Truncated;
 
@@ -17,7 +24,7 @@ impl<'a> BitReader<'a> {
     pub fn with_offset(buf: &'a [u8], bit_offset: usize) -> Self {
         Self {
             buf,
-            pos: bit_offset.min(buf.len() * 8),
+            pos: bit_offset.min(buf.len().saturating_mul(8)),
         }
     }
 
@@ -26,7 +33,7 @@ impl<'a> BitReader<'a> {
     }
 
     pub fn remaining(&self) -> usize {
-        self.buf.len() * 8 - self.pos
+        (self.buf.len().saturating_mul(8)).saturating_sub(self.pos)
     }
 
     pub fn read_bit(&mut self) -> Result<u32, Truncated> {
@@ -48,13 +55,17 @@ impl<'a> BitReader<'a> {
         while left > 0 {
             let byte = *self.buf.get(pos >> 3).ok_or(Truncated)?;
             let bit_in_byte = (pos & 7) as u32;
-            let avail = 8 - bit_in_byte;
+            let avail = 8u32.saturating_sub(bit_in_byte);
             let take = avail.min(left);
-            let shift = avail - take;
-            let mask = if take == 8 { 0xff } else { (1u32 << take) - 1 };
+            let shift = avail.saturating_sub(take);
+            let mask = if take == 8 {
+                0xff
+            } else {
+                (1u32 << take).saturating_sub(1)
+            };
             out = (out << take) | ((byte as u32 >> shift) & mask);
-            pos += take as usize;
-            left -= take;
+            pos = pos.saturating_add(take as usize);
+            left = left.saturating_sub(take);
         }
 
         self.pos = pos;
@@ -69,13 +80,13 @@ impl<'a> BitReader<'a> {
             return Ok(0);
         }
 
-        let w = floor_log2(n) + 1;
-        let m = (1u32 << w) - n;
-        let v = self.read_bits(w - 1)?;
+        let w = floor_log2(n).saturating_add(1);
+        let m = (1u32 << w).saturating_sub(n);
+        let v = self.read_bits(w.saturating_sub(1))?;
         let out = if v < m {
             v
         } else {
-            (v << 1) - m + self.read_bit()?
+            (v << 1).saturating_sub(m).saturating_add(self.read_bit()?)
         };
 
         debug_assert!(out < n, "ns({n}) decoded {out} out of range");
@@ -86,7 +97,7 @@ impl<'a> BitReader<'a> {
         if self.remaining() < n {
             return Err(Truncated);
         }
-        self.pos += n;
+        self.pos = self.pos.saturating_add(n);
         Ok(())
     }
 }
@@ -119,22 +130,26 @@ impl<'a> BitWriter<'a> {
         if n == 0 {
             return Ok(());
         }
-        if self.buf.len() * 8 - self.pos < n as usize {
+        if (self.buf.len().saturating_mul(8)).saturating_sub(self.pos) < n as usize {
             return Err(Overflow);
         }
 
-        let v = if n == 32 { v } else { v & ((1u32 << n) - 1) };
+        let v = if n == 32 {
+            v
+        } else {
+            v & (1u32 << n).saturating_sub(1)
+        };
         let mut left = n;
         let mut pos = self.pos;
         while left > 0 {
             let byte = self.buf.get_mut(pos >> 3).ok_or(Overflow)?;
             let bit_in_byte = (pos & 7) as u32;
-            let avail = 8 - bit_in_byte;
+            let avail = 8u32.saturating_sub(bit_in_byte);
             let take = avail.min(left);
-            let chunk = (v >> (left - take)) & ((1u32 << take) - 1);
-            *byte |= (chunk as u8) << (avail - take);
-            pos += take as usize;
-            left -= take;
+            let chunk = (v >> left.saturating_sub(take)) & (1u32 << take).saturating_sub(1);
+            *byte |= (chunk as u8) << avail.saturating_sub(take);
+            pos = pos.saturating_add(take as usize);
+            left = left.saturating_sub(take);
         }
 
         self.pos = pos;
@@ -148,13 +163,13 @@ impl<'a> BitWriter<'a> {
             return Ok(());
         }
 
-        let w = floor_log2(n) + 1;
-        let m = (1u32 << w) - n;
+        let w = floor_log2(n).saturating_add(1);
+        let m = (1u32 << w).saturating_sub(n);
         if v < m {
-            self.write_bits(v, w - 1)
+            self.write_bits(v, w.saturating_sub(1))
         } else {
-            let x = v + m;
-            self.write_bits(x >> 1, w - 1)?;
+            let x = v.saturating_add(m);
+            self.write_bits(x >> 1, w.saturating_sub(1))?;
             self.write_bit(x & 1 == 1)
         }
     }
@@ -168,11 +183,21 @@ impl<'a> BitWriter<'a> {
 
 fn floor_log2(v: u32) -> u32 {
     debug_assert!(v > 0);
-    u32::BITS - 1 - v.leading_zeros()
+    u32::BITS
+        .saturating_sub(1)
+        .saturating_sub(v.leading_zeros())
 }
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
     use super::*;
     use proptest::prelude::*;
 
@@ -261,11 +286,20 @@ mod tests {
         fn bits_roundtrip_arbitrary_widths(chunks in prop::collection::vec((0u32..=32, any::<u32>()), 1..24)) {
             let mut buf = [0u8; 128];
             let total: u32 = chunks.iter().map(|(n, _)| n).sum();
-            prop_assume!(total as usize <= buf.len() * 8);
+            prop_assume!(total as usize <= buf.len().saturating_mul(8));
 
             let masked: Vec<(u32, u32)> = chunks
                 .iter()
-                .map(|&(n, v)| (n, if n == 32 { v } else if n == 0 { 0 } else { v & ((1u32 << n) - 1) }))
+                .map(|&(n, v)| {
+                    let masked = if n == 32 {
+                        v
+                    } else if n == 0 {
+                        0
+                    } else {
+                        v & (1u32 << n).saturating_sub(1)
+                    };
+                    (n, masked)
+                })
                 .collect();
 
             let mut w = BitWriter::new(&mut buf);

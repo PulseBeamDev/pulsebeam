@@ -140,6 +140,7 @@ fn tcp_simulation_test() {
 fn tcp_multi_shard_simulation_test() {
     LocalNodeSim::new()
         .with_shards(2)
+        .with_tcp_only()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -401,4 +402,49 @@ fn abrupt_exit_chaos_test() {
                 .allow_missing_parameter_sets(1),
         },
     ]);
+}
+
+/// Media crossing a shard boundary, end to end, over UDP.
+///
+/// With `room_shard_slot(1)` the publisher and each subscriber land on
+/// *different* shards, so every forwarded packet is addressed by a route the
+/// destination allocated, wrapped in a `MediaEnvelope`, resolved by index and
+/// epoch, and restamped onto the receiving shard's timeline. A room below the
+/// spill threshold is co-located and reaches none of that — which is why the
+/// older multi-shard test, with four participants and a slot of sixteen, never
+/// exercised it despite the name.
+///
+/// Over UDP, so the shard each participant lands on is chosen by the
+/// `SO_REUSEPORT` group hashing its 4-tuple — the same mechanism a deployment
+/// relies on, rather than the TCP fallback the multi-shard tests started on.
+#[test]
+fn cross_shard_video_is_forwarded_decodably_test() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob"))
+                .with_participant(Participant::subscriber("carol")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice publishes; Bob and Carol subscribe from other shards",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckCrossShardMedia {
+                description: "media genuinely crossed a shard boundary",
+                min_frames: 100,
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes a stream that crossed a shard boundary",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100).allow_gaps(5),
+            },
+            Step::CheckVideoQuality {
+                description: "Carol decodes it too, over her own route",
+                participant: "carol",
+                quality: VideoQuality::min_frames(100).allow_gaps(5),
+            },
+        ]);
 }

@@ -60,12 +60,12 @@ impl FramePacketizer {
         let mtu = self.mtu;
         let total = self.packet_count(frame);
         (0..total).map(move |i| {
-            let start = i * mtu;
-            let end = ((i + 1) * mtu).min(frame.len());
+            let start = i.saturating_mul(mtu);
+            let end = i.saturating_add(1).saturating_mul(mtu).min(frame.len());
             FrameChunk {
                 data: &frame[start..end],
                 start_of_frame: i == 0,
-                end_of_frame: i == total - 1,
+                end_of_frame: i == total.saturating_sub(1),
             }
         })
     }
@@ -154,7 +154,7 @@ impl FrameDepacketizer {
                     last_seq: seq,
                 });
             }
-            seq += 1;
+            seq = seq.saturating_add(1);
         }
     }
 
@@ -174,6 +174,14 @@ impl FrameDepacketizer {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
     use super::*;
 
     fn chunks(frame: &[u8], mtu: usize) -> Vec<FrameChunk<'_>> {

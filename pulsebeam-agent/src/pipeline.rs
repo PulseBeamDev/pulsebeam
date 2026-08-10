@@ -182,13 +182,13 @@ impl JitterBuffer {
             return Some(pkt);
         }
         // Gap at `next`: wait up to `max_wait` for it to fill, then skip it (lost).
-        let (&head_seq, head_pkt) = self.buf.iter().next()?;
-        if now.saturating_duration_since(head_pkt.arrival) >= self.max_wait {
-            let pkt = self.buf.remove(&head_seq).unwrap();
-            self.next = Some(head_seq.wrapping_add(1));
-            return Some(pkt);
+        let (_, head_pkt) = self.buf.first_key_value()?;
+        if now.saturating_duration_since(head_pkt.arrival) < self.max_wait {
+            return None;
         }
-        None
+        let (head_seq, pkt) = self.buf.pop_first()?;
+        self.next = Some(head_seq.wrapping_add(1));
+        Some(pkt)
     }
 
     /// Release everything still buffered, in sequence order (end of stream).
@@ -312,8 +312,7 @@ impl FrameReceiver {
                 },
             );
             while self.pending.len() > 256 {
-                let oldest = *self.pending.keys().next().unwrap();
-                self.pending.remove(&oldest);
+                self.pending.pop_first();
             }
         }
 
@@ -322,7 +321,9 @@ impl FrameReceiver {
             .push(seq, &rtp.payload, start_of_frame, end_of_frame)?;
 
         let meta = self.pending.remove(&frame.first_seq)?;
-        let contiguous = self.prev_last_seq.is_none_or(|p| frame.first_seq == p + 1);
+        let contiguous = self
+            .prev_last_seq
+            .is_none_or(|p| frame.first_seq == p.saturating_add(1));
         self.prev_last_seq = Some(frame.last_seq);
 
         Some(MediaFrame {
@@ -382,7 +383,7 @@ fn temporal_cumulative_kbps(
     }
     (0..layers)
         .map(|k| {
-            let frac = 0.5 + 0.5 * (k as f64) / ((layers - 1) as f64);
+            let frac = 0.5 + 0.5 * (k as f64) / (layers.saturating_sub(1) as f64);
             TemporalLayerAllocation {
                 cumulative_kbps: ((full_kbps as f64) * frac).round() as u64,
             }
@@ -392,6 +393,14 @@ fn temporal_cumulative_kbps(
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
     use super::*;
 
     fn frame(data: Vec<u8>, is_keyframe: bool) -> MediaFrame {

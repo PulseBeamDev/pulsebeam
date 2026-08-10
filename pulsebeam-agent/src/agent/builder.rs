@@ -133,7 +133,7 @@ impl AgentBuilder {
                     .into_iter()
                     .filter(|i| !i.is_loopback())
                     .map(|i| i.ip()),
-            )
+            );
         }
 
         let mut rtc_builder = Rtc::builder()
@@ -180,19 +180,16 @@ impl AgentBuilder {
         // }
 
         let mut rtc = rtc_builder.build(Instant::now().into());
-        let mut candidate_count = 0;
+        let mut candidate_count = 0usize;
         let mut maybe_addr = None;
         for ip in &self.local_ips {
             let addr = SocketAddr::new(*ip, port);
-            let candidate = match Candidate::builder().udp().host(addr).build() {
-                Ok(candidate) => candidate,
-                Err(_) => {
-                    continue;
-                }
+            let Ok(candidate) = Candidate::builder().udp().host(addr).build() else {
+                continue;
             };
             rtc.add_local_candidate(candidate);
             maybe_addr = Some(addr);
-            candidate_count += 1;
+            candidate_count = candidate_count.saturating_add(1);
         }
 
         let mut tcp_stream: Option<pulsebeam_core::net::TcpStream> = None;
@@ -216,7 +213,7 @@ impl AgentBuilder {
                             .build()
                         {
                             rtc.add_local_candidate(c);
-                            candidate_count += 1;
+                            candidate_count = candidate_count.saturating_add(1);
                             if maybe_addr.is_none() {
                                 maybe_addr = Some(tcp_candidate_addr);
                             }
@@ -297,9 +294,11 @@ impl AgentBuilder {
             addr,
             rtc,
             socket: self.udp_socket,
-            tcp: match tcp_stream {
-                Some(s) => TcpSession::new(s, tcp_local_addr, tcp_server_addr.unwrap()),
-                None => TcpSession::inactive(),
+            tcp: match (tcp_stream, tcp_server_addr) {
+                (Some(s), Some(addr)) => TcpSession::new(s, tcp_local_addr, addr),
+                // A stream without a server address cannot be addressed, so it
+                // is no more usable than having no stream at all.
+                _ => TcpSession::inactive(),
             },
             signaling_cid,
             resource_uri: resp.resource_uri,

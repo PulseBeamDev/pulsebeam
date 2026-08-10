@@ -1,3 +1,11 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
 //! Make the process clock the *simulated* clock, so runs are reproducible.
 //!
 //! Derived from madsim's equivalent:

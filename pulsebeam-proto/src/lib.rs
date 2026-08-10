@@ -1,4 +1,7 @@
 pub mod reliable;
+// prost-build output. Doc text is copied verbatim from the .proto, so its
+// formatting is not ours to fix here.
+#[allow(clippy::doc_lazy_continuation)]
 pub mod signaling;
 pub mod rtp_extensions {
     /// RTP header extension IDs that are reserved by PulseBeam.

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)] // tests assert by panicking
 use proptest::prelude::*;
 
 use super::model::*;
@@ -33,7 +40,9 @@ prop_compose! {
         ),
         protected_by in prop::collection::vec(0usize..chain_count.max(1), dt_cnt),
         with_resolutions in any::<bool>(),
-        dims in prop::collection::vec((16u16..=4096, 16u16..=4096), spatial),
+        // Up to the full field, not a plausible-looking 4096: the coded form is
+        // `minus_1`, so the interesting values are at the ends.
+        dims in prop::collection::vec((1u16..=u16::MAX, 1u16..=u16::MAX), spatial),
     ) -> TemplateDependencyStructure {
         let mut templates = ArrayVec::new();
         for s in 0..spatial {

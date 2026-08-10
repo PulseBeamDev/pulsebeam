@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
 //! End-to-end bandwidth-estimation behaviour.
 //!
 //! These exercise the interaction between pulsebeam's allocator and str0m's BWE, which unit

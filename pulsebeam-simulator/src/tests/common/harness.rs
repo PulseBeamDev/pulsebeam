@@ -1,8 +1,13 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
 use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, VideoReceiveStats};
-use crate::tests::common::{
-    reserve_subnet, run_sim_or_timeout, start_sfu_node, start_sfu_node_tcp_only,
-    start_sfu_node_tcp_only_multi_shard, subnet_ip,
-};
+use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
@@ -421,6 +426,15 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
+    /// At least this many media frames actually crossed a shard boundary.
+    ///
+    /// Guards a cross-shard plan against passing by accident. Placement is a
+    /// hash, so a room can land co-located; delivery then looks identical while
+    /// reaching none of the route or envelope code the plan exists to cover.
+    CheckCrossShardMedia {
+        description: &'static str,
+        min_frames: u64,
+    },
     /// Cumulative bytes sent ≥ min_bytes.
     CheckTxBytes {
         description: &'static str,
@@ -835,7 +849,6 @@ async fn run_participant(
                                     if incoming_tracks.send(track).await.is_err() {
                                         // The client is shutting down and no longer reading; the
                                         // subscription itself succeeded, so this is not a failure.
-                                        return;
                                     }
                                 });
                             }
@@ -1075,6 +1088,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
+        Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
         Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
@@ -1307,7 +1321,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
                 );
                 let mut subs: Vec<VideoSubscription> = Vec::new();
-                for (name, height) in targets.iter() {
+                for (name, height) in *targets {
                     let pub_handle = get_handle(handles, name, description)?;
                     let id = pub_handle.shared.participant_id.lock().unwrap().clone();
                     let id = id.ok_or_else(|| {
@@ -1340,7 +1354,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
                 );
                 let mut subs: Vec<VideoSubscription> = Vec::new();
-                for (name, height, min_height, priority) in targets.iter() {
+                for (name, height, min_height, priority) in *targets {
                     let pub_handle = get_handle(handles, name, description)?;
                     let id = pub_handle.shared.participant_id.lock().unwrap().clone();
                     let id = id.ok_or_else(|| {
@@ -1593,6 +1607,20 @@ async fn execute_plan(
                 );
             }
 
+            Step::CheckCrossShardMedia {
+                description,
+                min_frames,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" (min {min_frames} frames)"
+                );
+                let actual = pulsebeam::sim_metrics::cross_shard_media_frames();
+                assert!(
+                    actual >= *min_frames,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     ≥ {min_frames} frames resolved from another shard\n  actual:       {actual}\n  note:         zero means the room was co-located, so no cross-shard\n                path ran at all — the plan proved nothing"
+                );
+            }
+
             Step::CheckTxBytes {
                 description,
                 participant,
@@ -1770,13 +1798,12 @@ async fn execute_plan(
                 let data_received = handle.shared.data_received.lock().unwrap();
                 let received = data_received
                     .get(*topic)
-                    .map(|v| v.as_slice())
+                    .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
                 let expected_vec = expected.to_vec();
                 assert!(
                     received.contains(&expected_vec),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {:?} in received list\n  actual:       {received:?}",
-                    expected
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {expected:?} in received list\n  actual:       {received:?}"
                 );
             }
 
@@ -1793,13 +1820,12 @@ async fn execute_plan(
                 let data_received = handle.shared.data_received.lock().unwrap();
                 let received = data_received
                     .get(*topic)
-                    .map(|v| v.as_slice())
+                    .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
                 let excluded_vec = excluded.to_vec();
                 assert!(
                     !received.contains(&excluded_vec),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {:?} NOT in received list\n  actual:       {received:?}",
-                    excluded
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {excluded:?} NOT in received list\n  actual:       {received:?}"
                 );
             }
 
@@ -1889,8 +1915,8 @@ async fn execute_plan(
     Ok(())
 }
 
-fn resolve<'a>(
-    map: &'a HashMap<&'static str, IpAddr>,
+fn resolve(
+    map: &HashMap<&'static str, IpAddr>,
     name: &str,
     step_desc: &str,
 ) -> anyhow::Result<IpAddr> {
@@ -1967,6 +1993,12 @@ fn assert_video_quality(
 /// would be exactly the kind of quietly-wrong assertion this type exists to remove. Use
 /// [`Property::EstimateStable`] and [`Property::QueueingDelayBelow`] on scheduled links.
 #[derive(Clone, Copy, Debug)]
+// A vocabulary of assertions a plan may make, not a set of call sites. Each
+// variant is implemented and documented with the regime it is fair in; a
+// variant no current plan happens to use is a claim available to the next one,
+// which is the opposite of dead code. Deleting the unused ones would leave the
+// suite able to express only what it already asserts.
+#[allow(dead_code)]
 pub enum Property {
     /// Video frames decoded during the last run after a complete, parameterized keyframe.
     VideoDecodes,
@@ -2054,7 +2086,10 @@ pub enum Property {
     /// other layer assertion here is a floor, and the byte-rate ceiling that stood in for this one
     /// cannot tell a stream forwarded at the wrong rung from one forwarded at the right rung with
     /// a busier picture. This reads the highest rank actually forwarded.
-    NeverForwardedAbove { origin: &'static str, max_quality: u8 },
+    NeverForwardedAbove {
+        origin: &'static str,
+        max_quality: u8,
+    },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
@@ -2146,6 +2181,7 @@ impl LinkReport {
 
     /// Media payload as a percentage of bytes received. Exceeds 100% under loss - see
     /// [`Property::MediaEfficiencyAtLeast`].
+    #[allow(dead_code)] // Report accessor, kept alongside the rest of the surface.
     pub fn media_percent(&self) -> f64 {
         pct(
             self.forwarded_media_bytes as f64,
@@ -2503,7 +2539,10 @@ fn check_property(
         Property::QualityChangesPerMinuteBelow { origin, max } => {
             // Resolved here rather than read off the report: the report's map is filled by the
             // end-of-plan scoreboard, which has not run yet mid-plan.
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2521,7 +2560,10 @@ fn check_property(
             }
         }
         Property::QualityReversalsBelow { origin, max } => {
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2541,7 +2583,10 @@ fn check_property(
             origin,
             max_quality,
         } => {
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2809,10 +2854,14 @@ impl LocalNodeSim {
         self
     }
 
-    /// Use N worker shards (implies tcp_only).
+    /// Spread the node across N worker shards.
+    ///
+    /// Independent of [`Self::with_tcp_only`]. Over UDP the shard a datagram
+    /// reaches is chosen by the `SO_REUSEPORT` group, which hashes its 4-tuple
+    /// exactly as the kernel does — so a plan that sets this is also exercising
+    /// the demuxer's shard check and the arrival path a real deployment uses.
     pub fn with_shards(mut self, n: usize) -> Self {
         self.num_shards = n;
-        self.tcp_only = true;
         self
     }
 
@@ -2871,17 +2920,9 @@ impl LocalNodeSim {
 
         sim.host(server_ip, move || async move {
             let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-            if tcp_only && num_shards > 1 {
-                start_sfu_node_tcp_only_multi_shard(server_ip, rng)
-                    .await
-                    .map_err(Into::into)
-            } else if tcp_only {
-                start_sfu_node_tcp_only(server_ip, rng)
-                    .await
-                    .map_err(Into::into)
-            } else {
-                start_sfu_node(server_ip, rng).await.map_err(Into::into)
-            }
+            start_sfu_node_with(server_ip, rng, num_shards, tcp_only)
+                .await
+                .map_err(Into::into)
         });
 
         let mut handles: HashMap<&'static str, ParticipantHandle> = HashMap::new();
@@ -2962,7 +3003,6 @@ impl LocalNodeSim {
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);
         run_sim_or_timeout(&mut sim, wall_budget).expect("simulation failed");
 
-        let out = reports.lock().expect("reports poisoned").clone();
-        out
+        reports.lock().expect("reports poisoned").clone()
     }
 }

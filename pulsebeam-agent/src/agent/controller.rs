@@ -54,7 +54,7 @@ impl BitrateEstimate {
 
     pub fn record_bytes(&mut self, bytes: usize, now: Instant) {
         self.advance_time(now);
-        self.accumulated_bytes += bytes;
+        self.accumulated_bytes = self.accumulated_bytes.saturating_add(bytes);
     }
 
     pub fn poll(&mut self, current_time: Instant) {
@@ -64,12 +64,16 @@ impl BitrateEstimate {
     fn advance_time(&mut self, time: Instant) {
         let current_tick = *self.tick_start.get_or_insert(time);
 
-        if time < current_tick + Duration::from_millis(Self::TICK_MS as u64) {
+        let tick = Duration::from_millis(Self::TICK_MS as u64);
+        if time < current_tick.checked_add(tick).unwrap_or(current_tick) {
             return;
         }
 
         let elapsed = time.saturating_duration_since(current_tick);
-        let ticks_passed = (elapsed.as_millis() / Self::TICK_MS as u128) as usize;
+        let ticks_passed = elapsed
+            .as_millis()
+            .checked_div(Self::TICK_MS as u128)
+            .unwrap_or(1) as usize;
 
         let instant_bps = (self.accumulated_bytes as f64 * 8.0 * 1000.0) / Self::TICK_MS;
         self.push_tick(instant_bps);
@@ -81,7 +85,11 @@ impl BitrateEstimate {
 
         self.accumulated_bytes = 0;
         self.tick_start = Some(
-            current_tick + Duration::from_millis((ticks_passed as u64) * Self::TICK_MS as u64),
+            current_tick
+                .checked_add(Duration::from_millis(
+                    (ticks_passed as u64).saturating_mul(Self::TICK_MS as u64),
+                ))
+                .unwrap_or(current_tick),
         );
     }
 
@@ -102,9 +110,9 @@ impl BitrateEstimate {
 
         let recent_len = self.raw_ticks.len();
         if recent_len >= 3 {
-            let a = self.raw_ticks[recent_len - 1];
-            let b = self.raw_ticks[recent_len - 2];
-            let c = self.raw_ticks[recent_len - 3];
+            let a = self.raw_ticks[recent_len.saturating_sub(1)];
+            let b = self.raw_ticks[recent_len.saturating_sub(2)];
+            let c = self.raw_ticks[recent_len.saturating_sub(3)];
             self.fast_trend_bps = a.max(b.min(c)).min(b.max(c));
         } else {
             self.fast_trend_bps = 0.0;
@@ -214,7 +222,9 @@ struct LayerState {
 impl LayerController {
     pub fn new() -> Self {
         Self {
-            available_bps: f64::MAX,
+            // No estimate yet: unlimited. Infinity rather than MAX so the
+            // check below is `is_infinite()` and not a float equality.
+            available_bps: f64::INFINITY,
             last_keyframe_request: HashMap::new(),
             order: Vec::new(),
             states: HashMap::new(),
@@ -292,7 +302,7 @@ impl LayerController {
             .map(|s| s.bps)
             .sum();
 
-        if self.available_bps == f64::MAX {
+        if self.available_bps.is_infinite() {
             return desired;
         }
 
@@ -307,7 +317,7 @@ impl LayerController {
         let debt = allocated - self.available_bps;
 
         if debt > self.available_bps * DEBT_LINGER_THRESHOLD {
-            self.debt_ticks += 1;
+            self.debt_ticks = self.debt_ticks.saturating_add(1);
         } else {
             self.debt_ticks = 0;
         }

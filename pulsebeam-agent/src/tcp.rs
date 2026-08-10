@@ -5,7 +5,6 @@ use str0m::{
     Input, Rtc,
     net::{Protocol, Receive},
 };
-use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
 /// RFC 4571 framing over a single active TCP connection (RFC 6544 client role).
@@ -84,7 +83,7 @@ impl TcpSession {
                         self.close();
                         break;
                     }
-                    if self.recv_accum.len() < 2 + len {
+                    if self.recv_accum.len() < len.saturating_add(2) {
                         break; // incomplete frame — wait for more data
                     }
                     self.recv_accum.advance(2);
@@ -111,19 +110,6 @@ impl TcpSession {
         }
     }
 
-    /// RFC 4571-frame `payload` and write it to the stream.  Closes the
-    /// stream on write failure.
-    pub(crate) async fn send(&mut self, payload: &[u8]) {
-        if let Some(stream) = &mut self.stream {
-            let header = (payload.len() as u16).to_be_bytes();
-            if stream.write_all(&header).await.is_err() || stream.write_all(payload).await.is_err()
-            {
-                tracing::warn!("TCP write failed, closing stream");
-                self.stream = None;
-            }
-        }
-    }
-
     pub(crate) fn try_send(&mut self, payload: &[u8]) {
         let Some(stream) = &mut self.stream else {
             return;
@@ -137,7 +123,7 @@ impl TcpSession {
 
         let header = (length as u16).to_be_bytes();
 
-        let mut packet = Vec::with_capacity(header.len() + payload.len());
+        let mut packet = Vec::with_capacity(header.len().saturating_add(payload.len()));
         packet.extend_from_slice(&header);
         packet.extend_from_slice(payload);
 

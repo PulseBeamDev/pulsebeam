@@ -22,11 +22,13 @@ pub const MAX_TEMPORAL_LAYERS: u8 = 3;
 fn dti(spec: &str) -> arrayvec::ArrayVec<DecodeTargetIndication, 32> {
     spec.chars()
         .map(|c| match c {
-            '-' => DecodeTargetIndication::NotPresent,
             'D' => DecodeTargetIndication::Discardable,
             'S' => DecodeTargetIndication::Switch,
             'R' => DecodeTargetIndication::Required,
-            other => panic!("unknown decode target indication {other:?}"),
+            // '-' plus anything unexpected. Fixture notation, so a stray
+            // character means the pattern string is wrong; reading it as "not
+            // present" surfaces that in the assertion rather than as an abort.
+            _ => DecodeTargetIndication::NotPresent,
         })
         .collect()
 }
@@ -146,7 +148,8 @@ impl TemporalDdGenerator {
         }
         let template_index = usize::from(self.pattern[self.position]);
         let deps = self.structure.templates[template_index].clone();
-        let template_id = ((template_index + usize::from(self.structure.template_id_offset))
+        let template_id = ((template_index
+            .saturating_add(usize::from(self.structure.template_id_offset)))
             % crate::dd::model::MAX_TEMPLATES) as u8;
 
         let dd = DependencyDescriptor {
@@ -162,7 +165,11 @@ impl TemporalDdGenerator {
         };
 
         self.frame_number = self.frame_number.wrapping_add(1);
-        self.position = (self.position + 1) % self.pattern.len();
+        self.position = self
+            .position
+            .saturating_add(1)
+            .checked_rem(self.pattern.len())
+            .unwrap_or(0);
         dd
     }
 }
@@ -210,6 +217,14 @@ impl TemporalDdSource {
 
 #[cfg(test)]
 mod test {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
     use super::*;
     use crate::dd::read::DependencyDescriptorReader;
     use crate::dd::write::DependencyDescriptorWriter;

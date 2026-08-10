@@ -1,3 +1,11 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
 //! A bottleneck link for the simulator: capacity, queueing delay, loss, and tail drop.
 //!
 //! turmoil models latency and loss but has no notion of capacity, so a simulated path will carry

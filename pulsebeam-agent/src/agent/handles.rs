@@ -1,3 +1,11 @@
+//! Handles the application holds on an agent's tracks and topics.
+//!
+//! Crash exception: the `map_err` closures below match on the very command the
+//! same function just constructed, so the other arms cannot be reached, and
+//! each has to produce a differently-typed `SendError` — there is no single
+//! fallback value to return instead. Scoped here rather than workspace-wide.
+#![allow(clippy::unreachable)]
+
 use crate::RtpPacket;
 use crate::agent::mailbox;
 use crate::manager::VideoSubscription;
@@ -13,7 +21,9 @@ pub(crate) struct PublicationLease {
 
 pub(crate) enum OutgoingCommand {
     SendData(SendData),
-    SendMedia(SendMedia),
+    /// Boxed: it is several times the size of any other variant, and an enum
+    /// is as large as its largest.
+    SendMedia(Box<SendMedia>),
     SetPlayoutDelay(Option<(u32, u32)>),
     Publish {
         kind: str0m::media::MediaKind,
@@ -240,11 +250,11 @@ impl LocalEncoding {
 
     pub async fn send(&self, packet: RtpPacket) -> Result<(), mailbox::SendError<RtpPacket>> {
         self.tx
-            .send(OutgoingCommand::SendMedia(SendMedia {
+            .send(OutgoingCommand::SendMedia(Box::new(SendMedia {
                 lease: self.lease,
                 rid: self.rid,
                 packet,
-            }))
+            })))
             .await
             .map_err(|error| match error.0 {
                 OutgoingCommand::SendMedia(media) => mailbox::SendError(media.packet),

@@ -10,6 +10,10 @@ documentation.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+
+[lints]
+workspace = true
+
 [dependencies]
 prost = "0.14.3"
 prost-types = "0.14.3"
