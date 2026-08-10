@@ -161,7 +161,7 @@ fn read_frame_dependencies(
         deps.frame_diffs.clear();
         let mut size = r.read_bits(2)?;
         while size > 0 {
-            let fdiff = r.read_bits(4 * size)? as u16 + 1;
+            let fdiff = (r.read_bits(4u32.saturating_mul(size))? as u16).saturating_add(1);
             deps.frame_diffs
                 .try_push(fdiff)
                 .map_err(|_| DdReadError::TooManyFrameDiffs)?;
@@ -180,7 +180,7 @@ fn read_frame_dependencies(
 
 fn read_structure(r: &mut BitReader) -> Result<TemplateDependencyStructure, DdReadError> {
     let template_id_offset = r.read_bits(6)? as u8;
-    let decode_target_count = r.read_bits(5)? as u8 + 1;
+    let decode_target_count = (r.read_bits(5)? as u8).saturating_add(1);
     debug_assert!(decode_target_count as usize <= MAX_DECODE_TARGETS);
 
     let mut s = TemplateDependencyStructure {
@@ -225,14 +225,14 @@ fn read_template_layers(
         match r.read_bits(2)? {
             SAME_LAYER => {}
             NEXT_TEMPORAL => {
-                temporal_id += 1;
+                temporal_id = temporal_id.saturating_add(1);
                 if usize::from(temporal_id) >= MAX_TEMPORAL_IDS {
                     return Err(DdReadError::TooManyTemporalLayers);
                 }
             }
             NEXT_SPATIAL => {
                 temporal_id = 0;
-                spatial_id += 1;
+                spatial_id = spatial_id.saturating_add(1);
                 if usize::from(spatial_id) >= MAX_SPATIAL_IDS {
                     return Err(DdReadError::TooManySpatialLayers);
                 }
@@ -267,7 +267,7 @@ fn read_template_fdiffs(
 ) -> Result<(), DdReadError> {
     for t in &mut s.templates {
         while r.read_bit()? != 0 {
-            let fdiff = r.read_bits(4)? as u16 + 1;
+            let fdiff = (r.read_bits(4)? as u16).saturating_add(1);
             t.frame_diffs
                 .try_push(fdiff)
                 .map_err(|_| DdReadError::TooManyFrameDiffs)?;
@@ -281,7 +281,7 @@ fn read_template_chains(
     s: &mut TemplateDependencyStructure,
 ) -> Result<(), DdReadError> {
     let dt_cnt = u32::from(s.decode_target_count);
-    let chain_count = r.read_ns(dt_cnt + 1)?;
+    let chain_count = r.read_ns(dt_cnt.saturating_add(1))?;
     debug_assert!(chain_count <= dt_cnt);
     s.chain_count = chain_count as u8;
     if chain_count == 0 {
@@ -316,11 +316,21 @@ fn read_resolutions(
 
     let mut resolutions = ArrayVec::new();
     for _ in 0..spatial_layers {
-        let width = (r.read_bits(16)? + 1) as u16;
-        let height = (r.read_bits(16)? + 1) as u16;
+        // `x_minus_1` is 16 bits, so the coded maximum is 65536 — one more
+        // than the field it lands in. `+ 1` then `as u16` turned the largest
+        // representable resolution into zero; clamping keeps it the largest.
+        let width = read_dimension(r)?;
+        let height = read_dimension(r)?;
         resolutions.push(RenderResolution { width, height });
     }
     s.resolutions = resolutions;
 
     Ok(())
+}
+
+/// Decode a `*_minus_1` render dimension, clamping the one coded value that
+/// does not fit the field it lands in.
+fn read_dimension(r: &mut BitReader<'_>) -> Result<u16, DdReadError> {
+    let coded = r.read_bits(16)?.saturating_add(1);
+    Ok(u16::try_from(coded).unwrap_or(u16::MAX))
 }
