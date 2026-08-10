@@ -1132,7 +1132,7 @@ impl ShardCore {
         // Tracks already published when this member arrived never went through
         // `publish_track` here, so their audio routes are installed now.
         let registry = &self.registry;
-        let events = self.routing.install_known_audio_routes(
+        let events = self.routing.adopt_known_tracks(
             room_id,
             &known_tracks,
             &|id| registry.contains(id),

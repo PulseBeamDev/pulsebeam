@@ -252,13 +252,14 @@ pub(crate) struct TrackRoute {
     /// only appears here once it has installed its route, so the presence of a
     /// handle is what permits media to flow.
     pub remote_routes: Vec<RemoteRoute>,
-    /// Where to send keyframe requests for this track, when it is published on
-    /// another shard. `None` for a locally published track: its requests are
-    /// dispatched in-process and never addressed.
-    reverse: Option<ReverseRoute>,
-    /// Encoding order for this track, so a reverse frame can name one by index.
-    encodings: Vec<Option<Rid>>,
     cache: TrackStreamCache,
+}
+
+/// Where to send keyframe requests for a track published on another shard, and
+/// the encoding order needed to name one of its layers.
+struct TrackReverseTarget {
+    route: ReverseRoute,
+    encodings: Vec<Option<Rid>>,
 }
 
 impl TrackRoute {
@@ -275,8 +276,6 @@ impl TrackRoute {
             track_id,
             subscribers: Vec::with_capacity(256),
             layer_states: Vec::new(),
-            reverse: None,
-            encodings: Vec::new(),
             remote_routes: Vec::new(),
             cache: TrackStreamCache::new(),
         }
@@ -316,6 +315,17 @@ pub(crate) struct ShardRoutingTable {
     /// Handles for reverse routes *other* shards opened, learned from publisher
     /// announcements — the addresses this shard sends acks to.
     topic_reverse_targets: HashMap<DataStreamId, ReverseRoute>,
+    /// The same for tracks: where this shard addresses keyframe requests.
+    ///
+    /// Keyed by track rather than kept in the fanout entry, because it
+    /// describes the track and not this shard's subscribers to it. The two have
+    /// different lifetimes, and both differences lost the handle: a fanout is
+    /// released once its last subscriber leaves, and a shard that gains its
+    /// first room member *after* a track was published never runs
+    /// `publish_track` for that track at all — so a descriptor kept there was
+    /// missing in exactly the case a late subscriber needs it, and its keyframe
+    /// requests went nowhere for the life of the track.
+    track_reverse_targets: HashMap<TrackId, TrackReverseTarget>,
 }
 
 impl ShardRoutingTable {
@@ -370,6 +380,7 @@ impl ShardRoutingTable {
             track_reverse_routes: HashMap::new(),
             topic_reverse_routes: HashMap::new(),
             topic_reverse_targets: HashMap::new(),
+            track_reverse_targets: HashMap::new(),
         }
     }
 
@@ -598,10 +609,9 @@ impl ShardRoutingTable {
         track_id: &TrackId,
         rid: Option<Rid>,
     ) -> Option<(ReverseRoute, u8)> {
-        let entry = self.tracks.get(self.fanout_of(track_id)?)?;
-        let handle = entry.reverse?;
-        let layer = entry.encodings.iter().position(|r| *r == rid)?;
-        Some((handle, u8::try_from(layer).ok()?))
+        let target = self.track_reverse_targets.get(track_id)?;
+        let layer = target.encodings.iter().position(|r| *r == rid)?;
+        Some((target.route, u8::try_from(layer).ok()?))
     }
 
     /// Record the measurements a publisher's shard sent for a track this shard
@@ -1274,14 +1284,7 @@ impl ShardRoutingTable {
             tracing::debug!(%room_id, "publish_track: room missing on this shard");
             return None;
         };
-        if let Some(reverse) = track.reverse {
-            let key = self.fanout_key(track.meta.id);
-            let Some(entry) = self.tracks.get_mut(key) else {
-                pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
-            };
-            entry.reverse = Some(reverse);
-            entry.encodings = track.layers.iter().map(|l| l.rid).collect();
-        }
+        self.adopt_track_reverse_target(&track);
         let room = self.rooms.get(&room_id)?;
         let tracks = std::slice::from_ref(&track);
         let has_members = !room.members.is_empty();
@@ -1333,7 +1336,7 @@ impl ShardRoutingTable {
     /// Install audio routes for tracks already published when this shard's
     /// first member joins the room — publish-then-join is as common as
     /// join-then-publish, and only the latter goes through `publish_track`.
-    pub fn install_known_audio_routes(
+    pub fn adopt_known_tracks(
         &mut self,
         room_id: RoomId,
         tracks: &[Track],
@@ -1341,11 +1344,38 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Vec<ShardEvent> {
+        // Everything `publish_track` would have established, for tracks that
+        // predate this shard's first member in the room. Previously only the
+        // audio routes were replayed, so a keyframe request for a video track
+        // published before the subscriber arrived had nowhere to go.
+        for track in tracks {
+            self.adopt_track_reverse_target(track);
+        }
         tracks
             .iter()
             .filter(|t| t.meta.id.kind() == TrackKind::Audio && !local(&t.meta.origin))
             .filter_map(|t| self.install_audio_route(t.meta.clone(), room_id, now, wall))
             .collect()
+    }
+
+    /// Record where keyframe requests for `track` are addressed.
+    ///
+    /// The only place this is established, so both the announcement path and
+    /// the late-join path go through it. Splitting them is what allowed one to
+    /// drift into replaying part of the other's work.
+    fn adopt_track_reverse_target(&mut self, track: &Track) {
+        let Some(route) = track.reverse else {
+            // A locally published track: its keyframe requests are dispatched
+            // in-process and never addressed.
+            return;
+        };
+        self.track_reverse_targets.insert(
+            track.meta.id,
+            TrackReverseTarget {
+                route,
+                encodings: track.layers.iter().map(|l| l.rid).collect(),
+            },
+        );
     }
 
     /// Install a destination route for a concrete data stream. Returns the
@@ -1637,6 +1667,7 @@ impl ShardRoutingTable {
         }
         for &track_id in track_ids {
             self.retire_audio_route(room_id, track_id, now);
+            self.track_reverse_targets.remove(&track_id);
             self.release_fanout_if_idle(&track_id);
         }
         let Some(room) = self.rooms.get(&room_id) else {
@@ -2711,6 +2742,53 @@ mod tests {
             table.routes.len(),
             0,
             "unpublishing must free the reverse route"
+        );
+    }
+
+    /// A shard that gains its first room member after a track was published can
+    /// still address keyframe requests for it.
+    ///
+    /// The controller announces a track only to the shards holding room members
+    /// at the time, so a shard joining later never runs `publish_track` for it
+    /// and learns of it through the joining participant's known-track list
+    /// instead. That path replayed the audio routes and nothing else, so the
+    /// reverse target was never recorded and every keyframe request for the
+    /// track was discarded for as long as it existed - silently, because the
+    /// only thing noticing was a `debug_assert!` that release builds drop.
+    #[test]
+    fn a_late_joining_shard_can_address_keyframe_requests() {
+        let mut publisher_shard = ShardRoutingTable::new();
+        let publisher = pid();
+        let meta = TrackMeta {
+            shard_id: ShardId::new(0),
+            id: publisher.derive_track_id(TrackKind::Video, "v"),
+            origin: publisher,
+        };
+
+        // The publishing shard stamps the descriptor, exactly as it does on
+        // `ParticipantControlEvent::TrackPublished`.
+        let mut track = video_track_with(&meta);
+        track.reverse = publisher_shard.open_track_reverse_route(&track, now(), &wall());
+        assert!(
+            track.reverse.is_some(),
+            "publishing must open a reverse route"
+        );
+
+        // A different shard learns of the track only by a participant joining
+        // after the fact, never through an announcement.
+        let mut late_shard = ShardRoutingTable::new();
+        let room = room_id("late-join");
+        assert!(
+            late_shard.track_reverse_target(&meta.id, None).is_none(),
+            "a shard that has not seen the track cannot address it yet"
+        );
+
+        late_shard.adopt_known_tracks(room, &[track], &|_| false, now(), &wall());
+
+        assert!(
+            late_shard.track_reverse_target(&meta.id, None).is_some(),
+            "the late-joining shard cannot address keyframe requests for a track that was \
+             already published, so every request it makes is dropped"
         );
     }
 
