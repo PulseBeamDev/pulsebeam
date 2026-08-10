@@ -1,3 +1,11 @@
+//! Batched UDP with GRO on receive and GSO on send.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! arena offsets and batch accumulators here index fixed-size slots; with
+//! `overflow-checks` off in release a wrapped offset reads a neighbouring
+//! datagram's bytes rather than failing.
+#![deny(clippy::arithmetic_side_effects)]
+
 //! Batched UDP transport built directly on Linux's `recvmmsg(2)`/`sendmmsg(2)`
 //! plus UDP GRO (receive-side coalescing) and UDP GSO (send-side segmentation
 //! offload) — no `quinn-udp` dependency.
@@ -67,8 +75,8 @@ impl UdpRecvArena {
     fn packet(&self, slot: usize, len: usize) -> &[u8] {
         debug_assert!(slot < BATCH_SIZE);
         debug_assert!(len <= GRO_SLOT_SIZE);
-        let start = slot * GRO_SLOT_SIZE;
-        let end = start + len;
+        let start = slot.saturating_mul(GRO_SLOT_SIZE);
+        let end = start.saturating_add(len);
         debug_assert!(end <= self.bytes.len());
         &self.bytes[start..end]
     }
@@ -332,7 +340,7 @@ impl UdpTransportReader {
                     offset: 0,
                 });
             }
-            Ok(out.len() - prev_len)
+            Ok(out.len().saturating_sub(prev_len))
         })
     }
 }
@@ -399,7 +407,7 @@ impl UdpTransportWriter {
                 .gso_capable
                 .then_some(packets[i].segment_size)
                 .filter(|&seg| seg < packets[i].buf.len());
-            let mut j = i + 1;
+            let mut j = i.saturating_add(1);
             let mut bytes = packets[i].buf.len();
             while j < packets.len()
                 && self
@@ -407,13 +415,13 @@ impl UdpTransportWriter {
                     .then_some(packets[j].segment_size)
                     .filter(|&seg| seg < packets[j].buf.len())
                     == gso_seg
-                && (j - i) < BATCH_SIZE
-                && bytes + packets[j].buf.len() <= self.send_batch_limit
+                && j.saturating_sub(i) < BATCH_SIZE
+                && bytes.saturating_add(packets[j].buf.len()) <= self.send_batch_limit
             {
-                bytes += packets[j].buf.len();
-                j += 1;
+                bytes = bytes.saturating_add(packets[j].buf.len());
+                j = j.saturating_add(1);
             }
-            sent += self.send_group(&packets[i..j], gso_seg)?;
+            sent = sent.saturating_add(self.send_group(&packets[i..j], gso_seg)?);
             i = j;
         }
 
@@ -498,7 +506,7 @@ impl UdpTransportWriter {
 
         match result {
             Ok(count) => {
-                self.record_drop(group.len() - count);
+                self.record_drop(group.len().saturating_sub(count));
                 Ok(count)
             }
             // Lossy: kernel buffer full — drop this group rather than queue it.
@@ -520,7 +528,7 @@ impl UdpTransportWriter {
         if self.drop_count.is_multiple_of(DROP_LOG_INTERVAL) {
             tracing::warn!(dropped = count, "udp dropped packets during sendmmsg");
         }
-        self.drop_count += count;
+        self.drop_count = self.drop_count.saturating_add(count);
     }
 }
 
