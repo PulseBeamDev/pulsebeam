@@ -93,7 +93,7 @@ fn main() {
         // https://github.com/tokio-rs/tokio/issues/7745
         .enable_alt_timer()
         .build_local(LocalOptions::default())
-        .unwrap();
+        .unwrap_or_else(|err| pulsebeam_runtime::fatal!("cannot build the node runtime: {err}"));
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
     rt.block_on(run(shutdown.clone(), workers, rtc_port, args.iface));

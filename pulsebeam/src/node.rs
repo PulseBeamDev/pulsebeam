@@ -337,7 +337,11 @@ impl NodeBuilder {
                         .host(addr)
                         .tcptype(str0m::net::TcpType::Passive)
                         .build()
-                        .expect("a TCP passive host candidate"),
+                        .unwrap_or_else(|err| {
+                            pulsebeam_runtime::fatal!(
+                                "cannot advertise a TCP candidate for {addr}: {err}"
+                            )
+                        }),
                 );
             }
         }
@@ -428,7 +432,11 @@ impl NodeBuilder {
                                 .enable_all()
                                 .enable_alt_timer()
                                 .build_local(tokio::runtime::LocalOptions::default())
-                                .unwrap();
+                                .unwrap_or_else(|err| {
+                                    pulsebeam_runtime::fatal!(
+                                        "shard {shard_id} cannot build its runtime: {err}"
+                                    )
+                                });
                             tune_current_data_thread(core_id);
                             rt.block_on(async move {
                                 let udp_sock = match udp_sock.into_unified_socket() {
@@ -619,7 +627,9 @@ fn sockets_to_candidates(
             .udp()
             .host(addr)
             .build()
-            .expect("a UDP host candidate");
+            .unwrap_or_else(|err| {
+                pulsebeam_runtime::fatal!("cannot advertise a UDP candidate for {addr}: {err}")
+            });
         candidates.push(candidate);
     }
 

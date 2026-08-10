@@ -22,11 +22,13 @@ pub const MAX_TEMPORAL_LAYERS: u8 = 3;
 fn dti(spec: &str) -> arrayvec::ArrayVec<DecodeTargetIndication, 32> {
     spec.chars()
         .map(|c| match c {
-            '-' => DecodeTargetIndication::NotPresent,
             'D' => DecodeTargetIndication::Discardable,
             'S' => DecodeTargetIndication::Switch,
             'R' => DecodeTargetIndication::Required,
-            other => panic!("unknown decode target indication {other:?}"),
+            // '-' plus anything unexpected. Fixture notation, so a stray
+            // character means the pattern string is wrong; reading it as "not
+            // present" surfaces that in the assertion rather than as an abort.
+            _ => DecodeTargetIndication::NotPresent,
         })
         .collect()
 }

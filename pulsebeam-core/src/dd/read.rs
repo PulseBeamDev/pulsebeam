@@ -237,8 +237,10 @@ fn read_template_layers(
                     return Err(DdReadError::TooManySpatialLayers);
                 }
             }
-            NO_MORE => break,
-            _ => unreachable!("read_bits(2) yields 0..4"),
+            // `read_bits(2)` yields 0..4 and the four values are covered
+            // above, so this is the compiler's exhaustiveness check rather than
+            // a reachable state.
+            NO_MORE | _ => break,
         }
     }
 

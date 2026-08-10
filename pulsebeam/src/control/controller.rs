@@ -167,10 +167,9 @@ impl ControllerActor {
         // Spawn the TCP acceptor onto the current LocalSet / LocalRuntime.
         // It owns the listener, enforces caps, reads the first STUN frame from
         // each connection, and sends results back through the mailbox.
-        let listener = self
-            .tcp_listener
-            .take()
-            .expect("ControllerActor::run called twice");
+        let Some(listener) = self.tcp_listener.take() else {
+            pulsebeam_runtime::fatal!("ControllerActor::run called twice")
+        };
         let acceptor = TcpAcceptorHandle::spawn(listener, shutdown.child_token());
         let mut pending_rx = acceptor.event_rx;
 

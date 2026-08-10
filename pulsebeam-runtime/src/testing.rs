@@ -49,7 +49,7 @@ where
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
+            .unwrap_or_else(|err| crate::fatal!("test runtime unavailable: {err}"));
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, test);
     }

@@ -1,3 +1,11 @@
+//! Handles the application holds on an agent's tracks and topics.
+//!
+//! Crash exception: the `map_err` closures below match on the very command the
+//! same function just constructed, so the other arms cannot be reached, and
+//! each has to produce a differently-typed `SendError` — there is no single
+//! fallback value to return instead. Scoped here rather than workspace-wide.
+#![allow(clippy::unreachable)]
+
 use crate::RtpPacket;
 use crate::agent::mailbox;
 use crate::manager::VideoSubscription;
