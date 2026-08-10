@@ -22,6 +22,33 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The seed every plan runs under unless it pins its own.
+///
+/// Fixed, so an ordinary run reproduces exactly and a failure bisects.
+pub const DEFAULT_SIM_SEED: u64 = 0xDEAD_BEEF;
+
+/// The seed for this process, `DEFAULT_SIM_SEED` unless `PULSEBEAM_SIM_SEED`
+/// overrides it.
+///
+/// One fixed seed samples one point out of the space of orderings, latencies
+/// and losses these plans can produce, and then reports that point forever. The
+/// override is what lets the same suite sweep the rest of the space without
+/// giving up reproducibility: a sweep failure names its seed, and
+/// `make test-sim-seed SEED=<n>` replays exactly that run.
+///
+/// A malformed value is refused rather than silently ignored — a sweep that
+/// quietly ran 200 iterations of the default seed would report the opposite of
+/// what it found.
+pub fn sim_seed() -> u64 {
+    match std::env::var("PULSEBEAM_SIM_SEED") {
+        Err(_) => DEFAULT_SIM_SEED,
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("PULSEBEAM_SIM_SEED={raw:?} is not a u64")),
+    }
+}
+
 static NEXT_SUBNET: AtomicU32 = AtomicU32::new(0);
 
 /// Subnets available to plans. Excludes 0 and 255, and the address space is a byte.

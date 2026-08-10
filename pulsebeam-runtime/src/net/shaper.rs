@@ -434,7 +434,22 @@ struct Queued {
 #[derive(Default, Clone)]
 pub struct Shaper(std::sync::Arc<Mutex<ShaperState>>);
 
-#[derive(Default)]
+/// Seed for the impairment stream, set per plan by the simulator harness.
+///
+/// Loss, reordering and duplication are all drawn from one SplitMix64 stream
+/// per socket. That stream used to start at zero unconditionally, so every plan
+/// replayed one fixed impairment sequence no matter how the rest of the
+/// simulation was seeded — a seed sweep would have varied latency jitter and
+/// key material while feeding the congestion controller the identical pattern
+/// of drops every single time.
+static IMPAIRMENT_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Seed the impairment stream for this plan. Process-global, like the rest of
+/// the shaper registries; nextest gives each plan its own process.
+pub fn seed_impairments(seed: u64) {
+    IMPAIRMENT_SEED.store(seed, std::sync::atomic::Ordering::Relaxed);
+}
+
 struct ShaperState {
     /// When the link to a destination next falls idle. The backlog is this minus now.
     next_free: HashMap<IpAddr, Instant>,
@@ -442,6 +457,17 @@ struct ShaperState {
     loss_counter: u64,
     /// Gilbert-Elliott position per destination: true while in the bad state.
     in_bad_state: HashMap<IpAddr, bool>,
+}
+
+impl Default for ShaperState {
+    fn default() -> Self {
+        Self {
+            next_free: HashMap::new(),
+            queue: VecDeque::new(),
+            loss_counter: IMPAIRMENT_SEED.load(std::sync::atomic::Ordering::Relaxed),
+            in_bad_state: HashMap::new(),
+        }
+    }
 }
 
 /// What the caller should do with a packet offered to the shaper.

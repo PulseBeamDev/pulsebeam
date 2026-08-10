@@ -35,8 +35,10 @@
 //! the space rather than covering it. It is still strictly more than one hand-picked point, and
 //! the seed makes anything it finds reproducible.
 
-use super::common::{LinkReport, LocalNodeSim, Loss, Participant, Reorder, Room, Step};
+use super::common::{LinkReport, LocalNodeSim, Loss, Participant, Reorder, Room, Step, sim_seed};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
 use std::time::Duration;
 
 /// A generated network and the load offered over it.
@@ -296,39 +298,104 @@ fn config() -> ProptestConfig {
     }
 }
 
-proptest! {
-    #![proptest_config(config())]
+/// The seed must reach the *generator*, not only the network.
+///
+/// `check` exists because proptest otherwise seeds itself from the OS. If that
+/// regressed, every property below would keep passing while the replay command
+/// they print on failure quietly became a lie — the worst possible failure mode
+/// for a randomised suite, because it is invisible until someone needs it.
+///
+/// The network-level counterpart lives in `bwe.rs`
+/// (`a_different_seed_is_a_different_network_test`). This one asserts at the
+/// generator so it costs no simulation.
+#[test]
+fn the_seed_selects_the_generated_scenarios() {
+    fn sample(seed: u64) -> Vec<String> {
+        let mut rng_seed = [0u8; 32];
+        rng_seed[..8].copy_from_slice(&seed.to_le_bytes());
+        let mut runner = TestRunner::new_with_rng(
+            config(),
+            TestRng::from_seed(RngAlgorithm::ChaCha, &rng_seed),
+        );
+        let strategy = Scenario::healthy();
+        (0..16)
+            .map(|_| format!("{:?}", strategy.new_tree(&mut runner).unwrap().current()))
+            .collect()
+    }
 
-    /// On a link with room to spare, a subscribed stream must actually be delivered.
-    ///
-    /// The weakest possible statement of what an SFU is for, and the one production was
-    /// violating: the screen share was subscribed, the link was fine, and nothing arrived. It
-    /// holds for every network here by construction - capacity starts at 2 Mbps against a 1.25
-    /// Mbps top layer - so a failure is never the link's fault.
-    #[test]
-    fn a_subscribed_stream_is_delivered_on_a_link_with_room(scenario in Scenario::healthy()) {
+    assert_eq!(
+        sample(1),
+        sample(1),
+        "the same seed generated different scenarios, so a reported failure cannot be replayed"
+    );
+    assert_ne!(
+        sample(1),
+        sample(2),
+        "two seeds generated identical scenarios, so the seed is not reaching the generator and \
+         sweeping it proves nothing"
+    );
+}
+
+/// Run `strategy` under this process's simulation seed.
+///
+/// proptest draws its generator entropy from the OS by default, which would leave
+/// a generated failure unreproducible: the plan seed replays the network but not
+/// the scenario that ran on it. Seeding the runner from `sim_seed()` makes the
+/// seed the whole input, so the command printed below genuinely reproduces the
+/// run — which is the property every other part of the sweep depends on.
+fn check<S>(strategy: S, test: impl Fn(S::Value) -> TestCaseResult)
+where
+    S: Strategy,
+    S::Value: std::fmt::Debug,
+{
+    let seed = sim_seed();
+    let mut rng_seed = [0u8; 32];
+    rng_seed[..8].copy_from_slice(&seed.to_le_bytes());
+
+    let mut runner = TestRunner::new_with_rng(
+        config(),
+        TestRng::from_seed(RngAlgorithm::ChaCha, &rng_seed),
+    );
+
+    if let Err(err) = runner.run(&strategy, test) {
+        panic!("{err}\n\nreplay this exact run with:\n    make test-sim-seed SEED={seed}\n");
+    }
+}
+
+/// On a link with room to spare, a subscribed stream must actually be delivered.
+///
+/// The weakest possible statement of what an SFU is for, and the one production was
+/// violating: the screen share was subscribed, the link was fine, and nothing arrived. It
+/// holds for every network here by construction - capacity starts at 2 Mbps against a 1.25
+/// Mbps top layer - so a failure is never the link's fault.
+#[test]
+fn a_subscribed_stream_is_delivered_on_a_link_with_room() {
+    check(Scenario::healthy(), |scenario| {
         let report = scenario.run("subscribed_stream");
         prop_assert!(
             report.samples > 0,
             "no allocation passes recorded; the plan never exercised the viewer, so every \
-             other claim here would pass vacuously ({scenario:?})"
+                 other claim here would pass vacuously ({scenario:?})"
         );
         prop_assert!(
             report.received_bytes > 0,
             "nothing was delivered over 30s on a {} bps link carrying at most 1.25 Mbps of \
-             video ({scenario:?}, report {report:?})",
+                 video ({scenario:?}, report {report:?})",
             scenario.capacity_bps
         );
-    }
+        Ok(())
+    });
+}
 
-    /// The estimate must not fall below what the application asked for, on a link that can
-    /// supply it.
-    ///
-    /// This is the production failure stated as a property. The estimate is not required to find
-    /// the capacity - it cannot, when the application is not using it - only to keep up with
-    /// demand it is being asked to carry, on a link demonstrably able to carry it.
-    #[test]
-    fn the_estimate_keeps_up_with_demand_it_can_afford(scenario in Scenario::healthy()) {
+/// The estimate must not fall below what the application asked for, on a link that can
+/// supply it.
+///
+/// This is the production failure stated as a property. The estimate is not required to find
+/// the capacity - it cannot, when the application is not using it - only to keep up with
+/// demand it is being asked to carry, on a link demonstrably able to carry it.
+#[test]
+fn the_estimate_keeps_up_with_demand_it_can_afford() {
+    check(Scenario::healthy(), |scenario| {
         let report = scenario.run("demand");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
 
@@ -342,21 +409,24 @@ proptest! {
         prop_assert!(
             got >= 60.0,
             "estimate ended at {} bps against a need of {need} bps ({got:.0}%) on a {} bps \
-             link, having dropped {:.1}% from its peak with {:.2}% congestion loss ({scenario:?})",
+                 link, having dropped {:.1}% from its peak with {:.2}% congestion loss ({scenario:?})",
             report.estimate_last_bps,
             scenario.capacity_bps,
             report.worst_drawdown_percent,
             report.congestion_loss_percent(),
         );
-    }
+        Ok(())
+    });
+}
 
-    /// A controller must not sustain congestion loss on a link it is not filling.
-    ///
-    /// Overuse is defined by the bottleneck's own tail-drop, not by a bitrate anyone chose, so
-    /// this holds for any capacity: if the link is not being filled, packets have no business
-    /// being dropped for congestion.
-    #[test]
-    fn an_underused_link_is_not_driven_into_loss(scenario in Scenario::healthy()) {
+/// A controller must not sustain congestion loss on a link it is not filling.
+///
+/// Overuse is defined by the bottleneck's own tail-drop, not by a bitrate anyone chose, so
+/// this holds for any capacity: if the link is not being filled, packets have no business
+/// being dropped for congestion.
+#[test]
+fn an_underused_link_is_not_driven_into_loss() {
+    check(Scenario::healthy(), |scenario| {
         let report = scenario.run("underused_link");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
         let Some(utilisation) = report.utilisation_percent() else {
@@ -367,30 +437,29 @@ proptest! {
         prop_assert!(
             report.congestion_loss_percent() < 1.0,
             "{:.2}% congestion loss while using only {utilisation:.1}% of the link \
-             ({} of {} packets, queue peaked at {:?}) ({scenario:?})",
+                 ({} of {} packets, queue peaked at {:?}) ({scenario:?})",
             report.congestion_loss_percent(),
             report.congestion_drops,
             report.delivered_packets + report.congestion_drops,
             report.max_backlog,
         );
-    }
+        Ok(())
+    });
 }
 
-proptest! {
-    #![proptest_config(config())]
-
-    /// A stream asking for the least the ladder offers must not be starved to pay for another.
-    ///
-    /// The production report was "the allocator doesn't think there is enough for the camera",
-    /// with the camera paused while a screen share ran. The generator makes the co-tenant ask for
-    /// the bottom rung only - 150 kbps against links from 2 Mbps up - so there is no capacity
-    /// argument available: a stream left paused here was not priced out, it was overlooked.
-    ///
-    /// Stated as "not paused" rather than "gets its fair share". What fairness means between a
-    /// screen share and a camera is a policy question with defensible answers either way; being
-    /// dropped entirely is not one of them.
-    #[test]
-    fn a_cheap_co_tenant_is_not_starved(scenario in Scenario::contended()) {
+/// A stream asking for the least the ladder offers must not be starved to pay for another.
+///
+/// The production report was "the allocator doesn't think there is enough for the camera",
+/// with the camera paused while a screen share ran. The generator makes the co-tenant ask for
+/// the bottom rung only - 150 kbps against links from 2 Mbps up - so there is no capacity
+/// argument available: a stream left paused here was not priced out, it was overlooked.
+///
+/// Stated as "not paused" rather than "gets its fair share". What fairness means between a
+/// screen share and a camera is a policy question with defensible answers either way; being
+/// dropped entirely is not one of them.
+#[test]
+fn a_cheap_co_tenant_is_not_starved() {
+    check(Scenario::contended(), |scenario| {
         let report = scenario.run("cheap_cotenant");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
 
@@ -408,32 +477,31 @@ proptest! {
         prop_assert!(
             quality.is_some_and(|q| q > 0),
             "the co-tenant was left at {quality:?} (0 = paused) on a {} bps link that covers the \
-             full {} bps of demand, so nothing was priced out. The other stream ended at {:?}. \
-             ({scenario:?}, estimate {} bps, {:.2}% congestion loss)",
+                 full {} bps of demand, so nothing was priced out. The other stream ended at {:?}. \
+                 ({scenario:?}, estimate {} bps, {:.2}% congestion loss)",
             scenario.capacity_bps,
             report.demand_last_bps,
             report.forwarded_quality.get("publisher"),
             report.estimate_last_bps,
             report.congestion_loss_percent(),
         );
-    }
+        Ok(())
+    });
 }
 
-proptest! {
-    #![proptest_config(config())]
-
-    /// A settled stream must not oscillate between layers, whatever the network did to get there.
-    ///
-    /// Every other figure a plan reports is an average or an endpoint, and a stream flipping
-    /// between two layers looks healthy in all of them: right final layer, right byte count,
-    /// right estimate. Only a reversal count sees it, and only a reversal count can be asserted
-    /// while the link is still ramping - climbing q to h to f is correct, turning round is not.
-    ///
-    /// This is the shape of the defect that motivated the whole allocation rework: an estimate
-    /// collapsing at a traffic onset dragged the forwarded layer down and back up repeatedly, and
-    /// the viewer saw a stream that never held long enough to decode.
-    #[test]
-    fn a_forwarded_stream_does_not_oscillate(scenario in Scenario::healthy()) {
+/// A settled stream must not oscillate between layers, whatever the network did to get there.
+///
+/// Every other figure a plan reports is an average or an endpoint, and a stream flipping
+/// between two layers looks healthy in all of them: right final layer, right byte count,
+/// right estimate. Only a reversal count sees it, and only a reversal count can be asserted
+/// while the link is still ramping - climbing q to h to f is correct, turning round is not.
+///
+/// This is the shape of the defect that motivated the whole allocation rework: an estimate
+/// collapsing at a traffic onset dragged the forwarded layer down and back up repeatedly, and
+/// the viewer saw a stream that never held long enough to decode.
+#[test]
+fn a_forwarded_stream_does_not_oscillate() {
+    check(Scenario::healthy(), |scenario| {
         let report = scenario.run("no_oscillation");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
         // An outage is a genuine reason to shed and then climb back; the reversal it causes is
@@ -444,28 +512,31 @@ proptest! {
             prop_assert!(
                 *reversals <= 2,
                 "{publisher}'s layer reversed direction {reversals} times (changing {:?} times in \
-                 total) on a {} bps link. Climbing is fine; turning round repeatedly means the \
-                 stream never settles, and every switch costs a keyframe ({scenario:?}, estimate \
-                 {} bps, drawdown {:.1}%)",
+                     total) on a {} bps link. Climbing is fine; turning round repeatedly means the \
+                     stream never settles, and every switch costs a keyframe ({scenario:?}, estimate \
+                     {} bps, drawdown {:.1}%)",
                 report.quality_changes.get(publisher),
                 scenario.capacity_bps,
                 report.estimate_last_bps,
                 report.worst_drawdown_percent,
             );
         }
-    }
+        Ok(())
+    });
+}
 
-    /// The estimate must not collapse on a link that never changed.
-    ///
-    /// Capacity here is fixed for the life of the plan, so a deep fall from peak is not the link
-    /// being withdrawn - it is the controller mistaking something else for congestion. That is
-    /// exactly what a throughput sample taken while the sender was idle used to do: a 2.6 Mbps
-    /// estimate went to 67 kbps in one step with no packet loss at all, and the allocator could
-    /// only offer what the collapsed estimate allowed, so it could not climb back out.
-    ///
-    /// Burst loss is excluded because backing off is the correct response to it.
-    #[test]
-    fn a_fixed_link_does_not_collapse_the_estimate(scenario in Scenario::healthy()) {
+/// The estimate must not collapse on a link that never changed.
+///
+/// Capacity here is fixed for the life of the plan, so a deep fall from peak is not the link
+/// being withdrawn - it is the controller mistaking something else for congestion. That is
+/// exactly what a throughput sample taken while the sender was idle used to do: a 2.6 Mbps
+/// estimate went to 67 kbps in one step with no packet loss at all, and the allocator could
+/// only offer what the collapsed estimate allowed, so it could not climb back out.
+///
+/// Burst loss is excluded because backing off is the correct response to it.
+#[test]
+fn a_fixed_link_does_not_collapse_the_estimate() {
+    check(Scenario::healthy(), |scenario| {
         let report = scenario.run("no_collapse");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
         prop_assume!(report.capacity_fixed);
@@ -474,24 +545,27 @@ proptest! {
         prop_assert!(
             report.worst_drawdown_percent < 75.0,
             "the estimate fell {:.1}% from its peak on a link whose capacity never moved, \
-             ending at {} bps against {} bps of demand with {:.2}% congestion loss. A fixed link \
-             gives nothing to back off from ({scenario:?})",
+                 ending at {} bps against {} bps of demand with {:.2}% congestion loss. A fixed link \
+                 gives nothing to back off from ({scenario:?})",
             report.worst_drawdown_percent,
             report.estimate_last_bps,
             report.demand_last_bps,
             report.congestion_loss_percent(),
         );
-    }
+        Ok(())
+    });
+}
 
-    /// Under contention, the stream asked for at a higher rung must not end below the one asked
-    /// for at the lowest.
-    ///
-    /// The co-tenant always requests 180p and the publisher requests at least as much, so this is
-    /// the weakest possible statement of "what the viewer asked for is what decides who gets the
-    /// bandwidth". It fails on a priority inversion - which the allocator had, with a low-priority
-    /// screen share holding a floor that preempted a focused camera's target.
-    #[test]
-    fn the_stream_asked_for_more_is_not_served_less(scenario in Scenario::contended()) {
+/// Under contention, the stream asked for at a higher rung must not end below the one asked
+/// for at the lowest.
+///
+/// The co-tenant always requests 180p and the publisher requests at least as much, so this is
+/// the weakest possible statement of "what the viewer asked for is what decides who gets the
+/// bandwidth". It fails on a priority inversion - which the allocator had, with a low-priority
+/// screen share holding a floor that preempted a focused camera's target.
+#[test]
+fn the_stream_asked_for_more_is_not_served_less() {
+    check(Scenario::contended(), |scenario| {
         let report = scenario.run("no_inversion");
         prop_assume!(report.samples > 0 && report.received_bytes > 0);
         // Only meaningful where the publisher asked for a taller rung than the co-tenant's 180p.
@@ -509,9 +583,10 @@ proptest! {
         prop_assert!(
             publisher >= cotenant,
             "the publisher was asked for {}p and ended at layer {publisher}, below the co-tenant \
-             asked for 180p and served at layer {cotenant}, on a {} bps link ({scenario:?})",
+                 asked for 180p and served at layer {cotenant}, on a {} bps link ({scenario:?})",
             scenario.target_height,
             scenario.capacity_bps,
         );
-    }
+        Ok(())
+    });
 }

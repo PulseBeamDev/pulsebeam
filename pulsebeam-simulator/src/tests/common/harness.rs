@@ -2801,7 +2801,7 @@ impl LocalNodeSim {
         Self {
             rooms: Vec::new(),
             tick_duration: Duration::from_millis(1),
-            rng_seed: 0xDEAD_BEEF,
+            rng_seed: super::sim_seed(),
             subnet: None,
             tcp_only: false,
             num_shards: 1,
@@ -2890,6 +2890,15 @@ impl LocalNodeSim {
         // real clock is back in force before the runtime tears down.
         let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
         crate::sim_rand::set_thread_rng(self.rng_seed);
+        // Loss, reordering and duplication come from the shaper's own stream, not
+        // from turmoil's RNG, so it has to be seeded too or a sweep replays one
+        // impairment pattern under every seed.
+        pulsebeam_runtime::net::shaper::seed_impairments(self.rng_seed);
+        tracing::info!(
+            seed = self.rng_seed,
+            "simulation plan seed; replay with `make test-sim-seed SEED={}`",
+            self.rng_seed
+        );
 
         let sim_duration = plan
             .iter()
