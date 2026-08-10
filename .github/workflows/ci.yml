@@ -23,10 +23,6 @@ jobs:
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.10
     - run: rustup component add clippy rustfmt
-    # Formatting first, and not for tidiness: `pulsebeam-proto/build.rs` emits
-    # into `src/`, so any build rewrites `signaling.rs` in prost's own layout,
-    # which rustfmt does not agree with. Checking after a build would compare
-    # generated output against rustfmt and fail on code nobody wrote.
     - name: Formatting
       run: cargo fmt --all --check
     - name: Lint
