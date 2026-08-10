@@ -355,8 +355,7 @@ impl NodeBuilder {
         let mut frame_rxs = Vec::new();
         let use_shared_runtime = matches!(self.worker_execution, WorkerExecution::SharedRuntime);
         for _ in 0..udp_sockets.len() {
-            // TODO: should cross shard channel capacities this big?
-            let (tx, rx) = mailbox::new(1024);
+            let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_FRAME_CAPACITY);
             frame_txs.push(tx);
             frame_rxs.push(rx);
         }

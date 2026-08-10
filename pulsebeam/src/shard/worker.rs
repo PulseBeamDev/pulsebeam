@@ -52,6 +52,16 @@ pub const SHARD_EVENT_CAPACITY: usize = 65_536;
 /// asserted about a number nothing uses.
 pub const SHARD_COMMAND_CAPACITY: usize = 1024;
 
+/// Depth of the shard -> shard media queue, one per receiving shard.
+///
+/// This lane is lossy on purpose: it carries forwarded media, and a receiver
+/// that has fallen this far behind is better off dropping than accumulating
+/// latency it can never pay back. So the depth is a jitter buffer, not a
+/// backlog — deep enough to absorb one scheduling hiccup on the receiving
+/// core, shallow enough that a stalled shard sheds load promptly instead of
+/// holding a second of stale video.
+pub const SHARD_FRAME_CAPACITY: usize = 1024;
+
 const _: () = assert!(
     SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
     "the queue a shard cannot block on must have far more headroom than the one it can"
