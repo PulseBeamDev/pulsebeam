@@ -201,6 +201,15 @@ impl EgressGuard {
 
 #[cfg(test)]
 mod test {
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    #![allow(clippy::arithmetic_side_effects)]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     fn mid() -> Mid {

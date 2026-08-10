@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
+#![allow(clippy::arithmetic_side_effects)] // test harness; an overflow here should fail the test
 //! End-to-end stream-switching tests.
 //!
 //! The harness mirrors production wiring exactly: `ShardRoutingTable::route_video`
@@ -71,7 +79,7 @@ impl Forwarder {
         // track cache routes it to the right per-encoding ring.
         let mut pkt = pkt.clone();
         pkt.ext_vals.rid = sid.1;
-        self.cache.push(&pkt);
+        self.cache.push(pkt);
 
         let Forwarder {
             switcher,
@@ -283,9 +291,9 @@ fn cache_segments_on_frames_not_arrival_time() {
 
     let kf = b.keyframe_with_slices(3, 2);
     for p in &kf {
-        cache.push(p);
+        cache.push(p.clone());
     }
-    let last = kf.last().unwrap();
+    let _last = kf.last().unwrap();
     let replay = cache
         .replay()
         .expect("a complete keyframe must be replayable");
@@ -678,14 +686,13 @@ fn a_reordered_marker_does_not_look_like_a_frame_boundary() {
     assert!(fwd.switched());
     assert_decodable(fwd.emitted(), "switch after a reordered marker");
 
-    let forwarded: Vec<_> = fwd
+    let forwarded = fwd
         .emitted()
         .iter()
         .filter(|p| p.rtp_ts.numer() == frame_ts)
-        .collect();
+        .count();
     assert_eq!(
-        forwarded.len(),
-        3,
+        forwarded, 3,
         "the switch must wait for the in-flight packet rather than abandon it"
     );
     assert_eq!(
@@ -1222,11 +1229,11 @@ fn the_cache_does_not_grow_without_bound() {
     let mut cache = StreamCache::default();
 
     for p in b.keyframe(4) {
-        cache.push(&p);
+        cache.push(p.clone());
     }
     for _ in 0..2000 {
         for p in b.delta_frame(8) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
     }
 

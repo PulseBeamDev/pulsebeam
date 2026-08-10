@@ -1,9 +1,22 @@
+//! Shared-state exception, imposed by str0m: `RtpWrite::new` takes
+//! `payload: Arc<[u8]>`, so a packet carries one, and its extension map
+//! stores `Arc<dyn Any>`. Neither can be removed without changing the fork.
+//! Both are kept core-local — `to_transit` copies the payload and
+//! `rehome_extensions` re-anchors the descriptor — so no refcount is ever
+//! shared across shards. See `docs/thread-per-core.md`.
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::float_cmp
+)]
+
 pub mod cache;
 #[cfg(debug_assertions)]
 pub mod egress_guard;
 pub mod frame_selector;
 pub mod h264;
 pub mod monitor;
+pub mod normalize;
 pub mod switcher;
 pub mod sync;
 pub mod timeline;
@@ -122,11 +135,28 @@ impl RtpPacket {
         (pkt, sr)
     }
 
-    pub fn deep_clone(&self) -> Self {
+    /// Copy for handoff to another core. The payload copy is deliberate: sharing
+    /// one `Arc` across shards would put the refcount header in the same cache
+    /// line as the payload head, so a remote drop invalidates a line other cores
+    /// are reading. Copying into a fresh `Arc` is also the *cheapest* option, not
+    /// a compromise — str0m's `RtpWrite::new` demands `Arc<[u8]>` at egress, so a
+    /// pooled block or `Rc<[u8]>` would cost a second copy on the way out.
+    /// Revisit only if the str0m fork stops requiring `Arc<[u8]>`.
+    pub fn to_transit(&self) -> Self {
+        let mut ext_vals = self.ext_vals.clone();
+
+        // The sender's Video Layers Allocation describes *its* simulcast set.
+        // The destination never reads it — normalization already ran, once, on
+        // this side — and egress strips it before writing. Carrying it across
+        // is dead weight and one more shared refcount.
+        ext_vals
+            .user_values
+            .remove::<str0m::rtp::vla::VideoLayersAllocation>();
+
         Self {
             ssrc: self.ssrc,
             marker: self.marker,
-            ext_vals: self.ext_vals.clone(),
+            ext_vals,
             header_len: self.header_len,
             seq_no: self.seq_no,
             rtp_ts: self.rtp_ts,
@@ -138,6 +168,31 @@ impl RtpPacket {
         }
     }
 
+    /// Move the parsed descriptor onto a fresh allocation owned by this core.
+    ///
+    /// Cloning the extension map clones the `Arc<dyn Any>` inside it, so an
+    /// arriving packet's descriptor is still refcounted against the publisher's
+    /// core. Both cores then touch that line on every packet — the publisher
+    /// when it clones for its own subscribers, this core when it clones for
+    /// each of ours — and it ping-pongs between them for as long as the stream
+    /// runs. Copying the payload in [`Self::to_transit`] exists to prevent
+    /// exactly that; the extensions were the hole in it.
+    ///
+    /// Done here rather than in `to_transit` because the publisher pays that
+    /// once per destination while a destination pays it once, and the publisher
+    /// is the busier core: it also normalizes, caches, and fans out locally.
+    pub fn rehome_extensions(&mut self) {
+        let Some(dd) = self
+            .ext_vals
+            .user_values
+            .get::<pulsebeam_core::dd::DependencyDescriptor>()
+        else {
+            return;
+        };
+        let owned = Arc::new(dd.clone());
+        self.ext_vals.user_values.set_arc(owned);
+    }
+
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {
         self.playout_time = playout_time;
         self
@@ -146,6 +201,15 @@ impl RtpPacket {
 
 #[cfg(test)]
 pub mod test_utils {
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    #![allow(clippy::arithmetic_side_effects)]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use std::time::Duration;
 
     use super::*;
@@ -169,7 +233,7 @@ pub mod test_utils {
                 new_packet.rtp_ts.frequency(),
             );
 
-            new_packet.playout_time = new_packet.playout_time + playout_time_delta;
+            new_packet.playout_time += playout_time_delta;
             if let Some(at) = new_packet.arrival_ts.checked_add(playout_time_delta) {
                 new_packet.arrival_ts = at;
             }

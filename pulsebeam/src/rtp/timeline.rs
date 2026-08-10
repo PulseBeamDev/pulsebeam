@@ -1,3 +1,13 @@
+//! Overflow is explicit here, and denied workspace-wide.
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+
 use crate::rtp::RtpPacket;
 use pulsebeam_runtime::rand::RngCore;
 use std::time::Duration;
@@ -89,11 +99,16 @@ impl Timeline {
     /// within half a frame of real time, so this does not reintroduce drift.
     fn switch_target(&self, raw_target: u64) -> u64 {
         let Some(interval) = self.frame_interval.filter(|i| *i > 0) else {
-            return raw_target.max(self.max_output_ts + self.min_switch_advance());
+            return raw_target.max(self.max_output_ts.saturating_add(self.min_switch_advance()));
         };
         let advance = raw_target.saturating_sub(self.max_output_ts);
-        let frames = ((advance + interval / 2) / interval).max(1);
-        self.max_output_ts + frames * interval
+        let frames = advance
+            .saturating_add(interval / 2)
+            .checked_div(interval)
+            .unwrap_or(1)
+            .max(1);
+        self.max_output_ts
+            .saturating_add(frames.saturating_mul(interval))
     }
 
     /// Whether `delta` between consecutive frames is a believable frame interval
@@ -105,7 +120,7 @@ impl Timeline {
 
     #[inline]
     fn ticks(&self, d: Duration) -> u64 {
-        ((d.as_nanos() * self.clock_rate.get() as u128) / 1_000_000_000u128) as u64
+        ((d.as_nanos().saturating_mul(self.clock_rate.get() as u128)) / 1_000_000_000u128) as u64
     }
 
     /// Re-aligns the timeline to a new source stream starting with `packet`.
@@ -217,7 +232,7 @@ impl Timeline {
             self.max_output = output_seq;
         }
         if output_ts > self.max_output_ts {
-            let delta = output_ts - self.max_output_ts;
+            let delta = output_ts.saturating_sub(self.max_output_ts);
             if self.awaiting_first_frame {
                 self.awaiting_first_frame = false;
             } else if self.plausible_interval(delta) {
@@ -230,6 +245,20 @@ impl Timeline {
 
 #[cfg(test)]
 mod test {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 

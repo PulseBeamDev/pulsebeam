@@ -110,6 +110,13 @@ impl FrameSelector for DependencyDescriptorSelector {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use pulsebeam_core::dd::{
         DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
@@ -118,9 +125,11 @@ mod test {
 
     /// A packet whose frame declares the given per-decode-target indications.
     fn pkt_with_dtis(dtis: &[DecodeTargetIndication]) -> RtpPacket {
-        let mut dd = DependencyDescriptor::default();
-        dd.frame_dependencies = FrameDependencyTemplate {
-            dtis: dtis.iter().copied().collect(),
+        let dd = DependencyDescriptor {
+            frame_dependencies: FrameDependencyTemplate {
+                dtis: dtis.iter().copied().collect(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut pkt = RtpPacket::default();

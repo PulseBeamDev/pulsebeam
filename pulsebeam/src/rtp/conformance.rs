@@ -1,3 +1,15 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice
+)] // test / simulation support
+//! Overflow is allowed here: this module is `#[cfg(test)]`-only, and a check
+//! whose own arithmetic overflows should fail loudly rather than clamp into a
+//! passing verdict about the stream it is judging.
+#![allow(clippy::arithmetic_side_effects)]
+
 //! Invariants the egress RTP stream must satisfy for a subscriber to decode it.
 //!
 //! Subscribers have no jitter buffer in front of the SFU, so anything the

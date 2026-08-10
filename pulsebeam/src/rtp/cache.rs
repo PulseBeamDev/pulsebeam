@@ -1,3 +1,10 @@
+//! Per-stream packet cache backing keyframe replay on a layer switch.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! sequence arithmetic decides which cached packets are replayed; a wrap here
+//! would replay the wrong window and hand the decoder a segment that does not
+//! start at a keyframe.
+
 use crate::rtp::RtpPacket;
 use str0m::media::{MediaTime, Rid};
 use str0m::rtp::SeqNo;
@@ -102,7 +109,15 @@ impl StreamCache {
             .filter(|p| *p.seq_no == seq)
     }
 
-    pub fn push(&mut self, pkt: &RtpPacket) {
+    /// Take ownership of a packet, handing it back only when it was too old to
+    /// store.
+    ///
+    /// By value because the cache holds a copy of every packet regardless, so a
+    /// caller that also needs one should read the stored copy rather than make
+    /// a second. That is not a micro-optimisation: `ExtensionValues` carries a
+    /// type-keyed map, so cloning an `RtpPacket` heap-allocates — measured at
+    /// 75ns against 35ns for one with no extensions.
+    pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
         if pkt.nal.sps() {
             self.sps = Some(pkt.clone());
         }
@@ -117,16 +132,18 @@ impl StreamCache {
         if let Some(newest) = self.newest_seq
             && seq.wrapping_add(STREAM_CACHE_CAPACITY as u64) <= newest
         {
-            return;
+            return Some(pkt);
         }
+
+        let frame_ts = pkt.rtp_ts.numer();
+        let is_keyframe = pkt.is_keyframe;
 
         // Placing the packet naturally evicts whatever occupied its slot
         // `CAPACITY` positions ago — no eviction loop needed.
-        self.ring[(seq & CACHE_MASK) as usize] = Some(pkt.clone());
+        self.ring[(seq & CACHE_MASK) as usize] = Some(pkt);
         self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
 
-        let frame_ts = pkt.rtp_ts.numer();
-        if pkt.is_keyframe && self.segment_ts != Some(frame_ts) {
+        if is_keyframe && self.segment_ts != Some(frame_ts) {
             self.open_segment(seq, frame_ts);
         }
 
@@ -138,6 +155,7 @@ impl StreamCache {
             self.segment_ts = None;
             self.segment_start_seq = None;
         }
+        None
     }
 
     /// Anchor the segment at the earliest buffered packet belonging to the
@@ -190,7 +208,7 @@ impl StreamCache {
                 Some(p) => segment.push(p.clone()),
                 None => break,
             }
-            seq += 1;
+            seq = seq.saturating_add(1);
         }
 
         if !segment.iter().any(|p| p.is_keyframe) {
@@ -214,7 +232,7 @@ impl StreamCache {
         for p in &segment {
             let ts = p.rtp_ts.numer();
             if seen_ts != Some(ts) {
-                frames += 1;
+                frames = frames.saturating_add(1);
                 seen_ts = Some(ts);
             }
         }
@@ -232,36 +250,35 @@ impl StreamCache {
 
         let clock_rate = segment[0].rtp_ts.frequency().get() as u64;
         let span = seen_ts.unwrap_or(segment_ts).saturating_sub(segment_ts);
-        if span > clock_rate * MAX_REPLAY_SPAN_MS / 1000 {
+        if span > clock_rate.saturating_mul(MAX_REPLAY_SPAN_MS) / 1000 {
             return None;
         }
 
-        // A Dependency Descriptor keyframe is a decode-target entry point by
-        // contract, so its segment is self-sufficient. It also means the payload
-        // may be opaque (SFrame/E2EE), where the SPS/PPS probe sees nothing and
-        // synthesis is neither possible nor needed — the client's decoder owns the
-        // parameter sets end-to-end. Only synthesize parameter sets for the legacy
-        // deep-inspection path, where the payload is readable.
-        let dd_driven = segment.iter().any(|p| {
-            p.ext_vals
-                .user_values
-                .get::<pulsebeam_core::dd::DependencyDescriptor>()
-                .is_some()
-        });
+        // Only a keyframe the H.264 probe could actually read needs a
+        // parameter-set prefix. Everything else — VP8/VP9/AV1, or H.264 under
+        // SFrame/E2EE — leaves the NAL flags empty, has a self-sufficient
+        // keyframe, and offers no parameter sets to synthesize from.
+        //
+        // Do not key this off the Dependency Descriptor: plain readable H.264
+        // negotiates DD too, and skipping its prefix ships an IDR the decoder
+        // cannot initialize on, which renders as a blank stream with nothing
+        // reporting an error. Do not key it off cached SPS/PPS either — those
+        // can arrive after the IDR under reordering.
+        let needs_parameter_sets = segment.iter().any(|p| p.nal.idr());
 
-        let mut out = if dd_driven {
-            Vec::new()
-        } else {
+        let mut out = if needs_parameter_sets {
             self.parameter_set_prefix(&segment, segment_ts)?
+        } else {
+            Vec::new()
         };
         out.extend(segment);
 
         debug_assert!(
-            dd_driven || out.iter().any(|p| p.nal.sps()),
+            !needs_parameter_sets || out.iter().any(|p| p.nal.sps()),
             "replay lacks SPS"
         );
         debug_assert!(
-            dd_driven || out.iter().any(|p| p.nal.pps()),
+            !needs_parameter_sets || out.iter().any(|p| p.nal.pps()),
             "replay lacks PPS"
         );
         debug_assert!(out.iter().any(|p| p.is_keyframe), "replay lacks a keyframe");
@@ -284,7 +301,7 @@ impl StreamCache {
         let cursor = *cursor;
         let (lo, hi) = match self.newest_seq {
             Some(newest) if newest > cursor => {
-                let floor = newest.saturating_sub(STREAM_CACHE_CAPACITY as u64 - 1);
+                let floor = newest.saturating_sub((STREAM_CACHE_CAPACITY as u64).saturating_sub(1));
                 (cursor.wrapping_add(1).max(floor), newest)
             }
             // Empty range: nothing newer than the cursor.
@@ -336,14 +353,16 @@ impl StreamCache {
             p.playout_time = anchor.playout_time;
             p.marker = false;
             // Keep the prefix ahead of the segment once it is sorted by seq.
-            p.seq_no = (*anchor.seq_no).saturating_sub((n - i) as u64).into();
+            p.seq_no = (*anchor.seq_no)
+                .saturating_sub(n.saturating_sub(i) as u64)
+                .into();
         }
 
         Some(prefix)
     }
 
     pub fn clear(&mut self) {
-        for slot in self.ring.iter_mut() {
+        for slot in &mut self.ring {
             *slot = None;
         }
         self.newest_seq = None;
@@ -373,8 +392,10 @@ impl TrackStreamCache {
 
     /// Route `pkt` into its encoding's cache, reading the encoding from the
     /// packet's `rid` (absent for non-simulcast tracks).
-    pub fn push(&mut self, pkt: &RtpPacket) {
-        self.encoding_mut(pkt.ext_vals.rid).push(pkt);
+    /// Returns the packet only when it was too old to store; otherwise the
+    /// cache owns it and the caller reads it back with [`Self::get`].
+    pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
+        self.encoding_mut(pkt.ext_vals.rid).push(pkt)
     }
 
     pub fn encoding(&self, rid: Option<Rid>) -> Option<&StreamCache> {
@@ -385,15 +406,18 @@ impl TrackStreamCache {
     }
 
     fn encoding_mut(&mut self, rid: Option<Rid>) -> &mut StreamCache {
-        if let Some(pos) = self.encodings.iter().position(|(r, _)| *r == rid) {
-            return &mut self.encodings[pos].1;
-        }
-        debug_assert!(
-            self.encodings.len() < MAX_SIMULCAST_ENCODINGS,
-            "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
-        );
-        self.encodings.push((rid, StreamCache::default()));
-        &mut self.encodings.last_mut().unwrap().1
+        let pos = match self.encodings.iter().position(|(r, _)| *r == rid) {
+            Some(pos) => pos,
+            None => {
+                debug_assert!(
+                    self.encodings.len() < MAX_SIMULCAST_ENCODINGS,
+                    "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
+                );
+                self.encodings.push((rid, StreamCache::default()));
+                self.encodings.len().saturating_sub(1)
+            }
+        };
+        &mut self.encodings[pos].1
     }
 }
 
@@ -403,6 +427,20 @@ const MAX_SIMULCAST_ENCODINGS: usize = 4;
 
 #[cfg(test)]
 mod test {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use std::time::Duration;
@@ -417,11 +455,11 @@ mod test {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         for p in b.keyframe(4) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         let last = b.delta_frame(1);
         for p in &last {
-            cache.push(p);
+            cache.push(p.clone());
         }
 
         let replay = cache.replay().expect("replayable");
@@ -435,15 +473,15 @@ mod test {
         let mut b = builder(ParameterSetStyle::OnceAtStreamStart);
         let mut cache = StreamCache::new();
         for p in b.keyframe(2) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         for p in b.delta_frames(3, 2) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         // A later IDR with no parameter sets of its own.
         let kf = b.keyframe(2);
         for p in &kf {
-            cache.push(p);
+            cache.push(p.clone());
         }
 
         let replay = cache.replay().expect("replayable");
@@ -476,7 +514,7 @@ mod test {
         kf.ext_vals
             .user_values
             .set_arc(std::sync::Arc::new(g.next(true)));
-        cache.push(&kf);
+        cache.push(kf.clone());
 
         let mut delta = RtpPacket::default();
         delta.seq_no = SeqNo::from(2u64);
@@ -486,7 +524,7 @@ mod test {
             .ext_vals
             .user_values
             .set_arc(std::sync::Arc::new(g.next(false)));
-        cache.push(&delta);
+        cache.push(delta.clone());
 
         let replay = cache
             .replay()
@@ -502,12 +540,47 @@ mod test {
     }
 
     #[test]
+    fn readable_h264_still_gets_parameter_sets_when_it_also_carries_a_descriptor() {
+        // A plain browser H.264 sender negotiates the Dependency Descriptor
+        // alongside a readable payload. Its IDR is useless to a decoder without
+        // SPS/PPS, so the descriptor must not suppress the prefix — doing so
+        // renders as a blank stream with no error anywhere.
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
+
+        let mut g = TemporalDdGenerator::new(3);
+        let mut b = builder(ParameterSetStyle::OnceAtStreamStart);
+        let mut cache = StreamCache::new();
+
+        let mut with_dd = |pkts: Vec<RtpPacket>, keyframe: bool| {
+            for mut p in pkts {
+                p.ext_vals
+                    .user_values
+                    .set_arc(std::sync::Arc::new(g.next(keyframe && p.is_keyframe)));
+                cache.push(p.clone());
+            }
+        };
+        with_dd(b.keyframe(2), true);
+        with_dd(b.delta_frames(3, 2), false);
+        with_dd(b.keyframe(2), true);
+
+        let replay = cache.replay().expect("replayable");
+        assert!(
+            replay.iter().any(|p| p.nal.sps()),
+            "readable H.264 must carry SPS even when a descriptor is present"
+        );
+        assert!(
+            replay.iter().any(|p| p.nal.pps()),
+            "readable H.264 must carry PPS even when a descriptor is present"
+        );
+    }
+
+    #[test]
     fn a_multi_slice_keyframe_opens_exactly_one_segment() {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         let kf = b.keyframe_with_slices(4, 2);
         for p in &kf {
-            cache.push(p);
+            cache.push(p.clone());
         }
         let replay = cache.replay().expect("replayable");
         assert_eq!(replay.len(), kf.len());
@@ -525,11 +598,11 @@ mod test {
         let mut cache = StreamCache::new();
         let kf = b.keyframe(4);
         for p in &kf {
-            cache.push(p);
+            cache.push(p.clone());
         }
         let arrived = kf.last().unwrap().arrival_ts;
 
-        let much_later = arrived + Duration::from_secs(30);
+        let _much_later = arrived + Duration::from_secs(30);
         assert!(
             cache.replay().is_some(),
             "a still screen must not be withheld just because it has been still"
@@ -544,12 +617,12 @@ mod test {
         let mut b = builder(ParameterSetStyle::SeparatePacket).with_fps(1);
         let mut cache = StreamCache::new();
         for p in b.keyframe(2) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         assert!(cache.replay().is_some(), "the keyframe alone is free");
 
         for p in b.delta_frames(2, 1) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         assert!(
             cache.replay().is_none(),
@@ -575,7 +648,7 @@ mod test {
             "fixture must not exceed the hard cap"
         );
         for p in &kf {
-            cache.push(p);
+            cache.push(p.clone());
         }
         assert!(
             cache.replay().is_some(),
@@ -597,7 +670,7 @@ mod test {
             "fixture must exceed the hard cap"
         );
         for p in &kf {
-            cache.push(p);
+            cache.push(p.clone());
         }
         assert!(
             cache.replay().is_none(),
@@ -612,12 +685,12 @@ mod test {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         for p in b.keyframe(MAX_REPLAY_PACKETS) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         assert!(cache.replay().is_some());
 
         for p in b.delta_frame(4) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         assert!(
             cache.replay().is_none(),
@@ -632,10 +705,10 @@ mod test {
         let mut b = builder(ParameterSetStyle::SeparatePacket).with_fps(5);
         let mut cache = StreamCache::new();
         for p in b.keyframe(3) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         for p in b.delta_frame(1) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         assert!(
             cache.replay().is_some(),
@@ -648,7 +721,7 @@ mod test {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         for p in b.keyframe(2) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         let burst = cache.replay().expect("replayable");
         let cursor = burst.last().unwrap().seq_no;
@@ -663,7 +736,7 @@ mod test {
         // A live delta frame arrives.
         let delta = b.delta_frame(2);
         for p in &delta {
-            cache.push(p);
+            cache.push(p.clone());
         }
         let live: Vec<_> = cache.range_after(cursor).collect();
         assert!(
@@ -687,7 +760,7 @@ mod test {
         let mut cache = StreamCache::new();
         let kf = b.keyframe(2);
         for p in &kf {
-            cache.push(p);
+            cache.push(p.clone());
         }
         let cursor = *kf.last().unwrap().seq_no;
 
@@ -695,7 +768,7 @@ mod test {
         let mut delta = b.delta_frame(3);
         delta.reverse();
         for p in &delta {
-            cache.push(p);
+            cache.push(p.clone());
         }
 
         // The ring is keyed by sequence number, so the read is ordered regardless
@@ -719,16 +792,16 @@ mod test {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         for p in b.keyframe(2) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         let old = b.delta_frame(1)[0].clone();
-        cache.push(&old);
+        cache.push(old.clone());
         assert!(cache.get(old.seq_no).is_some(), "present right after push");
 
         // Push more than a full ring's worth so `old`'s slot is overwritten by a
         // newer sequence number; the tag check must report the old seq as absent.
         for p in b.delta_frames(STREAM_CACHE_CAPACITY + 4, 1) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         assert!(
             cache.get(old.seq_no).is_none(),
@@ -742,7 +815,7 @@ mod test {
         let mut cache = StreamCache::new();
         let frames = b.delta_frames(5, 2);
         for p in &frames {
-            cache.push(p);
+            cache.push(p.clone());
         }
         assert!(!cache.has_keyframe());
         assert!(cache.replay().is_none());
@@ -756,7 +829,7 @@ mod test {
         kf.swap(0, 2);
         let dup = kf[1].clone();
         for p in kf.iter().chain(std::iter::once(&dup)) {
-            cache.push(p);
+            cache.push(p.clone());
         }
 
         let replay = cache.replay().expect("replayable");
@@ -769,13 +842,13 @@ mod test {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         for p in b.keyframe(2) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
         assert!(cache.has_keyframe());
 
         let flood = b.delta_frames(STREAM_CACHE_CAPACITY, 2);
         for p in &flood {
-            cache.push(p);
+            cache.push(p.clone());
         }
         assert!(!cache.has_keyframe(), "an over-long GOP is not switchable");
         assert!(cache.replay().is_none());
@@ -795,7 +868,7 @@ mod test {
         let kf = b.keyframe(2);
         let kf_ts = kf[0].rtp_ts.numer();
         for p in &kf {
-            cache.push(p);
+            cache.push(p.clone());
         }
         assert!(cache.replay().is_some(), "clean keyframe is replayable");
 
@@ -804,7 +877,7 @@ mod test {
         let delta_ts = delta[0].rtp_ts.numer();
         assert!(delta_ts > kf_ts, "delta must have a higher timestamp");
         for p in &delta {
-            cache.push(p);
+            cache.push(p.clone());
         }
 
         // Simulate a late IDR fragment: same ts as keyframe (T0) but
@@ -813,7 +886,7 @@ mod test {
         let mut late_frag = kf.last().unwrap().clone();
         late_frag.seq_no = (delta_last_seq + 1).into();
         // seq = delta_last_seq+1 is still within the keyframe's segment (same ts=T0).
-        cache.push(&late_frag);
+        cache.push(late_frag);
 
         // The burst is now [kf_seqs..., delta_seqs..., late_frag_seq] sorted by
         // seq_no, with timestamps [T0, ..., T1, ..., T0] — non-monotonic.

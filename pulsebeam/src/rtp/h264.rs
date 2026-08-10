@@ -30,6 +30,15 @@ const FU_START_MASK: u8 = 0x80;
 
 #[cfg(test)]
 pub mod test_utils {
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    #![allow(clippy::arithmetic_side_effects)]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     /// A single NAL unit packet of the given type, padded to `len` bytes.
@@ -89,6 +98,13 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::test_utils::*;
     use super::*;
 
