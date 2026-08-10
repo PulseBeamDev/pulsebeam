@@ -1026,7 +1026,7 @@ impl AllocationEngine {
         // Lowest target still meeting the frame-rate floor.
         let floor_dt = (0..count)
             .find(|&dt| self.decode_target_fps(layer, dt) >= min_fps)
-            .unwrap_or(count.saturating_sub(1));
+            .unwrap_or_else(|| count.saturating_sub(1));
         // Highest affordable target at or above the floor. Skip the top target —
         // that is "full", handled by the normal (non-degraded) path.
         (floor_dt..count.saturating_sub(1)).rev().find_map(|dt| {
