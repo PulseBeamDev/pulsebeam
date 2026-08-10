@@ -333,11 +333,12 @@ mod ice {
                 buf.extend_from_slice(attr_value);
 
                 // Add padding
-                let padded_len = (attr_value_len + 3) & !3;
-                let padding_len = padded_len - attr_value_len;
+                let padded_len = attr_value_len.saturating_add(3) & !3;
+                let padding_len = padded_len.saturating_sub(attr_value_len);
                 buf.extend_from_slice(&vec![0u8; padding_len]);
 
-                total_attr_len += ATTRIBUTE_HEADER_SIZE + padded_len;
+                total_attr_len =
+                    total_attr_len.saturating_add(ATTRIBUTE_HEADER_SIZE.saturating_add(padded_len));
             }
 
             // Check for unreasonable total length during test construction
@@ -771,6 +772,8 @@ mod ice {
 
 #[cfg(test)]
 mod demux_tests {
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    #![allow(clippy::arithmetic_side_effects)]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     #![allow(

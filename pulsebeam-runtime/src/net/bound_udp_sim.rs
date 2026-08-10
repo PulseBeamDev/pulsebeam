@@ -82,7 +82,7 @@ fn member_for(src: SocketAddr, dst: SocketAddr, members: usize) -> usize {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     src.hash(&mut hasher);
     dst.hash(&mut hasher);
-    (hasher.finish() % members as u64) as usize
+    hasher.finish().checked_rem(members as u64).unwrap_or(0) as usize
 }
 
 impl ReuseportGroup {
@@ -219,7 +219,7 @@ pub async fn bind_udp_socket(
     let index = {
         let mut inboxes = group.inboxes.borrow_mut();
         inboxes.push(Inbox::default());
-        inboxes.len() - 1
+        inboxes.len().saturating_sub(1)
     };
 
     let socket = group.socket.clone();

@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test / simulation support code
 //! A bottleneck link for the simulator: capacity, queueing delay, loss, and tail drop.
 //!
 //! turmoil models latency and loss but has no notion of capacity, so a simulated path will carry

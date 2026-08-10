@@ -4,7 +4,6 @@
 //! accounting decides how a contiguous arena is split into segments, so a
 //! wrapped length does not fail — the kernel slices the buffer somewhere else
 //! and the peer receives datagrams that were never sent.
-#![deny(clippy::arithmetic_side_effects)]
 
 use arrayvec::ArrayVec;
 use pulsebeam_runtime::net;

@@ -6,7 +6,6 @@
 //! `overflow-checks` off in release a wrap would not stop — it would read a
 //! NAL type from the wrong place and the switcher would treat a payload as a
 //! keyframe that is not one.
-#![deny(clippy::arithmetic_side_effects)]
 
 const NALU_TYPE_MASK: u8 = 0x1F;
 

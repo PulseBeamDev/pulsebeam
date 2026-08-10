@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test / simulation support code
 //! Per-packet cost on the shard-local forwarding path, measured on real types.
 //!
 //! Not a criterion suite — the point is a repeatable number for the work one

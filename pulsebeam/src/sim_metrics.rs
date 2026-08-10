@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test / simulation support code
 //! Test-only observation points for the simulator.
 //!
 //! The simulator runs the SFU in-process under turmoil, so a task-local sink is enough to get

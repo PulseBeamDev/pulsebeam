@@ -1455,6 +1455,7 @@ mod alloc_test_support {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     #![allow(
+        clippy::arithmetic_side_effects,
         clippy::disallowed_types,
         clippy::disallowed_methods,
         clippy::float_cmp
@@ -1518,6 +1519,7 @@ mod assignment_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     #![allow(
+        clippy::arithmetic_side_effects,
         clippy::disallowed_types,
         clippy::disallowed_methods,
         clippy::float_cmp
@@ -2247,6 +2249,7 @@ mod allocation_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     #![allow(
+        clippy::arithmetic_side_effects,
         clippy::disallowed_types,
         clippy::disallowed_methods,
         clippy::float_cmp
@@ -3447,6 +3450,7 @@ mod slot_switch_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     #![allow(
+        clippy::arithmetic_side_effects,
         clippy::disallowed_types,
         clippy::disallowed_methods,
         clippy::float_cmp

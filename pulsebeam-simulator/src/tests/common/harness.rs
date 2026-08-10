@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test / simulation support code
 use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, VideoReceiveStats};
 use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
 use pulsebeam_agent::SimulcastLayer;

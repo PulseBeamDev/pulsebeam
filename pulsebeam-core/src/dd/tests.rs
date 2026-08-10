@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test/simulation support code
 use proptest::prelude::*;
 
 use super::model::*;

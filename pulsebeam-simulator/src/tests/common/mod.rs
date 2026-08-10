@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test / simulation support code
 pub mod client;
 pub mod harness;
 

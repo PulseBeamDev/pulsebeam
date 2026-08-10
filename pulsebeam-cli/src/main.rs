@@ -209,14 +209,15 @@ async fn spawn_room(
     let room_name = format!("bench-room-{room_id}");
 
     for user_id in 0..config.users_per_room {
-        let delay_ms = rand::random_range(0u64..(config.join_spread_secs * 1_000).max(1));
+        let delay_ms =
+            rand::random_range(0u64..config.join_spread_secs.saturating_mul(1_000).max(1));
         let session_duration = Duration::from_secs(config.session_duration);
         let simulcast = config.simulcast;
 
         let ctx = AgentContext {
             api_url: api_url.to_string(),
             room_id,
-            agent_id: room_id * 1000 + user_id,
+            agent_id: room_id.saturating_mul(1000).saturating_add(user_id),
             logger: logger.clone(),
             assets: assets.clone(),
         };

@@ -4,7 +4,6 @@
 //! This parses attacker-supplied bytes, and `overflow-checks` is off in
 //! release, so a wrapped offset or width would not stop — it would read the
 //! wrong bits and hand up a descriptor that looks valid.
-#![deny(clippy::arithmetic_side_effects)]
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Truncated;

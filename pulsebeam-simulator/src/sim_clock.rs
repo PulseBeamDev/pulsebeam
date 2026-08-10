@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test / simulation support code
 //! Make the process clock the *simulated* clock, so runs are reproducible.
 //!
 //! Derived from madsim's equivalent:

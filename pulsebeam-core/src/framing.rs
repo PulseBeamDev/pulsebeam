@@ -60,12 +60,12 @@ impl FramePacketizer {
         let mtu = self.mtu;
         let total = self.packet_count(frame);
         (0..total).map(move |i| {
-            let start = i * mtu;
-            let end = ((i + 1) * mtu).min(frame.len());
+            let start = i.saturating_mul(mtu);
+            let end = i.saturating_add(1).saturating_mul(mtu).min(frame.len());
             FrameChunk {
                 data: &frame[start..end],
                 start_of_frame: i == 0,
-                end_of_frame: i == total - 1,
+                end_of_frame: i == total.saturating_sub(1),
             }
         })
     }

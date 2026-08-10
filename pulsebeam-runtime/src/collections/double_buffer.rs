@@ -35,7 +35,7 @@ impl<T> DoubleBuffer<T> {
     /// Returns the total number of items pending across both buffers
     #[inline]
     pub fn len(&self) -> usize {
-        self.accumulate.len() + self.send.len()
+        self.accumulate.len().saturating_add(self.send.len())
     }
 
     /// Prepares items for sending and returns a slice to send.

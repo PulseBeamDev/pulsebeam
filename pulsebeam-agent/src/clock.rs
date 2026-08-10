@@ -24,7 +24,9 @@ impl ClockAnchor {
     }
 
     pub fn wallclock(&self, now: Instant) -> SystemTime {
-        self.system_time + now.duration_since(self.instant)
+        self.system_time
+            .checked_add(now.duration_since(self.instant))
+            .unwrap_or(self.system_time)
     }
 
     pub fn since(&self, at: Instant) -> Duration {

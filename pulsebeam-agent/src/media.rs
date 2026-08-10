@@ -55,12 +55,15 @@ impl SharedH264Asset {
 
     fn frame_has_idr(frame: &[u8]) -> bool {
         let mut i = 0usize;
-        while i + 3 < frame.len() {
-            if frame[i] == 0 && frame[i + 1] == 0 {
-                let header_pos = if frame[i + 2] == 1 {
-                    i + 3
-                } else if i + 4 < frame.len() && frame[i + 2] == 0 && frame[i + 3] == 1 {
-                    i + 4
+        while i.saturating_add(3) < frame.len() {
+            if frame[i] == 0 && frame[i.saturating_add(1)] == 0 {
+                let header_pos = if frame[i.saturating_add(2)] == 1 {
+                    i.saturating_add(3)
+                } else if i.saturating_add(4) < frame.len()
+                    && frame[i.saturating_add(2)] == 0
+                    && frame[i.saturating_add(3)] == 1
+                {
+                    i.saturating_add(4)
                 } else {
                     i = i.saturating_add(1);
                     continue;
@@ -85,13 +88,13 @@ impl SharedH264Asset {
 fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
     const NON_IDR_SLICE: u8 = 1;
     let mut out = frame.to_vec();
-    let mut i = 0;
-    while i + 3 < out.len() {
-        if out[i] == 0 && out[i + 1] == 0 && out[i + 2] == 1 {
-            let header = i + 3;
+    let mut i = 0usize;
+    while i.saturating_add(3) < out.len() {
+        if out[i] == 0 && out[i.saturating_add(1)] == 0 && out[i.saturating_add(2)] == 1 {
+            let header = i.saturating_add(3);
             // Keep forbidden_zero_bit + nal_ref_idc, replace only the 5-bit type.
             out[header] = (out[header] & 0xE0) | NON_IDR_SLICE;
-            i = header + 1;
+            i = header.saturating_add(1);
         } else {
             i = i.saturating_add(1);
         }
@@ -154,7 +157,11 @@ impl H264Looper {
 
     fn next(&mut self) -> Arc<[u8]> {
         let frame = &self.asset.frames[self.index];
-        self.index = (self.index + 1) % self.asset.frames.len();
+        self.index = self
+            .index
+            .saturating_add(1)
+            .checked_rem(self.asset.frames.len())
+            .unwrap_or(0);
         if self.opaque_payload {
             return opaque_frame(frame);
         }
@@ -193,7 +200,10 @@ impl H264Looper {
 
             let is_keyframe = self.index == self.asset.first_idr;
             let frame_data = self.next();
-            let next_ts = (frame_count * clock_rate) / self.fps as u64;
+            let next_ts = frame_count
+                .saturating_mul(clock_rate)
+                .checked_div(self.fps as u64)
+                .unwrap_or(0);
 
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz(next_ts),
@@ -417,24 +427,35 @@ impl VbrLooper {
         if self.small.is_empty() {
             return self.next();
         }
-        let idx = self.small[self.small_index % self.small.len()];
+        let idx = self.small[self.small_index.checked_rem(self.small.len()).unwrap_or(0)];
         self.small_index = self.small_index.wrapping_add(1);
         self.asset.frames[idx].clone()
     }
 
     fn next(&mut self) -> Arc<[u8]> {
         let frame = &self.asset.frames[self.index];
-        self.index = (self.index + 1) % self.asset.frames.len();
+        self.index = self
+            .index
+            .saturating_add(1)
+            .checked_rem(self.asset.frames.len())
+            .unwrap_or(0);
         frame.clone()
     }
 
     /// Whether we are in an active burst at `elapsed` into the run.
     fn is_active(&self, elapsed: Duration) -> bool {
-        let cycle = self.profile.active + self.profile.idle;
+        let cycle = self
+            .profile
+            .active
+            .checked_add(self.profile.idle)
+            .unwrap_or(self.profile.active);
         if cycle.is_zero() {
             return true;
         }
-        let phase = (elapsed.as_nanos() % cycle.as_nanos()) as u64;
+        let phase = elapsed
+            .as_nanos()
+            .checked_rem(cycle.as_nanos())
+            .unwrap_or(0) as u64;
         Duration::from_nanos(phase) < self.profile.active
     }
 
@@ -450,13 +471,16 @@ impl VbrLooper {
             let loop_duration = frame_times
                 .last()
                 .copied()
-                .expect("non-empty frame schedule")
-                + self.profile.loop_idle;
+                .unwrap_or_default()
+                .saturating_add(self.profile.loop_idle);
             let mut loop_start = start;
             let mut index = 0usize;
             loop {
                 debug_assert!(index < frame_times.len());
-                tokio::time::sleep_until(loop_start + frame_times[index]).await;
+                let due = loop_start
+                    .checked_add(frame_times[index])
+                    .unwrap_or(loop_start);
+                tokio::time::sleep_until(due).await;
                 let now = tokio::time::Instant::now();
                 if sender.keyframe_rx.is_requested() {
                     index = self.asset.first_idr;
@@ -506,7 +530,9 @@ impl VbrLooper {
                 self.profile.idle_fps
             }
             .max(1);
-            next_frame_at = now + Duration::from_secs_f64(1.0 / fps as f64);
+            next_frame_at = now
+                .checked_add(Duration::from_secs_f64(1.0 / fps as f64))
+                .unwrap_or(now);
 
             if sender.keyframe_rx.is_requested() {
                 tracing::debug!(
@@ -561,21 +587,27 @@ impl<'a> H264FrameSlicer<'a> {
 
     fn next_nalu_bounds(&self, start: usize) -> Option<(usize, usize, u8)> {
         let mut i = start;
-        while i + 3 < self.data.len() {
+        while i.saturating_add(3) < self.data.len() {
             if self.data[i] == 0
-                && self.data[i + 1] == 0
-                && (self.data[i + 2] == 1 || (self.data[i + 2] == 0 && self.data[i + 3] == 1))
+                && self.data[i.saturating_add(1)] == 0
+                && (self.data[i.saturating_add(2)] == 1
+                    || (self.data[i.saturating_add(2)] == 0 && self.data[i.saturating_add(3)] == 1))
             {
                 let nalu_start = i;
-                let header_pos = if self.data[i + 2] == 1 { i + 3 } else { i + 4 };
+                let header_pos = if self.data[i.saturating_add(2)] == 1 {
+                    i.saturating_add(3)
+                } else {
+                    i.saturating_add(4)
+                };
                 let nalu_type = self.data[header_pos] & 0x1F;
 
                 let mut next = header_pos;
-                while next + 3 < self.data.len() {
+                while next.saturating_add(3) < self.data.len() {
                     if self.data[next] == 0
-                        && self.data[next + 1] == 0
-                        && (self.data[next + 2] == 1
-                            || (self.data[next + 2] == 0 && self.data[next + 3] == 1))
+                        && self.data[next.saturating_add(1)] == 0
+                        && (self.data[next.saturating_add(2)] == 1
+                            || (self.data[next.saturating_add(2)] == 0
+                                && self.data[next.saturating_add(3)] == 1))
                     {
                         return Some((nalu_start, next, nalu_type));
                     }
@@ -592,14 +624,14 @@ impl<'a> H264FrameSlicer<'a> {
         match nalu_type {
             6..=9 => true,
             1 | 5 => {
-                let header_pos = if self.data[nalu_start + 2] == 1 {
-                    nalu_start + 3
+                let header_pos = if self.data[nalu_start.saturating_add(2)] == 1 {
+                    nalu_start.saturating_add(3)
                 } else {
-                    nalu_start + 4
+                    nalu_start.saturating_add(4)
                 };
 
-                if self.data.len() > header_pos + 1 {
-                    let first_byte_of_slice_header = self.data[header_pos + 1];
+                if self.data.len() > header_pos.saturating_add(1) {
+                    let first_byte_of_slice_header = self.data[header_pos.saturating_add(1)];
                     return (first_byte_of_slice_header & 0x80) != 0;
                 }
                 false

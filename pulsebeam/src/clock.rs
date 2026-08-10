@@ -1,7 +1,7 @@
 //! The NTP timeline: the only clock representation that crosses a shard or
 //! process boundary. `Instant` is local scheduling time and never leaves.
 //!
-//! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
+//! Overflow is explicit here, and denied workspace-wide.
 //!
 //! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
 //! range does not stop — it yields a plausible-looking number that the pacer,
@@ -10,7 +10,6 @@
 //! every operation says which behaviour it wants: `saturating_` to clamp,
 //! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
 //! the correct answer.
-#![deny(clippy::arithmetic_side_effects)]
 
 //!
 //! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of

@@ -402,7 +402,7 @@ impl AgentDriver {
                 notifier: tokio::sync::Notify::new(),
                 sleep: Box::pin(tokio::time::sleep(MIN_QUANTA)),
                 rtc_deadline: None,
-                bwe_next_tick: now + BWE_SLOW_INTERVAL,
+                bwe_next_tick: now.checked_add(BWE_SLOW_INTERVAL).unwrap_or(now),
             },
         };
 
@@ -560,7 +560,8 @@ impl AgentDriver {
     fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
         self.subscriptions.playout_delay_ms = bounds;
         self.subscriptions.sub_manager.reset_active_assignments();
-        self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+        self.subscriptions.pending_deadline =
+            Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
         self.flush_pending_state();
         self.timers.notifier.notify_one();
     }
@@ -629,9 +630,10 @@ impl AgentDriver {
     }
 
     fn reset_sleep_to_next_deadline(&mut self) {
-        let next = self
-            .next_deadline()
-            .unwrap_or_else(|| Instant::now() + MIN_QUANTA);
+        let next = self.next_deadline().unwrap_or_else(|| {
+            let now = Instant::now();
+            now.checked_add(MIN_QUANTA).unwrap_or(now)
+        });
         if self.timers.sleep.deadline() != next {
             self.timers.sleep.as_mut().reset(next);
         }
@@ -1090,7 +1092,8 @@ impl AgentDriver {
 
     fn flush_pending_state(&mut self) {
         let Some(mut ch) = self.rtc.channel(self.data.signaling_cid) else {
-            self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+            self.subscriptions.pending_deadline =
+                Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
             return;
         };
 
@@ -1123,7 +1126,8 @@ impl AgentDriver {
         let encoded = msg.encode_to_vec();
         if let Err(err) = ch.write(true, encoded.as_slice()) {
             tracing::warn!("failed to send signaling: {:?}", err);
-            self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+            self.subscriptions.pending_deadline =
+                Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
         } else {
             self.subscriptions.pending_deadline = None;
             self.subscriptions.upstream_dirty = false;
@@ -1138,11 +1142,14 @@ impl AgentDriver {
         let delay = match self.session.retry_count {
             0 => Duration::ZERO,
             1 => Duration::from_millis(500),
-            n => Duration::from_millis(500 * 2u64.pow(n.min(10) - 1)).min(Duration::from_secs(5)),
+            n => {
+                Duration::from_millis(500u64.saturating_mul(2u64.pow(n.min(10).saturating_sub(1))))
+                    .min(Duration::from_secs(5))
+            }
         };
 
         self.session.retry_count = self.session.retry_count.saturating_add(1);
-        self.session.reconnect_deadline = Some(now + delay);
+        self.session.reconnect_deadline = Some(now.checked_add(delay).unwrap_or(now));
     }
 
     async fn perform_reconnect(&mut self) {

@@ -321,7 +321,9 @@ impl FrameReceiver {
             .push(seq, &rtp.payload, start_of_frame, end_of_frame)?;
 
         let meta = self.pending.remove(&frame.first_seq)?;
-        let contiguous = self.prev_last_seq.is_none_or(|p| frame.first_seq == p + 1);
+        let contiguous = self
+            .prev_last_seq
+            .is_none_or(|p| frame.first_seq == p.saturating_add(1));
         self.prev_last_seq = Some(frame.last_seq);
 
         Some(MediaFrame {
@@ -381,7 +383,7 @@ fn temporal_cumulative_kbps(
     }
     (0..layers)
         .map(|k| {
-            let frac = 0.5 + 0.5 * (k as f64) / ((layers - 1) as f64);
+            let frac = 0.5 + 0.5 * (k as f64) / (layers.saturating_sub(1) as f64);
             TemporalLayerAllocation {
                 cumulative_kbps: ((full_kbps as f64) * frac).round() as u64,
             }

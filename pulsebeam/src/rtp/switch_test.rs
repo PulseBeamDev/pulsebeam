@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)] // test harness; an overflow here should fail the test
 //! End-to-end stream-switching tests.
 //!
 //! The harness mirrors production wiring exactly: `ShardRoutingTable::route_video`

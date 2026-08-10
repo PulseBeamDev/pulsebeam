@@ -221,7 +221,9 @@ fn decayed_power(power: f32, last_arrival_ts: Option<Instant>, now: Instant) -> 
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
+    // A fixture that overflows should fail the test, not clamp into a pass.
     #![allow(
+        clippy::arithmetic_side_effects,
         clippy::disallowed_types,
         clippy::disallowed_methods,
         clippy::float_cmp

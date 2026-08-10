@@ -733,7 +733,10 @@ pub mod unix {
         }
 
         // Wait for all signal handlers to complete (or time out).
-        let deadline = Instant::now() + Duration::from_secs(SIGNAL_WAIT_SECS);
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_secs(SIGNAL_WAIT_SECS))
+            .unwrap_or(started);
         loop {
             let s = unsafe { &*session_ptr };
             if s.remaining.load(Ordering::Acquire) == 0 {
@@ -776,7 +779,7 @@ pub mod unix {
         (0..NUM_SAMPLES)
             .map(|i| {
                 let s = collect_once(signal, targets);
-                if i + 1 < NUM_SAMPLES {
+                if i.saturating_add(1) < NUM_SAMPLES {
                     thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
                 }
                 s
@@ -1084,9 +1087,12 @@ pub mod unix {
                         .entry(culprit_key.clone())
                         .or_insert_with(|| CulpritRecord {
                             total_hits: 0,
+                            // Backdated so the first sighting reports rather
+                            // than being deduplicated against a nonexistent one.
                             last_full_report: Instant::now()
-                                - DEDUP_INTERVAL
-                                - Duration::from_secs(1),
+                                .checked_sub(DEDUP_INTERVAL)
+                                .and_then(|t| t.checked_sub(Duration::from_secs(1)))
+                                .unwrap_or_else(Instant::now),
                         });
                     rec.total_hits = rec.total_hits.saturating_add(1);
                     let should_print = rec.last_full_report.elapsed() >= DEDUP_INTERVAL;

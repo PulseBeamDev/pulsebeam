@@ -83,7 +83,7 @@ impl TcpSession {
                         self.close();
                         break;
                     }
-                    if self.recv_accum.len() < 2 + len {
+                    if self.recv_accum.len() < len.saturating_add(2) {
                         break; // incomplete frame — wait for more data
                     }
                     self.recv_accum.advance(2);
@@ -123,7 +123,7 @@ impl TcpSession {
 
         let header = (length as u16).to_be_bytes();
 
-        let mut packet = Vec::with_capacity(header.len() + payload.len());
+        let mut packet = Vec::with_capacity(header.len().saturating_add(payload.len()));
         packet.extend_from_slice(&header);
         packet.extend_from_slice(payload);
 

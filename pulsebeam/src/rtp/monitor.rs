@@ -4,7 +4,6 @@
 //! numbers this produces are what the allocator spends bandwidth against, so a
 //! wrap does not fail — it reports a bitrate that was never observed and the
 //! allocator sizes the ladder to it.
-#![deny(clippy::arithmetic_side_effects)]
 
 use std::time::Duration;
 use str0m::bwe::Bitrate;

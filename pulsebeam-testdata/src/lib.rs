@@ -1,3 +1,9 @@
+//! H.264 Annex-B test fixtures.
+//!
+//! Overflow is explicit here, denied workspace-wide, so
+//! the start-code scan states its bounds rather than relying on the `while`
+//! guard three lines up.
+
 pub const RAW_H264_FULL_CBR: &[u8] = include_bytes!("full_f_cbr.h264");
 pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");
 pub const RAW_H264_QUARTER_CBR: &[u8] = include_bytes!("quarter_q_cbr.h264");
@@ -21,15 +27,18 @@ pub const RAW_CHROME_SDP: &str = include_str!("chrome.sdp");
 pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
     let n = data.len();
     let mut sc_positions: Vec<usize> = Vec::new();
-    let mut i = 0;
-    while i + 2 < n {
-        if data[i] == 0 && data[i + 1] == 0 {
-            if i + 3 < n && data[i + 2] == 0 && data[i + 3] == 1 {
+    let mut i = 0usize;
+    while i.saturating_add(2) < n {
+        if data[i] == 0 && data[i.saturating_add(1)] == 0 {
+            if i.saturating_add(3) < n
+                && data[i.saturating_add(2)] == 0
+                && data[i.saturating_add(3)] == 1
+            {
                 sc_positions.push(i);
                 i = i.saturating_add(4);
                 continue;
             }
-            if data[i + 2] == 1 {
+            if data[i.saturating_add(2)] == 1 {
                 sc_positions.push(i);
                 i = i.saturating_add(3);
                 continue;
@@ -46,14 +55,14 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
     let mut seen_vcl = false;
 
     for (k, &sc_pos) in sc_positions.iter().enumerate() {
-        let sc_len = if sc_pos + 3 < n && data[sc_pos + 2] == 0 {
+        let sc_len = if sc_pos.saturating_add(3) < n && data[sc_pos.saturating_add(2)] == 0 {
             4
         } else {
             3
         };
-        let nalu_start = sc_pos + sc_len;
-        let nalu_end = if k + 1 < sc_positions.len() {
-            sc_positions[k + 1]
+        let nalu_start = sc_pos.saturating_add(sc_len);
+        let nalu_end = if k.saturating_add(1) < sc_positions.len() {
+            sc_positions[k.saturating_add(1)]
         } else {
             n
         };
@@ -62,7 +71,7 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
         }
         let nalu = &data[nalu_start..nalu_end];
         let nal_type = nalu[0] & 0x1f;
-        let nalu_size = nalu_end - nalu_start;
+        let nalu_size = nalu_end.saturating_sub(nalu_start);
 
         let is_vcl = matches!(nal_type, 1..=5);
         // first_mb_in_slice == 0  ↔  MSB of byte[1] set (Exp-Golomb "1" prefix).

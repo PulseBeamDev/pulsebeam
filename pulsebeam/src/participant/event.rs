@@ -130,7 +130,7 @@ pub mod test_utils {
         }
 
         fn exit(&mut self) {
-            self.exit_count += 1;
+            self.exit_count = self.exit_count.saturating_add(1);
         }
 
         fn publish_rtp(&mut self, stream_id: StreamId, _pkt: RtpPacket) {

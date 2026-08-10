@@ -146,7 +146,8 @@ impl TemporalDdGenerator {
         }
         let template_index = usize::from(self.pattern[self.position]);
         let deps = self.structure.templates[template_index].clone();
-        let template_id = ((template_index + usize::from(self.structure.template_id_offset))
+        let template_id = ((template_index
+            .saturating_add(usize::from(self.structure.template_id_offset)))
             % crate::dd::model::MAX_TEMPLATES) as u8;
 
         let dd = DependencyDescriptor {
@@ -162,7 +163,11 @@ impl TemporalDdGenerator {
         };
 
         self.frame_number = self.frame_number.wrapping_add(1);
-        self.position = (self.position + 1) % self.pattern.len();
+        self.position = self
+            .position
+            .saturating_add(1)
+            .checked_rem(self.pattern.len())
+            .unwrap_or(0);
         dd
     }
 }

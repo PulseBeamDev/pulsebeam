@@ -5,7 +5,6 @@
 //! offset a peer chose against a buffer it did not. With `overflow-checks` off
 //! in release a wrap would not stop — it would index somewhere else in the
 //! stream or report a frame that is not there.
-#![deny(clippy::arithmetic_side_effects)]
 
 use super::{RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;

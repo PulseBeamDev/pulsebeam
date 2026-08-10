@@ -4,7 +4,6 @@
 //! hole tracking compares sequence numbers from a publisher, so a wrap would
 //! either record a gap of billions or hide a real one, and the switcher would
 //! hold or release a switch on a number that was never true.
-#![deny(clippy::arithmetic_side_effects)]
 
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::BTreeSet;

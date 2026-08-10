@@ -4,7 +4,6 @@
 //! Several fields are coded as `value - 1`, which has no encoding for zero; a
 //! wrap would write 0xFFFF.. and the peer would decode a different descriptor
 //! than the one that was built.
-#![deny(clippy::arithmetic_side_effects)]
 
 use thiserror::Error;
 

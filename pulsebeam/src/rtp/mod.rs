@@ -201,6 +201,8 @@ impl RtpPacket {
 
 #[cfg(test)]
 pub mod test_utils {
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    #![allow(clippy::arithmetic_side_effects)]
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     #![allow(

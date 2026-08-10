@@ -4,7 +4,6 @@
 //! arena offsets and batch accumulators here index fixed-size slots; with
 //! `overflow-checks` off in release a wrapped offset reads a neighbouring
 //! datagram's bytes rather than failing.
-#![deny(clippy::arithmetic_side_effects)]
 
 //! Batched UDP transport built directly on Linux's `recvmmsg(2)`/`sendmmsg(2)`
 //! plus UDP GRO (receive-side coalescing) and UDP GSO (send-side segmentation

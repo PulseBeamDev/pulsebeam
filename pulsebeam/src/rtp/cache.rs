@@ -4,7 +4,6 @@
 //! sequence arithmetic decides which cached packets are replayed; a wrap here
 //! would replay the wrong window and hand the decoder a segment that does not
 //! start at a keyframe.
-#![deny(clippy::arithmetic_side_effects)]
 
 use crate::rtp::RtpPacket;
 use str0m::media::{MediaTime, Rid};
