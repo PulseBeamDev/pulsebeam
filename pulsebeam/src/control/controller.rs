@@ -178,7 +178,7 @@ impl ControllerActor {
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut next_cmd_at = tokio::time::Instant::now();
         #[cfg(not(feature = "unpace"))]
-        let cooldown_duration = SHARD_LOAD_POLL_INTERVAL / 4;
+        let cooldown_duration = SHARD_LOAD_POLL_INTERVAL.checked_div(4).unwrap_or_default();
         #[cfg(feature = "unpace")]
         let cooldown_duration = std::time::Duration::from_secs(0);
 
@@ -210,7 +210,8 @@ impl ControllerActor {
 
                     #[cfg(not(feature = "unpace"))]
                     if is_join {
-                        next_cmd_at = tokio::time::Instant::now() + cooldown_duration;
+                        let poll_from = tokio::time::Instant::now();
+                    next_cmd_at = poll_from.checked_add(cooldown_duration).unwrap_or(poll_from);
                     }
                 }
 
@@ -319,7 +320,9 @@ impl ControllerActor {
                     .try_route(&routing_key)
                     .ok_or(ControllerError::ServiceUnavailable)?
             }
-            RoomPlacement::RoundRobin => crate::id::ShardId::new(slot % self.router.shard_count()),
+            RoomPlacement::RoundRobin => {
+                crate::id::ShardId::new(slot.checked_rem(self.router.shard_count()).unwrap_or(0))
+            }
         };
 
         // Encode routing metadata into the ICE ufrag.  The shard worker and

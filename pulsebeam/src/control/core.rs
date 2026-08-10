@@ -115,7 +115,10 @@ impl ControllerCore {
             .get_room(room_id)
             .map(super::room::Room::participant_count)
             .unwrap_or_default();
-        (count / self.room_shard_slot, self.placement)
+        (
+            count.checked_div(self.room_shard_slot).unwrap_or(0),
+            self.placement,
+        )
     }
 
     pub fn process_shard_event(&mut self, e: ShardEventWrapper, eq: &mut ControllerEventQueue) {

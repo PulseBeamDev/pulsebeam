@@ -71,7 +71,10 @@ impl TimerWheel {
                 ticks_until_deadline <= MAX_DEADLINE_TICKS,
                 "participant deadline exceeds the 100ms scheduling bound"
             );
-            let deadline_tick = requested_tick.min(self.current_tick + (SLOT_COUNT as u64 - 1));
+            let deadline_tick = requested_tick.min(
+                self.current_tick
+                    .saturating_add((SLOT_COUNT as u64).saturating_sub(1)),
+            );
             (u16::from(deadline_tick as u8), deadline_tick)
         };
 
@@ -113,9 +116,13 @@ impl TimerWheel {
 
         let mut offset = 1;
         while offset < SLOT_COUNT {
-            let tick = self.current_tick + offset as u64;
+            let tick = self.current_tick.saturating_add(offset as u64);
             if self.slot_occupied(tick as u8) {
-                return Some(self.epoch + Duration::from_millis(tick));
+                return Some(
+                    self.epoch
+                        .checked_add(Duration::from_millis(tick))
+                        .unwrap_or(self.epoch),
+                );
             }
             offset = offset.saturating_add(1);
         }
@@ -247,7 +254,9 @@ impl TimerWheel {
     fn deadline_tick(&self, deadline: Instant) -> u64 {
         let elapsed = deadline.saturating_duration_since(self.epoch);
         let millis = elapsed.as_millis();
-        let rounded = millis + u128::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000));
+        let rounded = millis.saturating_add(u128::from(
+            !elapsed.subsec_nanos().is_multiple_of(1_000_000),
+        ));
         u64::try_from(rounded).unwrap_or(u64::MAX)
     }
 

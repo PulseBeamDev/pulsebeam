@@ -706,10 +706,11 @@ impl ShardRoutingTable {
             .or_insert_with(|| ShardRoomContext::new(rng))
             .remote_shards
             .insert(shard_id);
-        *self
+        let count = self
             .remote_participant_counts
             .entry((room_id, shard_id))
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     pub fn unregister_remote_participant(

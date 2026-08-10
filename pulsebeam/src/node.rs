@@ -416,7 +416,10 @@ impl NodeBuilder {
                     let core_id = if cpu_cores.is_empty() {
                         None
                     } else {
-                        cpu_cores.get(shard_idx % cpu_cores.len()).copied()
+                        shard_idx
+                            .checked_rem(cpu_cores.len())
+                            .and_then(|i| cpu_cores.get(i))
+                            .copied()
                     };
                     let builder = std::thread::Builder::new().name(format!("pb-w-{shard_id}"));
                     let handle = builder

@@ -384,7 +384,8 @@ impl ShardWorker {
             self.wait_for_inputs(sleep.as_mut()).await?;
 
             let busy_start = Instant::now();
-            self.metrics.record_idle(busy_start - loop_start);
+            self.metrics
+                .record_idle(busy_start.saturating_duration_since(loop_start));
 
             self.tick(busy_start);
             self.flush_shard_events()?;

@@ -1,3 +1,11 @@
+//! Switching a subscriber between encodings of one track.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! hole tracking compares sequence numbers from a publisher, so a wrap would
+//! either record a gap of billions or hide a real one, and the switcher would
+//! hold or release a switch on a number that was never true.
+#![deny(clippy::arithmetic_side_effects)]
+
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -282,7 +290,7 @@ impl Switcher {
                     // stream may still fill by reordering (bounded).
                     if let Some(expected) = self.next_expected_input
                         && input_seq > expected
-                        && input_seq - expected <= MAX_TRACKED_HOLES as u64
+                        && input_seq.saturating_sub(expected) <= MAX_TRACKED_HOLES as u64
                     {
                         self.active_input_holes.extend(expected..input_seq);
                         self.trim_active_input_holes();
@@ -541,7 +549,7 @@ impl Switcher {
             Some(expected) if seq_v == expected => {}
             Some(expected) if seq_v > expected => {
                 // A jump this large is a switch, not loss; do not record it.
-                if seq_v - expected <= MAX_TRACKED_HOLES as u64 {
+                if seq_v.saturating_sub(expected) <= MAX_TRACKED_HOLES as u64 {
                     self.holes.extend(expected..seq_v);
                 }
             }
@@ -561,7 +569,7 @@ impl Switcher {
             self.frame_start_output = Some(seq_v);
         }
         if self.next_expected_output.is_none_or(|e| seq_v >= e) {
-            self.next_expected_output = Some(seq_v + 1);
+            self.next_expected_output = Some(seq_v.saturating_add(1));
         }
         if self.last_output.is_none_or(|last| seq_v > *last) {
             self.last_output = Some(seq);

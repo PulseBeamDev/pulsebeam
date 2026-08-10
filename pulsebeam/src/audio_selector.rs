@@ -153,7 +153,7 @@ impl TopNAudioSelector {
         let slot = &mut self.slots[victim_idx];
         slot.owner = Some(stream_id);
         slot.last_arrival_ts = Some(now);
-        slot.immunity_expiry = now + NEWBORN_IMMUNITY;
+        slot.immunity_expiry = now.checked_add(NEWBORN_IMMUNITY).unwrap_or(now);
         slot.last_power = power;
         Self::rewrite_slot_timeline(&mut slot.slot_timeline, true, pkt);
         Some(AudioSelectorSlotId::new(victim_idx))

@@ -206,12 +206,15 @@ mod ice {
                 return None;
             }
 
-            let attr_type = u16::from_be_bytes([data[current_pos], data[current_pos + 1]]);
-            let attr_value_len =
-                u16::from_be_bytes([data[current_pos + 2], data[current_pos + 3]]) as usize;
+            let attr_type =
+                u16::from_be_bytes([data[current_pos], data[current_pos.saturating_add(1)]]);
+            let attr_value_len = u16::from_be_bytes([
+                data[current_pos.saturating_add(2)],
+                data[current_pos.saturating_add(3)],
+            ]) as usize;
 
             // Calculate start position of the attribute value
-            let value_pos = current_pos + ATTRIBUTE_HEADER_SIZE;
+            let value_pos = current_pos.saturating_add(ATTRIBUTE_HEADER_SIZE);
 
             // Check if the attribute value (based on its *own* length field) fits
             // within the bounds defined by the *message* length field.
@@ -232,7 +235,7 @@ mod ice {
             // Move to the next attribute.
             // Value must be padded to a multiple of 4 bytes.
             // Performance: Bitwise trick for padding calculation is fast.
-            let padded_len = (attr_value_len + 3) & !3;
+            let padded_len = attr_value_len.saturating_add(3) & !3;
             // Check for overflow before updating current_pos
             let next_pos = value_pos.checked_add(padded_len)?;
 

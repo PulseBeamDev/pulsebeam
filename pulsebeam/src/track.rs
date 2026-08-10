@@ -366,7 +366,7 @@ impl TrackMonitor {
 
         for encoding in &mut self.encodings {
             let self_recent = encoding.monitor.has_recent_packets(now);
-            let is_any_sibling_active = recent - usize::from(self_recent) > 0;
+            let is_any_sibling_active = recent.saturating_sub(usize::from(self_recent)) > 0;
             encoding.poll_stats(now, is_any_sibling_active);
         }
     }

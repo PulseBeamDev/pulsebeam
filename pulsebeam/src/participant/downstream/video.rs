@@ -633,7 +633,8 @@ impl Slot {
         }
 
         let keepalive_mode = retries >= KEYFRAME_MAX_RETRIES;
-        let reached_keepalive = !keepalive_mode && retries + 1 == KEYFRAME_MAX_RETRIES;
+        let reached_keepalive =
+            !keepalive_mode && retries.saturating_add(1) == KEYFRAME_MAX_RETRIES;
         if !keepalive_mode {
             self.staging_keyframe_retries = self.staging_keyframe_retries.saturating_add(1);
         }
@@ -989,10 +990,10 @@ impl AllocationEngine {
         if declared > 0 {
             return declared as f64;
         }
-        if count <= 1 || dt + 1 >= count {
+        if count <= 1 || dt.saturating_add(1) >= count {
             return snap.bitrate_bps;
         }
-        let frac = 0.5 + 0.5 * (dt as f64) / ((count - 1) as f64);
+        let frac = 0.5 + 0.5 * (dt as f64) / (count.saturating_sub(1) as f64);
         snap.bitrate_bps * frac
     }
 
@@ -1001,10 +1002,10 @@ impl AllocationEngine {
     fn decode_target_fps(&self, layer: &TrackLayer, dt: usize) -> u32 {
         let snap = self.snap(layer);
         let count = usize::from(snap.decode_targets.max(1));
-        if snap.full_fps == 0 || dt + 1 >= count {
+        if snap.full_fps == 0 || dt.saturating_add(1) >= count {
             return snap.full_fps;
         }
-        snap.full_fps >> (count - 1 - dt)
+        snap.full_fps >> count.saturating_sub(1).saturating_sub(dt)
     }
 
     /// The highest decode target of a scalable encoding that fits `budget` while
@@ -1025,7 +1026,7 @@ impl AllocationEngine {
         // Lowest target still meeting the frame-rate floor.
         let floor_dt = (0..count)
             .find(|&dt| self.decode_target_fps(layer, dt) >= min_fps)
-            .unwrap_or(count - 1);
+            .unwrap_or(count.saturating_sub(1));
         // Highest affordable target at or above the floor. Skip the top target —
         // that is "full", handled by the normal (non-degraded) path.
         (floor_dt..count.saturating_sub(1)).rev().find_map(|dt| {

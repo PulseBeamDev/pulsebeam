@@ -707,7 +707,7 @@ impl ParticipantCore {
 
             self.publish_changed_stats(events);
 
-            if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
+            if now.saturating_duration_since(self.last_slow_poll) >= SLOW_POLL_INTERVAL {
                 self.poll_slow(now, events);
                 self.last_slow_poll = now;
                 self.rtc_needs_drain = true;
@@ -767,7 +767,10 @@ impl ParticipantCore {
                 continue;
             }
 
-            let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
+            let next_slow_poll = self
+                .last_slow_poll
+                .checked_add(SLOW_POLL_INTERVAL)
+                .unwrap_or(self.last_slow_poll);
             let deadline = self
                 .rtc_deadline
                 .expect("drained RTC must have a deadline")

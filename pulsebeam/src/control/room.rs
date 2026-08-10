@@ -23,7 +23,8 @@ impl Room {
 
     pub fn add_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
         self.participants.insert(*participant_id, Vec::new());
-        *self.participant_shards.entry(shard_id).or_insert(0) += 1;
+        let count = self.participant_shards.entry(shard_id).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     pub fn remove_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
