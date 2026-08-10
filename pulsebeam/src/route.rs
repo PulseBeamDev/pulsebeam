@@ -3,6 +3,27 @@
 //! A route id is allocated by the *destination*, because it indexes that
 //! destination's table. Semantic ids (participant, track, room, topic) never
 //! appear on the wire; they survive only in [`RouteNames`] for logs.
+//!
+//! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
+
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::VecDeque;
 use tokio::time::{Duration, Instant};
@@ -405,20 +426,23 @@ impl RouteEntry {
     /// Comparison is wrapping: `link_seq` is modulo 2^32, so "newer" means a
     /// positive signed delta, not a larger integer.
     pub fn observe(&mut self, link_seq: u32) {
-        self.stats.received += 1;
+        self.stats.received = self.stats.received.saturating_add(1);
         let Some(last) = self.last_link_seq else {
             self.last_link_seq = Some(link_seq);
             return;
         };
         let delta = link_seq.wrapping_sub(last) as i32;
         match delta {
-            0 => self.stats.duplicated += 1,
+            0 => self.stats.duplicated = self.stats.duplicated.saturating_add(1),
             d if d > 0 => {
-                self.stats.lost += u64::from(d as u32 - 1);
+                self.stats.lost = self
+                    .stats
+                    .lost
+                    .saturating_add(u64::from(d.unsigned_abs().saturating_sub(1)));
                 self.last_link_seq = Some(link_seq);
             }
             _ => {
-                self.stats.reordered += 1;
+                self.stats.reordered = self.stats.reordered.saturating_add(1);
                 // A late frame does not move the high-water mark, and its gap
                 // was already counted when the newer frame advanced past it.
                 self.stats.lost = self.stats.lost.saturating_sub(1);
@@ -684,7 +708,7 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
     pub fn subscribe(&mut self, key: K) -> ImportEffect {
         match self.entries.get_mut(&key) {
             Some(import) => {
-                import.subscribers += 1;
+                import.subscribers = import.subscribers.saturating_add(1);
                 ImportEffect::None
             }
             None => {

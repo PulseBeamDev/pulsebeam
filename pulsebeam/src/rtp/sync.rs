@@ -1,3 +1,14 @@
+//! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::clock::NtpTime;
 use crate::rtp::RtpPacket;
 use ahash::HashMap;
@@ -19,9 +30,29 @@ struct ClockReference {
     arrival_ts: Instant,
 }
 
+/// Shift an NTP wall time by a signed number of seconds.
+///
+/// Saturating rather than trapping: `ntp_delta_secs` comes from a sender
+/// report's RTP delta, which a misbehaving or malicious publisher controls. A
+/// clamped timestamp produces a bad playout estimate that the rest of the
+/// pipeline already bounds; an overflow would end the process.
+fn offset_ntp(base: NtpTime, delta_secs: f64) -> NtpTime {
+    if !delta_secs.is_finite() {
+        return base;
+    }
+    let magnitude = Duration::from_secs_f64(delta_secs.abs());
+    if delta_secs >= 0.0 {
+        base.saturating_add(magnitude)
+    } else {
+        base.saturating_sub(magnitude)
+    }
+}
+
 impl ClockReference {
     fn server_time_at_anchor(&self, ntp_delta: Duration) -> Instant {
-        self.arrival_ts + ntp_delta
+        self.arrival_ts
+            .checked_add(ntp_delta)
+            .unwrap_or(self.arrival_ts)
     }
 
     /// Of two anchors on the same NTP wall clock, the one implying the lower
@@ -32,7 +63,7 @@ impl ClockReference {
         match other.ntp_time.duration_since(self.ntp_time) {
             // other is later on the NTP clock: does it arrive sooner than self predicts?
             Ok(dt) => {
-                if other.arrival_ts < self.arrival_ts + dt {
+                if other.arrival_ts < self.arrival_ts.checked_add(dt).unwrap_or(self.arrival_ts) {
                     other
                 } else {
                     self
@@ -40,7 +71,7 @@ impl ClockReference {
             }
             // other is earlier on the NTP clock: compare the other way round.
             Err(e) => {
-                if other.arrival_ts + e < self.arrival_ts {
+                if other.arrival_ts.checked_add(e).unwrap_or(other.arrival_ts) < self.arrival_ts {
                     other
                 } else {
                     self
@@ -109,11 +140,7 @@ impl Synchronizer {
             let rtp_delta =
                 (packet.rtp_ts.numer() as i64).wrapping_sub(latest.rtp_time.numer() as i64);
             let ntp_delta_secs = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
-            let ntp_pkt = if ntp_delta_secs >= 0.0 {
-                latest.ntp_time + Duration::from_secs_f64(ntp_delta_secs)
-            } else {
-                latest.ntp_time - Duration::from_secs_f64(-ntp_delta_secs)
-            };
+            let ntp_pkt = offset_ntp(latest.ntp_time, ntp_delta_secs);
 
             if let Some(anchor) = self.ntp_anchor {
                 let ntp_delta = ntp_pkt
@@ -126,7 +153,9 @@ impl Synchronizer {
         // 2. Fallback/Standard path: use the local RTP-based baseline
         let seconds_delta = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
         let mut expected_playout = if seconds_delta >= 0.0 {
-            base_server_time + Duration::from_secs_f64(seconds_delta)
+            base_server_time
+                .checked_add(Duration::from_secs_f64(seconds_delta))
+                .unwrap_or(base_server_time)
         } else {
             base_server_time
                 .checked_sub(Duration::from_secs_f64(-seconds_delta))
@@ -211,7 +240,10 @@ impl Synchronizer {
                 .ntp_time
                 .duration_since(anchor.ntp_time)
                 .unwrap_or(Duration::ZERO);
-            let expected_server = anchor.arrival_ts + ntp_delta;
+            let expected_server = anchor
+                .arrival_ts
+                .checked_add(ntp_delta)
+                .unwrap_or(anchor.arrival_ts);
             if now < expected_server {
                 // This SR arrived earlier than the previous anchor relative to NTP.
                 // It represents a lower propagation delay.

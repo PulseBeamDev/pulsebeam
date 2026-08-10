@@ -1,5 +1,26 @@
 //! The NTP timeline: the only clock representation that crosses a shard or
 //! process boundary. `Instant` is local scheduling time and never leaves.
+//!
+//! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
+
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
@@ -61,7 +82,11 @@ impl NtpTime {
 
     pub fn to_system_time(self) -> SystemTime {
         let secs = (self.0 >> 32).saturating_sub(NTP_UNIX_OFFSET_SECS);
-        UNIX_EPOCH + Duration::new(secs, frac_nanos(self.0))
+        // An NTP era is 136 years, so this cannot leave `SystemTime`'s range;
+        // clamping rather than trapping keeps a logging path from ending the node.
+        UNIX_EPOCH
+            .checked_add(Duration::new(secs, frac_nanos(self.0)))
+            .unwrap_or(UNIX_EPOCH)
     }
 
     /// Bits 47..16 — what the envelope carries.
@@ -85,6 +110,21 @@ impl NtpTime {
             units if units > 0 => units_to_duration(units as u64),
             _ => Duration::ZERO,
         }
+    }
+
+    /// Shift forward by `d`, clamping at the end of the NTP range.
+    ///
+    /// Deliberately *not* modular, unlike the comparisons: those wrap because a
+    /// timestamp either side of an era boundary is still a real instant, while
+    /// an offset large enough to overflow came from a bad input, and wrapping
+    /// it would turn that into a plausible-looking time in the distant past.
+    pub fn saturating_add(self, d: Duration) -> Self {
+        Self(self.0.saturating_add(duration_to_units(d)))
+    }
+
+    /// Shift back by `d`, clamping at the start of the NTP range.
+    pub fn saturating_sub(self, d: Duration) -> Self {
+        Self(self.0.saturating_sub(duration_to_units(d)))
     }
 
     /// `Ok` with the elapsed time when `self` is at or after `earlier`, `Err`
@@ -141,11 +181,14 @@ impl std::ops::Sub<Duration> for NtpTime {
 // every playout timestamp and reshuffle a deterministic simulation.
 fn frac_units(nanos: u32) -> u64 {
     debug_assert!(nanos < 1_000_000_000, "not a subsecond value: {nanos}");
-    ((u64::from(nanos) << 32) + 500_000_000) / 1_000_000_000
+    ((u64::from(nanos) << 32).saturating_add(500_000_000)) / 1_000_000_000
 }
 
 fn frac_nanos(raw: u64) -> u32 {
-    ((((raw & 0xFFFF_FFFF) * 1_000_000_000) + (1 << 31)) >> 32) as u32
+    (((raw & 0xFFFF_FFFF)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(1 << 31))
+        >> 32) as u32
 }
 
 fn duration_to_units(d: Duration) -> u64 {
@@ -197,8 +240,14 @@ impl WallAnchor {
 
     pub fn to_instant(&self, t: NtpTime) -> Instant {
         match t.units_since(self.ntp) {
-            units if units >= 0 => self.mono + units_to_duration(units as u64),
-            units => self.mono - units_to_duration(units.unsigned_abs()),
+            units if units >= 0 => self
+                .mono
+                .checked_add(units_to_duration(units as u64))
+                .unwrap_or(self.mono),
+            units => self
+                .mono
+                .checked_sub(units_to_duration(units.unsigned_abs()))
+                .unwrap_or(self.mono),
         }
     }
 }
@@ -237,7 +286,7 @@ impl NtpExpander {
             return Err(ExpandError::Ambiguous { gap });
         }
 
-        let steps = (self.reference.as_raw() >> MID_SHIFT) as i64 + gap;
+        let steps = ((self.reference.as_raw() >> MID_SHIFT) as i64).saturating_add(gap);
         debug_assert!(steps >= 0, "expansion underflowed the NTP epoch: {steps}");
         let expanded = NtpTime::from_raw((steps as u64) << MID_SHIFT);
         debug_assert_eq!(
