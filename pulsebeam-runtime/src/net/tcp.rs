@@ -321,7 +321,11 @@ impl TcpTransport {
         *count += 1;
 
         if let Err(e) = stream.set_nodelay(true) {
-            *self.ip_counts.get_mut(&peer_ip).unwrap() -= 1;
+            if let Some(count) = self.ip_counts.get_mut(&peer_ip) {
+                *count -= 1;
+            } else {
+                debug_assert!(false, "per-IP count vanished between insert and rollback");
+            }
             return Err(e);
         }
 

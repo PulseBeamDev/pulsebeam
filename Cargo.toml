@@ -103,11 +103,28 @@ debug = 1
 disallowed_types = "deny"
 disallowed_methods = "deny"
 
+# -- crashing --------------------------------------------------------------
+# `panic = "abort"`, one process, every participant on the node inside it. A
+# panic in one request handler drops calls that had nothing to do with it, so
+# ending the process is a decision that has to be written down rather than a
+# thing an expression does.
+#
+# There is exactly one sanctioned crash point, `pulsebeam::fatal!`, which
+# carries the `#[allow]` internally. Everything below routes through it or does
+# not compile. Tests allow these in their own module blocks: a test process
+# ending is the assertion mechanism, not an outage.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+exit = "warn"
+string_slice = "warn"           # panics on a non-char-boundary byte index
+unimplemented = "deny"
+todo = "deny"
+
 # -- correctness -------------------------------------------------------------
 float_cmp = "deny"              # bitrates and loss ratios are compared all over
 mem_forget = "deny"
-unimplemented = "deny"
-todo = "deny"
 
 # -- debug output must not reach a release build -----------------------------
 dbg_macro = "deny"

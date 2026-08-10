@@ -1,7 +1,10 @@
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::rand;
-use std::{net::SocketAddr, num::NonZeroUsize};
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
+};
 use tokio::runtime::LocalOptions;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -110,9 +113,10 @@ pub async fn run(
         .copied()
         .map(|ip| SocketAddr::new(ip, rtc_port))
         .collect();
-    let local_addr: SocketAddr = format!("[::]:{rtc_port}").parse().unwrap();
-    let http_api_addr: SocketAddr = "[::]:7070".parse().unwrap();
-    let metrics_addr: SocketAddr = "[::]:6060".parse().unwrap();
+    let unspecified_v6 = |port| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    let local_addr = unspecified_v6(rtc_port);
+    let http_api_addr = unspecified_v6(7070);
+    let metrics_addr = unspecified_v6(6060);
 
     tracing::info!(
         ?external_addrs,

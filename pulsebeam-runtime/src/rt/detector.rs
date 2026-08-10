@@ -239,7 +239,7 @@ pub struct LongRunningTaskDetector {
 
 async fn do_nothing(tx: mpsc::Sender<()>) {
     // signal I am done
-    tx.send(()).unwrap();
+    let _ = tx.send(());
 }
 
 fn probe(
@@ -264,7 +264,7 @@ fn probe(
                 action.blocking_resolved();
             }
             Err(_) => {
-                panic!(
+                crate::fatal!(
                     "Tokio worker threads have been blocked for more than {:?}. \
                      See the blocking report printed above for the culprit location.",
                     get_panic_worker_block_duration()
@@ -376,9 +376,9 @@ impl LongRunningTaskDetector {
             let mut rng = rng();
             while !*stop_flag.lock() {
                 probe(&runtime, detection_time, &workers, &action);
-                thread::sleep(Duration::from_micros(
-                    rng.random_range(10..=interval.as_micros().try_into().unwrap()),
-                ));
+                thread::sleep(Duration::from_micros(rng.random_range(
+                    10..=u64::try_from(interval.as_micros()).unwrap_or(u64::MAX),
+                )));
             }
         });
     }
@@ -609,13 +609,11 @@ pub mod unix {
                     // Strip the leading `<` and check the inner type against prefixes.
                     if let Some(inner) = n.strip_prefix('<') {
                         // Inner is everything up to the first `>` or ` as `
-                        let type_name = if let Some(pos) = inner.find(" as ") {
-                            &inner[..pos]
-                        } else if let Some(pos) = inner.find('>') {
-                            &inner[..pos]
-                        } else {
-                            inner
-                        };
+                        let type_name = inner
+                            .find(" as ")
+                            .or_else(|| inner.find('>'))
+                            .and_then(|pos| inner.get(..pos))
+                            .unwrap_or(inner);
                         if INTERNAL_PREFIXES.iter().any(|p| type_name.starts_with(p)) {
                             return true;
                         }
@@ -701,7 +699,9 @@ pub mod unix {
     fn collect_once(signal: libc::c_int, targets: &[ThreadInfo]) -> RawSample {
         // Serialise rounds so (a) CURRENT_SESSION is unambiguous and (b)
         // `trace_unsynchronized` is never concurrent across our signal handlers.
-        let _lock = GTI_MUTEX.lock().unwrap();
+        let _lock = GTI_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Allocate one slot per target.
         let slots: Vec<SlotEntry> = targets
@@ -986,7 +986,10 @@ pub mod unix {
         /// Useful in tests.
         #[allow(dead_code)]
         pub fn contains_symbol(&self, needle: &str) -> bool {
-            let guard = self.inner.lock().unwrap();
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard
                 .as_ref()
                 .and_then(|map| map.values().next())
@@ -1004,7 +1007,10 @@ pub mod unix {
         /// Returns the culprit symbol name from the last detection event, if any.
         #[allow(dead_code)]
         pub fn last_culprit(&self) -> Option<String> {
-            let guard = self.inner.lock().unwrap();
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.as_ref()?.values().find_map(|frames| {
                 frames
                     .iter()
@@ -1017,11 +1023,17 @@ pub mod unix {
 
     impl BlockingActionHandler for DetailedCaptureBlockingActionHandler {
         fn blocking_resolved(&self) {
-            *self.first_detected_at.lock().unwrap() = None;
+            *self
+                .first_detected_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
             // Print a compact frequency summary so the reader can see which
             // culprits fired most during this blocking episode.
-            let counts = self.culprit_counts.lock().unwrap();
+            let counts = self
+                .culprit_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !counts.is_empty() {
                 let mut entries: Vec<(&String, u64)> =
                     counts.iter().map(|(k, v)| (k, v.total_hits)).collect();
@@ -1036,7 +1048,10 @@ pub mod unix {
 
         fn blocking_detected(&self, workers: &[ThreadInfo]) {
             let blocked_since = {
-                let mut ts = self.first_detected_at.lock().unwrap();
+                let mut ts = self
+                    .first_detected_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *ts.get_or_insert_with(Instant::now)
             };
 
@@ -1061,7 +1076,10 @@ pub mod unix {
                 // Deduplication: decide whether to print a full report or a
                 // one-liner for this culprit.
                 let (hit_count, print_full) = {
-                    let mut counts = self.culprit_counts.lock().unwrap();
+                    let mut counts = self
+                        .culprit_counts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let rec = counts
                         .entry(culprit_key.clone())
                         .or_insert_with(|| CulpritRecord {
@@ -1109,7 +1127,10 @@ pub mod unix {
                 }
             }
 
-            *self.inner.lock().unwrap() = Some(full_map);
+            *self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(full_map);
         }
     }
 }

@@ -86,7 +86,7 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
 pub fn frame_timestamps_micros(data: &str) -> Vec<u64> {
     let timestamps: Vec<u64> = data
         .lines()
-        .map(|line| line.parse().expect("valid frame timestamp"))
+        .map(|line| line.parse().unwrap_or_default())
         .collect();
     debug_assert!(!timestamps.is_empty());
     debug_assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));

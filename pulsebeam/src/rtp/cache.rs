@@ -397,15 +397,18 @@ impl TrackStreamCache {
     }
 
     fn encoding_mut(&mut self, rid: Option<Rid>) -> &mut StreamCache {
-        if let Some(pos) = self.encodings.iter().position(|(r, _)| *r == rid) {
-            return &mut self.encodings[pos].1;
-        }
-        debug_assert!(
-            self.encodings.len() < MAX_SIMULCAST_ENCODINGS,
-            "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
-        );
-        self.encodings.push((rid, StreamCache::default()));
-        &mut self.encodings.last_mut().unwrap().1
+        let pos = match self.encodings.iter().position(|(r, _)| *r == rid) {
+            Some(pos) => pos,
+            None => {
+                debug_assert!(
+                    self.encodings.len() < MAX_SIMULCAST_ENCODINGS,
+                    "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
+                );
+                self.encodings.push((rid, StreamCache::default()));
+                self.encodings.len() - 1
+            }
+        };
+        &mut self.encodings[pos].1
     }
 }
 

@@ -237,7 +237,8 @@ async fn spawn_agent(
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &ctx.api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
+    let mut builder =
+        AgentBuilder::new(api, socket).with_local_ip(std::net::Ipv4Addr::LOCALHOST.into());
 
     if simulcast {
         builder = builder.video_upstream_slots(

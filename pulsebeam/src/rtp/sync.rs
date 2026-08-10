@@ -83,12 +83,12 @@ impl Synchronizer {
             self.add_sender_report(sr, packet.arrival_ts);
         }
 
-        if self.base_rtp.is_none() {
-            self.reset_baseline(packet.rtp_ts, packet.arrival_ts);
-        }
-
-        let base_rtp = self.base_rtp.unwrap();
-        let mut base_server_time = self.base_server_time.unwrap();
+        // The two move together, so read them together: a baseline half-set is
+        // a bug rather than a state to recover from.
+        let (base_rtp, mut base_server_time) = match (self.base_rtp, self.base_server_time) {
+            (Some(rtp), Some(server_time)) => (rtp, server_time),
+            _ => self.reset_baseline(packet.rtp_ts, packet.arrival_ts),
+        };
 
         let rtp_delta = (packet.rtp_ts.numer() as i64).wrapping_sub(base_rtp.numer() as i64);
         let max_ticks = (MAX_RTP_GAP_SECS * self.clock_rate.get() as f64) as i64;
@@ -162,13 +162,14 @@ impl Synchronizer {
         packet.playout_time = expected_playout;
     }
 
-    fn reset_baseline(&mut self, rtp_ts: MediaTime, arrival_ts: Instant) {
+    fn reset_baseline(&mut self, rtp_ts: MediaTime, arrival_ts: Instant) -> (MediaTime, Instant) {
         self.base_rtp = Some(rtp_ts);
         self.base_server_time = Some(arrival_ts);
         self.first_sr = None;
         self.latest_sr = None;
         self.ntp_anchor = None;
         self.estimated_clock_drift_ppm = 0.0;
+        (rtp_ts, arrival_ts)
     }
 
     fn add_sender_report(&mut self, sr: SenderInfo, now: Instant) {

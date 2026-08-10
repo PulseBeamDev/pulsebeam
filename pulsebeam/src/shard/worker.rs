@@ -482,13 +482,14 @@ impl ShardWorker {
                     return Err(ShardError::ManagerDisconnected);
                 }
                 Err(mailbox::TrySendError::Full(ev)) => {
-                    panic!(
+                    pulsebeam_runtime::fatal!(
                         "shard {} filled the {SHARD_EVENT_CAPACITY}-slot control queue to the \
                          controller and cannot block on it without deadlocking (the controller \
                          awaits on the reverse channel). The controller has stopped draining \
                          topology events, so cluster routing state is already diverging. \
                          Dropped: {:?}",
-                        self.router.shard_id, ev.ev
+                        self.router.shard_id,
+                        ev.ev
                     );
                 }
             }

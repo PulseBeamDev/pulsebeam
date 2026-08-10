@@ -36,7 +36,13 @@ pub async fn bind_udp_socket(
         UdpMode::Batch => udp::bind_socket(addr)?,
         UdpMode::Scalar => bind_scalar_socket(addr)?,
     };
-    let local_addr = external_addr.unwrap_or(socket.local_addr()?.as_socket().expect("UDP socket"));
+    let local_addr = match external_addr {
+        Some(addr) => addr,
+        None => match socket.local_addr()?.as_socket() {
+            Some(addr) => addr,
+            None => crate::fatal!("a bound UDP socket reported a non-IP local address"),
+        },
+    };
     Ok(BoundUdpSocket {
         socket,
         mode,

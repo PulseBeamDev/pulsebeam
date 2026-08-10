@@ -1,4 +1,4 @@
-use http::{Method, Response, Uri};
+use http::{HeaderValue, Method, Response, Uri};
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest};
 use str0m::{
     change::{SdpAnswer, SdpOffer},
@@ -151,7 +151,7 @@ impl HttpApiClient {
         let mut req = HttpRequest::new(raw_body);
         *req.uri_mut() = uri.parse()?;
         req.headers_mut()
-            .insert("Content-Type", "application/sdp".parse().unwrap());
+            .insert("Content-Type", HeaderValue::from_static("application/sdp"));
         *req.method_mut() = Method::POST;
 
         let res = self.http_client.execute(req).await?;
@@ -169,7 +169,7 @@ impl HttpApiClient {
         let mut req = HttpRequest::new(raw_body);
         *req.uri_mut() = uri;
         req.headers_mut()
-            .insert("Content-Type", "application/sdp".parse().unwrap());
+            .insert("Content-Type", HeaderValue::from_static("application/sdp"));
         *req.method_mut() = Method::PATCH;
 
         let res = self.http_client.execute(req).await?;

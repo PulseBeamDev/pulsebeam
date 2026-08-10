@@ -116,7 +116,9 @@ pub struct ExternalRoomId(ArrayString<MAX_EXTERNAL_ROOM_ID_LEN>);
 impl ExternalRoomId {
     pub fn new(id: &str) -> Result<Self, IdValidationError> {
         validate_external_string(id)?;
-        Ok(Self(ArrayString::from(id).unwrap()))
+        ArrayString::from(id)
+            .map(Self)
+            .map_err(|_| IdValidationError::TooLong(MAX_EXTERNAL_ROOM_ID_LEN))
     }
 
     pub fn as_str(&self) -> &str {

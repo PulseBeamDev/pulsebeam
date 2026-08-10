@@ -11,6 +11,7 @@
 #![allow(clippy::disallowed_types)]
 
 pub mod collections;
+pub mod fatal;
 pub mod mailbox;
 pub mod net;
 pub mod prelude;

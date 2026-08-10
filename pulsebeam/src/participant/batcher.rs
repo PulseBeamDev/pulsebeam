@@ -1,6 +1,9 @@
 use arrayvec::ArrayVec;
 use pulsebeam_runtime::net;
-use std::{collections::VecDeque, net::SocketAddr};
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 const MAX_FREE_STATES: usize = 3;
 
@@ -247,18 +250,15 @@ impl Batcher {
                 buf: &state.buf,
                 segment_size: state.segment_size,
             }];
-            let res = socket.try_send_batch(&net::SendPacketBatch { packets: &packet });
-            match res {
-                Ok(_) => {
-                    let state = self.pop_front().unwrap();
-                    self.reclaim(state);
-                }
-                Err(err) => {
-                    tracing::trace!("error on writing to TCP socket: {:?}", err);
-                    let state = self.pop_front().unwrap();
-                    self.reclaim(state);
-                }
+            if let Err(err) = socket.try_send_batch(&net::SendPacketBatch { packets: &packet }) {
+                tracing::trace!("error on writing to TCP socket: {:?}", err);
             }
+            // Reclaimed either way: a failed write drops the batch rather than
+            // retrying it, so leaving it queued would spin this loop forever.
+            let Some(state) = self.pop_front() else {
+                break;
+            };
+            self.reclaim(state);
         }
     }
 }
@@ -277,7 +277,7 @@ impl BatcherState {
     fn with_capacity(cap: usize) -> Self {
         debug_assert_ne!(cap, 0);
         Self {
-            dst: "0.0.0.0:0".parse().unwrap(),
+            dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             segment_size: 0,
             segment_count: 0,
             max_segments: cap,

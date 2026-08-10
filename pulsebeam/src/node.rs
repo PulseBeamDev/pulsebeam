@@ -428,8 +428,12 @@ impl NodeBuilder {
                                 .unwrap();
                             tune_current_data_thread(core_id);
                             rt.block_on(async move {
-                                let udp_sock =
-                                    udp_sock.into_unified_socket().expect("bound UDP socket");
+                                let udp_sock = match udp_sock.into_unified_socket() {
+                                    Ok(sock) => sock,
+                                    Err(err) => pulsebeam_runtime::fatal!(
+                                        "shard {shard_id} cannot use its bound UDP socket: {err}"
+                                    ),
+                                };
                                 let shard = ShardWorker::new(
                                     shard_id,
                                     udp_sock,

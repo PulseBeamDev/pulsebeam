@@ -48,12 +48,14 @@ impl From<&str> for MediaType {
     }
 }
 
-impl From<MediaType> for MediaKind {
-    fn from(value: MediaType) -> Self {
+impl TryFrom<MediaType> for MediaKind {
+    type Error = MediaType;
+
+    fn try_from(value: MediaType) -> Result<Self, Self::Error> {
         match value {
-            MediaType::Video => MediaKind::Video,
-            MediaType::Audio => MediaKind::Audio,
-            typ => panic!("unexpected media type: {typ}"),
+            MediaType::Video => Ok(MediaKind::Video),
+            MediaType::Audio => Ok(MediaKind::Audio),
+            other => Err(other),
         }
     }
 }

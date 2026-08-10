@@ -174,11 +174,7 @@ mod ice {
 
         // 4. Read Message Length (bytes 2-3) - Big Endian
         // This is the length of the attributes *only*.
-        // Performance: from_be_bytes is efficient. try_into().unwrap() is safe
-        // because we checked data.len() >= 20.
-        let message_length = u16::from_be_bytes(
-            data[2..4].try_into().unwrap(), // Safe slice and unwrap
-        ) as usize;
+        let message_length = u16::from_be_bytes([data[2], data[3]]) as usize;
 
         // 5. Validate overall length
         // The total expected size (header + attributes) must not exceed the buffer size.
@@ -211,17 +207,9 @@ mod ice {
                 return None;
             }
 
-            // Read Attribute Type (Big Endian)
-            // Slicing is safe due to the check above.
-            let attr_type = u16::from_be_bytes(
-                data[current_pos..current_pos + 2].try_into().unwrap(), // Safe
-            );
-
-            // Read Attribute Value Length (Big Endian)
-            // Slicing is safe due to the check above.
-            let attr_value_len = u16::from_be_bytes(
-                data[current_pos + 2..current_pos + 4].try_into().unwrap(), // Safe
-            ) as usize;
+            let attr_type = u16::from_be_bytes([data[current_pos], data[current_pos + 1]]);
+            let attr_value_len =
+                u16::from_be_bytes([data[current_pos + 2], data[current_pos + 3]]) as usize;
 
             // Calculate start position of the attribute value
             let value_pos = current_pos + ATTRIBUTE_HEADER_SIZE;

@@ -182,13 +182,13 @@ impl JitterBuffer {
             return Some(pkt);
         }
         // Gap at `next`: wait up to `max_wait` for it to fill, then skip it (lost).
-        let (&head_seq, head_pkt) = self.buf.iter().next()?;
-        if now.saturating_duration_since(head_pkt.arrival) >= self.max_wait {
-            let pkt = self.buf.remove(&head_seq).unwrap();
-            self.next = Some(head_seq.wrapping_add(1));
-            return Some(pkt);
+        let (_, head_pkt) = self.buf.first_key_value()?;
+        if now.saturating_duration_since(head_pkt.arrival) < self.max_wait {
+            return None;
         }
-        None
+        let (head_seq, pkt) = self.buf.pop_first()?;
+        self.next = Some(head_seq.wrapping_add(1));
+        Some(pkt)
     }
 
     /// Release everything still buffered, in sequence order (end of stream).
@@ -312,8 +312,7 @@ impl FrameReceiver {
                 },
             );
             while self.pending.len() > 256 {
-                let oldest = *self.pending.keys().next().unwrap();
-                self.pending.remove(&oldest);
+                self.pending.pop_first();
             }
         }
 

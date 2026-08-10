@@ -324,7 +324,9 @@ impl Switcher {
 
     fn trim_active_input_holes(&mut self) {
         while self.active_input_holes.len() > MAX_TRACKED_HOLES {
-            let lowest = *self.active_input_holes.iter().next().expect("non-empty");
+            let Some(&lowest) = self.active_input_holes.iter().next() else {
+                break;
+            };
             self.active_input_holes.remove(&lowest);
         }
     }
@@ -548,7 +550,9 @@ impl Switcher {
             }
         }
         while self.holes.len() > MAX_TRACKED_HOLES {
-            let lowest = *self.holes.iter().next().expect("non-empty");
+            let Some(&lowest) = self.holes.iter().next() else {
+                break;
+            };
             self.holes.remove(&lowest);
         }
 
