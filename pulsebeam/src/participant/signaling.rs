@@ -286,7 +286,7 @@ impl Signaling {
         };
 
         // 4. Construct the Update
-        self.seq += 1;
+        self.seq = self.seq.saturating_add(1);
         let update = signaling::StateUpdate {
             seq: self.seq,
             is_snapshot: self.pending_snapshot_request,

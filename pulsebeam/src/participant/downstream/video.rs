@@ -278,7 +278,7 @@ impl VideoAllocator {
                         .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
                 });
                 slot.switch_to(layer, true);
-                staged += 1;
+                staged = staged.saturating_add(1);
             } else {
                 break;
             }
@@ -635,7 +635,7 @@ impl Slot {
         let keepalive_mode = retries >= KEYFRAME_MAX_RETRIES;
         let reached_keepalive = !keepalive_mode && retries + 1 == KEYFRAME_MAX_RETRIES;
         if !keepalive_mode {
-            self.staging_keyframe_retries += 1;
+            self.staging_keyframe_retries = self.staging_keyframe_retries.saturating_add(1);
         }
         self.staging_keyframe_last_at = Some(now);
 

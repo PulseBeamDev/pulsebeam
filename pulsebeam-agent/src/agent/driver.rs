@@ -694,7 +694,11 @@ impl AgentDriver {
                 self.media.last_desired = filtered_bitrate;
                 self.rtc.bwe().set_desired_bitrate(filtered_bitrate);
             }
-            self.timers.bwe_next_tick += BWE_SLOW_INTERVAL;
+            self.timers.bwe_next_tick = self
+                .timers
+                .bwe_next_tick
+                .checked_add(BWE_SLOW_INTERVAL)
+                .unwrap_or(self.timers.bwe_next_tick);
         }
     }
 
@@ -1137,7 +1141,7 @@ impl AgentDriver {
             n => Duration::from_millis(500 * 2u64.pow(n.min(10) - 1)).min(Duration::from_secs(5)),
         };
 
-        self.session.retry_count += 1;
+        self.session.retry_count = self.session.retry_count.saturating_add(1);
         self.session.reconnect_deadline = Some(now + delay);
     }
 

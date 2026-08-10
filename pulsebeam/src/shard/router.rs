@@ -211,7 +211,7 @@ impl DataStreamRoute {
     fn attach_remote_subscriber_shard(&mut self, remote: RemoteRoute) {
         match self.remote_subscriber_shards.get_mut(&remote.shard_id) {
             Some(existing) => {
-                existing.refs += 1;
+                existing.refs = existing.refs.saturating_add(1);
                 debug_assert!(existing.refs <= 2);
                 // A reinstall at the destination supersedes the old incarnation.
                 if existing.remote.route != remote.route || existing.remote.epoch != remote.epoch {

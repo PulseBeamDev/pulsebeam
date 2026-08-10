@@ -62,7 +62,7 @@ impl SharedH264Asset {
                 } else if i + 4 < frame.len() && frame[i + 2] == 0 && frame[i + 3] == 1 {
                     i + 4
                 } else {
-                    i += 1;
+                    i = i.saturating_add(1);
                     continue;
                 };
                 if header_pos < frame.len() && (frame[header_pos] & 0x1F) == 5 {
@@ -70,7 +70,7 @@ impl SharedH264Asset {
                 }
                 i = header_pos;
             } else {
-                i += 1;
+                i = i.saturating_add(1);
             }
         }
         false
@@ -93,7 +93,7 @@ fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
             out[header] = (out[header] & 0xE0) | NON_IDR_SLICE;
             i = header + 1;
         } else {
-            i += 1;
+            i = i.saturating_add(1);
         }
     }
     out.into()
@@ -213,7 +213,7 @@ impl H264Looper {
                     return;
                 }
             }
-            frame_count += 1;
+            frame_count = frame_count.saturating_add(1);
         }
     }
 }
@@ -485,10 +485,10 @@ impl VbrLooper {
                         return;
                     }
                 }
-                index += 1;
+                index = index.saturating_add(1);
                 if index == frame_times.len() {
                     index = 0;
-                    loop_start += loop_duration;
+                    loop_start = loop_start.checked_add(loop_duration).unwrap_or(loop_start);
                 }
             }
         }
@@ -579,11 +579,11 @@ impl<'a> H264FrameSlicer<'a> {
                     {
                         return Some((nalu_start, next, nalu_type));
                     }
-                    next += 1;
+                    next = next.saturating_add(1);
                 }
                 return Some((nalu_start, self.data.len(), nalu_type));
             }
-            i += 1;
+            i = i.saturating_add(1);
         }
         None
     }

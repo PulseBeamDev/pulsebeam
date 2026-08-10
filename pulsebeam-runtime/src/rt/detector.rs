@@ -558,7 +558,7 @@ pub mod unix {
             backtrace::trace_unsynchronized(|frame| {
                 if count < MAX_FRAMES {
                     buf[count] = frame.ip() as usize;
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
                 true
             });
@@ -945,7 +945,7 @@ pub mod unix {
                         "║  {frame_idx:>4}: {sym_name}{marker}\n║        at {loc}\n"
                     ));
                 }
-                frame_idx += 1;
+                frame_idx = frame_idx.saturating_add(1);
             }
         }
 
@@ -1088,7 +1088,7 @@ pub mod unix {
                                 - DEDUP_INTERVAL
                                 - Duration::from_secs(1),
                         });
-                    rec.total_hits += 1;
+                    rec.total_hits = rec.total_hits.saturating_add(1);
                     let should_print = rec.last_full_report.elapsed() >= DEDUP_INTERVAL;
                     if should_print {
                         rec.last_full_report = Instant::now();

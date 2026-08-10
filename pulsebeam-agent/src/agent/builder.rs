@@ -180,7 +180,7 @@ impl AgentBuilder {
         // }
 
         let mut rtc = rtc_builder.build(Instant::now().into());
-        let mut candidate_count = 0;
+        let mut candidate_count = 0usize;
         let mut maybe_addr = None;
         for ip in &self.local_ips {
             let addr = SocketAddr::new(*ip, port);
@@ -189,7 +189,7 @@ impl AgentBuilder {
             };
             rtc.add_local_candidate(candidate);
             maybe_addr = Some(addr);
-            candidate_count += 1;
+            candidate_count = candidate_count.saturating_add(1);
         }
 
         let mut tcp_stream: Option<pulsebeam_core::net::TcpStream> = None;
@@ -213,7 +213,7 @@ impl AgentBuilder {
                             .build()
                         {
                             rtc.add_local_candidate(c);
-                            candidate_count += 1;
+                            candidate_count = candidate_count.saturating_add(1);
                             if maybe_addr.is_none() {
                                 maybe_addr = Some(tcp_candidate_addr);
                             }

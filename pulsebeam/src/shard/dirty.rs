@@ -55,7 +55,7 @@ impl DirtyTracker {
         #[cfg(debug_assertions)]
         debug_assert!(self.active);
         let entry = self.participants.get(self.cursor).copied()?;
-        self.cursor += 1;
+        self.cursor = self.cursor.saturating_add(1);
         Some(entry)
     }
 

@@ -281,7 +281,7 @@ impl UdpTransportWriter {
                 if self.drop_count.is_multiple_of(100) {
                     tracing::warn!("udp_scalar dropped a packet due to full socket");
                 }
-                self.drop_count += 1;
+                self.drop_count = self.drop_count.saturating_add(1);
                 Ok(true)
             }
             Err(err) => {

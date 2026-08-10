@@ -125,7 +125,6 @@ pub(crate) fn extract_stun_server_ufrag(data: &[u8]) -> Option<String> {
 }
 
 mod ice {
-    use std::convert::TryInto;
 
     // --- Constants defined by RFC 5389 ---
     const MIN_STUN_HEADER_SIZE: usize = 20;

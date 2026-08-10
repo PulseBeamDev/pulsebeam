@@ -154,7 +154,7 @@ impl FrameDepacketizer {
                     last_seq: seq,
                 });
             }
-            seq += 1;
+            seq = seq.saturating_add(1);
         }
     }
 

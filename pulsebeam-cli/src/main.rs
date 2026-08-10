@@ -150,7 +150,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
     let latency_writer_handle = tokio::spawn(latency_writer_task(latency_rx, latency_csv));
     let snapshot_writer_handle = tokio::spawn(snapshot_writer_task(snapshot_rx, snapshots_csv));
 
-    let mut total_rooms = 0;
+    let mut total_rooms = 0usize;
     for room_id in 0..config.rooms {
         spawn_room(
             &mut join_set,
@@ -161,7 +161,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
             assets.clone(),
         )
         .await;
-        total_rooms += 1;
+        total_rooms = total_rooms.saturating_add(1);
     }
 
     // Monitor for room generation loops alongside early manual interruption signals
@@ -179,7 +179,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
                 tokio::time::sleep(delay).await;
 
                 spawn_room(&mut join_set, &api_url, total_rooms, &config, logger.clone(), assets.clone()).await;
-                total_rooms += 1;
+                total_rooms = total_rooms.saturating_add(1);
             }
             // Keep running inside this block until all active agents complete their session schedules
             while join_set.join_next().await.is_some() {}
@@ -342,7 +342,7 @@ async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -
     let _ = writer
         .write_all("elapsed_ms,room_id,agent_id,delay_us\n".as_bytes())
         .await;
-    let mut count = 0;
+    let mut count = 0usize;
 
     while let Ok(e) = rx.recv().await {
         let _ = writer
@@ -357,7 +357,7 @@ async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -
                 .as_bytes(),
             )
             .await;
-        count += 1;
+        count = count.saturating_add(1);
 
         if count >= 1000 {
             let _ = writer.flush().await;

@@ -201,7 +201,7 @@ impl StreamCache {
                 Some(p) => segment.push(p.clone()),
                 None => break,
             }
-            seq += 1;
+            seq = seq.saturating_add(1);
         }
 
         if !segment.iter().any(|p| p.is_keyframe) {
@@ -225,7 +225,7 @@ impl StreamCache {
         for p in &segment {
             let ts = p.rtp_ts.numer();
             if seen_ts != Some(ts) {
-                frames += 1;
+                frames = frames.saturating_add(1);
                 seen_ts = Some(ts);
             }
         }

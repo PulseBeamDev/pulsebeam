@@ -393,7 +393,7 @@ impl StreamMonitor {
         } else if seq > self.window_highest_seq.unwrap_or(0) {
             self.window_highest_seq = Some(seq);
         }
-        self.window_actual_packets += 1;
+        self.window_actual_packets = self.window_actual_packets.saturating_add(1);
 
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             let ext = &packet.ext_vals;
@@ -759,7 +759,9 @@ impl BitrateEstimate {
 
     pub fn record(&mut self, pkt: &RtpPacket) {
         self.advance_time(pkt.playout_time);
-        self.accumulated_bytes += pkt.header_len + pkt.payload.len();
+        self.accumulated_bytes = self
+            .accumulated_bytes
+            .saturating_add(pkt.header_len + pkt.payload.len());
     }
 
     pub fn poll(&mut self, now: Instant) {

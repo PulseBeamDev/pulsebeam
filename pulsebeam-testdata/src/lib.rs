@@ -26,16 +26,16 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
         if data[i] == 0 && data[i + 1] == 0 {
             if i + 3 < n && data[i + 2] == 0 && data[i + 3] == 1 {
                 sc_positions.push(i);
-                i += 4;
+                i = i.saturating_add(4);
                 continue;
             }
             if data[i + 2] == 1 {
                 sc_positions.push(i);
-                i += 3;
+                i = i.saturating_add(3);
                 continue;
             }
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
     if sc_positions.is_empty() {
         return vec![];
@@ -75,7 +75,7 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
         if is_vcl {
             seen_vcl = true;
         }
-        current_frame_bytes += nalu_size;
+        current_frame_bytes = current_frame_bytes.saturating_add(nalu_size);
     }
     if current_frame_bytes > 0 {
         frames.push(current_frame_bytes);

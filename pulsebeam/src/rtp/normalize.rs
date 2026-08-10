@@ -99,7 +99,7 @@ impl StreamNormalizer {
                 self.dd.structure().map(|s| s.decode_target_count)
             }
             Err(err) => {
-                self.dd_errors += 1;
+                self.dd_errors = self.dd_errors.saturating_add(1);
                 if self.dd_errors.is_power_of_two() {
                     tracing::warn!(
                         mid = %self.mid,

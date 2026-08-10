@@ -677,7 +677,7 @@ impl ParticipantCore {
         #[cfg(feature = "sim")]
         let _sim_guard = sim_span.enter();
 
-        let mut budget = 3;
+        let mut budget = 3usize;
         'drain: loop {
             if self.rtc_needs_drain {
                 let Some(rtc_deadline) = self.poll_rtc(now, events) else {
@@ -776,7 +776,7 @@ impl ParticipantCore {
             // upper bounded to 3 ticks to defensively avoid spin loops from bugs or just to give fairness
             // to other participants
             if deadline <= now && budget > 0 {
-                budget -= 1;
+                budget = budget.saturating_sub(1);
                 let _ = self.rtc.handle_input(Input::Timeout(now.into()));
                 self.rtc_needs_drain = true;
                 continue;

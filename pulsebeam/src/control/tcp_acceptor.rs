@@ -134,7 +134,7 @@ async fn acceptor_loop(
                             continue;
                         }
                         *ip_count += 1;
-                        pending += 1;
+                        pending = pending.saturating_add(1);
 
                         let tx = event_tx.clone();
                         let done = done_tx.clone();

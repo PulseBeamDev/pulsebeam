@@ -54,7 +54,7 @@ impl BitrateEstimate {
 
     pub fn record_bytes(&mut self, bytes: usize, now: Instant) {
         self.advance_time(now);
-        self.accumulated_bytes += bytes;
+        self.accumulated_bytes = self.accumulated_bytes.saturating_add(bytes);
     }
 
     pub fn poll(&mut self, current_time: Instant) {
@@ -309,7 +309,7 @@ impl LayerController {
         let debt = allocated - self.available_bps;
 
         if debt > self.available_bps * DEBT_LINGER_THRESHOLD {
-            self.debt_ticks += 1;
+            self.debt_ticks = self.debt_ticks.saturating_add(1);
         } else {
             self.debt_ticks = 0;
         }

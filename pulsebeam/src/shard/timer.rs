@@ -117,7 +117,7 @@ impl TimerWheel {
             if self.slot_occupied(tick as u8) {
                 return Some(self.epoch + Duration::from_millis(tick));
             }
-            offset += 1;
+            offset = offset.saturating_add(1);
         }
         None
     }
@@ -134,7 +134,7 @@ impl TimerWheel {
             }
         } else {
             while self.current_tick < target_tick {
-                self.current_tick += 1;
+                self.current_tick = self.current_tick.saturating_add(1);
                 self.drain_location(u16::from(self.current_tick as u8), &mut f);
             }
         }
