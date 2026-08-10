@@ -145,7 +145,7 @@ impl DownstreamAllocator {
 
     pub fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
         const MAX_HUNDREDTHS: u64 = 0xfff;
-        let to_hundredths = |ms: u32| ((ms as u64 + 5) / 10).min(MAX_HUNDREDTHS);
+        let to_hundredths = |ms: u32| ((ms as u64).saturating_add(5) / 10).min(MAX_HUNDREDTHS);
         let Some(bounds) = bounds else {
             return;
         };
@@ -314,6 +314,10 @@ impl DownstreamAllocator {
     }
 
     #[inline]
+    pub fn update_layer_states(&mut self, track_id: TrackId, states: &crate::track::TrackStates) {
+        self.video.update_layer_states(track_id, states);
+    }
+
     pub fn on_forward_rtp(
         &mut self,
         track_id: TrackId,
@@ -342,6 +346,13 @@ impl DownstreamAllocator {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     fn expected(initial: f64, target: f64, elapsed: Duration, time_constant: Duration) -> f64 {

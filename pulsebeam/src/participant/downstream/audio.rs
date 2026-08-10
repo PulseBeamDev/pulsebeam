@@ -118,6 +118,21 @@ impl AudioAllocator {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::participant::downstream::SlotConfig;
     use crate::rtp::RtpPacket;
