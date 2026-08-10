@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use axum::{
     Router,
     extract::{MatchedPath, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{patch, post},
@@ -50,11 +50,18 @@ pub struct ParticipantResponseHeaders {
 }
 
 impl ParticipantResponseHeaders {
-    pub fn to_header_map(&self) -> HeaderMap {
+    /// Fallible because `location` is assembled from `x-forwarded-proto` and
+    /// `x-forwarded-host` — client-supplied. `HeaderValue` rejects bytes that
+    /// cannot appear in a header, and with `panic = "abort"` a panic in a
+    /// request handler takes the node down, so this is a 500 instead.
+    pub fn to_header_map(&self) -> Result<HeaderMap, ApiError> {
+        let location = HeaderValue::from_str(&self.location).map_err(|_| ApiError::BadUrl)?;
+        let etag = HeaderValue::from_str(&self.etag.as_str())
+            .map_err(|_| ApiError::Unknown("connection id is not a valid header".to_string()))?;
         let mut headers = HeaderMap::new();
-        headers.insert(LOCATION, self.location.parse().unwrap());
-        headers.insert(ETAG, self.etag.as_str().parse().unwrap());
-        headers
+        headers.insert(LOCATION, location);
+        headers.insert(ETAG, etag);
+        Ok(headers)
     }
 }
 
@@ -235,7 +242,7 @@ async fn create_participant(
 
     Ok((
         StatusCode::CREATED,
-        response_headers.to_header_map(),
+        response_headers.to_header_map()?,
         reply.answer.to_sdp_string(),
     ))
 }
@@ -325,7 +332,7 @@ async fn patch_participant(
         .get(IF_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim_matches('"'))
-        .ok_or(ApiError::BadRequest("If-Match header required".into()))?
+        .ok_or_else(|| ApiError::BadRequest("If-Match header required".into()))?
         .try_into()?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -366,7 +373,7 @@ async fn patch_participant(
 
     Ok((
         StatusCode::OK,
-        response_headers.to_header_map(),
+        response_headers.to_header_map()?,
         reply.answer.to_sdp_string(),
     ))
 }

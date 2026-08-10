@@ -44,7 +44,7 @@ pub enum IdValidationError {
 
 fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
     let encoded = base32::encode(base32::Alphabet::Crockford, bytes);
-    format!("{}_{}", prefix, encoded)
+    format!("{prefix}_{encoded}")
 }
 
 fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdValidationError> {
@@ -116,7 +116,9 @@ pub struct ExternalRoomId(ArrayString<MAX_EXTERNAL_ROOM_ID_LEN>);
 impl ExternalRoomId {
     pub fn new(id: &str) -> Result<Self, IdValidationError> {
         validate_external_string(id)?;
-        Ok(Self(ArrayString::from(id).unwrap()))
+        ArrayString::from(id)
+            .map(Self)
+            .map_err(|_| IdValidationError::TooLong(MAX_EXTERNAL_ROOM_ID_LEN))
     }
 
     pub fn as_str(&self) -> &str {
@@ -473,6 +475,21 @@ impl fmt::Debug for TrackId {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use pulsebeam_runtime::rand::seeded_rng;
     use std::collections::{HashMap, HashSet};

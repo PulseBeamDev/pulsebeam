@@ -90,7 +90,7 @@ impl ParticipantRegistry {
             participants: SlotMap::with_key(),
             participant_keys: HashMap::default(),
             next_generation: 1,
-            demuxer: Demuxer::new(shard_id.into()),
+            demuxer: Demuxer::new(),
             pending_close: VecDeque::new(),
         }
     }
@@ -98,10 +98,10 @@ impl ParticipantRegistry {
     pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantId {
         let participant_id = cfg.participant_id;
         let generation = self.next_generation;
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .expect("participant generation exhausted");
+        let Some(next) = self.next_generation.checked_add(1) else {
+            pulsebeam_runtime::fatal!("participant generation counter exhausted on this shard")
+        };
+        self.next_generation = next;
         debug_assert_ne!(generation, 0);
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
@@ -132,10 +132,11 @@ impl ParticipantRegistry {
     /// (room_id, upstream track ids) before it's dropped.
     pub fn remove(&mut self, id: &ParticipantId) -> Option<ParticipantMeta> {
         let key = self.participant_keys.remove(id)?;
-        let meta = self
-            .participants
-            .remove(key)
-            .expect("participant ID mapped to a missing local slot");
+        let Some(meta) = self.participants.remove(key) else {
+            pulsebeam_runtime::fatal!(
+                "participant {id} is keyed to a slot the registry does not hold"
+            )
+        };
         debug_assert_eq!(meta.participant_id, *id);
         let addrs = self.demuxer.unregister(*id);
         self.pending_close.extend(addrs);
@@ -209,6 +210,20 @@ impl ParticipantRegistry {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

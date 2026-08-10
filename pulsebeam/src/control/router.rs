@@ -3,11 +3,7 @@ use pulsebeam_runtime::mailbox::{self};
 use pulsebeam_runtime::rand::RngCore;
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use crate::{
-    id::ShardId,
-    shard::ShardContext,
-    shard::worker::{ClusterCommand, ShardCommand},
-};
+use crate::{id::ShardId, shard::ShardContext, shard::worker::ShardCommand};
 
 const MAX_LOAD: f64 = 0.8;
 
@@ -86,6 +82,10 @@ impl ShardRouter {
         }
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.shard_loads.len()
+    }
+
     pub fn try_route<K: Hash>(&self, key: &K) -> Option<ShardId> {
         let mut best_index = None;
         let mut max_hash = -1.0;
@@ -114,17 +114,20 @@ impl ShardRouter {
         best_index
     }
 
+    /// Awaiting here is safe *only* because the shard never awaits on the
+    /// reverse channel.
+    ///
+    /// The two directions form a cycle: if a shard blocked sending the
+    /// controller an event while the controller blocked sending that shard a
+    /// command, neither would drain. The shard side breaks it — it `try_send`s
+    /// its events and treats a full queue as fatal — so a shard always reaches
+    /// the top of its loop and drains this queue. Do not make the shard side
+    /// await, and do not rely on that guarantee from anywhere else.
     pub async fn send(&mut self, shard_id: ShardId, cmd: ShardCommand) {
-        self.get_mut(shard_id)
-            .send(cmd)
-            .await
-            .expect("shard to be running");
-    }
-
-    pub async fn broadcast(&mut self, cmd: ClusterCommand) {
-        for ctx in &self.shard_contexts {
-            let cmd = ShardCommand::Cluster(cmd.clone());
-            ctx.command_tx.send(cmd).await.expect("shard to be running");
+        // A shard that has gone away cannot be told anything; the controller
+        // keeps serving the others rather than following it down.
+        if self.get_mut(shard_id).send(cmd).await.is_err() {
+            tracing::error!(%shard_id, "shard is not running; dropping command");
         }
     }
 
@@ -135,11 +138,26 @@ impl ShardRouter {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     // Helper to generate a minimal testing router with artificial capacity
     fn setup_test_router(shard_count: usize) -> ShardRouter {
-        let rng = pulsebeam_runtime::rand::seeded_rng(42);
+        let _rng = pulsebeam_runtime::rand::seeded_rng(42);
         ShardRouter {
             hasher_config: ahash::RandomState::with_seeds(1, 2, 3, 4),
             shard_contexts: vec![], // Omitted to keep tests pure-functional on routing math

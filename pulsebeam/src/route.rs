@@ -3,23 +3,59 @@
 //! A route id is allocated by the *destination*, because it indexes that
 //! destination's table. Semantic ids (participant, track, room, topic) never
 //! appear on the wire; they survive only in [`RouteNames`] for logs.
+//!
+//! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
+
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::VecDeque;
 use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
-use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
-use crate::id::AudioSelectorSlotId;
-use crate::shard::participants::ParticipantHandle;
-use crate::track::Topic;
+use crate::entity::{ParticipantId, RoomId, TrackId};
+use crate::shard::router::LocalTrackKey;
+use crate::track::{DataLane, Topic};
+use str0m::media::Rid;
 
-pub const ENVELOPE_LEN: usize = 16;
+pub const MEDIA_ENVELOPE_LEN: usize = 16;
+pub const ROUTE_ENVELOPE_LEN: usize = 8;
 pub const ENVELOPE_VERSION: u8 = 1;
 
-/// No flag bits are defined yet. They are the reserved surface for compatible
-/// v1 extensions, and must be zero until one is defined — a set bit we do not
-/// understand is a bug or a version mismatch, not something to skip past.
-const FLAGS_RESERVED: u8 = 0xFF;
+/// Which direction a frame is travelling, carried in `flags` bit 0.
+///
+/// Both lanes share one socket cross-node, so the receiver has to demux them
+/// before it can know how long the header is. `ver` and `flags` sit at the same
+/// two offsets in both envelopes precisely so this bit can be read first.
+///
+/// This is the first defined flag bit. It is an addition to a field that was
+/// wholly reserved, not a reinterpretation of one that meant something else —
+/// the distinction the version rules turn on.
+const FLAG_LANE: u8 = 0b0000_0001;
+const FLAG_LANE_MEDIA: u8 = 0;
+const FLAG_LANE_REVERSE: u8 = FLAG_LANE;
+
+/// Bits with no meaning yet. They are the reserved surface for further
+/// compatible v1 extensions, and must be zero until one is defined — a set bit
+/// we do not understand is a bug or a version mismatch, not something to skip
+/// past.
+const FLAGS_RESERVED: u8 = !FLAG_LANE;
 
 /// How long a retired slot waits before it can be handed out again.
 ///
@@ -54,22 +90,63 @@ impl std::fmt::Display for RouteId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopeError {
-    Truncated { len: usize },
-    UnsupportedVersion { ver: u8 },
-    ReservedFlags { flags: u8 },
+    Truncated {
+        len: usize,
+    },
+    UnsupportedVersion {
+        ver: u8,
+    },
+    ReservedFlags {
+        flags: u8,
+    },
+    /// Decoded as one lane but the header says the other.
+    WrongLane {
+        want: Lane,
+    },
 }
 
 impl std::fmt::Display for EnvelopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Truncated { len } => write!(f, "envelope truncated: {len} < {ENVELOPE_LEN}"),
+            Self::Truncated { len } => write!(f, "envelope truncated: {len} bytes"),
             Self::UnsupportedVersion { ver } => write!(f, "unsupported envelope version {ver}"),
             Self::ReservedFlags { flags } => write!(f, "reserved envelope flags set: {flags:#04x}"),
+            Self::WrongLane { want } => write!(f, "envelope is not on the {want:?} lane"),
         }
     }
 }
 
-/// The 16-byte header that wraps every media frame crossing a link.
+/// Which lane a frame on the wire belongs to, read before anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Media,
+    Reverse,
+}
+
+/// Read the lane of an encoded frame without committing to a header length.
+///
+/// Cross-node both lanes arrive on one socket, so this is the first thing a
+/// receiver does; the two envelopes deliberately agree on `ver` and `flags`
+/// offsets so it can.
+pub fn peek_lane(buf: &[u8]) -> Result<Lane, EnvelopeError> {
+    let (ver, flags) = match buf {
+        [ver, flags, ..] => (*ver, *flags),
+        _ => return Err(EnvelopeError::Truncated { len: buf.len() }),
+    };
+    if ver != ENVELOPE_VERSION {
+        return Err(EnvelopeError::UnsupportedVersion { ver });
+    }
+    if flags & FLAGS_RESERVED != 0 {
+        return Err(EnvelopeError::ReservedFlags { flags });
+    }
+    Ok(if flags & FLAG_LANE == FLAG_LANE_REVERSE {
+        Lane::Reverse
+    } else {
+        Lane::Media
+    })
+}
+
+/// The 16-byte header on every media frame crossing a link.
 ///
 /// Encoded big-endian at fixed offsets rather than by casting a Rust struct —
 /// `repr(C)` layout is not a portable wire format.
@@ -85,7 +162,7 @@ impl std::fmt::Display for EnvelopeError {
 /// +-------------------------------+-----------------------+
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Envelope {
+pub struct MediaEnvelope {
     pub epoch: u16,
     pub route: RouteId,
     /// Scoped to `(route, epoch)` — a route incarnation. Wrapping `u32`, one
@@ -96,11 +173,11 @@ pub struct Envelope {
     pub playout_ntp32: u32,
 }
 
-impl Envelope {
-    pub fn encode(&self) -> [u8; ENVELOPE_LEN] {
-        let mut out = [0u8; ENVELOPE_LEN];
+impl MediaEnvelope {
+    pub fn encode(&self) -> [u8; MEDIA_ENVELOPE_LEN] {
+        let mut out = [0u8; MEDIA_ENVELOPE_LEN];
         out[0] = ENVELOPE_VERSION;
-        out[1] = 0;
+        out[1] = FLAG_LANE_MEDIA;
         out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
         out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
         out[8..12].copy_from_slice(&self.link_seq.to_be_bytes());
@@ -109,16 +186,11 @@ impl Envelope {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        if buf.len() < ENVELOPE_LEN {
+        if buf.len() < MEDIA_ENVELOPE_LEN {
             return Err(EnvelopeError::Truncated { len: buf.len() });
         }
-        let ver = buf[0];
-        if ver != ENVELOPE_VERSION {
-            return Err(EnvelopeError::UnsupportedVersion { ver });
-        }
-        let flags = buf[1];
-        if flags & FLAGS_RESERVED != 0 {
-            return Err(EnvelopeError::ReservedFlags { flags });
+        if peek_lane(buf)? != Lane::Media {
+            return Err(EnvelopeError::WrongLane { want: Lane::Media });
         }
         Ok(Self {
             epoch: u16::from_be_bytes([buf[2], buf[3]]),
@@ -129,13 +201,127 @@ impl Envelope {
     }
 }
 
+/// The 8-byte header on every frame that carries no timeline.
+///
+/// Used by both directions that need addressing without one: upstream requests
+/// travelling back to a publisher, and forward telemetry travelling out to a
+/// destination. Half the size of [`MediaEnvelope`] because neither needs the
+/// two fields that make up the difference. `link_seq` exists to observe
+/// loss on a link, but every reverse body is a request the sender repeats if it
+/// still needs it, so a lost one costs a round trip and there is nothing to
+/// account for. `playout_ntp32` places a packet on a timeline; a request has
+/// none.
+///
+/// ```text
+/// 0       1       2               4                       8
+/// +-------+-------+---------------+-----------------------+
+/// | ver   | flags | epoch         | route (u32)           |
+/// +-------+-------+---------------+-----------------------+
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteEnvelope {
+    pub epoch: u16,
+    pub route: RouteId,
+}
+
+impl RouteEnvelope {
+    pub fn new(handle: ReverseRoute) -> Self {
+        Self {
+            epoch: handle.epoch,
+            route: handle.route,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; ROUTE_ENVELOPE_LEN] {
+        let mut out = [0u8; ROUTE_ENVELOPE_LEN];
+        out[0] = ENVELOPE_VERSION;
+        out[1] = FLAG_LANE_REVERSE;
+        out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
+        out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
+        if buf.len() < ROUTE_ENVELOPE_LEN {
+            return Err(EnvelopeError::Truncated { len: buf.len() });
+        }
+        if peek_lane(buf)? != Lane::Reverse {
+            return Err(EnvelopeError::WrongLane {
+                want: Lane::Reverse,
+            });
+        }
+        Ok(Self {
+            epoch: u16::from_be_bytes([buf[2], buf[3]]),
+            route: RouteId::new(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
+        })
+    }
+}
+
+/// A sender-side handle to a route installed at a destination.
+///
+/// Holding one is the *only* way to address a destination, so "media must not
+/// be emitted before the receiver route is installed" is structural: the
+/// handle does not exist until the destination has installed and acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteRoute {
+    pub shard_id: crate::id::ShardId,
+    pub route: RouteId,
+    pub epoch: u16,
+    link_seq: u32,
+}
+
+impl RemoteRoute {
+    pub fn new(shard_id: crate::id::ShardId, route: RouteId, epoch: u16) -> Self {
+        Self {
+            shard_id,
+            route,
+            epoch,
+            link_seq: 0,
+        }
+    }
+
+    /// Build the envelope for the next frame on this route, advancing
+    /// `link_seq`. Wrapping, because `link_seq` is modulo 2^32.
+    pub fn next_envelope(&mut self, playout: NtpTime) -> MediaEnvelope {
+        let env = MediaEnvelope {
+            epoch: self.epoch,
+            route: self.route,
+            link_seq: self.link_seq,
+            playout_ntp32: playout.middle32(),
+        };
+        self.link_seq = self.link_seq.wrapping_add(1);
+        env
+    }
+}
+
 /// Semantic identity, for logs and assertions only. Never read on the hot path.
+///
+/// A route on the wire names nothing, which is the point and also the reason a
+/// route-level fault is otherwise unreadable: `rt41 epoch 3` says nothing about
+/// whose stream stopped. This is the only place that mapping survives, so the
+/// paths that report a fault holding a live entry render it.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteNames {
-    pub room_id: RoomId,
+    pub room_id: Option<RoomId>,
     pub origin: ParticipantId,
     pub track_id: Option<TrackId>,
     pub topic: Option<Topic>,
+}
+
+impl std::fmt::Display for RouteNames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.origin)?;
+        if let Some(room_id) = &self.room_id {
+            write!(f, " in {room_id}")?;
+        }
+        if let Some(track_id) = &self.track_id {
+            write!(f, " track {track_id}")?;
+        }
+        if let Some(topic) = &self.topic {
+            write!(f, " topic {topic}")?;
+        }
+        Ok(())
+    }
 }
 
 /// What the destination does with a frame that arrives on a route.
@@ -147,24 +333,71 @@ pub(crate) struct RouteNames {
 #[derive(Debug, Clone)]
 pub(crate) enum RouteAction {
     Video {
-        local_track: TrackId,
-        kind: TrackKind,
-        nominal_bps: u64,
+        /// The destination's own fanout handle — a dense index, not a name.
+        /// Resolving a route hands dispatch something it can use directly,
+        /// rather than a `TrackId` it would have to hash back into a map.
+        local_track: LocalTrackKey,
     },
+    /// One route per (audio stream, destination). Audio is broadcast to a room
+    /// rather than explicitly subscribed, so the destination installs this as
+    /// soon as it learns the track exists and it has members to deliver to.
     Audio {
         room_id: RoomId,
         origin: ParticipantId,
-        selector_slot: Option<AudioSelectorSlotId>,
+        track_id: TrackId,
     },
-    Sctp {
+    /// One route per (publisher, topic, lane, destination). The destination
+    /// installs it whether the local subscription named a publisher or was a
+    /// wildcard — wildcards resolve to concrete streams as publishers are
+    /// announced.
+    ///
+    /// `lane` is the client's channel semantics and lives only here, in the
+    /// compiled plan. It never rides a frame: the destination already knows it,
+    /// and it says nothing about how this hop is delivered.
+    Data {
+        lane: DataLane,
         room_id: RoomId,
         origin: ParticipantId,
         topic: Topic,
-        reliable: bool,
     },
-    Ingress {
-        participant: ParticipantHandle,
+    /// The reverse path for one published stream, resolving at the shard that
+    /// owns the publisher.
+    ///
+    /// Exactly one of these exists per published stream, shared by every
+    /// subscribing shard rather than allocated per sender the way media routes
+    /// are. Everything on the reverse lane is an idempotent request the sender
+    /// repeats if it still needs it, so there is no per-link bookkeeping a
+    /// per-sender route would protect — and with a 32-bit id space, paying
+    /// `streams x shards` here would make it the largest consumer in the table.
+    Reverse {
+        origin: ParticipantId,
+        target: ReverseTarget,
     },
+}
+
+/// What a reverse route points at, holding everything the destination needs to
+/// act on a frame that names nothing but the route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReverseTarget {
+    Track {
+        track_id: TrackId,
+        /// Encodings in declared order. A frame names one by index, so the rid
+        /// itself never travels; both ends order them from the same track
+        /// descriptor the control plane distributed.
+        encodings: Vec<Option<Rid>>,
+    },
+    Topic {
+        room_id: RoomId,
+        topic: Topic,
+    },
+}
+
+/// A sender-side handle to a reverse route, handed out with the stream it
+/// belongs to by the control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReverseRoute {
+    pub route: RouteId,
+    pub epoch: u16,
 }
 
 #[derive(Debug)]
@@ -193,20 +426,23 @@ impl RouteEntry {
     /// Comparison is wrapping: `link_seq` is modulo 2^32, so "newer" means a
     /// positive signed delta, not a larger integer.
     pub fn observe(&mut self, link_seq: u32) {
-        self.stats.received += 1;
+        self.stats.received = self.stats.received.saturating_add(1);
         let Some(last) = self.last_link_seq else {
             self.last_link_seq = Some(link_seq);
             return;
         };
         let delta = link_seq.wrapping_sub(last) as i32;
         match delta {
-            0 => self.stats.duplicated += 1,
+            0 => self.stats.duplicated = self.stats.duplicated.saturating_add(1),
             d if d > 0 => {
-                self.stats.lost += u64::from(d as u32 - 1);
+                self.stats.lost = self
+                    .stats
+                    .lost
+                    .saturating_add(u64::from(d.unsigned_abs().saturating_sub(1)));
                 self.last_link_seq = Some(link_seq);
             }
             _ => {
-                self.stats.reordered += 1;
+                self.stats.reordered = self.stats.reordered.saturating_add(1);
                 // A late frame does not move the high-water mark, and its gap
                 // was already counted when the newer frame advanced past it.
                 self.stats.lost = self.stats.lost.saturating_sub(1);
@@ -222,22 +458,64 @@ enum Slot {
 }
 
 /// Destination-owned table of installed routes.
-#[derive(Debug, Default)]
+///
+/// # Id budget
+///
+/// [`RouteId`] is 32 bits and slots grow monotonically until a retired one
+/// clears [`ROUTE_QUARANTINE`], so the table's size is peak concurrent routes
+/// plus whatever churned in the last quarantine window. What matters is that
+/// every route family stays proportional to something bounded:
+///
+/// | family    | count per shard        |
+/// |-----------|------------------------|
+/// | video     | imported tracks        |
+/// | audio     | imported audio streams |
+/// | data      | imported (publisher, topic, lane) |
+/// | feedback  | *published* tracks     |
+///
+/// Feedback is the one that could easily have been `tracks x shards`: a route
+/// per subscribing shard is the obvious symmetry with the forward direction.
+/// It is deliberately not, because feedback is latest-wins and keeps no
+/// per-link accounting, so a per-sender route would buy nothing and would cost
+/// 32x on a 32-shard node.
+///
+/// [`MAX_ROUTES_PER_SHARD`] enforces that reasoning rather than leaving it as
+/// prose: the families above are all bounded, so passing the cap means one of
+/// them is not behaving as described, and failing the install says so while
+/// there is still a process to say it in.
+#[derive(Debug)]
 pub(crate) struct RouteTable {
     slots: Vec<Slot>,
     epochs: Vec<u16>,
     /// Retired slots, oldest first, with the instant they were retired.
     quarantine: VecDeque<(u32, Instant)>,
+    max_slots: u32,
 }
+
+/// Ceiling on slots one shard's table may grow to.
+///
+/// Sized for headroom, not for fit: every route family is proportional to
+/// participants on this shard, so a healthy shard uses orders of magnitude
+/// fewer. It exists to convert unbounded growth — a reconnect storm churning
+/// routes faster than [`ROUTE_QUARANTINE`] returns them — into a bounded
+/// failure that names itself, instead of an allocator death spiral 4 billion
+/// slots later.
+pub const MAX_ROUTES_PER_SHARD: u32 = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
-    /// No slot is out of quarantine and the table is at capacity.
-    Exhausted,
+    /// No slot is out of quarantine and the table is at its cap.
+    Exhausted { max_slots: u32 },
     /// The envelope named a slot that is free, or an incarnation that is gone.
     Stale { route: RouteId, epoch: u16 },
     /// The envelope named a slot past the end of the table.
     OutOfRange { route: RouteId },
+}
+
+impl Default for RouteTable {
+    fn default() -> Self {
+        Self::with_max_slots(MAX_ROUTES_PER_SHARD)
+    }
 }
 
 impl RouteTable {
@@ -245,6 +523,16 @@ impl RouteTable {
         Self::default()
     }
 
+    pub fn with_max_slots(max_slots: u32) -> Self {
+        Self {
+            slots: Vec::new(),
+            epochs: Vec::new(),
+            quarantine: VecDeque::new(),
+            max_slots,
+        }
+    }
+
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.slots
             .iter()
@@ -252,8 +540,12 @@ impl RouteTable {
             .count()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    #[cfg(test)]
+    pub fn get(&self, id: RouteId) -> Option<&RouteEntry> {
+        match self.slots.get(id.index()) {
+            Some(Slot::Live(entry)) => Some(entry),
+            _ => None,
+        }
     }
 
     /// Allocate and install in one step. The caller hands the resulting
@@ -292,7 +584,7 @@ impl RouteTable {
         true
     }
 
-    pub fn resolve(&mut self, env: &Envelope) -> Result<&mut RouteEntry, RouteError> {
+    pub fn resolve(&mut self, env: &MediaEnvelope) -> Result<&mut RouteEntry, RouteError> {
         let idx = env.route.index();
         let Some(slot) = self.slots.get_mut(idx) else {
             return Err(RouteError::OutOfRange { route: env.route });
@@ -306,9 +598,14 @@ impl RouteTable {
         }
     }
 
-    pub fn get(&self, id: RouteId) -> Option<&RouteEntry> {
-        match self.slots.get(id.index()) {
-            Some(Slot::Live(entry)) => Some(entry),
+    /// The compiled action behind a route, if that incarnation is still live.
+    ///
+    /// For frames that carry no [`MediaEnvelope`] — feedback has neither a timeline
+    /// nor per-link accounting to keep, so it addresses with `(route, epoch)`
+    /// alone.
+    pub fn resolve_action(&self, route: RouteId, epoch: u16) -> Option<&RouteAction> {
+        match self.slots.get(route.index()) {
+            Some(Slot::Live(entry)) if entry.epoch == epoch => Some(&entry.action),
             _ => None,
         }
     }
@@ -332,7 +629,12 @@ impl RouteTable {
             return Ok(RouteId::new(idx));
         }
 
-        let idx = u32::try_from(self.slots.len()).map_err(|_| RouteError::Exhausted)?;
+        let idx = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+        if idx >= self.max_slots {
+            return Err(RouteError::Exhausted {
+                max_slots: self.max_slots,
+            });
+        }
         self.slots.push(Slot::Free);
         self.epochs.push(0);
         Ok(RouteId::new(idx))
@@ -406,7 +708,7 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
     pub fn subscribe(&mut self, key: K) -> ImportEffect {
         match self.entries.get_mut(&key) {
             Some(import) => {
-                import.subscribers += 1;
+                import.subscribers = import.subscribers.saturating_add(1);
                 ImportEffect::None
             }
             None => {
@@ -464,6 +766,31 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
         }
     }
 
+    /// The install never happened, so the import returns to Absent.
+    ///
+    /// [`Self::subscribe`] moves to `Installing` before the caller has a route,
+    /// which means a failed install would otherwise leave an entry no later
+    /// subscribe can advance and no unsubscribe can clear — the stream becomes
+    /// permanently undeliverable on this shard. Cross-node an install is a
+    /// request to a peer and failing is ordinary, so this is the normal path,
+    /// not an exceptional one.
+    ///
+    /// Only legal while `Installing`: once a route exists, retirement is the
+    /// way back, and cancelling would leak it.
+    pub fn cancel_install(&mut self, key: &K) {
+        let Some(import) = self.entries.get(key) else {
+            return;
+        };
+        debug_assert_eq!(
+            import.state,
+            ImportState::Installing,
+            "cancel_install on an import that already has a route"
+        );
+        if matches!(import.state, ImportState::Installing) {
+            self.entries.remove(key);
+        }
+    }
+
     /// Retirement completed. A subscriber that arrived while it was in flight
     /// reinstalls rather than resurrecting the retired route.
     pub fn on_retired(&mut self, key: &K) -> ImportEffect {
@@ -481,12 +808,28 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::entity::TrackKind;
 
     fn names() -> RouteNames {
         RouteNames {
-            room_id: RoomId::from_external(&crate::entity::ExternalRoomId::new("room1").unwrap()),
+            room_id: Some(RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("room1").unwrap(),
+            )),
             origin: ParticipantId::from_bytes([7u8; 16]),
             track_id: None,
             topic: None,
@@ -495,14 +838,14 @@ mod tests {
 
     fn action() -> RouteAction {
         RouteAction::Audio {
-            room_id: names().room_id,
+            room_id: names().room_id.unwrap(),
             origin: names().origin,
-            selector_slot: None,
+            track_id: names().origin.derive_track_id(TrackKind::Audio, "a"),
         }
     }
 
-    fn envelope(route: RouteId, epoch: u16) -> Envelope {
-        Envelope {
+    fn envelope(route: RouteId, epoch: u16) -> MediaEnvelope {
+        MediaEnvelope {
             epoch,
             route,
             link_seq: 0,
@@ -512,13 +855,13 @@ mod tests {
 
     #[test]
     fn envelope_is_exactly_sixteen_bytes() {
-        assert_eq!(ENVELOPE_LEN, 16);
+        assert_eq!(MEDIA_ENVELOPE_LEN, 16);
         assert_eq!(envelope(RouteId::new(1), 1).encode().len(), 16);
     }
 
     #[test]
     fn envelope_encodes_big_endian_at_documented_offsets() {
-        let env = Envelope {
+        let env = MediaEnvelope {
             epoch: 0x1122,
             route: RouteId::new(0x3344_5566),
             link_seq: 0x7788_99AA,
@@ -549,22 +892,77 @@ mod tests {
     }
 
     #[test]
+    fn reverse_envelope_is_exactly_eight_bytes() {
+        assert_eq!(ROUTE_ENVELOPE_LEN, 8);
+        assert_eq!(
+            RouteEnvelope {
+                epoch: 1,
+                route: RouteId::new(1),
+            }
+            .encode()
+            .len(),
+            8,
+            "the reverse lane pays for addressing and nothing else"
+        );
+    }
+
+    #[test]
+    fn reverse_envelope_round_trips() {
+        let env = RouteEnvelope {
+            epoch: u16::MAX,
+            route: RouteId::new(u32::MAX),
+        };
+        assert_eq!(RouteEnvelope::decode(&env.encode()).unwrap(), env);
+    }
+
+    /// Cross-node both lanes share a socket, so a receiver must be able to tell
+    /// them apart before it knows how long the header is. The lane bit is at a
+    /// fixed offset both envelopes agree on, so peeking never needs the length.
+    #[test]
+    fn the_two_lanes_are_distinguishable_on_the_wire() {
+        let media = envelope(RouteId::new(3), 4).encode();
+        let reverse = RouteEnvelope {
+            epoch: 4,
+            route: RouteId::new(3),
+        }
+        .encode();
+
+        assert_eq!(peek_lane(&media).unwrap(), Lane::Media);
+        assert_eq!(peek_lane(&reverse).unwrap(), Lane::Reverse);
+
+        // Peeking works on the shorter of the two, so it never over-reads.
+        assert_eq!(peek_lane(&reverse[..2]).unwrap(), Lane::Reverse);
+
+        // And decoding one as the other is refused rather than misread.
+        assert_eq!(
+            MediaEnvelope::decode(&reverse),
+            Err(EnvelopeError::Truncated { len: 8 })
+        );
+        assert_eq!(
+            RouteEnvelope::decode(&media),
+            Err(EnvelopeError::WrongLane {
+                want: Lane::Reverse
+            })
+        );
+    }
+
+    #[test]
     fn envelope_round_trips() {
-        let env = Envelope {
+        let env = MediaEnvelope {
             epoch: 65_535,
             route: RouteId::new(u32::MAX),
             link_seq: u32::MAX,
             playout_ntp32: u32::MAX,
         };
-        assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
+        assert_eq!(MediaEnvelope::decode(&env.encode()).unwrap(), env);
     }
 
     #[test]
     fn decode_rejects_truncated_input() {
         let full = envelope(RouteId::new(1), 1).encode();
-        for len in 0..ENVELOPE_LEN {
+        for len in 0..MEDIA_ENVELOPE_LEN {
             assert_eq!(
-                Envelope::decode(&full[..len]),
+                MediaEnvelope::decode(&full[..len]),
                 Err(EnvelopeError::Truncated { len })
             );
         }
@@ -575,7 +973,7 @@ mod tests {
         let mut bytes = envelope(RouteId::new(1), 1).encode();
         bytes[0] = ENVELOPE_VERSION + 1;
         assert_eq!(
-            Envelope::decode(&bytes),
+            MediaEnvelope::decode(&bytes),
             Err(EnvelopeError::UnsupportedVersion {
                 ver: ENVELOPE_VERSION + 1
             })
@@ -584,9 +982,37 @@ mod tests {
         let mut bytes = envelope(RouteId::new(1), 1).encode();
         bytes[1] = 0b0000_0010;
         assert_eq!(
-            Envelope::decode(&bytes),
+            MediaEnvelope::decode(&bytes),
             Err(EnvelopeError::ReservedFlags { flags: 0b0000_0010 })
         );
+    }
+
+    /// Growth is bounded, so a churn storm fails an install rather than
+    /// consuming the node's memory until the allocator decides for us.
+    #[tokio::test(start_paused = true)]
+    async fn a_table_at_its_cap_refuses_instead_of_growing() {
+        let mut table = RouteTable::with_max_slots(2);
+        let now = Instant::now();
+
+        for _ in 0..2 {
+            table
+                .install(action(), names(), NtpTime::ZERO, now)
+                .expect("within the cap");
+        }
+
+        assert_eq!(
+            table
+                .install(action(), names(), NtpTime::ZERO, now)
+                .unwrap_err(),
+            RouteError::Exhausted { max_slots: 2 },
+        );
+
+        // Quarantine still returns slots, so the cap bounds concurrency rather
+        // than the total number of routes a shard may ever install.
+        table.retire(RouteId::new(0), now);
+        table
+            .install(action(), names(), NtpTime::ZERO, now + ROUTE_QUARANTINE)
+            .expect("a quarantined slot comes back");
     }
 
     #[tokio::test(start_paused = true)]
@@ -668,9 +1094,7 @@ mod tests {
         let (id, epoch) = table
             .install(
                 RouteAction::Video {
-                    local_track: names().origin.derive_track_id(TrackKind::Video, "0"),
-                    kind: TrackKind::Video,
-                    nominal_bps: 0,
+                    local_track: LocalTrackKey::default(),
                 },
                 names(),
                 NtpTime::ZERO,
@@ -751,6 +1175,54 @@ mod tests {
         );
         assert_eq!(imports.on_retired(&key), ImportEffect::None);
         assert_eq!(imports.state(&key), None);
+    }
+
+    /// A failed install must leave no trace, or the stream is undeliverable on
+    /// this shard forever: `Installing` absorbs later subscribes and ignores
+    /// unsubscribes, so nothing would ever retry.
+    #[test]
+    fn an_install_that_failed_can_be_attempted_again() {
+        let mut imports = ImportTable::new();
+        let key = "trk";
+        assert_eq!(imports.subscribe(key), ImportEffect::Install);
+
+        imports.cancel_install(&key);
+        assert_eq!(imports.state(&key), None, "back to Absent");
+        assert_eq!(imports.subscribers(&key), 0);
+
+        assert_eq!(
+            imports.subscribe(key),
+            ImportEffect::Install,
+            "the next subscriber drives a fresh install"
+        );
+        let (route, epoch) = (RouteId::new(7), 2);
+        assert_eq!(imports.on_installed(&key, route, epoch), ImportEffect::None);
+        assert_eq!(
+            imports.state(&key),
+            Some(ImportState::Active { route, epoch })
+        );
+    }
+
+    /// Without a rollback the entry is stuck: this pins the two transitions
+    /// that would otherwise silently absorb every later attempt.
+    #[test]
+    fn an_import_wedged_in_installing_absorbs_everything() {
+        let mut imports = ImportTable::new();
+        let key = "trk";
+        imports.subscribe(key);
+
+        assert_eq!(
+            imports.subscribe(key),
+            ImportEffect::None,
+            "a later subscriber attaches to the pending install"
+        );
+        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+        assert_eq!(
+            imports.state(&key),
+            Some(ImportState::Installing),
+            "no unsubscribe can clear an import that never installed"
+        );
     }
 
     #[test]

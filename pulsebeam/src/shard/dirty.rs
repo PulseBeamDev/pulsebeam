@@ -55,7 +55,7 @@ impl DirtyTracker {
         #[cfg(debug_assertions)]
         debug_assert!(self.active);
         let entry = self.participants.get(self.cursor).copied()?;
-        self.cursor += 1;
+        self.cursor = self.cursor.saturating_add(1);
         Some(entry)
     }
 
@@ -84,6 +84,20 @@ impl DirtyTracker {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     fn id(value: u8) -> ParticipantId {

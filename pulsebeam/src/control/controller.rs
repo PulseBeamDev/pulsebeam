@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::{
     control::{
-        core::{ControllerCore, ControllerEvent, ControllerEventQueue},
+        core::{ControllerCore, ControllerEvent, ControllerEventQueue, RoomPlacement},
         negotiator::{Negotiator, NegotiatorError},
         router::ShardRouter,
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
@@ -12,7 +12,7 @@ use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},
     shard::{
         ShardContext,
-        worker::{ClusterCommand, ShardCommand, ShardEventWrapper},
+        worker::{ShardCommand, ShardEventWrapper},
     },
 };
 use pulsebeam_runtime::mailbox;
@@ -105,18 +105,53 @@ pub struct ControllerActor {
 
 impl ControllerActor {
     pub fn new(
-        mut rng: pulsebeam_runtime::rand::Rng,
+        rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<Candidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
     ) -> Self {
+        Self::with_room_shard_slot(
+            rng,
+            shard_contexts,
+            candidates,
+            tcp_listener,
+            crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
+        )
+    }
+
+    pub fn with_room_shard_slot(
+        rng: pulsebeam_runtime::rand::Rng,
+        shard_contexts: Vec<ShardContext>,
+        candidates: Vec<Candidate>,
+        tcp_listener: pulsebeam_core::net::TcpListener,
+        room_shard_slot: usize,
+    ) -> Self {
+        Self::with_placement(
+            rng,
+            shard_contexts,
+            candidates,
+            tcp_listener,
+            room_shard_slot,
+            RoomPlacement::Hashed,
+        )
+    }
+
+    pub fn with_placement(
+        mut rng: pulsebeam_runtime::rand::Rng,
+        shard_contexts: Vec<ShardContext>,
+        candidates: Vec<Candidate>,
+        tcp_listener: pulsebeam_core::net::TcpListener,
+        room_shard_slot: usize,
+        placement: RoomPlacement,
+    ) -> Self {
+        let shard_count = shard_contexts.len();
         let router = ShardRouter::new(shard_contexts, &mut rng);
 
         Self {
             router,
-            core: ControllerCore::new(),
+            core: ControllerCore::with_placement(room_shard_slot, placement),
             negotiator: Negotiator::new(candidates),
-            eq: ControllerEventQueue::default(),
+            eq: ControllerEventQueue::new(shard_count),
             tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
@@ -132,10 +167,9 @@ impl ControllerActor {
         // Spawn the TCP acceptor onto the current LocalSet / LocalRuntime.
         // It owns the listener, enforces caps, reads the first STUN frame from
         // each connection, and sends results back through the mailbox.
-        let listener = self
-            .tcp_listener
-            .take()
-            .expect("ControllerActor::run called twice");
+        let Some(listener) = self.tcp_listener.take() else {
+            pulsebeam_runtime::fatal!("ControllerActor::run called twice")
+        };
         let acceptor = TcpAcceptorHandle::spawn(listener, shutdown.child_token());
         let mut pending_rx = acceptor.event_rx;
 
@@ -143,7 +177,7 @@ impl ControllerActor {
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut next_cmd_at = tokio::time::Instant::now();
         #[cfg(not(feature = "unpace"))]
-        let cooldown_duration = SHARD_LOAD_POLL_INTERVAL / 4;
+        let cooldown_duration = SHARD_LOAD_POLL_INTERVAL.checked_div(4).unwrap_or_default();
         #[cfg(feature = "unpace")]
         let cooldown_duration = std::time::Duration::from_secs(0);
 
@@ -175,7 +209,8 @@ impl ControllerActor {
 
                     #[cfg(not(feature = "unpace"))]
                     if is_join {
-                        next_cmd_at = tokio::time::Instant::now() + cooldown_duration;
+                        let poll_from = tokio::time::Instant::now();
+                    next_cmd_at = poll_from.checked_add(cooldown_duration).unwrap_or(poll_from);
                     }
                 }
 
@@ -215,9 +250,8 @@ impl ControllerActor {
     async fn drain_core_events(&mut self) {
         while let Some(ev) = self.eq.pop() {
             match ev {
-                ControllerEvent::ShardCommandBroadcasted(cmd) => self.router.broadcast(cmd).await,
                 ControllerEvent::ShardCommandSent(shard_id, cmd) => {
-                    self.router.send(shard_id, cmd).await
+                    self.router.send(shard_id, cmd).await;
                 }
             }
         }
@@ -277,11 +311,18 @@ impl ControllerActor {
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         // Determine shard first so we can encode it into the ICE ufrag.
-        let routing_key = self.core.routing_key(&state.room_id);
-        let shard_id = self
-            .router
-            .try_route(&routing_key)
-            .ok_or(ControllerError::ServiceUnavailable)?;
+        let (slot, placement) = self.core.room_slot(&state.room_id);
+        let shard_id = match placement {
+            RoomPlacement::Hashed => {
+                let routing_key = format!("{}-{}", state.room_id, slot);
+                self.router
+                    .try_route(&routing_key)
+                    .ok_or(ControllerError::ServiceUnavailable)?
+            }
+            RoomPlacement::RoundRobin => {
+                crate::id::ShardId::new(slot.checked_rem(self.router.shard_count()).unwrap_or(0))
+            }
+        };
 
         // Encode routing metadata into the ICE ufrag.  The shard worker and
         // demuxer can decode shard_id / participant_id directly from STUN
@@ -297,12 +338,13 @@ impl ControllerActor {
         let (rtc, answer) = self.negotiator.create_answer(offer, creds)?;
         let cfg = self.core.create_participant(rtc, state, shard_id);
 
-        self.eq.broadcast(ClusterCommand::RegisterParticipant {
+        self.eq.broadcast(|| ShardCommand::RegisterParticipant {
             shard_id,
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         });
-        self.eq.send(shard_id, ShardCommand::AddParticipant(cfg));
+        self.eq
+            .send(shard_id, ShardCommand::AddParticipant(Box::new(cfg)));
         Ok(answer)
     }
 }
@@ -319,6 +361,21 @@ async fn recv_command_paced(
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::id::ShardId;
     use crate::{

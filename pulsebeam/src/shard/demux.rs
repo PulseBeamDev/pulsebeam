@@ -15,6 +15,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///
+/// Resolving a participant does not imply this shard owns it — see the note on
+/// cross-shard arrivals below.
+///
 /// Routing uses two mechanisms:
 /// 1. A fast-path map from `SocketAddr` to `ParticipantId` (`addr_map`): efficient
 ///    routing for known addresses (DTLS, RTP, RTCP).
@@ -24,11 +27,15 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 ///
 /// Non-STUN packets from unknown addresses are rejected.
 ///
+/// A ufrag naming another shard is *not* rejected. `SO_REUSEPORT` picks the
+/// receiving socket by hashing the 4-tuple, which has nothing to do with which
+/// shard owns the participant, so arriving on the wrong one is ordinary rather
+/// than suspicious; `ShardCore::on_udp_batch` forwards it to the owner. Dropping
+/// it here instead makes a participant unreachable whenever the hash disagrees
+/// with placement, which is most of the time.
+///
 /// # Security hardening
 ///
-/// * **Shard validation**: the `shard_id` encoded in the ICE ufrag must match this
-///   shard.  Packets whose ufrag targets a different shard — whether misrouted or
-///   crafted by an attacker — are dropped before the cache is touched.
 /// * **Total cache cap** (`MAX_ADDR_ENTRIES`): the fast-path `addr_map` is bounded.
 ///   Once full, packets are still decoded and forwarded but the source address is not
 ///   cached, limiting memory under a flood of distinct source IPs.
@@ -36,8 +43,6 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 ///   addresses a single participant (real or fabricated) can occupy in the cache,
 ///   preventing one participant slot from monopolising the budget.
 pub struct Demuxer {
-    /// Which shard this demuxer belongs to — used to validate ICE ufrag routing metadata.
-    shard_id: u8,
     /// Fast-path cache: maps a known remote `SocketAddr` to a participant.
     addr_map: HashMap<SocketAddr, ParticipantId>,
     /// Reverse: maps a participant to all their known source addresses (for cleanup).
@@ -47,9 +52,8 @@ pub struct Demuxer {
 }
 
 impl Demuxer {
-    pub fn new(shard_id: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            shard_id: shard_id as u8,
             addr_map: HashMap::with_capacity(MAX_ADDR_ENTRIES),
             participant_addrs: HashMap::with_capacity(MAX_ADDR_ENTRIES),
             addr_to_participant: HashMap::with_capacity(MAX_ADDR_ENTRIES),
@@ -121,7 +125,6 @@ pub(crate) fn extract_stun_server_ufrag(data: &[u8]) -> Option<String> {
 }
 
 mod ice {
-    use std::convert::TryInto;
 
     // --- Constants defined by RFC 5389 ---
     const MIN_STUN_HEADER_SIZE: usize = 20;
@@ -170,11 +173,7 @@ mod ice {
 
         // 4. Read Message Length (bytes 2-3) - Big Endian
         // This is the length of the attributes *only*.
-        // Performance: from_be_bytes is efficient. try_into().unwrap() is safe
-        // because we checked data.len() >= 20.
-        let message_length = u16::from_be_bytes(
-            data[2..4].try_into().unwrap(), // Safe slice and unwrap
-        ) as usize;
+        let message_length = u16::from_be_bytes([data[2], data[3]]) as usize;
 
         // 5. Validate overall length
         // The total expected size (header + attributes) must not exceed the buffer size.
@@ -207,20 +206,15 @@ mod ice {
                 return None;
             }
 
-            // Read Attribute Type (Big Endian)
-            // Slicing is safe due to the check above.
-            let attr_type = u16::from_be_bytes(
-                data[current_pos..current_pos + 2].try_into().unwrap(), // Safe
-            );
-
-            // Read Attribute Value Length (Big Endian)
-            // Slicing is safe due to the check above.
-            let attr_value_len = u16::from_be_bytes(
-                data[current_pos + 2..current_pos + 4].try_into().unwrap(), // Safe
-            ) as usize;
+            let attr_type =
+                u16::from_be_bytes([data[current_pos], data[current_pos.saturating_add(1)]]);
+            let attr_value_len = u16::from_be_bytes([
+                data[current_pos.saturating_add(2)],
+                data[current_pos.saturating_add(3)],
+            ]) as usize;
 
             // Calculate start position of the attribute value
-            let value_pos = current_pos + ATTRIBUTE_HEADER_SIZE;
+            let value_pos = current_pos.saturating_add(ATTRIBUTE_HEADER_SIZE);
 
             // Check if the attribute value (based on its *own* length field) fits
             // within the bounds defined by the *message* length field.
@@ -241,7 +235,7 @@ mod ice {
             // Move to the next attribute.
             // Value must be padded to a multiple of 4 bytes.
             // Performance: Bitwise trick for padding calculation is fast.
-            let padded_len = (attr_value_len + 3) & !3;
+            let padded_len = attr_value_len.saturating_add(3) & !3;
             // Check for overflow before updating current_pos
             let next_pos = value_pos.checked_add(padded_len)?;
 
@@ -274,7 +268,6 @@ mod ice {
     ///
     /// Returns `Some(&str)` if the USERNAME attribute is found and contains valid
     /// UTF-8 data, `None` otherwise.
-
     #[inline]
     pub fn parse_stun_remote_ufrag_raw(data: &[u8]) -> Option<&[u8]> {
         find_stun_username_slice(data).and_then(|slice| first_token(slice, b':'))
@@ -293,6 +286,22 @@ mod ice {
     // --- Robust Test Suite ---
     #[cfg(test)]
     mod tests {
+        #![allow(
+            clippy::unwrap_used,
+            clippy::expect_used,
+            clippy::panic,
+            clippy::unreachable,
+            clippy::string_slice
+        )]
+        // Convenience only: a test is not a shard, so nothing here is
+        // cross-core, and a fixture may read the host clock. Allowed at the
+        // module, never the file, so it cannot drift over production code
+        // sharing it. See docs/thread-per-core.md.
+        #![allow(
+            clippy::disallowed_types,
+            clippy::disallowed_methods,
+            clippy::float_cmp
+        )]
         use super::*;
 
         const BINDING_REQUEST: u16 = 0x0001;
@@ -331,11 +340,12 @@ mod ice {
                 buf.extend_from_slice(attr_value);
 
                 // Add padding
-                let padded_len = (attr_value_len + 3) & !3;
-                let padding_len = padded_len - attr_value_len;
+                let padded_len = attr_value_len.saturating_add(3) & !3;
+                let padding_len = padded_len.saturating_sub(attr_value_len);
                 buf.extend_from_slice(&vec![0u8; padding_len]);
 
-                total_attr_len += ATTRIBUTE_HEADER_SIZE + padded_len;
+                total_attr_len =
+                    total_attr_len.saturating_add(ATTRIBUTE_HEADER_SIZE.saturating_add(padded_len));
             }
 
             // Check for unreasonable total length during test construction
@@ -769,6 +779,22 @@ mod ice {
 
 #[cfg(test)]
 mod demux_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    #![allow(clippy::arithmetic_side_effects)]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use crate::{control::ufrag::IceUfrag, entity::ParticipantId};
     use pulsebeam_runtime::net::{RecvPacketBatch, Transport};
@@ -832,7 +858,7 @@ mod demux_tests {
 
     #[test]
     fn valid_ufrag_matching_shard_routes_and_caches() {
-        let mut d = Demuxer::new(3);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(3);
         let encoded = ice.encode();
         let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
@@ -845,9 +871,22 @@ mod demux_tests {
         assert_eq!(d.addr_map.len(), 1); // no duplicate
     }
 
+    /// A ufrag for another shard resolves rather than being dropped: which
+    /// socket `SO_REUSEPORT` chose says nothing about which shard owns the
+    /// participant, and the caller forwards it on. Rejecting it here made every
+    /// participant whose hash disagreed with its placement unreachable.
+    #[test]
+    fn a_ufrag_for_another_shard_still_resolves_so_it_can_be_forwarded() {
+        let mut d = Demuxer::new();
+        let (ice, pid) = ufrag(4);
+        let batch = make_batch(src(1000), stun_with_ufrag(&ice.encode()));
+
+        assert_eq!(d.demux(&batch), Some(pid));
+    }
+
     #[test]
     fn oversized_ufrag_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         // 41 chars — one byte over the encoded length
         let oversized = "A".repeat(IceUfrag::ENCODED_LEN + 1);
         let batch = make_batch(src(1000), stun_with_ufrag(&oversized));
@@ -857,7 +896,7 @@ mod demux_tests {
 
     #[test]
     fn garbage_ufrag_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let batch = make_batch(src(1000), stun_with_ufrag("notavalidufrag!"));
         assert_eq!(d.demux(&batch), None);
         assert!(d.addr_map.is_empty());
@@ -865,14 +904,14 @@ mod demux_tests {
 
     #[test]
     fn non_stun_from_unknown_addr_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let batch = make_batch(src(1000), b"RTP not STUN".to_vec());
         assert_eq!(d.demux(&batch), None);
     }
 
     #[test]
     fn per_participant_addr_cap_limits_cache_growth() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(0);
         let encoded = ice.encode();
 
@@ -895,7 +934,7 @@ mod demux_tests {
 
     #[test]
     fn unregister_clears_all_cached_addrs() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(0);
         let encoded = ice.encode();
 

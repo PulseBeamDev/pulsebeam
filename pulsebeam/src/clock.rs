@@ -1,5 +1,25 @@
 //! The NTP timeline: the only clock representation that crosses a shard or
 //! process boundary. `Instant` is local scheduling time and never leaves.
+//!
+//! Overflow is explicit here, and denied workspace-wide.
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
@@ -27,7 +47,14 @@ const MAX_EXPANSION_GAP: i64 = 1 << 30;
 /// seconds since 1900, the lower 32 a binary fraction of a second.
 ///
 /// Serializable and portable, unlike `Instant`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// A point on the NTP timeline, 32.32 fixed point.
+///
+/// Deliberately **not** `Ord`. The seconds field is modulo 2^32, so the
+/// timeline wraps at the era boundary and raw integer comparison is wrong
+/// there: a timestamp just past the rollover compares as older than one just
+/// before it. Every comparison must go through [`NtpTime::units_since`], which
+/// is modular, so this omission is what keeps that from being optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct NtpTime(u64);
 
 impl NtpTime {
@@ -54,7 +81,11 @@ impl NtpTime {
 
     pub fn to_system_time(self) -> SystemTime {
         let secs = (self.0 >> 32).saturating_sub(NTP_UNIX_OFFSET_SECS);
-        UNIX_EPOCH + Duration::new(secs, frac_nanos(self.0))
+        // An NTP era is 136 years, so this cannot leave `SystemTime`'s range;
+        // clamping rather than trapping keeps a logging path from ending the node.
+        UNIX_EPOCH
+            .checked_add(Duration::new(secs, frac_nanos(self.0)))
+            .unwrap_or(UNIX_EPOCH)
     }
 
     /// Bits 47..16 — what the envelope carries.
@@ -68,17 +99,44 @@ impl NtpTime {
         self.0.wrapping_sub(earlier.0) as i64
     }
 
+    /// Elapsed time since `earlier`, or zero when `self` precedes it.
+    ///
+    /// Built on [`units_since`](Self::units_since) so ordering is modular:
+    /// raw integer comparison would read a timestamp just past the era rollover
+    /// as older than one just before it, and produce a 136-year interval.
     pub fn saturating_duration_since(self, earlier: Self) -> Duration {
-        units_to_duration(self.0.saturating_sub(earlier.0))
+        match self.units_since(earlier) {
+            units if units > 0 => units_to_duration(units as u64),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Shift forward by `d`, clamping at the end of the NTP range.
+    ///
+    /// Deliberately *not* modular, unlike the comparisons: those wrap because a
+    /// timestamp either side of an era boundary is still a real instant, while
+    /// an offset large enough to overflow came from a bad input, and wrapping
+    /// it would turn that into a plausible-looking time in the distant past.
+    pub fn saturating_add(self, d: Duration) -> Self {
+        Self(self.0.saturating_add(duration_to_units(d)))
+    }
+
+    /// Shift back by `d`, clamping at the start of the NTP range.
+    pub fn saturating_sub(self, d: Duration) -> Self {
+        Self(self.0.saturating_sub(duration_to_units(d)))
     }
 
     /// `Ok` with the elapsed time when `self` is at or after `earlier`, `Err`
     /// with the magnitude when it is before — mirroring `SystemTime`.
+    ///
+    /// Modular, like every other comparison here: "after" means within the
+    /// half-era window ahead, not numerically greater.
     pub fn duration_since(self, earlier: Self) -> Result<Duration, Duration> {
-        if self.0 >= earlier.0 {
-            Ok(units_to_duration(self.0 - earlier.0))
+        let units = self.units_since(earlier);
+        if units >= 0 {
+            Ok(units_to_duration(units as u64))
         } else {
-            Err(units_to_duration(earlier.0 - self.0))
+            Err(units_to_duration(units.unsigned_abs()))
         }
     }
 
@@ -122,11 +180,14 @@ impl std::ops::Sub<Duration> for NtpTime {
 // every playout timestamp and reshuffle a deterministic simulation.
 fn frac_units(nanos: u32) -> u64 {
     debug_assert!(nanos < 1_000_000_000, "not a subsecond value: {nanos}");
-    ((u64::from(nanos) << 32) + 500_000_000) / 1_000_000_000
+    ((u64::from(nanos) << 32).saturating_add(500_000_000)) / 1_000_000_000
 }
 
 fn frac_nanos(raw: u64) -> u32 {
-    ((((raw & 0xFFFF_FFFF) * 1_000_000_000) + (1 << 31)) >> 32) as u32
+    (((raw & 0xFFFF_FFFF)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(1 << 31))
+        >> 32) as u32
 }
 
 fn duration_to_units(d: Duration) -> u64 {
@@ -177,10 +238,15 @@ impl WallAnchor {
     }
 
     pub fn to_instant(&self, t: NtpTime) -> Instant {
-        if t >= self.ntp {
-            self.mono + t.saturating_duration_since(self.ntp)
-        } else {
-            self.mono - self.ntp.saturating_duration_since(t)
+        match t.units_since(self.ntp) {
+            units if units >= 0 => self
+                .mono
+                .checked_add(units_to_duration(units as u64))
+                .unwrap_or(self.mono),
+            units => self
+                .mono
+                .checked_sub(units_to_duration(units.unsigned_abs()))
+                .unwrap_or(self.mono),
         }
     }
 }
@@ -219,7 +285,7 @@ impl NtpExpander {
             return Err(ExpandError::Ambiguous { gap });
         }
 
-        let steps = (self.reference.as_raw() >> MID_SHIFT) as i64 + gap;
+        let steps = ((self.reference.as_raw() >> MID_SHIFT) as i64).saturating_add(gap);
         debug_assert!(steps >= 0, "expansion underflowed the NTP epoch: {steps}");
         let expanded = NtpTime::from_raw((steps as u64) << MID_SHIFT);
         debug_assert_eq!(
@@ -235,6 +301,21 @@ impl NtpExpander {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     fn ntp(secs: u64, frac: u64) -> NtpTime {
@@ -331,6 +412,51 @@ mod tests {
         assert_eq!(got.as_raw() >> MID_SHIFT, target.as_raw() >> MID_SHIFT);
     }
 
+    /// Everything that compares two `NtpTime`s must be modular. The seconds
+    /// field wraps in 2036, and a raw comparison there reads a fresh timestamp
+    /// as 136 years old — which turns a millisecond interval into an enormous
+    /// one and sends `to_instant` the wrong way.
+    #[test]
+    fn comparisons_stay_correct_across_the_era_rollover() {
+        // One second either side of the wrap.
+        let before = ntp(u32::MAX as u64, 0);
+        let after = before.wrapping_add(Duration::from_secs(2));
+
+        assert!(
+            after.units_since(before) > 0,
+            "a timestamp past the rollover must read as later"
+        );
+        assert_eq!(
+            after.saturating_duration_since(before),
+            Duration::from_secs(2),
+            "the interval across the rollover must be the real one"
+        );
+        assert_eq!(before.saturating_duration_since(after), Duration::ZERO);
+        assert_eq!(after.duration_since(before), Ok(Duration::from_secs(2)));
+        assert_eq!(before.duration_since(after), Err(Duration::from_secs(2)));
+    }
+
+    /// `to_instant` must follow the same modular ordering; branching on raw
+    /// integer comparison would subtract a whole era from the anchor.
+    #[test]
+    fn anchor_conversion_stays_correct_across_the_era_rollover() {
+        let before = ntp(u32::MAX as u64, 0);
+        let mono = Instant::now();
+        let anchor = WallAnchor { ntp: before, mono };
+
+        let after = before.wrapping_add(Duration::from_secs(2));
+        assert_eq!(
+            anchor.to_instant(after),
+            mono + Duration::from_secs(2),
+            "a post-rollover timestamp must map ahead of the anchor"
+        );
+        assert_eq!(
+            anchor.to_instant(before.wrapping_sub(Duration::from_secs(2))),
+            mono - Duration::from_secs(2),
+            "a pre-rollover timestamp must map behind it"
+        );
+    }
+
     #[test]
     fn expansion_handles_reordering_backwards() {
         let reference = ntp(3_900_000_000, 0);
@@ -341,7 +467,7 @@ mod tests {
         let reordered = reference.wrapping_add(Duration::from_millis(80));
         let got = exp.expand(reordered.middle32()).unwrap();
         assert!(
-            got < ahead,
+            got.units_since(ahead) < 0,
             "a reordered packet must expand to an earlier instant"
         );
     }

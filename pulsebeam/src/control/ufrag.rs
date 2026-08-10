@@ -117,6 +117,21 @@ impl IceUfrag {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::string_slice
+    )]
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
     use pulsebeam_runtime::rand::os_rng;
 
@@ -153,7 +168,7 @@ mod tests {
         // Crockford '1' encodes as 0x01, so replacing the first char with
         // a value whose high nibble is non-zero is simplest via raw bytes.
         let raw = base32::decode(base32::Alphabet::Crockford, &encoded).unwrap();
-        let mut bad = raw.clone();
+        let mut bad = raw;
         bad[0] = 0x10; // version = 1
         encoded = base32::encode(base32::Alphabet::Crockford, &bad);
         assert!(IceUfrag::decode(&encoded).is_none());
