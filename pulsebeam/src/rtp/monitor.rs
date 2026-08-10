@@ -1,3 +1,11 @@
+//! Per-stream bitrate and health measurement.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! numbers this produces are what the allocator spends bandwidth against, so a
+//! wrap does not fail — it reports a bitrate that was never observed and the
+//! allocator sizes the ladder to it.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::time::Duration;
 use str0m::bwe::Bitrate;
 use tokio::time::Instant;
@@ -194,7 +202,7 @@ impl StreamStats {
     pub fn decode_target_bps(&self, dt: usize) -> u64 {
         self.decode_target_kbps
             .get(dt)
-            .map(|kbps| u64::from(*kbps) * 1000)
+            .map(|kbps| u64::from(*kbps).saturating_mul(1000))
             .unwrap_or(0)
     }
 
@@ -761,7 +769,7 @@ impl BitrateEstimate {
         self.advance_time(pkt.playout_time);
         self.accumulated_bytes = self
             .accumulated_bytes
-            .saturating_add(pkt.header_len + pkt.payload.len());
+            .saturating_add(pkt.header_len.saturating_add(pkt.payload.len()));
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -770,11 +778,14 @@ impl BitrateEstimate {
 
     fn advance_time(&mut self, time: Instant) {
         let current_tick = *self.tick_start.get_or_insert(time);
-        if time < current_tick + Self::TICK {
+        if time < current_tick.checked_add(Self::TICK).unwrap_or(current_tick) {
             return;
         }
         let elapsed = time.saturating_duration_since(current_tick);
-        let ticks_passed = (elapsed.as_millis() / Self::TICK.as_millis()) as usize;
+        let ticks_passed = elapsed
+            .as_millis()
+            .checked_div(Self::TICK.as_millis())
+            .unwrap_or(1) as usize;
         self.tick_bps = (self.accumulated_bytes as f64 * 8.0) / Self::TICK.as_secs_f64();
         self.accumulated_bytes = 0;
         self.warm = true;
@@ -784,7 +795,10 @@ impl BitrateEstimate {
         if ticks_passed > 1 {
             self.tick_bps = 0.0;
         }
-        self.tick_start = Some(current_tick + Self::TICK * ticks_passed as u32);
+        let advance = Self::TICK
+            .checked_mul(u32::try_from(ticks_passed).unwrap_or(u32::MAX))
+            .unwrap_or(Self::TICK);
+        self.tick_start = Some(current_tick.checked_add(advance).unwrap_or(current_tick));
     }
 
     pub fn tick_bps(&self) -> f64 {
@@ -919,7 +933,10 @@ impl AudioMonitor {
 mod test {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
+    // Fixtures build timelines by hand; an overflow in one should fail the
+    // test rather than clamp into a passing state.
     #![allow(
+        clippy::arithmetic_side_effects,
         clippy::disallowed_types,
         clippy::disallowed_methods,
         clippy::float_cmp

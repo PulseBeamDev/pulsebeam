@@ -442,7 +442,7 @@ impl Switcher {
         self.tail = Some(Tail {
             seq_base,
             ts_base: self.timeline.ts_base(),
-            expires_at: now + TAIL_DRAIN_WINDOW,
+            expires_at: now.checked_add(TAIL_DRAIN_WINDOW).unwrap_or(now),
             holes,
         });
     }

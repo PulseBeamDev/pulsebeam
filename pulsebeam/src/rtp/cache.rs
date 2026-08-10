@@ -1,3 +1,11 @@
+//! Per-stream packet cache backing keyframe replay on a layer switch.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! sequence arithmetic decides which cached packets are replayed; a wrap here
+//! would replay the wrong window and hand the decoder a segment that does not
+//! start at a keyframe.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::rtp::RtpPacket;
 use str0m::media::{MediaTime, Rid};
 use str0m::rtp::SeqNo;
@@ -243,7 +251,7 @@ impl StreamCache {
 
         let clock_rate = segment[0].rtp_ts.frequency().get() as u64;
         let span = seen_ts.unwrap_or(segment_ts).saturating_sub(segment_ts);
-        if span > clock_rate * MAX_REPLAY_SPAN_MS / 1000 {
+        if span > clock_rate.saturating_mul(MAX_REPLAY_SPAN_MS) / 1000 {
             return None;
         }
 
@@ -294,7 +302,7 @@ impl StreamCache {
         let cursor = *cursor;
         let (lo, hi) = match self.newest_seq {
             Some(newest) if newest > cursor => {
-                let floor = newest.saturating_sub(STREAM_CACHE_CAPACITY as u64 - 1);
+                let floor = newest.saturating_sub((STREAM_CACHE_CAPACITY as u64).saturating_sub(1));
                 (cursor.wrapping_add(1).max(floor), newest)
             }
             // Empty range: nothing newer than the cursor.
@@ -346,7 +354,9 @@ impl StreamCache {
             p.playout_time = anchor.playout_time;
             p.marker = false;
             // Keep the prefix ahead of the segment once it is sorted by seq.
-            p.seq_no = (*anchor.seq_no).saturating_sub((n - i) as u64).into();
+            p.seq_no = (*anchor.seq_no)
+                .saturating_sub(n.saturating_sub(i) as u64)
+                .into();
         }
 
         Some(prefix)
@@ -405,7 +415,7 @@ impl TrackStreamCache {
                     "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
                 );
                 self.encodings.push((rid, StreamCache::default()));
-                self.encodings.len() - 1
+                self.encodings.len().saturating_sub(1)
             }
         };
         &mut self.encodings[pos].1
