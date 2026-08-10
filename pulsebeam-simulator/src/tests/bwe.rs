@@ -1733,11 +1733,13 @@ fn estimate_follows_a_sliding_link_without_riding_the_queue_test() {
                 description: "settled after the decline",
                 participant: "bob",
             },
-            // Measured settled: 68ms of queue, no congestion loss, and the estimate within 5.7%
-            // of the new capacity. During the decline itself the queue hits the full 200ms buffer
-            // with 7.2% tail-drop, which is what a window spanning the transition reports - and
-            // asserting on that would be asserting that the controller predict a capacity drop
-            // before observing it.
+            // Measured settled: a 7ms standing queue behind a ~100ms peak, no congestion loss,
+            // and the estimate within 5.7% of the new capacity. The gap between those two numbers
+            // is the point - the peak moves 88-108ms with the seed while the standing queue holds
+            // at 6-8ms, so bounding the peak tested the noise and not the controller. During the
+            // decline itself the queue hits the full 200ms buffer with 7.2% tail-drop, which is
+            // what a window spanning the transition reports - and asserting on that would be
+            // asserting that the controller predict a capacity drop before observing it.
             Step::Expect {
                 description: "Once settled, the controller is not sitting in the buffer",
                 participant: "bob",

@@ -282,10 +282,27 @@ pub struct Stats {
     pub reordered: u64,
     /// Delivered a second time by the duplication model.
     pub duplicated: u64,
-    /// Deepest queue occupancy seen, as time. This is the bufferbloat measure - a controller that
-    /// keeps the link full but the queue shallow is behaving well; one that drives 200ms of
-    /// standing queue is not, even if throughput looks fine.
+    /// Deepest queue occupancy seen, as time. A transient spike, so it says what the worst
+    /// moment was and nothing about whether the controller lives there.
     pub max_backlog: Duration,
+    /// Queue occupancy summed over delivered packets, so `mean_backlog` can report the queue a
+    /// controller actually sits behind. Weighted by packet rather than by time: on a link worth
+    /// measuring the two agree closely, and per-packet needs no timer.
+    pub backlog_sum: Duration,
+}
+
+impl Stats {
+    /// The standing queue: what a packet typically waits behind, rather than the worst moment.
+    ///
+    /// This is the bufferbloat measure. A controller that keeps the link full but the queue
+    /// shallow is behaving well; one that parks 200ms of queue is not, even though throughput
+    /// looks fine in both. A peak cannot tell those apart - it is one sample, and every link
+    /// that ever filled has a high one.
+    pub fn mean_backlog(&self) -> Duration {
+        self.backlog_sum
+            .checked_div(u32::try_from(self.delivered).unwrap_or(u32::MAX))
+            .unwrap_or_default()
+    }
 }
 
 fn stats_map() -> &'static Mutex<HashMap<IpAddr, Stats>> {
@@ -628,6 +645,7 @@ impl ShaperState {
         record(dst.ip(), |s| {
             s.delivered += 1;
             s.max_backlog = s.max_backlog.max(backlog);
+            s.backlog_sum = s.backlog_sum.saturating_add(backlog);
         });
 
         // Reordering is applied to the release time, not by shuffling the queue, so the packet
@@ -799,6 +817,50 @@ mod tests {
         let late = shaper.drain_due(start + Duration::from_millis(60));
         assert_eq!(late.len(), 1, "the delayed packet should arrive afterwards");
         assert_eq!(stats(ip).reordered, 1);
+    }
+
+    /// A brief dip into the buffer must not read as a standing queue.
+    ///
+    /// The two are opposite verdicts on a controller: a burst that drains is correct behaviour on
+    /// any link that changes, while a queue held at the same depth is bufferbloat — the link looks
+    /// full and the call is unusable. A peak cannot tell them apart, because every link that ever
+    /// filled has a high one, so a bufferbloat check written against the peak passes the
+    /// controller that parks and fails the one that recovers.
+    #[test]
+    fn a_burst_that_drains_does_not_read_as_a_standing_queue() {
+        let ip: IpAddr = "9.10.11.12".parse().unwrap();
+        let dst = SocketAddr::new(ip, 1234);
+        set_downlink_with_backlog(ip, 1_000_000, Duration::from_millis(500));
+
+        let mut shaper = Shaper::default();
+        let start = Instant::now();
+
+        // A burst deep enough to build a queue, then a long quiet stretch where each packet finds
+        // the link idle — the shape of a controller that overshot once and backed off.
+        for _ in 0..20 {
+            shaper.offer(start, dst, &[0u8; 1200]);
+        }
+        for i in 0..200u32 {
+            shaper.offer(
+                start + Duration::from_millis(500 + u64::from(i) * 20),
+                dst,
+                &[0u8; 1200],
+            );
+        }
+
+        let s = stats(ip);
+        assert!(
+            s.max_backlog > Duration::from_millis(100),
+            "the burst should have built a real queue, or this proves nothing (max {:?})",
+            s.max_backlog
+        );
+        assert!(
+            s.mean_backlog() < Duration::from_millis(20),
+            "a queue that drained and stayed drained reported a standing depth of {:?} behind a \
+             {:?} peak; the standing measure is tracking the spike instead of the steady state",
+            s.mean_backlog(),
+            s.max_backlog
+        );
     }
 
     #[test]

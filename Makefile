@@ -28,8 +28,11 @@ run-profile: profile
 
 test: test-unit test-sim
 
+# `sim` is on because the shaper lives behind it, and the shaper is the authority on what a
+# simulated link can carry. Without the feature its tests are not compiled, so they never ran
+# here and nothing said so.
 test-unit:
-	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator -- $(TEST)
+	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --features pulsebeam/sim -- $(TEST)
 
 # One plan per process, across all cores.
 #

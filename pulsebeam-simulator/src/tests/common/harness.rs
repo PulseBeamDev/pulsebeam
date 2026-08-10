@@ -2049,7 +2049,19 @@ pub enum Property {
     ///
     /// Bufferbloat: a controller can hold a link perfectly full while parking hundreds of
     /// milliseconds of queue. That looks healthy in throughput and is unusable for a call.
+    ///
+    /// The *standing* queue, not the deepest moment. A peak is one sample, and every link that
+    /// ever filled has a high one - so bounding it fails a controller that dipped into the buffer
+    /// once on the way to behaving well, and passes one that sits at 90ms forever. Those are
+    /// opposite verdicts on the thing this property exists to catch. Use
+    /// [`Property::PeakQueueingDelayBelow`] where the transient genuinely is the claim.
     QueueingDelayBelow(Duration),
+    /// The deepest queue occupancy reached, at any instant.
+    ///
+    /// A strictly stronger and much noisier claim than [`Property::QueueingDelayBelow`]: fair
+    /// only where a plan holds capacity steady, since a controller cannot shed rate before
+    /// observing a capacity it has not yet been told about.
+    PeakQueueingDelayBelow(Duration),
     /// At most this percent of offered packets were dropped by a full bottleneck buffer.
     ///
     /// Congestion drops only, distinct from configured link loss: this is the controller
@@ -2139,6 +2151,8 @@ pub struct LinkReport {
     pub demand_min_bps: u64,
     pub demand_max_bps: u64,
     pub max_backlog: Duration,
+    /// The queue a packet typically waited behind, as distinct from the worst moment.
+    pub standing_backlog: Duration,
     pub delivered_packets: u64,
     pub congestion_drops: u64,
     pub link_loss_drops: u64,
@@ -2232,6 +2246,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         demand_min_bps: series.iter().map(|(_, _, d)| *d).min().unwrap_or(0),
         demand_max_bps: series.iter().map(|(_, _, d)| *d).max().unwrap_or(0),
         max_backlog: stats.max_backlog,
+        standing_backlog: stats.mean_backlog(),
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
@@ -2319,7 +2334,8 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
 
     let offered = stats.delivered + stats.dropped_overflow;
     out.push_str(&format!(
-        " | queue max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {} | media {:.1}%",
+        " | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
+        stats.mean_backlog(),
         stats.max_backlog,
         pct(stats.dropped_overflow as f64, offered as f64),
         stats.dropped_overflow,
@@ -2519,10 +2535,22 @@ fn check_property(
             }
         }
         Property::QueueingDelayBelow(max) => {
+            let standing = stats.mean_backlog();
+            if standing > max {
+                return Err(format!(
+                    "bottleneck queue stood at {standing:?}; expected below {max:?} \
+                     (peaked at {:?})",
+                    stats.max_backlog
+                ));
+            }
+        }
+        Property::PeakQueueingDelayBelow(max) => {
             if stats.max_backlog > max {
                 return Err(format!(
-                    "bottleneck queue reached {:?}; expected below {max:?}",
-                    stats.max_backlog
+                    "bottleneck queue reached {:?}; expected below {max:?} \
+                     (standing at {:?})",
+                    stats.max_backlog,
+                    stats.mean_backlog()
                 ));
             }
         }
