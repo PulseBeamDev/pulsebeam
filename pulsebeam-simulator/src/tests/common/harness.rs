@@ -2848,9 +2848,10 @@ impl LocalNodeSim {
 
     /// Spread the node across N worker shards.
     ///
-    /// No longer implies [`Self::with_tcp_only`], so the two are stated
-    /// separately — but multi-shard currently *requires* it, and `run` fails
-    /// loudly if it is missing rather than hanging. See the note there.
+    /// Independent of [`Self::with_tcp_only`]. Over UDP the shard a datagram
+    /// reaches is chosen by the `SO_REUSEPORT` group, which hashes its 4-tuple
+    /// exactly as the kernel does — so a plan that sets this is also exercising
+    /// the demuxer's shard check and the arrival path a real deployment uses.
     pub fn with_shards(mut self, n: usize) -> Self {
         self.num_shards = n;
         self
@@ -2908,24 +2909,6 @@ impl LocalNodeSim {
         let seed = self.rng_seed;
         let tcp_only = self.tcp_only;
         let num_shards = self.num_shards;
-
-        // Multi-shard over UDP does not converge, and fails as a ten-minute
-        // hang rather than an error, so refuse it here instead.
-        //
-        // `SO_REUSEPORT` is emulated by sharing one socket across the group
-        // (`bound_udp_sim.rs`) and a datagram goes to whichever worker polls
-        // first. That was written off as "harsher than reality". It is not
-        // harsher, it is wrong: real `SO_REUSEPORT` is sticky per 4-tuple, and
-        // the stickiness is load-bearing — a session's DTLS and ICE state lives
-        // on one shard, so scattering its datagrams means no handshake ever
-        // completes. Making this reachable means giving the group per-member
-        // inboxes and dispatching on a hash of the source 4-tuple.
-        assert!(
-            num_shards <= 1 || tcp_only,
-            "multi-shard simulation needs .with_tcp_only(): the SO_REUSEPORT \
-             emulation is not sticky per 4-tuple, so a participant's datagrams \
-             scatter across shards and DTLS never completes"
-        );
 
         sim.host(server_ip, move || async move {
             let rng = pulsebeam_runtime::rand::seeded_rng(seed);

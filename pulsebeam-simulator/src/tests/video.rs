@@ -361,7 +361,6 @@ fn simulcast_stream_stability_test() {
 fn cross_shard_stream_survives_congestion_test() {
     LocalNodeSim::new()
         .with_shards(2)
-        .with_tcp_only()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
@@ -412,7 +411,6 @@ fn cross_shard_stream_survives_congestion_test() {
 fn cross_shard_simulcast_switching_stays_decodable_test() {
     LocalNodeSim::new()
         .with_shards(2)
-        .with_tcp_only()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["f", "h", "q"]))

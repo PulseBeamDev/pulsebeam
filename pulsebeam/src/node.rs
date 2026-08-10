@@ -23,7 +23,6 @@ use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
 use str0m::Candidate;
-use tokio::runtime::LocalOptions;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
@@ -345,7 +344,9 @@ impl NodeBuilder {
 
         let (shard_event_tx, shard_event_rx) =
             mailbox::new(crate::shard::worker::SHARD_EVENT_CAPACITY);
-        let mut shard_handles = Vec::new();
+        // Stays empty under `sim`, where every shard shares one runtime.
+        #[cfg_attr(feature = "sim", allow(unused_mut))]
+        let mut shard_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
         let mut frame_txs = Vec::new();
         let mut frame_rxs = Vec::new();
         let use_shared_runtime = matches!(self.worker_execution, WorkerExecution::SharedRuntime);
@@ -403,40 +404,50 @@ impl NodeBuilder {
                 );
                 join_set.spawn_local(ignore(shard.run()));
             } else {
-                let core_id = if cpu_cores.is_empty() {
-                    None
-                } else {
-                    cpu_cores.get(shard_idx % cpu_cores.len()).copied()
-                };
-                let builder = std::thread::Builder::new().name(format!("pb-w-{shard_id}"));
-                let handle = builder
-                    .spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .enable_alt_timer()
-                            .build_local(LocalOptions::default())
-                            .unwrap();
-                        tune_current_data_thread(core_id);
-                        rt.block_on(async move {
-                            let udp_sock =
-                                udp_sock.into_unified_socket().expect("bound UDP socket");
-                            let shard = ShardWorker::new(
-                                shard_id,
-                                udp_sock,
-                                tcp_sock,
-                                shard_command_rx,
-                                shard_event_tx,
-                                frame_rx,
-                                frame_txs,
-                                shard_occupancy,
-                                shard_rng,
-                                wall_anchor,
-                            );
-                            tokio::task::unconstrained(shard.run()).await;
-                        });
-                    })
-                    .unwrap();
-                shard_handles.push(handle);
+                // A simulated socket is a member of a thread-local
+                // `SO_REUSEPORT` group and deliberately not `Send`: the group
+                // that decides which member a datagram belongs to lives on the
+                // host's thread. Simulations always take the branch above.
+                #[cfg(feature = "sim")]
+                unreachable!("a simulated node runs its shards on one runtime");
+
+                #[cfg(not(feature = "sim"))]
+                {
+                    let core_id = if cpu_cores.is_empty() {
+                        None
+                    } else {
+                        cpu_cores.get(shard_idx % cpu_cores.len()).copied()
+                    };
+                    let builder = std::thread::Builder::new().name(format!("pb-w-{shard_id}"));
+                    let handle = builder
+                        .spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .enable_alt_timer()
+                                .build_local(tokio::runtime::LocalOptions::default())
+                                .unwrap();
+                            tune_current_data_thread(core_id);
+                            rt.block_on(async move {
+                                let udp_sock =
+                                    udp_sock.into_unified_socket().expect("bound UDP socket");
+                                let shard = ShardWorker::new(
+                                    shard_id,
+                                    udp_sock,
+                                    tcp_sock,
+                                    shard_command_rx,
+                                    shard_event_tx,
+                                    frame_rx,
+                                    frame_txs,
+                                    shard_occupancy,
+                                    shard_rng,
+                                    wall_anchor,
+                                );
+                                tokio::task::unconstrained(shard.run()).await;
+                            });
+                        })
+                        .unwrap();
+                    shard_handles.push(handle);
+                }
             }
 
             shard_contexts.push(ShardContext {

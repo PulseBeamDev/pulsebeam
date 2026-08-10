@@ -90,7 +90,7 @@ impl ParticipantRegistry {
             participants: SlotMap::with_key(),
             participant_keys: HashMap::default(),
             next_generation: 1,
-            demuxer: Demuxer::new(shard_id.into()),
+            demuxer: Demuxer::new(),
             pending_close: VecDeque::new(),
         }
     }

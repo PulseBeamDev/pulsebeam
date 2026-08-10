@@ -414,15 +414,13 @@ fn abrupt_exit_chaos_test() {
 /// older multi-shard test, with four participants and a slot of sixteen, never
 /// exercised it despite the name.
 ///
-/// Still TCP-only, and not by choice: multi-shard over UDP does not converge
-/// because the `SO_REUSEPORT` emulation is not sticky per 4-tuple. The harness
-/// refuses that combination and explains why. So cross-shard forwarding is
-/// covered, and the transport carrying almost all real media is not.
+/// Over UDP, so the shard each participant lands on is chosen by the
+/// `SO_REUSEPORT` group hashing its 4-tuple — the same mechanism a deployment
+/// relies on, rather than the TCP fallback the multi-shard tests started on.
 #[test]
 fn cross_shard_video_is_forwarded_decodably_test() {
     LocalNodeSim::new()
         .with_shards(2)
-        .with_tcp_only()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))

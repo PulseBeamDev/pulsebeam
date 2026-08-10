@@ -129,7 +129,10 @@ pub async fn run(
         .with_internal_metrics(metrics_addr);
 
     let node = node_builder.run(shutdown.child_token());
-    let node_handle = tokio::task::spawn(node);
+    // Not `spawn`: under `--features sim` a bound socket belongs to a
+    // thread-local `SO_REUSEPORT` group, which makes the node future `!Send`.
+    // It runs on this thread either way, so nothing is lost by saying so.
+    let node_handle = tokio::task::spawn_local(node);
 
     tracing::info!("server started...");
 

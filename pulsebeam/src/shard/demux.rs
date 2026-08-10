@@ -15,6 +15,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///
+/// Resolving a participant does not imply this shard owns it — see the note on
+/// cross-shard arrivals below.
+///
 /// Routing uses two mechanisms:
 /// 1. A fast-path map from `SocketAddr` to `ParticipantId` (`addr_map`): efficient
 ///    routing for known addresses (DTLS, RTP, RTCP).
@@ -24,11 +27,15 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 ///
 /// Non-STUN packets from unknown addresses are rejected.
 ///
+/// A ufrag naming another shard is *not* rejected. `SO_REUSEPORT` picks the
+/// receiving socket by hashing the 4-tuple, which has nothing to do with which
+/// shard owns the participant, so arriving on the wrong one is ordinary rather
+/// than suspicious; `ShardCore::on_udp_batch` forwards it to the owner. Dropping
+/// it here instead makes a participant unreachable whenever the hash disagrees
+/// with placement, which is most of the time.
+///
 /// # Security hardening
 ///
-/// * **Shard validation**: the `shard_id` encoded in the ICE ufrag must match this
-///   shard.  Packets whose ufrag targets a different shard — whether misrouted or
-///   crafted by an attacker — are dropped before the cache is touched.
 /// * **Total cache cap** (`MAX_ADDR_ENTRIES`): the fast-path `addr_map` is bounded.
 ///   Once full, packets are still decoded and forwarded but the source address is not
 ///   cached, limiting memory under a flood of distinct source IPs.
@@ -36,8 +43,6 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 ///   addresses a single participant (real or fabricated) can occupy in the cache,
 ///   preventing one participant slot from monopolising the budget.
 pub struct Demuxer {
-    /// Which shard this demuxer belongs to — used to validate ICE ufrag routing metadata.
-    shard_id: u8,
     /// Fast-path cache: maps a known remote `SocketAddr` to a participant.
     addr_map: HashMap<SocketAddr, ParticipantId>,
     /// Reverse: maps a participant to all their known source addresses (for cleanup).
@@ -47,9 +52,8 @@ pub struct Demuxer {
 }
 
 impl Demuxer {
-    pub fn new(shard_id: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            shard_id: shard_id as u8,
             addr_map: HashMap::with_capacity(MAX_ADDR_ENTRIES),
             participant_addrs: HashMap::with_capacity(MAX_ADDR_ENTRIES),
             addr_to_participant: HashMap::with_capacity(MAX_ADDR_ENTRIES),
@@ -92,16 +96,6 @@ impl Demuxer {
 
         let ufrag_str = std::str::from_utf8(ufrag_raw).ok()?;
         let decoded = IceUfrag::decode(ufrag_str)?;
-
-        // Drop before the cache is touched, not after. A ufrag naming another
-        // shard reaches us either because `SO_REUSEPORT` hashed it here or
-        // because someone fabricated it; either way this shard does not own
-        // that participant, and caching the address would spend a slot of the
-        // bounded `addr_map` on a mapping it can never serve.
-        if decoded.shard_id.index() != usize::from(self.shard_id) {
-            return None;
-        }
-
         let participant_id = decoded.participant_id;
 
         // Populate the fast-path cache only when within the safety bounds, to
@@ -857,7 +851,7 @@ mod demux_tests {
 
     #[test]
     fn valid_ufrag_matching_shard_routes_and_caches() {
-        let mut d = Demuxer::new(3);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(3);
         let encoded = ice.encode();
         let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
@@ -870,24 +864,22 @@ mod demux_tests {
         assert_eq!(d.addr_map.len(), 1); // no duplicate
     }
 
-    /// The shard check the module doc has always promised, which until now was
-    /// documented but not implemented.
+    /// A ufrag for another shard resolves rather than being dropped: which
+    /// socket `SO_REUSEPORT` chose says nothing about which shard owns the
+    /// participant, and the caller forwards it on. Rejecting it here made every
+    /// participant whose hash disagreed with its placement unreachable.
     #[test]
-    fn ufrag_naming_another_shard_is_dropped_before_the_cache() {
-        let mut d = Demuxer::new(3);
-        let (ice, _) = ufrag(4);
+    fn a_ufrag_for_another_shard_still_resolves_so_it_can_be_forwarded() {
+        let mut d = Demuxer::new();
+        let (ice, pid) = ufrag(4);
         let batch = make_batch(src(1000), stun_with_ufrag(&ice.encode()));
 
-        assert_eq!(d.demux(&batch), None);
-        assert!(
-            d.addr_map.is_empty(),
-            "a ufrag for another shard must not consume a cache slot"
-        );
+        assert_eq!(d.demux(&batch), Some(pid));
     }
 
     #[test]
     fn oversized_ufrag_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         // 41 chars — one byte over the encoded length
         let oversized = "A".repeat(IceUfrag::ENCODED_LEN + 1);
         let batch = make_batch(src(1000), stun_with_ufrag(&oversized));
@@ -897,7 +889,7 @@ mod demux_tests {
 
     #[test]
     fn garbage_ufrag_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let batch = make_batch(src(1000), stun_with_ufrag("notavalidufrag!"));
         assert_eq!(d.demux(&batch), None);
         assert!(d.addr_map.is_empty());
@@ -905,14 +897,14 @@ mod demux_tests {
 
     #[test]
     fn non_stun_from_unknown_addr_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let batch = make_batch(src(1000), b"RTP not STUN".to_vec());
         assert_eq!(d.demux(&batch), None);
     }
 
     #[test]
     fn per_participant_addr_cap_limits_cache_growth() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(0);
         let encoded = ice.encode();
 
@@ -935,7 +927,7 @@ mod demux_tests {
 
     #[test]
     fn unregister_clears_all_cached_addrs() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(0);
         let encoded = ice.encode();
 
