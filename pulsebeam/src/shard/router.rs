@@ -997,17 +997,18 @@ impl ShardRoutingTable {
                 let was_empty = subscribers.is_empty();
                 let inserted = subscribers.insert(handle);
                 debug_assert!(inserted);
-                let mut already_published = Vec::new();
+                // Every stream already known on this topic, whether published
+                // here or imported from another shard. An imported one is only
+                // announced to the shard once, when its first wildcard
+                // subscriber arrives, so a later subscriber that skipped this
+                // would never join the fanout and would receive nothing for the
+                // life of the stream. `unregister_data_subscriber` detaches on
+                // the same terms.
                 for (stream_id, route) in &mut room.data_streams {
-                    if route.published && stream_id.topic == topic {
+                    if stream_id.topic == topic {
                         route.local_subscribers.insert(handle);
-                        already_published.push(stream_id.publisher_id);
                     }
                 }
-                // Locally published streams need no cluster route; remote ones
-                // arrive as announcements once the publisher shard learns of
-                // this wildcard subscription.
-                let _ = already_published;
                 was_empty.then_some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     room_id,
                     topic,
@@ -2364,6 +2365,95 @@ mod tests {
             0,
             "the last subscriber leaving retires the imported route"
         );
+    }
+
+    /// A wildcard subscriber that arrives after a remote publisher is already
+    /// known still joins that stream's fanout.
+    ///
+    /// The shard is announced to only once per topic, when its first wildcard
+    /// subscriber arrives, and the announcement snapshots the subscribers that
+    /// existed at that moment. So a second subscriber has to attach itself to
+    /// streams already imported. Missing that is silent: it subscribes, the
+    /// stream flows, and it alone receives nothing.
+    #[test]
+    fn a_late_wildcard_subscriber_joins_an_imported_stream() {
+        let mut table = ShardRoutingTable::new();
+        let mut rng = rand::seeded_rng(13);
+        let room = room_id("wildcard-late");
+        let topic = Topic::for_test("chat");
+        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+
+        let mut subscribers = Vec::new();
+        for _ in 0..2 {
+            let id = pid();
+            let handle = ParticipantHandle::new(slots.insert(()), id, 1);
+            table.add_local_member(id, handle, room, &mut rng);
+            subscribers.push((id, handle));
+        }
+        let publisher = pid();
+
+        table.register_data_subscriber(room, subscribers[0].0, topic.clone(), None, now(), &wall());
+        table.on_remote_data_publisher(room, publisher, &topic, now(), &wall());
+        table.register_data_subscriber(room, subscribers[1].0, topic.clone(), None, now(), &wall());
+
+        let fanout = table
+            .rooms
+            .get(&room)
+            .and_then(|r| {
+                r.data_streams
+                    .get(&DataStreamId::new(publisher, topic.clone()))
+            })
+            .map(|route| route.local_subscribers.clone())
+            .expect("the imported stream should exist once its publisher is announced");
+
+        for (n, (_, handle)) in subscribers.iter().enumerate() {
+            assert!(
+                fanout.contains(handle),
+                "wildcard subscriber {n} is not in the imported stream's fanout, so it \
+                 receives nothing while the other subscriber is served"
+            );
+        }
+    }
+
+    /// Every local subscriber on a topic receives a remote publisher's frame,
+    /// not just the one that happened to subscribe first.
+    ///
+    /// The shard announces its interest in a topic only when the first local
+    /// subscriber arrives, because later ones need no new route. That makes the
+    /// fan-out at delivery the only thing standing between a second subscriber
+    /// and silence, which is what this pins.
+    #[test]
+    fn every_local_subscriber_receives_a_remote_publishers_frame() {
+        let mut table = ShardRoutingTable::new();
+        let mut rng = rand::seeded_rng(13);
+        let room = room_id("reliable-fanout");
+        let topic = Topic::for_test("chat");
+        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+
+        let mut ctx = RecordingCtx::default();
+        let mut subscribers = Vec::new();
+        for _ in 0..2 {
+            let id = pid();
+            let handle = ParticipantHandle::new(slots.insert(()), id, 1);
+            table.add_local_member(id, handle, room, &mut rng);
+            subscribers.push(id);
+        }
+
+        let publisher = pid();
+        table.register_reliable_data_subscriber(room, subscribers[0], topic.clone());
+        table.on_remote_reliable_publisher(room, publisher, &topic, now(), &wall());
+        table.register_reliable_data_subscriber(room, subscribers[1], topic.clone());
+
+        table.route_reliable_data(room, publisher, &topic, b"hello", &mut ctx);
+
+        let delivered = ctx.forwarded_sctp.borrow().clone();
+        for (n, subscriber) in subscribers.iter().enumerate() {
+            assert!(
+                delivered.contains(subscriber),
+                "subscriber {n} received nothing; a topic fan-out that serves only \
+                 some of its subscribers loses data silently (delivered to {delivered:?})"
+            );
+        }
     }
 
     /// An explicit `publisher: Some(..)` data subscription knows its stream, so

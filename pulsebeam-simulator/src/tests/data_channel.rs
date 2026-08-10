@@ -400,6 +400,16 @@ fn cross_shard_data_channel_forwarding_test() {
                 topic: "xshard_topic",
                 expected: b"hello-across-shards",
             },
+            // Both, not either. Which shard each subscriber lands on is decided
+            // by the 4-tuple hash, so asserting on one of them passes whenever
+            // that one happens to win - and a fanout serving only the first
+            // subscriber on a shard looked healthy for exactly that reason.
+            Step::CheckDataReceived {
+                description: "So did the second subscriber, wherever it landed",
+                participant: "sub2",
+                topic: "xshard_topic",
+                expected: b"hello-across-shards",
+            },
             Step::CheckCrossShardMedia {
                 description: "the payload genuinely crossed a shard boundary",
                 min_frames: 1,
