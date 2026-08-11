@@ -177,15 +177,24 @@ not over-delivering, and it was untested.
 
 Worth writing down, because an absent capability looks exactly like a passing test.
 
-**Whether the client was told anything.** `RemoteTrack` exposes `publisher_id()` and `recv()`.
-There is no track state and no pause notification, so a subscriber cannot distinguish "the SFU
-paused this stream" from "the network died" - both are simply an absence of packets. A viewer
-therefore sees a blank tile where a placeholder would do, and no assertion can be written about it
-until the product exposes the state. The simulation can see that a stream was paused
-(`forwarded_quality == 0`); the client cannot.
+**Anything a browser does.** Both ends of the simulation are str0m, so nothing here exercises
+libwebrtc's receive path, and the two differ in ways that decide designs - see "Why the egress SSRC
+belongs to the slot" below. A plan can be green while Chrome renders nothing. Changes to stream
+identity, SSRCs or SDP need a manual browser check; the suite cannot stand in for one.
 
-**Audio.** Every QoE figure here is video. Audio has no continuity, freeze or decodability
-measurement at all, and audio breaking up is at least as noticeable as video freezing.
+**A publisher who rejoins.** Found while testing stream identity, reproduces independently of it,
+and unfixed. A publisher who leaves and comes back is never forwarded to an existing viewer at
+roughly half of seeds: the SFU binds the slot to the new track (`slot switching target` in the log)
+and then writes no RTP to that viewer again, while `configure_slot: requested track missing`
+repeats for the *departed* track - so the viewer's intent still names a publisher that has gone.
+Widening the settle window from 8s to 20s does not help, so it is not a keyframe wait. It wants its
+own investigation.
+
+**Audio quality.** Who is heard, who they are, and how many streams they arrive on are asserted
+now. How *well* they are heard is not: there is no audio continuity, gap or concealment figure
+scoped to a listener's experience, and a 200ms gap is a lost syllable where the same gap in video
+is a stutter nobody remarks on. `AudioStream` has the raw material (`packets`, `longest_gap`); what
+is missing is an `AudioQoe` with its own bar, mirroring `Qoe` rather than reusing it.
 
 **Temporal layers.** Generated scenarios never publish with `with_temporal_dd`, so shedding
 framerate instead of pausing a stream - the graceful degradation a weak link should get - is
@@ -196,6 +205,33 @@ preceded by a sequence hole is visible corruption.
 
 **Time-to-first-frame and freezes** are measured and on the scoreboard, but not gated, because the
 product currently fails both. See the note in `properties.rs`.
+
+## Why the egress SSRC belongs to the slot
+
+Recorded because it was got wrong once, at length, and the simulation could not see it.
+
+A slot keeps one SSRC for the session and carries whoever the SFU puts in it. It is tempting to
+make the SSRC follow the publisher instead, so that a recording can tell where one person's media
+ends and the next begins. That does not work against a browser:
+
+- **`pc/sdp_offer_answer.cc:2765`** - when the remote description declares `a=ssrc`, the receiver
+  binds its sink to *that exact SSRC* (`VideoRtpReceiver::SetSink`). Media on any other SSRC is
+  decoded and thrown away. Not a glitch: nothing renders.
+- With `a=ssrc` omitted, each new SSRC instead builds a receive stream. Video adds a 500ms cooldown
+  that drops a second change (`kUnsignaledSsrcCooldownMs`); audio gets a cold NetEq per change,
+  four kept per m-line, oldest destroyed (`kMaxUnsignaledRecvStreams`), plus the unfixed race at
+  `crbug/webrtc/12676`.
+- A browser cannot route by SSRC regardless - one `MediaStreamTrack` per transceiver.
+
+Who is speaking travels in `AudioAssignment` / `VideoAssignment` instead, which is the only form a
+browser can act on. `CheckAudioStreams` is the guard: a listener is sent no more streams than it
+has slots.
+
+And recording does not need it. Production SFUs record at ingest, per published track - LiveKit
+fires `StartTrackEgress` on track publish, mediasoup uses a `PlainTransport` consumer per producer.
+Only a "what the room looked like" composite records a subscriber's view, and that is a headless
+browser consuming decoded output. A forwarded slot is a poor archival source anyway: top-N audio
+only, one simulcast layer, paused streams absent.
 
 ## Two kinds of plan
 
