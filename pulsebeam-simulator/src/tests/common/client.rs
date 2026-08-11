@@ -369,11 +369,21 @@ pub struct AudioStream {
     /// that the loudest voice wins needs both, because "heard" and "heard as the loudest" are
     /// different claims and only the second is the selector's contract.
     pub best_rank: Option<u32>,
+    first_at: Option<Instant>,
     last_at: Option<Instant>,
 }
 
 impl AudioStream {
+    /// How long this speaker was on the wire, first packet to last.
+    pub fn audible_for(&self) -> Duration {
+        match (self.first_at, self.last_at) {
+            (Some(first), Some(last)) => last.saturating_duration_since(first),
+            _ => Duration::ZERO,
+        }
+    }
+
     fn record(&mut self, bytes: usize, now: Instant) {
+        self.first_at.get_or_insert(now);
         if let Some(previous) = self.last_at {
             self.longest_gap = self
                 .longest_gap
@@ -420,11 +430,18 @@ impl AudioReceiveLog {
     pub fn heard_from(&self) -> std::collections::BTreeSet<String> {
         self.by_publisher
             .iter()
-            .filter(|(_, stream)| stream.packets > 0)
+            .filter(|(_, stream)| stream.audible_for() >= MIN_AUDIBLE)
             .map(|(publisher, _)| publisher.clone())
             .collect()
     }
 }
+
+/// How long a voice must be forwarded before a listener can be said to have heard it.
+///
+/// Matched to `TopNAudioSelector`'s newborn immunity, which is the window in which the selector
+/// makes no promise about who holds a slot - and about the shortest stretch in which a listener
+/// could recognise a voice at all. Below this, a speaker is a start-up transient.
+pub const MIN_AUDIBLE: Duration = Duration::from_millis(300);
 
 /// How long a stream may deliver nothing before a viewer perceives a freeze rather than jitter.
 ///
