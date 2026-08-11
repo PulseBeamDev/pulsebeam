@@ -78,6 +78,10 @@ impl FrameSender {
         let mut packets = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let mut ext_vals = ExtensionValues::default();
+            // Without this the SFU's audio selector drops every packet: it ranks speakers by
+            // level and has nothing to rank an unlabelled one by.
+            ext_vals.audio_level = frame.audio_level;
+            ext_vals.voice_activity = frame.voice_activity;
             if let Some(raw) = &dd_bytes {
                 let mut bytes = raw.0.clone();
                 if let Some(first) = bytes.first_mut() {
@@ -346,6 +350,8 @@ impl FrameReceiver {
         self.prev_last_seq = Some(frame.last_seq);
 
         Some(MediaFrame {
+            audio_level: None,
+            voice_activity: None,
             ts: meta.ts,
             data: Arc::from(frame.data.as_slice()),
             capture_time: meta.capture_time,
@@ -425,6 +431,8 @@ mod tests {
 
     fn frame(data: Vec<u8>, is_keyframe: bool) -> MediaFrame {
         MediaFrame {
+            audio_level: None,
+            voice_activity: None,
             ts: MediaTime::from_90khz(9000),
             data: Arc::from(data.as_slice()),
             capture_time: Instant::now(),

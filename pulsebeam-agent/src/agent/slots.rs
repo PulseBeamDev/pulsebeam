@@ -60,8 +60,10 @@ impl SlotManager {
 
     /// Whether the SFU has stopped forwarding this track.
     ///
-    /// The counterpart to [`crate::AgentEvent::RemoteTrackPaused`] for callers that would rather
-    /// ask than subscribe.
+    /// Test-only: production reads the same state through `Publication::is_paused`, which is what
+    /// the application-facing `Participant::video_paused` is built on. Kept here because it is the
+    /// natural way to assert what `sync` recorded.
+    #[cfg(test)]
     pub fn is_paused(&self, track_id: &str) -> bool {
         self.slots
             .iter()

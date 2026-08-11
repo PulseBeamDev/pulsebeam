@@ -243,6 +243,8 @@ impl H264Looper {
                 .unwrap_or(0);
 
             let frame = MediaFrame {
+                audio_level: None,
+                voice_activity: None,
                 ts: MediaTime::from_90khz(next_ts),
                 data: frame_data,
                 capture_time: tick_time,
@@ -545,6 +547,8 @@ impl VbrLooper {
                 }
                 debug_assert!(index < self.asset.frames.len());
                 let frame = MediaFrame {
+                    audio_level: None,
+                    voice_activity: None,
                     ts: MediaTime::from_90khz(saturating_u64_from_f64(
                         now.duration_since(start).as_secs_f64() * clock_rate,
                     )),
@@ -610,6 +614,8 @@ impl VbrLooper {
                 self.next_small()
             };
             let frame = MediaFrame {
+                audio_level: None,
+                voice_activity: None,
                 ts: MediaTime::from_90khz(saturating_u64_from_f64(
                     elapsed.as_secs_f64() * clock_rate,
                 )),
@@ -725,6 +731,91 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
             self.data.get(start_pos..end_pos)
         } else {
             None
+        }
+    }
+}
+
+/// A synthetic audio source: fixed-size packets at a steady cadence, with a declared loudness.
+///
+/// Enough to exercise forwarding and speaker selection, which is what the SFU does with audio. It
+/// is not an encoder — the payload is filler — because nothing downstream of the selector inspects
+/// it, and a real codec would add a dependency for no extra coverage.
+///
+/// The level is the point. The SFU ranks speakers by RFC 6464 loudness and drops any audio packet
+/// that arrives without one, so a source that does not declare a level is a source whose audio
+/// never reaches anybody.
+pub struct AudioLooper {
+    /// Negative dBov: 0 is full scale, around -30 is ordinary speech, quieter is more negative.
+    level_dbov: i8,
+    speaking: bool,
+    packet_ms: u64,
+    payload_bytes: usize,
+}
+
+impl AudioLooper {
+    /// Someone talking at an ordinary level, in 20ms packets — the Opus default cadence.
+    pub fn speaking() -> Self {
+        Self {
+            level_dbov: -30,
+            speaking: true,
+            packet_ms: 20,
+            payload_bytes: 160,
+        }
+    }
+
+    /// Present but quiet, as an unmuted listener in a room is.
+    pub fn quiet() -> Self {
+        Self {
+            level_dbov: -70,
+            speaking: false,
+            ..Self::speaking()
+        }
+    }
+
+    /// Override the declared loudness, for plans about who the SFU picks.
+    pub fn with_level_dbov(mut self, level_dbov: i8) -> Self {
+        self.level_dbov = level_dbov;
+        self.speaking = level_dbov > -60;
+        self
+    }
+
+    pub async fn run(self, sender: LocalEncoding) {
+        const CLOCK_RATE: u64 = 48_000;
+        let mid = sender.mid;
+        let rid = sender.rid;
+        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, 0);
+        let mut interval = tokio::time::interval(Duration::from_millis(self.packet_ms));
+        let mut packets: u64 = 0;
+
+        loop {
+            let tick_time = interval.tick().await;
+            let ts = packets
+                .saturating_mul(CLOCK_RATE)
+                .saturating_mul(self.packet_ms)
+                .checked_div(1000)
+                .unwrap_or(0);
+            packets = packets.saturating_add(1);
+
+            let frame = MediaFrame {
+                audio_level: Some(self.level_dbov),
+                voice_activity: Some(self.speaking),
+                ts: MediaTime::new(ts, str0m::media::Frequency::FORTY_EIGHT_KHZ),
+                data: Arc::from(vec![0u8; self.payload_bytes].as_slice()),
+                capture_time: tick_time,
+                abs_capture_time: Some(crate::clock::capture_wallclock()),
+                contiguous: true,
+                is_keyframe: false,
+                target_bitrate_bps: None,
+                resolution: None,
+                dependency_descriptor: None,
+                temporal_layers: None,
+            };
+
+            for packet in frame_sender.packetize(&frame) {
+                if sender.send(packet).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }

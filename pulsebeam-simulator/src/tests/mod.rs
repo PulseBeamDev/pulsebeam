@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod bwe;
 pub mod common;
 pub mod connectivity;

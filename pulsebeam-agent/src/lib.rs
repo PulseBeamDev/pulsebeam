@@ -61,6 +61,15 @@ pub struct MediaFrame {
     /// Whether this frame follows the previous one with no missing packets.
     pub contiguous: bool,
     pub is_keyframe: bool,
+    /// Loudness of this audio frame, in negative dBov: 0 is full scale, -30 is ordinary speech,
+    /// and quieter is more negative. RFC 6464.
+    ///
+    /// Required for audio to be forwarded at all. The SFU selects which speakers to send using
+    /// this, and drops any audio packet that arrives without it - so an audio frame published
+    /// without a level reaches the selector and goes no further. `None` for video.
+    pub audio_level: Option<i8>,
+    /// Whether this frame contains speech rather than background. The RFC 6464 voice-activity bit.
+    pub voice_activity: Option<bool>,
     /// What the encoder says this layer will cost, if it declares one.
     ///
     /// Sent on to the SFU as a Video Layers Allocation. The distinction from the measured rate is

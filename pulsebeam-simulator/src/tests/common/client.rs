@@ -15,7 +15,7 @@ use pulsebeam_agent::agent::{
     DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
 };
 use pulsebeam_agent::api::HttpApiClient;
-use pulsebeam_agent::media::{H264Looper, VbrLooper, VbrProfile};
+use pulsebeam_agent::media::{AudioLooper, H264Looper, VbrLooper, VbrProfile};
 use pulsebeam_agent::{
     Agent, LocalTrack, ParticipantChange, Participants, RemoteTrack, SimulcastLayer,
 };
@@ -43,6 +43,8 @@ pub struct SimClientBuilder {
     vbr_profile: Option<VbrProfile>,
     /// When set, attach a synthetic L1T{n} temporal Dependency Descriptor per frame.
     temporal_dd: Option<u8>,
+    /// Publish audio at this loudness, in negative dBov. `None` publishes no audio.
+    audio_level_dbov: Option<i8>,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
 }
@@ -70,6 +72,7 @@ impl SimClientBuilder {
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
+            audio_level_dbov: None,
             opaque_payload: false,
         })
     }
@@ -94,6 +97,7 @@ impl SimClientBuilder {
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
+            audio_level_dbov: None,
             opaque_payload: false,
         })
     }
@@ -101,6 +105,23 @@ impl SimClientBuilder {
     pub fn publish_video(mut self, simulcast_layers: Option<Vec<SimulcastLayer>>) -> Self {
         self.agent_builder = self.agent_builder.video_upstream_slots(1, simulcast_layers);
         self.publishes_video = true;
+        self
+    }
+
+    /// Receive audio, reserving `capacity` downstream slots.
+    ///
+    /// The SFU forwards only the loudest few speakers, so this is how many it can send at once -
+    /// the receiving end of `TopNAudioSelector`'s slots.
+    pub fn receive_audio(mut self, capacity: usize) -> Self {
+        self.agent_builder = self.agent_builder.audio_downstream_slots(capacity);
+        self
+    }
+
+    /// Publish audio at the given loudness in negative dBov: around -30 is ordinary speech,
+    /// below about -60 reads as a quiet room.
+    pub fn publish_audio(mut self, level_dbov: i8) -> Self {
+        self.agent_builder = self.agent_builder.audio_upstream_slots(1);
+        self.audio_level_dbov = Some(level_dbov);
         self
     }
 
@@ -164,6 +185,10 @@ impl SimClientBuilder {
         } else {
             None
         };
+        let local_audio = match self.audio_level_dbov {
+            Some(level) => Some((agent.media().publish_audio().await?, level)),
+            None => None,
+        };
         let (incoming_track_tx, incoming_tracks) = tokio::sync::mpsc::channel(32);
         let participants = agent.participants();
         tracing::info!("connected to {room}");
@@ -210,6 +235,11 @@ impl SimClientBuilder {
                         join_set.spawn(looper.run(sender));
                     }
                 }
+            }
+        }
+        if let Some((publication, level)) = local_audio {
+            for sender in publication.encodings().iter().cloned() {
+                join_set.spawn(AudioLooper::speaking().with_level_dbov(level).run(sender));
             }
         }
         Ok(SimClient { ctx, join_set })
