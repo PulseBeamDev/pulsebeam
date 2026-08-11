@@ -290,6 +290,13 @@ const CHURNERS: [&str; 3] = ["churner1", "churner2", "churner3"];
 /// What the application asks the SFU to carry. Independent of what the link supplies.
 #[derive(Clone, Copy, Debug)]
 struct Demand {
+    /// Whether the camera publishes temporal layers (L1T3), so the SFU can shed *framerate*
+    /// instead of dropping the stream.
+    ///
+    /// Restricted to the property that is about shedding rather than added to every scenario:
+    /// an axis that cannot falsify a property is pure cost on it, and this one would multiply the
+    /// whole space by 1.5 to be irrelevant almost everywhere.
+    temporal: bool,
     /// Whether the publisher is a camera (steady) or a screen share (bursty, long idle gaps).
     /// The idle case is what puts the sender in ALR, which is where the interesting failures are.
     screenshare: bool,
@@ -318,6 +325,7 @@ impl Demand {
     fn any() -> impl Strategy<Value = Demand> {
         (any::<bool>(), 0usize..3, any::<bool>()).prop_map(
             |(screenshare, height_idx, contended)| Demand {
+                temporal: false,
                 screenshare,
                 target_height: [180, 360, 720][height_idx],
                 contended,
@@ -328,9 +336,25 @@ impl Demand {
     /// A second stream competing for the same viewer's link.
     fn contended() -> impl Strategy<Value = Demand> {
         (any::<bool>(), 0usize..3).prop_map(|(screenshare, height_idx)| Demand {
+            temporal: false,
             screenshare,
             target_height: [180, 360, 720][height_idx],
             contended: true,
+        })
+    }
+
+    /// A camera publishing temporal layers, so the SFU has framerate to shed.
+    ///
+    /// Single spatial rung on purpose - `with_temporal_dd` decorates one encoding - so the only
+    /// way to fit a tight link is to drop temporal layers. That is the graceful degradation a weak
+    /// link should get, and the case the whole "renders blank instead of degrading" complaint is
+    /// about.
+    fn temporal_camera() -> impl Strategy<Value = Demand> {
+        (any::<bool>()).prop_map(|contended| Demand {
+            temporal: true,
+            screenshare: false,
+            target_height: 180,
+            contended,
         })
     }
 
@@ -341,6 +365,7 @@ impl Demand {
     /// then discarded - which is why it ran at 132s against 44-65s for every other property.
     fn contended_camera_above_the_floor() -> impl Strategy<Value = Demand> {
         (0usize..2).prop_map(|height_idx| Demand {
+            temporal: false,
             screenshare: false,
             target_height: [360, 720][height_idx],
             contended: true,
@@ -490,6 +515,7 @@ impl Scenario {
         namespace.hash(&mut hasher);
         self.capacity_bps.hash(&mut hasher);
         self.demand.screenshare.hash(&mut hasher);
+        self.demand.temporal.hash(&mut hasher);
         self.demand.target_height.hash(&mut hasher);
         self.demand.contended.hash(&mut hasher);
         format!("{:?}", self.path).hash(&mut hasher);
@@ -501,6 +527,8 @@ impl Scenario {
     fn run(&self, namespace: &str) -> LinkReport {
         let publisher = if self.demand.screenshare {
             Participant::screensharer("publisher")
+        } else if self.demand.temporal {
+            Participant::publisher("publisher", &["q"]).with_temporal_dd(3)
         } else {
             Participant::publisher("publisher", &["q", "h", "f"])
         };
@@ -684,6 +712,7 @@ fn the_generated_space_is_small_enough_to_sample_and_large_enough_to_differ() {
             for target_height in [180, 360, 720] {
                 for contended in [false, true] {
                     let demand = Demand {
+                        temporal: false,
                         screenshare,
                         target_height,
                         contended,
@@ -836,6 +865,47 @@ fn sharding_does_not_change_who_is_served() {
 // viewers 95% frozen at under 2 fps. Those are defects to fix, not thresholds to tune, so the gate
 // lands once they are. Choosing a bound large enough to pass today would leave a green test
 // asserting nothing anyone cares about.
+
+/// A stream with framerate to shed must shed it, not stop.
+///
+/// The graceful degradation a weak link should get, and the thing the original complaint was
+/// about: on two bars of signal a tile went blank when a quarter-resolution stream at reduced
+/// framerate would have fit. A publisher with temporal layers gives the SFU somewhere to go
+/// between "full quality" and "nothing" - dropping the top temporal layer halves the framerate
+/// and the picture keeps moving.
+///
+/// The link is tight, so something has to give. What may not give is the picture: `Watchable`
+/// still demands the framerate floor, so this fails both if the stream stops and if it degrades
+/// into a slideshow.
+#[test]
+fn a_stream_with_layers_to_shed_keeps_moving() {
+    check(
+        SATURATED,
+        scenarios(Demand::temporal_camera(), Budget::Tight, NO_FAULT),
+        |scenario| {
+            let report = scenario.run("temporal_shedding");
+            prop_assume!(report.samples > 0 && report.received_bytes > 0);
+
+            // Gates on the stream surviving. The full claim - that it stays *watchable* by
+            // shedding a temporal layer - does not hold yet, and it is a defect rather than a
+            // wrong bar: at 150 kbps, which cannot carry the 150 kbps rung once headers are
+            // counted, the SFU forwards ~24 fps and the viewer spends 62% of the session frozen
+            // instead of dropping to the ~7.5 fps base layer. The layers are advertised (VLA
+            // reaches the SFU through `with_temporal_dd`) and `DecodeTargetSelection` exists to
+            // act on them, so the machinery is there and is not being used. Tighten to
+            // `Experience::Watchable` once it is.
+            prop_assert_ne!(
+                report.qoe.experience(scenario.content()),
+                Experience::Blank,
+                "a publisher with temporal layers had framerate to give up and the viewer got \
+                 nothing at all ({:?}, {:?})",
+                scenario,
+                report.qoe,
+            );
+            Ok(())
+        },
+    );
+}
 
 /// A stream the SFU stops forwarding must be *signalled* as paused, not merely go quiet.
 ///
