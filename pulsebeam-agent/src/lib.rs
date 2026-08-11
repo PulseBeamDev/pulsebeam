@@ -11,7 +11,7 @@ pub use str0m;
 pub use str0m::Candidate;
 pub use str0m::IceConnectionState;
 pub use str0m::media::{MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
-pub use str0m::rtp::{ExtensionValues, SeqNo};
+pub use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use tokio::time::Instant;
 
 pub mod clock;
@@ -46,6 +46,12 @@ pub struct RtpPacket {
     pub seq: SeqNo,
     pub ts: MediaTime,
     pub marker: bool,
+    /// The RTP stream this packet arrived on. `None` before it has been on the wire.
+    ///
+    /// A slot carries one stream for the whole session and whoever the SFU puts in it, so this
+    /// does not say who is speaking - the assignment does. It says how many streams the SFU is
+    /// asking a receiver to hold open, which is the thing a browser is unforgiving about.
+    pub ssrc: Option<Ssrc>,
     pub payload: Arc<[u8]>,
     pub ext_vals: ExtensionValues,
     /// When the packet was handed over (arrival on ingress, send time on egress).

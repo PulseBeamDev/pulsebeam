@@ -116,6 +116,7 @@ impl FrameSender {
                 seq,
                 ts: frame.ts,
                 marker: chunk.end_of_frame,
+                ssrc: None,
                 payload: Arc::from(chunk.data),
                 ext_vals,
                 arrival: frame.capture_time,
@@ -531,6 +532,7 @@ mod tests {
 
         let base = Instant::now();
         let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            ssrc: None,
             mid: Mid::from("v0"),
             rid: None,
             seq: SeqNo::from(seq),
@@ -570,6 +572,7 @@ mod tests {
 
         let base = Instant::now();
         let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            ssrc: None,
             mid: Mid::from("v0"),
             rid: None,
             seq: SeqNo::from(seq),
@@ -610,6 +613,7 @@ mod tests {
 
         let base = Instant::now();
         let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            ssrc: None,
             mid: Mid::from("v0"),
             rid: None,
             seq: SeqNo::from(seq),

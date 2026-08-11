@@ -254,6 +254,8 @@ impl SimClientBuilder {
                         while let Ok(rtp) = track.recv().await {
                             log.lock().unwrap().record(
                                 &publisher,
+                                rtp.ssrc.map_or(0, |s| *s),
+                                *rtp.seq,
                                 rtp.payload.len(),
                                 Instant::now(),
                             );
@@ -412,14 +414,41 @@ impl AudioStream {
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct AudioReceiveLog {
     pub by_publisher: std::collections::BTreeMap<String, AudioStream>,
+    /// Every RTP stream this listener was sent, and whether each stayed whole.
+    ///
+    /// Keyed by SSRC rather than by speaker on purpose. Several speakers share a slot's stream
+    /// over a call, spliced onto one timeline, and that is the design: a browser cannot route by
+    /// SSRC, and libwebrtc answers an SSRC it did not see in the SDP by building a whole new
+    /// receive stream. What has to hold is that the shared stream is unbroken across the changes.
+    pub by_stream: std::collections::BTreeMap<u32, AudioStreamContinuity>,
+}
+
+/// One inbound RTP stream, whoever happens to be on it.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct AudioStreamContinuity {
+    pub packets: u64,
+    /// Largest forward jump in sequence number. Any hole is loss to the receiver, whether the
+    /// network caused it or the SFU spliced two speakers together badly.
+    pub max_seq_gap: u64,
+    last_seq: Option<u64>,
 }
 
 impl AudioReceiveLog {
-    fn record(&mut self, publisher: &str, bytes: usize, now: Instant) {
+    fn record(&mut self, publisher: &str, ssrc: u32, seq: u64, bytes: usize, now: Instant) {
         self.by_publisher
             .entry(publisher.to_owned())
             .or_default()
             .record(bytes, now);
+
+        let stream = self.by_stream.entry(ssrc).or_default();
+        stream.packets = stream.packets.saturating_add(1);
+        if let Some(previous) = stream.last_seq {
+            let gap = seq.saturating_sub(previous).saturating_sub(1);
+            stream.max_seq_gap = stream.max_seq_gap.max(gap);
+        }
+        if stream.last_seq.is_none_or(|previous| seq > previous) {
+            stream.last_seq = Some(seq);
+        }
     }
 
     fn record_rank(&mut self, publisher: &str, rank: u32) {
@@ -444,6 +473,14 @@ impl AudioReceiveLog {
             .collect()
     }
 }
+
+/// How much of one stream may be missing before a listener would notice.
+///
+/// Not zero: a subscriber's audio slots are provisioned as their mids finish negotiating, so a
+/// speaker the SFU starts forwarding into a slot that does not exist yet loses the packets in
+/// between. That is a handful at the very start of a call and a receiver conceals it inaudibly. It
+/// is a different thing from the stream itself being torn, which is what the bound exists for.
+pub const MAX_CONCEALABLE_GAP: u64 = 2;
 
 /// How long a voice must be forwarded before a listener can be said to have heard it.
 ///

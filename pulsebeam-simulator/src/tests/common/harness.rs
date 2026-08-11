@@ -8,7 +8,7 @@
     clippy::indexing_slicing
 )] // test / simulation support
 use crate::tests::common::client::{
-    AudioReceiveLog, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+    AudioReceiveLog, MAX_CONCEALABLE_GAP, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
 use pulsebeam_agent::SimulcastLayer;
@@ -498,6 +498,27 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         expected: &'static [&'static str],
+    },
+    /// A listener is never handed more audio streams than it has slots, and none of them is torn.
+    ///
+    /// The browser-facing invariant, and the reason the egress SSRC belongs to the slot rather
+    /// than the speaker. libwebrtc answers an SSRC it did not see in the SDP by building a whole
+    /// new `AudioReceiveStream` - a cold NetEq, four kept per m-line and the oldest destroyed - so
+    /// minting one per speaker churns jitter buffers several times a minute to express something a
+    /// browser cannot read anyway: it has one `MediaStreamTrack` per transceiver and routes by
+    /// mid. Worse, when the SDP *did* declare an SSRC, the receiver binds its sink to that one
+    /// specifically and media on any other is decoded and thrown away.
+    ///
+    /// So slots keep their stream whoever is in it, and who that is travels in the assignment.
+    /// What the SFU owes in exchange is a stream that does not tear across the changes: a hole is
+    /// loss to the receiver, however deliberate it was.
+    CheckAudioStreams {
+        description: &'static str,
+        participant: &'static str,
+        /// How many distinct speakers must have been heard, so the plan cannot pass on silence.
+        min_speakers: usize,
+        /// How many RTP streams the listener may be sent - its slot count, never more.
+        max_streams: usize,
     },
     /// Where the SFU said each speaker sat, loudest first, at their best moment.
     ///
@@ -1201,6 +1222,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckRxBytes { .. } => "CheckRxBytes",
         Step::CheckHeardFrom { .. } => "CheckHeardFrom",
         Step::CheckSpeakerRank { .. } => "CheckSpeakerRank",
+        Step::CheckAudioStreams { .. } => "CheckAudioStreams",
         Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
@@ -1756,6 +1778,39 @@ async fn execute_plan(
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  heard from:   {heard:?}\n  per speaker:  {:?}",
                     audio.by_publisher
                 );
+            }
+
+            Step::CheckAudioStreams {
+                description,
+                participant,
+                min_speakers,
+                max_streams,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, ≥{min_speakers} speakers, ≤{max_streams} streams)"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let audio = handle.audio_rx();
+                let heard = audio.heard_from();
+                assert!(
+                    heard.len() >= *min_speakers,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     ≥ {min_speakers} distinct speakers heard\n  actual:       {}\n  per speaker:  {:?}\n  note:         fewer speakers than slots means no slot was ever stolen, so\n                the plan proved nothing",
+                    heard.len(),
+                    audio.by_publisher
+                );
+                assert!(
+                    audio.by_stream.len() <= *max_streams,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     at most {max_streams} RTP streams, one per slot\n  actual:       {}\n  streams:      {:?}\n  note:         a stream per speaker costs a browser a fresh receive stream and\n                a cold jitter buffer every time a slot changes hands",
+                    audio.by_stream.len(),
+                    audio.by_stream.keys().collect::<Vec<_>>()
+                );
+                for (ssrc, stream) in &audio.by_stream {
+                    assert!(
+                        stream.max_seq_gap <= MAX_CONCEALABLE_GAP,
+                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  stream:       {ssrc}\n  expected:     at most {MAX_CONCEALABLE_GAP} packets missing\n  actual:       a gap of {} packets\n  note:         this plan configures no loss, so a hole in a slot's stream is the\n                SFU splicing two speakers onto it badly",
+                        stream.max_seq_gap
+                    );
+                }
             }
 
             Step::CheckSpeakerRank {

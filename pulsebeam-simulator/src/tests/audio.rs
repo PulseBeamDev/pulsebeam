@@ -120,3 +120,57 @@ fn the_listener_is_told_who_it_is_hearing_test() {
             },
         ]);
 }
+
+/// A slot carries many speakers on one stream, and the stream stays whole.
+///
+/// Four people taking turns and three slots, so the selector has to steal one back and forth. The
+/// slot keeps its SSRC through every steal, deliberately.
+///
+/// A browser cannot use a per-speaker SSRC: it has one `MediaStreamTrack` per transceiver and
+/// routes by mid. Worse, libwebrtc binds a receiver's sink to the SSRC the SDP declared, so media
+/// arriving on any other one is decoded and thrown away - and where no SSRC was declared, each new
+/// one builds a whole receive stream with a cold NetEq, four kept per m-line, oldest destroyed.
+/// Who is speaking travels in the assignment instead, which a browser can act on.
+///
+/// What the SFU owes in exchange is a stream that does not tear. Every speaker is rewritten onto
+/// the slot's timeline, so the splice has to be seamless. When the SSRC briefly followed the
+/// speaker instead, a returning voice resumed hundreds of packets ahead of where it left off, and
+/// put seven seconds of apparent loss inside one stream.
+#[test]
+fn a_slot_carries_many_speakers_without_tearing_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::data_participant("alice").speaking_at(-25))
+                // Staggered around the 150-packet speech cycle so somebody is always arriving to a
+                // room whose slots are full, which is the only way a slot is stolen.
+                .with_participant(
+                    Participant::data_participant("bob")
+                        .speaking_at(-25)
+                        .taking_turns_after(40),
+                )
+                .with_participant(
+                    Participant::data_participant("carol")
+                        .speaking_at(-25)
+                        .taking_turns_after(80),
+                )
+                .with_participant(
+                    Participant::data_participant("dave")
+                        .speaking_at(-25)
+                        .taking_turns_after(120),
+                )
+                .with_participant(Participant::subscriber("listener").hearing(3)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "They take turns; three slots cannot hold four voices",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckAudioStreams {
+                description: "Three slots carried four voices, and none of them tore",
+                participant: "listener",
+                min_speakers: 4,
+                max_streams: 3,
+            },
+        ]);
+}
