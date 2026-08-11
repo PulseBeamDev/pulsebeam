@@ -173,6 +173,30 @@ cross-shard data-topic defect survived precisely that: two subscribers, one asse
 participant is a deliberate bystander, assert it received *nothing* — that is a real claim about
 not over-delivering, and it was untested.
 
+## What the suite still cannot see
+
+Worth writing down, because an absent capability looks exactly like a passing test.
+
+**Whether the client was told anything.** `RemoteTrack` exposes `publisher_id()` and `recv()`.
+There is no track state and no pause notification, so a subscriber cannot distinguish "the SFU
+paused this stream" from "the network died" - both are simply an absence of packets. A viewer
+therefore sees a blank tile where a placeholder would do, and no assertion can be written about it
+until the product exposes the state. The simulation can see that a stream was paused
+(`forwarded_quality == 0`); the client cannot.
+
+**Audio.** Every QoE figure here is video. Audio has no continuity, freeze or decodability
+measurement at all, and audio breaking up is at least as noticeable as video freezing.
+
+**Temporal layers.** Generated scenarios never publish with `with_temporal_dd`, so shedding
+framerate instead of pausing a stream - the graceful degradation a weak link should get - is
+untested by any property.
+
+**Torn frames.** 1,370 across a suite run, measured and reported, asserted on by nothing. A frame
+preceded by a sequence hole is visible corruption.
+
+**Time-to-first-frame and freezes** are measured and on the scoreboard, but not gated, because the
+product currently fails both. See the note in `properties.rs`.
+
 ## Two kinds of plan
 
 **Authored plans** (`bwe.rs`, `video.rs`, `connectivity.rs`, `data_channel.rs`)
