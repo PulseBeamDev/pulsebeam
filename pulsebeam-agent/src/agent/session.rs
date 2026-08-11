@@ -4,6 +4,7 @@ use super::handles::{
     OutgoingCommand, Publication, PublicationLease, RemoteTrack,
 };
 use super::mailbox;
+use super::slots::Speaker;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::{Future, IntoFuture};
@@ -57,6 +58,7 @@ struct AgentInner {
     stats: watch::Receiver<Arc<StatisticsSnapshot>>,
     connection: watch::Receiver<ConnectionState>,
     publications: watch::Receiver<Arc<HashMap<String, Publication>>>,
+    speakers: watch::Receiver<Arc<[Speaker]>>,
 }
 
 #[derive(Clone)]
@@ -195,7 +197,63 @@ impl Drop for LocalTrack {
     }
 }
 
+/// The ranked list of who this receiver is hearing.
+#[derive(Clone)]
+pub struct Speakers {
+    state: watch::Receiver<Arc<[Speaker]>>,
+}
+
+impl Speakers {
+    pub fn current(&self) -> Arc<[Speaker]> {
+        self.state.borrow().clone()
+    }
+
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.state.changed().await
+    }
+}
+
+/// Every audio track the SFU decides to forward to this receiver.
+///
+/// The stream never ends on its own: a slot vacated by one speaker is filled by the next, and
+/// each arrival is a fresh track. Pair it with [`Media::speakers`] to know who is in which slot.
+pub struct AudioTracks {
+    rx: mailbox::Receiver<RemoteTrack>,
+}
+
+impl AudioTracks {
+    pub async fn next(&mut self) -> Result<RemoteTrack, AgentError> {
+        self.rx.recv().await.map_err(|_| AgentError::Closed)
+    }
+}
+
 impl Media {
+    /// Who is being heard right now, loudest first.
+    ///
+    /// A snapshot rather than a stream: a UI redraws from the current ranking, and a caller that
+    /// wants transitions can await [`Speakers::changed`].
+    pub fn speakers(&self) -> Speakers {
+        Speakers {
+            state: self.agent.inner.speakers.clone(),
+        }
+    }
+
+    /// Register to receive audio.
+    ///
+    /// Unlike video there is nothing to subscribe to: the SFU forwards the loudest few speakers
+    /// and decides for itself who those are, so a receiver says only that it wants audio at all.
+    pub async fn receive_audio(&self) -> Result<AudioTracks, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.agent
+            .inner
+            .commands
+            .send(OutgoingCommand::ReceiveAudio { response })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        let rx = result.await.map_err(|_| AgentError::Closed)?;
+        Ok(AudioTracks { rx })
+    }
+
     pub async fn publish_video(&self) -> Result<LocalTrack, AgentError> {
         self.publish(str0m::media::MediaKind::Video).await
     }
@@ -740,6 +798,7 @@ pub struct AgentRunner {
     stats: watch::Sender<Arc<StatisticsSnapshot>>,
     connection: watch::Sender<ConnectionState>,
     publications: watch::Sender<Arc<HashMap<String, Publication>>>,
+    speakers: watch::Sender<Arc<[Speaker]>>,
     publication_state: HashMap<String, Publication>,
     /// Correlates agent-side str0m logs with the SFU peer in simulator traces.
     #[cfg(feature = "sim")]
@@ -759,6 +818,7 @@ impl AgentRunner {
         let (stats, stats_rx) = watch::channel(Arc::new(driver.stats().clone()));
         let (connection, connection_rx) = watch::channel(ConnectionState::Connecting);
         let (publications, publication_rx) = watch::channel(Arc::new(HashMap::new()));
+        let (speakers, speakers_rx) = watch::channel(Arc::from(Vec::new()));
         let agent = Agent {
             inner: Arc::new(AgentInner {
                 participant_id,
@@ -766,6 +826,7 @@ impl AgentRunner {
                 stats: stats_rx,
                 connection: connection_rx,
                 publications: publication_rx,
+                speakers: speakers_rx,
             }),
         };
         (
@@ -775,6 +836,7 @@ impl AgentRunner {
                 stats,
                 connection,
                 publications,
+                speakers,
                 publication_state: HashMap::new(),
                 #[cfg(feature = "sim")]
                 sim_span,
@@ -803,6 +865,9 @@ impl AgentRunner {
                     self.publication_state
                         .insert(publication.id().to_owned(), publication);
                     self.publish_publications();
+                }
+                AgentEvent::SpeakersChanged(speakers) => {
+                    self.speakers.send_replace(Arc::from(speakers));
                 }
                 AgentEvent::RemoteTrackRemoved(track_id) => {
                     self.publication_state.remove(&track_id);

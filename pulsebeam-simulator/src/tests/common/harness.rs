@@ -478,6 +478,17 @@ pub enum Step {
         participant: &'static str,
         expected: &'static [&'static str],
     },
+    /// Where the SFU said each speaker sat, loudest first, at their best moment.
+    ///
+    /// Distinct from `CheckHeardFrom`: that one asserts audio arrived, this one asserts the
+    /// listener was *told* who it was and in what order. The two come apart exactly where the
+    /// bug did - the media can flow while the assignment carrying the speaker's name does not,
+    /// and then no application can attribute a voice to a face.
+    CheckSpeakerRank {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [(&'static str, u32)],
+    },
     /// At least this many media frames actually crossed a shard boundary.
     ///
     /// Guards a cross-shard plan against passing by accident. Placement is a
@@ -1168,6 +1179,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
         Step::CheckHeardFrom { .. } => "CheckHeardFrom",
+        Step::CheckSpeakerRank { .. } => "CheckSpeakerRank",
         Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
@@ -1722,6 +1734,31 @@ async fn execute_plan(
                     heard, want,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  heard from:   {heard:?}\n  per speaker:  {:?}",
                     audio.by_publisher
+                );
+            }
+
+            Step::CheckSpeakerRank {
+                description,
+                participant,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let ranked = handle.audio_rx().ranked();
+                let want: std::collections::BTreeMap<String, u32> = expected
+                    .iter()
+                    .filter_map(|(name, rank)| {
+                        handles
+                            .get(name)
+                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
+                            .map(|id| (id, *rank))
+                    })
+                    .collect();
+                assert_eq!(
+                    ranked, want,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  signalled:    {ranked:?}"
                 );
             }
 

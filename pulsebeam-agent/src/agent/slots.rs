@@ -13,6 +13,22 @@ struct ReceiverSlot {
     /// assignment when something about it moved, but it also upserts for reasons other than pause,
     /// and an application that redraws a placeholder on every notification would flicker.
     paused: bool,
+    /// Set when this slot carries audio, naming who is currently in it.
+    ///
+    /// Audio slots are shared: the SFU steals one the moment someone louder starts talking, so
+    /// the occupant changes without the receiver asking for anything.
+    speaker: Option<Speaker>,
+}
+
+/// A speaker the SFU is currently forwarding to us.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Speaker {
+    pub participant_id: String,
+    pub track_id: TrackId,
+    /// 0 is the loudest currently-forwarded speaker.
+    pub rank: u32,
+    /// Most recent loudness in negative dBov: 0 is full scale, around -30 is ordinary speech.
+    pub level_dbov: i32,
 }
 
 pub struct SlotManager {
@@ -33,6 +49,7 @@ impl SlotManager {
     pub fn register(&mut self, mid: Mid) {
         self.slots.push(ReceiverSlot {
             paused: false,
+            speaker: None,
             mid,
             track_id: None,
         });
@@ -71,8 +88,20 @@ impl SlotManager {
             .is_some_and(|s| s.paused)
     }
 
+    /// Who is being heard, loudest first.
+    pub fn speakers(&self) -> Vec<Speaker> {
+        let mut speakers: Vec<Speaker> = self
+            .slots
+            .iter()
+            .filter_map(|s| s.speaker.clone())
+            .collect();
+        speakers.sort_by_key(|s| s.rank);
+        speakers
+    }
+
     pub fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> SyncOutcome {
         let mut new_assignments: Vec<(Mid, Track)> = Vec::new();
+        let mut speakers_changed = false;
         let mut pause_changes: Vec<(TrackId, bool)> = Vec::new();
         let mut newly_discovered_tracks = Vec::new();
         let removed_tracks = update.tracks_remove.clone();
@@ -138,6 +167,52 @@ impl SlotManager {
             }
         }
 
+        for a in update.audio_remove {
+            if let Some(s) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.mid.as_bytes() == a.as_bytes())
+            {
+                speakers_changed |= s.speaker.is_some();
+                s.speaker = None;
+                s.track_id = None;
+            }
+        }
+
+        for a in update.audio_upsert {
+            let Some(s) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.mid.as_bytes() == a.mid.as_bytes())
+            else {
+                continue;
+            };
+            let publisher = self
+                .pending_tracks
+                .get(&a.track_id)
+                .or_else(|| self.active_tracks.get(&a.track_id))
+                .map(|t| t.participant_id.clone())
+                .unwrap_or_default();
+            let speaker = Speaker {
+                participant_id: publisher,
+                track_id: a.track_id.clone(),
+                rank: a.rank,
+                level_dbov: a.level_dbov,
+            };
+            speakers_changed |= s.speaker.as_ref() != Some(&speaker);
+            s.speaker = Some(speaker);
+
+            if s.track_id.as_deref() == Some(&a.track_id) {
+                continue;
+            }
+            s.track_id = Some(a.track_id.clone());
+            if let Some(track) = self.pending_tracks.remove(&a.track_id) {
+                let mid = s.mid;
+                self.active_tracks.insert(a.track_id, track.clone());
+                new_assignments.push((mid, track));
+            }
+        }
+
         for slot in &self.slots {
             let Some(track_id) = &slot.track_id else {
                 continue;
@@ -161,6 +236,7 @@ impl SlotManager {
             newly_discovered_tracks,
             removed_tracks,
             pause_changes,
+            speakers_changed,
         }
     }
 }
@@ -172,6 +248,8 @@ pub struct SyncOutcome {
     pub removed_tracks: Vec<TrackId>,
     /// Tracks whose forwarding state changed, and what it changed to.
     pub pause_changes: Vec<(TrackId, bool)>,
+    /// Whether who-is-being-heard moved. Read the ranking back with [`SlotManager::speakers`].
+    pub speakers_changed: bool,
 }
 
 #[cfg(test)]
@@ -188,6 +266,47 @@ mod tests {
             tracks_remove: Vec::new(),
             assignments_upsert: assignments,
             assignments_remove: Vec::new(),
+            audio_upsert: Vec::new(),
+            audio_remove: Vec::new(),
+        }
+    }
+
+    fn audio_update(
+        audio: Vec<pulsebeam_proto::signaling::AudioAssignment>,
+        tracks: Vec<ProtoTrack>,
+    ) -> StateUpdate {
+        StateUpdate {
+            seq: 1,
+            is_snapshot: false,
+            tracks_upsert: tracks,
+            tracks_remove: Vec::new(),
+            assignments_upsert: Vec::new(),
+            assignments_remove: Vec::new(),
+            audio_upsert: audio,
+            audio_remove: Vec::new(),
+        }
+    }
+
+    fn speaking(
+        mid: &str,
+        track_id: &str,
+        rank: u32,
+        level_dbov: i32,
+    ) -> pulsebeam_proto::signaling::AudioAssignment {
+        pulsebeam_proto::signaling::AudioAssignment {
+            mid: mid.to_owned(),
+            track_id: track_id.to_owned(),
+            rank,
+            level_dbov,
+        }
+    }
+
+    fn audio_track(id: &str, publisher: &str) -> ProtoTrack {
+        ProtoTrack {
+            id: id.to_owned(),
+            kind: 2,
+            participant_id: publisher.to_owned(),
+            meta: Default::default(),
         }
     }
 
@@ -239,6 +358,108 @@ mod tests {
         let resumed = slots.sync(update(vec![assignment("v0", "t1", false)], Vec::new()));
         assert_eq!(resumed.pause_changes, vec![("t1".to_owned(), false)]);
         assert!(!slots.is_paused("t1"));
+    }
+
+    /// An audio slot binds its track the same way a video slot does, so the media has somewhere
+    /// to go. Without this the packets arrive on a mid nothing is listening to and are dropped.
+    #[test]
+    fn an_audio_assignment_binds_the_track_to_its_slot() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("a0"));
+
+        let sync = slots.sync(audio_update(
+            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![audio_track("audio-alice", "alice")],
+        ));
+
+        assert_eq!(
+            sync.new_assignments.len(),
+            1,
+            "the audio track must be bound to its mid"
+        );
+        assert!(sync.speakers_changed);
+        assert_eq!(
+            slots.speakers(),
+            vec![Speaker {
+                participant_id: "alice".to_owned(),
+                track_id: "audio-alice".to_owned(),
+                rank: 0,
+                level_dbov: -30,
+            }]
+        );
+    }
+
+    /// The SFU steals a slot as soon as someone louder talks. The mid does not move, so unless
+    /// the steal is applied the receiver goes on attributing the new voice to the old speaker.
+    #[test]
+    fn a_stolen_slot_rebinds_to_the_new_speaker() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("a0"));
+        slots.sync(audio_update(
+            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![audio_track("audio-alice", "alice")],
+        ));
+
+        let sync = slots.sync(audio_update(
+            vec![speaking("a0", "audio-bob", 0, -12)],
+            vec![audio_track("audio-bob", "bob")],
+        ));
+
+        assert!(sync.speakers_changed);
+        assert_eq!(
+            sync.new_assignments.len(),
+            1,
+            "the new speaker needs its own delivery, not the one the old speaker held"
+        );
+        let speakers = slots.speakers();
+        assert_eq!(speakers.len(), 1, "one slot holds one speaker");
+        assert_eq!(speakers[0].participant_id, "bob");
+    }
+
+    /// Ranking is what a UI draws, and it must not depend on which order the slots were filled.
+    #[test]
+    fn speakers_are_reported_loudest_first() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("a0"));
+        slots.register(Mid::from("a1"));
+
+        slots.sync(audio_update(
+            vec![
+                speaking("a0", "audio-alice", 1, -40),
+                speaking("a1", "audio-bob", 0, -12),
+            ],
+            vec![
+                audio_track("audio-alice", "alice"),
+                audio_track("audio-bob", "bob"),
+            ],
+        ));
+
+        let speakers = slots.speakers();
+        assert_eq!(
+            speakers
+                .iter()
+                .map(|s| s.participant_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bob", "alice"]
+        );
+    }
+
+    /// A speaker who stops talking frees the slot, and the receiver has to stop showing them.
+    #[test]
+    fn a_vacated_slot_stops_being_reported() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("a0"));
+        slots.sync(audio_update(
+            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![audio_track("audio-alice", "alice")],
+        ));
+
+        let mut update = audio_update(Vec::new(), Vec::new());
+        update.audio_remove = vec!["a0".to_owned()];
+        let sync = slots.sync(update);
+
+        assert!(sync.speakers_changed);
+        assert!(slots.speakers().is_empty(), "nobody is being heard");
     }
 
     /// Repeating a state is not a change.

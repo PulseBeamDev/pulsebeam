@@ -37,6 +37,14 @@ pub(crate) enum OutgoingCommand {
         subscription: VideoSubscription,
         response: tokio::sync::oneshot::Sender<Result<RemoteTrack, super::AgentError>>,
     },
+    /// Ask to be handed every audio track the SFU decides to forward.
+    ///
+    /// Audio has no per-track subscription: which speakers are forwarded is the SFU's decision,
+    /// taken continuously as people start and stop talking, so a receiver cannot ask for a
+    /// speaker by name and wait. It registers once and is handed each track as it appears.
+    ReceiveAudio {
+        response: tokio::sync::oneshot::Sender<mailbox::Receiver<RemoteTrack>>,
+    },
     Shutdown(tokio::sync::oneshot::Sender<()>),
     DeclareOrderedPublisher {
         topic: String,

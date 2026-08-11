@@ -26,6 +26,30 @@ message VideoAssignment {
   bool paused = 3;
 }
 
+// Which speaker currently occupies one of the subscriber's audio slots.
+//
+// Audio slots are not assigned the way video slots are. The SFU forwards only the
+// loudest few speakers and steals a slot the moment someone louder starts talking,
+// so the occupant of a `mid` changes on its own and a client cannot infer who it is
+// hearing from the media alone.
+//
+// `rank` is the ordering that matters to a UI: 0 is the loudest speaker currently
+// being forwarded. Slots themselves stay fixed; only who sits in them moves.
+message AudioAssignment {
+  string mid = 1;
+  string track_id = 2;
+
+  // 0 is the loudest currently-forwarded speaker. Ranks are contiguous over the
+  // speakers being forwarded, so the set of ranks is 0..N for N occupied slots.
+  uint32 rank = 3;
+
+  // Most recent loudness, in negative dBov as RFC 6464 carries it: 0 is full
+  // scale, around -30 is ordinary speech, quieter is more negative. Present so a
+  // recording has the loudness envelope without re-deriving it from the media, and
+  // so a UI can show speaking intensity rather than a binary indicator.
+  int32 level_dbov = 4;
+}
+
 // ========================================================================
 // 2. Server -> Client (Unified State Synchronization)
 // ========================================================================
@@ -46,6 +70,12 @@ message StateUpdate {
   // User State (Active Assignments)
   repeated VideoAssignment assignments_upsert = 5;
   repeated string assignments_remove = 6;
+
+  // Who is currently being heard, and how loudly. Sent when the set of forwarded
+  // speakers or their ordering changes; `audio_remove` carries the mids whose slot
+  // fell silent.
+  repeated AudioAssignment audio_upsert = 7;
+  repeated string audio_remove = 8;
 }
 
 // ========================================================================

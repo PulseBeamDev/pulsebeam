@@ -12,7 +12,7 @@ use slotmap::{SlotMap, new_key_type};
 
 use crate::audio_selector::TopNAudioSelector;
 use crate::clock::WallAnchor;
-use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
+use crate::entity::{AudioOrigin, ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::{DataLane, Topic, Track, TrackMeta};
@@ -78,6 +78,7 @@ pub(crate) trait RoutingContext: ShardTransport {
         &mut self,
         subscriber: ParticipantHandle,
         slot_idx: AudioSelectorSlotId,
+        origin: AudioOrigin,
         pkt: &RtpPacket,
     );
     fn forward_sctp(
@@ -1773,7 +1774,15 @@ impl ShardRoutingTable {
             if participant.participant_id() == ev.origin {
                 continue;
             }
-            ctx.forward_audio_rtp(participant, slot_idx, &ev.pkt);
+            ctx.forward_audio_rtp(
+                participant,
+                slot_idx,
+                AudioOrigin {
+                    participant: ev.origin,
+                    track: ev.stream_id.0,
+                },
+                &ev.pkt,
+            );
         }
     }
 
@@ -2127,6 +2136,7 @@ mod tests {
             &mut self,
             subscriber: ParticipantHandle,
             slot_idx: AudioSelectorSlotId,
+            _origin: AudioOrigin,
             _pkt: &RtpPacket,
         ) {
             self.forwarded_audio

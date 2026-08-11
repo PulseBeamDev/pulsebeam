@@ -6,6 +6,7 @@ mod mailbox;
 mod ordered_topic;
 mod session;
 mod slots;
+pub use slots::Speaker;
 
 pub use builder::AgentBuilder;
 pub use driver::{AgentError, ParticipantId, StatisticsSnapshot, VideoPreset};

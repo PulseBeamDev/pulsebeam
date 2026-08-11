@@ -3,6 +3,7 @@ mod video;
 
 use std::time::Duration;
 
+use crate::entity::AudioOrigin;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
 use crate::id::AudioSelectorSlotId;
@@ -411,10 +412,21 @@ impl DownstreamAllocator {
     pub fn on_forward_audio_rtp(
         &mut self,
         slot_idx: AudioSelectorSlotId,
+        origin: AudioOrigin,
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) {
-        self.audio.on_rtp(slot_idx, pkt, writer);
+        self.audio.on_rtp(slot_idx, origin, pkt, writer);
+    }
+
+    /// Whether someone new took over an audio slot since this was last asked.
+    pub fn take_audio_speakers_changed(&mut self) -> bool {
+        self.audio.take_speakers_changed()
+    }
+
+    /// Who this subscriber is currently hearing, loudest first.
+    pub fn audio_assignments(&self) -> Vec<crate::participant::downstream::audio::Heard> {
+        self.audio.assignments()
     }
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) -> Option<&TrackLayer> {

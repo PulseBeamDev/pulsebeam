@@ -10,7 +10,7 @@ use super::events::{
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
-    entity::{ParticipantId, TrackId, TrackKind},
+    entity::{AudioOrigin, ParticipantId, TrackId, TrackKind},
     id::ShardId,
     participant::{ParticipantConfig, batcher::GsoSendBatch},
     rtp::RtpPacket,
@@ -76,10 +76,11 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         &mut self,
         subscriber: ParticipantHandle,
         slot_idx: AudioSelectorSlotId,
+        origin: AudioOrigin,
         pkt: &RtpPacket,
     ) {
         if let Some(p) = self.registry.resolve_mut(subscriber) {
-            p.on_forward_audio_rtp(slot_idx, pkt);
+            p.on_forward_audio_rtp(slot_idx, origin, pkt);
             self.dirty.mark(subscriber, p);
         }
     }

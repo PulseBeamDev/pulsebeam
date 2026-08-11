@@ -46,6 +46,7 @@ pub struct SimClientBuilder {
     temporal_dd: Option<u8>,
     /// Publish audio at this loudness, in negative dBov. `None` publishes no audio.
     audio_level_dbov: Option<i8>,
+    receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
 }
@@ -75,6 +76,7 @@ impl SimClientBuilder {
             vbr_profile: None,
             temporal_dd: None,
             audio_level_dbov: None,
+            receives_audio: false,
             opaque_payload: false,
         })
     }
@@ -101,6 +103,7 @@ impl SimClientBuilder {
             vbr_profile: None,
             temporal_dd: None,
             audio_level_dbov: None,
+            receives_audio: false,
             opaque_payload: false,
         })
     }
@@ -117,6 +120,7 @@ impl SimClientBuilder {
     /// the receiving end of `TopNAudioSelector`'s slots.
     pub fn receive_audio(mut self, capacity: usize) -> Self {
         self.agent_builder = self.agent_builder.audio_downstream_slots(capacity);
+        self.receives_audio = true;
         self
     }
 
@@ -199,6 +203,14 @@ impl SimClientBuilder {
         };
         let (incoming_track_tx, incoming_tracks) = tokio::sync::mpsc::channel(32);
         let participants = agent.participants();
+        let audio_tracks = if self.receives_audio {
+            // Registered before anything is heard: audio has no per-speaker subscription, so
+            // whoever the SFU picks arrives unasked and there is nowhere to put them otherwise.
+            Some(agent.media().receive_audio().await?)
+        } else {
+            None
+        };
+        let speakers = self.receives_audio.then(|| agent.media().speakers());
         tracing::info!("connected to {room}");
         let video_rx = self
             .video_rx
@@ -228,6 +240,39 @@ impl SimClientBuilder {
             audio_rx,
             local_publications: local_video.into_iter().collect(),
         };
+        if let Some(mut audio_tracks) = audio_tracks {
+            let log = ctx.audio_rx.clone();
+            join_set.spawn(async move {
+                while let Ok(mut track) = audio_tracks.next().await {
+                    let publisher = track.publisher_id().to_owned();
+                    let log = log.clone();
+                    tokio::spawn(async move {
+                        while let Ok(rtp) = track.recv().await {
+                            log.lock().unwrap().record(
+                                &publisher,
+                                rtp.payload.len(),
+                                Instant::now(),
+                            );
+                        }
+                    });
+                }
+            });
+        }
+        if let Some(mut speakers) = speakers {
+            let log = ctx.audio_rx.clone();
+            join_set.spawn(async move {
+                loop {
+                    for speaker in speakers.current().iter() {
+                        log.lock()
+                            .unwrap()
+                            .record_rank(&speaker.participant_id, speaker.rank);
+                    }
+                    if speakers.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
         for publication in &ctx.local_publications {
             for sender in publication.encodings().iter().cloned() {
                 let rid = sender.rid();
@@ -318,6 +363,12 @@ pub struct AudioStream {
     /// Audio is far less forgiving than video here. A picture that misses 200ms is a stutter
     /// nobody remarks on; a voice that drops 200ms loses a syllable.
     pub longest_gap: Duration,
+    /// The best (loudest) rank the SFU ever gave this speaker, as signalled.
+    ///
+    /// Packets alone say a speaker got through; the rank says where the SFU placed them. A test
+    /// that the loudest voice wins needs both, because "heard" and "heard as the loudest" are
+    /// different claims and only the second is the selector's contract.
+    pub best_rank: Option<u32>,
     last_at: Option<Instant>,
 }
 
@@ -350,6 +401,19 @@ impl AudioReceiveLog {
             .entry(publisher.to_owned())
             .or_default()
             .record(bytes, now);
+    }
+
+    fn record_rank(&mut self, publisher: &str, rank: u32) {
+        let entry = self.by_publisher.entry(publisher.to_owned()).or_default();
+        entry.best_rank = Some(entry.best_rank.map_or(rank, |best| best.min(rank)));
+    }
+
+    /// Speakers this listener was told about, whether or not media arrived.
+    pub fn ranked(&self) -> std::collections::BTreeMap<String, u32> {
+        self.by_publisher
+            .iter()
+            .filter_map(|(publisher, s)| s.best_rank.map(|rank| (publisher.clone(), rank)))
+            .collect()
     }
 
     /// Speakers this listener actually heard.
@@ -654,38 +718,20 @@ impl SimClient {
                         self.ctx
                             .remote_tracks
                             .insert(publication_id.clone(), publication_id);
-                        if track.kind() == Some(pulsebeam_agent::str0m::media::MediaKind::Audio) {
-                            // Audio is logged per speaker and not reassembled into frames. The
-                            // question audio raises is *who* got through the SFU's speaker
-                            // selection, which a frame count cannot answer, and running it through
-                            // the video depacketizer would corrupt the video QoE figures besides.
-                            let log = self.ctx.audio_rx.clone();
-                            let publisher = track.publisher_id().to_owned();
-                            self.join_set.spawn(async move {
-                                while let Ok(rtp) = track.recv().await {
-                                    log.lock().unwrap().record(
-                                        &publisher,
-                                        rtp.payload.len(),
-                                        Instant::now(),
-                                    );
-                                }
-                            });
-                        } else {
-                            let log = self.ctx.video_rx.clone();
-                            self.join_set.spawn(async move {
-                                // The agent forwards RTP; reassemble frames here (the
-                                // "higher layer") before logging QoE.
-                                let mut receiver = pulsebeam_agent::FrameReceiver::new();
-                                while let Ok(rtp) = track.recv().await {
-                                    for frame in receiver.push(rtp) {
-                                        log.lock().unwrap().record(&frame);
-                                    }
-                                }
-                                for frame in receiver.flush() {
+                        let log = self.ctx.video_rx.clone();
+                        self.join_set.spawn(async move {
+                            // The agent forwards RTP; reassemble frames here (the
+                            // "higher layer") before logging QoE.
+                            let mut receiver = pulsebeam_agent::FrameReceiver::new();
+                            while let Ok(rtp) = track.recv().await {
+                                for frame in receiver.push(rtp) {
                                     log.lock().unwrap().record(&frame);
                                 }
-                            });
-                        }
+                            }
+                            for frame in receiver.flush() {
+                                log.lock().unwrap().record(&frame);
+                            }
+                        });
 
                         // Re-check the predicate after processing an event, since a new
                         // event may indicate the desired state has been reached.

@@ -399,6 +399,18 @@ pub struct TrackId {
     kind: TrackKind,
 }
 
+/// Who a forwarded audio packet came from.
+///
+/// The subscriber's audio slots are shared: the selector steals a slot the moment someone else
+/// is louder, so the mid and the SSRC carrying a packet say nothing about who spoke. Both halves
+/// travel with the packet because the subscriber needs the track to name the stream and the
+/// participant to attribute it to a person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AudioOrigin {
+    pub participant: ParticipantId,
+    pub track: TrackId,
+}
+
 impl TrackId {
     pub fn kind(&self) -> TrackKind {
         self.kind

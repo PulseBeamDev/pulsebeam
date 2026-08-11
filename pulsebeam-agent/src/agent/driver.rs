@@ -197,6 +197,8 @@ pub(crate) enum AgentEvent {
     StatsUpdated,
     RemoteTrackDiscovered(Track),
     RemoteTrackRemoved(String),
+    /// Who the SFU is forwarding audio for, loudest first, whenever that changes.
+    SpeakersChanged(Vec<crate::agent::slots::Speaker>),
     /// The SFU stopped forwarding this track - it is out of bandwidth for it, not gone. A UI
     /// should show a placeholder rather than the blank it would otherwise render.
     RemoteTrackPaused(String),
@@ -249,6 +251,8 @@ struct MediaSubsystem {
     /// that carries no media yet; its sender waits here until an assignment arrives, so raising
     /// the height later starts feeding the handle the subscriber already holds.
     pending_media_targets: HashMap<String, mailbox::Sender<RtpPacket>>,
+    /// Where to hand audio tracks the SFU decides to forward, once someone has asked for them.
+    audio_sink: Option<mailbox::Sender<RemoteTrack>>,
     layer_ctrl: LayerController,
     desired_ctrl: BitrateController,
     last_desired: Bitrate,
@@ -375,6 +379,7 @@ impl AgentDriver {
                 upstream_slots: HashMap::new(),
                 pending_media_subscriptions: HashMap::new(),
                 pending_media_targets: HashMap::new(),
+                audio_sink: None,
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
                 last_desired: Bitrate::bps(0),
@@ -788,6 +793,11 @@ impl AgentDriver {
                     let _ = response.send(Ok(()));
                 }
             }
+            OutgoingCommand::ReceiveAudio { response } => {
+                let (tx, rx) = mailbox::bounded(16);
+                self.media.audio_sink = Some(tx);
+                let _ = response.send(rx);
+            }
             OutgoingCommand::SubscribeMedia {
                 subscription,
                 response,
@@ -1083,8 +1093,21 @@ impl AgentDriver {
                     self.media.pending_media_targets.remove(&track_id);
                     self.emit(AgentEvent::RemoteTrackRemoved(track_id));
                 }
+                if sync.speakers_changed {
+                    self.emit(AgentEvent::SpeakersChanged(self.slot_manager.speakers()));
+                }
                 for (mid, track) in assignments {
                     let track_id = track.id.clone();
+                    if track.kind == i32::from(signaling::TrackKind::Audio) {
+                        // Nobody subscribed to this: the SFU chose to forward it. Hand the whole
+                        // track over rather than looking for a waiting subscription.
+                        let (tx, rx) = mailbox::bounded(256);
+                        self.media.media_targets.insert(mid, tx);
+                        if let Some(sink) = &self.media.audio_sink {
+                            let _ = sink.try_send(RemoteTrack::new(track, rx));
+                        }
+                        continue;
+                    }
                     // A subscriber already holds the receiving half, from a subscription answered
                     // before this assignment existed. Wire its sender to the slot rather than
                     // replacing it, or the handle it is holding would never receive anything.

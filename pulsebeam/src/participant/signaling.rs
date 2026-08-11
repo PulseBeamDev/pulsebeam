@@ -31,6 +31,27 @@ struct PreviousAssignment {
     paused: bool,
 }
 
+/// What was last signalled for one audio slot.
+///
+/// Loudness is deliberately absent: it moves with every packet, so including it would make every
+/// packet a change. See `audio_assignment_changed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviousAudioAssignment {
+    track_id: String,
+    rank: u32,
+}
+
+fn audio_assignment_changed(
+    previous: Option<&PreviousAudioAssignment>,
+    current: &signaling::AudioAssignment,
+) -> bool {
+    debug_assert!(!current.mid.is_empty());
+    debug_assert!(!current.track_id.is_empty());
+    previous.is_none_or(|previous| {
+        previous.track_id != current.track_id || previous.rank != current.rank
+    })
+}
+
 fn assignment_changed(
     previous: Option<&PreviousAssignment>,
     current: &signaling::VideoAssignment,
@@ -59,6 +80,7 @@ pub struct Signaling {
     // We store the IDs of the objects sent in the last successful update.
     previous_track_ids: HashSet<String>,
     previous_assignments: HashMap<String, PreviousAssignment>,
+    previous_audio_assignments: HashMap<String, PreviousAudioAssignment>,
     last_client_intents: Option<HashMap<Mid, Intent>>,
 }
 
@@ -74,6 +96,7 @@ impl Signaling {
             // Initialize empty sets
             previous_track_ids: HashSet::new(),
             previous_assignments: HashMap::new(),
+            previous_audio_assignments: HashMap::new(),
             last_client_intents: None,
 
             slot_count: 0,
@@ -206,7 +229,8 @@ impl Signaling {
 
         // 1. Prepare Current State (The "Truth")
         // We gather all currently active tracks and assignments.
-        let current_tracks: Vec<signaling::Track> = downstream
+        let heard = downstream.audio_assignments();
+        let mut current_tracks: Vec<signaling::Track> = downstream
             .video
             .tracks()
             .map(|t| signaling::Track {
@@ -214,6 +238,26 @@ impl Signaling {
                 kind: signaling::TrackKind::Video.into(),
                 participant_id: t.origin.as_str(),
                 meta: Default::default(),
+            })
+            .collect();
+        // A speaker is only announced while they are being heard. Audio has no subscription for
+        // the client to make - the SFU decides who is forwarded - so the assignment arriving is
+        // the first the client knows of the track, and the track has to accompany it.
+        current_tracks.extend(heard.iter().map(|h| signaling::Track {
+            id: h.origin.track.as_str(),
+            kind: signaling::TrackKind::Audio.into(),
+            participant_id: h.origin.participant.as_str(),
+            meta: Default::default(),
+        }));
+
+        let current_audio: Vec<signaling::AudioAssignment> = heard
+            .iter()
+            .enumerate()
+            .map(|(rank, h)| signaling::AudioAssignment {
+                mid: h.mid.to_string(),
+                track_id: h.origin.track.as_str(),
+                rank: u32::try_from(rank).unwrap_or(u32::MAX),
+                level_dbov: i32::from(h.level_dbov),
             })
             .collect();
 
@@ -245,12 +289,25 @@ impl Signaling {
             })
             .collect();
         debug_assert_eq!(current_assign_map.len(), current_assignments.len());
+        let current_audio_map: HashMap<String, PreviousAudioAssignment> = current_audio
+            .iter()
+            .map(|a| {
+                (
+                    a.mid.clone(),
+                    PreviousAudioAssignment {
+                        track_id: a.track_id.clone(),
+                        rank: a.rank,
+                    },
+                )
+            })
+            .collect();
+        debug_assert_eq!(current_audio_map.len(), current_audio.len());
 
         // 3. Compute Deltas
         // If snapshot: removals are empty.
         // If delta: removals = previous - current.
-        let (tracks_remove, assignments_remove) = if self.pending_snapshot_request {
-            (vec![], vec![])
+        let (tracks_remove, assignments_remove, audio_remove) = if self.pending_snapshot_request {
+            (vec![], vec![], vec![])
         } else {
             (
                 self.previous_track_ids
@@ -262,10 +319,15 @@ impl Signaling {
                     .filter(|mid| !current_assign_map.contains_key(*mid))
                     .cloned()
                     .collect(),
+                self.previous_audio_assignments
+                    .keys()
+                    .filter(|mid| !current_audio_map.contains_key(*mid))
+                    .cloned()
+                    .collect(),
             )
         };
-        let (tracks_upsert, assignments_upsert) = if self.pending_snapshot_request {
-            (current_tracks, current_assignments)
+        let (tracks_upsert, assignments_upsert, audio_upsert) = if self.pending_snapshot_request {
+            (current_tracks, current_assignments, current_audio)
         } else {
             let track_ids_upsert: HashSet<String> = current_track_ids
                 .difference(&self.previous_track_ids)
@@ -282,6 +344,12 @@ impl Signaling {
                     .into_iter()
                     .filter(|a| assignment_changed(self.previous_assignments.get(&a.mid), a))
                     .collect(),
+                current_audio
+                    .into_iter()
+                    .filter(|a| {
+                        audio_assignment_changed(self.previous_audio_assignments.get(&a.mid), a)
+                    })
+                    .collect(),
             )
         };
 
@@ -296,6 +364,9 @@ impl Signaling {
 
             assignments_upsert,
             assignments_remove,
+
+            audio_upsert,
+            audio_remove,
         };
 
         let msg = signaling::ServerMessage {
@@ -314,6 +385,7 @@ impl Signaling {
         // Write succeeded: Update our "Previous" state to match "Current"
         self.previous_track_ids = current_track_ids;
         self.previous_assignments = current_assign_map;
+        self.previous_audio_assignments = current_audio_map;
 
         // Reset flags
         self.dirty_tracks = false;
@@ -333,6 +405,65 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
+
+    fn audio(mid: &str, track_id: &str, rank: u32, level_dbov: i32) -> signaling::AudioAssignment {
+        signaling::AudioAssignment {
+            mid: mid.to_owned(),
+            track_id: track_id.to_owned(),
+            rank,
+            level_dbov,
+        }
+    }
+
+    /// A slot steal has to reach the client: the mid and the SSRC do not move, so nothing else
+    /// tells it the voice it is hearing belongs to someone new.
+    #[test]
+    fn a_new_speaker_in_a_slot_is_an_audio_change() {
+        let previous = PreviousAudioAssignment {
+            track_id: "audio-a".to_owned(),
+            rank: 0,
+        };
+        assert!(audio_assignment_changed(
+            Some(&previous),
+            &audio("a0", "audio-b", 0, -30)
+        ));
+    }
+
+    /// Reordering is what a UI draws, so it counts even when nobody was replaced.
+    #[test]
+    fn a_reordering_is_an_audio_change() {
+        let previous = PreviousAudioAssignment {
+            track_id: "audio-a".to_owned(),
+            rank: 0,
+        };
+        assert!(audio_assignment_changed(
+            Some(&previous),
+            &audio("a0", "audio-a", 1, -30)
+        ));
+    }
+
+    /// Loudness moves with every packet. If it were a trigger, a room with two people talking
+    /// would produce a signalling message per packet - so it rides along on updates caused by
+    /// something else and never causes one itself.
+    #[test]
+    fn loudness_alone_is_not_an_audio_change() {
+        let previous = PreviousAudioAssignment {
+            track_id: "audio-a".to_owned(),
+            rank: 0,
+        };
+        assert!(!audio_assignment_changed(
+            Some(&previous),
+            &audio("a0", "audio-a", 0, -12)
+        ));
+    }
+
+    #[test]
+    fn a_first_sighting_is_an_audio_change() {
+        assert!(audio_assignment_changed(
+            None,
+            &audio("a0", "audio-a", 0, -30)
+        ));
+    }
 
     #[test]
     fn track_replacement_is_an_assignment_change() {

@@ -53,21 +53,9 @@ fn audio_reaches_the_room_test() {
 /// listener in a room is; the loud one is talking. The listener must hear the talker and only the
 /// talker - a selector that forwarded whoever arrived first would pass a byte count and fail this.
 ///
-/// **Ignored: a recorded defect.** It fails with `heard from: {}` because an application cannot
-/// receive audio at all, which is the other half of the audio bug.
-///
-/// Sending now works: the level is stamped, the SFU accepts and forwards, and the listener's
-/// transport receives ~50kB. But the agent hands incoming RTP to an application through
-/// `media_targets`, keyed by mid and populated *only* from `assignments_upsert` - and the protocol
-/// has one assignment type, `VideoAssignment`. There is no audio assignment anywhere in
-/// `signaling.proto`, and no audio handling in the driver. So the SFU chooses which speakers fill
-/// a subscriber's audio slots and never says who they are, and the packets arrive with nothing to
-/// deliver them to.
-///
-/// Closing that needs an assignment carrying mid -> speaker, the SFU emitting it as the selector
-/// switches, and the agent surfacing a `RemoteTrack` per audio slot. The receive path here is
-/// already written for it and will work unchanged once those exist.
-#[ignore = "an application cannot receive audio: the protocol has no audio assignment"]
+/// For a long time this could not pass at all: the SFU chose who filled a subscriber's audio slots
+/// and never said who they were, so packets arrived at the agent with nothing to deliver them to.
+/// `AudioAssignment` is what closed that, and removing it puts `heard from: {}` back.
 #[test]
 fn the_loudest_speaker_is_the_one_forwarded_test() {
     LocalNodeSim::new()
@@ -86,6 +74,42 @@ fn the_loudest_speaker_is_the_one_forwarded_test() {
                 description: "The talker got the slot, and the quiet one did not",
                 participant: "listener",
                 expected: &["loud"],
+            },
+        ]);
+}
+
+/// The listener is told who it is hearing, and where they rank.
+///
+/// Audio slots are shared and stolen: the mid and the SSRC carrying a voice stay put across a
+/// switch, so nothing in the media says the speaker changed. Without the assignment an
+/// application can play the audio and still not know whose face to light up - which is the
+/// difference between a conference call and a noise.
+///
+/// Two speakers and two slots, so both are heard and the ordering is the claim. The louder one
+/// must be signalled as rank 0.
+#[test]
+fn the_listener_is_told_who_it_is_hearing_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::data_participant("loud").speaking_at(-20))
+                .with_participant(Participant::data_participant("quiet").speaking_at(-45))
+                .with_participant(Participant::subscriber("listener").hearing(2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Both talk, and both fit",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckHeardFrom {
+                description: "Both speakers reach the listener",
+                participant: "listener",
+                expected: &["loud", "quiet"],
+            },
+            Step::CheckSpeakerRank {
+                description: "The louder speaker is signalled as the loudest",
+                participant: "listener",
+                expected: &[("loud", 0), ("quiet", 1)],
             },
         ]);
 }
