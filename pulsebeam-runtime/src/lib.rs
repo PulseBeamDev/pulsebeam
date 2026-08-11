@@ -11,6 +11,7 @@
 //! nothing here licenses an `Arc` inside a shard.
 #![allow(clippy::disallowed_types)]
 
+pub mod buggify;
 pub mod collections;
 pub mod fatal;
 pub mod mailbox;

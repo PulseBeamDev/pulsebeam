@@ -448,3 +448,99 @@ fn cross_shard_video_is_forwarded_decodably_test() {
             },
         ]);
 }
+
+/// The SFU keeps serving video while route installs are failing under it.
+///
+/// Every fallible internal call has a rollback written beside it, and none of them had ever run:
+/// the route table only fills at a participant count no plan reaches, so the four callers'
+/// recovery paths were dead code that happened to compile. `with_buggify` makes the failure
+/// happen on purpose.
+///
+/// The claim is deliberately about recovery rather than perfection. Some subscriptions will not
+/// install while the table is refusing, and that is the correct response to exhaustion - what may
+/// not happen is the node wedging, losing a stable stream, or tripping an assertion on the way
+/// through.
+///
+/// Single shard for now. Adding `.with_shards(3)` reaches the cross-shard installers and trips
+/// `core.rs`'s "no reverse route for a remotely published track" immediately: a failed reverse
+/// install publishes the track with no reverse handle, so keyframe requests for it are dropped for
+/// its whole life. That is a real defect with an open design question - whether a track that
+/// cannot be addressed should be announced at all - and it is not this plan's to answer.
+#[test]
+fn video_survives_failing_route_installs_test() {
+    LocalNodeSim::new()
+        .with_buggify(300)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("stable"))
+                .with_participant(Participant::subscriber("observer"))
+                .with_participant(Participant::single_publisher("joiner").starts_disconnected()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the stable pair",
+                duration: Duration::from_secs(10),
+            },
+            Step::Join {
+                description: "Another publisher arrives while installs are failing",
+                participant: "joiner",
+            },
+            Step::Run {
+                description: "Churn through the failures",
+                duration: Duration::from_secs(10),
+            },
+            Step::AbruptExit {
+                description: "And leaves without signalling",
+                participant: "joiner",
+            },
+            Step::Run {
+                description: "Recover",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckVideoQuality {
+                description: "The observer still receives renderable video throughout",
+                participant: "observer",
+                quality: VideoQuality::min_frames(100),
+            },
+        ]);
+
+    // Without this the plan passes hardest when it injects nothing. At 80 per thousand and a
+    // handful of install calls it injected nothing at all on the first seed tried, and looked
+    // exactly like a pass.
+    let (_, fired) = pulsebeam_runtime::buggify::coverage();
+    assert!(
+        !fired.is_empty(),
+        "no failure was injected, so this plan asserted only that the happy path works"
+    );
+}
+
+/// Every declared failure point is reachable, and the injector actually injects.
+///
+/// A `buggify!` site that no plan reaches is a failure path still untested, and it looks exactly
+/// like one that is covered - silence either way. This turns the declared sites into a list that
+/// has to be kept honest: reaching zero of them, or firing none of them, means the mechanism has
+/// quietly stopped doing anything.
+#[test]
+fn every_declared_failure_point_is_reachable_test() {
+    LocalNodeSim::new()
+        .with_buggify(500)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![Step::Run {
+            description: "Enough traffic to reach the route table",
+            duration: Duration::from_secs(10),
+        }]);
+
+    let (seen, fired) = pulsebeam_runtime::buggify::coverage();
+    assert!(
+        !seen.is_empty(),
+        "no buggify site was reached, so failure injection is testing nothing"
+    );
+    assert!(
+        !fired.is_empty(),
+        "buggify sites were reached ({seen:?}) but none fired at 50%, so injection is inert"
+    );
+}

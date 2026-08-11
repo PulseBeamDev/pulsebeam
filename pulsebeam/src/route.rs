@@ -573,6 +573,14 @@ impl RouteTable {
         ntp_ref: NtpTime,
         now: Instant,
     ) -> Result<(RouteId, u16), RouteError> {
+        // Exhaustion is the one failure every caller here has written a rollback for and none has
+        // ever taken: the table only fills under a participant count no plan reaches. Injecting it
+        // is what puts those four recovery paths under test at all.
+        if pulsebeam_runtime::buggify!("route table exhausted") {
+            return Err(RouteError::Exhausted {
+                max_slots: self.max_slots,
+            });
+        }
         let id = self.allocate(now)?;
         let epoch = self.epochs.get(id.index()).copied().unwrap_or(0);
         let Some(slot) = self.slots.get_mut(id.index()) else {

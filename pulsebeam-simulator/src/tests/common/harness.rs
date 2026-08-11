@@ -2816,6 +2816,7 @@ pub struct LocalNodeSim {
     tcp_only: bool,
     num_shards: usize,
     link: LinkProfile,
+    buggify_permille: u32,
 }
 
 impl Default for LocalNodeSim {
@@ -2833,6 +2834,7 @@ impl LocalNodeSim {
             subnet: None,
             tcp_only: false,
             num_shards: 1,
+            buggify_permille: 0,
             link: LinkProfile::default(),
         }
     }
@@ -2868,6 +2870,16 @@ impl LocalNodeSim {
     /// would share a network.
     pub fn with_subnet(mut self, subnet: u8) -> Self {
         self.subnet = Some(1 + (subnet % 200));
+        self
+    }
+
+    /// Inject failures at declared points, `permille` parts per thousand.
+    ///
+    /// Off everywhere else, so the rest of the suite keeps asserting against a system where
+    /// nothing unexpected fails. A plan that turns this on is asserting something different: that
+    /// the recovery paths hold, not that the happy path is correct.
+    pub fn with_buggify(mut self, permille: u32) -> Self {
+        self.buggify_permille = permille;
         self
     }
 
@@ -2922,6 +2934,7 @@ impl LocalNodeSim {
         // from turmoil's RNG, so it has to be seeded too or a sweep replays one
         // impairment pattern under every seed.
         pulsebeam_runtime::net::shaper::seed_impairments(self.rng_seed);
+        pulsebeam_runtime::buggify::enable(self.buggify_permille, self.rng_seed);
         tracing::info!(
             seed = self.rng_seed,
             "simulation plan seed; replay with `make test-sim-seed SEED={}`",
