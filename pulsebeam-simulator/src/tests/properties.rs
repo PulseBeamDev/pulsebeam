@@ -50,6 +50,7 @@ use super::common::{LinkProfile, LinkReport, LocalNodeSim, Participant, Room, St
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// The simulcast ladder every plan here publishes, and the single-layer screen share rate.
@@ -547,6 +548,93 @@ impl Scenario {
             .cloned()
             .expect("the viewer should have been measured")
     }
+
+    /// The same scenario with two viewers, at a chosen shard count, reporting on both.
+    ///
+    /// Two because one cannot see the failures that matter here: a fanout serving only the first
+    /// subscriber on a shard looks perfect to a plan with one subscriber, and that is exactly how
+    /// a data-topic drop stayed green.
+    fn run_two_viewers(
+        &self,
+        namespace: &str,
+        placement: Placement,
+    ) -> BTreeMap<String, DeliverySignature> {
+        let publisher = if self.demand.screenshare {
+            Participant::screensharer("publisher")
+        } else {
+            Participant::publisher("publisher", &["q", "h", "f"])
+        };
+        const TARGETS: &[(&str, u32)] = &[("publisher", 720)];
+        let plan = vec![
+            Step::Run {
+                description: "Establish connections and discover the track",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeTo {
+                description: "First viewer subscribes",
+                participant: "viewer",
+                targets: TARGETS,
+            },
+            Step::SubscribeTo {
+                description: "Second viewer subscribes",
+                participant: "viewer2",
+                targets: TARGETS,
+            },
+            Step::Run {
+                description: "Settle",
+                duration: self.path.settle(),
+            },
+            Step::Run {
+                description: "Measurement window",
+                duration: Duration::from_secs(20),
+            },
+        ];
+
+        let room = Room::new("room1")
+            .with_participant(publisher)
+            .with_participant(Participant::manual_subscriber("viewer", 1))
+            .with_participant(Participant::manual_subscriber("viewer2", 1));
+
+        LocalNodeSim::new()
+            .with_subnet(self.subnet(namespace))
+            .with_link(self.path.profile())
+            .with_bandwidth(self.capacity_bps)
+            .with_shards(placement.shards())
+            .with_room(room)
+            .run_collecting(plan)
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("viewer"))
+            .map(|(name, report)| (name.to_owned(), DeliverySignature::of(&report)))
+            .collect()
+    }
+}
+
+/// What a subscriber observably got, coarse enough to survive a different packet schedule.
+///
+/// Deliberately not bitrates or byte counts: two shard layouts schedule packets differently, so
+/// those differ by a little every run and comparing them would report noise. What must not differ
+/// is *whether a subscriber was served at all* and *which publishers reached it* - the questions
+/// both cross-shard defects found so far got wrong.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DeliverySignature {
+    received_media: bool,
+    served_origins: Vec<String>,
+}
+
+impl DeliverySignature {
+    fn of(report: &LinkReport) -> Self {
+        let mut served_origins: Vec<String> = report
+            .forwarded_quality
+            .iter()
+            .filter(|(_, quality)| **quality > 0)
+            .map(|(origin, _)| (*origin).to_owned())
+            .collect();
+        served_origins.sort();
+        Self {
+            received_media: report.received_bytes > 0,
+            served_origins,
+        }
+    }
 }
 
 fn config(cases: u32) -> ProptestConfig {
@@ -684,6 +772,49 @@ where
     if let Err(err) = runner.run(&strategy, test) {
         panic!("{err}\n\nreplay this exact run with:\n    make test-sim-seed SEED={seed}\n");
     }
+}
+
+/// How the node is sharded must not change who gets served.
+///
+/// A differential property: rather than asserting what the right outcome is, it runs the same
+/// scenario in two configurations that must agree, and reports the disagreement. That makes it the
+/// one oracle here immune to the problem every threshold has - there is no number to pick, no
+/// argument about what a correct controller should achieve, and no way for it to be quietly wrong
+/// in the way `QueueingDelayBelow` was.
+///
+/// Sharding is a placement decision. `SO_REUSEPORT` hashes a 4-tuple, so which worker owns a
+/// participant is not something the application chose and must not be something a subscriber can
+/// notice. Every cross-shard defect found so far is a difference this would have reported
+/// immediately and unambiguously: a data topic reaching only the first subscriber on a shard, and
+/// a keyframe path that went nowhere for a shard that joined the room late.
+///
+/// Bitrates are excluded on purpose - see [`DeliverySignature`]. Only the questions those bugs got
+/// wrong are compared.
+#[test]
+fn sharding_does_not_change_who_is_served() {
+    check(
+        SPACIOUS,
+        scenarios(Demand::any(), Budget::Ample, NO_FAULT),
+        |scenario| {
+            let single = scenario.run_two_viewers("shard_equiv", Placement::SingleShard);
+            let multi = scenario.run_two_viewers("shard_equiv", Placement::MultiShard);
+
+            prop_assert!(
+                single.values().any(|s| s.received_media),
+                "neither viewer received anything even on one shard, so this case proves \
+                 nothing about sharding ({scenario:?}, {single:?})"
+            );
+            prop_assert_eq!(
+                &single,
+                &multi,
+                "spreading the node across shards changed who was served. A subscriber cannot \
+                 tell which worker owns it, so this is the SFU losing a stream to its own \
+                 internal placement ({:?})",
+                scenario
+            );
+            Ok(())
+        },
+    );
 }
 
 /// On a link with room to spare, a subscribed stream must actually be delivered.
