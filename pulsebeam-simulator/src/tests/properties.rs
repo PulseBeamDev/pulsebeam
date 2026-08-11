@@ -837,6 +837,45 @@ fn sharding_does_not_change_who_is_served() {
 // lands once they are. Choosing a bound large enough to pass today would leave a green test
 // asserting nothing anyone cares about.
 
+/// A stream the SFU stops forwarding must be *signalled* as paused, not merely go quiet.
+///
+/// This is the complaint that started the QoE work, stated as a property: on a weak link a tile
+/// renders blank, when a placeholder saying "paused" would tell the viewer what is happening. From
+/// the media alone the two are identical - a paused stream and a dead connection are both an
+/// absence of packets - so the client can only draw the right thing if it was told.
+///
+/// The generator runs tight links so the allocator has to shed something. Whenever it does, the
+/// viewer must have heard about it.
+#[test]
+fn a_stream_the_sfu_sheds_is_signalled_not_just_silent() {
+    check(
+        SATURATED,
+        scenarios(Demand::contended(), Budget::Tight, NO_FAULT),
+        |scenario| {
+            let report = scenario.run("pause_signalled");
+            prop_assume!(report.samples > 0);
+
+            // Only meaningful where something was actually shed.
+            let shed: Vec<&str> = report
+                .forwarded_quality
+                .iter()
+                .filter(|(_, quality)| **quality == 0)
+                .map(|(origin, _)| *origin)
+                .collect();
+            prop_assume!(!shed.is_empty());
+
+            prop_assert!(
+                !report.signalled_paused.is_empty(),
+                "the SFU stopped forwarding {shed:?} and the viewer was never told. A client \
+                 cannot tell that from a dead connection, so it renders a blank tile where a \
+                 placeholder belongs ({:?})",
+                scenario,
+            );
+            Ok(())
+        },
+    );
+}
+
 /// Bytes arriving is not a picture. What arrives must be decodable.
 ///
 /// Every other claim here is about bytes, bitrates and layer indices, and a viewer cannot see any

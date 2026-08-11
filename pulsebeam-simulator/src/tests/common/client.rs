@@ -37,6 +37,7 @@ pub struct SimClientBuilder {
     ip: IpAddr,
     agent_builder: AgentBuilder,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
+    paused_publishers: Option<Arc<Mutex<std::collections::BTreeSet<String>>>>,
     publishes_video: bool,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
@@ -65,6 +66,7 @@ impl SimClientBuilder {
             ip,
             agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
             video_rx: None,
+            paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
@@ -88,6 +90,7 @@ impl SimClientBuilder {
                 .with_local_ip(ip)
                 .with_tcp_server_addr(server_tcp_addr),
             video_rx: None,
+            paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
@@ -137,6 +140,14 @@ impl SimClientBuilder {
 
     /// Inject a shared `VideoReceiveLog` so the harness can read it externally.
     /// If not called, `connect()` allocates a private one.
+    pub fn with_paused_publishers(
+        mut self,
+        seen: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    ) -> Self {
+        self.paused_publishers = Some(seen);
+        self
+    }
+
     pub fn with_video_rx(mut self, rx: Arc<Mutex<VideoReceiveLog>>) -> Self {
         self.video_rx = Some(rx);
         self
@@ -159,6 +170,9 @@ impl SimClientBuilder {
         let video_rx = self
             .video_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
+        let ctx_paused_publishers = self
+            .paused_publishers
+            .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::BTreeSet::new())));
         let ctx = ClientContext {
             ip: self.ip,
             agent,
@@ -171,6 +185,7 @@ impl SimClientBuilder {
             ordered_publishers: Arc::new(Mutex::new(HashMap::new())),
             ordered_subscribers: Arc::new(Mutex::new(HashMap::new())),
             remote_tracks: HashMap::new(),
+            paused_publishers: ctx_paused_publishers,
             requested_tracks: HashSet::new(),
             received_data: Vec::new(),
             video_rx,
@@ -381,6 +396,14 @@ pub struct ClientContext {
     pub discovered_tracks: HashSet<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
     pub remote_tracks: HashMap<String, String>,
+    /// Publishers the SFU told this viewer it had stopped forwarding, at any point in the run.
+    ///
+    /// The distinction the whole pause signal exists for: a stream can stop because the SFU shed
+    /// it or because the connection died, and from the media alone those are identical. Recording
+    /// the signal lets a plan assert the viewer was *told*, not merely that packets stopped.
+    ///
+    /// Shared with the harness the same way `video_rx` is, so a plan can read it after the run.
+    pub paused_publishers: Arc<Mutex<std::collections::BTreeSet<String>>>,
     pub(crate) requested_tracks: HashSet<String>,
     pub published_topics: Arc<Mutex<HashMap<String, DataPublisher>>>,
     pub subscribed_topics: SubscribedTopics,
@@ -506,6 +529,11 @@ impl SimClient {
                         match change {
                             ParticipantChange::Joined(participant)
                             | ParticipantChange::Updated(participant) => {
+                                if participant.video_paused()
+                                    && let Ok(mut seen) = self.ctx.paused_publishers.lock()
+                                {
+                                    seen.insert(participant.id().to_string());
+                                }
                                 self.ctx
                                     .discovered_tracks
                                     .insert(participant.id().clone());

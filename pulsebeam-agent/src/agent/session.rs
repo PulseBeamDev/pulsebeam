@@ -272,6 +272,25 @@ impl Participant {
             })
     }
 
+    /// Whether the SFU has stopped forwarding this participant's video.
+    ///
+    /// A paused track is present and not flowing - the SFU could not afford it and shed it rather
+    /// than dropping the subscription. Distinguishing that from a dead connection is what lets a
+    /// UI show a placeholder instead of a blank tile, and it is not inferable from the media
+    /// stream, where both look like an absence of packets.
+    pub fn video_paused(&self) -> bool {
+        self.agent
+            .inner
+            .publications
+            .borrow()
+            .values()
+            .any(|publication| {
+                publication.publisher_id() == self.id
+                    && publication.kind() == Some(str0m::media::MediaKind::Video)
+                    && publication.is_paused()
+            })
+    }
+
     pub fn has_audio(&self) -> bool {
         self.agent
             .inner
@@ -380,6 +399,10 @@ impl IntoFuture for VideoSubscriber {
 struct ParticipantAvailability {
     video: bool,
     audio: bool,
+    /// Whether the SFU has stopped forwarding the video. Part of availability rather than a detail
+    /// of it: a paused track is present and not flowing, and a change feed that omitted it left
+    /// applications redrawing nothing while the picture stopped.
+    video_paused: bool,
 }
 
 pub enum ParticipantChange {
@@ -461,9 +484,16 @@ fn participant_availability(
             .or_insert(ParticipantAvailability {
                 video: false,
                 audio: false,
+                video_paused: false,
             });
         match publication.kind() {
-            Some(str0m::media::MediaKind::Video) => availability.video = true,
+            Some(str0m::media::MediaKind::Video) => {
+                availability.video = true;
+                // Part of availability, not merely a detail of it: a paused track is present and
+                // not flowing, and a change feed that omits it leaves an application redrawing
+                // nothing while the picture stops.
+                availability.video_paused |= publication.is_paused();
+            }
             Some(str0m::media::MediaKind::Audio) => availability.audio = true,
             None => {}
         }
@@ -515,6 +545,7 @@ mod tests {
             ParticipantAvailability {
                 video: true,
                 audio: true,
+                video_paused: false,
             }
         );
     }
