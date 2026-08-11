@@ -2289,11 +2289,18 @@ fn a_busy_room_starves_nobody_test() {
     room = room.with_participant(Participant::manual_subscriber("viewer", PUBLISHERS.len()));
 
     LocalNodeSim::new()
-        // Sized just above what the asserted outcome costs: six 180p floors at 150 kbps plus the
-        // speaker's 1.25 Mbps top layer is 2.15 Mbps. A paused tile here was therefore never
-        // priced out, and six top layers were never affordable, so the allocator has to choose
-        // rather than being handed enough for everything.
-        .with_bandwidth(2_500_000)
+        // Comfortably above what the asserted outcome costs - six 180p floors at 150 kbps plus
+        // the speaker's 1.25 Mbps top layer is 2.15 Mbps - while six top layers at 7.5 Mbps stay
+        // far out of reach, so the allocator still has to choose rather than being handed enough
+        // for everything.
+        //
+        // Sized at 2.5 Mbps this needed the *estimate* to reach 86% of the link before the
+        // allocator could seat all six, which made an allocator claim contingent on an estimator
+        // one. It passed at the committed seed and failed at seed 2 by 1.6%, with the estimate
+        // ranging 1.76-3.45 Mbps across the run: the verdict came down to where it happened to be
+        // at the final sample. The claim being made here is that a tile is never *overlooked*, so
+        // the budget has to be one the allocator cannot blame.
+        .with_bandwidth(3_000_000)
         .with_room(room)
         .run(vec![
             Step::Run {
