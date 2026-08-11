@@ -758,6 +758,12 @@ pub struct AudioLooper {
     /// 1.2s of pause at a 20ms cadence.
     spurt_packets: u64,
     pause_packets: u64,
+    /// Where in the cycle this source starts.
+    ///
+    /// Two sources at the same level and the same phase always talk over each other, so the
+    /// selector ranks them and never switches. Offsetting one makes them take turns, which is the
+    /// only way a plan reaches the slot-stealing path.
+    phase_offset: u64,
 }
 
 impl AudioLooper {
@@ -769,6 +775,7 @@ impl AudioLooper {
             packet_ms: 20,
             spurt_packets: 90,
             pause_packets: 60,
+            phase_offset: 0,
         }
     }
 
@@ -779,6 +786,12 @@ impl AudioLooper {
             talks: false,
             ..Self::speaking()
         }
+    }
+
+    /// Start this source part-way through its speech cycle, so it takes turns with another.
+    pub fn with_phase_offset(mut self, packets: u64) -> Self {
+        self.phase_offset = packets;
+        self
     }
 
     /// Override the declared loudness, for plans about who the SFU picks.
@@ -799,7 +812,10 @@ impl AudioLooper {
             return (self.level_dbov, false, 8);
         }
         let cycle = self.spurt_packets.saturating_add(self.pause_packets).max(1);
-        let phase = packet.checked_rem(cycle).unwrap_or(0);
+        let phase = packet
+            .saturating_add(self.phase_offset)
+            .checked_rem(cycle)
+            .unwrap_or(0);
         if phase >= self.spurt_packets {
             // Between spurts: comfort noise, far below anything the selector will rank.
             return (-70, false, 8);

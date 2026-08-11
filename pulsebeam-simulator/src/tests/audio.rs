@@ -42,38 +42,45 @@ fn audio_reaches_the_room_test() {
         ]);
 }
 
-/// The loudest speaker is the one forwarded.
+/// The loudest speakers are the ones forwarded.
 ///
-/// The SFU forwards only the loudest few, so a room that outnumbers a subscriber's slots puts
-/// `TopNAudioSelector` in charge of who is heard. Until audio ran in simulation at all, that code
-/// had only ever been exercised by its own unit tests - never against a real participant, a real
-/// negotiation, or a real link. This is the first plan that makes it choose.
+/// The SFU forwards a fixed number of speakers at a time, so a room with more voices than slots
+/// puts `TopNAudioSelector` in charge of who is heard. Until audio ran in simulation at all, that
+/// code had only ever been exercised by its own unit tests - never against a real participant, a
+/// real negotiation, or a real link.
 ///
-/// One slot and two speakers, one of them 50dB louder. The quiet one is present and unmuted, as a
-/// listener in a room is; the loud one is talking. The listener must hear the talker and only the
-/// talker - a selector that forwarded whoever arrived first would pass a byte count and fail this.
+/// Four speakers and three slots. Three are talking; the fourth is present and unmuted but quiet,
+/// as a listener in a room is. The quiet one must be the one left out - a selector that forwarded
+/// whoever arrived first would pass a byte count and fail this.
+///
+/// Note the four speakers: the slot count is a property of the room, not of the listener, so
+/// asking to hear fewer does not create contention. An earlier version of this plan had two
+/// speakers and a listener asking for one slot, and passed only because the second audio mid had
+/// no send stream declared on it and silently dropped everything.
 ///
 /// For a long time this could not pass at all: the SFU chose who filled a subscriber's audio slots
 /// and never said who they were, so packets arrived at the agent with nothing to deliver them to.
 /// `AudioAssignment` is what closed that, and removing it puts `heard from: {}` back.
 #[test]
-fn the_loudest_speaker_is_the_one_forwarded_test() {
+fn the_loudest_speakers_are_the_ones_forwarded_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::data_participant("loud").speaking_at(-25))
+                .with_participant(Participant::data_participant("louder").speaking_at(-20))
+                .with_participant(Participant::data_participant("loudest").speaking_at(-15))
                 .with_participant(Participant::data_participant("faint").speaking_at(-75))
-                .with_participant(Participant::subscriber("listener").hearing(1)),
+                .with_participant(Participant::subscriber("listener").hearing(3)),
         )
         .run(vec![
             Step::Run {
-                description: "Both talk; only one slot is available",
+                description: "Three talk over each other; there are three slots",
                 duration: Duration::from_secs(10),
             },
             Step::CheckHeardFrom {
-                description: "The talker got the slot, and the quiet one did not",
+                description: "The talkers got the slots, and the quiet one did not",
                 participant: "listener",
-                expected: &["loud"],
+                expected: &["loud", "louder", "loudest"],
             },
         ]);
 }

@@ -58,6 +58,8 @@ pub struct Participant {
     /// Separate from the role: a conference participant sends audio *and* video, and the audio
     /// path is selected independently of the video one.
     pub audio_level_dbov: Option<i8>,
+    /// Where in its speech cycle this speaker starts, in 20ms packets.
+    pub audio_phase_offset: u64,
     /// Publish a synthetic temporal Dependency Descriptor with this many layers,
     /// so the SFU can exercise decode-target shedding.
     pub temporal_dd: Option<u8>,
@@ -82,6 +84,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             audio_level_dbov: None,
+            audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
@@ -100,6 +103,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             audio_level_dbov: None,
+            audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
@@ -118,6 +122,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             audio_level_dbov: None,
+            audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
@@ -137,6 +142,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             audio_level_dbov: None,
+            audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
@@ -164,6 +170,7 @@ impl Participant {
             auto_subscribe: true,
             temporal_dd: None,
             audio_level_dbov: None,
+            audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
@@ -209,7 +216,11 @@ impl Participant {
         self
     }
 
-    /// Receive up to `slots` simultaneous speakers.
+    /// Reserve `slots` receive transceivers for audio.
+    ///
+    /// Not a cap on who the SFU forwards: how many speakers are selected is a property of the
+    /// room, so a plan that wants contention needs more speakers than the room has slots, not a
+    /// listener asking for fewer.
     pub fn hearing(mut self, slots: usize) -> Self {
         self.audio_slots = slots;
         self
@@ -221,6 +232,16 @@ impl Participant {
     /// this and forwards only the loudest few, so the value decides who gets heard.
     pub fn speaking_at(mut self, level_dbov: i8) -> Self {
         self.audio_level_dbov = Some(level_dbov);
+        self
+    }
+
+    /// Talk in turn with another speaker rather than over them.
+    ///
+    /// Two sources at the same loudness and the same phase talk simultaneously forever, so the
+    /// selector ranks them once and never switches. Offsetting one is what makes a slot change
+    /// hands, and slot stealing is where audio is hardest.
+    pub fn taking_turns_after(mut self, packets: u64) -> Self {
+        self.audio_phase_offset = packets;
         self
     }
 
@@ -853,7 +874,7 @@ async fn run_participant(
         // After the role's video slots. Transceivers are reserved in order, so putting audio first
         // shifts the mids the video paths are matched on and the viewer receives nothing at all.
         if let Some(level) = config.audio_level_dbov {
-            builder = builder.publish_audio(level);
+            builder = builder.publish_audio(level, config.audio_phase_offset);
         }
         if config.audio_slots > 0 {
             builder = builder.receive_audio(config.audio_slots);
