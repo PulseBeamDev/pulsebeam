@@ -152,7 +152,10 @@ impl Placement {
 /// Burst loss and reordering used to live here too, which double-counted them: `Path::Wifi` and
 /// `Path::Cellular` already lose in bursts and deliver out of order, so generating them again as
 /// faults multiplied the space without reaching a new decision. What is left is the thing a path
-/// character cannot express - an interruption with a beginning and an end.
+/// character cannot express: an interruption with a beginning and an end, and the arrival and
+/// departure of other participants. Timing rides on the variant rather than crossing it with a
+/// separate axis - "during ramp vs settled" would double the whole space, and the placement that
+/// matters differs per disturbance anyway.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fault {
     None,
@@ -160,6 +163,12 @@ enum Fault {
     /// the point where ICE tears the session down; past that it is not an impairment but a lost
     /// session, which is a different failure with a different fix.
     Outage,
+    /// Another publisher dies without signalling, mid-measurement.
+    PeerCrash,
+    /// Another publisher leaves cleanly and comes back.
+    PeerRejoin,
+    /// Several arrive and leave in quick succession.
+    PeerStorm,
 }
 
 impl Fault {
@@ -186,9 +195,93 @@ impl Fault {
                     duration: Duration::from_secs(40),
                 },
             ],
+            Fault::PeerCrash => vec![
+                Step::Join {
+                    description: "Another publisher joins",
+                    participant: CHURNERS[0],
+                },
+                Step::Run {
+                    description: "It publishes for a while",
+                    duration: Duration::from_secs(6),
+                },
+                Step::AbruptExit {
+                    description: "It dies without signalling",
+                    participant: CHURNERS[0],
+                },
+                Step::Run {
+                    description: "Carry on without it",
+                    duration: Duration::from_secs(8),
+                },
+            ],
+            Fault::PeerRejoin => vec![
+                Step::Join {
+                    description: "Another publisher joins",
+                    participant: CHURNERS[0],
+                },
+                Step::Run {
+                    description: "It publishes for a while",
+                    duration: Duration::from_secs(6),
+                },
+                Step::Disconnect {
+                    description: "It leaves cleanly",
+                    participant: CHURNERS[0],
+                },
+                Step::Run {
+                    description: "Gap before it returns",
+                    duration: Duration::from_secs(4),
+                },
+                Step::Reconnect {
+                    description: "It comes back",
+                    participant: CHURNERS[0],
+                },
+                Step::Run {
+                    description: "Settle again",
+                    duration: Duration::from_secs(8),
+                },
+            ],
+            Fault::PeerStorm => {
+                let mut steps = Vec::new();
+                for who in CHURNERS {
+                    steps.push(Step::Join {
+                        description: "A publisher arrives",
+                        participant: who,
+                    });
+                    steps.push(Step::Run {
+                        description: "Briefly active",
+                        duration: Duration::from_secs(3),
+                    });
+                    steps.push(Step::AbruptExit {
+                        description: "And is gone",
+                        participant: who,
+                    });
+                }
+                steps.push(Step::Run {
+                    description: "Settle after the storm",
+                    duration: Duration::from_secs(8),
+                });
+                steps
+            }
+        }
+    }
+
+    /// Publishers this fault needs standing by, disconnected until a step brings them in.
+    fn churners(self) -> &'static [&'static str] {
+        match self {
+            Fault::None | Fault::Outage => &[],
+            Fault::PeerCrash | Fault::PeerRejoin => &CHURNERS[..1],
+            Fault::PeerStorm => &CHURNERS,
         }
     }
 }
+
+/// Publishers that come and go during a run.
+///
+/// Nobody subscribes to them: the viewer is a `manual_subscriber` bound to fixed targets, so the
+/// route table, import lifecycle, quarantine expiry and refcounts churn underneath while every
+/// claim stays a claim about `publisher` and `cotenant`. That is what keeps the properties
+/// meaningful under churn rather than merely noisy - "a participant crashing does not disturb an
+/// unrelated stream" is the assertion, and it is worth making.
+const CHURNERS: [&str; 3] = ["churner1", "churner2", "churner3"];
 
 /// What the application asks the SFU to carry. Independent of what the link supplies.
 #[derive(Clone, Copy, Debug)]
@@ -347,10 +440,32 @@ const SPACIOUS: u32 = 20;
 const SATURATED: u32 = 12;
 
 const NO_FAULT: &[Fault] = &[Fault::None];
-/// Repeated rather than weighted because `select` is uniform over the slice.
-/// One case in four sees an outage, which is what the four-way fault axis this
-/// replaced produced.
-const ANY_FAULT: &[Fault] = &[Fault::None, Fault::None, Fault::None, Fault::Outage];
+
+/// Repeated rather than weighted because `select` is uniform over the slice. Roughly half of all
+/// cases stay undisturbed, matching how often anything actually goes wrong.
+const ANY_FAULT: &[Fault] = &[
+    Fault::None,
+    Fault::None,
+    Fault::None,
+    Fault::None,
+    Fault::Outage,
+    Fault::PeerCrash,
+    Fault::PeerRejoin,
+    Fault::PeerStorm,
+];
+
+/// Churn without a path interruption, for claims an outage would legitimately break.
+///
+/// A participant crashing is not a reason for an unrelated stream to shed a layer or for its
+/// estimate to collapse, so these properties keep asserting through it. An outage is such a
+/// reason, so it stays out.
+const PEER_CHURN: &[Fault] = &[
+    Fault::None,
+    Fault::None,
+    Fault::PeerCrash,
+    Fault::PeerRejoin,
+    Fault::PeerStorm,
+];
 
 impl Scenario {
     /// A subnet derived from the scenario, so a replayed case runs the network it originally did
@@ -416,6 +531,9 @@ impl Scenario {
         if self.demand.contended {
             room = room.with_participant(Participant::publisher("cotenant", &["q", "h", "f"]));
         }
+        for who in self.fault.churners() {
+            room = room.with_participant(Participant::single_publisher(who).starts_disconnected());
+        }
         let slots = if self.demand.contended { 2 } else { 1 };
         let reports = LocalNodeSim::new()
             .with_subnet(self.subnet(namespace))
@@ -452,6 +570,12 @@ fn config(cases: u32) -> ProptestConfig {
 /// of thousands, where a run samples a fraction of a percent and a failure cannot be attributed to
 /// anything; over-tightening takes it to a handful, where every seed runs the same cases and
 /// sweeping proves nothing. Neither shows up as a failure anywhere else.
+///
+/// What the bound is guarding against is *resolution creep* - a range where a set of named values
+/// belongs. Growth from a genuinely new axis is how this suite is supposed to get better, so
+/// raising the ceiling to admit one is legitimate; widening it to fit a re-introduced continuous
+/// parameter is not. Adding lifecycle churn as five discrete disturbances took the widest property
+/// from 504 to 1260, which is that first kind.
 #[test]
 fn the_generated_space_is_small_enough_to_sample_and_large_enough_to_differ() {
     fn size(budget: Budget, faults: &[Fault]) -> usize {
@@ -485,13 +609,14 @@ fn the_generated_space_is_small_enough_to_sample_and_large_enough_to_differ() {
     }
 
     for budget in [Budget::Ample, Budget::Tight] {
-        for faults in [NO_FAULT, ANY_FAULT] {
+        for faults in [NO_FAULT, PEER_CHURN, ANY_FAULT] {
             let size = size(budget, faults);
             assert!(
-                (60..=1200).contains(&size),
+                (60..=1400).contains(&size),
                 "{budget:?} with {} fault(s) generates {size} distinct scenarios; outside \
-                 60..=1200 the sample is either too thin to attribute a failure or too small \
-                 for two seeds to disagree",
+                 60..=1400 the sample is either too thin to attribute a failure or too small \
+                 for two seeds to disagree. Check whether the growth came from a new named axis, \
+                 which is fine, or from a range creeping back in, which is not",
                 faults.len()
             );
         }
@@ -711,7 +836,7 @@ fn a_cheap_co_tenant_is_not_starved() {
 fn a_forwarded_stream_does_not_oscillate() {
     check(
         SPACIOUS,
-        scenarios(Demand::any(), Budget::Ample, NO_FAULT),
+        scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
         |scenario| {
             let report = scenario.run("no_oscillation");
             prop_assume!(report.samples > 0 && report.received_bytes > 0);
@@ -745,7 +870,7 @@ fn a_forwarded_stream_does_not_oscillate() {
 fn a_fixed_link_does_not_collapse_the_estimate() {
     check(
         SPACIOUS,
-        scenarios(Demand::any(), Budget::Ample, NO_FAULT),
+        scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
         |scenario| {
             let report = scenario.run("no_collapse");
             prop_assume!(report.samples > 0 && report.received_bytes > 0);
