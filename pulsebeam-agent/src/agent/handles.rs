@@ -331,6 +331,15 @@ impl RemoteTrack {
         self.publication.publisher_id()
     }
 
+    /// Whether this track carries audio or video.
+    ///
+    /// A receiver has to know before it can do anything with the packets - the two need different
+    /// depacketizers and different decoders - and until now the only way to find out was to
+    /// cross-reference the publication list by publisher id.
+    pub fn kind(&self) -> Option<str0m::media::MediaKind> {
+        self.publication.kind()
+    }
+
     /// Receive the next RTP packet for this track. Frame reassembly, jitter
     /// buffering, and decryption are higher-level concerns — see
     /// [`crate::pipeline::FrameReceiver`].

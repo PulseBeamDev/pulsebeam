@@ -37,6 +37,7 @@ pub struct SimClientBuilder {
     ip: IpAddr,
     agent_builder: AgentBuilder,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
+    audio_rx: Option<Arc<Mutex<AudioReceiveLog>>>,
     paused_publishers: Option<Arc<Mutex<std::collections::BTreeSet<String>>>>,
     publishes_video: bool,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
@@ -68,6 +69,7 @@ impl SimClientBuilder {
             ip,
             agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
             video_rx: None,
+            audio_rx: None,
             paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
@@ -93,6 +95,7 @@ impl SimClientBuilder {
                 .with_local_ip(ip)
                 .with_tcp_server_addr(server_tcp_addr),
             video_rx: None,
+            audio_rx: None,
             paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
@@ -169,6 +172,11 @@ impl SimClientBuilder {
         self
     }
 
+    pub fn with_audio_rx(mut self, rx: Arc<Mutex<AudioReceiveLog>>) -> Self {
+        self.audio_rx = Some(rx);
+        self
+    }
+
     pub fn with_video_rx(mut self, rx: Arc<Mutex<VideoReceiveLog>>) -> Self {
         self.video_rx = Some(rx);
         self
@@ -195,6 +203,9 @@ impl SimClientBuilder {
         let video_rx = self
             .video_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
+        let audio_rx = self
+            .audio_rx
+            .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
         let ctx_paused_publishers = self
             .paused_publishers
             .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::BTreeSet::new())));
@@ -214,6 +225,7 @@ impl SimClientBuilder {
             requested_tracks: HashSet::new(),
             received_data: Vec::new(),
             video_rx,
+            audio_rx,
             local_publications: local_video.into_iter().collect(),
         };
         for publication in &ctx.local_publications {
@@ -294,6 +306,60 @@ pub struct VideoReceiveLog {
     last_frame_at: Option<Instant>,
     last_ts: Option<u64>,
     seen_ts: HashSet<u64>,
+}
+
+/// What arrived from one speaker, as the listener heard it.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioStream {
+    pub packets: u64,
+    pub bytes: u64,
+    /// Longest stretch with no packet, once the stream had started.
+    ///
+    /// Audio is far less forgiving than video here. A picture that misses 200ms is a stutter
+    /// nobody remarks on; a voice that drops 200ms loses a syllable.
+    pub longest_gap: Duration,
+    last_at: Option<Instant>,
+}
+
+impl AudioStream {
+    fn record(&mut self, bytes: usize, now: Instant) {
+        if let Some(previous) = self.last_at {
+            self.longest_gap = self
+                .longest_gap
+                .max(now.saturating_duration_since(previous));
+        }
+        self.last_at = Some(now);
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+}
+
+/// What a listener heard, and from whom.
+///
+/// Keyed by publisher because that is the question the SFU's speaker selection raises: with more
+/// speakers in a room than a subscriber has slots, *which* of them got through is the whole claim,
+/// and a total byte count cannot answer it.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct AudioReceiveLog {
+    pub by_publisher: std::collections::BTreeMap<String, AudioStream>,
+}
+
+impl AudioReceiveLog {
+    fn record(&mut self, publisher: &str, bytes: usize, now: Instant) {
+        self.by_publisher
+            .entry(publisher.to_owned())
+            .or_default()
+            .record(bytes, now);
+    }
+
+    /// Speakers this listener actually heard.
+    pub fn heard_from(&self) -> std::collections::BTreeSet<String> {
+        self.by_publisher
+            .iter()
+            .filter(|(_, stream)| stream.packets > 0)
+            .map(|(publisher, _)| publisher.clone())
+            .collect()
+    }
 }
 
 /// How long a stream may deliver nothing before a viewer perceives a freeze rather than jitter.
@@ -425,6 +491,8 @@ pub struct ClientContext {
     participants: Participants,
     /// Aggregated decode-side view of every remote video track.
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
+    /// What this listener heard, per speaker. Shared with the harness like `video_rx`.
+    pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
     local_publications: Vec<LocalTrack>,
 
     /// Remote track IDs that have been discovered from signaling updates.
@@ -586,20 +654,38 @@ impl SimClient {
                         self.ctx
                             .remote_tracks
                             .insert(publication_id.clone(), publication_id);
-                        let log = self.ctx.video_rx.clone();
-                        self.join_set.spawn(async move {
-                            // The agent forwards RTP; reassemble frames here (the
-                            // "higher layer") before logging QoE.
-                            let mut receiver = pulsebeam_agent::FrameReceiver::new();
-                            while let Ok(rtp) = track.recv().await {
-                                for frame in receiver.push(rtp) {
+                        if track.kind() == Some(pulsebeam_agent::str0m::media::MediaKind::Audio) {
+                            // Audio is logged per speaker and not reassembled into frames. The
+                            // question audio raises is *who* got through the SFU's speaker
+                            // selection, which a frame count cannot answer, and running it through
+                            // the video depacketizer would corrupt the video QoE figures besides.
+                            let log = self.ctx.audio_rx.clone();
+                            let publisher = track.publisher_id().to_owned();
+                            self.join_set.spawn(async move {
+                                while let Ok(rtp) = track.recv().await {
+                                    log.lock().unwrap().record(
+                                        &publisher,
+                                        rtp.payload.len(),
+                                        Instant::now(),
+                                    );
+                                }
+                            });
+                        } else {
+                            let log = self.ctx.video_rx.clone();
+                            self.join_set.spawn(async move {
+                                // The agent forwards RTP; reassemble frames here (the
+                                // "higher layer") before logging QoE.
+                                let mut receiver = pulsebeam_agent::FrameReceiver::new();
+                                while let Ok(rtp) = track.recv().await {
+                                    for frame in receiver.push(rtp) {
+                                        log.lock().unwrap().record(&frame);
+                                    }
+                                }
+                                for frame in receiver.flush() {
                                     log.lock().unwrap().record(&frame);
                                 }
-                            }
-                            for frame in receiver.flush() {
-                                log.lock().unwrap().record(&frame);
-                            }
-                        });
+                            });
+                        }
 
                         // Re-check the predicate after processing an event, since a new
                         // event may indicate the desired state has been reached.

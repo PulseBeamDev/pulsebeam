@@ -7,7 +7,9 @@
     clippy::string_slice,
     clippy::indexing_slicing
 )] // test / simulation support
-use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, VideoReceiveStats};
+use crate::tests::common::client::{
+    AudioReceiveLog, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+};
 use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
@@ -466,6 +468,16 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
+    /// Exactly these speakers were heard, and no others.
+    ///
+    /// The claim the SFU's speaker selection actually makes. A byte count says audio arrived; only
+    /// naming the speakers says the right ones did, which is the difference between a selector
+    /// that works and one that forwards whoever happens to be first.
+    CheckHeardFrom {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [&'static str],
+    },
     /// At least this many media frames actually crossed a shard boundary.
     ///
     /// Guards a cross-shard plan against passing by accident. Placement is a
@@ -664,6 +676,7 @@ pub struct VideoSubscription {
 
 struct ParticipantShared {
     video_rx: Arc<Mutex<VideoReceiveLog>>,
+    audio_rx: Arc<Mutex<AudioReceiveLog>>,
     paused_publishers: Arc<Mutex<BTreeSet<String>>>,
     tx_bytes: Mutex<u64>,
     rx_bytes: Mutex<u64>,
@@ -684,6 +697,7 @@ impl ParticipantShared {
     fn new() -> Self {
         Self {
             video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
+            audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
             paused_publishers: Arc::new(Mutex::new(BTreeSet::new())),
             tx_bytes: Mutex::new(0),
             rx_bytes: Mutex::new(0),
@@ -733,6 +747,10 @@ impl ParticipantHandle {
     }
     fn video_rx(&self) -> VideoReceiveLog {
         self.shared.video_rx.lock().unwrap().clone()
+    }
+
+    fn audio_rx(&self) -> AudioReceiveLog {
+        self.shared.audio_rx.lock().unwrap().clone()
     }
 
     fn paused_publishers(&self) -> BTreeSet<String> {
@@ -839,6 +857,7 @@ async fn run_participant(
         let shared_clone = shared.clone();
         let mut client = builder
             .with_paused_publishers(shared.paused_publishers.clone())
+            .with_audio_rx(shared.audio_rx.clone())
             .with_video_rx(shared.video_rx.clone())
             .connect(room_name)
             .await?;
@@ -1148,6 +1167,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
+        Step::CheckHeardFrom { .. } => "CheckHeardFrom",
         Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
@@ -1672,6 +1692,36 @@ async fn execute_plan(
                 assert!(
                     actual >= *min_bytes,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {min_bytes} bytes (cumulative)\n  actual:       {actual} bytes"
+                );
+            }
+
+            Step::CheckHeardFrom {
+                description,
+                participant,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let audio = handle.audio_rx();
+                let heard = audio.heard_from();
+                let want: BTreeSet<String> =
+                    expected.iter().map(|name| (*name).to_owned()).collect();
+                // Names in the plan are harness names; the wire carries participant ids, so
+                // compare on the ids those names resolve to.
+                let want: BTreeSet<String> = want
+                    .iter()
+                    .filter_map(|name| {
+                        handles
+                            .get(name.as_str())
+                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    heard, want,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  heard from:   {heard:?}\n  per speaker:  {:?}",
+                    audio.by_publisher
                 );
             }
 
@@ -2332,6 +2382,12 @@ pub struct LinkReport {
     pub standing_backlog: Duration,
     /// Longest gap between consecutive delivered video frames, once the stream had started.
     pub longest_silence: Duration,
+    /// What this listener heard, per speaker.
+    ///
+    /// The SFU forwards only the loudest few speakers, so "was audio delivered" is the wrong
+    /// question and "from whom" is the right one. A total byte count cannot distinguish the
+    /// selector picking correctly from it picking at all.
+    pub audio: AudioReceiveLog,
     /// Publishers this viewer was *told* the SFU had stopped forwarding.
     ///
     /// A stream that stops is either paused or broken, and the media cannot tell you which. The
@@ -2481,6 +2537,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         longest_silence: qoe.longest_freeze,
         qoe,
         signalled_paused: handle.paused_publishers(),
+        audio: handle.audio_rx(),
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
