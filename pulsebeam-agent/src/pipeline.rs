@@ -77,11 +77,13 @@ impl FrameSender {
         let chunks: Vec<_> = self.packetizer.packetize(&frame.data).collect();
         let mut packets = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            let mut ext_vals = ExtensionValues::default();
-            // Without this the SFU's audio selector drops every packet: it ranks speakers by
-            // level and has nothing to rank an unlabelled one by.
-            ext_vals.audio_level = frame.audio_level;
-            ext_vals.voice_activity = frame.voice_activity;
+            // Audio level is not optional decoration: the SFU's speaker selector ranks by it and
+            // drops any audio packet that arrives without one.
+            let mut ext_vals = ExtensionValues {
+                audio_level: frame.audio_level,
+                voice_activity: frame.voice_activity,
+                ..ExtensionValues::default()
+            };
             if let Some(raw) = &dd_bytes {
                 let mut bytes = raw.0.clone();
                 if let Some(first) = bytes.first_mut() {

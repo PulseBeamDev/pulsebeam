@@ -198,7 +198,7 @@ impl SimClientBuilder {
         let ctx_paused_publishers = self
             .paused_publishers
             .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::BTreeSet::new())));
-        let ctx = ClientContext {
+        let mut ctx = ClientContext {
             ip: self.ip,
             agent,
             incoming_tracks,
@@ -241,6 +241,11 @@ impl SimClientBuilder {
             for sender in publication.encodings().iter().cloned() {
                 join_set.spawn(AudioLooper::speaking().with_level_dbov(level).run(sender));
             }
+            // The handle has to outlive the loopers. Dropping a `LocalTrack` unpublishes it, so
+            // letting it fall out of scope here declared the track inactive the moment it was
+            // created: the packets still flowed into cloned senders, and the SFU - told the mid
+            // was inactive - never registered a track to route them to.
+            ctx.local_publications.push(publication);
         }
         Ok(SimClient { ctx, join_set })
     }
