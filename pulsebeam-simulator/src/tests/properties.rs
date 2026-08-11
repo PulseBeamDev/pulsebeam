@@ -46,7 +46,9 @@
 //! congestion controller must never do regardless of conditions - and those are exactly the ones
 //! that were being violated in production.
 
-use super::common::{LinkProfile, LinkReport, LocalNodeSim, Participant, Room, Step, sim_seed};
+use super::common::{
+    Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Participant, Room, Step, sim_seed,
+};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
@@ -469,6 +471,15 @@ const PEER_CHURN: &[Fault] = &[
 ];
 
 impl Scenario {
+    /// What this scenario's publisher is sending, which decides what watchable means for it.
+    fn content(&self) -> Content {
+        if self.demand.screenshare {
+            Content::Static
+        } else {
+            Content::Motion
+        }
+    }
+
     /// A subnet derived from the scenario, so a replayed case runs the network it originally did
     /// rather than whichever one its position in the sample happened to give it.
     fn subnet(&self, namespace: &str) -> u8 {
@@ -811,6 +822,90 @@ fn sharding_does_not_change_who_is_served() {
                  tell which worker owns it, so this is the SFU losing a stream to its own \
                  internal placement ({:?})",
                 scenario
+            );
+            Ok(())
+        },
+    );
+}
+
+// A liveness gate belongs here and is deliberately absent for now.
+//
+// The measurement exists - `Qoe::longest_freeze` and `freeze_ratio`, both on the scoreboard - and
+// it found real freezes: 10.4s on cellular under peer churn, 53s in one authored plan, several
+// viewers 95% frozen at under 2 fps. Those are defects to fix, not thresholds to tune, so the gate
+// lands once they are. Choosing a bound large enough to pass today would leave a green test
+// asserting nothing anyone cares about.
+
+/// Bytes arriving is not a picture. What arrives must be decodable.
+///
+/// Every other claim here is about bytes, bitrates and layer indices, and a viewer cannot see any
+/// of those. A stream can arrive at the right rate, on the right layer, with the right byte total,
+/// and still render nothing: a keyframe without SPS+PPS in the same picture is not decodable, so
+/// the decoder emits nothing and the tile stays blank while every byte-level measure looks
+/// healthy. That is the shape of "it works in the numbers and the user sees black", and until the
+/// report carried frame-level facts no generated property could tell the two apart.
+#[test]
+fn what_arrives_can_actually_be_decoded() {
+    check(
+        SPACIOUS,
+        scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
+        |scenario| {
+            let report = scenario.run("decodable");
+            prop_assume!(report.samples > 0 && report.received_bytes > 0);
+
+            // Gates on the part of the bar the product currently meets; the scoreboard carries
+            // the rest. Two of `Experience`'s clauses fail today for reasons that are real
+            // defects, not wrong thresholds - a ~5s time-to-first-frame from the receiver's
+            // initial jitter wait, and freezes past 8s under churn - and gating on them now would
+            // mean either a permanently red suite or a bar quietly lowered until it passed.
+            // Neither is worth having. They become gates when those are fixed.
+            prop_assert_ne!(
+                report.qoe.experience(scenario.content()),
+                Experience::Blank,
+                "media arrived and nothing rendered: the viewer saw a blank tile while every \
+                 byte-level measure looked healthy ({:?}, {:?})",
+                scenario,
+                report.qoe,
+            );
+            prop_assert_eq!(
+                report.qoe.undecodable_keyframes,
+                0,
+                "keyframes arrived without their parameter sets, so the decoder could not render \
+                 them. Each is a stretch of blank picture no bitrate or layer figure would show \
+                 ({:?})",
+                scenario,
+            );
+            Ok(())
+        },
+    );
+}
+
+/// A link that can carry the bottom rung must show a picture, not nothing.
+///
+/// The real complaint this comes from: on a weak mobile link a tile renders blank, when a quarter
+/// resolution stream would have fit. Degrading is correct; going blank is not. The generator makes
+/// the case unambiguous by only offering links that can carry the floor, so a viewer seeing
+/// nothing is never the link's fault.
+#[test]
+fn a_link_that_can_carry_the_floor_renders_something() {
+    check(
+        SATURATED,
+        scenarios(Demand::any(), Budget::Tight, PEER_CHURN),
+        |scenario| {
+            prop_assume!(scenario.capacity_bps >= LADDER_Q_BPS);
+            let report = scenario.run("renders_floor");
+            prop_assume!(report.samples > 0);
+
+            prop_assert_ne!(
+                report.qoe.experience(scenario.content()),
+                Experience::Blank,
+                "nothing rendered on a {} bps link, which carries the {} bps bottom rung several \
+                 times over. Shedding to the smallest layer is the right answer to a tight link; \
+                 a blank tile is not ({:?}, {:?})",
+                scenario.capacity_bps,
+                LADDER_Q_BPS,
+                scenario,
+                report.qoe,
             );
             Ok(())
         },

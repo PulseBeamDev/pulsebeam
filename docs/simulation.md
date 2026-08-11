@@ -85,6 +85,94 @@ would stop being reproducible, so two meta-tests guard it:
 Both are cheap and both fail loudly, because a suite that *looks* randomised but
 replays one fixed run is worse than an honestly fixed one.
 
+## Four kinds of oracle
+
+An oracle is whatever decides that a run was wrong. This suite has four, and they fail in
+different ways, so a plan is stronger for using more than one.
+
+**User-visible outcome** — "the message arrived", "the tile is not black". Self-justifying, and
+every unambiguous defect found so far has been one of these. Limited to failures someone thought
+to check.
+
+**Threshold** — "the estimate reaches 80% of need". Necessary for congestion control and the
+easiest to get wrong: `QueueingDelayBelow` bounded a peak while documenting a standing queue, and
+`a_busy_room_starves_nobody` needed an estimator to hit 86% before an allocator claim could pass.
+Every threshold needs an argument that a correct implementation can meet it.
+
+**Differential** — two configurations that must agree, where the disagreement is the report.
+`sharding_does_not_change_who_is_served` runs a scenario on one shard and on three: a subscriber
+cannot tell which worker owns it, so any difference is the SFU losing a stream to its own
+placement. No number to pick and no way to measure the wrong statistic. Both cross-shard defects
+found so far are differences it reports directly. Compare coarsely — whether a subscriber was
+served, not how many bytes — because two layouts schedule packets differently and byte counts
+would report noise.
+
+**Liveness** — every other oracle reads an endpoint or an average, and a stream that freezes for
+twenty seconds and recovers looks identical in all of them. `a_started_stream_does_not_go_quiet`
+bounds the longest gap between delivered frames. Measure per frame, not per plan step: a step is
+tens of seconds long, so a freeze inside one still leaves bytes in the window and reads as zero
+silence. The first attempt did exactly that and was vacuous — it passed with the bound set to
+zero.
+
+## Measuring anything new
+
+Four QoE metrics were added in one sitting and all four were wrong before they were right. The
+failures were not subtle bugs; each produced a plausible-looking number that meant nothing. A
+metric that lies is worse than no metric, because it gets trusted.
+
+**Prove the measurement moves before trusting it.** Set the bound to zero and confirm the test
+fails. The first liveness check sampled at `Run` boundaries, where a freeze inside a
+thirty-second window still leaves bytes in the window — it passed with the bound at
+`Duration::ZERO` and would have shipped as a green test measuring nothing.
+
+**Never compare timestamps taken on different turmoil hosts.** turmoil virtualises
+`tokio::time::Instant` per host, so a stamp from the coordinator and one from inside a participant
+are on different epochs. That mismatch reported every time-to-first-frame as ~5s and every freeze
+as 0% of the session. Use `std::time::Instant`, which `sim_clock` shims process-wide via
+`clock_gettime` and which therefore *is* coherent everywhere.
+
+**Match the scope of the numerator and denominator.** Cumulative frame counts over the last
+window's duration reported 159 fps; a cumulative maximum freeze next to a per-window frozen total
+reported "5s freeze, 0% frozen". Pick session-scoped or window-scoped and apply it to both.
+
+**Measure from what the user did, not from what the plan did.** Time-to-first-frame anchored to
+participant creation captured each plan's five-second "establish connection" step, putting the
+median at 5.18s across the suite — an artefact of scaffolding presented as a product latency.
+
+**Check a new bar against the whole suite before believing it.** The first QoE bar called 491 of
+492 viewers broken. By the triage rule above that is an unrealistic expectation, not a codebase in
+ruins — and it was: freeze limits were being applied to still screen shares, which are supposed to
+go quiet.
+
+## Injecting failures
+
+Recovery code is the least tested code in any system, because it only runs when something goes
+wrong and nothing goes wrong in a simulator unless the simulator makes it. Around ninety
+`debug_assert!`/`fatal!` sites here assert a condition cannot arise, and the route-install callers
+each have a rollback that had never executed.
+
+`buggify!("site")` declares such a point; `.with_buggify(permille)` arms it for a plan. Off
+everywhere else, so the rest of the suite keeps testing the happy path, and compiled out entirely
+without the `sim` feature.
+
+Two rules learned immediately:
+
+- **Assert that something was injected.** At 80 per thousand the first chaos plan injected nothing
+  on the first seed and passed — indistinguishable from a real pass.
+- **Watch which sites are reached.** `coverage()` reports reached and fired. A site nothing reaches
+  is a failure path still untested and looks exactly like a covered one, so
+  `every_declared_failure_point_is_reachable_test` fails if none is reached or none fires.
+
+It found a defect on its first real run: a failed reverse-route install publishes the track anyway
+with no reverse handle, so keyframe requests for it are dropped for the life of the track.
+
+## Assert over every instance
+
+A plan that creates N of something and checks one is a coin flip dressed as an assertion. The
+cross-shard data-topic defect survived precisely that: two subscribers, one asserted. Where a
+participant is a deliberate bystander, assert it received *nothing* — that is a real claim about
+not over-delivering, and it was untested.
+
 ## Two kinds of plan
 
 **Authored plans** (`bwe.rs`, `video.rs`, `connectivity.rs`, `data_channel.rs`)

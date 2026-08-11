@@ -26,6 +26,10 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinSet;
+// The process-wide shimmed clock, not tokio's: turmoil virtualises `tokio::time::Instant` per
+// host, so a timestamp taken here cannot be compared with one taken on the coordinator. See
+// `sim_clock`, which shims `clock_gettime` for the whole process.
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -222,15 +226,42 @@ pub struct VideoReceiveLog {
     /// every simulcast layer has its own SPS.
     pub missing_parameter_sets: u64,
     pub bytes: u64,
+    /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
+    /// against the moment the viewer subscribed, which only the harness knows.
+    pub first_frame_at: Option<Instant>,
+    /// Time spent in stretches longer than [`FREEZE_THRESHOLD`] with no frame.
+    ///
+    /// Distinct from the longest gap: one ten-second freeze and fifty two-hundred-millisecond
+    /// freezes are different experiences and a maximum cannot tell them apart. Short gaps are
+    /// excluded because ordinary jitter and a keyframe wait are not freezes.
+    pub frozen_time: Duration,
+    /// Longest wall gap between consecutive delivered frames.
+    ///
+    /// Measured per frame rather than per plan step, because a step is tens of seconds long and a
+    /// freeze inside one still leaves bytes in the window: sampled at step boundaries this reads
+    /// zero however badly the stream stalled. A viewer notices the gap, not the total.
+    pub longest_frame_gap: Duration,
+    last_frame_at: Option<Instant>,
     last_ts: Option<u64>,
     seen_ts: HashSet<u64>,
 }
+
+/// How long a stream may deliver nothing before a viewer perceives a freeze rather than jitter.
+///
+/// Below this, a gap is a late packet, a keyframe wait or a layer switch - all normal. Above it,
+/// the picture has visibly stopped.
+pub const FREEZE_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoReceiveStats {
     pub frames: u64,
     pub keyframes: u64,
     pub missing_parameter_sets: u64,
+    pub non_contiguous: u64,
+    pub longest_frame_gap: Duration,
+    pub first_frame_at: Option<Instant>,
+    pub last_frame_at: Option<Instant>,
+    pub frozen_time: Duration,
 }
 
 impl VideoReceiveStats {
@@ -241,6 +272,11 @@ impl VideoReceiveStats {
             missing_parameter_sets: self
                 .missing_parameter_sets
                 .saturating_sub(baseline.missing_parameter_sets),
+            non_contiguous: self.non_contiguous.saturating_sub(baseline.non_contiguous),
+            longest_frame_gap: self.longest_frame_gap.max(baseline.longest_frame_gap),
+            first_frame_at: self.first_frame_at.or(baseline.first_frame_at),
+            last_frame_at: self.last_frame_at,
+            frozen_time: self.frozen_time.saturating_sub(baseline.frozen_time),
         }
     }
 }
@@ -276,10 +312,25 @@ impl VideoReceiveLog {
             frames: self.frames,
             keyframes: self.keyframes,
             missing_parameter_sets: self.missing_parameter_sets,
+            non_contiguous: self.non_contiguous,
+            longest_frame_gap: self.longest_frame_gap,
+            first_frame_at: self.first_frame_at,
+            last_frame_at: self.last_frame_at,
+            frozen_time: self.frozen_time,
         }
     }
 
     fn record(&mut self, frame: &pulsebeam_agent::MediaFrame) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_frame_at {
+            let gap = now.saturating_duration_since(previous);
+            self.longest_frame_gap = self.longest_frame_gap.max(gap);
+            if gap > FREEZE_THRESHOLD {
+                self.frozen_time = self.frozen_time.saturating_add(gap);
+            }
+        }
+        self.first_frame_at.get_or_insert(now);
+        self.last_frame_at = Some(now);
         self.frames += 1;
         self.bytes += frame.data.len() as u64;
         if frame.is_keyframe {

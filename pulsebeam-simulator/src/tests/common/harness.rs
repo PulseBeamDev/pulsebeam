@@ -17,6 +17,10 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+// Process-wide shimmed clock, not tokio's: turmoil virtualises `tokio::time::Instant` per host,
+// so a stamp taken on the coordinator cannot be compared with one taken inside a participant.
+// That mismatch reported every time-to-first-frame as ~5s regardless of what happened.
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -663,6 +667,10 @@ struct ParticipantHandle {
     interval_tx_baseline: u64,
     /// RX bytes at the start of the most recent Step::Run (for interval checks).
     interval_rx_baseline: u64,
+    /// When this participant last asked for a stream. Time-to-first-frame is measured from here,
+    /// not from the start of the plan: the settle steps before a subscription are not time the
+    /// viewer spent waiting.
+    subscribed_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
 }
 
@@ -1305,6 +1313,8 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 handle
                     .shared
                     .pending_ops
@@ -1338,6 +1348,8 @@ async fn execute_plan(
                     });
                 }
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 handle
                     .shared
                     .pending_ops
@@ -1371,6 +1383,8 @@ async fn execute_plan(
                     });
                 }
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 handle
                     .shared
                     .pending_ops
@@ -1388,6 +1402,8 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, heights={heights:?})"
                 );
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 let mut tracks: Vec<String> = handle
                     .shared
                     .discovered_tracks
@@ -2130,6 +2146,116 @@ fn pct(part: f64, whole: f64) -> f64 {
 /// Separate from its formatting on purpose. A property needs to *compute* over these numbers, and
 /// a randomised scenario needs to return them rather than assert inline, so the measurement has
 /// to exist as data. Rendering it for a human is a second, lesser job.
+/// What a viewer actually experienced, as distinct from what the link carried.
+///
+/// One vocabulary, and below it one definition of the bar, because the alternative is what this
+/// suite had: every plan inventing its own scalar check, none of them describing a picture. Bytes,
+/// bitrates and layer indices are all invisible to a user. These are not.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Qoe {
+    pub frames: u64,
+    pub keyframes: u64,
+    /// Keyframes without SPS+PPS. Each is a stretch the decoder could not render.
+    pub undecodable_keyframes: u64,
+    /// Frames preceded by a sequence hole: visible corruption rather than a clean picture.
+    pub torn_frames: u64,
+    /// From subscribing to the first frame on screen. `None` if nothing ever rendered.
+    pub time_to_first_frame: Option<Duration>,
+    pub longest_freeze: Duration,
+    /// Time spent frozen as a fraction of the measured window.
+    pub freeze_ratio: f64,
+    pub mean_fps: f64,
+}
+
+/// What a viewer would say about a stream.
+///
+/// Deliberately three-valued. "Delivered / not delivered" is the distinction the suite used to
+/// make, and it cannot express the failure that matters most: a stream that is technically
+/// arriving and still unwatchable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Experience {
+    /// Nothing ever rendered. The tile is blank.
+    Blank,
+    /// Rendered, but a viewer would call it broken. Carries which bar it missed.
+    Broken(String),
+    Watchable,
+}
+
+/// What the source is sending, which decides what "watchable" even means.
+///
+/// A framerate floor is right for a camera and wrong for a screen share: a still screen is
+/// *supposed* to send almost nothing, and a bar that ignores that reports a defect on every
+/// screenshare plan. The first run of this check did exactly that - 3.3 fps from a static share on
+/// an 8 Mbps link, flagged as a slideshow when it was correct behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Content {
+    /// A camera: continuous motion, so a framerate floor applies.
+    Motion,
+    /// A screen share: long still stretches are the normal case, so only freezes that a viewer
+    /// would notice as *unresponsive* count, not a low frame count.
+    Static,
+}
+
+impl Qoe {
+    /// The bar, in one place.
+    ///
+    /// Every figure here is a perceptual claim rather than a tuning knob, each set where a viewer
+    /// changes their mind about whether the call is working. Change them here and every plan and
+    /// property moves together; that is the point of having one definition.
+    pub fn experience(&self, content: Content) -> Experience {
+        if self.frames == 0 {
+            return Experience::Blank;
+        }
+        if self.undecodable_keyframes > 0 {
+            return Experience::Broken(format!(
+                "{} keyframes arrived without parameter sets, so they did not render",
+                self.undecodable_keyframes
+            ));
+        }
+        if let Some(ttff) = self.time_to_first_frame
+            && ttff > MAX_TIME_TO_FIRST_FRAME
+        {
+            return Experience::Broken(format!(
+                "first frame took {ttff:?}; a viewer has already decided it is broken"
+            ));
+        }
+        // Freezes are only meaningful for a source that is supposed to be sending. A still screen
+        // share is *supposed* to go quiet, and judging it by gaps flags correct behaviour on
+        // every screenshare plan - the same mistake the framerate floor made before it learned
+        // about content.
+        if content == Content::Motion && self.longest_freeze > MAX_FREEZE {
+            return Experience::Broken(format!(
+                "froze for {:?} in one stretch",
+                self.longest_freeze
+            ));
+        }
+        if content == Content::Motion && self.freeze_ratio > MAX_FREEZE_RATIO {
+            return Experience::Broken(format!(
+                "spent {:.0}% of the window frozen",
+                self.freeze_ratio * 100.0
+            ));
+        }
+        if content == Content::Motion && self.mean_fps < MIN_FPS {
+            return Experience::Broken(format!(
+                "delivered {:.1} fps, which reads as a slideshow rather than video",
+                self.mean_fps
+            ));
+        }
+        Experience::Watchable
+    }
+}
+
+/// A viewer waiting this long for a first frame has concluded the call is broken.
+pub const MAX_TIME_TO_FIRST_FRAME: Duration = Duration::from_secs(5);
+/// One unbroken stretch of stillness a viewer calls a freeze rather than a stutter.
+pub const MAX_FREEZE: Duration = Duration::from_secs(3);
+/// Fraction of a session that may be frozen before it is not a call.
+pub const MAX_FREEZE_RATIO: f64 = 0.15;
+/// Below this a camera reads as a slideshow. Well under any sane encoder target, so it catches a
+/// stream that has fallen apart rather than one that shed a layer. Not applied to a screen share:
+/// see [`Content`].
+pub const MIN_FPS: f64 = 5.0;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinkReport {
     /// Configured capacity, and whether it held still for the window. Utilisation and the
@@ -2153,6 +2279,15 @@ pub struct LinkReport {
     pub max_backlog: Duration,
     /// The queue a packet typically waited behind, as distinct from the worst moment.
     pub standing_backlog: Duration,
+    /// Longest gap between consecutive delivered video frames, once the stream had started.
+    pub longest_silence: Duration,
+    /// What the decoder made of the stream, as distinct from what the link carried.
+    ///
+    /// Every other figure here is about bytes and bitrates, and a viewer cannot see bytes. A
+    /// stream can arrive at the right rate, on the right layer, and still render nothing: a
+    /// keyframe without its parameter sets is not decodable, and the picture stays blank while
+    /// every byte-level measure looks healthy.
+    pub qoe: Qoe,
     pub delivered_packets: u64,
     pub congestion_drops: u64,
     pub link_loss_drops: u64,
@@ -2212,6 +2347,44 @@ impl LinkReport {
     }
 }
 
+/// Derive what the viewer experienced. One place, so the scoreboard and the assertions can never
+/// disagree about what was measured.
+fn qoe_of(handle: &ParticipantHandle, _window: Duration) -> Qoe {
+    // Session-scoped, deliberately, where the rest of the report is window-scoped. A viewer
+    // experiences a call, not a measurement window: a freeze in an earlier step still happened to
+    // them, and time-to-first-frame has no meaning inside a later window at all. Mixing the two
+    // reported a 5s freeze as 0% of the session, because a cumulative maximum sat next to a
+    // per-window total.
+    let video = handle.video_rx().stats();
+    // The span the stream was actually live for, taken from the frame timestamps themselves. A
+    // clock read on the coordinator belongs to a different host's epoch and gave a denominator
+    // that silently swallowed every freeze.
+    let seconds = video
+        .first_frame_at
+        .zip(video.last_frame_at)
+        .map(|(first, last)| last.saturating_duration_since(first).as_secs_f64())
+        .unwrap_or(0.0)
+        .max(f64::EPSILON);
+    Qoe {
+        frames: video.frames,
+        keyframes: video.keyframes,
+        undecodable_keyframes: video.missing_parameter_sets,
+        torn_frames: video.non_contiguous,
+        // Only where the plan issued an explicit subscription. Falling back to the moment the
+        // participant was created measured the plan's own scaffolding instead: nearly every plan
+        // opens with a five-second "establish connection" step, and that reference put the median
+        // time-to-first-frame at 5.18s across the whole suite - an artefact, not a product
+        // latency.
+        time_to_first_frame: handle
+            .subscribed_at
+            .zip(video.first_frame_at)
+            .map(|(asked, shown)| shown.saturating_duration_since(asked)),
+        longest_freeze: video.longest_frame_gap,
+        freeze_ratio: (video.frozen_time.as_secs_f64() / seconds).clamp(0.0, 1.0),
+        mean_fps: video.frames as f64 / seconds,
+    }
+}
+
 fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkReport {
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
@@ -2228,6 +2401,8 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
             drawdown = drawdown.max((peak - *bps as f64) / peak * 100.0);
         }
     }
+
+    let qoe = qoe_of(handle, window);
 
     LinkReport {
         capacity_bps: pulsebeam_runtime::net::shaper::capacity_at(ip, now),
@@ -2247,6 +2422,8 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         demand_max_bps: series.iter().map(|(_, _, d)| *d).max().unwrap_or(0),
         max_backlog: stats.max_backlog,
         standing_backlog: stats.mean_backlog(),
+        longest_silence: qoe.longest_freeze,
+        qoe,
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
@@ -2257,6 +2434,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
 }
 
 fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> String {
+    let qoe_now = qoe_of(handle, window);
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
     let capacity = pulsebeam_runtime::net::shaper::capacity_at(ip, now);
@@ -2334,7 +2512,15 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
 
     let offered = stats.delivered + stats.dropped_overflow;
     out.push_str(&format!(
-        " | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
+        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
+        qoe_now.frames,
+        qoe_now.mean_fps,
+        qoe_now.keyframes,
+        qoe_now.undecodable_keyframes,
+        qoe_now.torn_frames,
+        qoe_now.time_to_first_frame,
+        qoe_now.longest_freeze,
+        qoe_now.freeze_ratio * 100.0,
         stats.mean_backlog(),
         stats.max_backlog,
         pct(stats.dropped_overflow as f64, offered as f64),
@@ -3027,6 +3213,7 @@ impl LocalNodeSim {
                         cmd_tx,
                         interval_tx_baseline: 0,
                         interval_rx_baseline: 0,
+                        subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
                     },
                 );

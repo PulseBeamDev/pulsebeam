@@ -18,7 +18,7 @@ on:
       seeds:
         description: 'How many seeds to run'
         required: false
-        default: '8'
+        default: '24'
       from:
         description: 'First seed'
         required: false
@@ -30,8 +30,9 @@ env:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    # A full suite run is ~3.5 minutes, so the default seed count lands well
-    # inside this. The cap exists so a hung plan cannot burn the runner.
+    # Seeds run in parallel lanes and skip the plans no seed changes, so the
+    # count is set by the budget rather than by one seed's wall time. The cap
+    # exists so a hung plan cannot burn the runner.
     timeout-minutes: 120
     steps:
     - uses: actions/checkout@v5
@@ -46,7 +47,7 @@ jobs:
     # from the run number so it is still a known range, not a mystery.
     - name: Sweep
       run: |
-        seeds="${{ github.event.inputs.seeds || '8' }}"
+        seeds="${{ github.event.inputs.seeds || '24' }}"
         from="${{ github.event.inputs.from }}"
         if [ -z "$from" ]; then
           from=$(( ${{ github.run_number }} * seeds + 1 ))

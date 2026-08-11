@@ -43,6 +43,16 @@ fn data_channel_pubsub_forwarding_test() {
                 topic: "sim_topic",
                 expected: b"hello-data-channel",
             },
+            // The bystander. `sub2` is in the room and never subscribed, so delivery to it would
+            // be the SFU sending a topic to someone who did not ask for it. Nothing asserted this
+            // before, and a plan that creates a participant it never checks is how the
+            // cross-shard fanout defect stayed green.
+            Step::CheckDataNotReceived {
+                description: "A participant that never subscribed receives nothing",
+                participant: "sub2",
+                topic: "sim_topic",
+                excluded: b"hello-data-channel",
+            },
         ]);
 }
 
@@ -263,6 +273,12 @@ fn latest_topic_eventually_delivers_newest_state() {
                 participant: "sub",
                 topic: "pose",
                 expected: b"pose:3",
+            },
+            Step::CheckDataNotReceived {
+                description: "A participant that never subscribed receives nothing",
+                participant: "sub2",
+                topic: "pose",
+                excluded: b"pose:3",
             },
         ]);
 }

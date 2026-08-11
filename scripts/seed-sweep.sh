@@ -13,18 +13,47 @@
 # reported at the end as replay commands rather than stopping the run — one bad
 # seed should not hide the other nineteen.
 #
+# Two things decide how many seeds an hour buys.
+#
+# The filter. Most of the suite is not seed-sensitive: the data-channel and signalling plans
+# finish in milliseconds and assert the same thing under every seed, and CI already runs them at
+# the committed one. Filtering to the plans where a seed changes the answer barely moves wall time
+# per seed - the longest plan is itself seed-sensitive and stays - but it cuts the CPU each seed
+# needs, which is what lets seeds overlap.
+#
+# The overlap, which turned out not to help. Seeds are independent, so running several at once
+# looks like a free win - but a single seed already runs 57 plans across every core, so lanes only
+# add contention. Measured on a 20-core machine: three lanes took 293s per seed against 234s
+# sequential. `LANES` is left available for a machine big enough that one seed cannot fill it;
+# the default is one because on this one it is a loss.
+#
 #   SEEDS   how many seeds to run          (default 20)
 #   FROM    first seed                     (default 1)
-#   TEST    nextest filter, e.g. properties:: (default: everything)
+#   TEST    nextest filter                 (default: the seed-sensitive plans)
+#   ALL=1   sweep every plan instead
 #   JOBS    nextest threads per iteration  (default: nextest's own choice)
+#   LANES   how many seeds to run at once   (default 3)
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
 SEEDS="${SEEDS:-20}"
 FROM="${FROM:-1}"
-TEST="${TEST:-}"
-JOBS="${JOBS:-}"
+# `-E` expression rather than a substring filter, so it is one argument and quotes cleanly.
+if [[ -n "${ALL:-}" ]]; then
+    TEST="${TEST:-}"
+else
+    TEST="${TEST:--E test(/bwe::|properties::|video::/)}"
+fi
+LANES="${LANES:-1}"
+# Split the machine between lanes rather than letting each lane assume it owns it. Three lanes
+# each spawning one test per core is heavy oversubscription, and the seeds finish slower together
+# than they would one at a time.
+if [[ -z "${JOBS:-}" ]]; then
+    cores="$(nproc 2>/dev/null || echo 4)"
+    JOBS=$(( cores / LANES ))
+    (( JOBS < 1 )) && JOBS=1
+fi
 
 jobs_arg=()
 [[ -n "$JOBS" ]] && jobs_arg=(--test-threads "$JOBS")
@@ -46,17 +75,33 @@ if ! cargo nextest run --cargo-profile sim -p pulsebeam-simulator \
     exit 1
 fi
 
-started=$(date +%s)
-for seed in $(seq "$FROM" "$last"); do
-    printf 'seed %-12s ' "$seed"
+run_seed() {
+    local seed="$1"
     if PULSEBEAM_SIM_SEED="$seed" cargo nextest run --cargo-profile sim \
             -p pulsebeam-simulator --no-fail-fast "${jobs_arg[@]}" $TEST \
             >"${log_dir}/seed-${seed}.log" 2>&1; then
-        echo "ok"
+        echo "ok" >"${log_dir}/seed-${seed}.status"
     else
-        echo "FAILED"
-        failed_seeds+=("$seed")
+        echo "FAILED" >"${log_dir}/seed-${seed}.status"
     fi
+}
+
+started=$(date +%s)
+running=0
+for seed in $(seq "$FROM" "$last"); do
+    run_seed "$seed" &
+    running=$((running + 1))
+    if (( running >= LANES )); then
+        wait -n 2>/dev/null || true
+        running=$((running - 1))
+    fi
+done
+wait
+
+for seed in $(seq "$FROM" "$last"); do
+    status="$(cat "${log_dir}/seed-${seed}.status" 2>/dev/null || echo FAILED)"
+    printf 'seed %-12s %s\n' "$seed" "$status"
+    [[ "$status" == "ok" ]] || failed_seeds+=("$seed")
 done
 elapsed=$(( $(date +%s) - started ))
 
