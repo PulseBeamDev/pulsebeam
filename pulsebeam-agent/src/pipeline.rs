@@ -132,18 +132,32 @@ struct PendingFrame {
 /// residual loss) via [`FrameReceiver::with_max_wait`].
 pub const DEFAULT_JITTER_MAX_WAIT: Duration = Duration::from_secs(5);
 
+/// How long the buffer absorbs reordering before committing to a first sequence number.
+///
+/// Separate from [`DEFAULT_JITTER_MAX_WAIT`] because the two answer different questions. A gap
+/// budget asks how long to hold a hole open hoping a retransmission fills it, and being generous
+/// there costs nothing until a packet is actually lost. The opening question is only how far a
+/// packet can arrive out of order, which is tens of milliseconds on any real path.
+///
+/// Sharing one constant made every stream pay the gap budget before its first frame: measured at a
+/// 5.1s median time-to-first-frame across the simulation suite, with variance far too tight to be
+/// anything but a fixed wait. A viewer joins a call and the tile is blank for five seconds.
+pub const DEFAULT_INITIAL_COMMIT_WAIT: Duration = Duration::from_millis(100);
+
 /// A time-bounded reorder / jitter buffer.
 ///
 /// Holds incoming RTP briefly so out-of-order and retransmitted (NACK/RTX)
 /// packets can take their place before a gap is declared lost, then releases
-/// packets strictly in sequence order. `max_wait` bounds both the initial
-/// reordering delay and how long any single gap is held open: larger recovers
-/// more under bursty loss, at the cost of buffering latency.
+/// packets strictly in sequence order. `max_wait` bounds how long any single gap
+/// is held open: larger recovers more under bursty loss, at the cost of
+/// buffering latency. Opening the stream is bounded separately by
+/// `initial_wait` — see [`DEFAULT_INITIAL_COMMIT_WAIT`].
 pub struct JitterBuffer {
     buf: BTreeMap<u64, RtpPacket>,
     next: Option<u64>,
     latest_arrival: Option<Instant>,
     max_wait: Duration,
+    initial_wait: Duration,
 }
 
 impl JitterBuffer {
@@ -153,6 +167,9 @@ impl JitterBuffer {
             next: None,
             latest_arrival: None,
             max_wait,
+            // Never longer than the gap budget: a caller that asked for a tight budget wants low
+            // latency, and handing it a slower start than it asked for would be perverse.
+            initial_wait: DEFAULT_INITIAL_COMMIT_WAIT.min(max_wait),
         }
     }
 
@@ -169,9 +186,11 @@ impl JitterBuffer {
         let next = match self.next {
             Some(n) => n,
             None => {
-                // Absorb initial reordering before committing to a first sequence.
+                // Absorb initial reordering before committing to a first sequence. Bounded by
+                // `initial_wait`, not the gap budget: this is "how late can the real first packet
+                // be", not "how long to hope a lost packet is retransmitted".
                 let (&min_seq, min_pkt) = self.buf.iter().next()?;
-                if now.saturating_duration_since(min_pkt.arrival) < self.max_wait {
+                if now.saturating_duration_since(min_pkt.arrival) < self.initial_wait {
                     return None;
                 }
                 min_seq
@@ -527,6 +546,85 @@ mod tests {
         }
         // 1 was never delivered; after the wait it is skipped and 2,3 follow in order.
         assert_eq!(seqs, vec![0, 2, 3]);
+    }
+
+    /// Opening a stream costs the reordering window, not the loss-recovery budget.
+    ///
+    /// These are different questions sharing one constant until now: how late the real first
+    /// packet can be, versus how long to hold a hole open hoping a retransmission fills it. With
+    /// the gap budget at its 5s default, every stream paid five seconds before its first frame -
+    /// measured as a 5.1s median time-to-first-frame across the simulation suite.
+    #[test]
+    fn a_stream_opens_without_paying_the_loss_recovery_budget() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload: Arc::from([u8::try_from(seq % 256).expect("masked to a byte")].as_slice()),
+            ext_vals: ExtensionValues::default(),
+            arrival: base + Duration::from_millis(at_ms),
+        };
+
+        // A generous loss-recovery budget, as a real consumer has.
+        let mut jb = JitterBuffer::new(Duration::from_secs(5));
+        jb.push(pkt(0, 0));
+
+        assert!(
+            jb.pop().is_none(),
+            "the opening packet is held briefly so a reordered predecessor can arrive"
+        );
+
+        // Well past the reordering window, nowhere near the 5s gap budget.
+        jb.push(pkt(1, 150));
+        assert_eq!(
+            jb.pop().map(|p| *p.seq),
+            Some(0),
+            "the stream must open on the reordering window, not the loss-recovery budget: at 5s \
+             a viewer stares at a blank tile for five seconds before the first frame"
+        );
+    }
+
+    /// The shorter opening window must still absorb the reordering it exists for.
+    ///
+    /// Simulated paths push a reordered packet back by 30ms, and real ones are comparable, so the
+    /// window has room to spare. If it were tightened below that, a stream that merely opened out
+    /// of order would commit to the wrong first sequence and drop the true first packet as late.
+    #[test]
+    fn the_opening_window_still_absorbs_reordering() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload: Arc::from([u8::try_from(seq % 256).expect("masked to a byte")].as_slice()),
+            ext_vals: ExtensionValues::default(),
+            arrival: base + Duration::from_millis(at_ms),
+        };
+
+        let mut jb = JitterBuffer::new(Duration::from_secs(5));
+        // 1 arrives first; 0 is 30ms behind it, the delay the simulated shaper applies.
+        jb.push(pkt(1, 0));
+        jb.push(pkt(0, 30));
+        jb.push(pkt(2, 150));
+
+        let mut seqs = Vec::new();
+        while let Some(p) = jb.pop() {
+            seqs.push(*p.seq);
+        }
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2],
+            "a stream that opened out of order must still be delivered in order"
+        );
     }
 
     #[test]

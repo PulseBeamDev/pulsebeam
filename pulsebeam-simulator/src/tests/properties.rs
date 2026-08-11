@@ -47,7 +47,8 @@
 //! that were being violated in production.
 
 use super::common::{
-    Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Participant, Room, Step, sim_seed,
+    Content, Experience, LinkProfile, LinkReport, LocalNodeSim, MAX_TIME_TO_FIRST_FRAME,
+    Participant, Room, Step, sim_seed,
 };
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -853,12 +854,10 @@ fn what_arrives_can_actually_be_decoded() {
             let report = scenario.run("decodable");
             prop_assume!(report.samples > 0 && report.received_bytes > 0);
 
-            // Gates on the part of the bar the product currently meets; the scoreboard carries
-            // the rest. Two of `Experience`'s clauses fail today for reasons that are real
-            // defects, not wrong thresholds - a ~5s time-to-first-frame from the receiver's
-            // initial jitter wait, and freezes past 8s under churn - and gating on them now would
-            // mean either a permanently red suite or a bar quietly lowered until it passed.
-            // Neither is worth having. They become gates when those are fixed.
+            // Gates on the part of the bar the product meets; the scoreboard carries the rest.
+            // Only the freeze clause is still held back, and only because freezes past 8s under
+            // churn are real defects rather than a wrong threshold - gating on it now would mean
+            // a permanently red suite or a bar quietly lowered until it passed.
             prop_assert_ne!(
                 report.qoe.experience(scenario.content()),
                 Experience::Blank,
@@ -875,6 +874,20 @@ fn what_arrives_can_actually_be_decoded() {
                  ({:?})",
                 scenario,
             );
+            // Motion only, for the same reason the framerate floor and the freeze bounds are.
+            // A still screen share has nothing to send, so the wait measures the source deciding
+            // to produce a frame rather than the SFU delivering one - a 7.4s first frame from a
+            // static share on an 8 Mbps link is correct behaviour, not a defect.
+            if let (Content::Motion, Some(ttff)) =
+                (scenario.content(), report.qoe.time_to_first_frame)
+            {
+                prop_assert!(
+                    ttff <= MAX_TIME_TO_FIRST_FRAME,
+                    "the viewer waited {ttff:?} to see anything after subscribing. A blank tile \
+                     for that long is indistinguishable from a broken call ({:?})",
+                    scenario,
+                );
+            }
             Ok(())
         },
     );

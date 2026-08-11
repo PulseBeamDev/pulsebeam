@@ -11,8 +11,8 @@ pub mod client;
 pub mod harness;
 
 pub use harness::{
-    Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Loss, Participant,
-    Property, Reorder, Room, Step, VideoQuality,
+    Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Loss,
+    MAX_TIME_TO_FIRST_FRAME, Participant, Property, Reorder, Room, Step, VideoQuality,
 };
 
 use pulsebeam_runtime::net::UdpMode;
