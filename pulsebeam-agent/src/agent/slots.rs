@@ -7,6 +7,12 @@ pub type TrackId = String;
 struct ReceiverSlot {
     mid: Mid,
     track_id: Option<TrackId>,
+    /// Whether the SFU last told us it had stopped forwarding this slot.
+    ///
+    /// Kept so a repeat of the same state is not reported as a change. The server only upserts an
+    /// assignment when something about it moved, but it also upserts for reasons other than pause,
+    /// and an application that redraws a placeholder on every notification would flicker.
+    paused: bool,
 }
 
 pub struct SlotManager {
@@ -26,6 +32,7 @@ impl SlotManager {
 
     pub fn register(&mut self, mid: Mid) {
         self.slots.push(ReceiverSlot {
+            paused: false,
             mid,
             track_id: None,
         });
@@ -51,15 +58,20 @@ impl SlotManager {
         Some((slot.mid, track))
     }
 
-    pub fn sync(
-        &mut self,
-        update: pulsebeam_proto::signaling::StateUpdate,
-    ) -> (
-        Vec<(Mid, Track)>,
-        Vec<pulsebeam_proto::signaling::Track>,
-        Vec<TrackId>,
-    ) {
+    /// Whether the SFU has stopped forwarding this track.
+    ///
+    /// The counterpart to [`crate::AgentEvent::RemoteTrackPaused`] for callers that would rather
+    /// ask than subscribe.
+    pub fn is_paused(&self, track_id: &str) -> bool {
+        self.slots
+            .iter()
+            .find(|s| s.track_id.as_deref() == Some(track_id))
+            .is_some_and(|s| s.paused)
+    }
+
+    pub fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> SyncOutcome {
         let mut new_assignments: Vec<(Mid, Track)> = Vec::new();
+        let mut pause_changes: Vec<(TrackId, bool)> = Vec::new();
         let mut newly_discovered_tracks = Vec::new();
         let removed_tracks = update.tracks_remove.clone();
 
@@ -100,10 +112,22 @@ impl SlotManager {
             };
 
             if s.track_id.as_deref() == Some(&a.track_id) {
+                // Same track in the same slot, so this upsert exists because something else about
+                // the assignment moved - in practice, because the SFU started or stopped
+                // forwarding it. Returning early here is what dropped every pause transition on
+                // the floor, leaving a client unable to tell a paused stream from a dead network.
+                if s.paused != a.paused {
+                    s.paused = a.paused;
+                    pause_changes.push((a.track_id.clone(), a.paused));
+                }
                 continue;
             }
 
             s.track_id = Some(a.track_id.clone());
+            s.paused = a.paused;
+            if a.paused {
+                pause_changes.push((a.track_id.clone(), true));
+            }
 
             if let Some(track) = self.pending_tracks.remove(&a.track_id) {
                 let mid = s.mid;
@@ -130,6 +154,108 @@ impl SlotManager {
             new_assignments.push((mid, track));
         }
 
-        (new_assignments, newly_discovered_tracks, removed_tracks)
+        SyncOutcome {
+            new_assignments,
+            newly_discovered_tracks,
+            removed_tracks,
+            pause_changes,
+        }
+    }
+}
+
+/// What changed in the room, from one server state update.
+pub struct SyncOutcome {
+    pub new_assignments: Vec<(Mid, Track)>,
+    pub newly_discovered_tracks: Vec<pulsebeam_proto::signaling::Track>,
+    pub removed_tracks: Vec<TrackId>,
+    /// Tracks whose forwarding state changed, and what it changed to.
+    pub pause_changes: Vec<(TrackId, bool)>,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+    use pulsebeam_proto::signaling::{StateUpdate, Track as ProtoTrack, VideoAssignment};
+
+    fn update(assignments: Vec<VideoAssignment>, tracks: Vec<ProtoTrack>) -> StateUpdate {
+        StateUpdate {
+            seq: 1,
+            is_snapshot: false,
+            tracks_upsert: tracks,
+            tracks_remove: Vec::new(),
+            assignments_upsert: assignments,
+            assignments_remove: Vec::new(),
+        }
+    }
+
+    fn track(id: &str) -> ProtoTrack {
+        ProtoTrack {
+            id: id.to_owned(),
+            kind: 1,
+            participant_id: "pub".to_owned(),
+            meta: Default::default(),
+        }
+    }
+
+    fn assignment(mid: &str, track_id: &str, paused: bool) -> VideoAssignment {
+        VideoAssignment {
+            mid: mid.to_owned(),
+            track_id: track_id.to_owned(),
+            paused,
+        }
+    }
+
+    /// A stream the SFU stops forwarding must reach the application as a pause.
+    ///
+    /// The server upserts the assignment when `paused` flips, with the same mid and the same
+    /// track. `sync` used to return early on exactly that shape - "this slot already holds this
+    /// track, nothing to do" - so every pause and resume was discarded before anything could see
+    /// it. A client was then unable to tell a paused stream from a dead network, and rendered a
+    /// blank tile where a placeholder belongs.
+    #[test]
+    fn a_pause_reaches_the_application_rather_than_being_swallowed() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("v0"));
+
+        let first = slots.sync(update(
+            vec![assignment("v0", "t1", false)],
+            vec![track("t1")],
+        ));
+        assert_eq!(first.new_assignments.len(), 1, "the track is assigned");
+        assert!(first.pause_changes.is_empty(), "nothing paused yet");
+        assert!(!slots.is_paused("t1"));
+
+        let paused = slots.sync(update(vec![assignment("v0", "t1", true)], Vec::new()));
+        assert_eq!(
+            paused.pause_changes,
+            vec![("t1".to_owned(), true)],
+            "the SFU stopped forwarding and the application must be told"
+        );
+        assert!(slots.is_paused("t1"));
+
+        let resumed = slots.sync(update(vec![assignment("v0", "t1", false)], Vec::new()));
+        assert_eq!(resumed.pause_changes, vec![("t1".to_owned(), false)]);
+        assert!(!slots.is_paused("t1"));
+    }
+
+    /// Repeating a state is not a change.
+    ///
+    /// The server upserts assignments for reasons other than pause, and an application that
+    /// redrew a placeholder on every notification would flicker.
+    #[test]
+    fn an_unchanged_pause_state_is_not_reported() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("v0"));
+        slots.sync(update(
+            vec![assignment("v0", "t1", true)],
+            vec![track("t1")],
+        ));
+
+        let again = slots.sync(update(vec![assignment("v0", "t1", true)], Vec::new()));
+        assert!(
+            again.pause_changes.is_empty(),
+            "the state did not move, so there is nothing to tell anyone"
+        );
     }
 }

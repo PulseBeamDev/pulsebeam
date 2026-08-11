@@ -777,6 +777,18 @@ impl AgentRunner {
                     self.publication_state.remove(&track_id);
                     self.publish_publications();
                 }
+                AgentEvent::RemoteTrackPaused(track_id) => {
+                    if let Some(p) = self.publication_state.get_mut(&track_id) {
+                        p.set_paused(true);
+                        self.publish_publications();
+                    }
+                }
+                AgentEvent::RemoteTrackResumed(track_id) => {
+                    if let Some(p) = self.publication_state.get_mut(&track_id) {
+                        p.set_paused(false);
+                        self.publish_publications();
+                    }
+                }
                 AgentEvent::Connected => {
                     let _ = self.connection.send(ConnectionState::Connected);
                 }

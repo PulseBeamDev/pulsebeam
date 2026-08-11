@@ -268,6 +268,12 @@ pub(crate) struct Publication {
     id: String,
     publisher_id: String,
     kind: Option<str0m::media::MediaKind>,
+    /// Whether the SFU has stopped forwarding this track.
+    ///
+    /// A track can be present and not flowing: the SFU pauses a stream it cannot afford rather
+    /// than dropping the subscription. Without this an application sees packets stop and has no
+    /// way to tell that from a dead network, so it renders a blank tile instead of a placeholder.
+    paused: bool,
 }
 
 impl Publication {
@@ -283,7 +289,16 @@ impl Publication {
             id: track.id,
             publisher_id: track.participant_id,
             kind,
+            paused: false,
         }
+    }
+
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused
     }
 
     pub(crate) fn id(&self) -> &str {

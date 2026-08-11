@@ -197,6 +197,11 @@ pub(crate) enum AgentEvent {
     StatsUpdated,
     RemoteTrackDiscovered(Track),
     RemoteTrackRemoved(String),
+    /// The SFU stopped forwarding this track - it is out of bandwidth for it, not gone. A UI
+    /// should show a placeholder rather than the blank it would otherwise render.
+    RemoteTrackPaused(String),
+    /// Forwarding resumed.
+    RemoteTrackResumed(String),
     Connected,
     Disconnected(String),
 }
@@ -1048,7 +1053,22 @@ impl AgentDriver {
 
         match payload {
             signaling::server_message::Payload::Update(update) => {
-                let (assignments, discovered, removed) = self.slot_manager.sync(update);
+                let sync = self.slot_manager.sync(update);
+                let (assignments, discovered, removed) = (
+                    sync.new_assignments,
+                    sync.newly_discovered_tracks,
+                    sync.removed_tracks,
+                );
+                for (track_id, paused) in sync.pause_changes {
+                    // The SFU told us it started or stopped forwarding. Without this an
+                    // application cannot tell a paused stream from a dead network, so it shows a
+                    // blank tile where a placeholder belongs.
+                    self.emit(if paused {
+                        AgentEvent::RemoteTrackPaused(track_id)
+                    } else {
+                        AgentEvent::RemoteTrackResumed(track_id)
+                    });
+                }
                 for track in discovered {
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
                 }
