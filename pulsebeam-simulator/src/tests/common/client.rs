@@ -374,12 +374,16 @@ pub struct AudioStream {
     /// Audio is far less forgiving than video here. A picture that misses 200ms is a stutter
     /// nobody remarks on; a voice that drops 200ms loses a syllable.
     pub longest_gap: Duration,
-    /// The best (loudest) rank the SFU ever gave this speaker, as signalled.
+    /// The most recent rank the SFU gave this speaker, as signalled.
     ///
     /// Packets alone say a speaker got through; the rank says where the SFU placed them. A test
     /// that the loudest voice wins needs both, because "heard" and "heard as the loudest" are
     /// different claims and only the second is the selector's contract.
-    pub best_rank: Option<u32>,
+    ///
+    /// The *latest* rank, not the best one ever held. A room does not form instantly, and while
+    /// only one person has connected they are trivially rank 0 - so a minimum over the whole run
+    /// reports the join order rather than the selector's judgement.
+    pub last_rank: Option<u32>,
     first_at: Option<Instant>,
     last_at: Option<Instant>,
 }
@@ -453,22 +457,39 @@ impl AudioReceiveLog {
 
     fn record_rank(&mut self, publisher: &str, rank: u32) {
         let entry = self.by_publisher.entry(publisher.to_owned()).or_default();
-        entry.best_rank = Some(entry.best_rank.map_or(rank, |best| best.min(rank)));
+        entry.last_rank = Some(rank);
     }
 
     /// Speakers this listener was told about, whether or not media arrived.
     pub fn ranked(&self) -> std::collections::BTreeMap<String, u32> {
         self.by_publisher
             .iter()
-            .filter_map(|(publisher, s)| s.best_rank.map(|rank| (publisher.clone(), rank)))
+            .filter_map(|(publisher, s)| s.last_rank.map(|rank| (publisher.clone(), rank)))
             .collect()
     }
 
-    /// Speakers this listener actually heard.
+    /// Speakers this listener heard for a meaningful part of the call.
+    ///
+    /// Not "sent us a packet once", and not merely "was audible briefly". A room does not form
+    /// instantly: every slot is empty when a call starts, so the first voices to arrive are
+    /// forwarded whoever they are, and somebody can hold a slot simply because nobody louder has
+    /// connected yet. Counting them reports join order, not the selector's judgement.
+    ///
+    /// So a speaker is heard if they were audible at all *and* for a decent share of however long
+    /// the most-heard speaker managed. One the selector genuinely keeps runs for the length of the
+    /// call; one that only occupied an empty slot while the room filled does not come close.
+    /// Measured at seed 9: 1.0s against 9.8s, evicted the instant the third talker connected.
     pub fn heard_from(&self) -> std::collections::BTreeSet<String> {
+        let longest = self
+            .by_publisher
+            .values()
+            .map(AudioStream::audible_for)
+            .max()
+            .unwrap_or_default();
+        let floor = MIN_AUDIBLE.max(longest / SUSTAINED_SHARE_DIVISOR);
         self.by_publisher
             .iter()
-            .filter(|(_, stream)| stream.audible_for() >= MIN_AUDIBLE)
+            .filter(|(_, stream)| stream.audible_for() >= floor)
             .map(|(publisher, _)| publisher.clone())
             .collect()
     }
@@ -481,6 +502,13 @@ impl AudioReceiveLog {
 /// between. That is a handful at the very start of a call and a receiver conceals it inaudibly. It
 /// is a different thing from the stream itself being torn, which is what the bound exists for.
 pub const MAX_CONCEALABLE_GAP: u64 = 2;
+
+/// What share of the most-heard speaker's airtime counts as having been heard too.
+///
+/// Half. Deliberately blunt: the gap between a speaker the selector keeps and one that held an
+/// empty slot while the room formed is an order of magnitude, not a few percent, so the threshold
+/// only has to land somewhere in the middle of it.
+const SUSTAINED_SHARE_DIVISOR: u32 = 2;
 
 /// How long a voice must be forwarded before a listener can be said to have heard it.
 ///
