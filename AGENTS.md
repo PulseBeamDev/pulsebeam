@@ -66,6 +66,8 @@ Tests verify fundamental properties and invariants rather than rigid, step-by-st
 ### Zero Flakiness & Determinism
 - **No Wall-Clock Delays:** Never use `std::thread::sleep`, real-world timeouts, or arbitrary sleep loops. Use simulated time, deterministic step ticks, or explicit async readiness notifications.
 - **Deterministic Simulation:** Ensure any randomized simulation parameters (latency, packet loss, ordering) are seeded so failures are 100% reproducible. One seed determines an entire run; read `docs/simulation.md` before adding a source of randomness.
+- **A seed-dependent failure is never flakiness.** Every plan is deterministic in its seed, so a plan that fails at one seed and passes at another is reporting a real difference in behaviour. `docs/simulation.md` has the triage: wide margin at one seed is a defect, narrow margin across several is a wrong threshold, failing everywhere means the expectation is unrealistic.
+- **Assume a red simulation test is a production bug** until the evidence says otherwise. Do not reach for a workaround, a relaxed threshold, or an `#[allow]`; these plans have found silent data loss and frozen bandwidth estimates that no unit test could reach. Fixing the design is in scope, including when the fix is structural.
 
 ## Preparing Changes
 
