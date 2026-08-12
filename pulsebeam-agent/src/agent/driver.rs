@@ -254,6 +254,9 @@ pub(crate) struct DriverInit {
     pub api: HttpApiClient,
     pub signaling_cid: ChannelId,
     pub resource_uri: Uri,
+    /// The connection generation, echoed as `If-Match` on the next reconnect and replaced by the
+    /// one the server answers with. Identity is the participant id; this says which connection.
+    pub etag: String,
     pub room_id: String,
     pub participant_id: String,
     pub medias: Vec<MediaAdded>,
@@ -350,6 +353,9 @@ struct SubscriptionSubsystem {
 struct SessionSubsystem {
     api: HttpApiClient,
     resource_uri: Uri,
+    /// The connection generation, echoed as `If-Match` on the next reconnect and replaced by the
+    /// one the server answers with. Identity is the participant id; this says which connection.
+    etag: String,
     room_id: String,
     participant_id: String,
     disconnected_reason: Option<String>,
@@ -447,6 +453,7 @@ impl AgentDriver {
             session: SessionSubsystem {
                 api: init.api,
                 resource_uri: init.resource_uri,
+                etag: init.etag,
                 room_id: init.room_id,
                 participant_id: init.participant_id,
                 disconnected_reason: None,
@@ -1156,18 +1163,17 @@ impl AgentDriver {
                 if sync.speakers_changed {
                     self.emit(AgentEvent::SpeakersChanged(self.slot_manager.speakers()));
                 }
+                for (mid, track) in sync.audio_arrivals {
+                    // Nobody subscribed to this: the SFU chose to forward it, and it is described
+                    // entirely by the assignment - a speaker never appears in `tracks_upsert`.
+                    let (tx, rx) = mailbox::bounded(256);
+                    self.media.media_targets.insert(mid, tx);
+                    if let Some(sink) = &self.media.audio_sink {
+                        let _ = sink.try_send(RemoteTrack::new(track, rx));
+                    }
+                }
                 for (mid, track) in assignments {
                     let track_id = track.id.clone();
-                    if track.kind == i32::from(signaling::TrackKind::Audio) {
-                        // Nobody subscribed to this: the SFU chose to forward it. Hand the whole
-                        // track over rather than looking for a waiting subscription.
-                        let (tx, rx) = mailbox::bounded(256);
-                        self.media.media_targets.insert(mid, tx);
-                        if let Some(sink) = &self.media.audio_sink {
-                            let _ = sink.try_send(RemoteTrack::new(track, rx));
-                        }
-                        continue;
-                    }
                     // A subscriber already holds the receiving half, from a subscription answered
                     // before this assignment existed. Wire its sender to the slot rather than
                     // replacing it, or the handle it is holding would never receive anything.
@@ -1336,9 +1342,16 @@ impl AgentDriver {
             .api
             .update_participant(
                 self.session.resource_uri.clone(),
-                UpdateParticipantRequest { offer },
+                UpdateParticipantRequest {
+                    offer,
+                    etag: self.session.etag.clone(),
+                },
             )
             .await?;
+
+        // The generation moves on with every successful reconnect; the next one has to quote the
+        // new value or the server will refuse it.
+        self.session.etag = resp.etag;
 
         self.rtc
             .sdp_api()

@@ -230,7 +230,7 @@ impl Signaling {
         // 1. Prepare Current State (The "Truth")
         // We gather all currently active tracks and assignments.
         let heard = downstream.audio_assignments();
-        let mut current_tracks: Vec<signaling::Track> = downstream
+        let current_tracks: Vec<signaling::Track> = downstream
             .video
             .tracks()
             .map(|t| signaling::Track {
@@ -240,15 +240,11 @@ impl Signaling {
                 meta: Default::default(),
             })
             .collect();
-        // A speaker is only announced while they are being heard. Audio has no subscription for
-        // the client to make - the SFU decides who is forwarded - so the assignment arriving is
-        // the first the client knows of the track, and the track has to accompany it.
-        current_tracks.extend(heard.iter().map(|h| signaling::Track {
-            id: h.origin.track.as_str(),
-            kind: signaling::TrackKind::Audio.into(),
-            participant_id: h.origin.participant.as_str(),
-            meta: Default::default(),
-        }));
+        // Audio deliberately does *not* appear in `tracks_upsert`. That list means "video tracks
+        // you can subscribe to", and clients treat every entry as one - announcing a speaker there
+        // gave them a second, video-shaped track and put the same person on screen twice. Who is
+        // speaking rides in the assignment instead, which needs no subscription because the SFU
+        // decides who is forwarded.
 
         let current_audio: Vec<signaling::AudioAssignment> = heard
             .iter()
@@ -256,6 +252,7 @@ impl Signaling {
             .map(|(rank, h)| signaling::AudioAssignment {
                 mid: h.mid.to_string(),
                 track_id: h.origin.track.as_str(),
+                participant_id: h.origin.participant.as_str(),
                 rank: u32::try_from(rank).unwrap_or(u32::MAX),
                 level_dbov: i32::from(h.level_dbov),
             })
@@ -410,6 +407,7 @@ mod tests {
         signaling::AudioAssignment {
             mid: mid.to_owned(),
             track_id: track_id.to_owned(),
+            participant_id: "pa_test".to_owned(),
             rank,
             level_dbov,
         }

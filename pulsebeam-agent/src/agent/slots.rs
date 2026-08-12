@@ -101,6 +101,7 @@ impl SlotManager {
 
     pub fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> SyncOutcome {
         let mut new_assignments: Vec<(Mid, Track)> = Vec::new();
+        let mut audio_arrivals: Vec<(Mid, Track)> = Vec::new();
         let mut speakers_changed = false;
         let mut pause_changes: Vec<(TrackId, bool)> = Vec::new();
         let mut newly_discovered_tracks = Vec::new();
@@ -109,6 +110,17 @@ impl SlotManager {
         for t in update.tracks_remove {
             self.pending_tracks.remove(&t);
             self.active_tracks.remove(&t);
+            // And any slot still naming them. The assignment that vacates a slot usually arrives
+            // too, but not always - a snapshot resync carries no removals by design - and a slot
+            // left naming a departed track goes on reporting them as a speaker. The room saying
+            // they are gone is enough on its own.
+            for slot in &mut self.slots {
+                if slot.track_id.as_deref() == Some(t.as_str()) {
+                    speakers_changed |= slot.speaker.is_some();
+                    slot.speaker = None;
+                    slot.track_id = None;
+                }
+            }
         }
 
         for t in update.tracks_upsert {
@@ -187,14 +199,8 @@ impl SlotManager {
             else {
                 continue;
             };
-            let publisher = self
-                .pending_tracks
-                .get(&a.track_id)
-                .or_else(|| self.active_tracks.get(&a.track_id))
-                .map(|t| t.participant_id.clone())
-                .unwrap_or_default();
             let speaker = Speaker {
-                participant_id: publisher,
+                participant_id: a.participant_id.clone(),
                 track_id: a.track_id.clone(),
                 rank: a.rank,
                 level_dbov: a.level_dbov,
@@ -206,11 +212,19 @@ impl SlotManager {
                 continue;
             }
             s.track_id = Some(a.track_id.clone());
-            if let Some(track) = self.pending_tracks.remove(&a.track_id) {
-                let mid = s.mid;
-                self.active_tracks.insert(a.track_id, track.clone());
-                new_assignments.push((mid, track));
-            }
+            // Built from the assignment, not looked up in `tracks_upsert`: a speaker never
+            // appears there. That list is video the client may subscribe to, and an audio entry
+            // in it becomes a second tile for somebody who already has one.
+            let mid = s.mid;
+            audio_arrivals.push((
+                mid,
+                Track {
+                    id: a.track_id.clone(),
+                    kind: i32::from(pulsebeam_proto::signaling::TrackKind::Audio),
+                    participant_id: a.participant_id.clone(),
+                    meta: Default::default(),
+                },
+            ));
         }
 
         for slot in &self.slots {
@@ -237,6 +251,7 @@ impl SlotManager {
             removed_tracks,
             pause_changes,
             speakers_changed,
+            audio_arrivals,
         }
     }
 }
@@ -250,6 +265,11 @@ pub struct SyncOutcome {
     pub pause_changes: Vec<(TrackId, bool)>,
     /// Whether who-is-being-heard moved. Read the ranking back with [`SlotManager::speakers`].
     pub speakers_changed: bool,
+    /// Audio the SFU has decided to forward, per slot that changed occupant.
+    ///
+    /// Separate from `new_assignments` because nobody subscribed to these: the SFU chooses who is
+    /// heard, and the speaker is described entirely by the assignment.
+    pub audio_arrivals: Vec<(Mid, Track)>,
 }
 
 #[cfg(test)]
@@ -293,9 +313,12 @@ mod tests {
         rank: u32,
         level_dbov: i32,
     ) -> pulsebeam_proto::signaling::AudioAssignment {
+        // Mirrors the SFU: the speaker's identity travels in the assignment, never in a track.
+        let participant_id = track_id.trim_start_matches("audio-").to_owned();
         pulsebeam_proto::signaling::AudioAssignment {
             mid: mid.to_owned(),
             track_id: track_id.to_owned(),
+            participant_id,
             rank,
             level_dbov,
         }
@@ -460,6 +483,33 @@ mod tests {
 
         assert!(sync.speakers_changed);
         assert!(slots.speakers().is_empty(), "nobody is being heard");
+    }
+
+    /// A speaker who leaves stops being reported, even if the slot is never explicitly vacated.
+    ///
+    /// The SFU normally sends both: the track goes from `tracks_remove` and the slot from
+    /// `audio_remove`. A snapshot resync carries no removals at all, though, so a client that
+    /// waited for the second would keep naming somebody who had left - a ghost speaker, and a
+    /// tile for a person who is not in the room.
+    #[test]
+    fn a_departed_track_is_dropped_from_its_slot() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("a0"));
+        slots.sync(audio_update(
+            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![audio_track("audio-alice", "alice")],
+        ));
+        assert_eq!(slots.speakers().len(), 1, "alice is being heard");
+
+        let mut gone = audio_update(Vec::new(), Vec::new());
+        gone.tracks_remove = vec!["audio-alice".to_owned()];
+        let sync = slots.sync(gone);
+
+        assert!(sync.speakers_changed, "the application has to be told");
+        assert!(
+            slots.speakers().is_empty(),
+            "a speaker who left the room is not still being heard"
+        );
     }
 
     /// Repeating a state is not a change.

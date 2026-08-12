@@ -39,6 +39,12 @@ message AudioAssignment {
   string mid = 1;
   string track_id = 2;
 
+  // Who is speaking. Carried here rather than as an entry in `tracks_upsert`,
+  // because that list means "video tracks you can subscribe to" and a client is
+  // entitled to treat every entry as one. Announcing audio there gave every
+  // heard speaker a second, video-shaped track and duplicated them on screen.
+  string participant_id = 5;
+
   // 0 is the loudest currently-forwarded speaker. Ranks are contiguous over the
   // speakers being forwarded, so the set of ranks is 0..N for N occupied slots.
   uint32 rank = 3;
