@@ -1,5 +1,29 @@
 # Agent Development Guide
 
+## Thread-per-core: read `docs/thread-per-core.md` first
+
+A shard owns its state and reaches other shards only by message. Denied by
+`clippy.toml` and gated by `make lint-check` (which CI runs): `Arc`, `Mutex`,
+`RwLock`, bare atomics, and blocking calls (`std::thread::sleep`,
+`block_in_place`). Each needs an `#[allow]` with a reason if you genuinely need
+one.
+
+The clock and the RNG are **not** linted: the simulator shims `clock_gettime`
+and `getrandom` process-wide, so `SystemTime::now` and `thread_rng` are already
+deterministic under a plan — and the shim covers dependencies a lint cannot.
+
+Two things that keep getting reintroduced, both explained in that file:
+
+- Several atomics read together **do not form a consistent snapshot**, however
+  atomic each read is. Packing two into one `AtomicU64` is not a pattern to
+  copy; it is a symptom.
+- Sharing state across shards is not a performance trade-off to revisit later.
+  It is a design that stops working at the node boundary, where there is no
+  shared memory to reach into.
+
+If a change reintroduces one of these, it is a regression even when the tests
+pass, and even when the profile looks the same.
+
 ## Critical Systems & Defensive Assertions
 
 This project is designed to run in simulation (`pulsebeam-simulator`). To catch subtle bugs early under simulated failure conditions, code changes must include extensive defensive assertions.
@@ -41,16 +65,21 @@ Tests verify fundamental properties and invariants rather than rigid, step-by-st
 
 ### Zero Flakiness & Determinism
 - **No Wall-Clock Delays:** Never use `std::thread::sleep`, real-world timeouts, or arbitrary sleep loops. Use simulated time, deterministic step ticks, or explicit async readiness notifications.
-- **Deterministic Simulation:** Ensure any randomized simulation parameters (latency, packet loss, ordering) are seeded so failures are 100% reproducible.
+- **Deterministic Simulation:** Ensure any randomized simulation parameters (latency, packet loss, ordering) are seeded so failures are 100% reproducible. One seed determines an entire run; read `docs/simulation.md` before adding a source of randomness.
+- **A seed-dependent failure is never flakiness.** Every plan is deterministic in its seed, so a plan that fails at one seed and passes at another is reporting a real difference in behaviour. `docs/simulation.md` has the triage: wide margin at one seed is a defect, narrow margin across several is a wrong threshold, failing everywhere means the expectation is unrealistic.
+- **Assume a red simulation test is a production bug** until the evidence says otherwise. Do not reach for a workaround, a relaxed threshold, or an `#[allow]`; these plans have found silent data loss and frozen bandwidth estimates that no unit test could reach. Fixing the design is in scope, including when the fix is structural.
 
 ## Preparing Changes
 
 Before considering a change complete, run:
 
 - **Checking:** `cargo check`
-- **Unit Tests:** `make test` (or `cargo test`)
-- **Simulation Tests:** `cargo test --profile sim --features sim`
-- **Test Filtering:** `cargo test <name>`, or for simulation tests: `cargo test <name> --profile sim --features sim`
+- **Unit Tests:** `make test-unit`
+- **Simulation Tests:** `make test-sim` — not bare `cargo test`, which uses the
+  debug profile and is slow enough to look flaky
+- **Everything CI runs:** `make test`
+- **Test Filtering:** `make test-unit TEST=<name>`, or `make test-sim TEST=<name>`
+- **Replaying one seed:** `make test-sim-seed SEED=<n>` — see `docs/simulation.md`
 - **Formatting & Linting:** `make lint`
 
 All of the above should pass cleanly before handing off or committing a change.
