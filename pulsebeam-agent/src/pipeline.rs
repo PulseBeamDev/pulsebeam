@@ -165,6 +165,8 @@ pub struct JitterBuffer {
     latest_arrival: Option<Instant>,
     max_wait: Duration,
     initial_wait: Duration,
+    /// Whether anything has reached the screen yet. See the gap budget in [`Self::pop`].
+    delivered_frame: bool,
 }
 
 impl JitterBuffer {
@@ -177,6 +179,7 @@ impl JitterBuffer {
             // Never longer than the gap budget: a caller that asked for a tight budget wants low
             // latency, and handing it a slower start than it asked for would be perverse.
             initial_wait: DEFAULT_INITIAL_COMMIT_WAIT.min(max_wait),
+            delivered_frame: false,
         }
     }
 
@@ -207,14 +210,32 @@ impl JitterBuffer {
             self.next = Some(next.wrapping_add(1));
             return Some(pkt);
         }
-        // Gap at `next`: wait up to `max_wait` for it to fill, then skip it (lost).
+        // Gap at `next`: wait for it to fill, then skip it (lost).
+        //
+        // The budget depends on whether anything is on screen yet. `max_wait` protects
+        // *continuity* - it is worth stalling a running picture to recover a packet, because the
+        // alternative is a visible tear. Before the first frame there is no continuity to protect,
+        // and a viewer looking at a blank tile would far rather see the next decodable frame than
+        // wait seconds for a packet that may never come. Measured: two packets went missing right
+        // after the first one the buffer committed to, and the viewer sat blank for 5s of loss
+        // budget before showing anything - on a link configured with no loss at all.
+        let budget = if self.delivered_frame {
+            self.max_wait
+        } else {
+            self.initial_wait
+        };
         let (_, head_pkt) = self.buf.first_key_value()?;
-        if now.saturating_duration_since(head_pkt.arrival) < self.max_wait {
+        if now.saturating_duration_since(head_pkt.arrival) < budget {
             return None;
         }
         let (head_seq, pkt) = self.buf.pop_first()?;
         self.next = Some(head_seq.wrapping_add(1));
         Some(pkt)
+    }
+
+    /// Note that a frame has reached the application, so gaps are now worth waiting out.
+    fn note_frame_delivered(&mut self) {
+        self.delivered_frame = true;
     }
 
     /// Release everything still buffered, in sequence order (end of stream).
@@ -282,6 +303,7 @@ impl FrameReceiver {
         let mut frames = Vec::new();
         while let Some(ordered) = self.jitter.pop() {
             if let Some(frame) = self.reassemble(ordered) {
+                self.jitter.note_frame_delivered();
                 frames.push(frame);
             }
         }
