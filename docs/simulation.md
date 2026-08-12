@@ -182,12 +182,11 @@ libwebrtc's receive path, and the two differ in ways that decide designs - see "
 belongs to the slot" below. A plan can be green while Chrome renders nothing. Changes to stream
 identity, SSRCs or SDP need a manual browser check; the suite cannot stand in for one.
 
-**Where media goes missing between the SFU writing it and the application reading it.** Found while
-chasing a first-frame stall: the SFU wrote a contiguous run of sequence numbers, the viewer's first
-packet was a hundred numbers into it, and two more went missing straight after - on a link
-configured with `loss: 0.0`, no loss model and no reorder. Whatever dropped them is inside the
-agent or its transport, and nothing measures it. The suite counts frames and gaps at the
-application, and packets at the wire, but nothing in between.
+**Where media goes missing between the SFU writing it and the application reading it.** The suite
+counts frames at the application and bytes at the wire, and nothing in between. A first-frame stall
+turned out to be 34 packets dropped inside the agent, and finding it needed hand-rolled probes at
+each hop rather than anything the harness offers. Worth a permanent counter on the agent for
+packets it could not route.
 
 **Audio quality.** Who is heard, who they are, and how many streams they arrive on are asserted
 now. How *well* they are heard is not: there is no audio continuity, gap or concealment figure

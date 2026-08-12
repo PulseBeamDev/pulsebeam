@@ -15,6 +15,20 @@ use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_proto::namespace;
 use pulsebeam_proto::prelude::Message;
+/// How many packets may wait for the assignment that says where they go.
+///
+/// Enough for the keyframe a stream opens with - a 720p one runs to a few dozen packets - and
+/// small enough that a peer sending unroutable media cannot cost more than a few hundred kilobytes.
+const UNROUTED_CAPACITY: usize = 128;
+
+/// How long a packet may wait to be routed before it is stale.
+///
+/// The assignment travels over the data channel, so the wait is a round trip at worst. Anything
+/// older belongs to a stream that has gone, and handing it over late is worse than dropping it:
+/// the receiver has moved on, and a packet from behind its sequence frontier reads as a gap it
+/// must wait out.
+const UNROUTED_MAX_WAIT: Duration = Duration::from_millis(500);
+
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};
 use std::collections::{HashMap, VecDeque};
@@ -238,6 +252,13 @@ struct DataSubsystem {
 
 struct MediaSubsystem {
     media_targets: HashMap<Mid, mailbox::Sender<RtpPacket>>,
+    /// Packets that arrived before the assignment saying which track their slot carries.
+    ///
+    /// Media and signalling travel separately, and the SFU starts forwarding as soon as it has a
+    /// slot - which can be before the assignment naming it reaches the client. Those first packets
+    /// are the keyframe the stream opens with, and dropping them costs the viewer the picture
+    /// until the next one, which on a settled stream can be seconds away.
+    unrouted: VecDeque<(Mid, Option<Instant>, RtpPacket)>,
     /// Cache of which (mid, rid) each incoming SSRC belongs to. `Event::RtpPacket`
     /// carries only the SSRC, so the mapping is resolved once via the DirectApi and
     /// reused. Mirrors the SFU's `incoming_rtp_routes`.
@@ -379,6 +400,7 @@ impl AgentDriver {
                 upstream_slots: HashMap::new(),
                 pending_media_subscriptions: HashMap::new(),
                 pending_media_targets: HashMap::new(),
+                unrouted: VecDeque::new(),
                 audio_sink: None,
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
@@ -807,6 +829,7 @@ impl AgentDriver {
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
                     let _ = response.send(Ok(RemoteTrack::new(track, rx)));
+                    self.deliver_unrouted();
                     self.subscriptions
                         .desired_subscriptions
                         .insert(track_id, subscription);
@@ -944,18 +967,28 @@ impl AgentDriver {
                         };
                         if let Some((mid, rid)) = route {
                             self.media.incoming_rtp_routes.insert(ssrc, (mid, rid));
-                            if let Some(tx) = self.media.media_targets.get(&mid) {
-                                let _ = tx.try_send(RtpPacket {
-                                    mid,
-                                    rid,
-                                    seq: rtp.seq_no,
-                                    ts: rtp.time,
-                                    marker: rtp.header.marker,
-                                    ssrc: Some(ssrc),
-                                    payload: rtp.payload,
-                                    ext_vals: rtp.header.ext_vals,
-                                    arrival: rtp.timestamp.into(),
-                                });
+                            let packet = RtpPacket {
+                                mid,
+                                rid,
+                                seq: rtp.seq_no,
+                                ts: rtp.time,
+                                marker: rtp.header.marker,
+                                ssrc: Some(ssrc),
+                                payload: rtp.payload,
+                                ext_vals: rtp.header.ext_vals,
+                                arrival: rtp.timestamp.into(),
+                            };
+                            match self.media.media_targets.get(&mid) {
+                                Some(tx) => {
+                                    let _ = tx.try_send(packet);
+                                }
+                                None => {
+                                    let deadline = self.now.checked_add(UNROUTED_MAX_WAIT);
+                                    self.media.unrouted.push_back((mid, deadline, packet));
+                                    while self.media.unrouted.len() > UNROUTED_CAPACITY {
+                                        self.media.unrouted.pop_front();
+                                    }
+                                }
                             }
                         }
                     }
@@ -1124,6 +1157,8 @@ impl AgentDriver {
                         let _ = response.send(Ok(remote_track));
                     }
                 }
+                // Last, once every slot this update touched is routable.
+                self.deliver_unrouted();
             }
             signaling::server_message::Payload::Error(err) => {
                 tracing::warn!("signaling error: {}", err);
@@ -1141,6 +1176,30 @@ impl AgentDriver {
     fn forget_track(&mut self, track_id: &str) {
         self.subscriptions.desired_subscriptions.remove(track_id);
         self.subscriptions.sub_manager.remove_track(track_id);
+    }
+
+    /// Hand over packets that were waiting for the assignment naming their slot.
+    ///
+    /// In arrival order, and only for slots now routable; anything still unrouted stays held until
+    /// it is claimed or goes stale.
+    fn deliver_unrouted(&mut self) {
+        if self.media.unrouted.is_empty() {
+            return;
+        }
+        let now = self.now;
+        let mut still_waiting = VecDeque::with_capacity(self.media.unrouted.len());
+        while let Some((mid, deadline, packet)) = self.media.unrouted.pop_front() {
+            if deadline.is_none_or(|deadline| now > deadline) {
+                continue;
+            }
+            match self.media.media_targets.get(&mid) {
+                Some(tx) => {
+                    let _ = tx.try_send(packet);
+                }
+                None => still_waiting.push_back((mid, deadline, packet)),
+            }
+        }
+        self.media.unrouted = still_waiting;
     }
 
     fn emit(&mut self, event: AgentEvent) {
