@@ -61,6 +61,20 @@ pub struct StatisticsSnapshot {
     /// a constantly climbing count means downstream cannot decode — the signature
     /// of a broken forwarding/reassembly path.
     pub(crate) keyframe_requests_received: u64,
+    /// Media the agent received and could not hand to anyone.
+    ///
+    /// Should be zero. Anything else is silent loss inside the client: packets that arrived, were
+    /// decrypted and demuxed, and then went nowhere because no slot claimed them before the hold
+    /// window ran out. Its absence is why a 34-packet drop once needed probes at every hop to
+    /// find - the frames were missing at the application and present at the wire, and nothing
+    /// measured in between.
+    pub(crate) unroutable_media_dropped: u64,
+    /// Media held until the assignment naming its slot arrived, then delivered.
+    ///
+    /// Expected to be small and non-zero: the SFU forwards as soon as it has a slot, which can
+    /// beat the assignment over the data channel. A large or growing figure means signalling is
+    /// lagging media badly enough to be worth looking at, even though nothing was lost.
+    pub(crate) media_held_for_routing: u64,
 }
 
 impl StatisticsSnapshot {
@@ -71,6 +85,16 @@ impl StatisticsSnapshot {
     /// Cumulative keyframe requests received (see field docs).
     pub fn keyframe_requests_received(&self) -> u64 {
         self.keyframe_requests_received
+    }
+
+    /// Media that arrived and could not be delivered to anyone (see field docs). Should be zero.
+    pub fn unroutable_media_dropped(&self) -> u64 {
+        self.unroutable_media_dropped
+    }
+
+    /// Media delayed until its slot became routable, then delivered (see field docs).
+    pub fn media_held_for_routing(&self) -> u64 {
+        self.media_held_for_routing
     }
 
     pub fn bytes_sent(&self) -> u64 {
@@ -987,6 +1011,8 @@ impl AgentDriver {
                                     self.media.unrouted.push_back((mid, deadline, packet));
                                     while self.media.unrouted.len() > UNROUTED_CAPACITY {
                                         self.media.unrouted.pop_front();
+                                        self.stats.unroutable_media_dropped =
+                                            self.stats.unroutable_media_dropped.wrapping_add(1);
                                     }
                                 }
                             }
@@ -1190,11 +1216,15 @@ impl AgentDriver {
         let mut still_waiting = VecDeque::with_capacity(self.media.unrouted.len());
         while let Some((mid, deadline, packet)) = self.media.unrouted.pop_front() {
             if deadline.is_none_or(|deadline| now > deadline) {
+                self.stats.unroutable_media_dropped =
+                    self.stats.unroutable_media_dropped.wrapping_add(1);
                 continue;
             }
             match self.media.media_targets.get(&mid) {
                 Some(tx) => {
                     let _ = tx.try_send(packet);
+                    self.stats.media_held_for_routing =
+                        self.stats.media_held_for_routing.wrapping_add(1);
                 }
                 None => still_waiting.push_back((mid, deadline, packet)),
             }

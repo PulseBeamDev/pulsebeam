@@ -1,4 +1,4 @@
-use super::common::{LocalNodeSim, Participant, Room, Step, VideoQuality};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
 
 #[test]
@@ -553,6 +553,8 @@ fn every_declared_failure_point_is_reachable_test() {
 #[test]
 fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
     LocalNodeSim::new()
+        .with_link(LinkProfile::cellular())
+        .with_shards(4)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -588,6 +590,10 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
                 description: "The viewer can see the publisher who replaced her",
                 participant: "viewer",
                 quality: VideoQuality::min_frames(50),
+            },
+            Step::CheckMediaRouted {
+                description: "And nothing was thrown away on the way in",
+                participant: "viewer",
             },
         ]);
 }

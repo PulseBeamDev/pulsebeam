@@ -475,6 +475,15 @@ pub enum Step {
         participant: &'static str,
         quality: VideoQuality,
     },
+    /// Nothing this participant received was thrown away for want of somewhere to put it.
+    ///
+    /// Silent loss inside the client, which is invisible from both ends: the frames are missing at
+    /// the application and present at the wire. Finding 34 such packets once took hand-rolled
+    /// probes at every hop, because nothing measured in between.
+    CheckMediaRouted {
+        description: &'static str,
+        participant: &'static str,
+    },
     /// Assert the publisher has received at most `max` keyframe (PLI) requests.
     /// A constantly climbing count means downstream cannot decode the forwarded
     /// stream — the signature of a broken DD/reassembly path (the "PLI storm").
@@ -746,6 +755,7 @@ struct ParticipantShared {
     connected: Mutex<bool>,
     /// Cumulative keyframe (PLI) requests this participant's publisher received.
     keyframe_requests: Mutex<u64>,
+    unroutable_media_dropped: Mutex<u64>,
     /// Set to Some(...) once the participant has connected for the first time.
     participant_id: Mutex<Option<String>>,
     /// Operations queued by the coordinator; drained on next drive tick.
@@ -766,6 +776,7 @@ impl ParticipantShared {
             rx_bytes: Mutex::new(0),
             connected: Mutex::new(false),
             keyframe_requests: Mutex::new(0),
+            unroutable_media_dropped: Mutex::new(0),
             participant_id: Mutex::new(None),
             pending_ops: Mutex::new(Vec::new()),
             data_received: Mutex::new(HashMap::new()),
@@ -804,6 +815,11 @@ impl ParticipantHandle {
     }
     fn keyframe_requests(&self) -> u64 {
         *self.shared.keyframe_requests.lock().unwrap()
+    }
+
+    /// Media this participant received and could not hand to anyone. Should always be zero.
+    fn unroutable_media_dropped(&self) -> u64 {
+        *self.shared.unroutable_media_dropped.lock().unwrap()
     }
     fn connected(&self) -> bool {
         *self.shared.connected.lock().unwrap()
@@ -1159,6 +1175,8 @@ async fn run_participant(
                 *shared_clone.connected.lock().unwrap() = stats.is_connected();
                 *shared_clone.keyframe_requests.lock().unwrap() =
                     stats.keyframe_requests_received();
+                *shared_clone.unroutable_media_dropped.lock().unwrap() =
+                    stats.unroutable_media_dropped();
                 false
             }));
 
@@ -1228,6 +1246,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
+        Step::CheckMediaRouted { .. } => "CheckMediaRouted",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
@@ -1722,6 +1741,19 @@ async fn execute_plan(
                     quality.min_frames,
                     stats.frames,
                     stats.keyframes,
+                );
+            }
+
+            Step::CheckMediaRouted {
+                description,
+                participant,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
+                let dropped = handle.unroutable_media_dropped();
+                assert_eq!(
+                    dropped, 0,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     no media discarded for want of a slot to put it in\n  actual:       {dropped} packets\n  note:         these arrived, were decrypted and demuxed, and then went\n                nowhere - invisible at both ends"
                 );
             }
 
