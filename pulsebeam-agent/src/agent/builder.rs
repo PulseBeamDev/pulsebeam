@@ -302,6 +302,7 @@ impl AgentBuilder {
             },
             signaling_cid,
             resource_uri: resp.resource_uri,
+            etag: resp.etag,
             room_id: room_id.to_string(),
             participant_id: resp.participant_id,
             medias,
