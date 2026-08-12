@@ -830,6 +830,12 @@ struct ParticipantHandle {
     publishes_audio: bool,
     /// Whether the plan has this participant in the room right now.
     present: bool,
+    /// How each departure ended, in order: `true` for a graceful leave, `false` for a crash.
+    ///
+    /// Per departure rather than per participant, because a rejoin makes the previous identity
+    /// superseded and how *that* one ended is what decides whether a lingering ghost of it is the
+    /// SFU's fault or the network's.
+    departures: Vec<bool>,
     /// Whether the last departure was a clean one.
     ///
     /// A graceful leave tells the SFU directly, so everyone should know at once and a ghost is a
@@ -1517,6 +1523,7 @@ async fn execute_plan(
                 // Ground truth for the room invariant, from the plan rather than the wire.
                 handle.present = false;
                 handle.departed_cleanly = true;
+                handle.departures.push(true);
                 handle.send_command(ParticipantCmd::Shutdown);
             }
 
@@ -1529,6 +1536,7 @@ async fn execute_plan(
                 // Ground truth for the room invariant, from the plan rather than the wire.
                 handle.present = false;
                 handle.departed_cleanly = false;
+                handle.departures.push(false);
                 handle.send_command(ParticipantCmd::Drop);
             }
 
@@ -2386,7 +2394,13 @@ fn assert_room_state_consistent(handles: &HashMap<&'static str, ParticipantHandl
         let last = incarnations.len().saturating_sub(1);
         for (i, id) in incarnations.into_iter().enumerate() {
             let state = if i < last {
-                Identity::Superseded
+                // Superseded, but only strictly if that incarnation ended by saying so. One that
+                // crashed is found out by timeout like any other.
+                if handle.departures.get(i).copied().unwrap_or(true) {
+                    Identity::Superseded
+                } else {
+                    Identity::Vanished
+                }
             } else if handle.present {
                 Identity::Live
             } else if handle.departed_cleanly {
@@ -3724,6 +3738,7 @@ impl LocalNodeSim {
                         publishes_audio: participant.audio_level_dbov.is_some(),
                         present: !participant.starts_disconnected,
                         departed_cleanly: true,
+                        departures: Vec::new(),
                     },
                 );
 

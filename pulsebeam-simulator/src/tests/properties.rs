@@ -1280,3 +1280,116 @@ fn the_stream_asked_for_more_is_not_served_less() {
         },
     );
 }
+
+/// The cast a churn sequence acts on. Small on purpose: the interesting states come from the
+/// *order* things happen in, not from how many people are in the room.
+const CHURN_CAST: [&str; 3] = ["churn1", "churn2", "churn3"];
+
+/// One thing that can happen to a room.
+///
+/// Deliberately only lifecycle: joining, leaving cleanly, and crashing. Those are what move the
+/// state the SFU keys on identity - routes, slots, subscriptions, assignments - and every state
+/// bug found by hand has been a disagreement about who is in the room.
+#[derive(Clone, Copy, Debug)]
+enum Churn {
+    Join(usize),
+    Leave(usize),
+    Crash(usize),
+}
+
+impl Churn {
+    fn strategy() -> impl Strategy<Value = Churn> {
+        let who = 0..CHURN_CAST.len();
+        prop_oneof![
+            who.clone().prop_map(Churn::Join),
+            who.clone().prop_map(Churn::Leave),
+            who.prop_map(Churn::Crash),
+        ]
+    }
+
+    fn who(self) -> usize {
+        match self {
+            Churn::Join(i) | Churn::Leave(i) | Churn::Crash(i) => i,
+        }
+    }
+
+    fn step(self) -> Step {
+        match self {
+            Churn::Join(i) => Step::Join {
+                description: "somebody joins",
+                participant: CHURN_CAST[i],
+            },
+            Churn::Leave(i) => Step::Disconnect {
+                description: "somebody leaves",
+                participant: CHURN_CAST[i],
+            },
+            Churn::Crash(i) => Step::AbruptExit {
+                description: "somebody crashes",
+                participant: CHURN_CAST[i],
+            },
+        }
+    }
+}
+
+/// No sequence of arrivals, departures and crashes leaves anyone's view of the room wrong.
+///
+/// The authored plans cover the churn somebody thought of. This covers the churn nobody did: a
+/// generated order of joins, clean leaves and crashes, run against the same room-state invariant
+/// every plan is held to - nothing known that has left, nothing from a superseded incarnation, no
+/// invented ids, and believed media kinds matching what is actually published.
+///
+/// Every state bug found by hand in this area was an ordering the suite happened not to contain: a
+/// speaker's slot never released, a publisher's data route outliving them and colliding with their
+/// own reconnect, a departed track reinstated by the next subscription. None needed an exotic
+/// network - only the right sequence.
+///
+/// Run with buggify armed, because the interesting orderings are the ones a fault produces: a
+/// route install that fails and is retried lands its effects in a different order than one that
+/// succeeds, and that is precisely where identity-keyed state gets out of step.
+#[test]
+fn no_order_of_churn_leaves_a_wrong_view_of_the_room() {
+    check(
+        24,
+        prop::collection::vec(Churn::strategy(), 2..7),
+        |churn| {
+            let mut room = Room::new("room1")
+                .with_participant(Participant::single_publisher("anchor"))
+                .with_participant(Participant::subscriber("viewer"));
+            for who in CHURN_CAST {
+                room =
+                    room.with_participant(Participant::single_publisher(who).starts_disconnected());
+            }
+
+            let mut plan = vec![Step::Run {
+                description: "Establish",
+                duration: Duration::from_secs(3),
+            }];
+            // Only what could actually happen. Joining somebody already in the room, or removing
+            // somebody who is not, is not churn - it is a nonsense instruction, and asserting on
+            // the room afterwards asserts nothing. Walking the generated sequence and dropping
+            // the impossible keeps shrinking useful while leaving every real ordering reachable.
+            let mut present = [false; CHURN_CAST.len()];
+            for op in &churn {
+                let who = op.who();
+                match op {
+                    Churn::Join(_) if present[who] => continue,
+                    Churn::Leave(_) | Churn::Crash(_) if !present[who] => continue,
+                    _ => {}
+                }
+                present[who] = matches!(op, Churn::Join(_));
+                plan.push(op.step());
+                // The invariant is only asked of a settled room, and this is what settles it.
+                plan.push(Step::Run {
+                    description: "Settle after a change of membership",
+                    duration: Duration::from_secs(6),
+                });
+            }
+
+            LocalNodeSim::new()
+                .with_buggify(200)
+                .with_room(room)
+                .run(plan);
+            Ok(())
+        },
+    );
+}
