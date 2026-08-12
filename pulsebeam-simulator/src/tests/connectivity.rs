@@ -597,3 +597,66 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
             },
         ]);
 }
+
+/// A connection that drops and recovers is the same participant throughout.
+///
+/// The path a real client takes after a network blip, and nothing covered it: every other churn
+/// plan tears the client down and joins again, which mints a *new* participant id and is a
+/// different thing entirely. A reconnect keeps the id and changes only the connection generation -
+/// the server does this over `PATCH` with `If-Match: <etag>`, and rejects an update that does not
+/// name the generation it replaces.
+///
+/// **Ignored: reconnect is designed but not implemented end to end.** Identity is stable - that
+/// part passes - but the viewer never sees Alice again, and the reason is upstream of the client:
+///
+/// - the SFU destroys the participant as soon as ICE drops (`Participant core disconnecting ...
+///   reason=ICE connection disconnected`), so by the time the network returns there is nothing
+///   left to `PATCH` and the generation model has nothing to attach to;
+/// - and the agent makes no reconnect attempt at all - zero `Sending SDP Offer (Update)` in a run.
+///
+/// The agent's missing `If-Match` header is fixed and was a real defect on this path, but it is
+/// only the last step of three. Un-ignore once the SFU holds a disconnected participant open long
+/// enough to be reclaimed, and the agent actually tries.
+#[ignore = "reconnect is not implemented end to end: the SFU drops the participant on ICE disconnect"]
+#[test]
+fn a_dropped_connection_recovers_as_the_same_participant_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice is on screen",
+                duration: Duration::from_secs(6),
+            },
+            Step::Partition {
+                description: "Alice's network drops",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Long enough for the connection to be given up on",
+                duration: Duration::from_secs(12),
+            },
+            Step::Repair {
+                description: "Her network comes back",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "She reconnects",
+                duration: Duration::from_secs(12),
+            },
+            Step::CheckIdentityStable {
+                description: "Alice reconnected rather than rejoining as somebody new",
+                participant: "alice",
+            },
+            Step::CheckVideoQualityInterval {
+                description: "And the viewer can see her again",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50),
+            },
+        ]);
+}

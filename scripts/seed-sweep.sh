@@ -43,7 +43,7 @@ FROM="${FROM:-1}"
 if [[ -n "${ALL:-}" ]]; then
     TEST="${TEST:-}"
 else
-    TEST="${TEST:--E test(/audio::|bwe::|properties::|video::/)}"
+    TEST="${TEST:--E test(/audio::|bwe::|connectivity::|properties::|video::/)}"
 fi
 LANES="${LANES:-1}"
 # Split the machine between lanes rather than letting each lane assume it owns it. Three lanes

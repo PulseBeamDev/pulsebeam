@@ -432,6 +432,16 @@ impl ShardRoutingTable {
         for route in room.data_streams.values_mut() {
             route.local_subscribers.swap_remove(&removed_handle);
         }
+        // And retire whatever they were publishing. `is_unused` deliberately keeps a route that is
+        // still published, so without this the route outlives the publisher - and a reconnect
+        // keeps the participant id on purpose, so the returning participant collides with its own
+        // stale route. In a debug build that trips the assertion in `register_data_publisher`; in
+        // release it leaves a route published by somebody who is not there.
+        for (stream, route) in &mut room.data_streams {
+            if stream.publisher_id == *participant_id {
+                route.published = false;
+            }
+        }
         room.data_streams.retain(|_, route| !route.is_unused());
         room.reliable.remove_participant(removed_handle);
         for id in audio_track_ids {
@@ -3061,6 +3071,46 @@ mod tests {
             0,
             "no members left means nothing to deliver to"
         );
+    }
+
+    /// A publisher who leaves and returns under the same id does not collide with itself.
+    ///
+    /// This is what a reconnect is: the participant id is deliberately kept stable so everyone
+    /// else sees a recovery rather than a departure and a stranger. Anything the SFU keys on that
+    /// id therefore has to be gone by the time they come back. Data routes were not: `is_unused`
+    /// keeps a route that is still marked published, so it outlived its publisher, and the
+    /// returning participant re-registering the same topic tripped
+    /// `debug_assert!(!route.published)` - or, in release, left a route published by somebody who
+    /// was not in the room.
+    #[test]
+    fn a_publisher_can_return_under_the_same_id() {
+        let mut table = ShardRoutingTable::new();
+        let mut rng = rand::seeded_rng(7);
+        let room = room_id("rejoin-room");
+        let participant = pid();
+        let topic = Topic::for_test("chat");
+
+        // Somebody has to stay, or the room empties and takes its routes with it - which would
+        // make this pass for the wrong reason.
+        let bystander = pid();
+        let bystander_handle = ParticipantHandle::new(
+            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+            bystander,
+            1,
+        );
+        table.add_local_member(bystander, bystander_handle, room, &mut rng);
+
+        for _ in 0..2 {
+            let handle = ParticipantHandle::new(
+                SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
+                participant,
+                1,
+            );
+            table.add_local_member(participant, handle, room, &mut rng);
+            // The same participant id comes back, exactly as a reconnect does.
+            table.register_data_publisher(room, participant, topic.clone());
+            table.remove_local_member(&participant, room, std::iter::empty(), now());
+        }
     }
 
     #[test]

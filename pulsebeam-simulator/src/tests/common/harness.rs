@@ -475,6 +475,25 @@ pub enum Step {
         participant: &'static str,
         quality: VideoQuality,
     },
+    /// This participant is still the same participant it was - it reconnected, it did not rejoin.
+    ///
+    /// A reconnect keeps the participant id and changes only the connection generation. If the
+    /// client comes back as a new participant instead, everyone else keeps a tile for the old one
+    /// and gains a second for the new: one person, twice on screen.
+    CheckIdentityStable {
+        description: &'static str,
+        participant: &'static str,
+    },
+    /// Exactly these participants are still known to the client - no more, no fewer.
+    ///
+    /// Catches the ghost: somebody who left the room but whose track the SFU keeps announcing, so
+    /// the client keeps a tile, a name and a publication for a person who is not there. A test
+    /// that only checks the living participants are present cannot see it.
+    CheckParticipantsKnown {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [&'static str],
+    },
     /// Nothing this participant received was thrown away for want of somewhere to put it.
     ///
     /// Silent loss inside the client, which is invisible from both ends: the frames are missing at
@@ -756,6 +775,9 @@ struct ParticipantShared {
     /// Cumulative keyframe (PLI) requests this participant's publisher received.
     keyframe_requests: Mutex<u64>,
     unroutable_media_dropped: Mutex<u64>,
+    media_kinds: Mutex<HashMap<String, (bool, bool)>>,
+    /// Every participant id this name has had, oldest first. All but the last are dead identities.
+    incarnations: Mutex<Vec<String>>,
     /// Set to Some(...) once the participant has connected for the first time.
     participant_id: Mutex<Option<String>>,
     /// Operations queued by the coordinator; drained on next drive tick.
@@ -777,6 +799,8 @@ impl ParticipantShared {
             connected: Mutex::new(false),
             keyframe_requests: Mutex::new(0),
             unroutable_media_dropped: Mutex::new(0),
+            media_kinds: Mutex::new(HashMap::new()),
+            incarnations: Mutex::new(Vec::new()),
             participant_id: Mutex::new(None),
             pending_ops: Mutex::new(Vec::new()),
             data_received: Mutex::new(HashMap::new()),
@@ -797,6 +821,22 @@ struct ParticipantHandle {
     /// viewer spent waiting.
     subscribed_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
+    /// Ground truth, from the plan rather than from anything the SFU said.
+    ///
+    /// The room invariant is checked against these: what this participant actually publishes, and
+    /// whether it is currently in the call at all. A client's belief is only interesting next to
+    /// something known to be true.
+    publishes_video: bool,
+    publishes_audio: bool,
+    /// Whether the plan has this participant in the room right now.
+    present: bool,
+    /// Whether the last departure was a clean one.
+    ///
+    /// A graceful leave tells the SFU directly, so everyone should know at once and a ghost is a
+    /// bug. A crash is only noticed when the transport times out, which takes seconds and is a
+    /// property of the network rather than of state management - so the invariant does not hold
+    /// anybody to it.
+    departed_cleanly: bool,
 }
 
 impl ParticipantHandle {
@@ -815,6 +855,17 @@ impl ParticipantHandle {
     }
     fn keyframe_requests(&self) -> u64 {
         *self.shared.keyframe_requests.lock().unwrap()
+    }
+
+    /// What kinds of media this client believes `publisher_id` is sending.
+    fn media_kinds_of(&self, publisher_id: &str) -> (bool, bool) {
+        *self
+            .shared
+            .media_kinds
+            .lock()
+            .unwrap()
+            .get(publisher_id)
+            .unwrap_or(&(false, false))
     }
 
     /// Media this participant received and could not hand to anyone. Should always be zero.
@@ -941,12 +992,13 @@ async fn run_participant(
             .connect(room_name)
             .await?;
 
-        // Capture participant_id after first connect.
+        // A reconnect makes a *new* participant, with a new id, and the plan needs both facts:
+        // which identity is live now, and which ones are dead. A client still holding a dead one
+        // is a ghost, and that is invisible if the harness only remembers the first.
         {
-            let mut id_guard = shared.participant_id.lock().unwrap();
-            if id_guard.is_none() {
-                *id_guard = Some(client.ctx.agent.participant_id().clone());
-            }
+            let id = client.ctx.agent.participant_id().clone();
+            *shared.participant_id.lock().unwrap() = Some(id.clone());
+            shared.incarnations.lock().unwrap().push(id);
         }
         *shared.connected.lock().unwrap() = true;
 
@@ -1163,9 +1215,18 @@ async fn run_participant(
                     }
                 }
 
-                // 3. Snapshot discovered tracks.
+                // 3. Snapshot discovered tracks, and what kind of media each is believed to have.
                 {
                     *shared_clone.discovered_tracks.lock().unwrap() = ctx.discovered_tracks.clone();
+                    let mut kinds = shared_clone.media_kinds.lock().unwrap();
+                    kinds.clear();
+                    for id in &ctx.discovered_tracks {
+                        let participant = ctx.agent.participant(id.clone());
+                        kinds.insert(
+                            id.clone(),
+                            (participant.has_video(), participant.has_audio()),
+                        );
+                    }
                 }
 
                 // 4. Update stats.
@@ -1247,6 +1308,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckMediaRouted { .. } => "CheckMediaRouted",
+        Step::CheckParticipantsKnown { .. } => "CheckParticipantsKnown",
+        Step::CheckIdentityStable { .. } => "CheckIdentityStable",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
@@ -1302,6 +1365,13 @@ async fn execute_plan(
                 pulsebeam_runtime::net::shaper::reset_stats_for(name_to_ip.values().copied());
                 window = *duration;
                 tokio::time::sleep(*duration).await;
+                // Every plan, every run step, every participant. A settled room is the only place
+                // this is fair to ask - discovery and teardown both need a moment - and a
+                // `Step::Run` is exactly that moment. Short runs are skipped: under a second is
+                // not settling, it is a pause mid-transition.
+                if *duration >= ROOM_SETTLE_FLOOR {
+                    assert_room_state_consistent(handles, description);
+                }
             }
 
             Step::Report {
@@ -1432,6 +1502,9 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = true;
+                handle.departed_cleanly = true;
                 handle.send_command(ParticipantCmd::Reconnect);
             }
 
@@ -1441,6 +1514,9 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = false;
+                handle.departed_cleanly = true;
                 handle.send_command(ParticipantCmd::Shutdown);
             }
 
@@ -1450,6 +1526,9 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = false;
+                handle.departed_cleanly = false;
                 handle.send_command(ParticipantCmd::Drop);
             }
 
@@ -1459,6 +1538,9 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = true;
+                handle.departed_cleanly = true;
                 handle.send_command(ParticipantCmd::Reconnect);
             }
 
@@ -1741,6 +1823,51 @@ async fn execute_plan(
                     quality.min_frames,
                     stats.frames,
                     stats.keyframes,
+                );
+            }
+
+            Step::CheckIdentityStable {
+                description,
+                participant,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
+                let incarnations = handle.shared.incarnations.lock().unwrap().clone();
+                assert_eq!(
+                    incarnations.len(),
+                    1,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     one identity for the whole call\n  actual:       {incarnations:?}\n  note:         it came back as a new participant rather than reconnecting, so\n                everyone else keeps a tile for the old one and gains a second"
+                );
+            }
+
+            Step::CheckParticipantsKnown {
+                description,
+                participant,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {expected:?})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let known: BTreeSet<String> = handle
+                    .shared
+                    .discovered_tracks
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .into_iter()
+                    .collect();
+                let want: BTreeSet<String> = expected
+                    .iter()
+                    .filter_map(|name| {
+                        handles
+                            .get(name)
+                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    known, want,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  still known:  {known:?}\n  note:         anyone here who has left is a ghost - a tile and a name for\n                somebody who is not in the room"
                 );
             }
 
@@ -2228,6 +2355,93 @@ fn get_handle<'a>(
         .get_mut(name)
         .ok_or_else(|| anyhow::anyhow!("step \"{step_desc}\": unknown participant \"{name}\""))
 }
+
+/// What every client must believe about the room, checked against what the plan actually did.
+///
+/// Run after every `Step::Run` of every plan, for every participant, rather than opted into by the
+/// plans that happen to think of it. State-management bugs do not announce themselves: a ghost
+/// participant, or somebody counted twice, looks exactly like a passing test to any assertion
+/// aimed at bitrate or frames. The two failures this exists for both shipped and were found by
+/// hand.
+///
+/// Deliberately only the *safety* half. "Everyone who should be known is known" is liveness and
+/// depends on discovery timing, which would make this flake; what it asserts is that nothing is
+/// known that should not be, and that whatever is known is described correctly.
+fn assert_room_state_consistent(handles: &HashMap<&'static str, ParticipantHandle>, after: &str) {
+    // Every participant id the plan has ever created, and what it means now.
+    #[derive(Clone, Copy)]
+    enum Identity {
+        /// The participant's current id, and they are in the room.
+        Live,
+        /// The current id of somebody the plan has removed.
+        Departed,
+        /// An id from before a reconnect. That person exists, but not under this name any more.
+        Superseded,
+        /// Gone without saying so. Nothing is asserted: detection is a timeout, not a message.
+        Vanished,
+    }
+    let mut identities: HashMap<String, (&'static str, Identity)> = HashMap::new();
+    for (name, handle) in handles {
+        let incarnations = handle.shared.incarnations.lock().unwrap().clone();
+        let last = incarnations.len().saturating_sub(1);
+        for (i, id) in incarnations.into_iter().enumerate() {
+            let state = if i < last {
+                Identity::Superseded
+            } else if handle.present {
+                Identity::Live
+            } else if handle.departed_cleanly {
+                Identity::Departed
+            } else {
+                // Crashed. The SFU only finds out when the transport times out, so how long a
+                // ghost lingers is a fact about the network. Not this invariant's business.
+                Identity::Vanished
+            };
+            identities.insert(id, (*name, state));
+        }
+    }
+
+    for (observer, handle) in handles {
+        // Only ask this of clients that are still running. A participant who has left stopped
+        // updating its view the moment it went, so its last snapshot is stale by construction -
+        // holding it to the room's current membership would report a ghost on every plan that
+        // ends by disconnecting everybody.
+        if !handle.present {
+            continue;
+        }
+        let known = handle.shared.discovered_tracks.lock().unwrap().clone();
+        for id in &known {
+            let Some((name, state)) = identities.get(id).copied() else {
+                panic!(
+                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {id}\n  problem:      no participant in this plan has ever had that id\n  note:         a client holding an id nobody owns is state invented from\n                nowhere - a tile for somebody who never existed"
+                );
+            };
+            match state {
+                // Live is fine; Vanished is a crash, whose detection is a timeout rather than a
+                // message, so how long the ghost lingers is a fact about the network.
+                Identity::Live | Identity::Vanished => {}
+                Identity::Departed => panic!(
+                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {name} ({id})\n  problem:      {name} has left the room\n  note:         a ghost - a tile, a name and a publication for somebody who\n                is not in the call"
+                ),
+                Identity::Superseded => panic!(
+                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {id}\n  problem:      that is {name}'s identity from before they reconnected\n  note:         a ghost of an earlier incarnation - {name} is in the room, but\n                under a new id, so this is a second tile for one person"
+                ),
+            }
+            let Some(subject) = handles.get(name) else {
+                continue;
+            };
+            let (video, _audio) = handle.media_kinds_of(id);
+            assert_eq!(
+                video, subject.publishes_video,
+                "\nroom state inconsistent after {after}\n  observer:     {observer}\n  subject:      {name}\n  believes video: {video}, actually publishes video: {}\n  note:         a participant believed to send video that does not is a phantom\n                tile; announcing audio in `tracks_upsert` caused exactly this,\n                and put anyone sending both on screen twice",
+                subject.publishes_video
+            );
+        }
+    }
+}
+
+/// A `Step::Run` shorter than this is a pause mid-transition, not a settled room, so the state
+/// invariant is not asked of it. Signalling a join or a departure is a round trip or two.
+const ROOM_SETTLE_FLOOR: Duration = Duration::from_secs(1);
 
 fn assert_video_quality(
     n: usize,
@@ -3505,6 +3719,11 @@ impl LocalNodeSim {
                         interval_rx_baseline: 0,
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
+                        publishes_video: matches!(participant.role, Role::Publisher)
+                            || participant.subscribes && !participant.rids.is_empty(),
+                        publishes_audio: participant.audio_level_dbov.is_some(),
+                        present: !participant.starts_disconnected,
+                        departed_cleanly: true,
                     },
                 );
 
