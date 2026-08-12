@@ -4,7 +4,7 @@ use str0m::media::{Mid, Pt};
 use str0m::rtp::Ssrc;
 
 use crate::audio_selector::SELECTOR_SLOTS;
-use crate::entity::AudioOrigin;
+use crate::entity::{AudioOrigin, TrackId};
 use crate::id::AudioSelectorSlotId;
 use crate::log::{LogCtx, plog_debug, plog_warn};
 use crate::participant::downstream::SlotConfig;
@@ -91,6 +91,25 @@ impl AudioAllocator {
                 "audio allocator has no free slot; dropping slot provisioning"
             );
         }
+    }
+
+    /// Forget a speaker who has left, so nothing goes on announcing them.
+    ///
+    /// A slot holds its last occupant until somebody takes it, which is right while the speaker is
+    /// merely quiet and wrong once they have gone: the assignment naming them keeps being sent,
+    /// the client keeps a publication, and the room shows a tile for somebody who is not in it.
+    /// Returns whether this slot was carrying them.
+    pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
+        let mut removed = false;
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.occupant.is_some_and(|o| o.origin.track == *track_id) {
+                slot.occupant = None;
+                // The next speaker to take this slot starts a talk spurt, whoever they are.
+                slot.pending_marker = true;
+                removed = true;
+            }
+        }
+        removed
     }
 
     pub fn has_slot(&self, mid: Mid) -> bool {
@@ -391,6 +410,40 @@ mod tests {
             "the slot was stolen, and nothing else on the wire says so"
         );
         assert_eq!(alloc.assignments()[0].origin, second);
+    }
+
+    /// A speaker who leaves stops occupying their slot.
+    ///
+    /// A slot holds its last occupant until somebody takes it, which is right while they are
+    /// merely quiet and wrong once they have gone: the assignment naming them keeps being sent and
+    /// the client keeps showing them. Nothing cleared it - `remove_track` only ever reached the
+    /// video allocator.
+    #[test]
+    fn a_departed_speaker_stops_occupying_their_slot() {
+        let mut alloc = AudioAllocator::new(test_ctx());
+        alloc.add_slot(make_audio_slot());
+        let speaker = origin(1);
+        let mut writer = StreamWriter::new();
+        alloc.on_rtp(
+            AudioSelectorSlotId::new(0),
+            speaker,
+            &speaking(-30),
+            &mut writer,
+        );
+        assert_eq!(alloc.assignments().len(), 1, "they are being heard");
+
+        assert!(
+            alloc.remove_track(&speaker.track),
+            "the slot was carrying them"
+        );
+        assert!(
+            alloc.assignments().is_empty(),
+            "a speaker who left the room is not still assigned a slot"
+        );
+        assert!(
+            !alloc.remove_track(&speaker.track),
+            "removing them twice is not a change"
+        );
     }
 
     #[test]

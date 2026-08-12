@@ -293,7 +293,11 @@ impl DownstreamAllocator {
         if removed {
             self.dirty_allocation = true;
         }
-        removed
+        // Audio too, and not folded into `removed`: that flag drives the *video* allocator's
+        // rebalance. A speaker leaving still has to stop being announced, or the room keeps a
+        // tile for somebody who is not in it.
+        let audio_removed = self.audio.remove_track(track_id);
+        removed || audio_removed
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
