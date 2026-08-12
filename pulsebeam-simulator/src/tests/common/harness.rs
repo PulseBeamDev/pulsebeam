@@ -465,6 +465,16 @@ pub enum Step {
         participant: &'static str,
         quality: VideoQuality,
     },
+    /// Video quality over the last `Step::Run` only, rather than the whole call.
+    ///
+    /// What a cumulative count cannot express: a stream that worked, stopped, and never came
+    /// back still has all its frames. Asking about the window after a disturbance is the only way
+    /// to say "and then it recovered".
+    CheckVideoQualityInterval {
+        description: &'static str,
+        participant: &'static str,
+        quality: VideoQuality,
+    },
     /// Assert the publisher has received at most `max` keyframe (PLI) requests.
     /// A constantly climbing count means downstream cannot decode the forwarded
     /// stream — the signature of a broken DD/reassembly path (the "PLI storm").
@@ -1216,6 +1226,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::DeclareOrderedSubscriber { .. } => "DeclareOrderedSubscriber",
         Step::PublishOrdered { .. } => "PublishOrdered",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
+        Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
@@ -1692,6 +1703,26 @@ async fn execute_plan(
                 let handle = get_handle(handles, participant, description)?;
                 let log = handle.video_rx();
                 assert_video_quality(n, total, description, participant, quality, &log);
+            }
+
+            Step::CheckVideoQualityInterval {
+                description,
+                participant,
+                quality,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
+                let stats = handle.video_stats_since_interval();
+                // Only the frame floor. The decodability and continuity bounds are cumulative
+                // counters, and a difference between two of them does not mean what it looks
+                // like; asking about frames arriving in a window is what this exists for.
+                assert!(
+                    stats.frames >= quality.min_frames,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} frames in the last interval\n  actual:       frames={}, keyframes={}\n  note:         a cumulative count would still show every frame from before the\n                disturbance; this asks whether anything arrived after it",
+                    quality.min_frames,
+                    stats.frames,
+                    stats.keyframes,
+                );
             }
 
             Step::CheckConnected {

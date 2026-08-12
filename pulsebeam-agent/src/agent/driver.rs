@@ -1084,7 +1084,7 @@ impl AgentDriver {
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
                 }
                 for track_id in &removed {
-                    self.subscriptions.sub_manager.remove_track(track_id);
+                    self.forget_track(track_id);
                 }
                 if !removed.is_empty() {
                     self.subscriptions.pending_deadline = Some(self.now);
@@ -1129,6 +1129,18 @@ impl AgentDriver {
                 tracing::warn!("signaling error: {}", err);
             }
         }
+    }
+
+    /// Drop every trace of a track the room says has gone.
+    ///
+    /// Both halves, and that is the point. `desired_subscriptions` is the source of truth - every
+    /// `set_desired` is rebuilt from it - while `sub_manager` holds what was derived from it last.
+    /// Clearing only the derived half looks like it works until the next subscription rebuilds
+    /// `desired` from a map that still holds the departed track, puts it back, and has the client
+    /// asking the SFU for a publisher who left.
+    fn forget_track(&mut self, track_id: &str) {
+        self.subscriptions.desired_subscriptions.remove(track_id);
+        self.subscriptions.sub_manager.remove_track(track_id);
     }
 
     fn emit(&mut self, event: AgentEvent) {

@@ -182,14 +182,6 @@ libwebrtc's receive path, and the two differ in ways that decide designs - see "
 belongs to the slot" below. A plan can be green while Chrome renders nothing. Changes to stream
 identity, SSRCs or SDP need a manual browser check; the suite cannot stand in for one.
 
-**A publisher who rejoins.** Found while testing stream identity, reproduces independently of it,
-and unfixed. A publisher who leaves and comes back is never forwarded to an existing viewer at
-roughly half of seeds: the SFU binds the slot to the new track (`slot switching target` in the log)
-and then writes no RTP to that viewer again, while `configure_slot: requested track missing`
-repeats for the *departed* track - so the viewer's intent still names a publisher that has gone.
-Widening the settle window from 8s to 20s does not help, so it is not a keyframe wait. It wants its
-own investigation.
-
 **Audio quality.** Who is heard, who they are, and how many streams they arrive on are asserted
 now. How *well* they are heard is not: there is no audio continuity, gap or concealment figure
 scoped to a listener's experience, and a 200ms gap is a lost syllable where the same gap in video

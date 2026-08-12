@@ -544,3 +544,50 @@ fn every_declared_failure_point_is_reachable_test() {
         "buggify sites were reached ({seen:?}) but none fired at 50%, so injection is inert"
     );
 }
+
+/// A publisher who leaves and comes back is shown to a viewer who never went away.
+///
+/// The reconnect churn plans all move the *subscriber*. This moves the publisher, which is a
+/// different path: the viewer keeps its slot and its subscription, and the room hands that slot a
+/// new track id belonging to a participant it has never seen. Nothing was covering it.
+#[test]
+fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice is on screen",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckVideoQuality {
+                description: "The viewer can see her",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::Disconnect {
+                description: "Alice drops out",
+                participant: "alice",
+            },
+            Step::Run {
+                description: "The tile is empty",
+                duration: Duration::from_secs(3),
+            },
+            Step::Reconnect {
+                description: "Alice comes back, as a participant the room has never seen",
+                participant: "alice",
+            },
+            Step::Run {
+                description: "Settle on the new publisher",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The viewer can see the publisher who replaced her",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50),
+            },
+        ]);
+}
