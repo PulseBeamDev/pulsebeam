@@ -1,209 +1,425 @@
+tests::bwe::a_busy_room_starves_nobody_test
+  [PASS]
+  ann: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1313) | link loss 1          | media 0.0%
+  ben: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1309) | link loss 1          | media 0.0%
+  cal: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1306) | link loss 8          | media 0.0%
+  dee: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1314) | link loss 5          | media 0.0%
+  eve: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1316) | link loss 4          | media 0.0%
+  fay: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1314) | link loss 0          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 58.1% (13064117 B / ~22500000 B) | estimate last 3292751 min 2092600 max 3679683 bps, worst drawdown 43.1%, 627 samples | demand last 3000000 min 1200000 max 3000000 bps | ends 9.8% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/16268) | link loss 38          | media 581.1%
+
+tests::bwe::a_different_seed_is_a_different_network_test
+  [PASS]
+  camera: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/871) | link loss 1          | media 0.0%
+  cotenant: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/882) | link loss 0          | media 0.0%
+  viewer: capacity 2000000 bps | utilisation 72.3% (7231704 B / ~10000000 B) | estimate last 2002589 min 2000000 max 2695110 bps, worst drawdown 25.7%, 414 samples | demand last 2600000 min 1200000 max 2600000 bps | ends 0.1% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/7923) | link loss 16          | media 232.8%
+  camera: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/867) | link loss 2          | media 0.0%
+  cotenant: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 291ns max 256µs | congestion loss 0.00% (0/877) | link loss 0          | media 0.0%
+  viewer: capacity 2000000 bps | utilisation 49.8% (4980477 B / ~10000000 B) | estimate last 2400696 min 300000 max 2400696 bps, worst drawdown 0.0%, 416 samples | demand last 2600000 min 1200000 max 2600000 bps | ends 20.0% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/5682) | link loss 18          | media 336.9%
+
+tests::bwe::a_plan_measures_identically_when_replayed_test
+  [PASS]
+  camera: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/871) | link loss 1          | media 0.0%
+  cotenant: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/882) | link loss 0          | media 0.0%
+  viewer: capacity 2000000 bps | utilisation 72.3% (7231704 B / ~10000000 B) | estimate last 2002589 min 2000000 max 2695110 bps, worst drawdown 25.7%, 414 samples | demand last 2600000 min 1200000 max 2600000 bps | ends 0.1% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/7923) | link loss 16          | media 232.8%
+  camera: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/871) | link loss 1          | media 0.0%
+  cotenant: capacity 2000000 bps | utilisation 0.0% (0 B / ~10000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/882) | link loss 0          | media 0.0%
+  viewer: capacity 2000000 bps | utilisation 72.3% (7231704 B / ~10000000 B) | estimate last 2002589 min 2000000 max 2695110 bps, worst drawdown 25.7%, 414 samples | demand last 2600000 min 1200000 max 2600000 bps | ends 0.1% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/7923) | link loss 16          | media 232.8%
+
+tests::bwe::a_reordering_path_does_not_churn_keyframes_test
+  [PASS]
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1282) | link loss 0          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 38.6% (8679216 B / ~22500000 B) | estimate last 2804874 min 2252243 max 2804874 bps, worst drawdown 0.0%, 601 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 6.5% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/8961) | link loss 0          | media 145.1%
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1282) | link loss 0          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 38.5% (8659937 B / ~22500000 B) | estimate last 3841142 min 2300266 max 3841142 bps, worst drawdown 0.0%, 602 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 28.0% off capacity | 80% at <s> | 90% at 7s | queue standing <ms> max <ms> | congestion loss 0.00% (0/8967) | link loss 0          | media 145.4%
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1282) | link loss 0          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 38.4% (8642603 B / ~22500000 B) | estimate last 2000000 min 2000000 max 2003001 bps, worst drawdown 0.1%, 602 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 33.3% off capacity | 80% never | 90% never | queue standing <ms> max <ms> | congestion loss 0.00% (0/8949) | link loss 0          | media 145.7%
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1282) | link loss 0          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 38.5% (8668875 B / ~22500000 B) | estimate last 2868577 min 2224266 max 2868577 bps, worst drawdown 0.0%, 603 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 4.4% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/8976) | link loss 0          | media 145.2%
+
 tests::bwe::a_stream_returns_after_a_total_outage_test
   [PASS]
-  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
-  bob: capacity 3000000 bps | utilisation 38.0% (4269552 B / ~11250000 B) | estimate last 2853581 min 2853581 max 2929783 bps, worst drawdown 2.6%, 307 samples | demand last 1700844 min 1566142 max 1951395 bps | ends 4.9% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/4309) | link loss 0 | media 99.5%
+  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/657) | link loss 0          | media 0.0%
+  bob: capacity 3000000 bps | utilisation 38.4% (4322573 B / ~11250000 B) | estimate last 3738181 min 3738181 max 3738181 bps, worst drawdown 0.0%, 300 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 24.6% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4419) | link loss 2          | media 143.6%
 
 tests::bwe::capped_subscription_is_not_over_served_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 2845662 B | estimate last 994057 min 994057 max 1274024 bps, worst drawdown 22.0%, 607 samples | demand last 474410 min 461147 max 511818 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.9%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 2          | media 0.0%
+  bob: capacity unshaped | received 2901239 B | estimate last 3773714 min 3773714 max 3773714 bps, worst drawdown 0.0%, 600 samples | demand last 800000 min 800000 max 800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 14          | media 438.0%
+
+tests::bwe::droppable_background_yields_to_focused_camera_test
+  [PASS]
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/984) | link loss 0          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 474ns max <µs> | congestion loss 0.00% (0/655) | link loss 1          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 33.7% (6626263 B / ~19687500 B) | estimate last 3297351 min 2320973 max 3297351 bps, worst drawdown 0.0%, 455 samples | demand last 4600000 min 1600000 max 4600000 bps | ends 5.8% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/6831) | link loss 3          | media 153.6%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/982) | link loss 6          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 239ns max <µs> | congestion loss 0.00% (0/688) | link loss 3          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 35.8% (7042301 B / ~19687500 B) | estimate last 3827739 min 1484046 max 3827739 bps, worst drawdown 56.6%, 471 samples | demand last 4000000 min 1600000 max 4000000 bps | ends 9.4% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/7233) | link loss 12          | media 139.8%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/982) | link loss 7          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 214ns max <µs> | congestion loss 0.00% (0/682) | link loss 4          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 35.1% (6906767 B / ~19687500 B) | estimate last 5000000 min 2628875 max 5000000 bps, worst drawdown 0.0%, 454 samples | demand last 4200000 min 1600000 max 4200000 bps | ends 42.9% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/7110) | link loss 6          | media 144.1%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/989) | link loss 4          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 248ns max <µs> | congestion loss 0.00% (0/663) | link loss 0          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 34.0% (6685130 B / ~19687500 B) | estimate last 5000000 min 2384417 max 5000000 bps, worst drawdown 0.0%, 455 samples | demand last 4200000 min 1600000 max 4600000 bps | ends 42.9% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/6917) | link loss 10          | media 150.2%
+
+tests::bwe::estimate_converges_when_feedback_is_lossy_test
+  [PASS]
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing <µs> max <µs> | congestion loss 0.00% (0/1332) | link loss 32          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 40.6% (9143687 B / ~22500000 B) | estimate last 3871428 min 2300266 max 3871428 bps, worst drawdown 0.0%, 605 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 29.0% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/9719) | link loss 290          | media 137.7%
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing <µs> max <µs> | congestion loss 0.00% (0/1339) | link loss 27          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 40.0% (8998167 B / ~22500000 B) | estimate last 3119799 min 2224266 max 3119799 bps, worst drawdown 0.0%, 603 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 4.0% off capacity | 80% at 800ms | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/9467) | link loss 206          | media 139.7%
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing <µs> max <µs> | congestion loss 0.00% (0/1357) | link loss 19          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 40.4% (9100413 B / ~22500000 B) | estimate last 2966235 min 2300266 max 2966235 bps, worst drawdown 0.0%, 602 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 1.1% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/9656) | link loss 249          | media 138.2%
+  camera: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing <µs> max <µs> | congestion loss 0.00% (0/1334) | link loss 56          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 40.3% (9071332 B / ~22500000 B) | estimate last 2865199 min 2000000 max 2865199 bps, worst drawdown 0.0%, 604 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 4.5% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/9594) | link loss 246          | media 138.8%
 
 tests::bwe::estimate_follows_a_sliding_link_without_riding_the_queue_test
   [PASS]
-  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
-  bob: capacity 700000 bps (scheduled) | received 1437526 B | estimate last 747005 min 747005 max 804278 bps, worst drawdown 7.1%, 305 samples | demand last 1884808 min 1508762 max 1951395 bps | ends 6.7% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/1842) | link loss 0 | media 99.4%
+  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/656) | link loss 0          | media 0.0%
+  bob: capacity 700000 bps (scheduled) | received 1453705 B | estimate last 610718 min 446025 max 650923 bps, worst drawdown 31.5%, 335 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 12.8% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/1860) | link loss 1          | media 434.2%
 
 tests::bwe::estimate_grows_to_fit_screenshare_and_camera_test
   [PASS]
-  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 4624938 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 310 samples | demand last 3434892 min 3217998 max 3526931 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 97.6%
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 1          | media 0.0%
+  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  viewer: capacity unshaped | received 4631315 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 302 samples | demand last 4000000 min 3800000 max 4200000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 6          | media 140.4%
 
 tests::bwe::estimate_survives_an_oscillating_lossy_link_test
   [PASS]
-  alice: capacity 2500000 bps | utilisation 0.0% (0 B / ~18750000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1282) | link loss 0 | media 0.0%
-  bob: capacity 803399 bps (scheduled) | received 3010579 B | estimate last 1251529 min 1051742 max 1777413 bps, worst drawdown 38.7%, 636 samples | demand last 1713213 min 1464059 max 1928335 bps | ends 55.8% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/3823) | link loss 7 | media 98.1%
+  alice: capacity 2500000 bps | utilisation 0.0% (0 B / ~18750000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1322) | link loss 7          | media 0.0%
+  bob: capacity 800509 bps (scheduled) | received 5622611 B | estimate last 1026054 min 810117 max 2171348 bps, worst drawdown 58.0%, 624 samples | demand last 2200000 min 2200000 max 2200000 bps | ends 28.2% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.77% (48/6220) | link loss 3          | media 221.9%
+
+tests::bwe::every_paused_tile_resumes_after_a_busy_link_recovers_test
+  [PASS]
+  speaker: capacity 2500000 bps | utilisation 0.0% (0 B / ~37500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/2606) | link loss 1          | media 0.0%
+  tile1: capacity 2500000 bps | utilisation 0.0% (0 B / ~37500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/2617) | link loss 2          | media 0.0%
+  tile2: capacity 2500000 bps | utilisation 0.0% (0 B / ~37500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/2621) | link loss 14          | media 0.0%
+  tile3: capacity 2500000 bps | utilisation 0.0% (0 B / ~37500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/2638) | link loss 9          | media 0.0%
+  tile4: capacity 2500000 bps | utilisation 0.0% (0 B / ~37500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/2612) | link loss 3          | media 0.0%
+  tile5: capacity 2500000 bps | utilisation 0.0% (0 B / ~37500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/2612) | link loss 2          | media 0.0%
+  viewer: capacity 8000000 bps | utilisation 23.8% (28602049 B / ~120000000 B) | estimate last 5000000 min 3188937 max 5000000 bps, worst drawdown 0.0%, 1206 samples | demand last 2800000 min 2800000 max 3200000 bps | ends 37.5% off capacity | 80% never | 90% never | queue standing <µs> max <ms> | congestion loss 0.00% (0/36200) | link loss 81          | media 530.4%
 
 tests::bwe::height_request_rounds_up_the_ladder_test
   [PASS]
-  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 4301188 B | estimate last 2915751 min 2536855 max 2945237 bps, worst drawdown 3.8%, 312 samples | demand last 1473549 min 1473549 max 1650504 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.8%
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  viewer: capacity unshaped | received 4370840 B | estimate last 3952615 min 3952615 max 3952615 bps, worst drawdown 0.0%, 300 samples | demand last 2000000 min 2000000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 5          | media 143.8%
+
+tests::bwe::hidden_stream_frees_its_bandwidth_test
+  [PASS]
+  camera: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1531) | link loss 3          | media 0.0%
+  hidden: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1526) | link loss 1          | media 0.0%
+  viewer: capacity 4000000 bps | utilisation 29.1% (10188736 B / ~35000000 B) | estimate last 3716571 min 2905598 max 3716571 bps, worst drawdown 0.0%, 703 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 7.1% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/10465) | link loss 5          | media 144.3%
+  camera: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1528) | link loss 2          | media 0.0%
+  hidden: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1522) | link loss 16          | media 0.0%
+  viewer: capacity 4000000 bps | utilisation 29.2% (10214527 B / ~35000000 B) | estimate last 3861333 min 2965687 max 3861333 bps, worst drawdown 0.0%, 703 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 3.5% off capacity | 80% at 970ms | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/10498) | link loss 19          | media 143.9%
+  camera: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1533) | link loss 4          | media 0.0%
+  hidden: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1528) | link loss 3          | media 0.0%
+  viewer: capacity 4000000 bps | utilisation 29.0% (10162520 B / ~35000000 B) | estimate last 3990153 min 3067021 max 3990153 bps, worst drawdown 0.0%, 704 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 0.2% off capacity | 80% at 1s | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/10471) | link loss 19          | media 144.8%
+  camera: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1533) | link loss 2          | media 0.0%
+  hidden: capacity 4000000 bps | utilisation 0.0% (0 B / ~35000000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1523) | link loss 7          | media 0.0%
+  viewer: capacity 4000000 bps | utilisation 29.1% (10170001 B / ~35000000 B) | estimate last 3953714 min 2760319 max 3953714 bps, worst drawdown 0.0%, 703 samples | demand last 2000000 min 1200000 max 2000000 bps | ends 1.2% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/10486) | link loss 18          | media 144.5%
 
 tests::bwe::high_priority_camera_reclaims_bandwidth_from_screenshare_test
   [PASS]
-  camera: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1285) | link loss 0 | media 0.0%
-  screen: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue max <µs> | congestion loss 0.00% (0/277) | link loss 0 | media 0.0%
-  viewer: capacity 2750000 bps | utilisation 24.2% (4988498 B / ~20625000 B) | estimate last 2279387 min 640162 max 2295912 bps, worst drawdown 72.1%, 704 samples | demand last 3357215 min 3353625 max 4371181 bps | ends 17.1% off capacity | 80% at 0ns | 90% never | queue max <ms> | congestion loss 0.00% (0/5609) | link loss 0 | media 97.7%
+  camera: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1310) | link loss 2          | media 0.0%
+  screen: capacity 2750000 bps | utilisation 0.0% (0 B / ~20625000 B) | estimate: no allocation passes | queue standing 935ns max <µs> | congestion loss 0.00% (0/896) | link loss 1          | media 0.0%
+  viewer: capacity 2750000 bps | utilisation 43.0% (8872544 B / ~20625000 B) | estimate last 2790927 min 2576984 max 2790927 bps, worst drawdown 0.0%, 601 samples | demand last 4200000 min 4200000 max 4600000 bps | ends 1.5% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/9158) | link loss 19          | media 151.3%
+
+tests::bwe::late_joiner_receives_earlier_participant_in_both_directions_test
+  [PASS]
+  first: capacity 5000000 bps | utilisation 24.1% (4514380 B / ~18750000 B) | estimate last 4319428 min 4319428 max 4319428 bps, worst drawdown 0.0%, 300 samples | demand last 2000000 min 1800000 max 2200000 bps | ends 13.6% off capacity | 80% at 0ns | 90% never | queue standing <ms> max <ms> | congestion loss 0.00% (0/5218) | link loss 1          | media 142.2%
+  second: capacity 5000000 bps | utilisation 23.0% (4311734 B / ~18750000 B) | estimate last 3864533 min 3140141 max 3864533 bps, worst drawdown 0.0%, 302 samples | demand last 2000000 min 400000 max 2000000 bps | ends 22.7% off capacity | 80% never | 90% never | queue standing <ms> max <ms> | congestion loss 0.00% (0/5110) | link loss 6          | media 145.6%
 
 tests::bwe::late_video_subscription_is_delivered_test
   [PASS]
-  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 7509109 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 465 samples | demand last 3692231 min 3217998 max 3992885 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 97.4%
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 1          | media 0.0%
+  viewer: capacity unshaped | received 7493736 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 453 samples | demand last 4800000 min 3800000 max 4800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 22          | media 136.1%
+
+tests::bwe::low_priority_floor_yields_to_high_priority_target_test
+  [PASS]
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/975) | link loss 0          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/691) | link loss 0          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 35.6% (7004841 B / ~19687500 B) | estimate last 5000000 min 2320973 max 5000000 bps, worst drawdown 0.0%, 458 samples | demand last 4000000 min 1600000 max 4000000 bps | ends 42.9% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/7183) | link loss 12          | media 140.7%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/982) | link loss 5          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 239ns max <µs> | congestion loss 0.00% (0/688) | link loss 1          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 35.7% (7036403 B / ~19687500 B) | estimate last 3827739 min 1484046 max 3827739 bps, worst drawdown 56.6%, 471 samples | demand last 4000000 min 1600000 max 4000000 bps | ends 9.4% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/7233) | link loss 16          | media 139.9%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/978) | link loss 1          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 244ns max <µs> | congestion loss 0.00% (0/672) | link loss 0          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 34.6% (6821527 B / ~19687500 B) | estimate last 3253644 min 2628875 max 3378742 bps, worst drawdown 17.2%, 454 samples | demand last 4600000 min 1600000 max 4600000 bps | ends 7.0% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/7050) | link loss 16          | media 148.1%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/982) | link loss 2          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~19687500 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/669) | link loss 0          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 33.7% (6633307 B / ~19687500 B) | estimate last 2618309 min 2384417 max 3179785 bps, worst drawdown 17.7%, 452 samples | demand last 4600000 min 1600000 max 4600000 bps | ends 25.2% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/6841) | link loss 10          | media 151.8%
+
+tests::bwe::paused_stream_resumes_with_media_after_bandwidth_recovers_test
+  [PASS]
+  camera: capacity 500000 bps | utilisation 0.0% (0 B / ~7500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/2616) | link loss 4          | media 0.0%
+  screen: capacity 500000 bps | utilisation 0.0% (0 B / ~7500000 B) | estimate: no allocation passes | queue standing <µs> max <ms> | congestion loss 0.00% (0/1794) | link loss 3          | media 0.0%
+  viewer: capacity 5000000 bps | utilisation 25.4% (19061243 B / ~75000000 B) | estimate last 4799083 min 300000 max 4799083 bps, worst drawdown 0.0%, 1207 samples | demand last 4200000 min 4000000 max 4800000 bps | ends 4.0% off capacity | 80% at <s> | 90% at <s> | queue standing <ms> max <ms> | congestion loss 0.00% (0/19517) | link loss 25          | media 140.8%
+
+tests::bwe::priority_reconfiguration_quality_churn_test
+  [PASS]
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/657) | link loss 3          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 999ns max <µs> | congestion loss 0.00% (0/494) | link loss 0          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 33.9% (4446918 B / ~13125000 B) | estimate last 3352685 min 3352685 max 3352685 bps, worst drawdown 0.0%, 300 samples | demand last 4200000 min 4000000 max 4400000 bps | ends 4.2% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4542) | link loss 6          | media 145.9%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/659) | link loss 0          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/490) | link loss 0          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 34.8% (4568854 B / ~13125000 B) | estimate last 2838594 min 2838594 max 3339529 bps, worst drawdown 15.0%, 301 samples | demand last 4200000 min 4200000 max 4200000 bps | ends 18.9% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4664) | link loss 9          | media 142.0%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/661) | link loss 1          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/489) | link loss 3          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 34.3% (4504274 B / ~13125000 B) | estimate last 4284353 min 3331999 max 4284353 bps, worst drawdown 0.0%, 301 samples | demand last 4200000 min 4000000 max 4400000 bps | ends 22.4% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4608) | link loss 11          | media 144.1%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/657) | link loss 2          | media 0.0%
+  screen: capacity 3500000 bps | utilisation 0.0% (0 B / ~13125000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/491) | link loss 2          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 34.3% (4495936 B / ~13125000 B) | estimate last 3481721 min 3350079 max 3481721 bps, worst drawdown 0.0%, 301 samples | demand last 4200000 min 4000000 max 4400000 bps | ends 0.5% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4593) | link loss 7          | media 144.8%
+
+tests::bwe::priority_swap_reaches_every_requested_top_layer_on_fast_link_test
+  [PASS]
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 3          | media 0.0%
+  screen: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 1          | media 0.0%
+  viewer: capacity unshaped | received 9729333 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 604 samples | demand last 4000000 min 4000000 max 4800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 18          | media 138.0%
+
+tests::bwe::resizing_camera_keeps_single_layer_screenshare_rendering_test
+  [PASS]
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  screen: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 2          | media 0.0%
+  viewer: capacity unshaped | received 2062434 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 300 samples | demand last 3400000 min 3400000 max 4600000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 1          | media 331.7%
 
 tests::bwe::screenshare_and_camera_conference_test
   [PASS]
-  camera: capacity unshaped | received 805737 B | estimate last 3859954 min 3278798 max 3862838 bps, worst drawdown 3.2%, 496 samples | demand last 2149730 min 1709164 max 2390341 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 83.0%
-  screen: capacity unshaped | received 6949327 B | estimate last 3348926 min 2823410 max 3377745 bps, worst drawdown 2.4%, 496 samples | demand last 1636819 min 1468954 max 1887546 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.7%
+  camera: capacity unshaped | received 764906 B | estimate last 5000000 min 4677333 max 5000000 bps, worst drawdown 0.0%, 481 samples | demand last 2600000 min 2000000 max 2800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 5          | media 87.8%
+  screen: capacity unshaped | received 7039731 B | estimate last 4310857 min 3991428 max 4310857 bps, worst drawdown 0.0%, 481 samples | demand last 2200000 min 2200000 max 2200000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 11          | media 142.7%
 
 tests::bwe::screenshare_and_camera_over_cellular_test
   [PASS]
-  camera: capacity unshaped | received 842190 B | estimate last 3528744 min 3146975 max 3652118 bps, worst drawdown 4.9%, 499 samples | demand last 2150701 min 1709479 max 2392590 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 64 | media 79.4%
-  screen: capacity unshaped | received 7259590 B | estimate last 3118305 min 2637878 max 3118305 bps, worst drawdown 2.5%, 496 samples | demand last 1652295 min 1529775 max 1803350 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 93 | media 95.3%
+  camera: capacity unshaped | received 792353 B | estimate last 5000000 min 4557499 max 5000000 bps, worst drawdown 0.0%, 482 samples | demand last 2600000 min 2000000 max 2800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 145          | media 84.7%
+  screen: capacity unshaped | received 7353239 B | estimate last 3996307 min 3996307 max 3996307 bps, worst drawdown 0.0%, 480 samples | demand last 2000000 min 2000000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 143          | media 136.7%
 
 tests::bwe::screenshare_and_camera_over_wifi_test
   [PASS]
-  camera: capacity unshaped | received 803531 B | estimate last 4000321 min 3209081 max 4000321 bps, worst drawdown 1.1%, 493 samples | demand last 2149730 min 1709164 max 2390341 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 7 | media 83.2%
-  screen: capacity unshaped | received 7020458 B | estimate last 3350051 min 2888583 max 3393266 bps, worst drawdown 1.4%, 494 samples | demand last 1636776 min 1469298 max 1887473 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 12 | media 98.7%
+  camera: capacity unshaped | received 764906 B | estimate last 5000000 min 4677333 max 5000000 bps, worst drawdown 0.0%, 481 samples | demand last 2600000 min 2000000 max 2800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 5          | media 87.8%
+  screen: capacity unshaped | received 7039731 B | estimate last 4310857 min 3991428 max 4310857 bps, worst drawdown 0.0%, 481 samples | demand last 2200000 min 2200000 max 2200000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 11          | media 142.7%
 
 tests::bwe::screenshare_recovers_after_competing_camera_pause_test
   [PASS]
-  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  screen: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity 3000000 bps | utilisation 7.0% (2355195 B / ~33750000 B) | estimate last 2538275 min 985068 max 2538275 bps, worst drawdown 48.0%, 926 samples | demand last 2500524 min 1904088 max 2583943 bps | ends 15.4% off capacity | 80% at <s> | 90% never | queue max <ms> | congestion loss 0.00% (0/4431) | link loss 0 | media 96.4%
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 1          | media 0.0%
+  screen: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 3          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 9.4% (3179272 B / ~33750000 B) | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 900 samples | demand last 3000000 min 2600000 max 3000000 bps | ends 66.7% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4832) | link loss 6          | media 641.1%
 
 tests::bwe::screenshare_recovers_full_quality_after_going_still_test
   [PASS]
-  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 2100168 B | estimate last 3353056 min 3073910 max 3727548 bps, worst drawdown 10.0%, 1652 samples | demand last 1532350 min 0 max 2487000 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 81.2%
+  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 5          | media 0.0%
+  viewer: capacity unshaped | received 2017136 B | estimate last 5000000 min 4677333 max 5000000 bps, worst drawdown 0.0%, 1603 samples | demand last 2200000 min 800000 max 2800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 48          | media 83.6%
 
 tests::bwe::static_screenshare_does_not_poison_bandwidth_estimate_test
   [PASS]
-  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  viewer: capacity unshaped | received 7758365 B | estimate last 5000000 min 4727801 max 5000000 bps, worst drawdown 0.0%, 499 samples | demand last 3302788 min 2951391 max 3631259 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 98.3%
+  camera: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 4          | media 0.0%
+  presenter: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 1          | media 0.0%
+  viewer: capacity unshaped | received 7850523 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 483 samples | demand last 4200000 min 3600000 max 4200000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 15          | media 137.5%
+
+tests::bwe::steady_state_allocation_does_not_churn_test
+  [PASS]
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~26250000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1311) | link loss 3          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 33.6% (8830929 B / ~26250000 B) | estimate last 3619733 min 3554666 max 3619733 bps, worst drawdown 0.0%, 601 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 3.4% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/9032) | link loss 14          | media 143.4%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~26250000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1312) | link loss 6          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 33.7% (8852712 B / ~26250000 B) | estimate last 3679999 min 3557714 max 3679999 bps, worst drawdown 0.0%, 601 samples | demand last 2000000 min 1800000 max 2000000 bps | ends 5.1% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/9066) | link loss 23          | media 143.1%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~26250000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1304) | link loss 2          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 33.8% (8862040 B / ~26250000 B) | estimate last 3891199 min 3891199 max 3891199 bps, worst drawdown 0.0%, 600 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 11.2% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/9076) | link loss 19          | media 142.9%
+  camera: capacity 3500000 bps | utilisation 0.0% (0 B / ~26250000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1315) | link loss 6          | media 0.0%
+  viewer: capacity 3500000 bps | utilisation 33.7% (8858810 B / ~26250000 B) | estimate last 3631466 min 3631466 max 3631466 bps, worst drawdown 0.0%, 600 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 3.8% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/9067) | link loss 18          | media 143.0%
 
 tests::bwe::steady_subscription_is_mostly_media_test
   [PASS]
-  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/1280) | link loss 0 | media 0.0%
-  bob: capacity 3000000 bps | utilisation 39.1% (8791899 B / ~22500000 B) | estimate last 2877278 min 2527094 max 2915395 bps, worst drawdown 5.6%, 624 samples | demand last 1697043 min 1467161 max 1702474 bps | ends 4.1% off capacity | 80% at 0ns | 90% at <s> | queue max <ms> | congestion loss 0.00% (0/8813) | link loss 0 | media 99.8%
+  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~22500000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/1311) | link loss 0          | media 0.0%
+  bob: capacity 3000000 bps | utilisation 39.6% (8910229 B / ~22500000 B) | estimate last 3595199 min 3021223 max 3595199 bps, worst drawdown 0.0%, 601 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 19.8% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/9096) | link loss 21          | media 142.6%
 
 tests::bwe::still_screenshare_does_not_talk_down_a_healthy_link_test
   [PASS]
-  presenter: capacity 6000000 bps | utilisation 0.0% (0 B / ~45000000 B) | estimate: no allocation passes | queue max 96µs | congestion loss 0.00% (0/277) | link loss 0 | media 0.0%
-  viewer: capacity 6000000 bps | utilisation 2.1% (945110 B / ~45000000 B) | estimate last 3385190 min 3273783 max 3461729 bps, worst drawdown 3.9%, 618 samples | demand last 2266135 min 1709164 max 2390341 bps | ends 43.6% off capacity | 80% never | 90% never | queue max <ms> | congestion loss 0.00% (0/6635) | link loss 0 | media 84.9%
+  presenter: capacity 6000000 bps | utilisation 0.0% (0 B / ~45000000 B) | estimate: no allocation passes | queue standing 320ns max 96µs | congestion loss 0.00% (0/900) | link loss 4          | media 0.0%
+  viewer: capacity 6000000 bps | utilisation 2.1% (933125 B / ~45000000 B) | estimate last 4488999 min 3790711 max 4488999 bps, worst drawdown 0.0%, 603 samples | demand last 2800000 min 2000000 max 2800000 bps | ends 25.2% off capacity | 80% never | 90% never | queue standing <µs> max <ms> | congestion loss 0.00% (0/6410) | link loss 1          | media 86.4%
 
 tests::bwe::subscriber_reaches_top_layer_on_a_rate_limited_link_test
   [PASS]
-  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
-  bob: capacity 3000000 bps | utilisation 38.8% (4361681 B / ~11250000 B) | estimate last 2752184 min 2752184 max 2915395 bps, worst drawdown 5.6%, 313 samples | demand last 1499412 min 1467161 max 1609049 bps | ends 8.3% off capacity | 80% at 0ns | 90% at 0ns | queue max <ms> | congestion loss 0.00% (0/4384) | link loss 0 | media 99.7%
+  alice: capacity 3000000 bps | utilisation 0.0% (0 B / ~11250000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/657) | link loss 0          | media 0.0%
+  bob: capacity 3000000 bps | utilisation 39.2% (4414522 B / ~11250000 B) | estimate last 3595199 min 3021223 max 3595199 bps, worst drawdown 0.0%, 301 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 19.8% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4528) | link loss 10          | media 143.7%
 
 tests::bwe::subscriber_reaches_top_layer_on_fast_link_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 2233094 B | estimate last 2810820 min 2776394 max 2915751 bps, worst drawdown 4.8%, 157 samples | demand last 1601566 min 1467161 max 1630094 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.7%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 2261273 B | estimate last 3962461 min 3962461 max 3962461 bps, worst drawdown 0.0%, 150 samples | demand last 2000000 min 2000000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 4          | media 141.7%
 
 tests::bwe::subscription_climbs_back_after_the_link_recovers_test
   [PASS]
-  alice: capacity 500000 bps | utilisation 0.0% (0 B / ~1875000 B) | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/640) | link loss 0 | media 0.0%
-  bob: capacity 3000000 bps | utilisation 38.8% (4362352 B / ~11250000 B) | estimate last 2853814 min 2451942 max 2856532 bps, worst drawdown 1.2%, 308 samples | demand last 1550922 min 1508883 max 1657069 bps | ends 4.9% off capacity | 80% at 0ns | 90% at <s> | queue max <ms> | congestion loss 0.00% (0/4384) | link loss 0 | media 99.7%
+  alice: capacity 500000 bps | utilisation 0.0% (0 B / ~1875000 B) | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/659) | link loss 11          | media 0.0%
+  bob: capacity 3000000 bps | utilisation 39.2% (4409807 B / ~11250000 B) | estimate last 4250285 min 4250285 max 4250285 bps, worst drawdown 0.0%, 300 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 41.7% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/4511) | link loss 6          | media 143.2%
 
 tests::bwe::upgrade_after_long_low_quality_period_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 1811634 B | estimate last 2768122 min 1356497 max 2816364 bps, worst drawdown 17.8%, 170 samples | demand last 1530170 min 1467161 max 1615573 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 98.8%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 1          | media 0.0%
+  bob: capacity unshaped | received 2114278 B | estimate last 3782857 min 3782857 max 3782857 bps, worst drawdown 0.0%, 150 samples | demand last 2000000 min 1800000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 6          | media 145.8%
 
 tests::connectivity::abrupt_exit_chaos_test
   [PASS]
-  crasher1: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  crasher2: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  crasher3: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  crasher4: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  observer: capacity unshaped | received 148195 B | estimate last 587720 min 587720 max 587720 bps, worst drawdown 0.0%, 82 samples | demand last 190103 min 184679 max 196442 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.8%
-  stable: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  crasher1: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  crasher2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  crasher3: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  crasher4: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  observer: capacity unshaped | received 152339 B | estimate last 3247435 min 3247435 max 3247435 bps, worst drawdown 0.0%, 82 samples | demand last 400000 min 400000 max 800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 98.4%
+  stable: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::connectivity::churn_test
   [PASS]
-  churner: capacity unshaped | received 1625 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  stable: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  churner: capacity unshaped | received 2460 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  stable: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+
+tests::connectivity::cross_shard_video_is_forwarded_decodably_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 369984 B | estimate last 3891199 min 2000000 max 3891199 bps, worst drawdown 0.0%, 202 samples | demand last 800000 min 800000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 98.0%
+  carol: capacity unshaped | received 371106 B | estimate last 3631999 min 781896 max 3631999 bps, worst drawdown 0.0%, 201 samples | demand last 800000 min 800000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 97.7%
 
 tests::connectivity::network_impairment_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 552871 B | estimate last 510939 min 510939 max 681373 bps, worst drawdown 25.0%, 306 samples | demand last 353977 min 150000 max 684475 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.1%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 558392 B | estimate last 3727999 min 3727999 max 3727999 bps, worst drawdown 0.0%, 300 samples | demand last 600000 min 400000 max 600000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 7          | media 100.8%
 
 tests::connectivity::reconnection_recovery_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 363389 B | estimate last 608088 min 392486 max 722762 bps, worst drawdown 45.7%, 226 samples | demand last 387997 min 150000 max 601224 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.9%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 379589 B | estimate last 3727999 min 3727999 max 3727999 bps, worst drawdown 0.0%, 200 samples | demand last 1000000 min 400000 max 1000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 102.9%
 
 tests::connectivity::simulation_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  carol: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  churn1: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  churn2: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  carol: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  churn1: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  churn2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::connectivity::tcp_multi_shard_simulation_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  carol: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  dave: capacity unshaped | received 0 B | estimate last 990913 min 990913 max 990913 bps, worst drawdown 0.0%, 1 samples | demand last 187696 min 187696 max 187696 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  carol: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  dave: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::connectivity::tcp_simulation_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+
+tests::data_channel::cross_shard_data_channel_forwarding_test
+  [PASS]
+  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::data_channel::data_channel_pubsub_forwarding_test
   [PASS]
-  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::data_channel::data_channel_scoped_subscribe_routing_test
   [PASS]
-  aggregate: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  pub_a: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  pub_b: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  scoped_a: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  scoped_b: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  aggregate: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  pub_a: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  pub_b: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  scoped_a: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  scoped_b: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::data_channel::latest_topic_eventually_delivers_newest_state
   [PASS]
-  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::data_channel::ordered_topic_continues_after_publisher_reconnect
   [PASS]
-  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::data_channel::ordered_topic_delivers_every_message_in_order
   [PASS]
-  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
+  pub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
 
 tests::subscriptions::declarative_subscription_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 92365 B | estimate last 732044 min 732044 max 732044 bps, worst drawdown 0.0%, 50 samples | demand last 187666 min 186368 max 189970 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 100.0%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 94363 B | estimate last 3727999 min 3727999 max 3727999 bps, worst drawdown 0.0%, 50 samples | demand last 400000 min 400000 max 400000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 98.7%
+
+tests::subscriptions::one_slot_track_replacement_keeps_media_flow_test
+  [PASS]
+  pub1: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  pub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 182294 B | estimate last 3067022 min 3067022 max 3067022 bps, worst drawdown 0.0%, 99 samples | demand last 400000 min 400000 max 800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 98.0%
 
 tests::subscriptions::slots_layout_update_test
   [PASS]
-  pub1: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  pub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  sub: capacity unshaped | received 369645 B | estimate last 804483 min 804483 max 804483 bps, worst drawdown 0.0%, 100 samples | demand last 375457 min 372858 max 388861 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 100.0%
+  pub1: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  pub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 376661 B | estimate last 3623999 min 3623999 max 3623999 bps, worst drawdown 0.0%, 100 samples | demand last 800000 min 800000 max 800000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 2          | media 98.9%
 
 tests::subscriptions::slots_prioritization_test
   [PASS]
-  pub1: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  pub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  sub: capacity unshaped | received 1620680 B | estimate last 3109327 min 3011171 max 3109327 bps, worst drawdown 0.0%, 103 samples | demand last 1665940 min 1627275 max 1688697 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.1%
+  pub1: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  pub2: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  sub: capacity unshaped | received 1646523 B | estimate last 5000000 min 5000000 max 5000000 bps, worst drawdown 0.0%, 100 samples | demand last 3000000 min 3000000 max 4200000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 3          | media 252.3%
+
+tests::video::cross_shard_simulcast_switching_stays_decodable_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity 5000000 bps | utilisation 2.9% (182086 B / ~6250000 B) | estimate last 300000 min 300000 max 300000 bps, worst drawdown 0.0%, 105 samples | demand last 2000000 min 2000000 max 2000000 bps | ends 94.0% off capacity | 80% never | 90% never | queue standing 0ns max 0ns | congestion loss 0.00% (0/312) | link loss 0          | media 1177.4%
+
+tests::video::cross_shard_stream_survives_congestion_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity 350000 bps | utilisation 43.2% (226962 B / ~525000 B) | estimate last 300000 min 300000 max 3727999 bps, worst drawdown 92.0%, 133 samples | demand last 400000 min 400000 max 1200000 bps | ends 14.3% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/388) | link loss 0          | media 98.7%
+
+tests::video::dd_publisher_streams_to_a_marker_only_subscriber_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 178140 B | estimate last 3727999 min 2000000 max 3727999 bps, worst drawdown 0.0%, 102 samples | demand last 1200000 min 1200000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 98.4%
+
+tests::video::dependency_descriptor_stream_is_forwarded_decodably_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 178140 B | estimate last 3727999 min 2000000 max 3727999 bps, worst drawdown 0.0%, 102 samples | demand last 1200000 min 1200000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 98.4%
+
+tests::video::dependency_descriptor_stream_survives_congestion_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity 350000 bps | utilisation 43.2% (226962 B / ~525000 B) | estimate last 300000 min 300000 max 3727999 bps, worst drawdown 92.0%, 135 samples | demand last 400000 min 400000 max 1200000 bps | ends 14.3% off capacity | 80% at 0ns | 90% at 0ns | queue standing <ms> max <ms> | congestion loss 0.00% (0/388) | link loss 0          | media 98.7%
 
 tests::video::fast_initial_ramp_up_on_good_network_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 2577205 B | estimate last 2197068 min 1822700 max 2197068 bps, worst drawdown 4.4%, 190 samples | demand last 1505781 min 1470887 max 1566605 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.7%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 2608055 B | estimate last 3747999 min 2863997 max 3747999 bps, worst drawdown 0.0%, 182 samples | demand last 2000000 min 2000000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 2          | media 143.9%
+
+tests::video::marker_only_publisher_streams_to_a_dd_subscriber_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 1169192 B | estimate last 3735466 min 2000000 max 3735466 bps, worst drawdown 0.0%, 103 samples | demand last 2000000 min 2000000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 167.7%
+
+tests::video::opaque_dependency_descriptor_holds_framerate_under_loss_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 10          | media 0.0%
+  bob: capacity unshaped | received 4760651 B | estimate last 4368615 min 4215999 max 4368615 bps, worst drawdown 0.0%, 301 samples | demand last 2000000 min 1800000 max 2200000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 176          | media 134.8%
+
+tests::video::opaque_dependency_descriptor_stream_forwards_on_dd_alone_test
+  [PASS]
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 178140 B | estimate last 3727999 min 2000000 max 3727999 bps, worst drawdown 0.0%, 102 samples | demand last 1200000 min 1200000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 98.4%
 
 tests::video::repeated_simulcast_switching_stays_decodable_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 300220 B | estimate last 3022671 min 2754110 max 3022671 bps, worst drawdown 0.0%, 26 samples | demand last 1833214 min 1833214 max 1877575 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 104.5%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 0.0%
+  bob: capacity unshaped | received 309805 B | estimate last 3781714 min 3781714 max 3781714 bps, worst drawdown 0.0%, 25 samples | demand last 2200000 min 2000000 max 2200000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 0          | media 156.9%
 
 tests::video::simulcast_stream_stability_test
   [PASS]
-  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 0.0%
-  bob: capacity unshaped | received 8660495 B | estimate last 2916372 min 1822700 max 2949752 bps, worst drawdown 3.8%, 622 samples | demand last 1473549 min 1441673 max 1650504 bps | queue max 0ns | congestion loss 0.00% (0/0) | link loss 0 | media 99.8%
+  alice: capacity unshaped | received 0 B | estimate: no allocation passes | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 4          | media 0.0%
+  bob: capacity unshaped | received 8797968 B | estimate last 3962461 min 3727998 max 3962461 bps, worst drawdown 0.0%, 603 samples | demand last 2000000 min 2000000 max 2000000 bps | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 17          | media 143.3%
 
