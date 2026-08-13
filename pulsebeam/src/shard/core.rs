@@ -324,7 +324,8 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.routing.route_audio(room, Origin::Remote, ev, &mut ctx);
+                self.routing
+                    .route_audio(room, track, Origin::Remote, ev, &mut ctx);
             }
             (RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let mut ctx = DispatchCtx {
@@ -410,9 +411,18 @@ impl ShardCore {
         };
         while let Some(ev) = self.pipeline.pop_audio_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Audio);
-            if let Some(room) = self.routing.control.room_keys.get(&ev.room_id).copied() {
-                self.routing.route_audio(room, Origin::Local, ev, &mut ctx);
-            }
+            // A locally published track still costs one lookup to reach its
+            // fanout: the publishing participant does not hold the key yet.
+            // Same race video already tolerates (TrackPublished may not have
+            // drained yet) — a silent skip here self-heals on the next packet.
+            let Some(room) = self.routing.control.room_keys.get(&ev.room_id).copied() else {
+                continue;
+            };
+            let Some(track) = self.routing.fanout_of(&ev.stream_id.0) else {
+                continue;
+            };
+            self.routing
+                .route_audio(room, track, Origin::Local, ev, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {

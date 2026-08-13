@@ -1814,6 +1814,7 @@ impl ShardRoutingTable {
     pub fn route_audio(
         &mut self,
         room: RoomKey,
+        track_key: LocalTrackKey,
         origin: Origin,
         mut ev: AudioRtpEvent,
         ctx: &mut impl RoutingContext,
@@ -1829,14 +1830,10 @@ impl ShardRoutingTable {
 
         // Split the borrow: the room owns the selector and members, while the
         // per-stream sender handles live in `tracks`.
-        let Self { data, control } = self;
+        let Self { data, .. } = self;
         let DataPlane { rooms, tracks, .. } = data;
         let Some(room) = rooms.get_mut(room) else {
             tracing::warn!(target: crate::log::TARGET_AUDIO, "audio packet dropped: room missing");
-            return;
-        };
-        let Some(&track_key) = control.track_keys.get(&ev.stream_id.0) else {
-            debug_assert!(false, "an audio stream's fanout key must already exist");
             return;
         };
 
