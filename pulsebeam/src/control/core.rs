@@ -291,7 +291,7 @@ mod tests {
                 from_shard_id: ShardId::new(3),
                 ev: ShardEvent::Relay(Topology::TrackSubscribed {
                     track: track.clone(),
-                    route: RouteId::new(0),
+                    route: RouteId::from_raw(0),
                     epoch: 0,
                 }),
             },
@@ -314,7 +314,7 @@ mod tests {
         assert!(matches!(
             topology,
             Topology::TrackSubscribed { track: routed, route, epoch }
-                if routed == track && route == RouteId::new(0) && epoch == 0
+                if routed == track && route == RouteId::from_raw(0) && epoch == 0
         ));
     }
 
@@ -329,7 +329,7 @@ mod tests {
                 from_shard_id: ShardId::new(4),
                 ev: ShardEvent::Relay(Topology::TrackUnsubscribed {
                     track: track.clone(),
-                    route: RouteId::new(0),
+                    route: RouteId::from_raw(0),
                     epoch: 0,
                 }),
             },

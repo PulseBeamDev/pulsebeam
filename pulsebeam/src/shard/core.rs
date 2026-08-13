@@ -197,7 +197,7 @@ impl ShardCore {
         Self {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
-            routing: ShardRoutingTable::new(),
+            routing: ShardRoutingTable::new(shard_id),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -1497,7 +1497,7 @@ mod test {
                 from_shard_id: ShardId::new(0),
                 topology: Topology::TrackSubscribed {
                     track: video_track(publisher, 1),
-                    route: crate::route::RouteId::new(0),
+                    route: crate::route::RouteId::from_raw(0),
                     epoch: 0,
                 },
             },

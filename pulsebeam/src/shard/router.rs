@@ -249,9 +249,9 @@ impl ShardRoutingTable {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new(shard_id: ShardId) -> Self {
         Self {
-            data: DataPlane::new(),
+            data: DataPlane::new(shard_id),
             control: ControlPlane::new(),
         }
     }
@@ -2165,22 +2165,24 @@ impl ShardRoutingTable {
     ) {
         if ctx.is_local(&publisher) {
             ctx.deliver_reliable_control(publisher, topic, bytes);
-        } else if let Some(shard_id) = self.remote_shard_for(&publisher) {
-            let key = DataStreamId::new(publisher, topic.clone());
-            let Some(target) = self.control.topic_reverse_targets.get(&key) else {
-                // The handle arrives with the publisher announcement, so a
-                // subscription cannot predate it.
-                debug_assert!(false, "no reverse route for a remote reliable publisher");
-                return;
-            };
-            ctx.send_frame(
-                shard_id,
-                ShardFrame::Reverse {
-                    env: RouteEnvelope::new(*target),
-                    body: Reverse::DataAck(bytes.to_vec()),
-                },
-            );
+            return;
         }
+        let key = DataStreamId::new(publisher, topic.clone());
+        let Some(target) = self.control.topic_reverse_targets.get(&key) else {
+            // The handle arrives with the publisher announcement, so a
+            // subscription cannot predate it.
+            debug_assert!(false, "no reverse route for a remote reliable publisher");
+            return;
+        };
+        // The reverse route's own id carries its destination shard, so there
+        // is nothing left to look up.
+        ctx.send_frame(
+            target.route.shard(),
+            ShardFrame::Reverse {
+                env: RouteEnvelope::new(*target),
+                body: Reverse::DataAck(bytes.to_vec()),
+            },
+        );
     }
 }
 
@@ -2475,7 +2477,7 @@ mod tests {
 
     #[test]
     fn duplicate_register_remote_participant_does_not_leak_refcount() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant = pid();
         let room = room_id("r1");
@@ -2504,7 +2506,7 @@ mod tests {
 
     #[test]
     fn moving_remote_participant_releases_the_old_shard() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant = pid();
         let room = room_id("r2");
@@ -2534,7 +2536,7 @@ mod tests {
 
     #[test]
     fn first_subscriber_notifies_publisher_shard() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let track = TrackMeta {
             shard_id: ShardId::new(1),
             id: pid().derive_track_id(TrackKind::Video, "v"),
@@ -2569,7 +2571,7 @@ mod tests {
     /// teardown-before-replace can prevent two keys for one person.
     #[test]
     fn a_reconnect_only_leaves_the_new_key_in_the_fanout() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let subscriber = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(1),
@@ -2612,7 +2614,7 @@ mod tests {
     /// local subscriber.
     #[test]
     fn a_reliable_subscription_resolves_on_publisher_announcement() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(13);
         let room = room_id("reliable-room");
         let subscriber = pid();
@@ -2667,7 +2669,7 @@ mod tests {
     /// stream flows, and it alone receives nothing.
     #[test]
     fn a_late_wildcard_subscriber_joins_an_imported_stream() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(13);
         let room = room_id("wildcard-late");
         let topic = Topic::for_test("chat");
@@ -2709,7 +2711,7 @@ mod tests {
     /// and silence, which is what this pins.
     #[test]
     fn every_local_subscriber_receives_a_remote_publishers_frame() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(13);
         let room = room_id("reliable-fanout");
         let topic = Topic::for_test("chat");
@@ -2748,7 +2750,7 @@ mod tests {
     /// the destination installs a route immediately and hands back the handle.
     #[test]
     fn an_explicit_data_subscription_installs_a_route() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(11);
         let room = room_id("data-room");
         let subscriber = pid();
@@ -2800,8 +2802,8 @@ mod tests {
     /// once capacity returns is the property, not the error itself.
     #[test]
     fn a_failed_install_leaves_the_stream_installable_again() {
-        let mut table = ShardRoutingTable::new();
-        table.data.routes = crate::route::RouteTable::with_max_slots(0);
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
+        table.data.routes = crate::route::RouteTable::with_max_slots(ShardId::new(0), 0);
         let mut rng = rand::seeded_rng(23);
         let room = room_id("data-room");
         let subscriber = pid();
@@ -2825,7 +2827,7 @@ mod tests {
         );
         assert_eq!(table.data.routes.len(), 0);
 
-        table.data.routes = crate::route::RouteTable::new();
+        table.data.routes = crate::route::RouteTable::new(ShardId::new(0));
         let second = pid();
         let h2 = new_participant_key();
         table.add_local_member(second, h2, room, &mut rng);
@@ -2857,7 +2859,7 @@ mod tests {
     fn a_stats_snapshot_replaces_what_the_fanout_held() {
         use crate::rtp::monitor::StreamStats;
 
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(77);
         let room = room_id("republish");
         let publisher = pid();
@@ -2912,7 +2914,7 @@ mod tests {
     /// kilobytes each, and it grows for as long as the shard runs.
     #[test]
     fn an_ended_track_releases_its_fanout() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(53);
         let room = room_id("fanout-release");
         let publisher = pid();
@@ -2945,7 +2947,7 @@ mod tests {
     /// names neither.
     #[test]
     fn a_reliable_topic_gets_one_reverse_route() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(91);
         let room = room_id("reliable-reverse");
         let publisher = pid();
@@ -3003,7 +3005,7 @@ mod tests {
     /// only thing noticing was a `debug_assert!` that release builds drop.
     #[test]
     fn a_late_joining_shard_can_address_keyframe_requests() {
-        let mut publisher_shard = ShardRoutingTable::new();
+        let mut publisher_shard = ShardRoutingTable::new(ShardId::new(0));
         let publisher = pid();
         let meta = TrackMeta {
             shard_id: ShardId::new(0),
@@ -3022,7 +3024,7 @@ mod tests {
 
         // A different shard learns of the track only by a participant joining
         // after the fact, never through an announcement.
-        let mut late_shard = ShardRoutingTable::new();
+        let mut late_shard = ShardRoutingTable::new(ShardId::new(0));
         let room = room_id("late-join");
         assert!(
             late_shard.track_reverse_target(&meta.id, None).is_none(),
@@ -3045,7 +3047,7 @@ mod tests {
     /// it is latest-wins and keeps no per-link state.
     #[test]
     fn feedback_costs_one_route_per_track_regardless_of_subscribers() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let publisher = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(0),
@@ -3096,7 +3098,7 @@ mod tests {
     /// on whatever later takes that slot.
     #[test]
     fn feedback_on_a_retired_route_is_dropped() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let publisher = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(0),
@@ -3121,7 +3123,7 @@ mod tests {
     /// the new subscription just asked for.
     #[test]
     fn a_stale_unsubscribe_does_not_tear_down_a_newer_route() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let publisher = pid();
         let track = TrackMeta {
             shard_id: ShardId::new(0),
@@ -3130,8 +3132,8 @@ mod tests {
         };
         let subscriber_shard = ShardId::new(1);
 
-        let stale = RouteId::new(7);
-        let fresh = RouteId::new(9);
+        let stale = RouteId::from_raw(7);
+        let fresh = RouteId::from_raw(9);
 
         // The destination resubscribed on a new route before its old
         // unsubscribe reached us.
@@ -3161,7 +3163,7 @@ mod tests {
     /// and the publisher keeps a handle for a destination that wants nothing.
     #[test]
     fn the_last_data_unsubscribe_retires_the_route() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(41);
         let room = room_id("data-retire");
         let publisher = pid();
@@ -3218,7 +3220,7 @@ mod tests {
     /// until a publisher is announced — then it resolves to a concrete route.
     #[test]
     fn a_wildcard_data_subscription_resolves_on_publisher_announcement() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(12);
         let room = room_id("data-wildcard");
         let subscriber = pid();
@@ -3262,7 +3264,7 @@ mod tests {
     /// exists and retires when it has nobody left to deliver to.
     #[test]
     fn an_audio_route_is_installed_per_stream_and_retired_with_the_room() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room");
         let local = pid();
@@ -3310,7 +3312,7 @@ mod tests {
     /// was not in the room.
     #[test]
     fn a_publisher_can_return_under_the_same_id() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(7);
         let room = room_id("rejoin-room");
         let participant = pid();
@@ -3333,7 +3335,7 @@ mod tests {
 
     #[test]
     fn a_locally_published_audio_track_installs_no_route() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room-local");
         let origin = pid();
@@ -3368,7 +3370,7 @@ mod tests {
     /// and only then does media flow — addressed by route, not by track id.
     #[test]
     fn a_route_is_installed_once_and_retired_with_the_last_subscriber() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let track = TrackMeta {
             shard_id: ShardId::new(1),
             id: pid().derive_track_id(TrackKind::Video, "v"),
@@ -3418,7 +3420,7 @@ mod tests {
 
     #[test]
     fn route_video_forwards_to_subscribers_and_remote_shards() {
-        let mut table = ShardRoutingTable::new();
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
         let publisher = pid();
         let track_id = publisher.derive_track_id(TrackKind::Video, "v");
         let subscriber = pid();
@@ -3437,7 +3439,7 @@ mod tests {
         // Stand in for a destination shard that installed a route and had its
         // handle acknowledged back to this publisher.
         table.register_remote_subscriber_shard(
-            RemoteRoute::new(ShardId::new(3), RouteId::new(0), 0),
+            RemoteRoute::new(ShardId::new(3), RouteId::from_raw(0), 0),
             TrackMeta {
                 shard_id: ShardId::new(0),
                 id: track_id,

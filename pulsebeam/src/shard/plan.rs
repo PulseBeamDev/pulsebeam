@@ -333,13 +333,13 @@ pub(crate) struct DataPlane {
 }
 
 impl DataPlane {
-    pub fn new() -> Self {
+    pub fn new(shard_id: ShardId) -> Self {
         Self {
             rooms: SlotMap::with_key(),
             tracks: SlotMap::with_key(),
             data_streams: SlotMap::with_key(),
             reliable_streams: SlotMap::with_key(),
-            routes: RouteTable::new(),
+            routes: RouteTable::new(shard_id),
         }
     }
 }
