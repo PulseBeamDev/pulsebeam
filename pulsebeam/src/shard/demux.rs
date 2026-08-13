@@ -15,6 +15,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///
+/// Resolving a participant does not imply this shard owns it — see the note on
+/// cross-shard arrivals below.
+///
 /// Routing uses two mechanisms:
 /// 1. A fast-path map from `SocketAddr` to `ParticipantId` (`addr_map`): efficient
 ///    routing for known addresses (DTLS, RTP, RTCP).
@@ -24,11 +27,15 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 ///
 /// Non-STUN packets from unknown addresses are rejected.
 ///
+/// A ufrag naming another shard is *not* rejected. `SO_REUSEPORT` picks the
+/// receiving socket by hashing the 4-tuple, which has nothing to do with which
+/// shard owns the participant, so arriving on the wrong one is ordinary rather
+/// than suspicious; `ShardCore::on_udp_batch` forwards it to the owner. Dropping
+/// it here instead makes a participant unreachable whenever the hash disagrees
+/// with placement, which is most of the time.
+///
 /// # Security hardening
 ///
-/// * **Shard validation**: the `shard_id` encoded in the ICE ufrag must match this
-///   shard.  Packets whose ufrag targets a different shard — whether misrouted or
-///   crafted by an attacker — are dropped before the cache is touched.
 /// * **Total cache cap** (`MAX_ADDR_ENTRIES`): the fast-path `addr_map` is bounded.
 ///   Once full, packets are still decoded and forwarded but the source address is not
 ///   cached, limiting memory under a flood of distinct source IPs.
@@ -36,8 +43,6 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
 ///   addresses a single participant (real or fabricated) can occupy in the cache,
 ///   preventing one participant slot from monopolising the budget.
 pub struct Demuxer {
-    /// Which shard this demuxer belongs to — used to validate ICE ufrag routing metadata.
-    shard_id: u8,
     /// Fast-path cache: maps a known remote `SocketAddr` to a participant.
     addr_map: HashMap<SocketAddr, ParticipantId>,
     /// Reverse: maps a participant to all their known source addresses (for cleanup).
@@ -47,9 +52,8 @@ pub struct Demuxer {
 }
 
 impl Demuxer {
-    pub fn new(shard_id: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            shard_id: shard_id as u8,
             addr_map: HashMap::with_capacity(MAX_ADDR_ENTRIES),
             participant_addrs: HashMap::with_capacity(MAX_ADDR_ENTRIES),
             addr_to_participant: HashMap::with_capacity(MAX_ADDR_ENTRIES),
@@ -121,7 +125,6 @@ pub(crate) fn extract_stun_server_ufrag(data: &[u8]) -> Option<String> {
 }
 
 mod ice {
-    use std::convert::TryInto;
 
     // --- Constants defined by RFC 5389 ---
     const MIN_STUN_HEADER_SIZE: usize = 20;
@@ -157,91 +160,60 @@ mod ice {
             return None;
         }
 
-        // 2. Check Message Type indicator (first two bits must be 00)
-        if data[0] & 0b1100_0000 != 0 {
+        // Message type: the first two bits must be 00.
+        if data.first()? & 0b1100_0000 != 0 {
             return None;
         }
 
-        // 3. Check Magic Cookie (bytes 4-7)
-        // We know data.len() >= 20, so slicing data[4..8] is safe.
-        if data[4..8] != MAGIC_COOKIE_BYTES {
+        if data.get(4..8) != Some(MAGIC_COOKIE_BYTES.as_slice()) {
             return None;
         }
 
-        // 4. Read Message Length (bytes 2-3) - Big Endian
-        // This is the length of the attributes *only*.
-        // Performance: from_be_bytes is efficient. try_into().unwrap() is safe
-        // because we checked data.len() >= 20.
-        let message_length = u16::from_be_bytes(
-            data[2..4].try_into().unwrap(), // Safe slice and unwrap
-        ) as usize;
+        // Message length covers the attributes only.
+        let message_length = usize::from(u16::from_be_bytes([*data.get(2)?, *data.get(3)?]));
 
-        // 5. Validate overall length
-        // The total expected size (header + attributes) must not exceed the buffer size.
+        // The declared total must actually be present, and a message with no
+        // attributes cannot carry a username.
         let expected_total_len = MIN_STUN_HEADER_SIZE.checked_add(message_length)?;
-        if data.len() < expected_total_len {
-            // Not enough data in the buffer according to the header's length field.
+        if data.len() < expected_total_len || message_length == 0 {
             return None;
         }
 
-        // Optimization: If message_length is 0, no attributes exist.
-        if message_length == 0 {
-            return None;
-        }
-
-        // --- Attribute Parsing ---
         let mut current_pos = MIN_STUN_HEADER_SIZE;
-        // Define the boundary for attribute data based *only* on the declared message_length.
-        // We trust message_length (after the data.len() check above) to define the attribute region.
-        let attributes_end = expected_total_len; // MIN_STUN_HEADER_SIZE + message_length;
+        // The attribute region is bounded by the declared length, which the
+        // check above proved is within the buffer.
+        let attributes_end = expected_total_len;
 
         while current_pos < attributes_end {
-            // Check if there's enough space for the attribute header (Type + Length)
-            // Need at least 4 bytes remaining *within the declared attribute region*.
             if current_pos.checked_add(ATTRIBUTE_HEADER_SIZE)? > attributes_end {
-                // Malformed: Not enough space left for an attribute header
-                // This could happen if the last attribute's padding calculation was wrong
-                // or if message_length implied space but the data buffer was actually shorter
-                // (although the earlier `data.len() < expected_total_len` check should catch the latter)
-                // or if the message_length is non-zero but doesn't even cover a single attribute header.
                 return None;
             }
 
-            // Read Attribute Type (Big Endian)
-            // Slicing is safe due to the check above.
-            let attr_type = u16::from_be_bytes(
-                data[current_pos..current_pos + 2].try_into().unwrap(), // Safe
-            );
+            let attr_type = u16::from_be_bytes([
+                *data.get(current_pos)?,
+                *data.get(current_pos.saturating_add(1))?,
+            ]);
+            let attr_value_len = usize::from(u16::from_be_bytes([
+                *data.get(current_pos.saturating_add(2))?,
+                *data.get(current_pos.saturating_add(3))?,
+            ]));
 
-            // Read Attribute Value Length (Big Endian)
-            // Slicing is safe due to the check above.
-            let attr_value_len = u16::from_be_bytes(
-                data[current_pos + 2..current_pos + 4].try_into().unwrap(), // Safe
-            ) as usize;
+            let value_pos = current_pos.saturating_add(ATTRIBUTE_HEADER_SIZE);
 
-            // Calculate start position of the attribute value
-            let value_pos = current_pos + ATTRIBUTE_HEADER_SIZE;
-
-            // Check if the attribute value (based on its *own* length field) fits
-            // within the bounds defined by the *message* length field.
+            // An attribute may not claim more than the message length allows.
             let end_of_value = value_pos.checked_add(attr_value_len)?;
             if end_of_value > attributes_end {
-                // Malformed: Attribute claims to be longer than the remaining message length allows
                 return None;
             }
 
-            // *** Check if this is the USERNAME attribute ***
             if attr_type == USERNAME_ATTRIBUTE_TYPE {
-                // Found it! Return a slice pointing to the value.
-                // Slicing is safe because we checked:
-                // value_pos + attr_value_len <= attributes_end <= data.len()
-                return Some(&data[value_pos..end_of_value]);
+                return data.get(value_pos..end_of_value);
             }
 
             // Move to the next attribute.
             // Value must be padded to a multiple of 4 bytes.
             // Performance: Bitwise trick for padding calculation is fast.
-            let padded_len = (attr_value_len + 3) & !3;
+            let padded_len = attr_value_len.saturating_add(3) & !3;
             // Check for overflow before updating current_pos
             let next_pos = value_pos.checked_add(padded_len)?;
 
@@ -274,7 +246,6 @@ mod ice {
     ///
     /// Returns `Some(&str)` if the USERNAME attribute is found and contains valid
     /// UTF-8 data, `None` otherwise.
-
     #[inline]
     pub fn parse_stun_remote_ufrag_raw(data: &[u8]) -> Option<&[u8]> {
         find_stun_username_slice(data).and_then(|slice| first_token(slice, b':'))
@@ -282,17 +253,17 @@ mod ice {
 
     #[inline]
     fn first_token(input: &[u8], delimiter: u8) -> Option<&[u8]> {
-        for (i, &b) in input.iter().enumerate() {
-            if b == delimiter {
-                return Some(&input[..i]);
-            }
-        }
-        None
+        let i = input.iter().position(|&b| b == delimiter)?;
+        input.get(..i)
     }
 
     // --- Robust Test Suite ---
     #[cfg(test)]
     mod tests {
+        // Convenience only: a test is not a shard, so nothing here is
+        // cross-core, and a fixture may read the host clock. Allowed at the
+        // module, never the file, so it cannot drift over production code
+        // sharing it. See docs/thread-per-core.md.
         use super::*;
 
         const BINDING_REQUEST: u16 = 0x0001;
@@ -327,15 +298,20 @@ mod ice {
                 );
 
                 buf.extend_from_slice(&attr_type.to_be_bytes());
-                buf.extend_from_slice(&(attr_value_len as u16).to_be_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(attr_value_len)
+                        .expect("fixture attr fits")
+                        .to_be_bytes(),
+                );
                 buf.extend_from_slice(attr_value);
 
                 // Add padding
-                let padded_len = (attr_value_len + 3) & !3;
-                let padding_len = padded_len - attr_value_len;
+                let padded_len = attr_value_len.saturating_add(3) & !3;
+                let padding_len = padded_len.saturating_sub(attr_value_len);
                 buf.extend_from_slice(&vec![0u8; padding_len]);
 
-                total_attr_len += ATTRIBUTE_HEADER_SIZE + padded_len;
+                total_attr_len =
+                    total_attr_len.saturating_add(ATTRIBUTE_HEADER_SIZE.saturating_add(padded_len));
             }
 
             // Check for unreasonable total length during test construction
@@ -345,7 +321,11 @@ mod ice {
             );
 
             // Write the actual message length (attribute part only)
-            buf[2..4].copy_from_slice(&(total_attr_len as u16).to_be_bytes());
+            buf[2..4].copy_from_slice(
+                &u16::try_from(total_attr_len)
+                    .expect("fixture length fits")
+                    .to_be_bytes(),
+            );
 
             buf
         }
@@ -512,7 +492,8 @@ mod ice {
                 &[(USERNAME_ATTRIBUTE_TYPE, username)], // Length should be 4+4=8
             );
             // Manually set message length to something larger than actual data size
-            let declared_len: u16 = (msg.len() - MIN_STUN_HEADER_SIZE + 1) as u16;
+            let declared_len: u16 =
+                u16::try_from(msg.len() - MIN_STUN_HEADER_SIZE + 1).expect("fixture length fits");
             msg[2..4].copy_from_slice(&declared_len.to_be_bytes());
 
             assert_eq!(find_stun_username_slice(&msg), None);
@@ -769,6 +750,9 @@ mod ice {
 
 #[cfg(test)]
 mod demux_tests {
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::{control::ufrag::IceUfrag, entity::ParticipantId};
     use pulsebeam_runtime::net::{RecvPacketBatch, Transport};
@@ -792,12 +776,20 @@ mod demux_tests {
 
         let mut buf = Vec::with_capacity(20 + attr_total);
         buf.extend_from_slice(&BINDING_REQUEST);
-        buf.extend_from_slice(&(attr_total as u16).to_be_bytes()); // message length
+        buf.extend_from_slice(
+            &u16::try_from(attr_total)
+                .expect("fixture attr total fits")
+                .to_be_bytes(),
+        ); // message length
         buf.extend_from_slice(&MAGIC_COOKIE);
         buf.extend_from_slice(&[0u8; 12]); // transaction ID
         // USERNAME attribute
         buf.extend_from_slice(&USERNAME_TYPE);
-        buf.extend_from_slice(&(value_len as u16).to_be_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(value_len)
+                .expect("fixture value fits")
+                .to_be_bytes(),
+        );
         buf.extend_from_slice(value);
         buf.extend_from_slice(&vec![0u8; padded_len - value_len]); // padding
         buf
@@ -832,7 +824,7 @@ mod demux_tests {
 
     #[test]
     fn valid_ufrag_matching_shard_routes_and_caches() {
-        let mut d = Demuxer::new(3);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(3);
         let encoded = ice.encode();
         let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
@@ -845,9 +837,22 @@ mod demux_tests {
         assert_eq!(d.addr_map.len(), 1); // no duplicate
     }
 
+    /// A ufrag for another shard resolves rather than being dropped: which
+    /// socket `SO_REUSEPORT` chose says nothing about which shard owns the
+    /// participant, and the caller forwards it on. Rejecting it here made every
+    /// participant whose hash disagreed with its placement unreachable.
+    #[test]
+    fn a_ufrag_for_another_shard_still_resolves_so_it_can_be_forwarded() {
+        let mut d = Demuxer::new();
+        let (ice, pid) = ufrag(4);
+        let batch = make_batch(src(1000), stun_with_ufrag(&ice.encode()));
+
+        assert_eq!(d.demux(&batch), Some(pid));
+    }
+
     #[test]
     fn oversized_ufrag_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         // 41 chars — one byte over the encoded length
         let oversized = "A".repeat(IceUfrag::ENCODED_LEN + 1);
         let batch = make_batch(src(1000), stun_with_ufrag(&oversized));
@@ -857,7 +862,7 @@ mod demux_tests {
 
     #[test]
     fn garbage_ufrag_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let batch = make_batch(src(1000), stun_with_ufrag("notavalidufrag!"));
         assert_eq!(d.demux(&batch), None);
         assert!(d.addr_map.is_empty());
@@ -865,19 +870,19 @@ mod demux_tests {
 
     #[test]
     fn non_stun_from_unknown_addr_is_dropped() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let batch = make_batch(src(1000), b"RTP not STUN".to_vec());
         assert_eq!(d.demux(&batch), None);
     }
 
     #[test]
     fn per_participant_addr_cap_limits_cache_growth() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(0);
         let encoded = ice.encode();
 
         // Fill up to the cap
-        for port in 0..MAX_ADDRS_PER_PARTICIPANT as u16 {
+        for port in 0..u16::try_from(MAX_ADDRS_PER_PARTICIPANT).expect("addr cap fits a u16") {
             let batch = make_batch(src(port), stun_with_ufrag(&encoded));
             assert_eq!(d.demux(&batch), Some(pid), "port {port} should route");
         }
@@ -895,7 +900,7 @@ mod demux_tests {
 
     #[test]
     fn unregister_clears_all_cached_addrs() {
-        let mut d = Demuxer::new(0);
+        let mut d = Demuxer::new();
         let (ice, pid) = ufrag(0);
         let encoded = ice.encode();
 

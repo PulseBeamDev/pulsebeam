@@ -1,3 +1,8 @@
+#![cfg_attr(not(test), forbid(unsafe_code))]
+//! Shared-state exception, crate-wide: The test/reference client. Not a shard — it is an ordinary async program.
+//! The thread-per-core restriction in `docs/thread-per-core.md` applies to the
+//! `pulsebeam` SFU crate.
+
 pub use bytes::Bytes;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -5,7 +10,7 @@ pub use str0m;
 pub use str0m::Candidate;
 pub use str0m::IceConnectionState;
 pub use str0m::media::{MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
-pub use str0m::rtp::{ExtensionValues, SeqNo};
+pub use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use tokio::time::Instant;
 
 pub mod clock;
@@ -40,6 +45,12 @@ pub struct RtpPacket {
     pub seq: SeqNo,
     pub ts: MediaTime,
     pub marker: bool,
+    /// The RTP stream this packet arrived on. `None` before it has been on the wire.
+    ///
+    /// A slot carries one stream for the whole session and whoever the SFU puts in it, so this
+    /// does not say who is speaking - the assignment does. It says how many streams the SFU is
+    /// asking a receiver to hold open, which is the thing a browser is unforgiving about.
+    pub ssrc: Option<Ssrc>,
     pub payload: Arc<[u8]>,
     pub ext_vals: ExtensionValues,
     /// When the packet was handed over (arrival on ingress, send time on egress).
@@ -55,6 +66,15 @@ pub struct MediaFrame {
     /// Whether this frame follows the previous one with no missing packets.
     pub contiguous: bool,
     pub is_keyframe: bool,
+    /// Loudness of this audio frame, in negative dBov: 0 is full scale, -30 is ordinary speech,
+    /// and quieter is more negative. RFC 6464.
+    ///
+    /// Required for audio to be forwarded at all. The SFU selects which speakers to send using
+    /// this, and drops any audio packet that arrives without it - so an audio frame published
+    /// without a level reaches the selector and goes no further. `None` for video.
+    pub audio_level: Option<i8>,
+    /// Whether this frame contains speech rather than background. The RFC 6464 voice-activity bit.
+    pub voice_activity: Option<bool>,
     /// What the encoder says this layer will cost, if it declares one.
     ///
     /// Sent on to the SFU as a Video Layers Allocation. The distinction from the measured rate is

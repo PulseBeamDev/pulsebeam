@@ -5,13 +5,13 @@ use std::time::Duration;
 use crate::entity::TrackId;
 use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
+use crate::rtp::normalize::StreamNormalizer;
 use crate::rtp::{
     self, RtpPacket,
-    monitor::{StreamMonitor, StreamState},
+    monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
 pub use data_track::*;
-use pulsebeam_core::dd::{DependencyDescriptorReader, RawDependencyDescriptor};
 pub use pulsebeam_core::simulcast::LayerQuality;
 use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::Ssrc;
@@ -104,20 +104,18 @@ pub struct TrackMeta {
     pub origin: crate::entity::ParticipantId,
 }
 
+/// One encoding's ingest: normalize the packet, then measure it.
+///
+/// The two halves are deliberately separate objects. Normalization is the
+/// once-per-node work a future UDP ingress reuses verbatim; measurement is what
+/// the whole node shares through `StreamStats`.
 #[derive(Debug)]
 pub struct UpstreamTrackLayer {
     pub mid: Mid,
     pub rid: Option<Rid>,
     pub quality: LayerQuality,
+    normalizer: StreamNormalizer,
     pub monitor: StreamMonitor,
-    /// The Video Layers Allocation simulcast-stream index this layer is sent on,
-    /// learned from its own packets. Used to read this layer's state out of a
-    /// VLA carried on any sibling's packet.
-    vla_index: Option<u8>,
-    /// Per-RTP-stream dependency descriptor state; templates only arrive on
-    /// keyframes and are referenced by later packets.
-    dd: DependencyDescriptorReader,
-    dd_errors: u64,
 }
 
 impl PartialEq for UpstreamTrackLayer {
@@ -134,61 +132,24 @@ impl UpstreamTrackLayer {
     }
 
     pub fn process(&mut self, pkt: &mut RtpPacket) -> bool {
+        // Normalize first, measure second: only the first stage writes to the
+        // packet, and the monitor reads none of what it writes.
+        let facts = self.normalizer.normalize(pkt);
         self.monitor.process_packet(pkt);
-        // Learn which VLA simulcast-stream index this layer is sent on, so a VLA
-        // carried on any sibling's packet can address this layer's state.
-        if let Some(vla) = pkt
-            .ext_vals
-            .user_values
-            .get::<str0m::rtp::vla::VideoLayersAllocation>()
-        {
-            self.vla_index = Some(vla.current_simulcast_stream_index);
+        // A scalable keyframe teaches the structure; publish how many decode
+        // targets it offers so the allocator can reason about shedding to them.
+        if let Some(count) = facts.decode_targets {
+            self.monitor.set_decode_target_count(count);
         }
-        self.parse_dependency_descriptor(pkt);
         // audio will only be filtered at the centralized audio_selector
         true
-    }
-
-    fn parse_dependency_descriptor(&mut self, pkt: &mut RtpPacket) {
-        let Some(raw) = pkt.ext_vals.user_values.get::<RawDependencyDescriptor>() else {
-            return;
-        };
-        match self.dd.read(&raw.0) {
-            Ok(dd) => {
-                // Under SFrame/E2EE the media payload is opaque, so the H.264 IDR
-                // probe in from_str0m sees nothing. The Dependency Descriptor rides
-                // in the clear and carries the template structure on every keyframe,
-                // so it is the authoritative keyframe signal whenever present.
-                pkt.is_keyframe = dd.attached_structure.is_some();
-                pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
-                // A scalable keyframe teaches the structure; publish how many decode
-                // targets it offers so the allocator can reason about shedding to them.
-                if let Some(structure) = self.dd.structure() {
-                    self.monitor
-                        .shared_state()
-                        .set_decode_target_count(structure.decode_target_count);
-                }
-            }
-            Err(err) => {
-                self.dd_errors += 1;
-                if self.dd_errors.is_power_of_two() {
-                    tracing::warn!(
-                        mid = %self.mid,
-                        rid = ?self.rid,
-                        errors = self.dd_errors,
-                        %err,
-                        "dependency descriptor parse failed"
-                    );
-                }
-            }
-        }
     }
 
     /// Apply a (track-wide) Video Layers Allocation to this layer using its
     /// learned stream index: the sender's declared target bitrate, resolution,
     /// and active/inactive state.
     fn apply_vla(&mut self, vla: &str0m::rtp::vla::VideoLayersAllocation) {
-        let Some(idx) = self.vla_index.map(usize::from) else {
+        let Some(idx) = self.normalizer.vla_index().map(usize::from) else {
             return;
         };
         let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
@@ -200,16 +161,14 @@ impl UpstreamTrackLayer {
         let temporal = vla_stream_temporal_cumulative_kbps(vla, idx);
         let full_fps = vla_stream_framerate(vla, idx).unwrap_or(0);
         if !temporal.is_empty() {
-            self.monitor
-                .shared_state()
-                .set_temporal_ladder(&temporal, full_fps);
+            self.monitor.set_temporal_ladder(&temporal, full_fps);
         }
         if first_declaration {
             tracing::info!(
                 mid = %self.mid,
                 rid = ?self.rid,
                 target_kbps = target_bps / 1000,
-                height = self.monitor.shared_state().height(),
+                height = self.monitor.stats().height(),
                 "VLA: sender declared layer target bitrate; allocating on it"
             );
         }
@@ -292,7 +251,7 @@ pub struct UpstreamTrack {
     /// One monitor for the whole track. It owns every simulcast encoding's
     /// ingest state and all cross-encoding reasoning (VLA fan-out, sibling
     /// activity, aggregate demand), while each encoding keeps its own
-    /// `StreamState` so the downstream allocator still sees per-layer metadata.
+    /// `StreamStats` so the downstream allocator still sees per-layer metadata.
     pub monitor: TrackMonitor,
 }
 
@@ -324,11 +283,16 @@ impl UpstreamTrack {
     pub fn poll_stats(&mut self, now: Instant) {
         self.monitor.poll(now);
     }
+
+    /// This track's measurement handles, to hand along the media path.
+    pub fn layer_states(&self) -> TrackStates {
+        self.monitor.layer_states()
+    }
 }
 
 /// The whole-track monitor: every simulcast encoding of one upstream track,
 /// mashed into a single unit. Per-encoding metrics stay separated (each
-/// `UpstreamTrackLayer` owns its own `StreamState`) so the allocator keeps its
+/// `UpstreamTrackLayer` owns its own `StreamStats`) so the allocator keeps its
 /// fine-grained per-layer view, but the cross-encoding decisions — a VLA on one
 /// encoding describing all of them, whether a layer has a live sibling, the
 /// track's aggregate demand — are made here where the whole ladder is visible.
@@ -351,12 +315,12 @@ impl TrackMonitor {
     }
 
     pub fn process(&mut self, rid: Option<&Rid>, packet: &mut RtpPacket) -> bool {
-        let processed = self
-            .encodings
-            .iter_mut()
-            .find(|s| s.rid.as_ref() == rid)
-            .expect("expected sender to always be available")
-            .process(packet);
+        // An unknown rid is a publisher sending an encoding it never declared;
+        // drop the packet rather than the process.
+        let Some(encoding) = self.encodings.iter_mut().find(|s| s.rid.as_ref() == rid) else {
+            return false;
+        };
+        let processed = encoding.process(packet);
 
         // A VLA on any encoding's packet describes every simulcast stream; push
         // it to every encoding whose stream index we've already learned. This is
@@ -378,34 +342,33 @@ impl TrackMonitor {
         self.encodings.iter_mut().find(|s| s.rid == *rid)
     }
 
+    pub fn layer_states(&self) -> TrackStates {
+        self.encodings
+            .iter()
+            .map(|e| (e.rid, e.monitor.stats()))
+            .collect()
+    }
+
     pub fn poll(&mut self, now: Instant) {
-        let active_encodings = self.active_encoding_count();
+        // Derive the sibling gate from packet arrivals, never from the encodings'
+        // published `inactive` flags: those flags are what this loop writes, so
+        // reading them back closes a feedback loop. It previously oscillated —
+        // with every encoding silent, all of them paused on one tick, which made
+        // the count zero, which read as "no sibling active" and un-paused them
+        // all on the next, at the poll rate for the whole 1s..3s window between
+        // the pause and dead timeouts.
+        let recent = self
+            .encodings
+            .iter()
+            .filter(|e| e.monitor.has_recent_packets(now))
+            .count();
+        debug_assert!(recent <= self.encodings.len());
 
-        for encoding in self.encodings.iter_mut() {
-            let is_current_active = !encoding.monitor.shared_state().is_inactive();
-            let is_any_sibling_active = if is_current_active {
-                active_encodings > 1
-            } else {
-                active_encodings > 0
-            };
-
+        for encoding in &mut self.encodings {
+            let self_recent = encoding.monitor.has_recent_packets(now);
+            let is_any_sibling_active = recent.saturating_sub(usize::from(self_recent)) > 0;
             encoding.poll_stats(now, is_any_sibling_active);
         }
-    }
-
-    /// How many of the track's encodings are currently sending.
-    pub fn active_encoding_count(&self) -> usize {
-        self.encodings
-            .iter()
-            .filter(|s| !s.monitor.shared_state().is_inactive())
-            .count()
-    }
-
-    /// Whether any encoding of this track is currently sending.
-    pub fn any_active(&self) -> bool {
-        self.encodings
-            .iter()
-            .any(|s| !s.monitor.shared_state().is_inactive())
     }
 
     /// Aggregate slow-decay demand across every active encoding — the whole
@@ -414,8 +377,8 @@ impl TrackMonitor {
     pub fn aggregate_stable_bitrate_bps(&self) -> f64 {
         self.encodings
             .iter()
-            .filter(|s| !s.monitor.shared_state().is_inactive())
-            .map(|s| s.monitor.shared_state().stable_bitrate_bps())
+            .filter(|s| !s.monitor.stats().is_inactive())
+            .map(|s| s.monitor.stats().stable_bitrate_bps())
             .sum()
     }
 }
@@ -424,6 +387,12 @@ impl TrackMonitor {
 pub struct Track {
     pub meta: TrackMeta,
     pub layers: Vec<TrackLayer>,
+    /// Where subscribing shards send everything that flows back toward this
+    /// track's publisher — keyframe requests today, NACKs later. Stamped by the
+    /// publisher's shard when it publishes, then carried to every other shard
+    /// by the control plane: the compiled reverse plan, so the data plane never
+    /// has to name the track to ask for anything.
+    pub reverse: Option<crate::route::ReverseRoute>,
 }
 
 impl Track {
@@ -431,17 +400,19 @@ impl Track {
         self.layers
             .iter()
             .min_by_key(|l| l.quality)
-            .expect("at least one layer")
+            .unwrap_or_else(|| {
+                pulsebeam_runtime::fatal!("track {} was published with no layers", self.meta.id)
+            })
     }
 
     /// Lowest layer that is currently healthy, falling back to the absolute
     /// lowest when no layer is healthy yet. Prefer this over `lowest_quality`
     /// when staging an initial layer so the slot can actually receive a keyframe
     /// (an inactive layer never produces packets and the slot would stall).
-    pub fn lowest_healthy_quality(&self) -> &TrackLayer {
+    pub fn lowest_healthy_quality(&self, is_healthy: impl Fn(&TrackLayer) -> bool) -> &TrackLayer {
         self.layers
             .iter()
-            .filter(|l| l.state.is_healthy())
+            .filter(|l| is_healthy(l))
             .min_by_key(|l| l.quality)
             .unwrap_or_else(|| self.lowest_quality())
     }
@@ -465,14 +436,21 @@ impl Track {
     }
 }
 
+/// A track's shape as it crosses a shard or the control plane: no measurement
+/// handles, so the controller never holds media-path state. Consumers get the
+/// measurements separately, keyed by [`StreamId`].
 #[derive(Clone, Debug)]
 pub struct TrackLayer {
     pub meta: TrackMeta,
     pub rid: Option<Rid>,
     pub quality: LayerQuality,
-    // pub keyframe_requester: KeyframeRequester,
-    pub state: StreamState,
 }
+
+/// The per-encoding measurement handles for one track.
+///
+/// Travels the media path only — participant to its shard, then shard to shard
+/// — never through the controller.
+pub type TrackStates = Vec<(Option<Rid>, StreamStats)>;
 
 impl Eq for TrackLayer {}
 
@@ -506,9 +484,9 @@ impl Display for TrackLayer {
 pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
     debug_assert_eq!(meta.id.kind(), TrackKind::Audio);
     let bitrate = 64_000;
-    let stream_state = StreamState::new(true, bitrate);
+    let stream_state = StreamStats::new(true, bitrate, 0);
     let stream_id = format!("{}:_", meta.id);
-    let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());
+    let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state);
 
     let sender = UpstreamTrack {
         meta: meta.clone(),
@@ -517,10 +495,8 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             mid,
             rid: None,
             quality: LayerQuality::Low,
+            normalizer: StreamNormalizer::new(mid, None),
             monitor,
-            vla_index: None,
-            dd: DependencyDescriptorReader::new(),
-            dd_errors: 0,
         }]),
     };
     (
@@ -528,6 +504,7 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
         Track {
             meta,
             layers: Vec::with_capacity(MAX_SIMULCAST_LAYERS),
+            reverse: None,
         },
     )
 }
@@ -565,24 +542,21 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
         let quality = LayerQuality::from_rid(rid.as_deref());
         let bitrate = quality.seed_bitrate_bps();
         let fallback_height = quality.fallback_height();
-        let stream_state = StreamState::new_with_height(true, bitrate, fallback_height);
+        let stream_state = StreamStats::new(true, bitrate, fallback_height);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
-        let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());
+        let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state);
 
         senders.push(UpstreamTrackLayer {
             mid,
             rid,
             quality,
+            normalizer: StreamNormalizer::new(mid, rid),
             monitor,
-            vla_index: None,
-            dd: DependencyDescriptorReader::new(),
-            dd_errors: 0,
         });
         layers.push(TrackLayer {
             meta: meta.clone(),
             rid,
             quality,
-            state: stream_state,
         });
     }
     senders.sort_by_key(|e| std::cmp::Reverse(e.quality));
@@ -592,6 +566,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     let track = Track {
         meta: meta.clone(),
         layers,
+        reverse: None,
     };
 
     (
@@ -606,6 +581,8 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
 
 #[cfg(test)]
 pub mod test_utils {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
 
     pub fn make_video_track(
@@ -659,7 +636,27 @@ mod data_track {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    /// A data-channel topic name.
+    ///
+    /// An owned `String`, deliberately. `Arc<str>` would make the two clones
+    /// per cross-shard data frame refcount bumps instead of allocations, but a
+    /// topic travels between shards on the control plane, so those bumps would
+    /// land on a count another core holds — trading a core-local malloc for
+    /// cross-core traffic, which is the wrong direction.
+    ///
+    /// The clones are not inherent: they exist only to build lookup keys, and a
+    /// dense key in `RouteAction::Data` removes them the way `LocalTrackKey`
+    /// did for video. Fix the cause, not the symptom.
     pub struct Topic(String);
+
+    impl Topic {
+        /// Production builds a `Topic` only by parsing a channel label; tests
+        /// need one without going through the label grammar.
+        #[cfg(test)]
+        pub fn for_test(topic: &str) -> Self {
+            Self(topic.to_string())
+        }
+    }
 
     impl AsRef<str> for Topic {
         #[inline]
@@ -850,8 +847,9 @@ mod data_track {
                         (_, DataTrackDirection::Publish, Some(_)) => {
                             return Err(DataTrackIntentError::ScopeNotAllowedForPublish);
                         }
-                        (_, DataTrackDirection::Publish, None) => None,
-                        (_, DataTrackDirection::Subscribe, None) => None,
+                        (_, DataTrackDirection::Publish | DataTrackDirection::Subscribe, None) => {
+                            None
+                        }
                         (DataLane::Reliable, DataTrackDirection::Subscribe, Some(_)) => {
                             return Err(DataTrackIntentError::ScopeNotAllowedForReliableSubscribe);
                         }
@@ -882,6 +880,10 @@ mod data_track {
 
     #[cfg(test)]
     mod test {
+        // Convenience only: a test is not a shard, so nothing here is
+        // cross-core, and a fixture may read the host clock. Allowed at the
+        // module, never the file, so it cannot drift over production code
+        // sharing it. See docs/thread-per-core.md.
         use std::ops::Deref;
 
         use super::*;
@@ -1111,21 +1113,21 @@ mod data_track {
 
 #[cfg(test)]
 mod dd_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use pulsebeam_core::dd::{
         DependencyDescriptor, DependencyDescriptorWriter, MAX_DD_LEN, test_utils,
     };
 
     fn layer() -> UpstreamTrackLayer {
-        let state = StreamState::new_with_height(true, 500_000, 360);
+        let state = StreamStats::new(true, 500_000, 360);
         UpstreamTrackLayer {
             mid: Mid::from("0"),
             rid: None,
             quality: LayerQuality::High,
+            normalizer: StreamNormalizer::new(Mid::from("0"), None),
             monitor: StreamMonitor::new(TrackKind::Video, "test".to_string(), state),
-            vla_index: None,
-            dd: DependencyDescriptorReader::new(),
-            dd_errors: 0,
         }
     }
 
@@ -1133,7 +1135,9 @@ mod dd_tests {
         let mut pkt = RtpPacket::default();
         pkt.ext_vals
             .user_values
-            .set(RawDependencyDescriptor(bytes.iter().copied().collect()));
+            .set(pulsebeam_core::dd::RawDependencyDescriptor(
+                bytes.iter().copied().collect(),
+            ));
         pkt
     }
 
@@ -1165,7 +1169,7 @@ mod dd_tests {
 
         let got = pkt.ext_vals.user_values.get::<DependencyDescriptor>();
         assert_eq!(got, Some(&sent));
-        assert_eq!(layer.dd_errors, 0);
+        assert_eq!(layer.normalizer.dd_errors(), 0);
     }
 
     #[test]
@@ -1175,7 +1179,7 @@ mod dd_tests {
         let mut buf = [0u8; MAX_DD_LEN];
         let mut layer = layer();
         assert_eq!(
-            layer.monitor.shared_state().decode_target_count(),
+            layer.monitor.stats().decode_target_count(),
             1,
             "no structure seen yet, so the encoding is one indivisible rung"
         );
@@ -1187,7 +1191,7 @@ mod dd_tests {
         layer.process(&mut pkt);
 
         assert_eq!(
-            layer.monitor.shared_state().decode_target_count(),
+            layer.monitor.stats().decode_target_count(),
             structure.decode_target_count,
             "the scalable keyframe's decode-target count is published for the allocator"
         );
@@ -1241,7 +1245,7 @@ mod dd_tests {
                 .get::<DependencyDescriptor>()
                 .is_none()
         );
-        assert_eq!(layer.dd_errors, 1);
+        assert_eq!(layer.normalizer.dd_errors(), 1);
     }
 
     #[test]
@@ -1250,12 +1254,14 @@ mod dd_tests {
         let mut pkt = RtpPacket::default();
 
         assert!(layer.process(&mut pkt));
-        assert_eq!(layer.dd_errors, 0);
+        assert_eq!(layer.normalizer.dd_errors(), 0);
     }
 }
 
 #[cfg(test)]
 mod vla_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::vla_stream_target_bps;
     use str0m::rtp::vla::{
         SimulcastStreamAllocation, SpatialLayerAllocation, TemporalLayerAllocation,
@@ -1287,11 +1293,14 @@ mod vla_tests {
     #[test]
     fn temporal_ladder_and_framerate_flow_into_stream_state() {
         use super::{vla_stream_framerate, vla_stream_temporal_cumulative_kbps};
-        use crate::rtp::monitor::StreamState;
+        use crate::rtp::monitor::StreamStats;
         use str0m::rtp::vla::ResolutionAndFramerate;
 
         let mut s = stream(&[300, 450, 600]);
-        s.spatial_layers[0].resolution_and_framerate = Some(ResolutionAndFramerate {
+        s.spatial_layers
+            .first_mut()
+            .expect("fixture has a spatial layer")
+            .resolution_and_framerate = Some(ResolutionAndFramerate {
             width: 1280,
             height: 720,
             framerate: 30,
@@ -1307,7 +1316,7 @@ mod vla_tests {
         );
         assert_eq!(vla_stream_framerate(&vla, 0), Some(30));
 
-        let state = StreamState::new_with_height(false, 0, 720);
+        let mut state = StreamStats::new(false, 0, 720);
         state.set_temporal_ladder(&vla_stream_temporal_cumulative_kbps(&vla, 0), 30);
         assert_eq!(state.decode_target_bps(0), 300_000);
         assert_eq!(state.decode_target_bps(1), 450_000);
@@ -1349,5 +1358,120 @@ mod vla_tests {
         assert_eq!(super::vla_stream_height_px(&vla, 0), Some(360));
         // Stream 1 carries no resolution → fall back to the height guess.
         assert_eq!(super::vla_stream_height_px(&vla, 1), None);
+    }
+}
+
+#[cfg(test)]
+mod simulcast_pause_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    use super::*;
+    use crate::entity::ParticipantId;
+    use crate::rtp::RtpPacket;
+    use std::time::Duration;
+    use str0m::media::SimulcastLayer;
+
+    /// A three-encoding video track and a starting instant.
+    fn track() -> (UpstreamTrack, Instant) {
+        let now = Instant::now();
+        let participant = ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(7));
+        let (upstream, _) = test_utils::make_video_track(
+            participant,
+            Mid::from("v"),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        (upstream, now)
+    }
+
+    fn feed(upstream: &mut UpstreamTrack, rid: &str, at: Instant) {
+        let mut pkt = RtpPacket {
+            arrival_ts: at,
+            ..Default::default()
+        };
+        upstream.monitor.process(Some(&Rid::from(rid)), &mut pkt);
+    }
+
+    fn inactive(upstream: &UpstreamTrack) -> Vec<bool> {
+        upstream
+            .monitor
+            .layer_states()
+            .iter()
+            .map(|(_, s)| s.is_inactive())
+            .collect()
+    }
+
+    /// The whole track going silent must settle, not oscillate.
+    ///
+    /// The sibling gate used to read the very `inactive` flags that `poll`
+    /// writes: all encodings silent paused them together, which then read back
+    /// as "no sibling active" and un-paused them all on the next tick. That ran
+    /// at the poll rate for the entire window between the pause and dead
+    /// timeouts, flapping every subscriber's allocation with it.
+    #[test]
+    fn an_entirely_silent_track_does_not_flap_its_encodings() {
+        let (mut upstream, start) = track();
+        for rid in ["q", "h", "f"] {
+            feed(&mut upstream, rid, start);
+        }
+
+        // Poll across the whole pause..dead window, and past it, at a realistic tick.
+        let mut transitions = 0usize;
+        let mut previous = inactive(&upstream);
+        for tick in 1..=40u32 {
+            let now = start + Duration::from_millis(100) * tick;
+            upstream.poll_stats(now);
+            let current = inactive(&upstream);
+            transitions += previous
+                .iter()
+                .zip(&current)
+                .filter(|(a, b)| a != b)
+                .count();
+            previous = current;
+        }
+
+        assert!(
+            transitions <= 3,
+            "a silent track must settle into inactive once per encoding, saw {transitions} \
+             active/inactive transitions across 3 encodings"
+        );
+        assert!(
+            inactive(&upstream).iter().all(|&i| i),
+            "every encoding of a silent track must end up inactive"
+        );
+    }
+
+    /// The gate still does its real job: a layer the sender dropped while other
+    /// encodings keep sending is paused promptly, without waiting out the much
+    /// longer dead timeout.
+    #[test]
+    fn a_layer_dropped_while_siblings_send_is_paused() {
+        let (mut upstream, start) = track();
+        for rid in ["q", "h", "f"] {
+            feed(&mut upstream, rid, start);
+        }
+
+        // "f" goes quiet; "q" and "h" keep sending past the pause timeout.
+        for tick in 1..=25u32 {
+            let now = start + Duration::from_millis(100) * tick;
+            feed(&mut upstream, "q", now);
+            feed(&mut upstream, "h", now);
+            upstream.poll_stats(now);
+        }
+
+        let states = upstream.monitor.layer_states();
+        let state_of = |rid: &str| {
+            states
+                .iter()
+                .find(|(r, _)| r.as_deref() == Some(rid))
+                .map(|(_, s)| s.is_inactive())
+                .unwrap()
+        };
+        assert!(state_of("f"), "the dropped layer must be paused");
+        assert!(!state_of("q"), "a sending layer must stay active");
+        assert!(!state_of("h"), "a sending layer must stay active");
     }
 }

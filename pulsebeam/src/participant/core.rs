@@ -50,10 +50,6 @@ impl TrackAvailability {
     fn unpublished() -> Self {
         Self { in_topology: false }
     }
-
-    fn published() -> Self {
-        Self { in_topology: true }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -286,6 +282,11 @@ impl ParticipantCore {
     }
 
     #[inline]
+    /// A track's latest measurements, pushed by the shard when they change.
+    pub fn update_layer_states(&mut self, track_id: TrackId, states: &crate::track::TrackStates) {
+        self.downstream.update_layer_states(track_id, states);
+    }
+
     pub fn on_forward_rtp(
         &mut self,
         track_id: TrackId,
@@ -312,10 +313,14 @@ impl ParticipantCore {
     pub fn on_forward_audio_rtp(
         &mut self,
         slot_idx: crate::id::AudioSelectorSlotId,
+        origin: crate::entity::AudioOrigin,
         pkt: &RtpPacket,
     ) {
         self.downstream
-            .on_forward_audio_rtp(slot_idx, pkt, &mut self.stream_writer);
+            .on_forward_audio_rtp(slot_idx, origin, pkt, &mut self.stream_writer);
+        if self.downstream.take_audio_speakers_changed() {
+            self.signaling.mark_assignments_dirty();
+        }
     }
 
     #[inline]
@@ -438,12 +443,25 @@ impl ParticipantCore {
         });
     }
 
+    /// Hand the shard any measurement that has moved.
+    ///
+    /// On the fast path as well as the slow poll, because `process_packet`
+    /// flips activity and health per packet and the allocator acts on those.
+    fn publish_changed_stats(&mut self, events: &mut impl ParticipantSink) {
+        for (track_id, states) in self.upstream.take_changed_stats() {
+            events.publish_track_stats(track_id, states);
+        }
+    }
+
     fn poll_slow(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        // Measure before allocating: the monitors produce this tick's numbers,
+        // and running the allocator first would decide against last tick's.
+        self.upstream.poll_slow(now);
+        self.publish_changed_stats(events);
         let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         if assignments_changed {
             self.signaling.mark_assignments_dirty();
         }
-        self.upstream.poll_slow(now);
     }
 
     /// Converts one routed item into zero or more deferred `Rtc` mutations.
@@ -516,7 +534,7 @@ impl ParticipantCore {
             } => {
                 if let Some(cid) = self.reliable_channels.subscriber_channel(&topic) {
                     let delivery = RelDelivery {
-                        publisher_id: origin.as_str().to_string(),
+                        publisher_id: origin.as_str(),
                         frame,
                     };
                     self.write_to_data_channel(cid, &topic, &delivery.encode_to_vec());
@@ -601,7 +619,7 @@ impl ParticipantCore {
             // build carrying real media keeps serving: one malformed stream is
             // not worth taking the node down for.
             #[cfg(feature = "sim")]
-            panic!("egress stream invariant violated: {violation}");
+            pulsebeam_runtime::fatal!("egress stream invariant violated: {violation}");
         }
         if nackable {
             plog_trace!(
@@ -636,7 +654,7 @@ impl ParticipantCore {
         let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
-            pkt.rtp_ts.numer() as u32,
+            u32::try_from(pkt.rtp_ts.numer() & u64::from(u32::MAX)).unwrap_or(0),
             now.into(),
             pkt.payload,
         )
@@ -663,7 +681,7 @@ impl ParticipantCore {
         #[cfg(feature = "sim")]
         let _sim_guard = sim_span.enter();
 
-        let mut budget = 3;
+        let mut budget = 3usize;
         'drain: loop {
             if self.rtc_needs_drain {
                 let Some(rtc_deadline) = self.poll_rtc(now, events) else {
@@ -691,7 +709,9 @@ impl ParticipantCore {
                 continue;
             }
 
-            if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
+            self.publish_changed_stats(events);
+
+            if now.saturating_duration_since(self.last_slow_poll) >= SLOW_POLL_INTERVAL {
                 self.poll_slow(now, events);
                 self.last_slow_poll = now;
                 self.rtc_needs_drain = true;
@@ -751,16 +771,21 @@ impl ParticipantCore {
                 continue;
             }
 
-            let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
+            let next_slow_poll = self
+                .last_slow_poll
+                .checked_add(SLOW_POLL_INTERVAL)
+                .unwrap_or(self.last_slow_poll);
+            // A drained Rtc always reports one; falling back to the slow poll
+            // costs a tick of latency rather than the process.
             let deadline = self
                 .rtc_deadline
-                .expect("drained RTC must have a deadline")
+                .unwrap_or(next_slow_poll)
                 .min(next_slow_poll);
 
             // upper bounded to 3 ticks to defensively avoid spin loops from bugs or just to give fairness
             // to other participants
             if deadline <= now && budget > 0 {
-                budget -= 1;
+                budget = budget.saturating_sub(1);
                 let _ = self.rtc.handle_input(Input::Timeout(now.into()));
                 self.rtc_needs_drain = true;
                 continue;
@@ -861,7 +886,7 @@ impl ParticipantCore {
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                self.downstream.update_bitrate(now, available)
+                self.downstream.update_bitrate(now, available);
             }
             Event::MediaEgressStats(stats) => {
                 if let Some(remote) = stats.remote {
@@ -1052,7 +1077,8 @@ impl ParticipantCore {
             }
 
             if let Some(track) = self.published_tracks.get(&track_id) {
-                events.publish_track(track.clone());
+                let states = self.upstream.layer_states_for(track_id);
+                events.publish_track(track.clone(), states);
                 state.in_topology = true;
             }
             return;

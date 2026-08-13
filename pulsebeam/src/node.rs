@@ -1,3 +1,6 @@
+//! Shared-state exception: `Arc<ShardMetrics>`, one per shard, handed over
+//! before any shard runs. See `shard::metrics`.
+
 use anyhow::{Context, Result};
 use core_affinity::get_core_ids;
 use pulsebeam_core::net::TcpListener;
@@ -15,7 +18,6 @@ use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
 use str0m::Candidate;
-use tokio::runtime::LocalOptions;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
@@ -27,7 +29,7 @@ use crate::control::controller::ControllerActor;
 use crate::id::ShardId;
 use crate::shard::ShardContext;
 use crate::shard::metrics::ShardMetrics;
-use crate::shard::worker::{ShardCommand, ShardWorker};
+use crate::shard::worker::ShardWorker;
 
 /// Defines how a service listener is acquired.
 enum ListenerSource {
@@ -88,6 +90,13 @@ pub struct NodeBuilder {
     /// to use the TCP path.  Used in simulation tests that exercise TCP-only
     /// connectivity.
     tcp_only: bool,
+
+    /// How many participants of one room share a shard before the next join
+    /// spills to another.
+    room_shard_slot: usize,
+
+    /// How a spilled room chooses its next shard.
+    room_placement: crate::control::core::RoomPlacement,
 }
 
 impl Default for NodeBuilder {
@@ -108,7 +117,34 @@ impl NodeBuilder {
             internal_metrics: None,
             worker_execution: WorkerExecution::ThreadPerWorker,
             tcp_only: false,
+            room_shard_slot: crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
+            room_placement: crate::control::core::RoomPlacement::Hashed,
         }
+    }
+
+    /// Place a room's slots round-robin instead of by hash.
+    ///
+    /// For simulations that must actually cross a shard boundary: hashing picks
+    /// independently per slot, so a small room lands co-located often enough
+    /// that a plan depending on the split would pass without ever running the
+    /// path it claims to cover.
+    pub fn round_robin_rooms(mut self) -> Self {
+        self.room_placement = crate::control::core::RoomPlacement::RoundRobin;
+        self
+    }
+
+    /// Spill a room onto another shard after this many participants.
+    ///
+    /// Lowering it is how a test reaches the cross-shard media path without
+    /// needing a room large enough to spill naturally: below the threshold a
+    /// room is co-located and its fanout never leaves one core.
+    pub fn room_shard_slot(mut self, participants: usize) -> Self {
+        assert!(
+            participants > 0,
+            "a shard slot must hold at least one participant"
+        );
+        self.room_shard_slot = participants;
+        self
     }
 
     /// Set the number of UDP workers (default: 1).
@@ -296,21 +332,27 @@ impl NodeBuilder {
                         .host(addr)
                         .tcptype(str0m::net::TcpType::Passive)
                         .build()
-                        .expect("a TCP passive host candidate"),
+                        .unwrap_or_else(|err| {
+                            pulsebeam_runtime::fatal!(
+                                "cannot advertise a TCP candidate for {addr}: {err}"
+                            )
+                        }),
                 );
             }
         }
 
-        let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
-        let mut shard_handles = Vec::new();
-        let mut cross_shard_event_txs = Vec::new();
-        let mut cross_shard_event_rxs = Vec::new();
+        let (shard_event_tx, shard_event_rx) =
+            mailbox::new(crate::shard::worker::SHARD_EVENT_CAPACITY);
+        // Stays empty under `sim`, where every shard shares one runtime.
+        #[cfg_attr(feature = "sim", allow(unused_mut))]
+        let mut shard_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let mut frame_txs = Vec::new();
+        let mut frame_rxs = Vec::new();
         let use_shared_runtime = matches!(self.worker_execution, WorkerExecution::SharedRuntime);
         for _ in 0..udp_sockets.len() {
-            // TODO: should cross shard channel capacities this big?
-            let (tx, rx) = mailbox::new(1024);
-            cross_shard_event_txs.push(tx);
-            cross_shard_event_rxs.push(rx);
+            let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_FRAME_CAPACITY);
+            frame_txs.push(tx);
+            frame_rxs.push(rx);
         }
 
         let mut rng = self.rng.ok_or_else(|| {
@@ -330,17 +372,18 @@ impl NodeBuilder {
 
         let mut shard_contexts = Vec::new();
 
-        for (shard_idx, (((udp_sock, tcp_sock), cross_shard_event_rx), shard_rng)) in udp_sockets
+        for (shard_idx, (((udp_sock, tcp_sock), frame_rx), shard_rng)) in udp_sockets
             .into_iter()
             .zip(tcp_sockets.into_iter())
-            .zip(cross_shard_event_rxs)
+            .zip(frame_rxs)
             .zip(shard_rngs)
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
-            let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
+            let (shard_command_tx, shard_command_rx) =
+                mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
             let shard_event_tx = shard_event_tx.clone();
-            let cross_shard_event_txs = cross_shard_event_txs.clone();
+            let frame_txs = frame_txs.clone();
             let occupancy = Arc::new(ShardMetrics::new());
             let shard_occupancy = Arc::new(ShardMetrics::new());
 
@@ -351,48 +394,73 @@ impl NodeBuilder {
                     tcp_sock,
                     shard_command_rx,
                     shard_event_tx,
-                    cross_shard_event_rx,
-                    cross_shard_event_txs,
+                    frame_rx,
+                    frame_txs,
                     shard_occupancy,
                     shard_rng,
                     wall_anchor,
                 );
                 join_set.spawn_local(ignore(shard.run()));
             } else {
-                let core_id = if cpu_cores.is_empty() {
-                    None
-                } else {
-                    cpu_cores.get(shard_idx % cpu_cores.len()).copied()
-                };
-                let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
-                let handle = builder
-                    .spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .enable_alt_timer()
-                            .build_local(LocalOptions::default())
-                            .unwrap();
-                        tune_current_data_thread(core_id);
-                        rt.block_on(async move {
-                            let udp_sock =
-                                udp_sock.into_unified_socket().expect("bound UDP socket");
-                            let shard = ShardWorker::new(
-                                shard_id,
-                                udp_sock,
-                                tcp_sock,
-                                shard_command_rx,
-                                shard_event_tx,
-                                cross_shard_event_rx,
-                                cross_shard_event_txs,
-                                shard_occupancy,
-                                shard_rng,
-                                wall_anchor,
-                            );
-                            tokio::task::unconstrained(shard.run()).await;
+                // A simulated socket is a member of a thread-local
+                // `SO_REUSEPORT` group and deliberately not `Send`: the group
+                // that decides which member a datagram belongs to lives on the
+                // host's thread. Simulations always take the branch above.
+                #[cfg(feature = "sim")]
+                pulsebeam_runtime::fatal!("a simulated node runs its shards on one runtime");
+
+                #[cfg(not(feature = "sim"))]
+                {
+                    let core_id = if cpu_cores.is_empty() {
+                        None
+                    } else {
+                        shard_idx
+                            .checked_rem(cpu_cores.len())
+                            .and_then(|i| cpu_cores.get(i))
+                            .copied()
+                    };
+                    let builder = std::thread::Builder::new().name(format!("pb-w-{shard_id}"));
+                    let handle = builder
+                        .spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .enable_alt_timer()
+                                .build_local(tokio::runtime::LocalOptions::default())
+                                .unwrap_or_else(|err| {
+                                    pulsebeam_runtime::fatal!(
+                                        "shard {shard_id} cannot build its runtime: {err}"
+                                    )
+                                });
+                            tune_current_data_thread(core_id);
+                            rt.block_on(async move {
+                                let udp_sock = match udp_sock.into_unified_socket() {
+                                    Ok(sock) => sock,
+                                    Err(err) => pulsebeam_runtime::fatal!(
+                                        "shard {shard_id} cannot use its bound UDP socket: {err}"
+                                    ),
+                                };
+                                let shard = ShardWorker::new(
+                                    shard_id,
+                                    udp_sock,
+                                    tcp_sock,
+                                    shard_command_rx,
+                                    shard_event_tx,
+                                    frame_rx,
+                                    frame_txs,
+                                    shard_occupancy,
+                                    shard_rng,
+                                    wall_anchor,
+                                );
+                                tokio::task::unconstrained(shard.run()).await;
+                            });
+                        })
+                        .unwrap_or_else(|err| {
+                            pulsebeam_runtime::fatal!(
+                                "cannot spawn the thread for shard {shard_id}: {err}"
+                            )
                         });
-                    })
-                    .unwrap();
-                shard_handles.push(handle);
+                    shard_handles.push(handle);
+                }
             }
 
             shard_contexts.push(ShardContext {
@@ -407,8 +475,14 @@ impl NodeBuilder {
             tune_current_control_thread();
         }
 
-        let controller =
-            ControllerActor::new(controller_rng, shard_contexts, candidates, tcp_listener);
+        let controller = ControllerActor::with_placement(
+            controller_rng,
+            shard_contexts,
+            candidates,
+            tcp_listener,
+            self.room_shard_slot,
+            self.room_placement,
+        );
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);
@@ -494,8 +568,6 @@ impl NodeBuilder {
 
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
-
-    shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
 }
 
 async fn bind_udp_sockets(
@@ -513,10 +585,13 @@ async fn bind_udp_sockets(
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
             }
             Err(e) => {
+                // Shedding workers here is not a capacity trade-off: a
+                // single-shard node never executes a cross-shard path at all.
                 tracing::warn!(
-                    "SO_REUSEPORT not supported or failed after first bind, proceeding with {} workers: {}",
-                    sockets.len(),
-                    e
+                    requested = workers,
+                    running = sockets.len(),
+                    "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
+                     workers than requested: {e}"
                 );
                 break;
             }
@@ -550,7 +625,9 @@ fn sockets_to_candidates(
             .udp()
             .host(addr)
             .build()
-            .expect("a UDP host candidate");
+            .unwrap_or_else(|err| {
+                pulsebeam_runtime::fatal!("cannot advertise a UDP candidate for {addr}: {err}")
+            });
         candidates.push(candidate);
     }
 
@@ -695,7 +772,7 @@ mod internal {
                     Matcher::Suffix("_delay_us".to_string()),
                     &create_exponential_buckets(1.0, 4.0, 6), // 1us -> 4ms,
                 )
-                .expect("invalid bucket config")
+                .context("metrics bucket configuration is invalid")?
                 .install_recorder()?;
 
             Ok(Self {
@@ -705,8 +782,6 @@ mod internal {
         }
 
         pub async fn serve_internal_http(self, shutdown: CancellationToken) -> Result<()> {
-            let addr = self.listener.local_addr().ok();
-
             const INDEX_HTML: &str = r#"
 <ul>
   <li><a href="/healthz">Healthcheck</a></li>
@@ -729,7 +804,10 @@ mod internal {
             };
             let rt_monitor_join = tokio::spawn(rt_background_monitor(self.prometheus));
 
-            tracing::info!("internal metrics listening on {:?}", addr);
+            tracing::info!(
+                "internal metrics listening on {:?}",
+                self.listener.local_addr().ok()
+            );
 
             tokio::select! {
                 res = axum::serve(self.listener, router) => {

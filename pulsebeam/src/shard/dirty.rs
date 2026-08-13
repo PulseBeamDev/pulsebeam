@@ -34,7 +34,10 @@ impl DirtyTracker {
             return;
         }
         debug_assert!(
-            !self.participants[self.cursor..]
+            !self
+                .participants
+                .get(self.cursor..)
+                .unwrap_or_default()
                 .iter()
                 .any(|entry| entry.handle == handle)
         );
@@ -55,7 +58,7 @@ impl DirtyTracker {
         #[cfg(debug_assertions)]
         debug_assert!(self.active);
         let entry = self.participants.get(self.cursor).copied()?;
-        self.cursor += 1;
+        self.cursor = self.cursor.saturating_add(1);
         Some(entry)
     }
 
@@ -76,7 +79,9 @@ impl DirtyTracker {
 
     #[cfg(test)]
     pub fn contains(&self, id: &ParticipantId) -> bool {
-        self.participants[self.cursor..]
+        self.participants
+            .get(self.cursor..)
+            .unwrap_or_default()
             .iter()
             .any(|entry| entry.handle.participant_id() == *id)
     }
@@ -84,6 +89,8 @@ impl DirtyTracker {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
 
     fn id(value: u8) -> ParticipantId {

@@ -71,7 +71,7 @@ impl Forwarder {
         // track cache routes it to the right per-encoding ring.
         let mut pkt = pkt.clone();
         pkt.ext_vals.rid = sid.1;
-        self.cache.push(&pkt);
+        self.cache.push(pkt);
 
         let Forwarder {
             switcher,
@@ -283,9 +283,9 @@ fn cache_segments_on_frames_not_arrival_time() {
 
     let kf = b.keyframe_with_slices(3, 2);
     for p in &kf {
-        cache.push(p);
+        cache.push(p.clone());
     }
-    let last = kf.last().unwrap();
+    let _last = kf.last().unwrap();
     let replay = cache
         .replay()
         .expect("a complete keyframe must be replayable");
@@ -394,7 +394,9 @@ fn repeated_switching_does_not_drift_the_output_clock() {
     let wall_elapsed = last
         .playout_time
         .saturating_duration_since(first.playout_time);
-    let wall_ticks = (wall_elapsed.as_secs_f64() * rtp::VIDEO_FREQUENCY.get() as f64) as u64;
+    let wall_ticks = crate::bitrate::saturating_bps(
+        wall_elapsed.as_secs_f64() * f64::from(rtp::VIDEO_FREQUENCY.get()),
+    );
 
     let skew_ticks = ts_elapsed.abs_diff(wall_ticks);
     let skew_ms = skew_ticks as f64 / 90.0;
@@ -521,7 +523,7 @@ fn switching_mid_gop_does_not_walk_the_output_clock_away_from_real_time() {
     // the resulting PLI.
     const SWITCHES: usize = 25;
     for round in 0..SWITCHES {
-        let target = (round % 2) as LayerId;
+        let target = LayerId::try_from(round % 2).expect("layer index fits");
 
         // A few frames into the GOP, the allocator decides to move.
         for _ in 0..4 {
@@ -568,7 +570,8 @@ fn switching_mid_gop_does_not_walk_the_output_clock_away_from_real_time() {
     let wall = last
         .playout_time
         .saturating_duration_since(first.playout_time);
-    let wall_ticks = (wall.as_secs_f64() * rtp::VIDEO_FREQUENCY.get() as f64) as u64;
+    let wall_ticks =
+        crate::bitrate::saturating_bps(wall.as_secs_f64() * f64::from(rtp::VIDEO_FREQUENCY.get()));
     let skew_ms = ts_elapsed.abs_diff(wall_ticks) as f64 / 90.0;
 
     assert!(
@@ -678,14 +681,13 @@ fn a_reordered_marker_does_not_look_like_a_frame_boundary() {
     assert!(fwd.switched());
     assert_decodable(fwd.emitted(), "switch after a reordered marker");
 
-    let forwarded: Vec<_> = fwd
+    let forwarded = fwd
         .emitted()
         .iter()
         .filter(|p| p.rtp_ts.numer() == frame_ts)
-        .collect();
+        .count();
     assert_eq!(
-        forwarded.len(),
-        3,
+        forwarded, 3,
         "the switch must wait for the in-flight packet rather than abandon it"
     );
     assert_eq!(
@@ -717,7 +719,7 @@ fn run_switch_workload(seed: u64, switches: usize, gap_frames: usize) -> Forward
             fwd.ingest_all(1, &f);
         }
 
-        let target = (round % 2) as LayerId;
+        let target = LayerId::try_from(round % 2).expect("layer index fits");
         fwd.switch_to(target);
         let kf = if target == 0 {
             pubr.high.keyframe(3)
@@ -1222,11 +1224,11 @@ fn the_cache_does_not_grow_without_bound() {
     let mut cache = StreamCache::default();
 
     for p in b.keyframe(4) {
-        cache.push(&p);
+        cache.push(p.clone());
     }
     for _ in 0..2000 {
         for p in b.delta_frame(8) {
-            cache.push(&p);
+            cache.push(p.clone());
         }
     }
 

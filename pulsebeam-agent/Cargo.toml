@@ -9,6 +9,7 @@ documentation.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+
 [features]
 default = ["pulsebeam-core/reqwest"]
 sim = []

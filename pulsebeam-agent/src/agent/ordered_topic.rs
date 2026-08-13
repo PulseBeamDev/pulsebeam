@@ -63,7 +63,7 @@ impl PublisherDelivery {
             });
         }
         if message.seq >= self.next_seq {
-            if message.seq - self.next_seq >= REORDER_CAPACITY as u64 {
+            if message.seq.saturating_sub(self.next_seq) >= REORDER_CAPACITY as u64 {
                 self.next_seq = message.seq;
                 self.pending.clear();
                 events.push(OrderedTopicDelivery::ResyncRequired {

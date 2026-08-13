@@ -1,3 +1,18 @@
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
+//! # Thread-per-core
+//!
+//! A shard owns its participants, routes and packet buffers outright and reaches
+//! other shards only by message.
+//!
+//! Denied here, each with a reason in `clippy.toml` and a level in
+//! `[workspace.lints]`: shared-state primitives (`Arc`, `Mutex`, `RwLock`, bare
+//! atomics), the ambient clock, unseeded randomness, and blocking calls. Taking
+//! one needs an `#[allow]` saying which exception applies.
+//!
+//! Read `docs/thread-per-core.md` before adding one. Those rules are not style
+//! preferences; they are what keeps the design able to span more than one node.
+
 pub mod audio_selector;
 mod bitrate;
 pub mod clock;

@@ -8,7 +8,8 @@ fn data_channel_pubsub_forwarding_test() {
         .with_room(
             Room::new("room-data")
                 .with_participant(Participant::data_participant("pub"))
-                .with_participant(Participant::data_participant("sub")),
+                .with_participant(Participant::data_participant("sub"))
+                .with_participant(Participant::data_participant("sub2")),
         )
         .run(vec![
             Step::DeclarePublishTopic {
@@ -41,6 +42,16 @@ fn data_channel_pubsub_forwarding_test() {
                 participant: "sub",
                 topic: "sim_topic",
                 expected: b"hello-data-channel",
+            },
+            // The bystander. `sub2` is in the room and never subscribed, so delivery to it would
+            // be the SFU sending a topic to someone who did not ask for it. Nothing asserted this
+            // before, and a plan that creates a participant it never checks is how the
+            // cross-shard fanout defect stayed green.
+            Step::CheckDataNotReceived {
+                description: "A participant that never subscribed receives nothing",
+                participant: "sub2",
+                topic: "sim_topic",
+                excluded: b"hello-data-channel",
             },
         ]);
 }
@@ -161,7 +172,8 @@ fn ordered_topic_delivers_every_message_in_order() {
         .with_room(
             Room::new("room-ordered")
                 .with_participant(Participant::data_participant("pub"))
-                .with_participant(Participant::data_participant("sub")),
+                .with_participant(Participant::data_participant("sub"))
+                .with_participant(Participant::data_participant("sub2")),
         )
         .run(vec![
             Step::DeclareOrderedPublisher {
@@ -215,7 +227,8 @@ fn latest_topic_eventually_delivers_newest_state() {
         .with_room(
             Room::new("room-latest")
                 .with_participant(Participant::data_participant("pub"))
-                .with_participant(Participant::data_participant("sub")),
+                .with_participant(Participant::data_participant("sub"))
+                .with_participant(Participant::data_participant("sub2")),
         )
         .run(vec![
             Step::DeclarePublishTopic {
@@ -261,6 +274,12 @@ fn latest_topic_eventually_delivers_newest_state() {
                 topic: "pose",
                 expected: b"pose:3",
             },
+            Step::CheckDataNotReceived {
+                description: "A participant that never subscribed receives nothing",
+                participant: "sub2",
+                topic: "pose",
+                excluded: b"pose:3",
+            },
         ]);
 }
 
@@ -270,7 +289,8 @@ fn ordered_topic_continues_after_publisher_reconnect() {
         .with_room(
             Room::new("room-ordered-reconnect")
                 .with_participant(Participant::data_participant("pub"))
-                .with_participant(Participant::data_participant("sub")),
+                .with_participant(Participant::data_participant("sub"))
+                .with_participant(Participant::data_participant("sub2")),
         )
         .run(vec![
             Step::DeclareOrderedPublisher {
@@ -337,6 +357,78 @@ fn ordered_topic_continues_after_publisher_reconnect() {
                 participant: "sub",
                 topic: "boxes",
                 expected: &[b"create:before", b"create:after"],
+            },
+        ]);
+}
+
+/// Data crossing a shard boundary.
+///
+/// The realtime data lane has its own route family, its own import lifecycle
+/// and its own wildcard resolution, none of which a co-located room touches.
+/// `with_shards(2)` puts publisher and subscriber on different shards, so the
+/// payload is addressed by a route the destination allocated, resolved against
+/// its `RouteAction::Data { lane }`, and handed to the subscriber's channel.
+#[test]
+fn cross_shard_data_channel_forwarding_test() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("room-data-xshard")
+                .with_participant(Participant::data_participant("pub"))
+                .with_participant(Participant::data_participant("sub"))
+                .with_participant(Participant::data_participant("sub2")),
+        )
+        .run(vec![
+            Step::DeclarePublishTopic {
+                description: "Publisher declares topic",
+                participant: "pub",
+                topic: "xshard_topic",
+            },
+            Step::DeclareSubscribeTopic {
+                description: "Subscriber on another shard subscribes",
+                participant: "sub",
+                topic: "xshard_topic",
+                scoped_to: None,
+            },
+            Step::DeclareSubscribeTopic {
+                description: "And a second, so at least one lands off-shard",
+                participant: "sub2",
+                topic: "xshard_topic",
+                scoped_to: None,
+            },
+            Step::Run {
+                description: "Let the destination install its data route",
+                duration: Duration::from_secs(2),
+            },
+            Step::PublishData {
+                description: "Publisher sends payload",
+                participant: "pub",
+                topic: "xshard_topic",
+                data: b"hello-across-shards",
+            },
+            Step::Run {
+                description: "Let the payload cross the shard boundary",
+                duration: Duration::from_secs(1),
+            },
+            Step::CheckDataReceived {
+                description: "Subscriber received it over a cross-shard route",
+                participant: "sub",
+                topic: "xshard_topic",
+                expected: b"hello-across-shards",
+            },
+            // Both, not either. Which shard each subscriber lands on is decided
+            // by the 4-tuple hash, so asserting on one of them passes whenever
+            // that one happens to win - and a fanout serving only the first
+            // subscriber on a shard looked healthy for exactly that reason.
+            Step::CheckDataReceived {
+                description: "So did the second subscriber, wherever it landed",
+                participant: "sub2",
+                topic: "xshard_topic",
+                expected: b"hello-across-shards",
+            },
+            Step::CheckCrossShardMedia {
+                description: "the payload genuinely crossed a shard boundary",
+                min_frames: 1,
             },
         ]);
 }

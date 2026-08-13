@@ -153,7 +153,7 @@ mod sim {
             let mut guard = self
                 .inner
                 .try_lock()
-                .expect("TurmoilReadHalf: mutex contended in single-threaded sim");
+                .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
             let waker = noop_waker();
             let mut cx = Context::from_waker(&waker);
             let mut read_buf = ReadBuf::new(buf);
@@ -169,9 +169,12 @@ mod sim {
             let inner = Arc::clone(&self.inner);
             let mut peek_buf = [0u8; 1];
             futures::future::poll_fn(move |cx| {
-                let mut guard = inner
-                    .try_lock()
-                    .expect("TurmoilReadHalf: mutex contended in single-threaded sim");
+                let Ok(mut guard) = inner.try_lock() else {
+                    // Single-threaded sim, so contention means another task on
+                    // this thread holds it; wake and retry rather than abort.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                };
                 let result = {
                     let mut rb = ReadBuf::new(&mut peek_buf);
                     Pin::new(&mut *guard).poll_peek(cx, &mut rb).map_ok(|_| ())
@@ -194,7 +197,7 @@ mod sim {
             let guard = self
                 .inner
                 .try_lock()
-                .expect("TurmoilWriteHalf: mutex contended in single-threaded sim");
+                .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
             (*guard).try_write(buf)
         }
     }
@@ -241,8 +244,14 @@ mod sim {
         type Addr = SocketAddr;
 
         async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-            let (s, addr) = self.0.accept().await.unwrap();
-            (TurmoilStream(s), addr)
+            loop {
+                // The trait has no error channel; a failed accept in a
+                // simulation is transient, so yield and try again.
+                match self.0.accept().await {
+                    Ok((s, addr)) => return (TurmoilStream(s), addr),
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
         }
 
         fn local_addr(&self) -> io::Result<Self::Addr> {

@@ -1,3 +1,10 @@
+//! Batched UDP with GRO on receive and GSO on send.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! arena offsets and batch accumulators here index fixed-size slots; with
+//! `overflow-checks` off in release a wrapped offset reads a neighbouring
+//! datagram's bytes rather than failing.
+
 //! Batched UDP transport built directly on Linux's `recvmmsg(2)`/`sendmmsg(2)`
 //! plus UDP GRO (receive-side coalescing) and UDP GSO (send-side segmentation
 //! offload) — no `quinn-udp` dependency.
@@ -8,9 +15,6 @@
 //!
 //! Linux only: `recvmmsg`/`sendmmsg`, `UDP_GRO`, and `UDP_SEGMENT` are all
 //! Linux-specific, so this file simply doesn't compile anywhere else.
-
-#![forbid(unsafe_code)]
-
 use crate::net::{Transport, UdpMode};
 use crate::sync::Arc;
 
@@ -67,10 +71,10 @@ impl UdpRecvArena {
     fn packet(&self, slot: usize, len: usize) -> &[u8] {
         debug_assert!(slot < BATCH_SIZE);
         debug_assert!(len <= GRO_SLOT_SIZE);
-        let start = slot * GRO_SLOT_SIZE;
-        let end = start + len;
+        let start = slot.saturating_mul(GRO_SLOT_SIZE);
+        let end = start.saturating_add(len);
         debug_assert!(end <= self.bytes.len());
-        &self.bytes[start..end]
+        self.bytes.get(start..end).unwrap_or_default()
     }
 }
 
@@ -261,9 +265,9 @@ impl UdpTransportReader {
         sock.try_io(tokio::io::Interest::READABLE, || {
             let mut slot_iter = arena.slots_mut();
             let mut iovs: [[IoSliceMut; 1]; BATCH_SIZE] = std::array::from_fn(|_| {
-                let slot = slot_iter
-                    .next()
-                    .expect("buffer has exactly BATCH_SIZE slots");
+                // The arena is built with exactly BATCH_SIZE slots; an empty
+                // slice here would simply read zero bytes for that message.
+                let slot = slot_iter.next().unwrap_or_default();
                 [IoSliceMut::new(slot)]
             });
             drop(slot_iter);
@@ -308,7 +312,11 @@ impl UdpTransportReader {
                             }
                         }
 
-                        received[slot_idx] = Some((src, stride, total_len));
+                        if let Some(slot) = received.get_mut(slot_idx) {
+                            *slot = Some((src, stride, total_len));
+                        } else {
+                            debug_assert!(false, "recvmmsg reported slot {slot_idx} out of range");
+                        }
                         debug_assert_ne!(stride, 0);
                         debug_assert!(stride <= total_len);
                     }
@@ -332,7 +340,7 @@ impl UdpTransportReader {
                     offset: 0,
                 });
             }
-            Ok(out.len() - prev_len)
+            Ok(out.len().saturating_sub(prev_len))
         })
     }
 }
@@ -391,29 +399,35 @@ impl UdpTransportWriter {
         let packets = &batch.packets;
         let mut i = 0;
 
-        while i < packets.len() {
+        while let Some(first) = packets.get(i) {
             // UDP_SEGMENT is encoded in every mmsghdr in a `sendmmsg` call.
             // Keep ordinary datagrams out of a GSO run: attaching a segment
             // cmsg to a one-segment message is rejected by some kernels.
             let gso_seg = self
                 .gso_capable
-                .then_some(packets[i].segment_size)
-                .filter(|&seg| seg < packets[i].buf.len());
-            let mut j = i + 1;
-            let mut bytes = packets[i].buf.len();
-            while j < packets.len()
-                && self
+                .then_some(first.segment_size)
+                .filter(|&seg| seg < first.buf.len());
+            let mut j = i.saturating_add(1);
+            let mut bytes = first.buf.len();
+            while let Some(next) = packets.get(j) {
+                let next_seg = self
                     .gso_capable
-                    .then_some(packets[j].segment_size)
-                    .filter(|&seg| seg < packets[j].buf.len())
-                    == gso_seg
-                && (j - i) < BATCH_SIZE
-                && bytes + packets[j].buf.len() <= self.send_batch_limit
-            {
-                bytes += packets[j].buf.len();
-                j += 1;
+                    .then_some(next.segment_size)
+                    .filter(|&seg| seg < next.buf.len());
+                if next_seg != gso_seg
+                    || j.saturating_sub(i) >= BATCH_SIZE
+                    || bytes.saturating_add(next.buf.len()) > self.send_batch_limit
+                {
+                    break;
+                }
+                bytes = bytes.saturating_add(next.buf.len());
+                j = j.saturating_add(1);
             }
-            sent += self.send_group(&packets[i..j], gso_seg)?;
+            let Some(group) = packets.get(i..j) else {
+                debug_assert!(false, "group {i}..{j} escapes the batch");
+                break;
+            };
+            sent = sent.saturating_add(self.send_group(group, gso_seg)?);
             i = j;
         }
 
@@ -462,15 +476,17 @@ impl UdpTransportWriter {
         // a significant part of CPU time for small RTP packets.
         let mut iovs: [[IoSlice<'_>; 1]; BATCH_SIZE] = std::array::from_fn(|_| [IoSlice::new(&[])]);
         let mut addrs: [Option<SockaddrStorage>; BATCH_SIZE] = std::array::from_fn(|_| None);
-        for (index, packet) in group.iter().enumerate() {
-            iovs[index] = [IoSlice::new(packet.buf)];
-            addrs[index] = Some(SockaddrStorage::from(packet.dst));
+        for ((iov, addr), packet) in iovs.iter_mut().zip(addrs.iter_mut()).zip(group.iter()) {
+            *iov = [IoSlice::new(packet.buf)];
+            *addr = Some(SockaddrStorage::from(packet.dst));
         }
 
         // GSO only makes sense (and is only legal) when segment_size is
         // strictly smaller than at least one packet in the group, and only
         // when we've confirmed the kernel supports UDP_SEGMENT.
-        let gso_seg = gso_seg.map(|size| size as u16);
+        // A segment size that does not fit the cmsg field means GSO cannot be
+        // used for this group, not that it can be used with a wrapped value.
+        let gso_seg = gso_seg.and_then(|size| u16::try_from(size).ok());
         let cmsg = gso_seg.as_ref().map(ControlMessage::UdpGsoSegments);
 
         let sock = &self.sock;
@@ -485,8 +501,8 @@ impl UdpTransportWriter {
             match sendmmsg(
                 fd,
                 &mut headers,
-                &iovs[..group.len()],
-                &addrs[..group.len()],
+                iovs.get(..group.len()).unwrap_or_default(),
+                addrs.get(..group.len()).unwrap_or_default(),
                 cmsgs,
                 MsgFlags::empty(),
             ) {
@@ -498,7 +514,7 @@ impl UdpTransportWriter {
 
         match result {
             Ok(count) => {
-                self.record_drop(group.len() - count);
+                self.record_drop(group.len().saturating_sub(count));
                 Ok(count)
             }
             // Lossy: kernel buffer full — drop this group rather than queue it.
@@ -520,12 +536,13 @@ impl UdpTransportWriter {
         if self.drop_count.is_multiple_of(DROP_LOG_INTERVAL) {
             tracing::warn!(dropped = count, "udp dropped packets during sendmmsg");
         }
-        self.drop_count += count;
+        self.drop_count = self.drop_count.saturating_add(count);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
     use super::*;
     use crate::net::{SendPacket, SendPacketBatch};
     use std::{net::SocketAddr, time::Duration};
@@ -579,7 +596,9 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_addr = receiver.local_addr().unwrap();
 
-        let payload = (0..1500).map(|i| (i % 256) as u8).collect::<Vec<_>>();
+        let payload = (0..1500)
+            .map(|i| u8::try_from(i % 256).expect("masked to a byte"))
+            .collect::<Vec<_>>();
         let packets = [SendPacket {
             dst: recv_addr,
             buf: &payload,
@@ -664,7 +683,7 @@ mod tests {
             .min(MAX_UDP_GSO_PAYLOAD_SIZE / segment_size);
         let mut payload = vec![0; segment_size * segment_count];
         for (index, segment) in payload.chunks_exact_mut(segment_size).enumerate() {
-            segment.fill(index as u8);
+            segment.fill(u8::try_from(index % 256).expect("masked to a byte"));
         }
         let packets = [SendPacket {
             dst: receiver.local_addr(),
@@ -692,7 +711,10 @@ mod tests {
 
         assert_eq!(received.len(), segment_count);
         for (index, packet) in received.iter().enumerate() {
-            assert_eq!(packet, &vec![index as u8; segment_size]);
+            assert_eq!(
+                packet,
+                &vec![u8::try_from(index % 256).expect("masked to a byte"); segment_size]
+            );
         }
     }
 
@@ -704,7 +726,10 @@ mod tests {
         let packet_count = BATCH_SIZE * 2;
 
         for index in 0..packet_count {
-            let payload = vec![index as u8; MAX_UDP_PAYLOAD_SIZE - index % 2];
+            let payload = vec![
+                u8::try_from(index % 256).expect("masked to a byte");
+                MAX_UDP_PAYLOAD_SIZE - index % 2
+            ];
             sender
                 .send_to(&payload, receiver.local_addr())
                 .await
@@ -729,7 +754,11 @@ mod tests {
         assert_eq!(received.len(), packet_count);
         for (index, packet) in received.iter().enumerate() {
             assert_eq!(packet.len(), MAX_UDP_PAYLOAD_SIZE - index % 2);
-            assert!(packet.iter().all(|&byte| byte == index as u8));
+            assert!(
+                packet
+                    .iter()
+                    .all(|&byte| byte == u8::try_from(index % 256).expect("masked to a byte"))
+            );
         }
     }
 
@@ -743,7 +772,8 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         for index in 0..UDP_MAX_GSO_SEGMENTS {
-            let payload = vec![index as u8; MAX_UDP_PAYLOAD_SIZE];
+            let payload =
+                vec![u8::try_from(index % 256).expect("masked to a byte"); MAX_UDP_PAYLOAD_SIZE];
             sender
                 .send_to(&payload, receiver.local_addr())
                 .await
@@ -767,7 +797,10 @@ mod tests {
 
         assert_eq!(received.len(), UDP_MAX_GSO_SEGMENTS);
         for (index, packet) in received.iter().enumerate() {
-            assert_eq!(packet, &vec![index as u8; MAX_UDP_PAYLOAD_SIZE]);
+            assert_eq!(
+                packet,
+                &vec![u8::try_from(index % 256).expect("masked to a byte"); MAX_UDP_PAYLOAD_SIZE]
+            );
         }
     }
 }

@@ -2,8 +2,8 @@ pub mod client;
 pub mod harness;
 
 pub use harness::{
-    Capacity, LinkProfile, LinkReport, LocalNodeSim, Loss, Participant, Property, Reorder, Room,
-    Step, VideoQuality,
+    Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Loss,
+    MAX_TIME_TO_FIRST_FRAME, Participant, Property, Reorder, Room, Step, VideoQuality,
 };
 
 use pulsebeam_runtime::net::UdpMode;
@@ -12,6 +12,33 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
+
+/// The seed every plan runs under unless it pins its own.
+///
+/// Fixed, so an ordinary run reproduces exactly and a failure bisects.
+pub const DEFAULT_SIM_SEED: u64 = 0xDEAD_BEEF;
+
+/// The seed for this process, `DEFAULT_SIM_SEED` unless `PULSEBEAM_SIM_SEED`
+/// overrides it.
+///
+/// One fixed seed samples one point out of the space of orderings, latencies
+/// and losses these plans can produce, and then reports that point forever. The
+/// override is what lets the same suite sweep the rest of the space without
+/// giving up reproducibility: a sweep failure names its seed, and
+/// `make test-sim-seed SEED=<n>` replays exactly that run.
+///
+/// A malformed value is refused rather than silently ignored — a sweep that
+/// quietly ran 200 iterations of the default seed would report the opposite of
+/// what it found.
+pub fn sim_seed() -> u64 {
+    match std::env::var("PULSEBEAM_SIM_SEED") {
+        Err(_) => DEFAULT_SIM_SEED,
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("PULSEBEAM_SIM_SEED={raw:?} is not a u64")),
+    }
+}
 
 static NEXT_SUBNET: AtomicU32 = AtomicU32::new(0);
 
@@ -37,81 +64,51 @@ pub fn reserve_subnet() -> u8 {
          space another octet rather than letting the counter wrap."
     );
     // Avoid 0 and 255.
-    (1 + next) as u8
+    u8::try_from(1 + next).expect("the assertion above bounds this below 255")
 }
 
 pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {
-    format!("192.168.{}.{}", subnet, host).parse().unwrap()
+    format!("192.168.{subnet}.{host}").parse().unwrap()
 }
 
-pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> anyhow::Result<()> {
-    let rtc_port = 3478;
-    let external_addr = SocketAddr::new(ip, rtc_port);
-    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
-    let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
-
-    pulsebeam::node::NodeBuilder::new()
-        .workers(1)
-        .local_addr(local_addr)
-        .external_addrs(vec![external_addr])
-        .rng(rng)
-        .with_udp_mode(UdpMode::Scalar)
-        .with_http_api(http_api_addr)
-        .with_current_runtime()
-        .run(tokio_util::sync::CancellationToken::new())
-        .await?;
-    Ok(())
-}
-
-/// Same as `start_sfu_node` but with UDP candidates suppressed so that
-/// clients must use the TCP path (TCP-only simulation tests).
-pub async fn start_sfu_node_tcp_only(
-    ip: IpAddr,
-    rng: pulsebeam_runtime::rand::Rng,
-) -> anyhow::Result<()> {
-    let rtc_port = 3478;
-    let external_addr = SocketAddr::new(ip, rtc_port);
-    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
-    let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
-
-    pulsebeam::node::NodeBuilder::new()
-        .workers(1)
-        .local_addr(local_addr)
-        .external_addrs(vec![external_addr])
-        .rng(rng)
-        .with_udp_mode(UdpMode::Scalar)
-        .with_http_api(http_api_addr)
-        .with_current_runtime()
-        .tcp_only()
-        .run(tokio_util::sync::CancellationToken::new())
-        .await?;
-    Ok(())
-}
-
-/// Same as `start_sfu_node_tcp_only` but with two worker shards.
+/// Start an SFU node in the simulation.
 ///
-/// Using two shards maximises the probability that `hash(peer_addr)` (used for
-/// TCP routing) and `hash(room_id)` (used for participant routing) disagree on
-/// which shard should own a connection, which is exactly the cross-shard TCP
-/// egress scenario we want to exercise.
-pub async fn start_sfu_node_tcp_only_multi_shard(
+/// `shards` above one also sets `room_shard_slot(1)` and `round_robin_rooms()`.
+/// Both halves matter: extra shards make `hash(peer_addr)` and `hash(room_id)`
+/// disagree, which is the cross-shard TCP egress case, but only the slot puts a
+/// room's *participants* on different shards. Without it a room of fewer than
+/// sixteen is co-located and its media never leaves a core, so none of the
+/// route, envelope or reverse-lane machinery is reached.
+///
+/// `tcp_only` suppresses UDP candidates so clients must take the TCP path. It
+/// is independent of `shards`: cross-shard forwarding has to hold on the
+/// transport that carries almost all real traffic, not only on the fallback.
+pub async fn start_sfu_node_with(
     ip: IpAddr,
     rng: pulsebeam_runtime::rand::Rng,
+    shards: usize,
+    tcp_only: bool,
 ) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
-    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
+    let local_addr: SocketAddr = format!("0.0.0.0:{rtc_port}").parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
-    pulsebeam::node::NodeBuilder::new()
-        .workers(2)
+    let mut builder = pulsebeam::node::NodeBuilder::new()
+        .workers(shards)
         .local_addr(local_addr)
         .external_addrs(vec![external_addr])
         .rng(rng)
         .with_udp_mode(UdpMode::Scalar)
         .with_http_api(http_api_addr)
-        .with_current_runtime()
-        .tcp_only()
+        .with_current_runtime();
+    if shards > 1 {
+        builder = builder.room_shard_slot(1).round_robin_rooms();
+    }
+    if tcp_only {
+        builder = builder.tcp_only();
+    }
+    builder
         .run(tokio_util::sync::CancellationToken::new())
         .await?;
     Ok(())
@@ -129,8 +126,7 @@ pub fn run_sim_or_timeout(sim: &mut turmoil::Sim<'_>, timeout: Duration) -> turm
     loop {
         if start.elapsed() > timeout {
             return Err(format!(
-                "Simulation did not complete within {:?} (wall-clock); aborting.",
-                timeout
+                "Simulation did not complete within {timeout:?} (wall-clock); aborting."
             )
             .into());
         }

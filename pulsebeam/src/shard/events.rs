@@ -48,7 +48,16 @@ pub enum ParticipantLifecycleEvent {
 }
 
 pub enum ParticipantControlEvent {
-    TrackPublished(Track),
+    TrackPublished(Track, crate::track::TrackStates),
+    /// A published track's latest measurements, refreshed on the slow poll.
+    ///
+    /// Within-shard: the participant that measures hands its own shard core a
+    /// value, which forwards it to the destinations holding a route. Nothing
+    /// reaches into a monitor from outside.
+    TrackStatsUpdated {
+        track_id: TrackId,
+        states: crate::track::TrackStates,
+    },
     TrackUnpublished {
         origin: ParticipantId,
         track_id: TrackId,
@@ -197,11 +206,19 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_track(&mut self, track: Track) {
+    fn publish_track_stats(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::TrackPublished(track),
+                ParticipantControlEvent::TrackStatsUpdated { track_id, states },
+            ));
+    }
+
+    fn publish_track(&mut self, track: Track, states: crate::track::TrackStates) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::TrackPublished(track, states),
             ));
     }
 

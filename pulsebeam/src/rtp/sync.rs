@@ -1,3 +1,13 @@
+//! Overflow is explicit here, and denied workspace-wide.
+//!
+//! `overflow-checks` is off in release, so a bare `+` or `-` that goes out of
+//! range does not stop — it yields a plausible-looking number that the pacer,
+//! the allocator or the jitter estimator then treats as a measurement. This is
+//! timestamp and sequence arithmetic, where that number is the whole output, so
+//! every operation says which behaviour it wants: `saturating_` to clamp,
+//! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
+//! the correct answer.
+
 use crate::clock::NtpTime;
 use crate::rtp::RtpPacket;
 use ahash::HashMap;
@@ -19,9 +29,29 @@ struct ClockReference {
     arrival_ts: Instant,
 }
 
+/// Shift an NTP wall time by a signed number of seconds.
+///
+/// Saturating rather than trapping: `ntp_delta_secs` comes from a sender
+/// report's RTP delta, which a misbehaving or malicious publisher controls. A
+/// clamped timestamp produces a bad playout estimate that the rest of the
+/// pipeline already bounds; an overflow would end the process.
+fn offset_ntp(base: NtpTime, delta_secs: f64) -> NtpTime {
+    if !delta_secs.is_finite() {
+        return base;
+    }
+    let magnitude = Duration::from_secs_f64(delta_secs.abs());
+    if delta_secs >= 0.0 {
+        base.saturating_add(magnitude)
+    } else {
+        base.saturating_sub(magnitude)
+    }
+}
+
 impl ClockReference {
     fn server_time_at_anchor(&self, ntp_delta: Duration) -> Instant {
-        self.arrival_ts + ntp_delta
+        self.arrival_ts
+            .checked_add(ntp_delta)
+            .unwrap_or(self.arrival_ts)
     }
 
     /// Of two anchors on the same NTP wall clock, the one implying the lower
@@ -32,7 +62,7 @@ impl ClockReference {
         match other.ntp_time.duration_since(self.ntp_time) {
             // other is later on the NTP clock: does it arrive sooner than self predicts?
             Ok(dt) => {
-                if other.arrival_ts < self.arrival_ts + dt {
+                if other.arrival_ts < self.arrival_ts.checked_add(dt).unwrap_or(self.arrival_ts) {
                     other
                 } else {
                     self
@@ -40,7 +70,7 @@ impl ClockReference {
             }
             // other is earlier on the NTP clock: compare the other way round.
             Err(e) => {
-                if other.arrival_ts + e < self.arrival_ts {
+                if other.arrival_ts.checked_add(e).unwrap_or(other.arrival_ts) < self.arrival_ts {
                     other
                 } else {
                     self
@@ -83,15 +113,21 @@ impl Synchronizer {
             self.add_sender_report(sr, packet.arrival_ts);
         }
 
-        if self.base_rtp.is_none() {
-            self.reset_baseline(packet.rtp_ts, packet.arrival_ts);
-        }
+        // The two move together, so read them together: a baseline half-set is
+        // a bug rather than a state to recover from.
+        let (base_rtp, mut base_server_time) = match (self.base_rtp, self.base_server_time) {
+            (Some(rtp), Some(server_time)) => (rtp, server_time),
+            _ => self.reset_baseline(packet.rtp_ts, packet.arrival_ts),
+        };
 
-        let base_rtp = self.base_rtp.unwrap();
-        let mut base_server_time = self.base_server_time.unwrap();
-
-        let rtp_delta = (packet.rtp_ts.numer() as i64).wrapping_sub(base_rtp.numer() as i64);
-        let max_ticks = (MAX_RTP_GAP_SECS * self.clock_rate.get() as f64) as i64;
+        let rtp_delta = packet
+            .rtp_ts
+            .numer()
+            .cast_signed()
+            .wrapping_sub(base_rtp.numer().cast_signed());
+        let max_ticks =
+            crate::bitrate::saturating_bps(MAX_RTP_GAP_SECS * f64::from(self.clock_rate.get()))
+                .cast_signed();
 
         // Auto-reset on massive RTP leaps to prevent timeline corruption
         if rtp_delta.abs() > max_ticks {
@@ -106,14 +142,13 @@ impl Synchronizer {
         // 1. If we have SR info, we can calculate the NTP time of this packet and use it for alignment.
         let mut ntp_expected_playout = None;
         if let Some(latest) = self.latest_sr {
-            let rtp_delta =
-                (packet.rtp_ts.numer() as i64).wrapping_sub(latest.rtp_time.numer() as i64);
+            let rtp_delta = packet
+                .rtp_ts
+                .numer()
+                .cast_signed()
+                .wrapping_sub(latest.rtp_time.numer().cast_signed());
             let ntp_delta_secs = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
-            let ntp_pkt = if ntp_delta_secs >= 0.0 {
-                latest.ntp_time + Duration::from_secs_f64(ntp_delta_secs)
-            } else {
-                latest.ntp_time - Duration::from_secs_f64(-ntp_delta_secs)
-            };
+            let ntp_pkt = offset_ntp(latest.ntp_time, ntp_delta_secs);
 
             if let Some(anchor) = self.ntp_anchor {
                 let ntp_delta = ntp_pkt
@@ -126,7 +161,9 @@ impl Synchronizer {
         // 2. Fallback/Standard path: use the local RTP-based baseline
         let seconds_delta = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
         let mut expected_playout = if seconds_delta >= 0.0 {
-            base_server_time + Duration::from_secs_f64(seconds_delta)
+            base_server_time
+                .checked_add(Duration::from_secs_f64(seconds_delta))
+                .unwrap_or(base_server_time)
         } else {
             base_server_time
                 .checked_sub(Duration::from_secs_f64(-seconds_delta))
@@ -162,13 +199,14 @@ impl Synchronizer {
         packet.playout_time = expected_playout;
     }
 
-    fn reset_baseline(&mut self, rtp_ts: MediaTime, arrival_ts: Instant) {
+    fn reset_baseline(&mut self, rtp_ts: MediaTime, arrival_ts: Instant) -> (MediaTime, Instant) {
         self.base_rtp = Some(rtp_ts);
         self.base_server_time = Some(arrival_ts);
         self.first_sr = None;
         self.latest_sr = None;
         self.ntp_anchor = None;
         self.estimated_clock_drift_ppm = 0.0;
+        (rtp_ts, arrival_ts)
     }
 
     fn add_sender_report(&mut self, sr: SenderInfo, now: Instant) {
@@ -185,8 +223,16 @@ impl Synchronizer {
         };
 
         if let Some(last) = self.latest_sr {
-            if current.ntp_time <= last.ntp_time
-                || current.rtp_time.numer().wrapping_sub(last.rtp_time.numer()) as i64 <= 0
+            // Both comparisons are modular: NTP wraps at the era boundary and
+            // the RTP timestamp wraps at 2^32, so a report that is genuinely
+            // newer can be numerically smaller than its predecessor.
+            if current.ntp_time.units_since(last.ntp_time) <= 0
+                || current
+                    .rtp_time
+                    .numer()
+                    .wrapping_sub(last.rtp_time.numer())
+                    .cast_signed()
+                    <= 0
             {
                 return;
             }
@@ -207,7 +253,10 @@ impl Synchronizer {
                 .ntp_time
                 .duration_since(anchor.ntp_time)
                 .unwrap_or(Duration::ZERO);
-            let expected_server = anchor.arrival_ts + ntp_delta;
+            let expected_server = anchor
+                .arrival_ts
+                .checked_add(ntp_delta)
+                .unwrap_or(anchor.arrival_ts);
             if now < expected_server {
                 // This SR arrived earlier than the previous anchor relative to NTP.
                 // It represents a lower propagation delay.
@@ -222,7 +271,8 @@ impl Synchronizer {
         let sender_rtp_delta = current
             .rtp_time
             .numer()
-            .wrapping_sub(first.rtp_time.numer()) as i64;
+            .wrapping_sub(first.rtp_time.numer())
+            .cast_signed();
         let sender_ntp_delta_secs = current
             .ntp_time
             .duration_since(first.ntp_time)
@@ -329,6 +379,8 @@ impl TrackSynchronizer {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::rtp::{RtpPacket, VIDEO_FREQUENCY};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -423,8 +475,16 @@ mod tests {
             );
         }
 
-        assert_eq!(sync_perfect.estimated_clock_drift_ppm.round() as i64, 0);
-        assert_eq!(sync_drifting.estimated_clock_drift_ppm.round() as i64, 1000);
+        assert_eq!(
+            crate::bitrate::saturating_bps(sync_perfect.estimated_clock_drift_ppm.round())
+                .cast_signed(),
+            0
+        );
+        assert_eq!(
+            crate::bitrate::saturating_bps(sync_drifting.estimated_clock_drift_ppm.round())
+                .cast_signed(),
+            1000
+        );
 
         let event_time = base_time + Duration::from_secs(10);
 

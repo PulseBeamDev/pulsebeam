@@ -1,3 +1,9 @@
+//! Fixtures for the Dependency Descriptor tests.
+//!
+//! Overflow is allowed here, unlike the code under test: a fixture that
+//! overflows should fail the test loudly rather than clamp into a value that
+//! makes it pass.
+
 use arrayvec::ArrayVec;
 
 use super::model::*;
@@ -132,7 +138,8 @@ pub fn delta(
 ) -> DependencyDescriptor {
     let deps = structure.templates[template_index].clone();
     let template_id =
-        ((template_index + usize::from(structure.template_id_offset)) % MAX_TEMPLATES) as u8;
+        u8::try_from((template_index + usize::from(structure.template_id_offset)) % MAX_TEMPLATES)
+            .expect("reduced mod MAX_TEMPLATES, which is 64");
     DependencyDescriptor {
         start_of_frame: true,
         end_of_frame: true,

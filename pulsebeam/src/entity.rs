@@ -44,7 +44,7 @@ pub enum IdValidationError {
 
 fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
     let encoded = base32::encode(base32::Alphabet::Crockford, bytes);
-    format!("{}_{}", prefix, encoded)
+    format!("{prefix}_{encoded}")
 }
 
 fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdValidationError> {
@@ -79,7 +79,11 @@ pub fn new_v8_sha3(namespace: &Uuid, name: &[u8]) -> Uuid {
 
     // Take the first 16 bytes of the SHA3-256 hash
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash[..16]);
+    if let Some(prefix) = hash.get(..16) {
+        bytes.copy_from_slice(prefix);
+    } else {
+        debug_assert!(false, "SHA3-256 produced fewer than 16 bytes");
+    }
 
     // Set Version to 8
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
@@ -116,7 +120,9 @@ pub struct ExternalRoomId(ArrayString<MAX_EXTERNAL_ROOM_ID_LEN>);
 impl ExternalRoomId {
     pub fn new(id: &str) -> Result<Self, IdValidationError> {
         validate_external_string(id)?;
-        Ok(Self(ArrayString::from(id).unwrap()))
+        ArrayString::from(id)
+            .map(Self)
+            .map_err(|_| IdValidationError::TooLong(MAX_EXTERNAL_ROOM_ID_LEN))
     }
 
     pub fn as_str(&self) -> &str {
@@ -393,6 +399,18 @@ pub struct TrackId {
     kind: TrackKind,
 }
 
+/// Who a forwarded audio packet came from.
+///
+/// The subscriber's audio slots are shared: the selector steals a slot the moment someone else
+/// is louder, so the mid and the SSRC carrying a packet say nothing about who spoke. Both halves
+/// travel with the packet because the subscriber needs the track to name the stream and the
+/// participant to attribute it to a person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AudioOrigin {
+    pub participant: ParticipantId,
+    pub track: TrackId,
+}
+
 impl TrackId {
     pub fn kind(&self) -> TrackKind {
         self.kind
@@ -473,6 +491,9 @@ impl fmt::Debug for TrackId {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use pulsebeam_runtime::rand::seeded_rng;
     use std::collections::{HashMap, HashSet};

@@ -9,8 +9,12 @@ pub async fn wait_for_signal_impl() {
 
     // Infos here:
     // https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html
-    let mut signal_terminate = signal(SignalKind::terminate()).unwrap();
-    let mut signal_interrupt = signal(SignalKind::interrupt()).unwrap();
+    let (Ok(mut signal_terminate), Ok(mut signal_interrupt)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        crate::fatal!("cannot register SIGTERM/SIGINT handlers; the node would be unstoppable")
+    };
 
     tokio::select! {
         _ = signal_terminate.recv() => tracing::debug!("received SIGTERM."),
@@ -41,7 +45,7 @@ pub async fn wait_for_signal_impl() {
 /// Registers signal handlers and waits for a signal that
 /// indicates a shutdown request.
 pub async fn wait_for_signal() {
-    wait_for_signal_impl().await
+    wait_for_signal_impl().await;
 }
 
 pub fn select_host_addresses(forced_interface: Option<&str>) -> Vec<IpAddr> {

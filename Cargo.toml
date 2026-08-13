@@ -70,19 +70,15 @@ lto = "thin"
 # We want to crash during simulation
 [profile.sim]
 inherits = "dev"
-# The simulation is CPU-bound on real packet work - str0m parsing, the allocator, BWE - run
-# across ~23k packets per plan, so runtime optimisation of that Rust code pays back directly in
-# wall time. opt-level 3 with a smaller codegen-units lets those hot paths inline across
-# functions; 16 rather than 1 keeps recompiles tolerable during iteration. (Crypto is aws-lc-rs,
-# already-optimised C, so it is unaffected by this either way.)
-opt-level = 3
-codegen-units = 16
-debug = true
-split-debuginfo = "unpacked"
-strip = "none"
-# Thin LTO earns its keep here specifically: a packet crosses agent -> str0m -> runtime crate
-# boundaries on its way through, and thin LTO inlines across those, which codegen-units cannot.
-# The cost is a link pass per rebuild - acceptable for a profile whose job is running the suite
-# rather than the tight edit loop, where a plain `cargo check` is what you'd use.
-lto = "thin"
+opt-level = 2
+
+# For fast feedback loop
 incremental = true
+codegen-units = 256
+lto = false
+
+debug-assertions = true
+overflow-checks = true
+
+# Enough symbols for useful backtraces/profiling.
+debug = 1

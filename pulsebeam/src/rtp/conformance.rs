@@ -1,3 +1,7 @@
+//! Overflow is allowed here: this module is `#[cfg(test)]`-only, and a check
+//! whose own arithmetic overflows should fail loudly rather than clamp into a
+//! passing verdict about the stream it is judging.
+
 //! Invariants the egress RTP stream must satisfy for a subscriber to decode it.
 //!
 //! Subscribers have no jitter buffer in front of the SFU, so anything the

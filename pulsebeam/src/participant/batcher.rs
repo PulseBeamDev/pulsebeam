@@ -1,6 +1,16 @@
+//! GSO batching: many datagrams to one destination in one syscall.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! accounting decides how a contiguous arena is split into segments, so a
+//! wrapped length does not fail — the kernel slices the buffer somewhere else
+//! and the peer receives datagrams that were never sent.
+
 use arrayvec::ArrayVec;
 use pulsebeam_runtime::net;
-use std::{collections::VecDeque, net::SocketAddr};
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 const MAX_FREE_STATES: usize = 3;
 
@@ -79,11 +89,16 @@ impl GsoSendBatch {
             debug_assert!(!packet.contents.is_empty());
             debug_assert!(packet.contents.len() <= net::MAX_UDP_PAYLOAD_SIZE);
             debug_assert!(segment_count <= queue.max_segments);
-            debug_assert!(self.arena.len() - start <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+            debug_assert!(self.arena.len().saturating_sub(start) <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
 
             if packet.dst != dst
                 || segment_count >= queue.max_segments
-                || self.arena.len() - start + packet.contents.len() > net::MAX_UDP_GSO_PAYLOAD_SIZE
+                || self
+                    .arena
+                    .len()
+                    .saturating_sub(start)
+                    .saturating_add(packet.contents.len())
+                    > net::MAX_UDP_GSO_PAYLOAD_SIZE
                 || packet.contents.len() > segment_size
             {
                 break;
@@ -91,7 +106,7 @@ impl GsoSendBatch {
 
             let is_tail = packet.contents.len() < segment_size;
             self.arena.extend_from_slice(&packet.contents);
-            segment_count += 1;
+            segment_count = segment_count.saturating_add(1);
             queue.packets.pop_front();
             if is_tail {
                 break;
@@ -101,7 +116,7 @@ impl GsoSendBatch {
         let end = self.arena.len();
         debug_assert_ne!(segment_count, 0);
         debug_assert!(end > start);
-        debug_assert!(end - start <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        debug_assert!(end.saturating_sub(start) <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
         self.packets.push(GsoPacketMeta {
             dst,
             segment_size,
@@ -121,9 +136,13 @@ impl GsoSendBatch {
             debug_assert!(packet.start < packet.end);
             debug_assert!(packet.end <= self.arena.len());
             debug_assert_ne!(packet.segment_size, 0);
+            let Some(buf) = self.arena.get(packet.start..packet.end) else {
+                debug_assert!(false, "queued packet escapes the arena");
+                continue;
+            };
             packets.push(net::SendPacket {
                 dst: packet.dst,
-                buf: &self.arena[packet.start..packet.end],
+                buf,
                 segment_size: packet.segment_size,
             });
         }
@@ -239,7 +258,7 @@ impl Batcher {
                 "BatcherState must have a nonzero segment_size before flush"
             );
             debug_assert!(
-                state.buf.len() <= state.max_segments * net::MAX_UDP_PAYLOAD_SIZE,
+                state.buf.len() <= state.max_segments.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE),
                 "Batch exceeds configured TCP batch capacity"
             );
             let packet = [net::SendPacket {
@@ -247,18 +266,15 @@ impl Batcher {
                 buf: &state.buf,
                 segment_size: state.segment_size,
             }];
-            let res = socket.try_send_batch(&net::SendPacketBatch { packets: &packet });
-            match res {
-                Ok(_) => {
-                    let state = self.pop_front().unwrap();
-                    self.reclaim(state);
-                }
-                Err(err) => {
-                    tracing::trace!("error on writing to TCP socket: {:?}", err);
-                    let state = self.pop_front().unwrap();
-                    self.reclaim(state);
-                }
+            if let Err(err) = socket.try_send_batch(&net::SendPacketBatch { packets: &packet }) {
+                tracing::trace!("error on writing to TCP socket: {:?}", err);
             }
+            // Reclaimed either way: a failed write drops the batch rather than
+            // retrying it, so leaving it queued would spin this loop forever.
+            let Some(state) = self.pop_front() else {
+                break;
+            };
+            self.reclaim(state);
         }
     }
 }
@@ -277,7 +293,7 @@ impl BatcherState {
     fn with_capacity(cap: usize) -> Self {
         debug_assert_ne!(cap, 0);
         Self {
-            dst: "0.0.0.0:0".parse().unwrap(),
+            dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             segment_size: 0,
             segment_count: 0,
             max_segments: cap,
@@ -285,7 +301,14 @@ impl BatcherState {
             // Reserving the full GSO maximum for every participant is costly
             // at SFU scale. Grow only for the batches that are actually used;
             // recycled states retain that capacity for the next tick.
-            buf: Vec::with_capacity(cap * net::MAX_UDP_PAYLOAD_SIZE),
+            //
+            // Capped at the GSO ceiling because `try_push` refuses to go past
+            // it, so any capacity above ~43 segments would reserve more than
+            // the batch can ever hold.
+            buf: Vec::with_capacity(
+                cap.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE)
+                    .min(net::MAX_UDP_GSO_PAYLOAD_SIZE),
+            ),
         }
     }
 
@@ -313,7 +336,7 @@ impl BatcherState {
             return false;
         }
 
-        if self.buf.len() + content.len() > net::MAX_UDP_GSO_PAYLOAD_SIZE {
+        if self.buf.len().saturating_add(content.len()) > net::MAX_UDP_GSO_PAYLOAD_SIZE {
             return false;
         }
 
@@ -323,19 +346,21 @@ impl BatcherState {
 
         if content.len() == self.segment_size {
             debug_assert!(
-                self.buf.len() + content.len() <= self.max_segments * net::MAX_UDP_PAYLOAD_SIZE
+                self.buf.len().saturating_add(content.len())
+                    <= self.max_segments.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE)
             );
             self.buf.extend_from_slice(content);
-            self.segment_count += 1;
+            self.segment_count = self.segment_count.saturating_add(1);
             debug_assert!(self.segment_count <= self.max_segments);
             debug_assert!(self.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
             true
         } else if content.len() < self.segment_size {
             debug_assert!(
-                self.buf.len() + content.len() <= self.max_segments * net::MAX_UDP_PAYLOAD_SIZE
+                self.buf.len().saturating_add(content.len())
+                    <= self.max_segments.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE)
             );
             self.buf.extend_from_slice(content);
-            self.segment_count += 1;
+            self.segment_count = self.segment_count.saturating_add(1);
             self.sealed = true;
             debug_assert!(self.segment_count <= self.max_segments);
             debug_assert!(self.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
@@ -360,8 +385,118 @@ impl BatcherState {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// GSO segment accounting at its edges.
+    ///
+    /// The invariant is "every segment the same size, except a smaller final
+    /// one that seals the batch". The accounting is `buf.len() + content.len()`
+    /// against a 65535-byte ceiling and `segment_count` against capacity, so
+    /// the cases that matter are exactly at, one under and one over each — not
+    /// a plausible run of 1200-byte packets, which never approaches either.
+    mod segment_accounting {
+        use super::super::*;
+        use super::create_test_addr;
+
+        fn state(cap: usize) -> BatcherState {
+            let mut st = BatcherState::with_capacity(cap);
+            st.reset(create_test_addr());
+            st
+        }
+
+        #[test]
+        fn a_batch_fills_to_exactly_its_segment_capacity() {
+            let mut st = state(4);
+            let dst = create_test_addr();
+            for i in 0..4 {
+                assert!(st.try_push(dst, &[7u8; 100]), "segment {i} should fit");
+            }
+            assert!(!st.try_push(dst, &[7u8; 100]), "capacity is a hard stop");
+            assert_eq!(st.segment_count, 4);
+            assert_eq!(st.buf.len(), 400);
+        }
+
+        /// The GSO payload ceiling, approached from both sides. A 1400-byte
+        /// segment divides 65535 unevenly, which is the realistic shape.
+        #[test]
+        fn the_gso_payload_ceiling_is_never_exceeded() {
+            let seg = 1400usize;
+            let mut st = state(1_000);
+            let dst = create_test_addr();
+            let mut pushed = 0usize;
+            while st.try_push(dst, &vec![1u8; seg]) {
+                pushed += 1;
+                assert!(
+                    st.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE,
+                    "buffer passed the GSO ceiling at segment {pushed}"
+                );
+            }
+            assert_eq!(pushed, net::MAX_UDP_GSO_PAYLOAD_SIZE / seg);
+            assert!(st.buf.len() + seg > net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        }
+
+        #[test]
+        fn a_shorter_final_segment_seals_the_batch() {
+            let mut st = state(8);
+            let dst = create_test_addr();
+            assert!(st.try_push(dst, &[1u8; 200]));
+            assert!(st.try_push(dst, &[1u8; 199]), "a shorter tail is allowed");
+            assert!(st.sealed);
+            assert!(
+                !st.try_push(dst, &[1u8; 199]),
+                "nothing follows a sealed batch, even at the same size"
+            );
+            assert_eq!(st.segment_count, 2);
+        }
+
+        /// One byte either side of the established segment size: equal fits,
+        /// smaller seals, larger is refused outright.
+        #[test]
+        fn segment_size_boundaries_are_exact() {
+            let dst = create_test_addr();
+
+            let mut equal = state(4);
+            assert!(equal.try_push(dst, &[1u8; 300]));
+            assert!(equal.try_push(dst, &[1u8; 300]));
+            assert!(!equal.sealed);
+
+            let mut smaller = state(4);
+            assert!(smaller.try_push(dst, &[1u8; 300]));
+            assert!(smaller.try_push(dst, &[1u8; 299]));
+            assert!(smaller.sealed);
+
+            let mut larger = state(4);
+            assert!(larger.try_push(dst, &[1u8; 300]));
+            assert!(
+                !larger.try_push(dst, &[1u8; 301]),
+                "a longer segment cannot join"
+            );
+            assert_eq!(larger.segment_count, 1);
+        }
+
+        #[test]
+        fn a_different_destination_never_joins_a_batch() {
+            let mut st = state(4);
+            let dst = create_test_addr();
+            assert!(st.try_push(dst, &[1u8; 100]));
+            let other = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 4444);
+            assert!(!st.try_push(other, &[1u8; 100]));
+            assert_eq!(st.segment_count, 1);
+        }
+
+        /// `with_capacity` multiplies capacity by the MTU to size the arena. A
+        /// capacity this large has no business being allocated, but it must not
+        /// wrap into a small reservation either.
+        #[test]
+        fn an_absurd_capacity_does_not_wrap_the_arena_reservation() {
+            let st = BatcherState::with_capacity(usize::MAX);
+            assert!(st.buf.capacity() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        }
+    }
 
     fn create_test_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)

@@ -1,3 +1,11 @@
+//! RFC 4571 framing over TCP.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! length prefix is 16 bits and peer-controlled, so every `offset + len` is an
+//! offset a peer chose against a buffer it did not. With `overflow-checks` off
+//! in release a wrap would not stop — it would index somewhere else in the
+//! stream or report a frame that is not there.
+
 use super::{RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
 use crate::{mailbox, net::SendPacket};
@@ -100,7 +108,7 @@ impl BufferedTcpStream {
             let mut payload = vec![0u8; len];
             stream.read_exact(&mut payload).await?;
 
-            let mut raw = Vec::with_capacity(2 + len);
+            let mut raw = Vec::with_capacity(len.saturating_add(2));
             raw.extend_from_slice(&header);
             raw.extend_from_slice(&payload);
 
@@ -161,15 +169,14 @@ async fn tcp_read_task(
     'outer: loop {
         // Decode all complete frames currently in the buffer before waiting.
         loop {
-            if recv_buf.len() < 2 {
+            let Some(len) = frame_len_at(&recv_buf, 0) else {
                 break;
-            }
-            let len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+            };
             if len == 0 || len > MAX_FRAME_SIZE {
                 tracing::warn!(%peer_addr, len, "Invalid TCP frame length, closing connection");
                 break 'outer;
             }
-            if recv_buf.len() < 2 + len {
+            if recv_buf.len() < len.saturating_add(2) {
                 break; // partial frame
             }
             recv_buf.advance(2);
@@ -214,7 +221,10 @@ async fn tcp_read_task(
         let mut tmp = [0u8; 4096];
         match read.try_read(&mut tmp) {
             Ok(0) => break, // EOF
-            Ok(n) => recv_buf.put_slice(&tmp[..n]),
+            Ok(n) => match tmp.get(..n) {
+                Some(chunk) => recv_buf.put_slice(chunk),
+                None => break,
+            },
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => {
                 tracing::warn!(%peer_addr, error = ?e, "TCP read error");
@@ -318,10 +328,16 @@ impl TcpTransport {
                 "TCP per-IP connection limit reached",
             ));
         }
-        *count += 1;
+        *count = count.saturating_add(1);
 
         if let Err(e) = stream.set_nodelay(true) {
-            *self.ip_counts.get_mut(&peer_ip).unwrap() -= 1;
+            if let Some(count) = self.ip_counts.get_mut(&peer_ip) {
+                // Wrapping here would pin the per-IP count near u32::MAX and
+                // lock that address out of the node for good.
+                *count = count.saturating_sub(1);
+            } else {
+                debug_assert!(false, "per-IP count vanished between insert and rollback");
+            }
             return Err(e);
         }
 
@@ -335,11 +351,10 @@ impl TcpTransport {
             let mut pos = BytesMut::from(pending.as_ref());
             pending.clear();
             loop {
-                if pos.len() < 2 {
+                let Some(len) = frame_len_at(&pos, 0) else {
                     break;
-                }
-                let len = u16::from_be_bytes([pos[0], pos[1]]) as usize;
-                if len == 0 || len > MAX_FRAME_SIZE || pos.len() < 2 + len {
+                };
+                if len == 0 || len > MAX_FRAME_SIZE || pos.len() < len.saturating_add(2) {
                     break;
                 }
                 pos.advance(2);
@@ -423,11 +438,8 @@ impl TcpTransport {
         }
 
         // Drain any further events that arrived since readable() was called.
-        loop {
-            match self.event_rx.try_recv() {
-                Ok(event) => self.handle_event(event, out, local_addr),
-                Err(_) => break,
-            }
+        while let Ok(event) = self.event_rx.try_recv() {
+            self.handle_event(event, out, local_addr);
         }
 
         if out.is_empty() {
@@ -490,9 +502,18 @@ impl TcpTransport {
         let mut buf = BytesMut::new();
         let mut offset = 0;
         while offset < batch.buf.len() {
-            let end = (offset + batch.segment_size).min(batch.buf.len());
-            let seg = &batch.buf[offset..end];
-            buf.put_u16(seg.len() as u16);
+            let end = offset
+                .saturating_add(batch.segment_size)
+                .min(batch.buf.len());
+            let Some(seg) = batch.buf.get(offset..end) else {
+                debug_assert!(false, "segment {offset}..{end} escapes the batch");
+                break;
+            };
+            let Ok(seg_len) = u16::try_from(seg.len()) else {
+                debug_assert!(false, "segment of {} bytes has no 16-bit length", seg.len());
+                break;
+            };
+            buf.put_u16(seg_len);
             buf.put_slice(seg);
             offset = end;
         }
@@ -512,7 +533,9 @@ impl TcpTransport {
                         if self.drop_count.is_multiple_of(100) {
                             tracing::warn!("udp dropped a packet due to full socket");
                         }
-                        self.drop_count += dropped as usize;
+                        self.drop_count = self
+                            .drop_count
+                            .saturating_add(usize::try_from(dropped).unwrap_or(usize::MAX));
                     }
                     break;
                 }
@@ -527,31 +550,46 @@ impl TcpTransport {
     }
 }
 
+/// The RFC 4571 big-endian length prefix at `offset`, or `None` if fewer than
+/// two bytes remain there.
+fn frame_len_at(buf: &[u8], offset: usize) -> Option<usize> {
+    let hi = *buf.get(offset)?;
+    let lo = *buf.get(offset.saturating_add(1))?;
+    Some(usize::from(u16::from_be_bytes([hi, lo])))
+}
+
+/// How many RFC 4571 frames a buffer holds, counting a trailing incomplete one.
+///
+/// Feeds the dropped-packet counter, so an over-count reports congestion that
+/// did not happen. The early exits `return` rather than `break`: they have
+/// already counted the frame they stopped on, and falling through to the
+/// trailing-remainder check counted it a second time.
 fn count_rfc4571_frames(buf: &[u8]) -> u64 {
-    let mut count = 0;
-    let mut offset = 0;
-    while offset + 2 <= buf.len() {
-        let len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+    let mut count = 0u64;
+    let mut offset = 0usize;
+    while offset.saturating_add(2) <= buf.len() {
+        let Some(len) = frame_len_at(buf, offset) else {
+            return count.saturating_add(1);
+        };
         if len == 0 {
-            count += 1;
-            break;
+            return count.saturating_add(1);
         }
-        let total = 2 + len;
-        if offset + total > buf.len() {
-            count += 1;
-            break;
+        let total = len.saturating_add(2);
+        if offset.saturating_add(total) > buf.len() {
+            return count.saturating_add(1);
         }
-        count += 1;
-        offset += total;
+        count = count.saturating_add(1);
+        offset = offset.saturating_add(total);
     }
     if offset < buf.len() {
-        count += 1;
+        count = count.saturating_add(1);
     }
     count
 }
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
     use super::*;
     use pulsebeam_core::net::TcpListener;
     use std::{net::IpAddr, time::Duration};
@@ -562,6 +600,108 @@ mod tests {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         crate::testing::run_local(test_host_ip(), test);
+    }
+
+    /// RFC 4571 framing: a 2-byte big-endian length, then that many bytes.
+    ///
+    /// These are boundary cases, not plausible ones. The arithmetic here is
+    /// `offset + 2` and `offset + 2 + len` against a buffer the peer controls,
+    /// so what matters is the buffer ending exactly at, one before, and one
+    /// after each of those, plus a length field large enough to run past the
+    /// end on its own.
+    mod rfc4571_framing {
+        use super::super::{MAX_FRAME_SIZE, count_rfc4571_frames};
+
+        fn frame(len: usize) -> Vec<u8> {
+            let mut v = u16::try_from(len)
+                .unwrap_or(u16::MAX)
+                .to_be_bytes()
+                .to_vec();
+            v.extend(std::iter::repeat_n(0xab, len));
+            v
+        }
+
+        #[test]
+        fn an_empty_buffer_has_no_frames() {
+            assert_eq!(count_rfc4571_frames(&[]), 0);
+        }
+
+        #[test]
+        fn a_lone_length_byte_is_not_yet_a_frame() {
+            assert_eq!(count_rfc4571_frames(&[0x00]), 1, "counted as a partial");
+        }
+
+        #[test]
+        fn whole_frames_are_counted_exactly() {
+            for n in [1usize, 2, 7, MAX_FRAME_SIZE] {
+                assert_eq!(count_rfc4571_frames(&frame(n)), 1, "single frame of {n}");
+                let mut two = frame(n);
+                two.extend(frame(n));
+                assert_eq!(count_rfc4571_frames(&two), 2, "two frames of {n}");
+            }
+        }
+
+        #[test]
+        fn a_zero_length_frame_terminates_the_scan() {
+            let mut buf = vec![0x00, 0x00];
+            buf.extend(frame(4));
+            assert_eq!(count_rfc4571_frames(&buf), 1);
+        }
+
+        #[test]
+        fn a_payload_one_byte_short_counts_as_partial() {
+            let mut buf = frame(8);
+            buf.pop();
+            assert_eq!(count_rfc4571_frames(&buf), 1);
+        }
+
+        /// The length field is 16 bits and the buffer is not, so a peer can
+        /// always claim more than it sent. `offset + 2 + len` must not run past
+        /// the end or wrap.
+        #[test]
+        fn a_length_larger_than_the_buffer_does_not_run_off_the_end() {
+            for claimed in [1u16, 1024, u16::MAX] {
+                let mut buf = claimed.to_be_bytes().to_vec();
+                buf.push(0xab);
+                assert_eq!(count_rfc4571_frames(&buf), 1, "claimed {claimed}");
+            }
+        }
+
+        /// Every truncation of a well-formed two-frame stream, which walks the
+        /// buffer end across both header boundaries and both payload interiors.
+        #[test]
+        fn every_prefix_of_a_valid_stream_is_counted_without_panicking() {
+            let mut full = frame(3);
+            full.extend(frame(5));
+            for cut in 0..=full.len() {
+                let n = count_rfc4571_frames(&full[..cut]);
+                assert!(
+                    usize::try_from(n).expect("count fits usize") <= full.len(),
+                    "prefix of {cut} reported {n} frames"
+                );
+            }
+            assert_eq!(count_rfc4571_frames(&full), 2);
+        }
+
+        /// Adversarial bytes rather than well-formed ones: the scan must
+        /// terminate and stay in bounds whatever the length fields say.
+        #[test]
+        fn arbitrary_bytes_never_panic_or_hang() {
+            let mut state = 0x2545_f491_4f6c_dd1du64;
+            for _ in 0..2_000 {
+                let len = (state % 40) as usize;
+                let buf: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        u8::try_from((state >> 24) & 0xff).expect("masked to a byte")
+                    })
+                    .collect();
+                let n = count_rfc4571_frames(&buf);
+                assert!(usize::try_from(n).expect("count fits usize") <= buf.len().max(1));
+            }
+        }
     }
 
     fn test_host_ip() -> IpAddr {
@@ -601,7 +741,8 @@ mod tests {
             let p2 = b"packet2-longer";
             let mut frame_bytes = Vec::new();
             for p in [p1.as_slice(), p2.as_slice()] {
-                frame_bytes.extend_from_slice(&(p.len() as u16).to_be_bytes());
+                let plen = u16::try_from(p.len()).expect("test frame fits a length prefix");
+                frame_bytes.extend_from_slice(&plen.to_be_bytes());
                 frame_bytes.extend_from_slice(p);
             }
             client.write_all(&frame_bytes).await.unwrap();
@@ -658,8 +799,8 @@ mod tests {
             // Build the RFC 4571-framed wire bytes (length header + payload) exactly
             // as read_first_tcp_frame would produce them.
             let mut wire = Vec::with_capacity(2 + payload.len());
-            wire.push((payload.len() >> 8) as u8);
-            wire.push(payload.len() as u8);
+            let plen = u16::try_from(payload.len()).expect("test frame fits a length prefix");
+            wire.extend_from_slice(&plen.to_be_bytes());
             wire.extend_from_slice(&payload);
 
             sock.add_connection(

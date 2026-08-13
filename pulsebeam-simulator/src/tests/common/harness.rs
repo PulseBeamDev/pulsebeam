@@ -1,16 +1,19 @@
-use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, VideoReceiveStats};
-use crate::tests::common::{
-    reserve_subnet, run_sim_or_timeout, start_sfu_node, start_sfu_node_tcp_only,
-    start_sfu_node_tcp_only_multi_shard, subnet_ip,
+use crate::tests::common::client::{
+    AudioReceiveLog, MAX_CONCEALABLE_GAP, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
+use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+// Process-wide shimmed clock, not tokio's: turmoil virtualises `tokio::time::Instant` per host,
+// so a stamp taken on the coordinator cannot be compared with one taken inside a participant.
+// That mismatch reported every time-to-first-frame as ~5s regardless of what happened.
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -36,6 +39,18 @@ pub struct Participant {
     pub subscribes: bool,
     /// Whether a receiving participant subscribes to newly discovered tracks automatically.
     pub auto_subscribe: bool,
+    /// How many speakers this participant can receive at once. Zero receives no audio.
+    ///
+    /// The receiving end of the SFU's speaker selection: it forwards the loudest few, and this is
+    /// how many "few" is for this listener.
+    pub audio_slots: usize,
+    /// Publish audio at this loudness, in negative dBov. `None` publishes no audio.
+    ///
+    /// Separate from the role: a conference participant sends audio *and* video, and the audio
+    /// path is selected independently of the video one.
+    pub audio_level_dbov: Option<i8>,
+    /// Where in its speech cycle this speaker starts, in 20ms packets.
+    pub audio_phase_offset: u64,
     /// Publish a synthetic temporal Dependency Descriptor with this many layers,
     /// so the SFU can exercise decode-target shedding.
     pub temporal_dd: Option<u8>,
@@ -59,6 +74,9 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            audio_level_dbov: None,
+            audio_phase_offset: 0,
+            audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
         }
@@ -75,6 +93,9 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            audio_level_dbov: None,
+            audio_phase_offset: 0,
+            audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
         }
@@ -91,6 +112,9 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            audio_level_dbov: None,
+            audio_phase_offset: 0,
+            audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
         }
@@ -108,6 +132,9 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            audio_level_dbov: None,
+            audio_phase_offset: 0,
+            audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
         }
@@ -133,6 +160,9 @@ impl Participant {
             subscribes: false,
             auto_subscribe: true,
             temporal_dd: None,
+            audio_level_dbov: None,
+            audio_phase_offset: 0,
+            audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
         }
@@ -174,6 +204,35 @@ impl Participant {
     pub fn and_subscribes(mut self) -> Self {
         self.subscribes = true;
         self.slots = self.slots.max(1);
+        self
+    }
+
+    /// Reserve `slots` receive transceivers for audio.
+    ///
+    /// Not a cap on who the SFU forwards: how many speakers are selected is a property of the
+    /// room, so a plan that wants contention needs more speakers than the room has slots, not a
+    /// listener asking for fewer.
+    pub fn hearing(mut self, slots: usize) -> Self {
+        self.audio_slots = slots;
+        self
+    }
+
+    /// Also publish audio, at the given loudness in negative dBov.
+    ///
+    /// Around -30 is someone talking; below about -60 is a quiet room. The SFU ranks speakers by
+    /// this and forwards only the loudest few, so the value decides who gets heard.
+    pub fn speaking_at(mut self, level_dbov: i8) -> Self {
+        self.audio_level_dbov = Some(level_dbov);
+        self
+    }
+
+    /// Talk in turn with another speaker rather than over them.
+    ///
+    /// Two sources at the same loudness and the same phase talk simultaneously forever, so the
+    /// selector ranks them once and never switches. Offsetting one is what makes a slot change
+    /// hands, and slot stealing is where audio is hardest.
+    pub fn taking_turns_after(mut self, packets: u64) -> Self {
+        self.audio_phase_offset = packets;
         self
     }
 
@@ -397,6 +456,44 @@ pub enum Step {
         participant: &'static str,
         quality: VideoQuality,
     },
+    /// Video quality over the last `Step::Run` only, rather than the whole call.
+    ///
+    /// What a cumulative count cannot express: a stream that worked, stopped, and never came
+    /// back still has all its frames. Asking about the window after a disturbance is the only way
+    /// to say "and then it recovered".
+    CheckVideoQualityInterval {
+        description: &'static str,
+        participant: &'static str,
+        quality: VideoQuality,
+    },
+    /// This participant is still the same participant it was - it reconnected, it did not rejoin.
+    ///
+    /// A reconnect keeps the participant id and changes only the connection generation. If the
+    /// client comes back as a new participant instead, everyone else keeps a tile for the old one
+    /// and gains a second for the new: one person, twice on screen.
+    CheckIdentityStable {
+        description: &'static str,
+        participant: &'static str,
+    },
+    /// Exactly these participants are still known to the client - no more, no fewer.
+    ///
+    /// Catches the ghost: somebody who left the room but whose track the SFU keeps announcing, so
+    /// the client keeps a tile, a name and a publication for a person who is not there. A test
+    /// that only checks the living participants are present cannot see it.
+    CheckParticipantsKnown {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [&'static str],
+    },
+    /// Nothing this participant received was thrown away for want of somewhere to put it.
+    ///
+    /// Silent loss inside the client, which is invisible from both ends: the frames are missing at
+    /// the application and present at the wire. Finding 34 such packets once took hand-rolled
+    /// probes at every hop, because nothing measured in between.
+    CheckMediaRouted {
+        description: &'static str,
+        participant: &'static str,
+    },
     /// Assert the publisher has received at most `max` keyframe (PLI) requests.
     /// A constantly climbing count means downstream cannot decode the forwarded
     /// stream — the signature of a broken DD/reassembly path (the "PLI storm").
@@ -420,6 +517,57 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         min_bytes: u64,
+    },
+    /// Exactly these speakers were heard, and no others.
+    ///
+    /// The claim the SFU's speaker selection actually makes. A byte count says audio arrived; only
+    /// naming the speakers says the right ones did, which is the difference between a selector
+    /// that works and one that forwards whoever happens to be first.
+    CheckHeardFrom {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [&'static str],
+    },
+    /// A listener is never handed more audio streams than it has slots, and none of them is torn.
+    ///
+    /// The browser-facing invariant, and the reason the egress SSRC belongs to the slot rather
+    /// than the speaker. libwebrtc answers an SSRC it did not see in the SDP by building a whole
+    /// new `AudioReceiveStream` - a cold NetEq, four kept per m-line and the oldest destroyed - so
+    /// minting one per speaker churns jitter buffers several times a minute to express something a
+    /// browser cannot read anyway: it has one `MediaStreamTrack` per transceiver and routes by
+    /// mid. Worse, when the SDP *did* declare an SSRC, the receiver binds its sink to that one
+    /// specifically and media on any other is decoded and thrown away.
+    ///
+    /// So slots keep their stream whoever is in it, and who that is travels in the assignment.
+    /// What the SFU owes in exchange is a stream that does not tear across the changes: a hole is
+    /// loss to the receiver, however deliberate it was.
+    CheckAudioStreams {
+        description: &'static str,
+        participant: &'static str,
+        /// How many distinct speakers must have been heard, so the plan cannot pass on silence.
+        min_speakers: usize,
+        /// How many RTP streams the listener may be sent - its slot count, never more.
+        max_streams: usize,
+    },
+    /// Where the SFU said each speaker sat, loudest first, at their best moment.
+    ///
+    /// Distinct from `CheckHeardFrom`: that one asserts audio arrived, this one asserts the
+    /// listener was *told* who it was and in what order. The two come apart exactly where the
+    /// bug did - the media can flow while the assignment carrying the speaker's name does not,
+    /// and then no application can attribute a voice to a face.
+    CheckSpeakerRank {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [(&'static str, u32)],
+    },
+    /// At least this many media frames actually crossed a shard boundary.
+    ///
+    /// Guards a cross-shard plan against passing by accident. Placement is a
+    /// hash, so a room can land co-located; delivery then looks identical while
+    /// reaching none of the route or envelope code the plan exists to cover.
+    CheckCrossShardMedia {
+        description: &'static str,
+        min_frames: u64,
     },
     /// Cumulative bytes sent ≥ min_bytes.
     CheckTxBytes {
@@ -610,11 +758,17 @@ pub struct VideoSubscription {
 
 struct ParticipantShared {
     video_rx: Arc<Mutex<VideoReceiveLog>>,
+    audio_rx: Arc<Mutex<AudioReceiveLog>>,
+    paused_publishers: Arc<Mutex<BTreeSet<String>>>,
     tx_bytes: Mutex<u64>,
     rx_bytes: Mutex<u64>,
     connected: Mutex<bool>,
     /// Cumulative keyframe (PLI) requests this participant's publisher received.
     keyframe_requests: Mutex<u64>,
+    unroutable_media_dropped: Mutex<u64>,
+    media_kinds: Mutex<HashMap<String, (bool, bool)>>,
+    /// Every participant id this name has had, oldest first. All but the last are dead identities.
+    incarnations: Mutex<Vec<String>>,
     /// Set to Some(...) once the participant has connected for the first time.
     participant_id: Mutex<Option<String>>,
     /// Operations queued by the coordinator; drained on next drive tick.
@@ -629,10 +783,15 @@ impl ParticipantShared {
     fn new() -> Self {
         Self {
             video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
+            audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
+            paused_publishers: Arc::new(Mutex::new(BTreeSet::new())),
             tx_bytes: Mutex::new(0),
             rx_bytes: Mutex::new(0),
             connected: Mutex::new(false),
             keyframe_requests: Mutex::new(0),
+            unroutable_media_dropped: Mutex::new(0),
+            media_kinds: Mutex::new(HashMap::new()),
+            incarnations: Mutex::new(Vec::new()),
             participant_id: Mutex::new(None),
             pending_ops: Mutex::new(Vec::new()),
             data_received: Mutex::new(HashMap::new()),
@@ -648,7 +807,33 @@ struct ParticipantHandle {
     interval_tx_baseline: u64,
     /// RX bytes at the start of the most recent Step::Run (for interval checks).
     interval_rx_baseline: u64,
+    /// When this participant last asked for a stream. Time-to-first-frame is measured from here,
+    /// not from the start of the plan: the settle steps before a subscription are not time the
+    /// viewer spent waiting.
+    subscribed_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
+    /// Ground truth, from the plan rather than from anything the SFU said.
+    ///
+    /// The room invariant is checked against these: what this participant actually publishes, and
+    /// whether it is currently in the call at all. A client's belief is only interesting next to
+    /// something known to be true.
+    publishes_video: bool,
+    publishes_audio: bool,
+    /// Whether the plan has this participant in the room right now.
+    present: bool,
+    /// How each departure ended, in order: `true` for a graceful leave, `false` for a crash.
+    ///
+    /// Per departure rather than per participant, because a rejoin makes the previous identity
+    /// superseded and how *that* one ended is what decides whether a lingering ghost of it is the
+    /// SFU's fault or the network's.
+    departures: Vec<bool>,
+    /// Whether the last departure was a clean one.
+    ///
+    /// A graceful leave tells the SFU directly, so everyone should know at once and a ghost is a
+    /// bug. A crash is only noticed when the transport times out, which takes seconds and is a
+    /// property of the network rather than of state management - so the invariant does not hold
+    /// anybody to it.
+    departed_cleanly: bool,
 }
 
 impl ParticipantHandle {
@@ -668,11 +853,35 @@ impl ParticipantHandle {
     fn keyframe_requests(&self) -> u64 {
         *self.shared.keyframe_requests.lock().unwrap()
     }
+
+    /// What kinds of media this client believes `publisher_id` is sending.
+    fn media_kinds_of(&self, publisher_id: &str) -> (bool, bool) {
+        *self
+            .shared
+            .media_kinds
+            .lock()
+            .unwrap()
+            .get(publisher_id)
+            .unwrap_or(&(false, false))
+    }
+
+    /// Media this participant received and could not hand to anyone. Should always be zero.
+    fn unroutable_media_dropped(&self) -> u64 {
+        *self.shared.unroutable_media_dropped.lock().unwrap()
+    }
     fn connected(&self) -> bool {
         *self.shared.connected.lock().unwrap()
     }
     fn video_rx(&self) -> VideoReceiveLog {
         self.shared.video_rx.lock().unwrap().clone()
+    }
+
+    fn audio_rx(&self) -> AudioReceiveLog {
+        self.shared.audio_rx.lock().unwrap().clone()
+    }
+
+    fn paused_publishers(&self) -> BTreeSet<String> {
+        self.shared.paused_publishers.lock().unwrap().clone()
     }
 
     fn video_stats_since_interval(&self) -> VideoReceiveStats {
@@ -757,6 +966,15 @@ async fn run_participant(
             }
         }
 
+        // After the role's video slots. Transceivers are reserved in order, so putting audio first
+        // shifts the mids the video paths are matched on and the viewer receives nothing at all.
+        if let Some(level) = config.audio_level_dbov {
+            builder = builder.publish_audio(level, config.audio_phase_offset);
+        }
+        if config.audio_slots > 0 {
+            builder = builder.receive_audio(config.audio_slots);
+        }
+
         if !config.auto_subscribe {
             builder = builder.manual_subscriptions();
         }
@@ -765,16 +983,19 @@ async fn run_participant(
             config.auto_subscribe && (matches!(config.role, Role::Subscriber) || config.subscribes);
         let shared_clone = shared.clone();
         let mut client = builder
+            .with_paused_publishers(shared.paused_publishers.clone())
+            .with_audio_rx(shared.audio_rx.clone())
             .with_video_rx(shared.video_rx.clone())
             .connect(room_name)
             .await?;
 
-        // Capture participant_id after first connect.
+        // A reconnect makes a *new* participant, with a new id, and the plan needs both facts:
+        // which identity is live now, and which ones are dead. A client still holding a dead one
+        // is a ghost, and that is invisible if the harness only remembers the first.
         {
-            let mut id_guard = shared.participant_id.lock().unwrap();
-            if id_guard.is_none() {
-                *id_guard = Some(client.ctx.agent.participant_id().clone());
-            }
+            let id = client.ctx.agent.participant_id().clone();
+            *shared.participant_id.lock().unwrap() = Some(id.clone());
+            shared.incarnations.lock().unwrap().push(id);
         }
         *shared.connected.lock().unwrap() = true;
 
@@ -835,7 +1056,6 @@ async fn run_participant(
                                     if incoming_tracks.send(track).await.is_err() {
                                         // The client is shutting down and no longer reading; the
                                         // subscription itself succeeded, so this is not a failure.
-                                        return;
                                     }
                                 });
                             }
@@ -992,9 +1212,18 @@ async fn run_participant(
                     }
                 }
 
-                // 3. Snapshot discovered tracks.
+                // 3. Snapshot discovered tracks, and what kind of media each is believed to have.
                 {
                     *shared_clone.discovered_tracks.lock().unwrap() = ctx.discovered_tracks.clone();
+                    let mut kinds = shared_clone.media_kinds.lock().unwrap();
+                    kinds.clear();
+                    for id in &ctx.discovered_tracks {
+                        let participant = ctx.agent.participant(id.clone());
+                        kinds.insert(
+                            id.clone(),
+                            (participant.has_video(), participant.has_audio()),
+                        );
+                    }
                 }
 
                 // 4. Update stats.
@@ -1004,6 +1233,8 @@ async fn run_participant(
                 *shared_clone.connected.lock().unwrap() = stats.is_connected();
                 *shared_clone.keyframe_requests.lock().unwrap() =
                     stats.keyframe_requests_received();
+                *shared_clone.unroutable_media_dropped.lock().unwrap() =
+                    stats.unroutable_media_dropped();
                 false
             }));
 
@@ -1071,10 +1302,18 @@ fn step_name(step: &Step) -> &'static str {
         Step::DeclareOrderedSubscriber { .. } => "DeclareOrderedSubscriber",
         Step::PublishOrdered { .. } => "PublishOrdered",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
+        Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
+        Step::CheckMediaRouted { .. } => "CheckMediaRouted",
+        Step::CheckParticipantsKnown { .. } => "CheckParticipantsKnown",
+        Step::CheckIdentityStable { .. } => "CheckIdentityStable",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
+        Step::CheckHeardFrom { .. } => "CheckHeardFrom",
+        Step::CheckSpeakerRank { .. } => "CheckSpeakerRank",
+        Step::CheckAudioStreams { .. } => "CheckAudioStreams",
+        Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
         Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
@@ -1123,6 +1362,13 @@ async fn execute_plan(
                 pulsebeam_runtime::net::shaper::reset_stats_for(name_to_ip.values().copied());
                 window = *duration;
                 tokio::time::sleep(*duration).await;
+                // Every plan, every run step, every participant. A settled room is the only place
+                // this is fair to ask - discovery and teardown both need a moment - and a
+                // `Step::Run` is exactly that moment. Short runs are skipped: under a second is
+                // not settling, it is a pause mid-transition.
+                if *duration >= ROOM_SETTLE_FLOOR {
+                    assert_room_state_consistent(handles, description);
+                }
             }
 
             Step::Report {
@@ -1253,6 +1499,9 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = true;
+                handle.departed_cleanly = true;
                 handle.send_command(ParticipantCmd::Reconnect);
             }
 
@@ -1262,6 +1511,10 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = false;
+                handle.departed_cleanly = true;
+                handle.departures.push(true);
                 handle.send_command(ParticipantCmd::Shutdown);
             }
 
@@ -1271,6 +1524,10 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = false;
+                handle.departed_cleanly = false;
+                handle.departures.push(false);
                 handle.send_command(ParticipantCmd::Drop);
             }
 
@@ -1280,6 +1537,9 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Ground truth for the room invariant, from the plan rather than the wire.
+                handle.present = true;
+                handle.departed_cleanly = true;
                 handle.send_command(ParticipantCmd::Reconnect);
             }
 
@@ -1290,6 +1550,8 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 handle
                     .shared
                     .pending_ops
@@ -1307,7 +1569,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
                 );
                 let mut subs: Vec<VideoSubscription> = Vec::new();
-                for (name, height) in targets.iter() {
+                for (name, height) in *targets {
                     let pub_handle = get_handle(handles, name, description)?;
                     let id = pub_handle.shared.participant_id.lock().unwrap().clone();
                     let id = id.ok_or_else(|| {
@@ -1323,6 +1585,8 @@ async fn execute_plan(
                     });
                 }
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 handle
                     .shared
                     .pending_ops
@@ -1340,7 +1604,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
                 );
                 let mut subs: Vec<VideoSubscription> = Vec::new();
-                for (name, height, min_height, priority) in targets.iter() {
+                for (name, height, min_height, priority) in *targets {
                     let pub_handle = get_handle(handles, name, description)?;
                     let id = pub_handle.shared.participant_id.lock().unwrap().clone();
                     let id = id.ok_or_else(|| {
@@ -1356,6 +1620,8 @@ async fn execute_plan(
                     });
                 }
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 handle
                     .shared
                     .pending_ops
@@ -1373,6 +1639,8 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, heights={heights:?})"
                 );
                 let handle = get_handle(handles, participant, description)?;
+                // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
+                handle.subscribed_at.get_or_insert_with(Instant::now);
                 let mut tracks: Vec<String> = handle
                     .shared
                     .discovered_tracks
@@ -1537,6 +1805,84 @@ async fn execute_plan(
                 assert_video_quality(n, total, description, participant, quality, &log);
             }
 
+            Step::CheckVideoQualityInterval {
+                description,
+                participant,
+                quality,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
+                let stats = handle.video_stats_since_interval();
+                // Only the frame floor. The decodability and continuity bounds are cumulative
+                // counters, and a difference between two of them does not mean what it looks
+                // like; asking about frames arriving in a window is what this exists for.
+                assert!(
+                    stats.frames >= quality.min_frames,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} frames in the last interval\n  actual:       frames={}, keyframes={}\n  note:         a cumulative count would still show every frame from before the\n                disturbance; this asks whether anything arrived after it",
+                    quality.min_frames,
+                    stats.frames,
+                    stats.keyframes,
+                );
+            }
+
+            Step::CheckIdentityStable {
+                description,
+                participant,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
+                let incarnations = handle.shared.incarnations.lock().unwrap().clone();
+                assert_eq!(
+                    incarnations.len(),
+                    1,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     one identity for the whole call\n  actual:       {incarnations:?}\n  note:         it came back as a new participant rather than reconnecting, so\n                everyone else keeps a tile for the old one and gains a second"
+                );
+            }
+
+            Step::CheckParticipantsKnown {
+                description,
+                participant,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {expected:?})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let known: BTreeSet<String> = handle
+                    .shared
+                    .discovered_tracks
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .into_iter()
+                    .collect();
+                let want: BTreeSet<String> = expected
+                    .iter()
+                    .filter_map(|name| {
+                        handles
+                            .get(name)
+                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    known, want,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  still known:  {known:?}\n  note:         anyone here who has left is a ghost - a tile and a name for\n                somebody who is not in the room"
+                );
+            }
+
+            Step::CheckMediaRouted {
+                description,
+                participant,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
+                let dropped = handle.unroutable_media_dropped();
+                assert_eq!(
+                    dropped, 0,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     no media discarded for want of a slot to put it in\n  actual:       {dropped} packets\n  note:         these arrived, were decrypted and demuxed, and then went\n                nowhere - invisible at both ends"
+                );
+            }
+
             Step::CheckConnected {
                 description,
                 participant,
@@ -1590,6 +1936,108 @@ async fn execute_plan(
                 assert!(
                     actual >= *min_bytes,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {min_bytes} bytes (cumulative)\n  actual:       {actual} bytes"
+                );
+            }
+
+            Step::CheckHeardFrom {
+                description,
+                participant,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let audio = handle.audio_rx();
+                let heard = audio.heard_from();
+                let want: BTreeSet<String> =
+                    expected.iter().map(|name| (*name).to_owned()).collect();
+                // Names in the plan are harness names; the wire carries participant ids, so
+                // compare on the ids those names resolve to.
+                let want: BTreeSet<String> = want
+                    .iter()
+                    .filter_map(|name| {
+                        handles
+                            .get(name.as_str())
+                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    heard, want,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  heard from:   {heard:?}\n  per speaker:  {:?}",
+                    audio.by_publisher
+                );
+            }
+
+            Step::CheckAudioStreams {
+                description,
+                participant,
+                min_speakers,
+                max_streams,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, ≥{min_speakers} speakers, ≤{max_streams} streams)"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let audio = handle.audio_rx();
+                let heard = audio.heard_from();
+                assert!(
+                    heard.len() >= *min_speakers,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     ≥ {min_speakers} distinct speakers heard\n  actual:       {}\n  per speaker:  {:?}\n  note:         fewer speakers than slots means no slot was ever stolen, so\n                the plan proved nothing",
+                    heard.len(),
+                    audio.by_publisher
+                );
+                assert!(
+                    audio.by_stream.len() <= *max_streams,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     at most {max_streams} RTP streams, one per slot\n  actual:       {}\n  streams:      {:?}\n  note:         a stream per speaker costs a browser a fresh receive stream and\n                a cold jitter buffer every time a slot changes hands",
+                    audio.by_stream.len(),
+                    audio.by_stream.keys().collect::<Vec<_>>()
+                );
+                for (ssrc, stream) in &audio.by_stream {
+                    assert!(
+                        stream.max_seq_gap <= MAX_CONCEALABLE_GAP,
+                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  stream:       {ssrc}\n  expected:     at most {MAX_CONCEALABLE_GAP} packets missing\n  actual:       a gap of {} packets\n  note:         this plan configures no loss, so a hole in a slot's stream is the\n                SFU splicing two speakers onto it badly",
+                        stream.max_seq_gap
+                    );
+                }
+            }
+
+            Step::CheckSpeakerRank {
+                description,
+                participant,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let ranked = handle.audio_rx().ranked();
+                let want: std::collections::BTreeMap<String, u32> = expected
+                    .iter()
+                    .filter_map(|(name, rank)| {
+                        handles
+                            .get(name)
+                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
+                            .map(|id| (id, *rank))
+                    })
+                    .collect();
+                assert_eq!(
+                    ranked, want,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  signalled:    {ranked:?}"
+                );
+            }
+
+            Step::CheckCrossShardMedia {
+                description,
+                min_frames,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" (min {min_frames} frames)"
+                );
+                let actual = pulsebeam::sim_metrics::cross_shard_media_frames();
+                assert!(
+                    actual >= *min_frames,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     ≥ {min_frames} frames resolved from another shard\n  actual:       {actual}\n  note:         zero means the room was co-located, so no cross-shard\n                path ran at all — the plan proved nothing"
                 );
             }
 
@@ -1770,13 +2218,12 @@ async fn execute_plan(
                 let data_received = handle.shared.data_received.lock().unwrap();
                 let received = data_received
                     .get(*topic)
-                    .map(|v| v.as_slice())
+                    .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
                 let expected_vec = expected.to_vec();
                 assert!(
                     received.contains(&expected_vec),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {:?} in received list\n  actual:       {received:?}",
-                    expected
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {expected:?} in received list\n  actual:       {received:?}"
                 );
             }
 
@@ -1793,13 +2240,12 @@ async fn execute_plan(
                 let data_received = handle.shared.data_received.lock().unwrap();
                 let received = data_received
                     .get(*topic)
-                    .map(|v| v.as_slice())
+                    .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
                 let excluded_vec = excluded.to_vec();
                 assert!(
                     !received.contains(&excluded_vec),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {:?} NOT in received list\n  actual:       {received:?}",
-                    excluded
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {excluded:?} NOT in received list\n  actual:       {received:?}"
                 );
             }
 
@@ -1889,8 +2335,8 @@ async fn execute_plan(
     Ok(())
 }
 
-fn resolve<'a>(
-    map: &'a HashMap<&'static str, IpAddr>,
+fn resolve(
+    map: &HashMap<&'static str, IpAddr>,
     name: &str,
     step_desc: &str,
 ) -> anyhow::Result<IpAddr> {
@@ -1908,6 +2354,99 @@ fn get_handle<'a>(
         .get_mut(name)
         .ok_or_else(|| anyhow::anyhow!("step \"{step_desc}\": unknown participant \"{name}\""))
 }
+
+/// What every client must believe about the room, checked against what the plan actually did.
+///
+/// Run after every `Step::Run` of every plan, for every participant, rather than opted into by the
+/// plans that happen to think of it. State-management bugs do not announce themselves: a ghost
+/// participant, or somebody counted twice, looks exactly like a passing test to any assertion
+/// aimed at bitrate or frames. The two failures this exists for both shipped and were found by
+/// hand.
+///
+/// Deliberately only the *safety* half. "Everyone who should be known is known" is liveness and
+/// depends on discovery timing, which would make this flake; what it asserts is that nothing is
+/// known that should not be, and that whatever is known is described correctly.
+fn assert_room_state_consistent(handles: &HashMap<&'static str, ParticipantHandle>, after: &str) {
+    // Every participant id the plan has ever created, and what it means now.
+    #[derive(Clone, Copy)]
+    enum Identity {
+        /// The participant's current id, and they are in the room.
+        Live,
+        /// The current id of somebody the plan has removed.
+        Departed,
+        /// An id from before a reconnect. That person exists, but not under this name any more.
+        Superseded,
+        /// Gone without saying so. Nothing is asserted: detection is a timeout, not a message.
+        Vanished,
+    }
+    let mut identities: HashMap<String, (&'static str, Identity)> = HashMap::new();
+    for (name, handle) in handles {
+        let incarnations = handle.shared.incarnations.lock().unwrap().clone();
+        let last = incarnations.len().saturating_sub(1);
+        for (i, id) in incarnations.into_iter().enumerate() {
+            let state = if i < last {
+                // Superseded, but only strictly if that incarnation ended by saying so. One that
+                // crashed is found out by timeout like any other.
+                if handle.departures.get(i).copied().unwrap_or(true) {
+                    Identity::Superseded
+                } else {
+                    Identity::Vanished
+                }
+            } else if handle.present {
+                Identity::Live
+            } else if handle.departed_cleanly {
+                Identity::Departed
+            } else {
+                // Crashed. The SFU only finds out when the transport times out, so how long a
+                // ghost lingers is a fact about the network. Not this invariant's business.
+                Identity::Vanished
+            };
+            identities.insert(id, (*name, state));
+        }
+    }
+
+    for (observer, handle) in handles {
+        // Only ask this of clients that are still running. A participant who has left stopped
+        // updating its view the moment it went, so its last snapshot is stale by construction -
+        // holding it to the room's current membership would report a ghost on every plan that
+        // ends by disconnecting everybody.
+        if !handle.present {
+            continue;
+        }
+        let known = handle.shared.discovered_tracks.lock().unwrap().clone();
+        for id in &known {
+            let Some((name, state)) = identities.get(id).copied() else {
+                panic!(
+                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {id}\n  problem:      no participant in this plan has ever had that id\n  note:         a client holding an id nobody owns is state invented from\n                nowhere - a tile for somebody who never existed"
+                );
+            };
+            match state {
+                // Live is fine; Vanished is a crash, whose detection is a timeout rather than a
+                // message, so how long the ghost lingers is a fact about the network.
+                Identity::Live | Identity::Vanished => {}
+                Identity::Departed => panic!(
+                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {name} ({id})\n  problem:      {name} has left the room\n  note:         a ghost - a tile, a name and a publication for somebody who\n                is not in the call"
+                ),
+                Identity::Superseded => panic!(
+                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {id}\n  problem:      that is {name}'s identity from before they reconnected\n  note:         a ghost of an earlier incarnation - {name} is in the room, but\n                under a new id, so this is a second tile for one person"
+                ),
+            }
+            let Some(subject) = handles.get(name) else {
+                continue;
+            };
+            let (video, _audio) = handle.media_kinds_of(id);
+            assert_eq!(
+                video, subject.publishes_video,
+                "\nroom state inconsistent after {after}\n  observer:     {observer}\n  subject:      {name}\n  believes video: {video}, actually publishes video: {}\n  note:         a participant believed to send video that does not is a phantom\n                tile; announcing audio in `tracks_upsert` caused exactly this,\n                and put anyone sending both on screen twice",
+                subject.publishes_video
+            );
+        }
+    }
+}
+
+/// A `Step::Run` shorter than this is a pause mid-transition, not a settled room, so the state
+/// invariant is not asked of it. Signalling a join or a departure is a round trip or two.
+const ROOM_SETTLE_FLOOR: Duration = Duration::from_secs(1);
 
 fn assert_video_quality(
     n: usize,
@@ -1967,6 +2506,12 @@ fn assert_video_quality(
 /// would be exactly the kind of quietly-wrong assertion this type exists to remove. Use
 /// [`Property::EstimateStable`] and [`Property::QueueingDelayBelow`] on scheduled links.
 #[derive(Clone, Copy, Debug)]
+// A vocabulary of assertions a plan may make, not a set of call sites. Each
+// variant is implemented and documented with the regime it is fair in; a
+// variant no current plan happens to use is a claim available to the next one,
+// which is the opposite of dead code. Deleting the unused ones would leave the
+// suite able to express only what it already asserts.
+#[allow(dead_code)]
 pub enum Property {
     /// Video frames decoded during the last run after a complete, parameterized keyframe.
     VideoDecodes,
@@ -2016,7 +2561,19 @@ pub enum Property {
     ///
     /// Bufferbloat: a controller can hold a link perfectly full while parking hundreds of
     /// milliseconds of queue. That looks healthy in throughput and is unusable for a call.
+    ///
+    /// The *standing* queue, not the deepest moment. A peak is one sample, and every link that
+    /// ever filled has a high one - so bounding it fails a controller that dipped into the buffer
+    /// once on the way to behaving well, and passes one that sits at 90ms forever. Those are
+    /// opposite verdicts on the thing this property exists to catch. Use
+    /// [`Property::PeakQueueingDelayBelow`] where the transient genuinely is the claim.
     QueueingDelayBelow(Duration),
+    /// The deepest queue occupancy reached, at any instant.
+    ///
+    /// A strictly stronger and much noisier claim than [`Property::QueueingDelayBelow`]: fair
+    /// only where a plan holds capacity steady, since a controller cannot shed rate before
+    /// observing a capacity it has not yet been told about.
+    PeakQueueingDelayBelow(Duration),
     /// At most this percent of offered packets were dropped by a full bottleneck buffer.
     ///
     /// Congestion drops only, distinct from configured link loss: this is the controller
@@ -2054,7 +2611,10 @@ pub enum Property {
     /// other layer assertion here is a floor, and the byte-rate ceiling that stood in for this one
     /// cannot tell a stream forwarded at the wrong rung from one forwarded at the right rung with
     /// a busier picture. This reads the highest rank actually forwarded.
-    NeverForwardedAbove { origin: &'static str, max_quality: u8 },
+    NeverForwardedAbove {
+        origin: &'static str,
+        max_quality: u8,
+    },
     /// At least this percent of the bytes the viewer received were media payload.
     ///
     /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
@@ -2082,6 +2642,116 @@ fn pct(part: f64, whole: f64) -> f64 {
 /// Separate from its formatting on purpose. A property needs to *compute* over these numbers, and
 /// a randomised scenario needs to return them rather than assert inline, so the measurement has
 /// to exist as data. Rendering it for a human is a second, lesser job.
+/// What a viewer actually experienced, as distinct from what the link carried.
+///
+/// One vocabulary, and below it one definition of the bar, because the alternative is what this
+/// suite had: every plan inventing its own scalar check, none of them describing a picture. Bytes,
+/// bitrates and layer indices are all invisible to a user. These are not.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Qoe {
+    pub frames: u64,
+    pub keyframes: u64,
+    /// Keyframes without SPS+PPS. Each is a stretch the decoder could not render.
+    pub undecodable_keyframes: u64,
+    /// Frames preceded by a sequence hole: visible corruption rather than a clean picture.
+    pub torn_frames: u64,
+    /// From subscribing to the first frame on screen. `None` if nothing ever rendered.
+    pub time_to_first_frame: Option<Duration>,
+    pub longest_freeze: Duration,
+    /// Time spent frozen as a fraction of the measured window.
+    pub freeze_ratio: f64,
+    pub mean_fps: f64,
+}
+
+/// What a viewer would say about a stream.
+///
+/// Deliberately three-valued. "Delivered / not delivered" is the distinction the suite used to
+/// make, and it cannot express the failure that matters most: a stream that is technically
+/// arriving and still unwatchable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Experience {
+    /// Nothing ever rendered. The tile is blank.
+    Blank,
+    /// Rendered, but a viewer would call it broken. Carries which bar it missed.
+    Broken(String),
+    Watchable,
+}
+
+/// What the source is sending, which decides what "watchable" even means.
+///
+/// A framerate floor is right for a camera and wrong for a screen share: a still screen is
+/// *supposed* to send almost nothing, and a bar that ignores that reports a defect on every
+/// screenshare plan. The first run of this check did exactly that - 3.3 fps from a static share on
+/// an 8 Mbps link, flagged as a slideshow when it was correct behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Content {
+    /// A camera: continuous motion, so a framerate floor applies.
+    Motion,
+    /// A screen share: long still stretches are the normal case, so only freezes that a viewer
+    /// would notice as *unresponsive* count, not a low frame count.
+    Static,
+}
+
+impl Qoe {
+    /// The bar, in one place.
+    ///
+    /// Every figure here is a perceptual claim rather than a tuning knob, each set where a viewer
+    /// changes their mind about whether the call is working. Change them here and every plan and
+    /// property moves together; that is the point of having one definition.
+    pub fn experience(&self, content: Content) -> Experience {
+        if self.frames == 0 {
+            return Experience::Blank;
+        }
+        if self.undecodable_keyframes > 0 {
+            return Experience::Broken(format!(
+                "{} keyframes arrived without parameter sets, so they did not render",
+                self.undecodable_keyframes
+            ));
+        }
+        if let Some(ttff) = self.time_to_first_frame
+            && ttff > MAX_TIME_TO_FIRST_FRAME
+        {
+            return Experience::Broken(format!(
+                "first frame took {ttff:?}; a viewer has already decided it is broken"
+            ));
+        }
+        // Freezes are only meaningful for a source that is supposed to be sending. A still screen
+        // share is *supposed* to go quiet, and judging it by gaps flags correct behaviour on
+        // every screenshare plan - the same mistake the framerate floor made before it learned
+        // about content.
+        if content == Content::Motion && self.longest_freeze > MAX_FREEZE {
+            return Experience::Broken(format!(
+                "froze for {:?} in one stretch",
+                self.longest_freeze
+            ));
+        }
+        if content == Content::Motion && self.freeze_ratio > MAX_FREEZE_RATIO {
+            return Experience::Broken(format!(
+                "spent {:.0}% of the window frozen",
+                self.freeze_ratio * 100.0
+            ));
+        }
+        if content == Content::Motion && self.mean_fps < MIN_FPS {
+            return Experience::Broken(format!(
+                "delivered {:.1} fps, which reads as a slideshow rather than video",
+                self.mean_fps
+            ));
+        }
+        Experience::Watchable
+    }
+}
+
+/// A viewer waiting this long for a first frame has concluded the call is broken.
+pub const MAX_TIME_TO_FIRST_FRAME: Duration = Duration::from_secs(5);
+/// One unbroken stretch of stillness a viewer calls a freeze rather than a stutter.
+pub const MAX_FREEZE: Duration = Duration::from_secs(3);
+/// Fraction of a session that may be frozen before it is not a call.
+pub const MAX_FREEZE_RATIO: f64 = 0.15;
+/// Below this a camera reads as a slideshow. Well under any sane encoder target, so it catches a
+/// stream that has fallen apart rather than one that shed a layer. Not applied to a screen share:
+/// see [`Content`].
+pub const MIN_FPS: f64 = 5.0;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinkReport {
     /// Configured capacity, and whether it held still for the window. Utilisation and the
@@ -2103,6 +2773,28 @@ pub struct LinkReport {
     pub demand_min_bps: u64,
     pub demand_max_bps: u64,
     pub max_backlog: Duration,
+    /// The queue a packet typically waited behind, as distinct from the worst moment.
+    pub standing_backlog: Duration,
+    /// Longest gap between consecutive delivered video frames, once the stream had started.
+    pub longest_silence: Duration,
+    /// What this listener heard, per speaker.
+    ///
+    /// The SFU forwards only the loudest few speakers, so "was audio delivered" is the wrong
+    /// question and "from whom" is the right one. A total byte count cannot distinguish the
+    /// selector picking correctly from it picking at all.
+    pub audio: AudioReceiveLog,
+    /// Publishers this viewer was *told* the SFU had stopped forwarding.
+    ///
+    /// A stream that stops is either paused or broken, and the media cannot tell you which. The
+    /// difference decides whether a UI can show a placeholder or has to leave the tile blank.
+    pub signalled_paused: BTreeSet<String>,
+    /// What the decoder made of the stream, as distinct from what the link carried.
+    ///
+    /// Every other figure here is about bytes and bitrates, and a viewer cannot see bytes. A
+    /// stream can arrive at the right rate, on the right layer, and still render nothing: a
+    /// keyframe without its parameter sets is not decodable, and the picture stays blank while
+    /// every byte-level measure looks healthy.
+    pub qoe: Qoe,
     pub delivered_packets: u64,
     pub congestion_drops: u64,
     pub link_loss_drops: u64,
@@ -2146,6 +2838,7 @@ impl LinkReport {
 
     /// Media payload as a percentage of bytes received. Exceeds 100% under loss - see
     /// [`Property::MediaEfficiencyAtLeast`].
+    #[allow(dead_code)] // Report accessor, kept alongside the rest of the surface.
     pub fn media_percent(&self) -> f64 {
         pct(
             self.forwarded_media_bytes as f64,
@@ -2158,6 +2851,44 @@ impl LinkReport {
     pub fn need_bps(&self) -> u64 {
         self.demand_last_bps
             .min(self.capacity_bps.unwrap_or(u64::MAX))
+    }
+}
+
+/// Derive what the viewer experienced. One place, so the scoreboard and the assertions can never
+/// disagree about what was measured.
+fn qoe_of(handle: &ParticipantHandle, _window: Duration) -> Qoe {
+    // Session-scoped, deliberately, where the rest of the report is window-scoped. A viewer
+    // experiences a call, not a measurement window: a freeze in an earlier step still happened to
+    // them, and time-to-first-frame has no meaning inside a later window at all. Mixing the two
+    // reported a 5s freeze as 0% of the session, because a cumulative maximum sat next to a
+    // per-window total.
+    let video = handle.video_rx().stats();
+    // The span the stream was actually live for, taken from the frame timestamps themselves. A
+    // clock read on the coordinator belongs to a different host's epoch and gave a denominator
+    // that silently swallowed every freeze.
+    let seconds = video
+        .first_frame_at
+        .zip(video.last_frame_at)
+        .map(|(first, last)| last.saturating_duration_since(first).as_secs_f64())
+        .unwrap_or(0.0)
+        .max(f64::EPSILON);
+    Qoe {
+        frames: video.frames,
+        keyframes: video.keyframes,
+        undecodable_keyframes: video.missing_parameter_sets,
+        torn_frames: video.non_contiguous,
+        // Only where the plan issued an explicit subscription. Falling back to the moment the
+        // participant was created measured the plan's own scaffolding instead: nearly every plan
+        // opens with a five-second "establish connection" step, and that reference put the median
+        // time-to-first-frame at 5.18s across the whole suite - an artefact, not a product
+        // latency.
+        time_to_first_frame: handle
+            .subscribed_at
+            .zip(video.first_frame_at)
+            .map(|(asked, shown)| shown.saturating_duration_since(asked)),
+        longest_freeze: video.longest_frame_gap,
+        freeze_ratio: (video.frozen_time.as_secs_f64() / seconds).clamp(0.0, 1.0),
+        mean_fps: video.frames as f64 / seconds,
     }
 }
 
@@ -2178,6 +2909,8 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         }
     }
 
+    let qoe = qoe_of(handle, window);
+
     LinkReport {
         capacity_bps: pulsebeam_runtime::net::shaper::capacity_at(ip, now),
         capacity_fixed: pulsebeam_runtime::net::shaper::capacity_is_fixed(ip),
@@ -2195,6 +2928,11 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         demand_min_bps: series.iter().map(|(_, _, d)| *d).min().unwrap_or(0),
         demand_max_bps: series.iter().map(|(_, _, d)| *d).max().unwrap_or(0),
         max_backlog: stats.max_backlog,
+        standing_backlog: stats.mean_backlog(),
+        longest_silence: qoe.longest_freeze,
+        qoe,
+        signalled_paused: handle.paused_publishers(),
+        audio: handle.audio_rx(),
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
@@ -2205,6 +2943,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
 }
 
 fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> String {
+    let qoe_now = qoe_of(handle, window);
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
     let capacity = pulsebeam_runtime::net::shaper::capacity_at(ip, now);
@@ -2282,7 +3021,16 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
 
     let offered = stats.delivered + stats.dropped_overflow;
     out.push_str(&format!(
-        " | queue max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {} | media {:.1}%",
+        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
+        qoe_now.frames,
+        qoe_now.mean_fps,
+        qoe_now.keyframes,
+        qoe_now.undecodable_keyframes,
+        qoe_now.torn_frames,
+        qoe_now.time_to_first_frame,
+        qoe_now.longest_freeze,
+        qoe_now.freeze_ratio * 100.0,
+        stats.mean_backlog(),
         stats.max_backlog,
         pct(stats.dropped_overflow as f64, offered as f64),
         stats.dropped_overflow,
@@ -2482,10 +3230,22 @@ fn check_property(
             }
         }
         Property::QueueingDelayBelow(max) => {
+            let standing = stats.mean_backlog();
+            if standing > max {
+                return Err(format!(
+                    "bottleneck queue stood at {standing:?}; expected below {max:?} \
+                     (peaked at {:?})",
+                    stats.max_backlog
+                ));
+            }
+        }
+        Property::PeakQueueingDelayBelow(max) => {
             if stats.max_backlog > max {
                 return Err(format!(
-                    "bottleneck queue reached {:?}; expected below {max:?}",
-                    stats.max_backlog
+                    "bottleneck queue reached {:?}; expected below {max:?} \
+                     (standing at {:?})",
+                    stats.max_backlog,
+                    stats.mean_backlog()
                 ));
             }
         }
@@ -2503,7 +3263,10 @@ fn check_property(
         Property::QualityChangesPerMinuteBelow { origin, max } => {
             // Resolved here rather than read off the report: the report's map is filled by the
             // end-of-plan scoreboard, which has not run yet mid-plan.
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2521,7 +3284,10 @@ fn check_property(
             }
         }
         Property::QualityReversalsBelow { origin, max } => {
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2541,7 +3307,10 @@ fn check_property(
             origin,
             max_quality,
         } => {
-            let Some(id) = handles.get(origin).and_then(|h| h.participant_id()) else {
+            let Some(id) = handles
+                .get(origin)
+                .and_then(ParticipantHandle::participant_id)
+            else {
                 return Err(format!(
                     "{origin} has no runtime participant id yet; add a Step::Run before this step"
                 ));
@@ -2742,6 +3511,7 @@ pub struct LocalNodeSim {
     tcp_only: bool,
     num_shards: usize,
     link: LinkProfile,
+    buggify_permille: u32,
 }
 
 impl Default for LocalNodeSim {
@@ -2755,10 +3525,11 @@ impl LocalNodeSim {
         Self {
             rooms: Vec::new(),
             tick_duration: Duration::from_millis(1),
-            rng_seed: 0xDEAD_BEEF,
+            rng_seed: super::sim_seed(),
             subnet: None,
             tcp_only: false,
             num_shards: 1,
+            buggify_permille: 0,
             link: LinkProfile::default(),
         }
     }
@@ -2797,6 +3568,16 @@ impl LocalNodeSim {
         self
     }
 
+    /// Inject failures at declared points, `permille` parts per thousand.
+    ///
+    /// Off everywhere else, so the rest of the suite keeps asserting against a system where
+    /// nothing unexpected fails. A plan that turns this on is asserting something different: that
+    /// the recovery paths hold, not that the happy path is correct.
+    pub fn with_buggify(mut self, permille: u32) -> Self {
+        self.buggify_permille = permille;
+        self
+    }
+
     #[allow(unused)]
     pub fn with_rng_seed(mut self, seed: u64) -> Self {
         self.rng_seed = seed;
@@ -2809,10 +3590,14 @@ impl LocalNodeSim {
         self
     }
 
-    /// Use N worker shards (implies tcp_only).
+    /// Spread the node across N worker shards.
+    ///
+    /// Independent of [`Self::with_tcp_only`]. Over UDP the shard a datagram
+    /// reaches is chosen by the `SO_REUSEPORT` group, which hashes its 4-tuple
+    /// exactly as the kernel does — so a plan that sets this is also exercising
+    /// the demuxer's shard check and the arrival path a real deployment uses.
     pub fn with_shards(mut self, n: usize) -> Self {
         self.num_shards = n;
-        self.tcp_only = true;
         self
     }
 
@@ -2840,6 +3625,16 @@ impl LocalNodeSim {
         // real clock is back in force before the runtime tears down.
         let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
         crate::sim_rand::set_thread_rng(self.rng_seed);
+        // Loss, reordering and duplication come from the shaper's own stream, not
+        // from turmoil's RNG, so it has to be seeded too or a sweep replays one
+        // impairment pattern under every seed.
+        pulsebeam_runtime::net::shaper::seed_impairments(self.rng_seed);
+        pulsebeam_runtime::buggify::enable(self.buggify_permille, self.rng_seed);
+        tracing::info!(
+            seed = self.rng_seed,
+            "simulation plan seed; replay with `make test-sim-seed SEED={}`",
+            self.rng_seed
+        );
 
         let sim_duration = plan
             .iter()
@@ -2871,17 +3666,9 @@ impl LocalNodeSim {
 
         sim.host(server_ip, move || async move {
             let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-            if tcp_only && num_shards > 1 {
-                start_sfu_node_tcp_only_multi_shard(server_ip, rng)
-                    .await
-                    .map_err(Into::into)
-            } else if tcp_only {
-                start_sfu_node_tcp_only(server_ip, rng)
-                    .await
-                    .map_err(Into::into)
-            } else {
-                start_sfu_node(server_ip, rng).await.map_err(Into::into)
-            }
+            start_sfu_node_with(server_ip, rng, num_shards, tcp_only)
+                .await
+                .map_err(Into::into)
         });
 
         let mut handles: HashMap<&'static str, ParticipantHandle> = HashMap::new();
@@ -2935,7 +3722,14 @@ impl LocalNodeSim {
                         cmd_tx,
                         interval_tx_baseline: 0,
                         interval_rx_baseline: 0,
+                        subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
+                        publishes_video: matches!(participant.role, Role::Publisher)
+                            || participant.subscribes && !participant.rids.is_empty(),
+                        publishes_audio: participant.audio_level_dbov.is_some(),
+                        present: !participant.starts_disconnected,
+                        departed_cleanly: true,
+                        departures: Vec::new(),
                     },
                 );
 
@@ -2962,7 +3756,6 @@ impl LocalNodeSim {
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);
         run_sim_or_timeout(&mut sim, wall_budget).expect("simulation failed");
 
-        let out = reports.lock().expect("reports poisoned").clone();
-        out
+        reports.lock().expect("reports poisoned").clone()
     }
 }

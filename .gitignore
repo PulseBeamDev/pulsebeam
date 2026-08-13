@@ -6,4 +6,12 @@ dist
 *.data.old
 venv
 workspace.lock.json
-proptest-regressions/
+
+# Scratch logs and dumps. A 421 MB capture reached a commit once, so the rule
+# is blanket; the committed artifacts below are exempted.
+*.txt
+!bwe-baseline.txt
+# proptest writes a failing case here and replays it before any new case, so it
+# is only useful checked in — otherwise a failure found in CI dies with the
+# runner. The blanket rule above would swallow it.
+!**/proptest-regressions/**

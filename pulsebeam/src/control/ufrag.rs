@@ -73,7 +73,7 @@ impl IceUfrag {
         raw[0] = (VERSION << 4) | ((self.cluster_id >> 8) as u8 & 0x0f);
         raw[1] = (self.cluster_id & 0xff) as u8;
         raw[2..4].copy_from_slice(&self.node_id.to_be_bytes());
-        raw[4] = self.shard_id.index() as u8;
+        raw[4] = u8::try_from(self.shard_id.index()).unwrap_or(u8::MAX);
         // bytes 5-8: reserved, already zero
         raw[9..25].copy_from_slice(self.participant_id.as_bytes());
         base32::encode(base32::Alphabet::Crockford, &raw)
@@ -86,14 +86,16 @@ impl IceUfrag {
         if raw.len() != RAW_LEN {
             return None;
         }
-        let version = raw[0] >> 4;
-        if version != VERSION {
+        let [c_hi, c_lo, n0, n1, shard, ..] = raw[..] else {
+            return None;
+        };
+        if c_hi >> 4 != VERSION {
             return None;
         }
-        let cluster_id = (((raw[0] & 0x0f) as u16) << 8) | (raw[1] as u16);
-        let node_id = u16::from_be_bytes([raw[2], raw[3]]);
-        let shard_id = ShardId::new(raw[4] as usize);
-        let participant_id = ParticipantId::from_bytes(raw[9..25].try_into().ok()?);
+        let cluster_id = (u16::from(c_hi & 0x0f) << 8) | u16::from(c_lo);
+        let node_id = u16::from_be_bytes([n0, n1]);
+        let shard_id = ShardId::new(usize::from(shard));
+        let participant_id = ParticipantId::from_bytes(raw.get(9..25)?.try_into().ok()?);
         Some(Self {
             cluster_id,
             node_id,
@@ -117,6 +119,9 @@ impl IceUfrag {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use pulsebeam_runtime::rand::os_rng;
 
@@ -153,7 +158,7 @@ mod tests {
         // Crockford '1' encodes as 0x01, so replacing the first char with
         // a value whose high nibble is non-zero is simplest via raw bytes.
         let raw = base32::decode(base32::Alphabet::Crockford, &encoded).unwrap();
-        let mut bad = raw.clone();
+        let mut bad = raw;
         bad[0] = 0x10; // version = 1
         encoded = base32::encode(base32::Alphabet::Crockford, &bad);
         assert!(IceUfrag::decode(&encoded).is_none());

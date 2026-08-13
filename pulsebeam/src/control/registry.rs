@@ -141,6 +141,9 @@ impl RoomRegistry {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::ExternalRoomId;
     use pulsebeam_runtime::rand::seeded_rng;

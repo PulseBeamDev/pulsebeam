@@ -55,26 +55,44 @@ impl SharedH264Asset {
 
     fn frame_has_idr(frame: &[u8]) -> bool {
         let mut i = 0usize;
-        while i + 3 < frame.len() {
-            if frame[i] == 0 && frame[i + 1] == 0 {
-                let header_pos = if frame[i + 2] == 1 {
-                    i + 3
-                } else if i + 4 < frame.len() && frame[i + 2] == 0 && frame[i + 3] == 1 {
-                    i + 4
+        while i.saturating_add(3) < frame.len() {
+            let (Some(&b0), Some(&b1), Some(&b2)) = (
+                frame.get(i),
+                frame.get(i.saturating_add(1)),
+                frame.get(i.saturating_add(2)),
+            ) else {
+                break;
+            };
+            if b0 == 0 && b1 == 0 {
+                let header_pos = if b2 == 1 {
+                    i.saturating_add(3)
+                } else if b2 == 0 && frame.get(i.saturating_add(3)) == Some(&1) {
+                    i.saturating_add(4)
                 } else {
-                    i += 1;
+                    i = i.saturating_add(1);
                     continue;
                 };
-                if header_pos < frame.len() && (frame[header_pos] & 0x1F) == 5 {
+                if frame.get(header_pos).is_some_and(|&b| b & 0x1F == 5) {
                     return true;
                 }
                 i = header_pos;
             } else {
-                i += 1;
+                i = i.saturating_add(1);
             }
         }
         false
     }
+}
+
+/// Convert a computed rate or timestamp to an integer without letting a NaN or
+/// a negative silently become a plausible value — `as u64` yields 0 for both,
+/// which reads downstream as "no bitrate" or "time zero".
+pub(crate) fn saturating_u64_from_f64(v: f64) -> u64 {
+    debug_assert!(v.is_finite(), "{v} is not a finite quantity");
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    v.min(u64::MAX as f64) as u64
 }
 
 /// Rewrite every Annex-B NAL unit type to a non-IDR coded slice (type 1),
@@ -85,15 +103,20 @@ impl SharedH264Asset {
 fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
     const NON_IDR_SLICE: u8 = 1;
     let mut out = frame.to_vec();
-    let mut i = 0;
-    while i + 3 < out.len() {
-        if out[i] == 0 && out[i + 1] == 0 && out[i + 2] == 1 {
-            let header = i + 3;
+    let mut i = 0usize;
+    while i.saturating_add(3) < out.len() {
+        let start_code = out.get(i) == Some(&0)
+            && out.get(i.saturating_add(1)) == Some(&0)
+            && out.get(i.saturating_add(2)) == Some(&1);
+        if start_code {
+            let header = i.saturating_add(3);
             // Keep forbidden_zero_bit + nal_ref_idc, replace only the 5-bit type.
-            out[header] = (out[header] & 0xE0) | NON_IDR_SLICE;
-            i = header + 1;
+            if let Some(byte) = out.get_mut(header) {
+                *byte = (*byte & 0xE0) | NON_IDR_SLICE;
+            }
+            i = header.saturating_add(1);
         } else {
-            i += 1;
+            i = i.saturating_add(1);
         }
     }
     out.into()
@@ -153,8 +176,22 @@ impl H264Looper {
     }
 
     fn next(&mut self) -> Arc<[u8]> {
-        let frame = &self.asset.frames[self.index];
-        self.index = (self.index + 1) % self.asset.frames.len();
+        debug_assert!(
+            self.index < self.asset.frames.len(),
+            "frame cursor left the asset"
+        );
+        let frame = self
+            .asset
+            .frames
+            .get(self.index)
+            .cloned()
+            .unwrap_or_default();
+        let frame = &frame;
+        self.index = self
+            .index
+            .saturating_add(1)
+            .checked_rem(self.asset.frames.len())
+            .unwrap_or(0);
         if self.opaque_payload {
             return opaque_frame(frame);
         }
@@ -170,7 +207,7 @@ impl H264Looper {
         let temporal_layers = self
             .dd
             .as_ref()
-            .map(|src| src.temporal_layers())
+            .map(pulsebeam_core::dd::temporal::TemporalDdSource::temporal_layers)
             .unwrap_or(1);
         let mut interval = tokio::time::interval(frame_interval);
         let mut frame_count: u64 = 0;
@@ -193,9 +230,14 @@ impl H264Looper {
 
             let is_keyframe = self.index == self.asset.first_idr;
             let frame_data = self.next();
-            let next_ts = (frame_count * clock_rate) / self.fps as u64;
+            let next_ts = frame_count
+                .saturating_mul(clock_rate)
+                .checked_div(self.fps as u64)
+                .unwrap_or(0);
 
             let frame = MediaFrame {
+                audio_level: None,
+                voice_activity: None,
                 ts: MediaTime::from_90khz(next_ts),
                 data: frame_data,
                 capture_time: tick_time,
@@ -213,7 +255,7 @@ impl H264Looper {
                     return;
                 }
             }
-            frame_count += 1;
+            frame_count = frame_count.saturating_add(1);
         }
     }
 }
@@ -375,7 +417,7 @@ impl VbrLooper {
             self.profile.idle_target_bps
         } as f64;
         self.declared_bps += (goal - self.declared_bps) * self.profile.target_step;
-        self.declared_bps.round() as u64
+        saturating_u64_from_f64(self.declared_bps.round())
     }
 
     pub fn new(data: &[u8], profile: VbrProfile) -> Self {
@@ -402,11 +444,15 @@ impl VbrLooper {
         let mut looper = Self::new(data, profile);
         let frame_times: Vec<Duration> = timing
             .lines()
-            .map(|line| Duration::from_micros(line.parse().expect("valid frame timestamp")))
+            .map(|line| Duration::from_micros(line.parse().unwrap_or_default()))
             .collect();
         debug_assert!(!frame_times.is_empty());
         debug_assert_eq!(looper.asset.frames.len(), frame_times.len());
-        debug_assert!(frame_times.windows(2).all(|pair| pair[0] < pair[1]));
+        debug_assert!(
+            frame_times
+                .windows(2)
+                .all(|pair| matches!(pair, [a, b] if a < b))
+        );
         looper.frame_times = Some(frame_times);
         looper
     }
@@ -417,24 +463,49 @@ impl VbrLooper {
         if self.small.is_empty() {
             return self.next();
         }
-        let idx = self.small[self.small_index % self.small.len()];
+        let slot = self.small_index.checked_rem(self.small.len()).unwrap_or(0);
+        let idx = self.small.get(slot).copied().unwrap_or(0);
         self.small_index = self.small_index.wrapping_add(1);
-        self.asset.frames[idx].clone()
+        self.asset.frames.get(idx).cloned().unwrap_or_default()
     }
 
     fn next(&mut self) -> Arc<[u8]> {
-        let frame = &self.asset.frames[self.index];
-        self.index = (self.index + 1) % self.asset.frames.len();
+        debug_assert!(
+            self.index < self.asset.frames.len(),
+            "frame cursor left the asset"
+        );
+        let frame = self
+            .asset
+            .frames
+            .get(self.index)
+            .cloned()
+            .unwrap_or_default();
+        let frame = &frame;
+        self.index = self
+            .index
+            .saturating_add(1)
+            .checked_rem(self.asset.frames.len())
+            .unwrap_or(0);
         frame.clone()
     }
 
     /// Whether we are in an active burst at `elapsed` into the run.
     fn is_active(&self, elapsed: Duration) -> bool {
-        let cycle = self.profile.active + self.profile.idle;
+        let cycle = self
+            .profile
+            .active
+            .checked_add(self.profile.idle)
+            .unwrap_or(self.profile.active);
         if cycle.is_zero() {
             return true;
         }
-        let phase = (elapsed.as_nanos() % cycle.as_nanos()) as u64;
+        let phase = u64::try_from(
+            elapsed
+                .as_nanos()
+                .checked_rem(cycle.as_nanos())
+                .unwrap_or(0),
+        )
+        .unwrap_or(u64::MAX);
         Duration::from_nanos(phase) < self.profile.active
     }
 
@@ -450,13 +521,17 @@ impl VbrLooper {
             let loop_duration = frame_times
                 .last()
                 .copied()
-                .expect("non-empty frame schedule")
-                + self.profile.loop_idle;
+                .unwrap_or_default()
+                .saturating_add(self.profile.loop_idle);
             let mut loop_start = start;
             let mut index = 0usize;
             loop {
                 debug_assert!(index < frame_times.len());
-                tokio::time::sleep_until(loop_start + frame_times[index]).await;
+                let due = frame_times
+                    .get(index)
+                    .and_then(|offset| loop_start.checked_add(*offset))
+                    .unwrap_or(loop_start);
+                tokio::time::sleep_until(due).await;
                 let now = tokio::time::Instant::now();
                 if sender.keyframe_rx.is_requested() {
                     index = self.asset.first_idr;
@@ -465,10 +540,12 @@ impl VbrLooper {
                 }
                 debug_assert!(index < self.asset.frames.len());
                 let frame = MediaFrame {
-                    ts: MediaTime::from_90khz(
-                        (now.duration_since(start).as_secs_f64() * clock_rate) as u64,
-                    ),
-                    data: self.asset.frames[index].clone(),
+                    audio_level: None,
+                    voice_activity: None,
+                    ts: MediaTime::from_90khz(saturating_u64_from_f64(
+                        now.duration_since(start).as_secs_f64() * clock_rate,
+                    )),
+                    data: self.asset.frames.get(index).cloned().unwrap_or_default(),
                     capture_time: now,
                     abs_capture_time: Some(crate::clock::capture_wallclock()),
                     contiguous: true,
@@ -485,10 +562,10 @@ impl VbrLooper {
                         return;
                     }
                 }
-                index += 1;
+                index = index.saturating_add(1);
                 if index == frame_times.len() {
                     index = 0;
-                    loop_start += loop_duration;
+                    loop_start = loop_start.checked_add(loop_duration).unwrap_or(loop_start);
                 }
             }
         }
@@ -506,7 +583,9 @@ impl VbrLooper {
                 self.profile.idle_fps
             }
             .max(1);
-            next_frame_at = now + Duration::from_secs_f64(1.0 / fps as f64);
+            next_frame_at = now
+                .checked_add(Duration::from_secs_f64(1.0 / fps as f64))
+                .unwrap_or(now);
 
             if sender.keyframe_rx.is_requested() {
                 tracing::debug!(
@@ -528,7 +607,11 @@ impl VbrLooper {
                 self.next_small()
             };
             let frame = MediaFrame {
-                ts: MediaTime::from_90khz((elapsed.as_secs_f64() * clock_rate) as u64),
+                audio_level: None,
+                voice_activity: None,
+                ts: MediaTime::from_90khz(saturating_u64_from_f64(
+                    elapsed.as_secs_f64() * clock_rate,
+                )),
                 data,
                 capture_time: now,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
@@ -554,6 +637,19 @@ pub struct H264FrameSlicer<'a> {
     pos: usize,
 }
 
+/// Where the NAL header begins if an Annex-B start code (3- or 4-byte) sits at
+/// `at`, otherwise `None`.
+fn start_code_at(data: &[u8], at: usize) -> Option<usize> {
+    if data.get(at) != Some(&0) || data.get(at.saturating_add(1)) != Some(&0) {
+        return None;
+    }
+    match data.get(at.saturating_add(2)) {
+        Some(&1) => Some(at.saturating_add(3)),
+        Some(&0) if data.get(at.saturating_add(3)) == Some(&1) => Some(at.saturating_add(4)),
+        _ => None,
+    }
+}
+
 impl<'a> H264FrameSlicer<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
@@ -561,29 +657,22 @@ impl<'a> H264FrameSlicer<'a> {
 
     fn next_nalu_bounds(&self, start: usize) -> Option<(usize, usize, u8)> {
         let mut i = start;
-        while i + 3 < self.data.len() {
-            if self.data[i] == 0
-                && self.data[i + 1] == 0
-                && (self.data[i + 2] == 1 || (self.data[i + 2] == 0 && self.data[i + 3] == 1))
-            {
-                let nalu_start = i;
-                let header_pos = if self.data[i + 2] == 1 { i + 3 } else { i + 4 };
-                let nalu_type = self.data[header_pos] & 0x1F;
+        while i.saturating_add(3) < self.data.len() {
+            let Some(header_pos) = start_code_at(self.data, i) else {
+                i = i.saturating_add(1);
+                continue;
+            };
+            let nalu_start = i;
+            let nalu_type = self.data.get(header_pos).map_or(0, |b| b & 0x1F);
 
-                let mut next = header_pos;
-                while next + 3 < self.data.len() {
-                    if self.data[next] == 0
-                        && self.data[next + 1] == 0
-                        && (self.data[next + 2] == 1
-                            || (self.data[next + 2] == 0 && self.data[next + 3] == 1))
-                    {
-                        return Some((nalu_start, next, nalu_type));
-                    }
-                    next += 1;
+            let mut next = header_pos;
+            while next.saturating_add(3) < self.data.len() {
+                if start_code_at(self.data, next).is_some() {
+                    return Some((nalu_start, next, nalu_type));
                 }
-                return Some((nalu_start, self.data.len(), nalu_type));
+                next = next.saturating_add(1);
             }
-            i += 1;
+            return Some((nalu_start, self.data.len(), nalu_type));
         }
         None
     }
@@ -592,17 +681,11 @@ impl<'a> H264FrameSlicer<'a> {
         match nalu_type {
             6..=9 => true,
             1 | 5 => {
-                let header_pos = if self.data[nalu_start + 2] == 1 {
-                    nalu_start + 3
-                } else {
-                    nalu_start + 4
-                };
-
-                if self.data.len() > header_pos + 1 {
-                    let first_byte_of_slice_header = self.data[header_pos + 1];
-                    return (first_byte_of_slice_header & 0x80) != 0;
-                }
-                false
+                let header_pos = start_code_at(self.data, nalu_start)
+                    .unwrap_or_else(|| nalu_start.saturating_add(3));
+                self.data.get(header_pos.saturating_add(1)).is_some_and(
+                    |first_byte_of_slice_header| (first_byte_of_slice_header & 0x80) != 0,
+                )
             }
             _ => false,
         }
@@ -625,7 +708,7 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
         while let Some((n_start, n_end, n_type)) = self.next_nalu_bounds(search_pos) {
             if has_vcl && self.is_new_access_unit(n_type, n_start, n_end) {
                 self.pos = n_start;
-                return Some(&self.data[start_pos..n_start]);
+                return self.data.get(start_pos..n_start);
             }
 
             if n_type == 1 || n_type == 5 {
@@ -638,9 +721,143 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
 
         self.pos = self.data.len();
         if end_pos > start_pos {
-            Some(&self.data[start_pos..end_pos])
+            self.data.get(start_pos..end_pos)
         } else {
             None
+        }
+    }
+}
+
+/// A synthetic audio source: fixed-size packets at a steady cadence, with a declared loudness.
+///
+/// Enough to exercise forwarding and speaker selection, which is what the SFU does with audio. It
+/// is not an encoder — the payload is filler — because nothing downstream of the selector inspects
+/// it, and a real codec would add a dependency for no extra coverage.
+///
+/// The level is the point. The SFU ranks speakers by RFC 6464 loudness and drops any audio packet
+/// that arrives without one, so a source that does not declare a level is a source whose audio
+/// never reaches anybody.
+pub struct AudioLooper {
+    /// Loudness while talking, in negative dBov: 0 is full scale, around -30 is ordinary speech.
+    level_dbov: i8,
+    /// Whether this source ever talks, as opposed to sitting quietly unmuted.
+    talks: bool,
+    packet_ms: u64,
+    /// Packets of speech before pausing, and of pause before speaking again.
+    ///
+    /// Real speech is talk spurts separated by silence, and that alternation is the whole reason
+    /// the SFU has a speaker selector: it ranks by recent loudness and decays it, so a source at a
+    /// constant level exercises the ranking and none of the switching. Roughly 1.8s of speech and
+    /// 1.2s of pause at a 20ms cadence.
+    spurt_packets: u64,
+    pause_packets: u64,
+    /// Where in the cycle this source starts.
+    ///
+    /// Two sources at the same level and the same phase always talk over each other, so the
+    /// selector ranks them and never switches. Offsetting one makes them take turns, which is the
+    /// only way a plan reaches the slot-stealing path.
+    phase_offset: u64,
+}
+
+impl AudioLooper {
+    /// Someone talking at an ordinary level, in 20ms packets — the Opus default cadence.
+    pub fn speaking() -> Self {
+        Self {
+            level_dbov: -30,
+            talks: true,
+            packet_ms: 20,
+            spurt_packets: 90,
+            pause_packets: 60,
+            phase_offset: 0,
+        }
+    }
+
+    /// Present but quiet, as an unmuted listener in a room is: background only, never a spurt.
+    pub fn quiet() -> Self {
+        Self {
+            level_dbov: -70,
+            talks: false,
+            ..Self::speaking()
+        }
+    }
+
+    /// Start this source part-way through its speech cycle, so it takes turns with another.
+    pub fn with_phase_offset(mut self, packets: u64) -> Self {
+        self.phase_offset = packets;
+        self
+    }
+
+    /// Override the declared loudness, for plans about who the SFU picks.
+    pub fn with_level_dbov(mut self, level_dbov: i8) -> Self {
+        self.level_dbov = level_dbov;
+        self.talks = level_dbov > -60;
+        self
+    }
+
+    /// Where this source is in its speech cycle, and what that sounds like on the wire.
+    ///
+    /// Returns the declared level, whether this packet is speech, and how many bytes it carries.
+    /// Silence is quiet *and* small: Opus drops to a few bytes per packet when nobody is talking,
+    /// so a source that keeps sending full-size frames through its pauses misrepresents both the
+    /// loudness the SFU ranks on and the bandwidth it costs.
+    fn at(&self, packet: u64) -> (i8, bool, usize) {
+        if !self.talks {
+            return (self.level_dbov, false, 8);
+        }
+        let cycle = self.spurt_packets.saturating_add(self.pause_packets).max(1);
+        let phase = packet
+            .saturating_add(self.phase_offset)
+            .checked_rem(cycle)
+            .unwrap_or(0);
+        if phase >= self.spurt_packets {
+            // Between spurts: comfort noise, far below anything the selector will rank.
+            return (-70, false, 8);
+        }
+        // Speech is not flat. A slow swing of a few dB keeps the ranking from being a constant.
+        let swing = i8::try_from((phase % 12) / 4)
+            .unwrap_or(0)
+            .saturating_mul(3);
+        (self.level_dbov.saturating_add(swing), true, 160)
+    }
+
+    pub async fn run(self, sender: LocalEncoding) {
+        const CLOCK_RATE: u64 = 48_000;
+        let mid = sender.mid;
+        let rid = sender.rid;
+        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, 0);
+        let mut interval = tokio::time::interval(Duration::from_millis(self.packet_ms));
+        let mut packets: u64 = 0;
+
+        loop {
+            let tick_time = interval.tick().await;
+            let ts = packets
+                .saturating_mul(CLOCK_RATE)
+                .saturating_mul(self.packet_ms)
+                .checked_div(1000)
+                .unwrap_or(0);
+            packets = packets.saturating_add(1);
+
+            let (level_dbov, speech, payload_bytes) = self.at(packets);
+            let frame = MediaFrame {
+                audio_level: Some(level_dbov),
+                voice_activity: Some(speech),
+                ts: MediaTime::new(ts, str0m::media::Frequency::FORTY_EIGHT_KHZ),
+                data: Arc::from(vec![0u8; payload_bytes].as_slice()),
+                capture_time: tick_time,
+                abs_capture_time: Some(crate::clock::capture_wallclock()),
+                contiguous: true,
+                is_keyframe: false,
+                target_bitrate_bps: None,
+                resolution: None,
+                dependency_descriptor: None,
+                temporal_layers: None,
+            };
+
+            for packet in frame_sender.packetize(&frame) {
+                if sender.send(packet).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }

@@ -1,5 +1,16 @@
 use str0m::bwe::Bitrate;
 
+/// Convert a computed bitrate to an integer without letting a NaN or a negative
+/// silently become a plausible rate — `as u64` yields 0 for both, which the
+/// allocator then reads as "this stream costs nothing".
+pub fn saturating_bps(v: f64) -> u64 {
+    debug_assert!(v.is_finite(), "computed bitrate {v} is not finite");
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    v.min(u64::MAX as f64) as u64
+}
+
 #[derive(Clone, Debug)]
 pub struct BitrateControllerConfig {
     pub min_bitrate: Bitrate,
@@ -87,6 +98,8 @@ impl BitrateController {
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use more_asserts::assert_le;
 
     use super::*;
@@ -122,8 +135,10 @@ mod tests {
 
     #[test]
     fn test_hysteresis_deadband_allows_deep_drop() {
-        let mut config = BitrateControllerConfig::default();
-        config.down_smoothing = 0.90;
+        let config = BitrateControllerConfig {
+            down_smoothing: 0.90,
+            ..Default::default()
+        };
         let mut ctrl = config.build();
 
         // Push target to 800k via default headroom + quantization.
@@ -183,9 +198,11 @@ mod tests {
 
     #[test]
     fn test_maximum_cap_hold_while_still_clamped() {
-        let mut config = BitrateControllerConfig::default();
-        config.max_bitrate = Bitrate::mbps(5);
-        config.down_smoothing = 0.90;
+        let config = BitrateControllerConfig {
+            max_bitrate: Bitrate::mbps(5),
+            down_smoothing: 0.90,
+            ..Default::default()
+        };
         let mut ctrl = config.build();
 
         // Demand above the configured maximum clamps to the cap.

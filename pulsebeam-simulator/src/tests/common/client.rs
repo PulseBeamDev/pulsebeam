@@ -6,7 +6,7 @@ use pulsebeam_agent::agent::{
     DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
 };
 use pulsebeam_agent::api::HttpApiClient;
-use pulsebeam_agent::media::{H264Looper, VbrLooper, VbrProfile};
+use pulsebeam_agent::media::{AudioLooper, H264Looper, VbrLooper, VbrProfile};
 use pulsebeam_agent::{
     Agent, LocalTrack, ParticipantChange, Participants, RemoteTrack, SimulcastLayer,
 };
@@ -17,6 +17,10 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinSet;
+// The process-wide shimmed clock, not tokio's: turmoil virtualises `tokio::time::Instant` per
+// host, so a timestamp taken here cannot be compared with one taken on the coordinator. See
+// `sim_clock`, which shims `clock_gettime` for the whole process.
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -24,19 +28,25 @@ pub struct SimClientBuilder {
     ip: IpAddr,
     agent_builder: AgentBuilder,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
+    audio_rx: Option<Arc<Mutex<AudioReceiveLog>>>,
+    paused_publishers: Option<Arc<Mutex<std::collections::BTreeSet<String>>>>,
     publishes_video: bool,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
     /// When set, attach a synthetic L1T{n} temporal Dependency Descriptor per frame.
     temporal_dd: Option<u8>,
+    /// Publish audio at this loudness, in negative dBov. `None` publishes no audio.
+    audio_level_dbov: Option<i8>,
+    audio_phase_offset: u64,
+    receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
     match ip {
-        IpAddr::V4(v4) => format!("http://{}:{}", v4, port),
-        IpAddr::V6(v6) => format!("http://[{}]:{}", v6, port),
+        IpAddr::V4(v4) => format!("http://{v4}:{port}"),
+        IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
     }
 }
 
@@ -52,9 +62,14 @@ impl SimClientBuilder {
             ip,
             agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
             video_rx: None,
+            audio_rx: None,
+            paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
+            audio_level_dbov: None,
+            audio_phase_offset: 0,
+            receives_audio: false,
             opaque_payload: false,
         })
     }
@@ -75,9 +90,14 @@ impl SimClientBuilder {
                 .with_local_ip(ip)
                 .with_tcp_server_addr(server_tcp_addr),
             video_rx: None,
+            audio_rx: None,
+            paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
+            audio_level_dbov: None,
+            audio_phase_offset: 0,
+            receives_audio: false,
             opaque_payload: false,
         })
     }
@@ -85,6 +105,25 @@ impl SimClientBuilder {
     pub fn publish_video(mut self, simulcast_layers: Option<Vec<SimulcastLayer>>) -> Self {
         self.agent_builder = self.agent_builder.video_upstream_slots(1, simulcast_layers);
         self.publishes_video = true;
+        self
+    }
+
+    /// Receive audio, reserving `capacity` downstream slots.
+    ///
+    /// The SFU forwards only the loudest few speakers, so this is how many it can send at once -
+    /// the receiving end of `TopNAudioSelector`'s slots.
+    pub fn receive_audio(mut self, capacity: usize) -> Self {
+        self.agent_builder = self.agent_builder.audio_downstream_slots(capacity);
+        self.receives_audio = true;
+        self
+    }
+
+    /// Publish audio at the given loudness in negative dBov: around -30 is ordinary speech,
+    /// below about -60 reads as a quiet room.
+    pub fn publish_audio(mut self, level_dbov: i8, phase_offset: u64) -> Self {
+        self.agent_builder = self.agent_builder.audio_upstream_slots(1);
+        self.audio_level_dbov = Some(level_dbov);
+        self.audio_phase_offset = phase_offset;
         self
     }
 
@@ -124,6 +163,19 @@ impl SimClientBuilder {
 
     /// Inject a shared `VideoReceiveLog` so the harness can read it externally.
     /// If not called, `connect()` allocates a private one.
+    pub fn with_paused_publishers(
+        mut self,
+        seen: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    ) -> Self {
+        self.paused_publishers = Some(seen);
+        self
+    }
+
+    pub fn with_audio_rx(mut self, rx: Arc<Mutex<AudioReceiveLog>>) -> Self {
+        self.audio_rx = Some(rx);
+        self
+    }
+
     pub fn with_video_rx(mut self, rx: Arc<Mutex<VideoReceiveLog>>) -> Self {
         self.video_rx = Some(rx);
         self
@@ -140,13 +192,31 @@ impl SimClientBuilder {
         } else {
             None
         };
+        let local_audio = match self.audio_level_dbov {
+            Some(level) => Some((agent.media().publish_audio().await?, level)),
+            None => None,
+        };
         let (incoming_track_tx, incoming_tracks) = tokio::sync::mpsc::channel(32);
         let participants = agent.participants();
+        let audio_tracks = if self.receives_audio {
+            // Registered before anything is heard: audio has no per-speaker subscription, so
+            // whoever the SFU picks arrives unasked and there is nowhere to put them otherwise.
+            Some(agent.media().receive_audio().await?)
+        } else {
+            None
+        };
+        let speakers = self.receives_audio.then(|| agent.media().speakers());
         tracing::info!("connected to {room}");
         let video_rx = self
             .video_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
-        let ctx = ClientContext {
+        let audio_rx = self
+            .audio_rx
+            .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
+        let ctx_paused_publishers = self
+            .paused_publishers
+            .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::BTreeSet::new())));
+        let mut ctx = ClientContext {
             ip: self.ip,
             agent,
             incoming_tracks,
@@ -158,11 +228,48 @@ impl SimClientBuilder {
             ordered_publishers: Arc::new(Mutex::new(HashMap::new())),
             ordered_subscribers: Arc::new(Mutex::new(HashMap::new())),
             remote_tracks: HashMap::new(),
+            paused_publishers: ctx_paused_publishers,
             requested_tracks: HashSet::new(),
             received_data: Vec::new(),
             video_rx,
+            audio_rx,
             local_publications: local_video.into_iter().collect(),
         };
+        if let Some(mut audio_tracks) = audio_tracks {
+            let log = ctx.audio_rx.clone();
+            join_set.spawn(async move {
+                while let Ok(mut track) = audio_tracks.next().await {
+                    let publisher = track.publisher_id().to_owned();
+                    let log = log.clone();
+                    tokio::spawn(async move {
+                        while let Ok(rtp) = track.recv().await {
+                            log.lock().unwrap().record(
+                                &publisher,
+                                rtp.ssrc.map_or(0, |s| *s),
+                                *rtp.seq,
+                                rtp.payload.len(),
+                                Instant::now(),
+                            );
+                        }
+                    });
+                }
+            });
+        }
+        if let Some(mut speakers) = speakers {
+            let log = ctx.audio_rx.clone();
+            join_set.spawn(async move {
+                loop {
+                    for speaker in speakers.current().iter() {
+                        log.lock()
+                            .unwrap()
+                            .record_rank(&speaker.participant_id, speaker.rank);
+                    }
+                    if speakers.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
         for publication in &ctx.local_publications {
             for sender in publication.encodings().iter().cloned() {
                 let rid = sender.rid();
@@ -183,6 +290,21 @@ impl SimClientBuilder {
                     }
                 }
             }
+        }
+        if let Some((publication, level)) = local_audio {
+            for sender in publication.encodings().iter().cloned() {
+                join_set.spawn(
+                    AudioLooper::speaking()
+                        .with_level_dbov(level)
+                        .with_phase_offset(self.audio_phase_offset)
+                        .run(sender),
+                );
+            }
+            // The handle has to outlive the loopers. Dropping a `LocalTrack` unpublishes it, so
+            // letting it fall out of scope here declared the track inactive the moment it was
+            // created: the packets still flowed into cloned senders, and the SFU - told the mid
+            // was inactive - never registered a track to route them to.
+            ctx.local_publications.push(publication);
         }
         Ok(SimClient { ctx, join_set })
     }
@@ -213,15 +335,195 @@ pub struct VideoReceiveLog {
     /// every simulcast layer has its own SPS.
     pub missing_parameter_sets: u64,
     pub bytes: u64,
+    /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
+    /// against the moment the viewer subscribed, which only the harness knows.
+    pub first_frame_at: Option<Instant>,
+    /// Time spent in stretches longer than [`FREEZE_THRESHOLD`] with no frame.
+    ///
+    /// Distinct from the longest gap: one ten-second freeze and fifty two-hundred-millisecond
+    /// freezes are different experiences and a maximum cannot tell them apart. Short gaps are
+    /// excluded because ordinary jitter and a keyframe wait are not freezes.
+    pub frozen_time: Duration,
+    /// Longest wall gap between consecutive delivered frames.
+    ///
+    /// Measured per frame rather than per plan step, because a step is tens of seconds long and a
+    /// freeze inside one still leaves bytes in the window: sampled at step boundaries this reads
+    /// zero however badly the stream stalled. A viewer notices the gap, not the total.
+    pub longest_frame_gap: Duration,
+    last_frame_at: Option<Instant>,
     last_ts: Option<u64>,
     seen_ts: HashSet<u64>,
 }
+
+/// What arrived from one speaker, as the listener heard it.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioStream {
+    pub packets: u64,
+    pub bytes: u64,
+    /// Longest stretch with no packet, once the stream had started.
+    ///
+    /// Audio is far less forgiving than video here. A picture that misses 200ms is a stutter
+    /// nobody remarks on; a voice that drops 200ms loses a syllable.
+    pub longest_gap: Duration,
+    /// The most recent rank the SFU gave this speaker, as signalled.
+    ///
+    /// Packets alone say a speaker got through; the rank says where the SFU placed them. A test
+    /// that the loudest voice wins needs both, because "heard" and "heard as the loudest" are
+    /// different claims and only the second is the selector's contract.
+    ///
+    /// The *latest* rank, not the best one ever held. A room does not form instantly, and while
+    /// only one person has connected they are trivially rank 0 - so a minimum over the whole run
+    /// reports the join order rather than the selector's judgement.
+    pub last_rank: Option<u32>,
+    first_at: Option<Instant>,
+    last_at: Option<Instant>,
+}
+
+impl AudioStream {
+    /// How long this speaker was on the wire, first packet to last.
+    pub fn audible_for(&self) -> Duration {
+        match (self.first_at, self.last_at) {
+            (Some(first), Some(last)) => last.saturating_duration_since(first),
+            _ => Duration::ZERO,
+        }
+    }
+
+    fn record(&mut self, bytes: usize, now: Instant) {
+        self.first_at.get_or_insert(now);
+        if let Some(previous) = self.last_at {
+            self.longest_gap = self
+                .longest_gap
+                .max(now.saturating_duration_since(previous));
+        }
+        self.last_at = Some(now);
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+}
+
+/// What a listener heard, and from whom.
+///
+/// Keyed by publisher because that is the question the SFU's speaker selection raises: with more
+/// speakers in a room than a subscriber has slots, *which* of them got through is the whole claim,
+/// and a total byte count cannot answer it.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct AudioReceiveLog {
+    pub by_publisher: std::collections::BTreeMap<String, AudioStream>,
+    /// Every RTP stream this listener was sent, and whether each stayed whole.
+    ///
+    /// Keyed by SSRC rather than by speaker on purpose. Several speakers share a slot's stream
+    /// over a call, spliced onto one timeline, and that is the design: a browser cannot route by
+    /// SSRC, and libwebrtc answers an SSRC it did not see in the SDP by building a whole new
+    /// receive stream. What has to hold is that the shared stream is unbroken across the changes.
+    pub by_stream: std::collections::BTreeMap<u32, AudioStreamContinuity>,
+}
+
+/// One inbound RTP stream, whoever happens to be on it.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct AudioStreamContinuity {
+    pub packets: u64,
+    /// Largest forward jump in sequence number. Any hole is loss to the receiver, whether the
+    /// network caused it or the SFU spliced two speakers together badly.
+    pub max_seq_gap: u64,
+    last_seq: Option<u64>,
+}
+
+impl AudioReceiveLog {
+    fn record(&mut self, publisher: &str, ssrc: u32, seq: u64, bytes: usize, now: Instant) {
+        self.by_publisher
+            .entry(publisher.to_owned())
+            .or_default()
+            .record(bytes, now);
+
+        let stream = self.by_stream.entry(ssrc).or_default();
+        stream.packets = stream.packets.saturating_add(1);
+        if let Some(previous) = stream.last_seq {
+            let gap = seq.saturating_sub(previous).saturating_sub(1);
+            stream.max_seq_gap = stream.max_seq_gap.max(gap);
+        }
+        if stream.last_seq.is_none_or(|previous| seq > previous) {
+            stream.last_seq = Some(seq);
+        }
+    }
+
+    fn record_rank(&mut self, publisher: &str, rank: u32) {
+        let entry = self.by_publisher.entry(publisher.to_owned()).or_default();
+        entry.last_rank = Some(rank);
+    }
+
+    /// Speakers this listener was told about, whether or not media arrived.
+    pub fn ranked(&self) -> std::collections::BTreeMap<String, u32> {
+        self.by_publisher
+            .iter()
+            .filter_map(|(publisher, s)| s.last_rank.map(|rank| (publisher.clone(), rank)))
+            .collect()
+    }
+
+    /// Speakers this listener heard for a meaningful part of the call.
+    ///
+    /// Not "sent us a packet once", and not merely "was audible briefly". A room does not form
+    /// instantly: every slot is empty when a call starts, so the first voices to arrive are
+    /// forwarded whoever they are, and somebody can hold a slot simply because nobody louder has
+    /// connected yet. Counting them reports join order, not the selector's judgement.
+    ///
+    /// So a speaker is heard if they were audible at all *and* for a decent share of however long
+    /// the most-heard speaker managed. One the selector genuinely keeps runs for the length of the
+    /// call; one that only occupied an empty slot while the room filled does not come close.
+    /// Measured at seed 9: 1.0s against 9.8s, evicted the instant the third talker connected.
+    pub fn heard_from(&self) -> std::collections::BTreeSet<String> {
+        let longest = self
+            .by_publisher
+            .values()
+            .map(AudioStream::audible_for)
+            .max()
+            .unwrap_or_default();
+        let floor = MIN_AUDIBLE.max(longest / SUSTAINED_SHARE_DIVISOR);
+        self.by_publisher
+            .iter()
+            .filter(|(_, stream)| stream.audible_for() >= floor)
+            .map(|(publisher, _)| publisher.clone())
+            .collect()
+    }
+}
+
+/// How much of one stream may be missing before a listener would notice.
+///
+/// Not zero: a subscriber's audio slots are provisioned as their mids finish negotiating, so a
+/// speaker the SFU starts forwarding into a slot that does not exist yet loses the packets in
+/// between. That is a handful at the very start of a call and a receiver conceals it inaudibly. It
+/// is a different thing from the stream itself being torn, which is what the bound exists for.
+pub const MAX_CONCEALABLE_GAP: u64 = 2;
+
+/// What share of the most-heard speaker's airtime counts as having been heard too.
+///
+/// Half. Deliberately blunt: the gap between a speaker the selector keeps and one that held an
+/// empty slot while the room formed is an order of magnitude, not a few percent, so the threshold
+/// only has to land somewhere in the middle of it.
+const SUSTAINED_SHARE_DIVISOR: u32 = 2;
+
+/// How long a voice must be forwarded before a listener can be said to have heard it.
+///
+/// Matched to `TopNAudioSelector`'s newborn immunity, which is the window in which the selector
+/// makes no promise about who holds a slot - and about the shortest stretch in which a listener
+/// could recognise a voice at all. Below this, a speaker is a start-up transient.
+pub const MIN_AUDIBLE: Duration = Duration::from_millis(300);
+
+/// How long a stream may deliver nothing before a viewer perceives a freeze rather than jitter.
+///
+/// Below this, a gap is a late packet, a keyframe wait or a layer switch - all normal. Above it,
+/// the picture has visibly stopped.
+pub const FREEZE_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoReceiveStats {
     pub frames: u64,
     pub keyframes: u64,
     pub missing_parameter_sets: u64,
+    pub non_contiguous: u64,
+    pub longest_frame_gap: Duration,
+    pub first_frame_at: Option<Instant>,
+    pub last_frame_at: Option<Instant>,
+    pub frozen_time: Duration,
 }
 
 impl VideoReceiveStats {
@@ -232,6 +534,11 @@ impl VideoReceiveStats {
             missing_parameter_sets: self
                 .missing_parameter_sets
                 .saturating_sub(baseline.missing_parameter_sets),
+            non_contiguous: self.non_contiguous.saturating_sub(baseline.non_contiguous),
+            longest_frame_gap: self.longest_frame_gap.max(baseline.longest_frame_gap),
+            first_frame_at: self.first_frame_at.or(baseline.first_frame_at),
+            last_frame_at: self.last_frame_at,
+            frozen_time: self.frozen_time.saturating_sub(baseline.frozen_time),
         }
     }
 }
@@ -267,10 +574,25 @@ impl VideoReceiveLog {
             frames: self.frames,
             keyframes: self.keyframes,
             missing_parameter_sets: self.missing_parameter_sets,
+            non_contiguous: self.non_contiguous,
+            longest_frame_gap: self.longest_frame_gap,
+            first_frame_at: self.first_frame_at,
+            last_frame_at: self.last_frame_at,
+            frozen_time: self.frozen_time,
         }
     }
 
     fn record(&mut self, frame: &pulsebeam_agent::MediaFrame) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_frame_at {
+            let gap = now.saturating_duration_since(previous);
+            self.longest_frame_gap = self.longest_frame_gap.max(gap);
+            if gap > FREEZE_THRESHOLD {
+                self.frozen_time = self.frozen_time.saturating_add(gap);
+            }
+        }
+        self.first_frame_at.get_or_insert(now);
+        self.last_frame_at = Some(now);
         self.frames += 1;
         self.bytes += frame.data.len() as u64;
         if frame.is_keyframe {
@@ -305,6 +627,8 @@ impl VideoReceiveLog {
     }
 }
 
+type SubscribedTopics = Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>;
+
 pub struct ClientContext {
     pub ip: IpAddr,
     pub agent: Agent,
@@ -313,15 +637,25 @@ pub struct ClientContext {
     participants: Participants,
     /// Aggregated decode-side view of every remote video track.
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
+    /// What this listener heard, per speaker. Shared with the harness like `video_rx`.
+    pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
     local_publications: Vec<LocalTrack>,
 
     /// Remote track IDs that have been discovered from signaling updates.
     pub discovered_tracks: HashSet<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
     pub remote_tracks: HashMap<String, String>,
+    /// Publishers the SFU told this viewer it had stopped forwarding, at any point in the run.
+    ///
+    /// The distinction the whole pause signal exists for: a stream can stop because the SFU shed
+    /// it or because the connection died, and from the media alone those are identical. Recording
+    /// the signal lets a plan assert the viewer was *told*, not merely that packets stopped.
+    ///
+    /// Shared with the harness the same way `video_rx` is, so a plan can read it after the run.
+    pub paused_publishers: Arc<Mutex<std::collections::BTreeSet<String>>>,
     pub(crate) requested_tracks: HashSet<String>,
     pub published_topics: Arc<Mutex<HashMap<String, DataPublisher>>>,
-    pub subscribed_topics: Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>,
+    pub subscribed_topics: SubscribedTopics,
     pub ordered_publishers: Arc<Mutex<HashMap<String, OrderedTopicPublisher>>>,
     pub ordered_subscribers: Arc<Mutex<HashMap<String, OrderedTopicSubscriber>>>,
     /// Data channel payloads received by topic.
@@ -444,6 +778,11 @@ impl SimClient {
                         match change {
                             ParticipantChange::Joined(participant)
                             | ParticipantChange::Updated(participant) => {
+                                if participant.video_paused()
+                                    && let Ok(mut seen) = self.ctx.paused_publishers.lock()
+                                {
+                                    seen.insert(participant.id().to_string());
+                                }
                                 self.ctx
                                     .discovered_tracks
                                     .insert(participant.id().clone());
@@ -505,13 +844,13 @@ pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
     let data = match rid {
         Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
         Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
-        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
     };
     H264Looper::new(data, 30)
 }
 
 pub fn create_vbr_looper_for_rid(rid: Option<&str>, profile: VbrProfile) -> VbrLooper {
-    debug_assert_eq!(rid.map(|rid| rid.as_ref()), Some("f"));
+    debug_assert_eq!(rid, Some("f"));
     VbrLooper::new_scheduled(
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,

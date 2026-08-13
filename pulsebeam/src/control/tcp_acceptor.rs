@@ -133,8 +133,8 @@ async fn acceptor_loop(
                             );
                             continue;
                         }
-                        *ip_count += 1;
-                        pending += 1;
+                        *ip_count = ip_count.saturating_add(1);
+                        pending = pending.saturating_add(1);
 
                         let tx = event_tx.clone();
                         let done = done_tx.clone();
@@ -178,6 +178,9 @@ async fn first_frame_task(
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use pulsebeam_core::net::TcpListener;
     use std::{net::IpAddr, time::Duration};
@@ -192,26 +195,6 @@ mod tests {
 
     fn test_host_ip() -> IpAddr {
         pulsebeam_runtime::testing::test_host_ip("192.168.250.11")
-    }
-
-    /// Accept one server-side TCP stream from a dedicated loopback listener.
-    /// Returns (client, server, peer_addr) keeping both sides alive.
-    async fn accept_one() -> (
-        pulsebeam_core::net::TcpStream,
-        pulsebeam_core::net::TcpStream,
-        SocketAddr,
-    ) {
-        let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (client, accepted) = tokio::join!(
-            pulsebeam_core::net::TcpStream::connect(addr),
-            listener.accept()
-        );
-        let client = client.unwrap();
-        let (server, peer_addr) = accepted.unwrap();
-        (client, server, peer_addr)
     }
 
     // ── pending cap ──────────────────────────────────────────────────────────
@@ -248,10 +231,7 @@ mod tests {
             // never wrote anything).  The excess connection produces no event.
             // We just verify that no MORE than MAX_PENDING_TCP events arrive
             // within a short window.
-            let mut count = 0;
-            while let Ok(Some(_)) = timeout(Duration::from_millis(10), event_rx.recv()).await {
-                count += 1;
-            }
+            while let Ok(Some(_)) = timeout(Duration::from_millis(10), event_rx.recv()).await {}
             // All connections eventually time out (TCP_FIRST_FRAME_TIMEOUT) and
             // produce a None result.  We mainly care that the cap was enforced.
             drop(clients);
@@ -325,7 +305,7 @@ mod tests {
     #[test]
     fn test_per_ip_cap_enforced() {
         // This test only makes sense if per-IP limit < global limit.
-        assert!(MAX_PENDING_TCP_PER_IP < MAX_PENDING_TCP);
+        const { assert!(MAX_PENDING_TCP_PER_IP < MAX_PENDING_TCP) };
 
         run_local(async {
             let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))

@@ -1,3 +1,10 @@
+//! Encoder for the AV1 Dependency Descriptor.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`.
+//! Several fields are coded as `value - 1`, which has no encoding for zero; a
+//! wrap would write 0xFFFF.. and the peer would decode a different descriptor
+//! than the one that was built.
+
 use thiserror::Error;
 
 use super::bits::{BitWriter, Overflow};
@@ -133,7 +140,11 @@ fn write_frame_dependencies(
             if fdiff == 0 || u32::from(fdiff) > 1 << 12 {
                 return Err(DdWriteError::OutOfRange);
             }
-            let value = u32::from(fdiff) - 1;
+            // Coded as `minus_1`, so zero has no encoding. Wrapping would write
+            // 0xFFFF..; clamping writes the smallest legal value instead, and the
+            // assert catches the caller in sim.
+            debug_assert!(fdiff > 0, "frame diff of 0 has no minus-1 encoding");
+            let value = u32::from(fdiff).saturating_sub(1);
             let size = if u32::from(fdiff) <= 1 << 4 {
                 1
             } else if u32::from(fdiff) <= 1 << 8 {
@@ -142,7 +153,7 @@ fn write_frame_dependencies(
                 3
             };
             w.write_bits(size, 2)?;
-            w.write_bits(value, 4 * size)?;
+            w.write_bits(value, 4u32.saturating_mul(size))?;
         }
         w.write_bits(0, 2)?;
     }
@@ -164,12 +175,19 @@ fn write_structure(w: &mut BitWriter, s: &TemplateDependencyStructure) -> Result
     {
         return Err(DdWriteError::Inconsistent);
     }
-    if s.templates[0].spatial_id != 0 || s.templates[0].temporal_id != 0 {
+    let Some(first) = s.templates.first() else {
+        return Err(DdWriteError::Inconsistent);
+    };
+    if first.spatial_id != 0 || first.temporal_id != 0 {
         return Err(DdWriteError::Inconsistent);
     }
 
     w.write_bits(u32::from(s.template_id_offset), 6)?;
-    w.write_bits(u32::from(s.decode_target_count) - 1, 5)?;
+    debug_assert!(
+        s.decode_target_count > 0,
+        "a descriptor with no decode targets has no minus-1 encoding"
+    );
+    w.write_bits(u32::from(s.decode_target_count).saturating_sub(1), 5)?;
 
     write_template_layers(w, s)?;
     write_template_dtis(w, s)?;
@@ -189,12 +207,17 @@ fn write_template_layers(
     s: &TemplateDependencyStructure,
 ) -> Result<(), DdWriteError> {
     for pair in s.templates.windows(2) {
-        let (prev, next) = (&pair[0], &pair[1]);
+        let [prev, next] = pair else {
+            debug_assert!(false, "windows(2) always yields pairs");
+            break;
+        };
         let idc = if next.spatial_id == prev.spatial_id && next.temporal_id == prev.temporal_id {
             NEXT_LAYER_SAME
-        } else if next.spatial_id == prev.spatial_id && next.temporal_id == prev.temporal_id + 1 {
+        } else if next.spatial_id == prev.spatial_id
+            && next.temporal_id == prev.temporal_id.saturating_add(1)
+        {
             NEXT_LAYER_TEMPORAL
-        } else if next.spatial_id == prev.spatial_id + 1 && next.temporal_id == 0 {
+        } else if next.spatial_id == prev.spatial_id.saturating_add(1) && next.temporal_id == 0 {
             NEXT_LAYER_SPATIAL
         } else {
             debug_assert!(false, "templates not expressible as next_layer_idc");
@@ -231,7 +254,8 @@ fn write_template_fdiffs(
                 return Err(DdWriteError::OutOfRange);
             }
             w.write_bit(true)?;
-            w.write_bits(u32::from(fdiff) - 1, 4)?;
+            debug_assert!(fdiff > 0, "frame diff of 0 has no minus-1 encoding");
+            w.write_bits(u32::from(fdiff).saturating_sub(1), 4)?;
         }
         w.write_bit(false)?;
     }
@@ -243,7 +267,7 @@ fn write_template_chains(
     s: &TemplateDependencyStructure,
 ) -> Result<(), DdWriteError> {
     let dt_cnt = u32::from(s.decode_target_count);
-    w.write_ns(u32::from(s.chain_count), dt_cnt + 1)?;
+    w.write_ns(u32::from(s.chain_count), dt_cnt.saturating_add(1))?;
     if s.chain_count == 0 {
         return Ok(());
     }
@@ -284,8 +308,12 @@ fn write_resolutions(
         if r.width == 0 || r.height == 0 {
             return Err(DdWriteError::OutOfRange);
         }
-        w.write_bits(u32::from(r.width) - 1, 16)?;
-        w.write_bits(u32::from(r.height) - 1, 16)?;
+        debug_assert!(
+            r.width > 0 && r.height > 0,
+            "a zero render dimension has no minus-1 encoding"
+        );
+        w.write_bits(u32::from(r.width).saturating_sub(1), 16)?;
+        w.write_bits(u32::from(r.height).saturating_sub(1), 16)?;
     }
     Ok(())
 }

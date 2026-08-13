@@ -1,4 +1,4 @@
-use super::common::{LocalNodeSim, Participant, Room, Step, VideoQuality};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
 
 #[test]
@@ -140,6 +140,7 @@ fn tcp_simulation_test() {
 fn tcp_multi_shard_simulation_test() {
     LocalNodeSim::new()
         .with_shards(2)
+        .with_tcp_only()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -401,4 +402,261 @@ fn abrupt_exit_chaos_test() {
                 .allow_missing_parameter_sets(1),
         },
     ]);
+}
+
+/// Media crossing a shard boundary, end to end, over UDP.
+///
+/// With `room_shard_slot(1)` the publisher and each subscriber land on
+/// *different* shards, so every forwarded packet is addressed by a route the
+/// destination allocated, wrapped in a `MediaEnvelope`, resolved by index and
+/// epoch, and restamped onto the receiving shard's timeline. A room below the
+/// spill threshold is co-located and reaches none of that — which is why the
+/// older multi-shard test, with four participants and a slot of sixteen, never
+/// exercised it despite the name.
+///
+/// Over UDP, so the shard each participant lands on is chosen by the
+/// `SO_REUSEPORT` group hashing its 4-tuple — the same mechanism a deployment
+/// relies on, rather than the TCP fallback the multi-shard tests started on.
+#[test]
+fn cross_shard_video_is_forwarded_decodably_test() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob"))
+                .with_participant(Participant::subscriber("carol")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice publishes; Bob and Carol subscribe from other shards",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckCrossShardMedia {
+                description: "media genuinely crossed a shard boundary",
+                min_frames: 100,
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes a stream that crossed a shard boundary",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100).allow_gaps(5),
+            },
+            Step::CheckVideoQuality {
+                description: "Carol decodes it too, over her own route",
+                participant: "carol",
+                quality: VideoQuality::min_frames(100).allow_gaps(5),
+            },
+        ]);
+}
+
+/// The SFU keeps serving video while route installs are failing under it.
+///
+/// Every fallible internal call has a rollback written beside it, and none of them had ever run:
+/// the route table only fills at a participant count no plan reaches, so the four callers'
+/// recovery paths were dead code that happened to compile. `with_buggify` makes the failure
+/// happen on purpose.
+///
+/// The claim is deliberately about recovery rather than perfection. Some subscriptions will not
+/// install while the table is refusing, and that is the correct response to exhaustion - what may
+/// not happen is the node wedging, losing a stable stream, or tripping an assertion on the way
+/// through.
+///
+/// Single shard for now. Adding `.with_shards(3)` reaches the cross-shard installers and trips
+/// `core.rs`'s "no reverse route for a remotely published track" immediately: a failed reverse
+/// install publishes the track with no reverse handle, so keyframe requests for it are dropped for
+/// its whole life. That is a real defect with an open design question - whether a track that
+/// cannot be addressed should be announced at all - and it is not this plan's to answer.
+#[test]
+fn video_survives_failing_route_installs_test() {
+    LocalNodeSim::new()
+        .with_buggify(300)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("stable"))
+                .with_participant(Participant::subscriber("observer"))
+                .with_participant(Participant::single_publisher("joiner").starts_disconnected()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the stable pair",
+                duration: Duration::from_secs(10),
+            },
+            Step::Join {
+                description: "Another publisher arrives while installs are failing",
+                participant: "joiner",
+            },
+            Step::Run {
+                description: "Churn through the failures",
+                duration: Duration::from_secs(10),
+            },
+            Step::AbruptExit {
+                description: "And leaves without signalling",
+                participant: "joiner",
+            },
+            Step::Run {
+                description: "Recover",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckVideoQuality {
+                description: "The observer still receives renderable video throughout",
+                participant: "observer",
+                quality: VideoQuality::min_frames(100),
+            },
+        ]);
+
+    // Without this the plan passes hardest when it injects nothing. At 80 per thousand and a
+    // handful of install calls it injected nothing at all on the first seed tried, and looked
+    // exactly like a pass.
+    let (_, fired) = pulsebeam_runtime::buggify::coverage();
+    assert!(
+        !fired.is_empty(),
+        "no failure was injected, so this plan asserted only that the happy path works"
+    );
+}
+
+/// Every declared failure point is reachable, and the injector actually injects.
+///
+/// A `buggify!` site that no plan reaches is a failure path still untested, and it looks exactly
+/// like one that is covered - silence either way. This turns the declared sites into a list that
+/// has to be kept honest: reaching zero of them, or firing none of them, means the mechanism has
+/// quietly stopped doing anything.
+#[test]
+fn every_declared_failure_point_is_reachable_test() {
+    LocalNodeSim::new()
+        .with_buggify(500)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![Step::Run {
+            description: "Enough traffic to reach the route table",
+            duration: Duration::from_secs(10),
+        }]);
+
+    let (seen, fired) = pulsebeam_runtime::buggify::coverage();
+    assert!(
+        !seen.is_empty(),
+        "no buggify site was reached, so failure injection is testing nothing"
+    );
+    assert!(
+        !fired.is_empty(),
+        "buggify sites were reached ({seen:?}) but none fired at 50%, so injection is inert"
+    );
+}
+
+/// A publisher who leaves and comes back is shown to a viewer who never went away.
+///
+/// The reconnect churn plans all move the *subscriber*. This moves the publisher, which is a
+/// different path: the viewer keeps its slot and its subscription, and the room hands that slot a
+/// new track id belonging to a participant it has never seen. Nothing was covering it.
+#[test]
+fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::cellular())
+        .with_shards(4)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice is on screen",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckVideoQuality {
+                description: "The viewer can see her",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::Disconnect {
+                description: "Alice drops out",
+                participant: "alice",
+            },
+            Step::Run {
+                description: "The tile is empty",
+                duration: Duration::from_secs(3),
+            },
+            Step::Reconnect {
+                description: "Alice comes back, as a participant the room has never seen",
+                participant: "alice",
+            },
+            Step::Run {
+                description: "Settle on the new publisher",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The viewer can see the publisher who replaced her",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::CheckMediaRouted {
+                description: "And nothing was thrown away on the way in",
+                participant: "viewer",
+            },
+        ]);
+}
+
+/// A connection that drops and recovers is the same participant throughout.
+///
+/// The path a real client takes after a network blip, and nothing covered it: every other churn
+/// plan tears the client down and joins again, which mints a *new* participant id and is a
+/// different thing entirely. A reconnect keeps the id and changes only the connection generation -
+/// the server does this over `PATCH` with `If-Match: <etag>`, and rejects an update that does not
+/// name the generation it replaces.
+///
+/// **Ignored: reconnect is designed but not implemented end to end.** Identity is stable - that
+/// part passes - but the viewer never sees Alice again, and the reason is upstream of the client:
+///
+/// - the SFU destroys the participant as soon as ICE drops (`Participant core disconnecting ...
+///   reason=ICE connection disconnected`), so by the time the network returns there is nothing
+///   left to `PATCH` and the generation model has nothing to attach to;
+/// - and the agent makes no reconnect attempt at all - zero `Sending SDP Offer (Update)` in a run.
+///
+/// The agent's missing `If-Match` header is fixed and was a real defect on this path, but it is
+/// only the last step of three. Un-ignore once the SFU holds a disconnected participant open long
+/// enough to be reclaimed, and the agent actually tries.
+#[ignore = "reconnect is not implemented end to end: the SFU drops the participant on ICE disconnect"]
+#[test]
+fn a_dropped_connection_recovers_as_the_same_participant_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice is on screen",
+                duration: Duration::from_secs(6),
+            },
+            Step::Partition {
+                description: "Alice's network drops",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Long enough for the connection to be given up on",
+                duration: Duration::from_secs(12),
+            },
+            Step::Repair {
+                description: "Her network comes back",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "She reconnects",
+                duration: Duration::from_secs(12),
+            },
+            Step::CheckIdentityStable {
+                description: "Alice reconnected rather than rejoining as somebody new",
+                participant: "alice",
+            },
+            Step::CheckVideoQualityInterval {
+                description: "And the viewer can see her again",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50),
+            },
+        ]);
 }

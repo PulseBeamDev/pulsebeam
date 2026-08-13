@@ -1725,11 +1725,13 @@ fn estimate_follows_a_sliding_link_without_riding_the_queue_test() {
                 description: "settled after the decline",
                 participant: "bob",
             },
-            // Measured settled: 68ms of queue, no congestion loss, and the estimate within 5.7%
-            // of the new capacity. During the decline itself the queue hits the full 200ms buffer
-            // with 7.2% tail-drop, which is what a window spanning the transition reports - and
-            // asserting on that would be asserting that the controller predict a capacity drop
-            // before observing it.
+            // Measured settled: a 7ms standing queue behind a ~100ms peak, no congestion loss,
+            // and the estimate within 5.7% of the new capacity. The gap between those two numbers
+            // is the point - the peak moves 88-108ms with the seed while the standing queue holds
+            // at 6-8ms, so bounding the peak tested the noise and not the controller. During the
+            // decline itself the queue hits the full 200ms buffer with 7.2% tail-drop, which is
+            // what a window spanning the transition reports - and asserting on that would be
+            // asserting that the controller predict a capacity drop before observing it.
             Step::Expect {
                 description: "Once settled, the controller is not sitting in the buffer",
                 participant: "bob",
@@ -2279,11 +2281,18 @@ fn a_busy_room_starves_nobody_test() {
     room = room.with_participant(Participant::manual_subscriber("viewer", PUBLISHERS.len()));
 
     LocalNodeSim::new()
-        // Sized just above what the asserted outcome costs: six 180p floors at 150 kbps plus the
-        // speaker's 1.25 Mbps top layer is 2.15 Mbps. A paused tile here was therefore never
-        // priced out, and six top layers were never affordable, so the allocator has to choose
-        // rather than being handed enough for everything.
-        .with_bandwidth(2_500_000)
+        // Comfortably above what the asserted outcome costs - six 180p floors at 150 kbps plus
+        // the speaker's 1.25 Mbps top layer is 2.15 Mbps - while six top layers at 7.5 Mbps stay
+        // far out of reach, so the allocator still has to choose rather than being handed enough
+        // for everything.
+        //
+        // Sized at 2.5 Mbps this needed the *estimate* to reach 86% of the link before the
+        // allocator could seat all six, which made an allocator claim contingent on an estimator
+        // one. It passed at the committed seed and failed at seed 2 by 1.6%, with the estimate
+        // ranging 1.76-3.45 Mbps across the run: the verdict came down to where it happened to be
+        // at the final sample. The claim being made here is that a tile is never *overlooked*, so
+        // the budget has to be one the allocator cannot blame.
+        .with_bandwidth(3_000_000)
         .with_room(room)
         .run(vec![
             Step::Run {
