@@ -25,7 +25,10 @@ use super::router::{
 
 pub(crate) struct AllPublisherSubscriptions {
     pub local_by_topic: HashMap<Topic, FastIndexSet<ParticipantKey>>,
-    pub remote_by_topic: HashMap<Topic, FastIndexSet<ShardId>>,
+    /// Wildcard remote subscribers per topic. A node's shard count is small
+    /// and bounded, so linear-scanning it beats hashing `ShardId`, the same
+    /// trade-off `RoomFanout::remote_shards` makes.
+    pub remote_by_topic: HashMap<Topic, Vec<ShardId>>,
 }
 
 impl AllPublisherSubscriptions {
@@ -51,7 +54,10 @@ pub(crate) struct DataStreamRoute {
     pub id: DataStreamId,
     pub published: bool,
     pub local_subscribers: FastIndexSet<ParticipantKey>,
-    pub remote_subscriber_shards: HashMap<ShardId, RemoteDataSubscriber>,
+    /// Remote destination shards for this stream. A shard's fan-out is
+    /// bounded by node size, not room size, so a linear scan beats a hash
+    /// lookup here — the same trade-off `RoomFanout::remote_shards` makes.
+    pub remote_subscriber_shards: Vec<RemoteDataSubscriber>,
 }
 
 impl DataStreamRoute {
@@ -60,7 +66,7 @@ impl DataStreamRoute {
             id,
             published: false,
             local_subscribers: fast_set_with_capacity(256),
-            remote_subscriber_shards: HashMap::default(),
+            remote_subscriber_shards: Vec::new(),
         }
     }
 
@@ -71,7 +77,11 @@ impl DataStreamRoute {
     }
 
     pub fn attach_remote_subscriber_shard(&mut self, remote: RemoteRoute) {
-        match self.remote_subscriber_shards.get_mut(&remote.shard_id) {
+        match self
+            .remote_subscriber_shards
+            .iter_mut()
+            .find(|entry| entry.remote.shard_id == remote.shard_id)
+        {
             Some(existing) => {
                 existing.refs = existing.refs.saturating_add(1);
                 debug_assert!(existing.refs <= 2);
@@ -82,20 +92,25 @@ impl DataStreamRoute {
             }
             None => {
                 self.remote_subscriber_shards
-                    .insert(remote.shard_id, RemoteDataSubscriber { remote, refs: 1 });
+                    .push(RemoteDataSubscriber { remote, refs: 1 });
             }
         }
     }
 
     pub fn detach_remote_subscriber_shard(&mut self, shard_id: ShardId) {
-        let Some(entry) = self.remote_subscriber_shards.get_mut(&shard_id) else {
+        let Some(pos) = self
+            .remote_subscriber_shards
+            .iter()
+            .position(|entry| entry.remote.shard_id == shard_id)
+        else {
             debug_assert!(false, "detaching an unknown remote subscriber shard");
             return;
         };
+        let entry = &mut self.remote_subscriber_shards[pos];
         debug_assert!(entry.refs > 0, "refcount underflow would leak this route");
         entry.refs = entry.refs.saturating_sub(1);
         if entry.refs == 0 {
-            self.remote_subscriber_shards.remove(&shard_id);
+            self.remote_subscriber_shards.swap_remove(pos);
         }
     }
 }
@@ -156,7 +171,11 @@ pub(crate) struct RoomFanout {
     /// follows.
     pub room_id: crate::entity::RoomId,
     pub members: FastIndexSet<ParticipantKey>,
-    pub remote_shards: FastIndexSet<ShardId>,
+    /// Shards with at least one remote member in this room. `ShardId` is
+    /// already a dense index bounded by worker count, so this is a small
+    /// linearly-scanned `Vec` rather than a hash index — the same trade
+    /// `TrackRoute::remote_routes` makes for the same reason.
+    pub remote_shards: Vec<ShardId>,
     /// Audio tracks this shard has installed a destination route for, so they
     /// can be retired when the room goes away.
     pub audio_imports: FastIndexSet<TrackId>,
@@ -180,13 +199,27 @@ impl RoomFanout {
         Self {
             room_id,
             members: fast_set(),
-            remote_shards: fast_set(),
+            remote_shards: Vec::new(),
             audio_imports: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
             data_stream_keys: fast_set(),
             reliable_stream_keys: fast_set(),
             all_publisher_subscriptions: AllPublisherSubscriptions::new(),
             reliable: ReliableRoutes::new(),
+        }
+    }
+
+    /// Idempotent: a redelivered remote-participant registration for a shard
+    /// already recorded here must not grow this list.
+    pub fn insert_remote_shard(&mut self, shard_id: ShardId) {
+        if !self.remote_shards.contains(&shard_id) {
+            self.remote_shards.push(shard_id);
+        }
+    }
+
+    pub fn remove_remote_shard(&mut self, shard_id: ShardId) {
+        if let Some(pos) = self.remote_shards.iter().position(|&s| s == shard_id) {
+            self.remote_shards.swap_remove(pos);
         }
     }
 }

@@ -847,8 +847,7 @@ impl ShardRoutingTable {
 
         self.control.participant_shards.insert(participant_id, meta);
         self.room_or_insert(room_id, rng)
-            .remote_shards
-            .insert(shard_id);
+            .insert_remote_shard(shard_id);
         let count = self
             .control
             .remote_participant_counts
@@ -905,7 +904,7 @@ impl ShardRoutingTable {
         }
 
         if let Some(room) = self.room_mut(&meta.room_id) {
-            room.remote_shards.swap_remove(&meta.shard_id);
+            room.remove_remote_shard(meta.shard_id);
             if room.members.is_empty() && room.remote_shards.is_empty() {
                 self.remove_room(&meta.room_id);
             }
@@ -1278,15 +1277,15 @@ impl ShardRoutingTable {
                 let Some(room) = self.room_mut(&room_id) else {
                     return Vec::new();
                 };
-                let inserted = room
+                let shards = room
                     .all_publisher_subscriptions
                     .remote_by_topic
                     .entry(topic.clone())
-                    .or_insert_with(fast_set)
-                    .insert(from_shard_id);
-                if !inserted {
+                    .or_default();
+                if shards.contains(&from_shard_id) {
                     return Vec::new();
                 }
+                shards.push(from_shard_id);
                 self.room_data_stream_keys(&room_id)
                     .into_iter()
                     .filter_map(|key| self.data.data_streams.get(key))
@@ -1322,7 +1321,13 @@ impl ShardRoutingTable {
                     .remote_by_topic
                     .get_mut(topic)
                 {
-                    let removed = shards.swap_remove(&from_shard_id);
+                    let removed = if let Some(pos) = shards.iter().position(|&s| s == from_shard_id)
+                    {
+                        shards.swap_remove(pos);
+                        true
+                    } else {
+                        false
+                    };
                     if shards.is_empty() {
                         room.all_publisher_subscriptions
                             .remote_by_topic
@@ -1993,7 +1998,7 @@ impl ShardRoutingTable {
 
         if origin.is_local() {
             let playout = ctx.wall().ntp();
-            for entry in route.remote_subscriber_shards.values_mut() {
+            for entry in route.remote_subscriber_shards.iter_mut() {
                 let env = entry.remote.next_envelope(playout);
                 ctx.send_media(entry.remote.shard_id, env, MediaPayload::Data(pkt.to_vec()));
             }
