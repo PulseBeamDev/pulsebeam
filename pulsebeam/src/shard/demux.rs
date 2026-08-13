@@ -47,8 +47,6 @@ pub struct Demuxer {
     addr_map: HashMap<SocketAddr, ParticipantId>,
     /// Reverse: maps a participant to all their known source addresses (for cleanup).
     participant_addrs: HashMap<ParticipantId, Vec<SocketAddr>>,
-    /// Reverse: maps a cached source address to its participant (for cleanup).
-    addr_to_participant: HashMap<SocketAddr, ParticipantId>,
 }
 
 impl Demuxer {
@@ -56,7 +54,6 @@ impl Demuxer {
         Self {
             addr_map: HashMap::with_capacity(MAX_ADDR_ENTRIES),
             participant_addrs: HashMap::with_capacity(MAX_ADDR_ENTRIES),
-            addr_to_participant: HashMap::with_capacity(MAX_ADDR_ENTRIES),
         }
     }
 
@@ -66,7 +63,6 @@ impl Demuxer {
         if let Some(addrs) = self.participant_addrs.remove(&participant_id) {
             for addr in &addrs {
                 self.addr_map.remove(addr);
-                self.addr_to_participant.remove(addr);
             }
             addrs
         } else {
@@ -105,7 +101,6 @@ impl Demuxer {
             if participant_entry.len() < MAX_ADDRS_PER_PARTICIPANT {
                 participant_entry.push(src);
                 self.addr_map.insert(src, participant_id);
-                self.addr_to_participant.insert(src, participant_id);
             }
         }
 
@@ -914,6 +909,5 @@ mod demux_tests {
         assert_eq!(freed.len(), 4);
         assert!(d.addr_map.is_empty());
         assert!(d.participant_addrs.is_empty());
-        assert!(d.addr_to_participant.is_empty());
     }
 }

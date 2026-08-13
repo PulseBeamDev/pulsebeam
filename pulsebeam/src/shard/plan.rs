@@ -166,6 +166,8 @@ pub(crate) struct RoomFanout {
     /// every stream on the shard. The arena entries themselves live in
     /// `DataPlane::data_streams`; this is bookkeeping, not the fanout.
     pub data_stream_keys: FastIndexSet<DataStreamKey>,
+    /// Same bookkeeping, for the reliable lane's arena entries.
+    pub reliable_stream_keys: FastIndexSet<ReliableStreamKey>,
     pub all_publisher_subscriptions: AllPublisherSubscriptions,
     pub(super) reliable: ReliableRoutes,
 }
@@ -182,6 +184,7 @@ impl RoomFanout {
             audio_imports: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
             data_stream_keys: fast_set(),
+            reliable_stream_keys: fast_set(),
             all_publisher_subscriptions: AllPublisherSubscriptions::new(),
             reliable: ReliableRoutes::new(),
         }
@@ -189,17 +192,38 @@ impl RoomFanout {
 }
 
 /// The descriptor for one reliable stream on this shard, in either role —
-/// publisher (reverse route target) or destination (forward route target).
-/// Enough to resolve an arriving frame or ack by key instead of carrying
-/// `room_id`/`origin`/`topic` inline in [`crate::route::RouteAction`] and
-/// [`crate::route::ReverseTarget`]. The forward-direction bookkeeping
-/// (subscribers, publish/import flags, remote handles) still lives in
-/// `ReliableRoutes`, inside `RoomFanout` — this arena exists only to give
-/// both routes a `Copy` key, not yet the full per-stream collapse the
-/// hash-container audit describes.
+/// publisher (reverse route target, `published`) or destination (forward
+/// route target, `imported`). Resolves an arriving frame or ack by key
+/// instead of carrying `room_id`/`origin`/`topic` inline in
+/// [`crate::route::RouteAction`] and [`crate::route::ReverseTarget`].
+///
+/// Local topic subscriptions stay in `ReliableRoutes` (inside `RoomFanout`):
+/// a subscription names a topic, not a stream, so it has no natural
+/// `ReliableStreamKey` to live under here.
 pub(crate) struct ReliableStream {
     pub id: DataStreamId,
     pub room_id: crate::entity::RoomId,
+    pub published: bool,
+    pub imported: bool,
+    /// Acknowledged destination handles, one per subscribing shard. Small and
+    /// scanned linearly rather than indexed by `ShardId` — same trade `TrackRoute::remote_routes` already makes.
+    pub remote_routes: Vec<RemoteRoute>,
+}
+
+impl ReliableStream {
+    pub fn new(id: DataStreamId, room_id: crate::entity::RoomId) -> Self {
+        Self {
+            id,
+            room_id,
+            published: false,
+            imported: false,
+            remote_routes: Vec::new(),
+        }
+    }
+
+    pub fn is_unused(&self) -> bool {
+        !self.published && !self.imported && self.remote_routes.is_empty()
+    }
 }
 
 pub(crate) struct DataPlane {
