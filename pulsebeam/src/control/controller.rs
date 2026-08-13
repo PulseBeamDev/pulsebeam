@@ -10,6 +10,7 @@ use crate::{
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
+    route::RouteId,
     shard::{
         ShardContext,
         worker::{ShardCommand, ShardEventWrapper},
@@ -205,7 +206,7 @@ impl ControllerActor {
                 Some(cmd) = recv_command_paced(&mut command_rx, next_cmd_at) => {
                     let is_join = matches!(cmd, ControllerCommand::CreateParticipant(_, _));
 
-                    self.process_command(cmd);
+                    self.process_command(cmd).await;
 
                     #[cfg(not(feature = "unpace"))]
                     if is_join {
@@ -225,11 +226,12 @@ impl ControllerActor {
         }
     }
 
-    pub fn process_command(&mut self, cmd: ControllerCommand) {
+    pub async fn process_command(&mut self, cmd: ControllerCommand) {
         match cmd {
             ControllerCommand::CreateParticipant(m, reply_tx) => {
                 let answer = self
                     .handle_create_participant(m.state, m.offer)
+                    .await
                     .map(|res| CreateParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
@@ -241,6 +243,7 @@ impl ControllerActor {
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
                     .handle_patch_participant(m.state, m.offer)
+                    .await
                     .map(|res| PatchParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
@@ -257,14 +260,14 @@ impl ControllerActor {
         }
     }
 
-    pub fn handle_patch_participant(
+    pub async fn handle_patch_participant(
         &mut self,
         state: ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         self.core
             .delete_participant(&state.participant_id, &mut self.eq);
-        self.handle_create_participant(state, offer)
+        self.handle_create_participant(state, offer).await
     }
 
     /// Route an accepted TCP connection to the shard that owns its participant.
@@ -297,7 +300,7 @@ impl ControllerActor {
         }
 
         self.eq.send(
-            ufrag.shard_id,
+            ufrag.route.shard(),
             ShardCommand::AddTcpConnection {
                 stream: conn.stream,
                 peer_addr: conn.peer_addr,
@@ -305,7 +308,36 @@ impl ControllerActor {
         );
     }
 
-    pub fn handle_create_participant(
+    /// Reserve a participant slot and its ingress route on `shard_id`,
+    /// awaiting the shard's reply — the only point in this actor's loop
+    /// that blocks on another actor, because nothing else can mint a route
+    /// in that shard's own table. `drain_core_events` runs first so a
+    /// `RemoveParticipant` queued by a preceding delete (a reconnect's
+    /// teardown-then-recreate) reaches the shard's mailbox before this does;
+    /// otherwise the reservation below could race the old entry under the
+    /// same id and trip the registry's duplicate-reservation assertion.
+    async fn reserve_ingress(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+    ) -> Option<(RouteId, u16)> {
+        self.drain_core_events().await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.router
+            .send(
+                shard_id,
+                ShardCommand::ReserveIngress {
+                    participant_id,
+                    room_id,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+        reply_rx.await.ok().flatten()
+    }
+
+    pub async fn handle_create_participant(
         &mut self,
         state: ParticipantState,
         offer: SdpOffer,
@@ -324,18 +356,38 @@ impl ControllerActor {
             }
         };
 
-        // Encode routing metadata into the ICE ufrag.  The shard worker and
-        // demuxer can decode shard_id / participant_id directly from STUN
-        // binding requests — no distributed lookup needed.
-        let ufrag = IceUfrag::new(
-            self.cluster_id,
-            self.node_id,
-            shard_id,
-            state.participant_id,
-        );
+        // The route can only be minted by the shard that will own it, and
+        // the ufrag has to carry a real one before negotiation can produce
+        // an answer — so the reservation is the first thing that touches
+        // the shard, not the last.
+        let Some((route, epoch)) = self
+            .reserve_ingress(shard_id, state.participant_id, state.room_id)
+            .await
+        else {
+            return Err(ControllerError::ServiceUnavailable);
+        };
+
+        let ufrag = IceUfrag::new(self.cluster_id, self.node_id, route, epoch);
         let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
 
-        let (rtc, answer) = self.negotiator.create_answer(offer, creds)?;
+        let negotiated = self.negotiator.create_answer(offer, creds);
+        let (rtc, answer) = match negotiated {
+            Ok(negotiated) => negotiated,
+            Err(err) => {
+                // The reservation already installed a route; nothing will
+                // ever populate it now, so it must be torn down explicitly
+                // rather than leaked.
+                self.router
+                    .send(
+                        shard_id,
+                        ShardCommand::CancelReservation {
+                            participant_id: state.participant_id,
+                        },
+                    )
+                    .await;
+                return Err(err.into());
+            }
+        };
         let cfg = self.core.create_participant(rtc, state, shard_id);
 
         self.eq.broadcast(|| ShardCommand::RegisterParticipant {
@@ -368,7 +420,6 @@ mod tests {
     use crate::id::ShardId;
     use crate::{
         control::{tcp_acceptor::PendingTcpConn, ufrag::IceUfrag},
-        entity::ParticipantId,
         shard::{ShardContext, metrics::ShardMetrics},
     };
     use pulsebeam_core::net::TcpListener;
@@ -386,8 +437,8 @@ mod tests {
         pulsebeam_runtime::testing::test_host_ip("192.168.250.10")
     }
 
-    fn dummy_pid() -> ParticipantId {
-        ParticipantId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    fn dummy_route(shard: usize) -> RouteId {
+        RouteId::new(ShardId::new(shard), 0)
     }
 
     async fn make_actor(num_shards: usize) -> ControllerActor {
@@ -441,7 +492,7 @@ mod tests {
             let peer_addr = "1.2.3.4:5000".parse().unwrap();
 
             // Encode for cluster=0, node=0 (actor defaults), shard=2
-            let ufrag = IceUfrag::new(0, 0, 2, dummy_pid()).encode();
+            let ufrag = IceUfrag::new(0, 0, dummy_route(2), 0).encode();
             let conn = PendingTcpConn {
                 stream,
                 peer_addr,
@@ -476,7 +527,7 @@ mod tests {
             let conn = PendingTcpConn {
                 stream,
                 peer_addr: "1.2.3.4:5001".parse().unwrap(),
-                server_ufrag: Some(IceUfrag::new(1, 0, 0, dummy_pid()).encode()),
+                server_ufrag: Some(IceUfrag::new(1, 0, dummy_route(0), 0).encode()),
             };
             actor.route_tcp_connection(conn);
             assert!(
@@ -495,7 +546,7 @@ mod tests {
             let conn = PendingTcpConn {
                 stream,
                 peer_addr: "1.2.3.4:5002".parse().unwrap(),
-                server_ufrag: Some(IceUfrag::new(0, 7, 0, dummy_pid()).encode()),
+                server_ufrag: Some(IceUfrag::new(0, 7, dummy_route(0), 0).encode()),
             };
             actor.route_tcp_connection(conn);
             assert!(

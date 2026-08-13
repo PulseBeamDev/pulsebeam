@@ -79,6 +79,24 @@ pub enum ShardError {
 /// never send each other any of this.
 #[derive(Debug)]
 pub enum ShardCommand {
+    /// Reserve a participant slot and install its ingress route, replying
+    /// with `(route, epoch)` so the controller can encode it into the ICE
+    /// ufrag before it has anything else to build one from — the route can
+    /// only be minted by the shard that will own it, and the ufrag has to
+    /// carry a real one. `None` means the route table is exhausted; nothing
+    /// is left reserved in that case.
+    ReserveIngress {
+        participant_id: ParticipantId,
+        room_id: RoomId,
+        reply: tokio::sync::oneshot::Sender<Option<(RouteId, u16)>>,
+    },
+    /// Release a reservation that never reached `AddParticipant` — the
+    /// negotiation that would have populated it failed after the route was
+    /// already installed. Fire-and-forget: a redelivered or late cancel for
+    /// an already-populated or already-gone key is a no-op.
+    CancelReservation {
+        participant_id: ParticipantId,
+    },
     /// Boxed because it dwarfs every other variant: an inline
     /// `ParticipantConfig` would set the size of the enum, and the command
     /// queue preallocates [`SHARD_COMMAND_CAPACITY`] of them per shard.
@@ -250,11 +268,15 @@ pub enum ShardFrame {
         env: RouteEnvelope,
         stats: crate::track::TrackStates,
     },
-    /// A datagram batch that landed on the wrong shard's socket. Node-local
-    /// with no cross-node analogue — a node demuxes its own participants — so
-    /// it is addressed semantically and never leaves the box.
+    /// A datagram batch that landed on the wrong shard's socket —
+    /// `SO_REUSEPORT` picks the receiving socket by 5-tuple hash, which has
+    /// nothing to do with which shard owns the route. Node-local with no
+    /// cross-node analogue, so it is addressed by the route the ufrag
+    /// carried, resolved by the receiving shard the same way every other
+    /// arrival is.
     Ingress {
-        participant_id: ParticipantId,
+        route: RouteId,
+        epoch: u16,
         batch: RecvPacketBatch,
     },
 }

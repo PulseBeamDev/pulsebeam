@@ -899,13 +899,6 @@ impl ShardRoutingTable {
         self.release_fanout_if_idle(track_id);
     }
 
-    pub fn remote_shard_for(&self, participant_id: &ParticipantId) -> Option<ShardId> {
-        self.control
-            .participant_shards
-            .get(participant_id)
-            .map(|m| m.shard_id)
-    }
-
     // -- remote participant membership (refcounted per room/shard) -------
 
     /// Idempotent: re-registering a participant with the same (room, shard)

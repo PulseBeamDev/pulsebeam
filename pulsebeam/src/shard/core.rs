@@ -11,7 +11,7 @@ use super::events::{
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
-    entity::{AudioOrigin, ParticipantId, TrackId, TrackKind},
+    entity::{AudioOrigin, ParticipantId, RoomId, TrackId, TrackKind},
     id::ShardId,
     participant::{ParticipantConfig, batcher::GsoSendBatch},
     rtp::RtpPacket,
@@ -389,21 +389,42 @@ impl ShardCore {
         batch: pulsebeam_runtime::net::RecvPacketBatch,
         router: &impl ShardTransport,
     ) {
-        let Some(participant_id) = self.registry.demux(&batch) else {
+        let Some((route, epoch)) = self.registry.demux(&batch) else {
             return;
         };
-        if let Some((key, participant)) = self.registry.get_mut_with_key(&participant_id) {
-            participant.on_ingress(batch);
-            self.dirty.mark(key, participant);
-        } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
+        self.dispatch_ingress(route, epoch, batch, router);
+    }
+
+    /// Everything downstream of here is index-addressed: `route.shard()` is
+    /// read once to decide forward-or-resolve, never hashed, and a route
+    /// this shard owns resolves straight to the participant key it was
+    /// installed for.
+    fn dispatch_ingress(
+        &mut self,
+        route: crate::route::RouteId,
+        epoch: u16,
+        batch: pulsebeam_runtime::net::RecvPacketBatch,
+        router: &impl ShardTransport,
+    ) {
+        if route.shard() != self.shard_id {
             router.send_frame(
-                shard_id,
+                route.shard(),
                 ShardFrame::Ingress {
-                    participant_id,
+                    route,
+                    epoch,
                     batch,
                 },
             );
+            return;
         }
+        let Some(key) = self.routing.resolve_ingress(route, epoch) else {
+            return;
+        };
+        let Some(participant) = self.registry.resolve_mut(key) else {
+            return;
+        };
+        participant.on_ingress(batch);
+        self.dirty.mark(key, participant);
     }
 
     pub(crate) fn flush_stream_buffers(&mut self, router: &impl ShardTransport) {
@@ -792,9 +813,59 @@ impl ShardCore {
             ShardCommand::AddTcpConnection { .. } => {
                 // Handled by the shard worker directly; no core action needed.
             }
+            ShardCommand::ReserveIngress {
+                participant_id,
+                room_id,
+                reply,
+            } => self.reserve_ingress(participant_id, room_id, now, reply),
+            ShardCommand::CancelReservation { participant_id } => {
+                self.cancel_reservation(&participant_id, now);
+            }
             cmd => self.on_control_command(cmd, now, router)?,
         }
         Some(())
+    }
+
+    /// Mint a participant slot and its ingress route in one step, so the
+    /// caller's ufrag always names a route that already resolves — a
+    /// reservation the route install failed for leaves nothing behind.
+    fn reserve_ingress(
+        &mut self,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+        now: Instant,
+        reply: tokio::sync::oneshot::Sender<Option<(crate::route::RouteId, u16)>>,
+    ) {
+        let key = self.registry.reserve(participant_id);
+        let installed =
+            self.routing
+                .install_ingress_route(key, participant_id, room_id, now, &self.wall);
+        match installed {
+            Some((route, epoch)) => {
+                self.registry.stash_ingress(key, route, epoch);
+                let _ = reply.send(Some((route, epoch)));
+            }
+            None => {
+                self.registry.release_reserved(key);
+                let _ = reply.send(None);
+            }
+        }
+    }
+
+    fn cancel_reservation(&mut self, participant_id: &ParticipantId, now: Instant) {
+        let Some(key) = self.registry.key_of(participant_id) else {
+            return;
+        };
+        // A redelivered or stale cancel racing a populate that already
+        // succeeded must never tear down a live participant — release_reserved
+        // itself refuses a populated slot only in debug builds.
+        if self.registry.resolve_mut(key).is_some() {
+            return;
+        }
+        if let Some((route, epoch)) = self.registry.pending_ingress_of(key) {
+            self.routing.retire_ingress_route(route, epoch, now);
+        }
+        self.registry.release_reserved(key);
     }
 
     fn on_control_command(
@@ -806,7 +877,9 @@ impl ShardCore {
         match cmd {
             ShardCommand::AddParticipant(_)
             | ShardCommand::RemoveParticipant(_)
-            | ShardCommand::AddTcpConnection { .. } => pulsebeam_runtime::fatal!(
+            | ShardCommand::AddTcpConnection { .. }
+            | ShardCommand::ReserveIngress { .. }
+            | ShardCommand::CancelReservation { .. } => pulsebeam_runtime::fatal!(
                 "a command handled by the outer match reached the inner one; the two have drifted apart"
             ),
             ShardCommand::RegisterParticipant {
@@ -828,11 +901,14 @@ impl ShardCore {
                 room_id,
                 participant_id,
             } => {
+                // Only the owning shard's demux entries are keyed by this
+                // participant's route, and only that shard can retire them —
+                // a shard the kernel misrouted a packet to caches by route,
+                // not by name, and ages out on its own bounded cap.
                 self.routing.unregister_remote_participant(
                     participant_id,
                     ParticipantShardMeta { shard_id, room_id },
                 );
-                self.registry.unregister_remote_demux(participant_id);
             }
             ShardCommand::PublishTrack(track, room_id) => {
                 let publisher_key = self.registry.key_of(&track.meta.origin);
@@ -1021,13 +1097,11 @@ impl ShardCore {
                 self.on_media_frame(env, payload, now, router);
             }
             ShardFrame::Ingress {
-                participant_id,
+                route,
+                epoch,
                 batch,
             } => {
-                if let Some((key, participant)) = self.registry.get_mut_with_key(&participant_id) {
-                    participant.on_ingress(batch);
-                    self.dirty.mark(key, participant);
-                }
+                self.dispatch_ingress(route, epoch, batch, router);
             }
             ShardFrame::Reverse { env, body } => {
                 self.on_reverse_frame(env, body, router);
@@ -1137,10 +1211,25 @@ impl ShardCore {
     ) {
         let room_id = cfg.room_id;
         let participant_id = cfg.participant_id;
-        self.remove_participant(&participant_id, now);
         let _ = router; // reserved: re-add currently needs no cross-shard notice
         let known_tracks = cfg.available_tracks.clone();
-        let key = self.registry.insert(cfg, &mut self.rng);
+        // The common case: `ReserveIngress` already minted this key and
+        // installed its route, so the ufrag the client is using already
+        // resolves — populate the reservation rather than minting a second
+        // key the route doesn't point at. Anything else (an already-populated
+        // participant under the same id, or no reservation at all) falls
+        // back to the old tear-down-and-insert behavior tests still rely on.
+        let key = match self.registry.key_of(&participant_id) {
+            Some(key) if self.registry.resolve_mut(key).is_none() => {
+                self.registry.populate(key, cfg, &mut self.rng);
+                key
+            }
+            Some(_) => {
+                self.remove_participant(&participant_id, now);
+                self.registry.insert(cfg, &mut self.rng)
+            }
+            None => self.registry.insert(cfg, &mut self.rng),
+        };
         self.routing.add_local_member(key, room_id, &mut self.rng);
         let Some(participant) = self.registry.get_mut(&participant_id) else {
             pulsebeam_runtime::fatal!(
@@ -1168,6 +1257,8 @@ impl ShardCore {
         let key = self.registry.key_of(participant_id)?;
         self.timers.cancel(key);
         let meta = self.registry.remove(participant_id)?;
+        self.routing
+            .retire_ingress_route(meta.ingress_route, meta.ingress_epoch, now);
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
             .remove_local_member(participant_id, key, meta.room_id, audio_ids, now);

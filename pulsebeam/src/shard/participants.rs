@@ -11,6 +11,7 @@ use crate::{
     entity::ParticipantId,
     id::ShardId,
     participant::{ParticipantConfig, ParticipantCore},
+    route::RouteId,
     shard::demux::Demuxer,
 };
 
@@ -32,6 +33,12 @@ new_key_type! {
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
     pub(super) queued_dirty: bool,
+    /// This connection's ICE association, so teardown can retire the route
+    /// and free the demuxer's cache entries for it. Route and key share a
+    /// lifetime by construction, but the route table and the demuxer are
+    /// reached separately, so both need the value.
+    pub(super) ingress_route: RouteId,
+    pub(super) ingress_epoch: u16,
 }
 
 impl Deref for ParticipantMeta {
@@ -57,6 +64,13 @@ pub(crate) struct ParticipantRegistry {
     /// same as a missing one.
     participants: SlotMap<ParticipantKey, Option<ParticipantMeta>>,
     participant_keys: HashMap<ParticipantId, ParticipantKey>,
+    /// The ingress route for a key between `reserve` and `populate` — the
+    /// route is installed (via `install_ingress_route`) in a separate step
+    /// from `reserve`, itself separate from `populate`, because the ufrag
+    /// built from the route has to exist before negotiation can produce the
+    /// `ParticipantConfig` `populate` needs. Entries here never outlive a
+    /// reservation: `populate` consumes one, `release_reserved` drops it.
+    pending_ingress: HashMap<ParticipantKey, (RouteId, u16)>,
     demuxer: Demuxer,
     /// Addresses freed by a removal/unregister, waiting for the worker to
     /// actually close the sockets during the output phase.
@@ -70,6 +84,7 @@ impl ParticipantRegistry {
             max_gso_segments,
             participants: SlotMap::with_key(),
             participant_keys: HashMap::default(),
+            pending_ingress: HashMap::default(),
             demuxer: Demuxer::new(),
             pending_close: VecDeque::new(),
         }
@@ -90,9 +105,27 @@ impl ParticipantRegistry {
         key
     }
 
-    /// Fill in a slot `reserve` minted, once negotiation completes.
+    /// Record the route `install_ingress_route` installed for a reserved
+    /// key, so `populate` can carry it onto the finished `ParticipantMeta`
+    /// once negotiation completes.
+    pub fn stash_ingress(&mut self, key: ParticipantKey, route: RouteId, epoch: u16) {
+        debug_assert!(
+            self.participants.get(key).is_some_and(Option::is_none),
+            "stash_ingress called on a key that isn't a bare reservation"
+        );
+        self.pending_ingress.insert(key, (route, epoch));
+    }
+
+    /// Fill in a slot `reserve` minted, once negotiation completes. Consumes
+    /// the route `stash_ingress` recorded; a key populated without ever
+    /// having a route stashed for it (test-only, local-only creation) falls
+    /// back to an unaddressable placeholder.
     pub fn populate(&mut self, key: ParticipantKey, cfg: ParticipantConfig, rng: &mut Rng) {
         let participant_id = cfg.participant_id;
+        let (ingress_route, ingress_epoch) = self
+            .pending_ingress
+            .remove(&key)
+            .unwrap_or((RouteId::from_raw(0), 0));
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -111,14 +144,15 @@ impl ParticipantRegistry {
         *slot = Some(ParticipantMeta {
             core,
             queued_dirty: false,
+            ingress_route,
+            ingress_epoch,
         });
         tracing::info!(%participant_id, "participant added to shard");
     }
 
     /// `reserve` immediately followed by `populate`, for callers that have
-    /// no reason to install anything against the key in between — tests, and
-    /// any local participant creation that doesn't route through connection
-    /// setup.
+    /// no real connection to address — tests, and any local participant
+    /// creation that doesn't route through connection setup.
     pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantKey {
         let key = self.reserve(cfg.participant_id);
         self.populate(key, cfg, rng);
@@ -133,6 +167,7 @@ impl ParticipantRegistry {
             !matches!(slot, Some(Some(_))),
             "release_reserved called on an already-populated slot"
         );
+        self.pending_ingress.remove(&key);
         self.participant_keys.retain(|_, k| *k != key);
     }
 
@@ -148,17 +183,9 @@ impl ParticipantRegistry {
         };
         let meta = slot?;
         debug_assert_eq!(meta.participant_id, *id);
-        let addrs = self.demuxer.unregister(*id);
+        let addrs = self.demuxer.unregister(meta.ingress_route);
         self.pending_close.extend(addrs);
         Some(meta)
-    }
-
-    /// Frees demux entries for a participant that lives on a *different*
-    /// shard (used when a remote registration is torn down) — there's no
-    /// local `ParticipantMeta` to remove, just stale routing state.
-    pub fn unregister_remote_demux(&mut self, id: ParticipantId) {
-        let addrs = self.demuxer.unregister(id);
-        self.pending_close.extend(addrs);
     }
 
     pub fn get_mut(&mut self, id: &ParticipantId) -> Option<&mut ParticipantMeta> {
@@ -195,8 +222,15 @@ impl ParticipantRegistry {
         self.participants.get_mut(key)?.as_mut()
     }
 
-    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<ParticipantId> {
+    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<(RouteId, u16)> {
         self.demuxer.demux(batch)
+    }
+
+    /// The route `stash_ingress` recorded for a reservation that never
+    /// reached `populate` — read (without consuming) by the cancellation
+    /// path so it can retire the route before calling `release_reserved`.
+    pub fn pending_ingress_of(&self, key: ParticipantKey) -> Option<(RouteId, u16)> {
+        self.pending_ingress.get(&key).copied()
     }
 
     pub fn drain_pending_close(&mut self) -> impl Iterator<Item = SocketAddr> + '_ {
@@ -304,25 +338,46 @@ mod tests {
     }
 
     #[test]
-    fn unregister_remote_demux_does_not_touch_local_participants() {
-        // A remote-registration teardown has no local ParticipantMeta to
-        // remove — this must be a pure demux-table operation and must not
-        // panic or affect any locally-registered participant.
+    fn a_reserved_key_resolves_only_after_populate() {
         let mut registry = ParticipantRegistry::new(ShardId::new(0), 1);
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
-        let local = pid();
-        let remote = pid();
-        registry.insert(cfg(local, room_id("r4")), &mut rng);
+        let p = pid();
 
-        registry.unregister_remote_demux(remote);
-
+        let key = registry.reserve(p);
         assert!(
-            registry.contains(&local),
-            "unrelated local participant must be unaffected"
+            registry.resolve_mut(key).is_none(),
+            "a bare reservation must not resolve to a participant"
         );
         assert!(
-            !registry.contains(&remote),
-            "remote id was never local to begin with"
+            !registry.contains(&p),
+            "a bare reservation must not count as present"
+        );
+
+        registry.stash_ingress(key, RouteId::from_raw(1), 3);
+        registry.populate(key, cfg(p, room_id("r6")), &mut rng);
+        assert!(
+            registry.resolve_mut(key).is_some(),
+            "the same key must resolve once populated"
+        );
+        assert!(registry.contains(&p));
+    }
+
+    #[test]
+    fn releasing_a_reservation_frees_its_name_and_key() {
+        let mut registry = ParticipantRegistry::new(ShardId::new(0), 1);
+        let p = pid();
+
+        let key = registry.reserve(p);
+        registry.release_reserved(key);
+
+        assert!(
+            !registry.contains(&p),
+            "a released reservation must not be resolvable by name"
+        );
+        assert!(registry.resolve_mut(key).is_none());
+        assert!(
+            registry.key_of(&p).is_none(),
+            "the name index must be freed too, or a retry can never reserve again"
         );
     }
 }
