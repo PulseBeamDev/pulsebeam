@@ -230,16 +230,36 @@ pub struct MediaEnvelope {
     pub playout_ntp32: u32,
 }
 
+/// The exact byte layout of [`MediaEnvelope`] on the wire. `Unaligned` plus
+/// the big-endian integer wrappers make encode/decode a memory copy instead
+/// of sixteen individual byte-slice operations — `repr(C)` is still not a
+/// portable wire format on its own (padding, host endianness), but paired
+/// with `zerocopy`'s byte-order types it is one, and the compiler checks it
+/// rather than the manual offsets that used to encode this.
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::Unaligned)]
+#[repr(C)]
+struct MediaEnvelopeWire {
+    ver: u8,
+    flags: u8,
+    epoch: zerocopy::big_endian::U16,
+    route: zerocopy::big_endian::U32,
+    link_seq: zerocopy::big_endian::U32,
+    playout_ntp32: zerocopy::big_endian::U32,
+}
+
+const _: () = assert!(size_of::<MediaEnvelopeWire>() == MEDIA_ENVELOPE_LEN);
+
 impl MediaEnvelope {
     pub fn encode(&self) -> [u8; MEDIA_ENVELOPE_LEN] {
-        let mut out = [0u8; MEDIA_ENVELOPE_LEN];
-        out[0] = ENVELOPE_VERSION;
-        out[1] = FLAG_LANE_MEDIA;
-        out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
-        out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
-        out[8..12].copy_from_slice(&self.link_seq.to_be_bytes());
-        out[12..16].copy_from_slice(&self.playout_ntp32.to_be_bytes());
-        out
+        let wire = MediaEnvelopeWire {
+            ver: ENVELOPE_VERSION,
+            flags: FLAG_LANE_MEDIA,
+            epoch: self.epoch.into(),
+            route: self.route.get().into(),
+            link_seq: self.link_seq.into(),
+            playout_ntp32: self.playout_ntp32.into(),
+        };
+        zerocopy::transmute!(wire)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
@@ -249,33 +269,14 @@ impl MediaEnvelope {
         if peek_lane(buf)? != Lane::Media {
             return Err(EnvelopeError::WrongLane { want: Lane::Media });
         }
-        let [
-            _,
-            _,
-            e0,
-            e1,
-            r0,
-            r1,
-            r2,
-            r3,
-            s0,
-            s1,
-            s2,
-            s3,
-            p0,
-            p1,
-            p2,
-            p3,
-            ..,
-        ] = *buf
-        else {
-            return Err(EnvelopeError::Truncated { len: buf.len() });
-        };
+        let (wire, _rest) = zerocopy::FromBytes::ref_from_prefix(buf)
+            .map_err(|_| EnvelopeError::Truncated { len: buf.len() })?;
+        let wire: &MediaEnvelopeWire = wire;
         Ok(Self {
-            epoch: u16::from_be_bytes([e0, e1]),
-            route: RouteId::from_raw(u32::from_be_bytes([r0, r1, r2, r3])),
-            link_seq: u32::from_be_bytes([s0, s1, s2, s3]),
-            playout_ntp32: u32::from_be_bytes([p0, p1, p2, p3]),
+            epoch: wire.epoch.get(),
+            route: RouteId::from_raw(wire.route.get()),
+            link_seq: wire.link_seq.get(),
+            playout_ntp32: wire.playout_ntp32.get(),
         })
     }
 }
@@ -303,6 +304,19 @@ pub struct RouteEnvelope {
     pub route: RouteId,
 }
 
+/// The exact byte layout of [`RouteEnvelope`] on the wire — see
+/// [`MediaEnvelopeWire`], the same trade applied to the shorter header.
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::Unaligned)]
+#[repr(C)]
+struct RouteEnvelopeWire {
+    ver: u8,
+    flags: u8,
+    epoch: zerocopy::big_endian::U16,
+    route: zerocopy::big_endian::U32,
+}
+
+const _: () = assert!(size_of::<RouteEnvelopeWire>() == ROUTE_ENVELOPE_LEN);
+
 impl RouteEnvelope {
     pub fn new(handle: ReverseRoute) -> Self {
         Self {
@@ -312,12 +326,13 @@ impl RouteEnvelope {
     }
 
     pub fn encode(&self) -> [u8; ROUTE_ENVELOPE_LEN] {
-        let mut out = [0u8; ROUTE_ENVELOPE_LEN];
-        out[0] = ENVELOPE_VERSION;
-        out[1] = FLAG_LANE_REVERSE;
-        out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
-        out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
-        out
+        let wire = RouteEnvelopeWire {
+            ver: ENVELOPE_VERSION,
+            flags: FLAG_LANE_REVERSE,
+            epoch: self.epoch.into(),
+            route: self.route.get().into(),
+        };
+        zerocopy::transmute!(wire)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
@@ -329,12 +344,12 @@ impl RouteEnvelope {
                 want: Lane::Reverse,
             });
         }
-        let [_, _, e0, e1, r0, r1, r2, r3, ..] = *buf else {
-            return Err(EnvelopeError::Truncated { len: buf.len() });
-        };
+        let (wire, _rest) = zerocopy::FromBytes::ref_from_prefix(buf)
+            .map_err(|_| EnvelopeError::Truncated { len: buf.len() })?;
+        let wire: &RouteEnvelopeWire = wire;
         Ok(Self {
-            epoch: u16::from_be_bytes([e0, e1]),
-            route: RouteId::from_raw(u32::from_be_bytes([r0, r1, r2, r3])),
+            epoch: wire.epoch.get(),
+            route: RouteId::from_raw(wire.route.get()),
         })
     }
 }
