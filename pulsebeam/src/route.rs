@@ -1,8 +1,11 @@
 //! Compiled routes and the wire envelope that addresses them.
 //!
-//! A route id is allocated by the *destination*, because it indexes that
-//! destination's table. Semantic ids (participant, track, room, topic) never
-//! appear on the wire; they survive only in [`RouteNames`] for logs.
+//! A route id's slot is allocated by the *destination*, because it indexes
+//! that destination's table — but the id also carries which shard that
+//! table belongs to (see [`RouteId`]), so it is a node-scoped address, not
+//! purely a destination-local one. Semantic ids (participant, track, room,
+//! topic) never appear on the wire; they survive only in [`RouteNames`] for
+//! logs.
 //!
 //! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
 //!
@@ -236,7 +239,13 @@ pub struct MediaEnvelope {
 /// portable wire format on its own (padding, host endianness), but paired
 /// with `zerocopy`'s byte-order types it is one, and the compiler checks it
 /// rather than the manual offsets that used to encode this.
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::Unaligned)]
+#[derive(
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
 #[repr(C)]
 struct MediaEnvelopeWire {
     ver: u8,
@@ -306,7 +315,13 @@ pub struct RouteEnvelope {
 
 /// The exact byte layout of [`RouteEnvelope`] on the wire — see
 /// [`MediaEnvelopeWire`], the same trade applied to the shorter header.
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::Unaligned)]
+#[derive(
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
 #[repr(C)]
 struct RouteEnvelopeWire {
     ver: u8,
