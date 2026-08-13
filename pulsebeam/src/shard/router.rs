@@ -1015,9 +1015,7 @@ impl ShardRoutingTable {
             }
             None => {
                 let was_empty = {
-                    let Some(room) = self.room_mut(&room_id) else {
-                        return None;
-                    };
+                    let room = self.room_mut(&room_id)?;
                     let subscribers = room
                         .all_publisher_subscriptions
                         .local_by_topic
