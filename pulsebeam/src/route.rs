@@ -24,6 +24,7 @@ use tokio::time::{Duration, Instant};
 use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::id::ShardId;
+use crate::shard::participants::ParticipantKey;
 use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
 use crate::track::Topic;
 
@@ -449,6 +450,12 @@ impl std::fmt::Display for RouteNames {
 /// local object and leaves the route untouched.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RouteAction {
+    /// A client's ICE association. The route and the participant's key share
+    /// a lifetime by construction — minted together at connection setup,
+    /// destroyed together at teardown — the same argument that already
+    /// justifies `ReverseTarget` holding no epoch of its own: a key handed to
+    /// a route always resolves.
+    Ingress { participant: ParticipantKey },
     Video {
         /// The destination's own fanout handle — a dense index, not a name.
         /// Resolving a route hands dispatch something it can use directly,

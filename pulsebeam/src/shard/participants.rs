@@ -50,7 +50,12 @@ impl DerefMut for ParticipantMeta {
 pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
-    participants: SlotMap<ParticipantKey, ParticipantMeta>,
+    /// `None` between `reserve` and `populate` — an ingress route may already
+    /// point at the key while connection setup (ICE/DTLS negotiation) is
+    /// still in flight, so the slot has to exist before `ParticipantCore`
+    /// does. Every lookup here treats a reserved-but-unpopulated slot the
+    /// same as a missing one.
+    participants: SlotMap<ParticipantKey, Option<ParticipantMeta>>,
     participant_keys: HashMap<ParticipantId, ParticipantKey>,
     demuxer: Demuxer,
     /// Addresses freed by a removal/unregister, waiting for the worker to
@@ -70,7 +75,23 @@ impl ParticipantRegistry {
         }
     }
 
-    pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantKey {
+    /// Reserve a slot for a connection whose ICE/DTLS setup is still in
+    /// flight. The key is real immediately — `install_ingress_route` can
+    /// address it — but `resolve_mut` returns `None` until `populate` fills
+    /// it in, or the reservation is abandoned via `release_reserved`.
+    pub fn reserve(&mut self, participant_id: ParticipantId) -> ParticipantKey {
+        debug_assert!(
+            !self.participant_keys.contains_key(&participant_id),
+            "duplicate participant registry reservation"
+        );
+        let key = self.participants.insert(None);
+        let previous = self.participant_keys.insert(participant_id, key);
+        debug_assert!(previous.is_none());
+        key
+    }
+
+    /// Fill in a slot `reserve` minted, once negotiation completes.
+    pub fn populate(&mut self, key: ParticipantKey, cfg: ParticipantConfig, rng: &mut Rng) {
         let participant_id = cfg.participant_id;
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
@@ -80,19 +101,39 @@ impl ParticipantRegistry {
             1,
             &mut participant_rng,
         );
-        let previous = self.participant_keys.get(&participant_id);
+        let Some(slot) = self.participants.get_mut(key) else {
+            pulsebeam_runtime::fatal!("populate called on a key the registry does not hold")
+        };
         debug_assert!(
-            previous.is_none(),
-            "duplicate participant registry insertion"
+            slot.is_none(),
+            "populate called on an already-populated slot"
         );
-        let key = self.participants.insert(ParticipantMeta {
+        *slot = Some(ParticipantMeta {
             core,
             queued_dirty: false,
         });
-        let previous = self.participant_keys.insert(participant_id, key);
-        debug_assert!(previous.is_none());
         tracing::info!(%participant_id, "participant added to shard");
+    }
+
+    /// `reserve` immediately followed by `populate`, for callers that have
+    /// no reason to install anything against the key in between — tests, and
+    /// any local participant creation that doesn't route through connection
+    /// setup.
+    pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantKey {
+        let key = self.reserve(cfg.participant_id);
+        self.populate(key, cfg, rng);
         key
+    }
+
+    /// Free a reservation that never got to `populate` — negotiation failed,
+    /// or the connection was abandoned before setup completed.
+    pub fn release_reserved(&mut self, key: ParticipantKey) {
+        let slot = self.participants.remove(key);
+        debug_assert!(
+            !matches!(slot, Some(Some(_))),
+            "release_reserved called on an already-populated slot"
+        );
+        self.participant_keys.retain(|_, k| *k != key);
     }
 
     /// Removes a local participant and queues its addresses for closing.
@@ -100,11 +141,12 @@ impl ParticipantRegistry {
     /// (room_id, upstream track ids) before it's dropped.
     pub fn remove(&mut self, id: &ParticipantId) -> Option<ParticipantMeta> {
         let key = self.participant_keys.remove(id)?;
-        let Some(meta) = self.participants.remove(key) else {
+        let Some(slot) = self.participants.remove(key) else {
             pulsebeam_runtime::fatal!(
                 "participant {id} is keyed to a slot the registry does not hold"
             )
         };
+        let meta = slot?;
         debug_assert_eq!(meta.participant_id, *id);
         let addrs = self.demuxer.unregister(*id);
         self.pending_close.extend(addrs);
@@ -121,7 +163,7 @@ impl ParticipantRegistry {
 
     pub fn get_mut(&mut self, id: &ParticipantId) -> Option<&mut ParticipantMeta> {
         let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get_mut(key)?;
+        let participant = self.participants.get_mut(key)?.as_mut()?;
         debug_assert_eq!(participant.participant_id, *id);
         Some(participant)
     }
@@ -131,13 +173,18 @@ impl ParticipantRegistry {
         id: &ParticipantId,
     ) -> Option<(ParticipantKey, &mut ParticipantMeta)> {
         let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get_mut(key)?;
+        let participant = self.participants.get_mut(key)?.as_mut()?;
         debug_assert_eq!(participant.participant_id, *id);
         Some((key, participant))
     }
 
+    /// True once the participant is fully populated — a bare reservation
+    /// does not count, since nothing downstream can act on it yet.
     pub fn contains(&self, id: &ParticipantId) -> bool {
-        self.participant_keys.contains_key(id)
+        self.participant_keys
+            .get(id)
+            .and_then(|&key| self.participants.get(key))
+            .is_some_and(Option::is_some)
     }
 
     pub fn key_of(&self, id: &ParticipantId) -> Option<ParticipantKey> {
@@ -145,7 +192,7 @@ impl ParticipantRegistry {
     }
 
     pub fn resolve_mut(&mut self, key: ParticipantKey) -> Option<&mut ParticipantMeta> {
-        self.participants.get_mut(key)
+        self.participants.get_mut(key)?.as_mut()
     }
 
     pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<ParticipantId> {

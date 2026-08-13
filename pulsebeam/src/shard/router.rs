@@ -675,6 +675,52 @@ impl ShardRoutingTable {
         Some(ReverseRoute { route, epoch })
     }
 
+    /// Install a client's ICE association. Route and key share a lifetime by
+    /// construction: this is called with a key already reserved for the
+    /// connection, so the route this hands back always resolves for as long
+    /// as that key does — the same rule tracks and streams already follow.
+    pub fn install_ingress_route(
+        &mut self,
+        participant: ParticipantKey,
+        origin: ParticipantId,
+        room_id: RoomId,
+        now: Instant,
+        wall: &WallAnchor,
+    ) -> Option<(RouteId, u16)> {
+        self.data
+            .routes
+            .install(
+                RouteAction::Ingress { participant },
+                RouteNames {
+                    room_id: Some(room_id),
+                    origin,
+                    track_id: None,
+                    topic: None,
+                },
+                wall.ntp(),
+                now,
+            )
+            .inspect_err(|err| tracing::error!(?err, "ingress route install failed"))
+            .ok()
+    }
+
+    /// Retire a client's ICE association route, e.g. on teardown or a failed
+    /// connection setup that never gets past `AddParticipant`.
+    pub fn retire_ingress_route(&mut self, route: RouteId, epoch: u16, now: Instant) {
+        self.data.routes.retire(route, epoch, now);
+    }
+
+    /// Resolve an arriving client packet to the participant key it addresses.
+    pub fn resolve_ingress(&self, route: RouteId, epoch: u16) -> Option<ParticipantKey> {
+        match self.data.routes.resolve_action(route, epoch)? {
+            RouteAction::Ingress { participant } => Some(*participant),
+            other => {
+                debug_assert!(false, "an ingress frame arrived on a {other:?} route");
+                None
+            }
+        }
+    }
+
     /// Close a track's reverse path when its publisher goes away.
     pub fn close_track_reverse_route(&mut self, track_id: &TrackId, now: Instant) {
         let Some(&key) = self.control.track_keys.get(track_id) else {
