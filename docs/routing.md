@@ -71,6 +71,10 @@ A shard is the unit of:
 - UDP socket ownership,
 - and established ICE-TCP connection ownership.
 
+The kernel steers packets to the owning shard before shard-local userspace
+state is consulted. Client UDP packets are not forwarded between shards
+through the in-process mailbox mesh.
+
 The route format encodes the `ShardId` directly so packet steering can identify the owning worker without a userspace lookup.
 
 ---
@@ -105,6 +109,12 @@ reuseport socket
 The route therefore acts as a compact compiled execution address.
 
 This avoids maintaining a dynamic eBPF routing map for every individual route.
+
+It also removes the ingress ownership race. The control plane allocates and
+installs the transport route before returning ICE credentials. eBPF uses the
+encoded shard to deliver the first STUN packet directly to the owning socket;
+no receiving shard needs to discover the owner and enqueue the packet to a
+different shard.
 
 ---
 
@@ -547,6 +557,10 @@ shard worker
 
 This allows the first transport packet to reach the correct owner.
 
+There is no `Ingress` packet message in the shard mailbox protocol. A client
+UDP packet that reaches the node is steered to the socket owned by the route's
+shard before PulseBeam userspace receives it.
+
 ---
 
 # 17. Established UDP flow routing
@@ -584,6 +598,9 @@ RouteId → ShardId
 for every track/endpoint.
 
 It needs only the flow affinity required for client transport delivery.
+
+The flow-affinity table is kernel steering state. It does not replace the
+transport route, route epoch, or shard-local transport table.
 
 ---
 
@@ -632,6 +649,10 @@ shard owns it permanently
 ```
 
 After handoff, no repeated routing lookup is necessary.
+
+ICE-TCP may use one reliable control handoff carrying the accepted connection
+to the owning shard. It does not require forwarding individual UDP packet
+batches through the shard mesh.
 
 ---
 
@@ -817,6 +838,10 @@ shard worker
 
 This is the primary reason the shard belongs in the packed route.
 
+The datagram is delivered directly to the selected shard socket. A client
+ingress-style mailbox message is not a fallback when the kernel has already
+selected the owner.
+
 ---
 
 # 28. Why not use an eBPF map per RouteId
@@ -925,7 +950,30 @@ RouteHandle {
 }
 ```
 
-The exact allocator ownership can be implemented without changing the wire contract.
+The control plane is the route allocator. It chooses the destination shard,
+allocates a slot and epoch in that shard's namespace, and asks the owning
+shard to install the compiled endpoint. The route handle is not published to
+a sender until installation is acknowledged.
+
+The owning shard remains the authority for live endpoint state and validates
+the route epoch on receipt. Allocation authority and endpoint state ownership
+are separate:
+
+```text
+control plane:
+    choose shard
+    allocate (route, epoch)
+    request installation
+    publish only after acknowledgement
+
+owning shard:
+    install endpoint at slot
+    process packets
+    retire endpoint on command
+```
+
+Transport routes and distributed endpoint routes use separate allocator
+namespaces even though they share the packed representation.
 
 ---
 
@@ -1159,6 +1207,10 @@ dispatch by Envelope.type
 ```
 
 The important point is that **kernel steering and userspace endpoint lookup use the same packed route**.
+
+There is no intermediate `route.shard()` forwarding step in userspace. The
+shard selected by eBPF is already the route owner. Userspace resolves only the
+slot and validates the epoch.
 
 ---
 
@@ -1671,6 +1723,10 @@ eBPF selects shard socket
 transport slot
 ```
 
+No client UDP packet is wrapped in a shard-to-shard mailbox message. The shard
+mesh carries control-plane commands and explicitly message-based coordination,
+not a second ingress path for client datagrams.
+
 Established flow:
 
 ```text
@@ -1714,6 +1770,9 @@ slot
   ↓
 typed endpoint
 ```
+
+The datagram is delivered directly to the selected shard socket. A client
+ingress-style `Ingress` mailbox message is not part of this path.
 
 ---
 
@@ -1818,6 +1877,10 @@ The routing architecture should follow these rules.
 12. **If a route moves to another shard, a new route is minted.**
 
 13. **Stable identities such as `ParticipantId` and `TrackId` never appear in the packet hot-path routing format.**
+
+14. **The control plane allocates route handles; the owning shard installs and executes them.**
+
+15. **eBPF performs packet steering before userspace; the shard mailbox mesh does not carry client UDP ingress packets.**
 
 ---
 
