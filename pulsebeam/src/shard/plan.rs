@@ -114,6 +114,10 @@ pub(crate) struct TrackRoute {
     /// only appears here once it has installed its route, so the presence of a
     /// handle is what permits media to flow.
     pub remote_routes: Vec<RemoteRoute>,
+    /// Encodings in declared order, set when this shard opens the track's
+    /// reverse path. A reverse frame names one by index instead of carrying a
+    /// rid, so resolving it needs the same order both ends used.
+    pub encodings: Vec<Option<str0m::media::Rid>>,
     pub cache: TrackStreamCache,
 }
 
@@ -135,6 +139,7 @@ impl TrackRoute {
             subscribers: Vec::with_capacity(256),
             layer_states: Vec::new(),
             remote_routes: Vec::new(),
+            encodings: Vec::new(),
             cache: TrackStreamCache::new(),
         }
     }

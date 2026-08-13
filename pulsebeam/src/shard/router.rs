@@ -408,11 +408,17 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ReverseRoute> {
+        let encodings: Vec<Option<Rid>> = track.layers.iter().map(|l| l.rid).collect();
+        let key = self.fanout_key(track.meta.id);
+        let Some(entry) = self.data.tracks.get_mut(key) else {
+            pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+        };
+        entry.encodings = encodings.clone();
         let handle = self.open_reverse_route(
             track.meta.origin,
             ReverseTarget::Track {
                 track_id: track.meta.id,
-                encodings: track.layers.iter().map(|l| l.rid).collect(),
+                encodings,
             },
             RouteNames {
                 room_id: None,
@@ -2821,6 +2827,11 @@ mod tests {
             .open_track_reverse_route(&video_track_with(&track), now(), &wall())
             .expect("publishing opens the reverse route");
         assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(
+            fanout(&table, &track.id).encodings,
+            vec![None],
+            "opening the reverse route must also stamp the track's own descriptor"
+        );
 
         // Every subscribing shard addresses the same id.
         for shard in 1..8u8 {
