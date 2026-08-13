@@ -33,15 +33,20 @@ impl From<Truncated> for DdReadError {
 }
 
 pub fn read_mandatory(buf: &[u8]) -> Result<MandatoryFields, DdReadError> {
-    if buf.len() < MANDATORY_LEN {
+    const _: () = assert!(
+        MANDATORY_LEN == 3,
+        "the slice pattern below reads three bytes"
+    );
+
+    let [flags, frame_hi, frame_lo, ..] = *buf else {
         return Err(DdReadError::Truncated);
-    }
+    };
 
     Ok(MandatoryFields {
-        start_of_frame: buf[0] & 0b1000_0000 != 0,
-        end_of_frame: buf[0] & 0b0100_0000 != 0,
-        template_id: buf[0] & 0b0011_1111,
-        frame_number: u16::from_be_bytes([buf[1], buf[2]]),
+        start_of_frame: flags & 0b1000_0000 != 0,
+        end_of_frame: flags & 0b0100_0000 != 0,
+        template_id: flags & 0b0011_1111,
+        frame_number: u16::from_be_bytes([frame_hi, frame_lo]),
     })
 }
 
@@ -152,7 +157,7 @@ fn read_frame_dependencies(
         .ok_or(DdReadError::UnknownTemplateId(mandatory.template_id))?;
 
     if fields.custom_dtis() {
-        for dti in deps.dtis.iter_mut() {
+        for dti in &mut deps.dtis {
             *dti = DecodeTargetIndication::from_bits(r.read_bits(2)?);
         }
     }
@@ -161,7 +166,9 @@ fn read_frame_dependencies(
         deps.frame_diffs.clear();
         let mut size = r.read_bits(2)?;
         while size > 0 {
-            let fdiff = r.read_bits(4 * size)? as u16 + 1;
+            let fdiff = r
+                .read_bits_u16(4u32.saturating_mul(size))?
+                .saturating_add(1);
             deps.frame_diffs
                 .try_push(fdiff)
                 .map_err(|_| DdReadError::TooManyFrameDiffs)?;
@@ -170,8 +177,8 @@ fn read_frame_dependencies(
     }
 
     if fields.custom_chains() {
-        for chain_diff in deps.chain_diffs.iter_mut() {
-            *chain_diff = r.read_bits(8)? as u8;
+        for chain_diff in &mut deps.chain_diffs {
+            *chain_diff = r.read_bits_u8(8)?;
         }
     }
 
@@ -179,8 +186,8 @@ fn read_frame_dependencies(
 }
 
 fn read_structure(r: &mut BitReader) -> Result<TemplateDependencyStructure, DdReadError> {
-    let template_id_offset = r.read_bits(6)? as u8;
-    let decode_target_count = r.read_bits(5)? as u8 + 1;
+    let template_id_offset = r.read_bits_u8(6)?;
+    let decode_target_count = r.read_bits_u8(5)?.saturating_add(1);
     debug_assert!(decode_target_count as usize <= MAX_DECODE_TARGETS);
 
     let mut s = TemplateDependencyStructure {
@@ -222,23 +229,29 @@ fn read_template_layers(
             })
             .map_err(|_| DdReadError::TooManyTemplates)?;
 
-        match r.read_bits(2)? {
+        let next_layer_idc = r.read_bits(2)?;
+        match next_layer_idc {
             SAME_LAYER => {}
             NEXT_TEMPORAL => {
-                temporal_id += 1;
+                temporal_id = temporal_id.saturating_add(1);
                 if usize::from(temporal_id) >= MAX_TEMPORAL_IDS {
                     return Err(DdReadError::TooManyTemporalLayers);
                 }
             }
             NEXT_SPATIAL => {
                 temporal_id = 0;
-                spatial_id += 1;
+                spatial_id = spatial_id.saturating_add(1);
                 if usize::from(spatial_id) >= MAX_SPATIAL_IDS {
                     return Err(DdReadError::TooManySpatialLayers);
                 }
             }
-            NO_MORE => break,
-            _ => unreachable!("read_bits(2) yields 0..4"),
+            _ => {
+                debug_assert_eq!(
+                    next_layer_idc, NO_MORE,
+                    "read_bits(2) yields 0..4 and the other three are matched above"
+                );
+                break;
+            }
         }
     }
 
@@ -251,7 +264,7 @@ fn read_template_dtis(
     s: &mut TemplateDependencyStructure,
 ) -> Result<(), DdReadError> {
     let dt_cnt = usize::from(s.decode_target_count);
-    for t in s.templates.iter_mut() {
+    for t in &mut s.templates {
         for _ in 0..dt_cnt {
             let dti = DecodeTargetIndication::from_bits(r.read_bits(2)?);
             debug_assert!(t.dtis.len() < MAX_DECODE_TARGETS);
@@ -265,9 +278,9 @@ fn read_template_fdiffs(
     r: &mut BitReader,
     s: &mut TemplateDependencyStructure,
 ) -> Result<(), DdReadError> {
-    for t in s.templates.iter_mut() {
+    for t in &mut s.templates {
         while r.read_bit()? != 0 {
-            let fdiff = r.read_bits(4)? as u16 + 1;
+            let fdiff = r.read_bits_u16(4)?.saturating_add(1);
             t.frame_diffs
                 .try_push(fdiff)
                 .map_err(|_| DdReadError::TooManyFrameDiffs)?;
@@ -281,22 +294,22 @@ fn read_template_chains(
     s: &mut TemplateDependencyStructure,
 ) -> Result<(), DdReadError> {
     let dt_cnt = u32::from(s.decode_target_count);
-    let chain_count = r.read_ns(dt_cnt + 1)?;
-    debug_assert!(chain_count <= dt_cnt);
-    s.chain_count = chain_count as u8;
+    let chain_count = r.read_ns_u8(dt_cnt.saturating_add(1))?;
+    debug_assert!(u32::from(chain_count) <= dt_cnt);
+    s.chain_count = chain_count;
     if chain_count == 0 {
         return Ok(());
     }
 
     for _ in 0..dt_cnt {
-        let protected_by = r.read_ns(chain_count)? as u8;
+        let protected_by = r.read_ns_u8(u32::from(chain_count))?;
         debug_assert!(s.decode_target_protected_by.len() < MAX_DECODE_TARGETS);
         s.decode_target_protected_by.push(protected_by);
     }
 
-    for t in s.templates.iter_mut() {
+    for t in &mut s.templates {
         for _ in 0..chain_count {
-            let diff = r.read_bits(4)? as u8;
+            let diff = r.read_bits_u8(4)?;
             debug_assert!(t.chain_diffs.len() < MAX_CHAINS);
             t.chain_diffs.push(diff);
         }
@@ -316,11 +329,21 @@ fn read_resolutions(
 
     let mut resolutions = ArrayVec::new();
     for _ in 0..spatial_layers {
-        let width = (r.read_bits(16)? + 1) as u16;
-        let height = (r.read_bits(16)? + 1) as u16;
+        // `x_minus_1` is 16 bits, so the coded maximum is 65536 — one more
+        // than the field it lands in. `+ 1` then `as u16` turned the largest
+        // representable resolution into zero; clamping keeps it the largest.
+        let width = read_dimension(r)?;
+        let height = read_dimension(r)?;
         resolutions.push(RenderResolution { width, height });
     }
     s.resolutions = resolutions;
 
     Ok(())
+}
+
+/// Decode a `*_minus_1` render dimension, clamping the one coded value that
+/// does not fit the field it lands in.
+fn read_dimension(r: &mut BitReader<'_>) -> Result<u16, DdReadError> {
+    let coded = r.read_bits(16)?.saturating_add(1);
+    Ok(u16::try_from(coded).unwrap_or(u16::MAX))
 }

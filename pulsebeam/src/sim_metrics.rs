@@ -48,6 +48,15 @@ struct Samples {
     forwarded_quality: HashMap<String, u8>,
     /// Highest forwarded quality observed for each track origin since the last reset.
     max_forwarded_quality: HashMap<String, u8>,
+    /// Media frames that actually crossed a shard boundary, counted where they
+    /// are resolved.
+    ///
+    /// A cross-shard test cannot assert this from received bytes: a room whose
+    /// participants happen to be co-located delivers exactly the same video
+    /// while reaching none of the route, envelope or restamping code the test
+    /// exists for. Placement is a hash, so that co-location is luck, and
+    /// without this the test passes either way.
+    cross_shard_media_frames: u64,
     /// How many times each origin's forwarded layer changed since the last reset.
     ///
     /// Switching layer is not free: the receiver needs a keyframe and the picture stutters. A
@@ -115,6 +124,15 @@ pub fn record_downstream_bwe(subscriber: &str, bwe_bps: u64, desired_bps: u64) {
     });
 }
 
+/// One media frame arrived from another shard and resolved to a live route.
+pub fn record_cross_shard_media() {
+    SAMPLES.with_borrow_mut(|s| s.cross_shard_media_frames += 1);
+}
+
+pub fn cross_shard_media_frames() -> u64 {
+    SAMPLES.with_borrow(|s| s.cross_shard_media_frames)
+}
+
 /// Clear observations. The harness calls this at the start of each timed step so assertions
 /// describe the window just run, matching the byte-counter semantics.
 pub fn reset() {
@@ -132,7 +150,7 @@ pub fn record_forwarded_media(subscriber: &str, bytes: u64) {
     SAMPLES.with_borrow_mut(|s| {
         *s.forwarded_media_bytes
             .entry(subscriber.to_string())
-            .or_default() += bytes
+            .or_default() += bytes;
     });
 }
 

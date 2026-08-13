@@ -3,11 +3,7 @@ use pulsebeam_runtime::mailbox::{self};
 use pulsebeam_runtime::rand::RngCore;
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use crate::{
-    id::ShardId,
-    shard::ShardContext,
-    shard::worker::{ClusterCommand, ShardCommand},
-};
+use crate::{id::ShardId, shard::ShardContext, shard::worker::ShardCommand};
 
 const MAX_LOAD: f64 = 0.8;
 
@@ -47,9 +43,16 @@ impl ShardRouter {
         let mut total_load = 0f64;
 
         for shard_idx in 0..shard_count {
-            let snapshot = self.shard_contexts[shard_idx].metrics.snapshot();
-            let load = snapshot.delta_load(&self.shard_occupancy_snapshots[shard_idx]);
-            self.shard_occupancy_snapshots[shard_idx] = snapshot;
+            let (Some(ctx), Some(previous)) = (
+                self.shard_contexts.get(shard_idx),
+                self.shard_occupancy_snapshots.get_mut(shard_idx),
+            ) else {
+                debug_assert!(false, "shard {shard_idx} has no context or snapshot");
+                continue;
+            };
+            let snapshot = ctx.metrics.snapshot();
+            let load = snapshot.delta_load(previous);
+            *previous = snapshot;
             let load = self.update_load(shard_idx, load);
             peak_load = peak_load.max(load);
             total_load += load;
@@ -86,13 +89,15 @@ impl ShardRouter {
         }
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.shard_loads.len()
+    }
+
     pub fn try_route<K: Hash>(&self, key: &K) -> Option<ShardId> {
         let mut best_index = None;
         let mut max_hash = -1.0;
 
-        for i in 0..self.shard_loads.len() {
-            let load = self.shard_loads[i];
-
+        for (i, &load) in self.shard_loads.iter().enumerate() {
             // Protect core real-time execution deadlines
             if load >= MAX_LOAD {
                 continue;
@@ -114,32 +119,44 @@ impl ShardRouter {
         best_index
     }
 
+    /// Awaiting here is safe *only* because the shard never awaits on the
+    /// reverse channel.
+    ///
+    /// The two directions form a cycle: if a shard blocked sending the
+    /// controller an event while the controller blocked sending that shard a
+    /// command, neither would drain. The shard side breaks it — it `try_send`s
+    /// its events and treats a full queue as fatal — so a shard always reaches
+    /// the top of its loop and drains this queue. Do not make the shard side
+    /// await, and do not rely on that guarantee from anywhere else.
     pub async fn send(&mut self, shard_id: ShardId, cmd: ShardCommand) {
-        self.get_mut(shard_id)
-            .send(cmd)
-            .await
-            .expect("shard to be running");
-    }
-
-    pub async fn broadcast(&mut self, cmd: ClusterCommand) {
-        for ctx in &self.shard_contexts {
-            let cmd = ShardCommand::Cluster(cmd.clone());
-            ctx.command_tx.send(cmd).await.expect("shard to be running");
+        // A shard that has gone away cannot be told anything; the controller
+        // keeps serving the others rather than following it down.
+        if self.get_mut(shard_id).send(cmd).await.is_err() {
+            tracing::error!(%shard_id, "shard is not running; dropping command");
         }
     }
 
     fn get_mut(&mut self, shard_id: ShardId) -> &mut mailbox::Sender<ShardCommand> {
-        &mut self.shard_contexts[shard_id.index()].command_tx
+        let Some(ctx) = self.shard_contexts.get_mut(shard_id.index()) else {
+            pulsebeam_runtime::fatal!(
+                "shard {} is not in this node's shard table",
+                shard_id.index()
+            )
+        };
+        &mut ctx.command_tx
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
 
     // Helper to generate a minimal testing router with artificial capacity
     fn setup_test_router(shard_count: usize) -> ShardRouter {
-        let rng = pulsebeam_runtime::rand::seeded_rng(42);
+        let _rng = pulsebeam_runtime::rand::seeded_rng(42);
         ShardRouter {
             hasher_config: ahash::RandomState::with_seeds(1, 2, 3, 4),
             shard_contexts: vec![], // Omitted to keep tests pure-functional on routing math

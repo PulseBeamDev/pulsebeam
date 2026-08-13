@@ -15,6 +15,20 @@ use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_proto::namespace;
 use pulsebeam_proto::prelude::Message;
+/// How many packets may wait for the assignment that says where they go.
+///
+/// Enough for the keyframe a stream opens with - a 720p one runs to a few dozen packets - and
+/// small enough that a peer sending unroutable media cannot cost more than a few hundred kilobytes.
+const UNROUTED_CAPACITY: usize = 128;
+
+/// How long a packet may wait to be routed before it is stale.
+///
+/// The assignment travels over the data channel, so the wait is a round trip at worst. Anything
+/// older belongs to a stream that has gone, and handing it over late is worse than dropping it:
+/// the receiver has moved on, and a packet from behind its sequence frontier reads as a gap it
+/// must wait out.
+const UNROUTED_MAX_WAIT: Duration = Duration::from_millis(500);
+
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};
 use std::collections::{HashMap, VecDeque};
@@ -47,6 +61,20 @@ pub struct StatisticsSnapshot {
     /// a constantly climbing count means downstream cannot decode — the signature
     /// of a broken forwarding/reassembly path.
     pub(crate) keyframe_requests_received: u64,
+    /// Media the agent received and could not hand to anyone.
+    ///
+    /// Should be zero. Anything else is silent loss inside the client: packets that arrived, were
+    /// decrypted and demuxed, and then went nowhere because no slot claimed them before the hold
+    /// window ran out. Its absence is why a 34-packet drop once needed probes at every hop to
+    /// find - the frames were missing at the application and present at the wire, and nothing
+    /// measured in between.
+    pub(crate) unroutable_media_dropped: u64,
+    /// Media held until the assignment naming its slot arrived, then delivered.
+    ///
+    /// Expected to be small and non-zero: the SFU forwards as soon as it has a slot, which can
+    /// beat the assignment over the data channel. A large or growing figure means signalling is
+    /// lagging media badly enough to be worth looking at, even though nothing was lost.
+    pub(crate) media_held_for_routing: u64,
 }
 
 impl StatisticsSnapshot {
@@ -57,6 +85,16 @@ impl StatisticsSnapshot {
     /// Cumulative keyframe requests received (see field docs).
     pub fn keyframe_requests_received(&self) -> u64 {
         self.keyframe_requests_received
+    }
+
+    /// Media that arrived and could not be delivered to anyone (see field docs). Should be zero.
+    pub fn unroutable_media_dropped(&self) -> u64 {
+        self.unroutable_media_dropped
+    }
+
+    /// Media delayed until its slot became routable, then delivered (see field docs).
+    pub fn media_held_for_routing(&self) -> u64 {
+        self.media_held_for_routing
     }
 
     pub fn bytes_sent(&self) -> u64 {
@@ -197,6 +235,13 @@ pub(crate) enum AgentEvent {
     StatsUpdated,
     RemoteTrackDiscovered(Track),
     RemoteTrackRemoved(String),
+    /// Who the SFU is forwarding audio for, loudest first, whenever that changes.
+    SpeakersChanged(Vec<crate::agent::slots::Speaker>),
+    /// The SFU stopped forwarding this track - it is out of bandwidth for it, not gone. A UI
+    /// should show a placeholder rather than the blank it would otherwise render.
+    RemoteTrackPaused(String),
+    /// Forwarding resumed.
+    RemoteTrackResumed(String),
     Connected,
     Disconnected(String),
 }
@@ -209,6 +254,9 @@ pub(crate) struct DriverInit {
     pub api: HttpApiClient,
     pub signaling_cid: ChannelId,
     pub resource_uri: Uri,
+    /// The connection generation, echoed as `If-Match` on the next reconnect and replaced by the
+    /// one the server answers with. Identity is the participant id; this says which connection.
+    pub etag: String,
     pub room_id: String,
     pub participant_id: String,
     pub medias: Vec<MediaAdded>,
@@ -231,6 +279,13 @@ struct DataSubsystem {
 
 struct MediaSubsystem {
     media_targets: HashMap<Mid, mailbox::Sender<RtpPacket>>,
+    /// Packets that arrived before the assignment saying which track their slot carries.
+    ///
+    /// Media and signalling travel separately, and the SFU starts forwarding as soon as it has a
+    /// slot - which can be before the assignment naming it reaches the client. Those first packets
+    /// are the keyframe the stream opens with, and dropping them costs the viewer the picture
+    /// until the next one, which on a settled stream can be seconds away.
+    unrouted: VecDeque<(Mid, Option<Instant>, RtpPacket)>,
     /// Cache of which (mid, rid) each incoming SSRC belongs to. `Event::RtpPacket`
     /// carries only the SSRC, so the mapping is resolved once via the DirectApi and
     /// reused. Mirrors the SFU's `incoming_rtp_routes`.
@@ -244,6 +299,8 @@ struct MediaSubsystem {
     /// that carries no media yet; its sender waits here until an assignment arrives, so raising
     /// the height later starts feeding the handle the subscriber already holds.
     pending_media_targets: HashMap<String, mailbox::Sender<RtpPacket>>,
+    /// Where to hand audio tracks the SFU decides to forward, once someone has asked for them.
+    audio_sink: Option<mailbox::Sender<RemoteTrack>>,
     layer_ctrl: LayerController,
     desired_ctrl: BitrateController,
     last_desired: Bitrate,
@@ -296,6 +353,9 @@ struct SubscriptionSubsystem {
 struct SessionSubsystem {
     api: HttpApiClient,
     resource_uri: Uri,
+    /// The connection generation, echoed as `If-Match` on the next reconnect and replaced by the
+    /// one the server answers with. Identity is the participant id; this says which connection.
+    etag: String,
     room_id: String,
     participant_id: String,
     disconnected_reason: Option<String>,
@@ -370,6 +430,8 @@ impl AgentDriver {
                 upstream_slots: HashMap::new(),
                 pending_media_subscriptions: HashMap::new(),
                 pending_media_targets: HashMap::new(),
+                unrouted: VecDeque::new(),
+                audio_sink: None,
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
                 last_desired: Bitrate::bps(0),
@@ -391,6 +453,7 @@ impl AgentDriver {
             session: SessionSubsystem {
                 api: init.api,
                 resource_uri: init.resource_uri,
+                etag: init.etag,
                 room_id: init.room_id,
                 participant_id: init.participant_id,
                 disconnected_reason: None,
@@ -402,7 +465,7 @@ impl AgentDriver {
                 notifier: tokio::sync::Notify::new(),
                 sleep: Box::pin(tokio::time::sleep(MIN_QUANTA)),
                 rtc_deadline: None,
-                bwe_next_tick: now + BWE_SLOW_INTERVAL,
+                bwe_next_tick: now.checked_add(BWE_SLOW_INTERVAL).unwrap_or(now),
             },
         };
 
@@ -560,7 +623,8 @@ impl AgentDriver {
     fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
         self.subscriptions.playout_delay_ms = bounds;
         self.subscriptions.sub_manager.reset_active_assignments();
-        self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+        self.subscriptions.pending_deadline =
+            Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
         self.flush_pending_state();
         self.timers.notifier.notify_one();
     }
@@ -594,7 +658,7 @@ impl AgentDriver {
                 _ = self.timers.notifier.notified() => {}
                 res = self.network.socket.recv_from(&mut self.network.buf) => {
                     if let Ok((n, source)) = res {
-                        match self.network.buf[..n].try_into() {
+                        match self.network.buf.get(..n).unwrap_or_default().try_into() {
                             Ok(contents) => {
                                 let _ = self.rtc.handle_input(Input::Receive(
                                     Instant::now().into(),
@@ -629,9 +693,10 @@ impl AgentDriver {
     }
 
     fn reset_sleep_to_next_deadline(&mut self) {
-        let next = self
-            .next_deadline()
-            .unwrap_or_else(|| Instant::now() + MIN_QUANTA);
+        let next = self.next_deadline().unwrap_or_else(|| {
+            let now = Instant::now();
+            now.checked_add(MIN_QUANTA).unwrap_or(now)
+        });
         if self.timers.sleep.deadline() != next {
             self.timers.sleep.as_mut().reset(next);
         }
@@ -688,13 +753,18 @@ impl AgentDriver {
 
         while now >= self.timers.bwe_next_tick {
             let desired_bps = self.media.layer_ctrl.tick(now);
-            let desired_bitrate = Bitrate::from(desired_bps.max(0.0) as u64);
+            let desired_bitrate =
+                Bitrate::from(crate::media::saturating_u64_from_f64(desired_bps.max(0.0)));
             let filtered_bitrate = self.media.desired_ctrl.update(desired_bitrate);
             if filtered_bitrate != self.media.last_desired {
                 self.media.last_desired = filtered_bitrate;
                 self.rtc.bwe().set_desired_bitrate(filtered_bitrate);
             }
-            self.timers.bwe_next_tick += BWE_SLOW_INTERVAL;
+            self.timers.bwe_next_tick = self
+                .timers
+                .bwe_next_tick
+                .checked_add(BWE_SLOW_INTERVAL)
+                .unwrap_or(self.timers.bwe_next_tick);
         }
     }
 
@@ -754,7 +824,7 @@ impl AgentDriver {
                 let rtp = RtpWrite::new(
                     pt,
                     packet.seq,
-                    packet.ts.numer() as u32,
+                    u32::try_from(packet.ts.numer() & u64::from(u32::MAX)).unwrap_or(0),
                     packet.arrival.into(),
                     packet.payload,
                 )
@@ -776,6 +846,11 @@ impl AgentDriver {
                     let _ = response.send(Ok(()));
                 }
             }
+            OutgoingCommand::ReceiveAudio { response } => {
+                let (tx, rx) = mailbox::bounded(16);
+                self.media.audio_sink = Some(tx);
+                let _ = response.send(rx);
+            }
             OutgoingCommand::SubscribeMedia {
                 subscription,
                 response,
@@ -785,6 +860,7 @@ impl AgentDriver {
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
                     let _ = response.send(Ok(RemoteTrack::new(track, rx)));
+                    self.deliver_unrouted();
                     self.subscriptions
                         .desired_subscriptions
                         .insert(track_id, subscription);
@@ -893,13 +969,12 @@ impl AgentDriver {
                         } else if let Some((_direction, topic, scope)) =
                             parse_data_track_label(&label)
                         {
-                            self.data
-                                .data_channels
-                                .entry(cid)
-                                .or_insert(DataTrackBinding {
+                            self.data.data_channels.entry(cid).or_insert_with(|| {
+                                DataTrackBinding {
                                     topic: topic.to_string(),
                                     scope: scope.clone(),
-                                });
+                                }
+                            });
                         } else {
                             self.ordered_topics.open_channel(cid, &label);
                         }
@@ -923,17 +998,30 @@ impl AgentDriver {
                         };
                         if let Some((mid, rid)) = route {
                             self.media.incoming_rtp_routes.insert(ssrc, (mid, rid));
-                            if let Some(tx) = self.media.media_targets.get(&mid) {
-                                let _ = tx.try_send(RtpPacket {
-                                    mid,
-                                    rid,
-                                    seq: rtp.seq_no,
-                                    ts: rtp.time,
-                                    marker: rtp.header.marker,
-                                    payload: rtp.payload,
-                                    ext_vals: rtp.header.ext_vals,
-                                    arrival: rtp.timestamp.into(),
-                                });
+                            let packet = RtpPacket {
+                                mid,
+                                rid,
+                                seq: rtp.seq_no,
+                                ts: rtp.time,
+                                marker: rtp.header.marker,
+                                ssrc: Some(ssrc),
+                                payload: rtp.payload,
+                                ext_vals: rtp.header.ext_vals,
+                                arrival: rtp.timestamp.into(),
+                            };
+                            match self.media.media_targets.get(&mid) {
+                                Some(tx) => {
+                                    let _ = tx.try_send(packet);
+                                }
+                                None => {
+                                    let deadline = self.now.checked_add(UNROUTED_MAX_WAIT);
+                                    self.media.unrouted.push_back((mid, deadline, packet));
+                                    while self.media.unrouted.len() > UNROUTED_CAPACITY {
+                                        self.media.unrouted.pop_front();
+                                        self.stats.unroutable_media_dropped =
+                                            self.stats.unroutable_media_dropped.wrapping_add(1);
+                                    }
+                                }
                             }
                         }
                     }
@@ -975,7 +1063,7 @@ impl AgentDriver {
                     return Some(t.into());
                 }
                 Err(e) => {
-                    self.session.disconnected_reason = Some(format!("RTC Error: {:?}", e));
+                    self.session.disconnected_reason = Some(format!("RTC Error: {e:?}"));
                     self.rtc.disconnect();
                     return None;
                 }
@@ -1042,12 +1130,27 @@ impl AgentDriver {
 
         match payload {
             signaling::server_message::Payload::Update(update) => {
-                let (assignments, discovered, removed) = self.slot_manager.sync(update);
+                let sync = self.slot_manager.sync(update);
+                let (assignments, discovered, removed) = (
+                    sync.new_assignments,
+                    sync.newly_discovered_tracks,
+                    sync.removed_tracks,
+                );
+                for (track_id, paused) in sync.pause_changes {
+                    // The SFU told us it started or stopped forwarding. Without this an
+                    // application cannot tell a paused stream from a dead network, so it shows a
+                    // blank tile where a placeholder belongs.
+                    self.emit(if paused {
+                        AgentEvent::RemoteTrackPaused(track_id)
+                    } else {
+                        AgentEvent::RemoteTrackResumed(track_id)
+                    });
+                }
                 for track in discovered {
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
                 }
                 for track_id in &removed {
-                    self.subscriptions.sub_manager.remove_track(track_id);
+                    self.forget_track(track_id);
                 }
                 if !removed.is_empty() {
                     self.subscriptions.pending_deadline = Some(self.now);
@@ -1056,6 +1159,18 @@ impl AgentDriver {
                 for track_id in removed {
                     self.media.pending_media_targets.remove(&track_id);
                     self.emit(AgentEvent::RemoteTrackRemoved(track_id));
+                }
+                if sync.speakers_changed {
+                    self.emit(AgentEvent::SpeakersChanged(self.slot_manager.speakers()));
+                }
+                for (mid, track) in sync.audio_arrivals {
+                    // Nobody subscribed to this: the SFU chose to forward it, and it is described
+                    // entirely by the assignment - a speaker never appears in `tracks_upsert`.
+                    let (tx, rx) = mailbox::bounded(256);
+                    self.media.media_targets.insert(mid, tx);
+                    if let Some(sink) = &self.media.audio_sink {
+                        let _ = sink.try_send(RemoteTrack::new(track, rx));
+                    }
                 }
                 for (mid, track) in assignments {
                     let track_id = track.id.clone();
@@ -1074,11 +1189,53 @@ impl AgentDriver {
                         let _ = response.send(Ok(remote_track));
                     }
                 }
+                // Last, once every slot this update touched is routable.
+                self.deliver_unrouted();
             }
             signaling::server_message::Payload::Error(err) => {
                 tracing::warn!("signaling error: {}", err);
             }
         }
+    }
+
+    /// Drop every trace of a track the room says has gone.
+    ///
+    /// Both halves, and that is the point. `desired_subscriptions` is the source of truth - every
+    /// `set_desired` is rebuilt from it - while `sub_manager` holds what was derived from it last.
+    /// Clearing only the derived half looks like it works until the next subscription rebuilds
+    /// `desired` from a map that still holds the departed track, puts it back, and has the client
+    /// asking the SFU for a publisher who left.
+    fn forget_track(&mut self, track_id: &str) {
+        self.subscriptions.desired_subscriptions.remove(track_id);
+        self.subscriptions.sub_manager.remove_track(track_id);
+    }
+
+    /// Hand over packets that were waiting for the assignment naming their slot.
+    ///
+    /// In arrival order, and only for slots now routable; anything still unrouted stays held until
+    /// it is claimed or goes stale.
+    fn deliver_unrouted(&mut self) {
+        if self.media.unrouted.is_empty() {
+            return;
+        }
+        let now = self.now;
+        let mut still_waiting = VecDeque::with_capacity(self.media.unrouted.len());
+        while let Some((mid, deadline, packet)) = self.media.unrouted.pop_front() {
+            if deadline.is_none_or(|deadline| now > deadline) {
+                self.stats.unroutable_media_dropped =
+                    self.stats.unroutable_media_dropped.wrapping_add(1);
+                continue;
+            }
+            match self.media.media_targets.get(&mid) {
+                Some(tx) => {
+                    let _ = tx.try_send(packet);
+                    self.stats.media_held_for_routing =
+                        self.stats.media_held_for_routing.wrapping_add(1);
+                }
+                None => still_waiting.push_back((mid, deadline, packet)),
+            }
+        }
+        self.media.unrouted = still_waiting;
     }
 
     fn emit(&mut self, event: AgentEvent) {
@@ -1087,7 +1244,8 @@ impl AgentDriver {
 
     fn flush_pending_state(&mut self) {
         let Some(mut ch) = self.rtc.channel(self.data.signaling_cid) else {
-            self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+            self.subscriptions.pending_deadline =
+                Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
             return;
         };
 
@@ -1120,7 +1278,8 @@ impl AgentDriver {
         let encoded = msg.encode_to_vec();
         if let Err(err) = ch.write(true, encoded.as_slice()) {
             tracing::warn!("failed to send signaling: {:?}", err);
-            self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+            self.subscriptions.pending_deadline =
+                Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
         } else {
             self.subscriptions.pending_deadline = None;
             self.subscriptions.upstream_dirty = false;
@@ -1135,11 +1294,14 @@ impl AgentDriver {
         let delay = match self.session.retry_count {
             0 => Duration::ZERO,
             1 => Duration::from_millis(500),
-            n => Duration::from_millis(500 * 2u64.pow(n.min(10) - 1)).min(Duration::from_secs(5)),
+            n => {
+                Duration::from_millis(500u64.saturating_mul(2u64.pow(n.min(10).saturating_sub(1))))
+                    .min(Duration::from_secs(5))
+            }
         };
 
-        self.session.retry_count += 1;
-        self.session.reconnect_deadline = Some(now + delay);
+        self.session.retry_count = self.session.retry_count.saturating_add(1);
+        self.session.reconnect_deadline = Some(now.checked_add(delay).unwrap_or(now));
     }
 
     async fn perform_reconnect(&mut self) {
@@ -1180,9 +1342,16 @@ impl AgentDriver {
             .api
             .update_participant(
                 self.session.resource_uri.clone(),
-                UpdateParticipantRequest { offer },
+                UpdateParticipantRequest {
+                    offer,
+                    etag: self.session.etag.clone(),
+                },
             )
             .await?;
+
+        // The generation moves on with every successful reconnect; the next one has to quote the
+        // new value or the server will refuse it.
+        self.session.etag = resp.etag;
 
         self.rtc
             .sdp_api()

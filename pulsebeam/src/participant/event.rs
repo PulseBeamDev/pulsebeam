@@ -5,7 +5,13 @@ use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
 pub trait ParticipantSink {
     fn subscribe(&mut self, track: TrackMeta);
     fn unsubscribe(&mut self, track: TrackMeta);
-    fn publish_track(&mut self, track: Track);
+    fn publish_track(&mut self, track: Track, states: crate::track::TrackStates);
+    /// A published track's latest measurements. Sent, not shared.
+    fn publish_track_stats(
+        &mut self,
+        track_id: crate::entity::TrackId,
+        states: crate::track::TrackStates,
+    );
     fn unpublish_track(&mut self, track_id: TrackId);
     fn subscribe_data_topic(
         &mut self,
@@ -35,6 +41,8 @@ pub trait ParticipantSink {
 
 #[cfg(test)]
 pub mod test_utils {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
 
     #[derive(Debug, Default)]
@@ -72,7 +80,14 @@ pub mod test_utils {
             self.unsubscribe_calls.push(track);
         }
 
-        fn publish_track(&mut self, track: Track) {
+        fn publish_track_stats(
+            &mut self,
+            _track_id: crate::entity::TrackId,
+            _states: crate::track::TrackStates,
+        ) {
+        }
+
+        fn publish_track(&mut self, track: Track, _states: crate::track::TrackStates) {
             self.publish_track_calls.push(track.meta.id);
         }
 
@@ -110,7 +125,7 @@ pub mod test_utils {
         }
 
         fn exit(&mut self) {
-            self.exit_count += 1;
+            self.exit_count = self.exit_count.saturating_add(1);
         }
 
         fn publish_rtp(&mut self, stream_id: StreamId, _pkt: RtpPacket) {

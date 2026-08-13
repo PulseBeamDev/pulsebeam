@@ -1,3 +1,10 @@
+//! Switching a subscriber between encodings of one track.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! hole tracking compares sequence numbers from a publisher, so a wrap would
+//! either record a gap of billions or hide a real one, and the switcher would
+//! hold or release a switch on a number that was never true.
+
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -282,7 +289,7 @@ impl Switcher {
                     // stream may still fill by reordering (bounded).
                     if let Some(expected) = self.next_expected_input
                         && input_seq > expected
-                        && input_seq - expected <= MAX_TRACKED_HOLES as u64
+                        && input_seq.saturating_sub(expected) <= MAX_TRACKED_HOLES as u64
                     {
                         self.active_input_holes.extend(expected..input_seq);
                         self.trim_active_input_holes();
@@ -324,7 +331,9 @@ impl Switcher {
 
     fn trim_active_input_holes(&mut self) {
         while self.active_input_holes.len() > MAX_TRACKED_HOLES {
-            let lowest = *self.active_input_holes.iter().next().expect("non-empty");
+            let Some(&lowest) = self.active_input_holes.iter().next() else {
+                break;
+            };
             self.active_input_holes.remove(&lowest);
         }
     }
@@ -440,7 +449,7 @@ impl Switcher {
         self.tail = Some(Tail {
             seq_base,
             ts_base: self.timeline.ts_base(),
-            expires_at: now + TAIL_DRAIN_WINDOW,
+            expires_at: now.checked_add(TAIL_DRAIN_WINDOW).unwrap_or(now),
             holes,
         });
     }
@@ -539,7 +548,7 @@ impl Switcher {
             Some(expected) if seq_v == expected => {}
             Some(expected) if seq_v > expected => {
                 // A jump this large is a switch, not loss; do not record it.
-                if seq_v - expected <= MAX_TRACKED_HOLES as u64 {
+                if seq_v.saturating_sub(expected) <= MAX_TRACKED_HOLES as u64 {
                     self.holes.extend(expected..seq_v);
                 }
             }
@@ -548,7 +557,9 @@ impl Switcher {
             }
         }
         while self.holes.len() > MAX_TRACKED_HOLES {
-            let lowest = *self.holes.iter().next().expect("non-empty");
+            let Some(&lowest) = self.holes.iter().next() else {
+                break;
+            };
             self.holes.remove(&lowest);
         }
 
@@ -557,7 +568,7 @@ impl Switcher {
             self.frame_start_output = Some(seq_v);
         }
         if self.next_expected_output.is_none_or(|e| seq_v >= e) {
-            self.next_expected_output = Some(seq_v + 1);
+            self.next_expected_output = Some(seq_v.saturating_add(1));
         }
         if self.last_output.is_none_or(|last| seq_v > *last) {
             self.last_output = Some(seq);
@@ -594,6 +605,8 @@ impl Switcher {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp;
@@ -626,8 +639,8 @@ mod test {
         for p in packets {
             let mut p = p.clone();
             p.ext_vals.rid = stream.1;
-            cache.push(&p);
             let now = p.arrival_ts;
+            cache.push(p);
             switcher.feed(stream.0, cache, now, &mut |o| out.push(o));
         }
     }
@@ -781,10 +794,12 @@ mod test {
             DecodeTargetIndication::NotPresent
         };
         for p in frame.iter_mut() {
-            let mut dd = DependencyDescriptor::default();
-            dd.frame_dependencies = FrameDependencyTemplate {
-                dtis: [dti].into_iter().collect(),
-                temporal_id: if in_dt0 { 0 } else { 1 },
+            let dd = DependencyDescriptor {
+                frame_dependencies: FrameDependencyTemplate {
+                    dtis: [dti].into_iter().collect(),
+                    temporal_id: if in_dt0 { 0 } else { 1 },
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             p.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));

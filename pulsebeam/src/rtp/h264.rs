@@ -30,6 +30,9 @@ const FU_START_MASK: u8 = 0x80;
 
 #[cfg(test)]
 pub mod test_utils {
+    // A fixture that overflows should fail the test, not clamp into a pass.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
 
     /// A single NAL unit packet of the given type, padded to `len` bytes.
@@ -58,8 +61,8 @@ pub mod test_utils {
         let mut payload = vec![STAPA_NALU_TYPE];
         for &(ty, len) in nalus {
             assert!(len >= 1);
-            payload.push((len >> 8) as u8);
-            payload.push(len as u8);
+            let len16 = u16::try_from(len).expect("fixture NAL fits a length prefix");
+            payload.extend_from_slice(&len16.to_be_bytes());
             payload.push(ty & NALU_TYPE_MASK);
             payload.extend(std::iter::repeat_n(0u8, len - 1));
         }
@@ -89,6 +92,8 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::test_utils::*;
     use super::*;
 

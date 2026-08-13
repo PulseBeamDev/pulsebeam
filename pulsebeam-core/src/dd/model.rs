@@ -68,7 +68,14 @@ pub struct TemplateDependencyStructure {
 impl TemplateDependencyStructure {
     pub fn template_index(&self, wire_id: u8) -> usize {
         let offset = u16::from(self.template_id_offset);
-        usize::from((u16::from(wire_id) + TEMPLATE_ID_MODULUS - offset) % TEMPLATE_ID_MODULUS)
+        // Modular by intent: template ids wrap within the modulus, so the
+        // addition before the subtraction is what keeps it non-negative.
+        usize::from(
+            u16::from(wire_id)
+                .wrapping_add(TEMPLATE_ID_MODULUS)
+                .wrapping_sub(offset)
+                % TEMPLATE_ID_MODULUS,
+        )
     }
 
     pub fn template(&self, wire_id: u8) -> Option<&FrameDependencyTemplate> {
@@ -80,14 +87,14 @@ impl TemplateDependencyStructure {
         match self.decode_target_count {
             0 => 0,
             n if n as usize >= MAX_DECODE_TARGETS => u32::MAX,
-            n => (1u32 << n) - 1,
+            n => (1u32 << n).saturating_sub(1),
         }
     }
 
     pub fn spatial_layer_count(&self) -> usize {
         self.templates
             .iter()
-            .map(|t| usize::from(t.spatial_id) + 1)
+            .map(|t| usize::from(t.spatial_id).saturating_add(1))
             .max()
             .unwrap_or(0)
     }
@@ -226,7 +233,8 @@ mod tests {
         s.decode_target_count = 5;
         assert_eq!(s.all_decode_targets_bitmask(), 0b11111);
 
-        s.decode_target_count = MAX_DECODE_TARGETS as u8;
+        s.decode_target_count =
+            u8::try_from(MAX_DECODE_TARGETS).expect("MAX_DECODE_TARGETS fits a u8");
         assert_eq!(s.all_decode_targets_bitmask(), u32::MAX);
     }
 

@@ -51,13 +51,52 @@ pub fn from_socket(
     socket: UdpSocket,
     external_addr: Option<SocketAddr>,
 ) -> io::Result<UdpTransport> {
-    let socket = Arc::new(socket);
+    from_shared(Arc::new(socket), external_addr)
+}
+
+/// Build a transport over a socket shared with the rest of a `SO_REUSEPORT`
+/// group, reading this member's share of the arrivals.
+///
+/// The group decides which member a datagram belongs to, by hashing its
+/// 4-tuple; see `bound_udp_sim`. Sending is unaffected — every member writes to
+/// the one socket, which is what the kernel does too.
+#[cfg(feature = "sim")]
+pub(crate) fn from_reuseport_member(
+    socket: Arc<UdpSocket>,
+    external_addr: Option<SocketAddr>,
+    member: crate::net::bound_udp::ReuseportMember,
+) -> io::Result<UdpTransport> {
+    build(socket, external_addr, Some(member))
+}
+
+/// Build a transport over a socket that may already have other transports on
+/// it. Several readers on one socket is what `SO_REUSEPORT` looks like from
+/// above: a datagram goes to whichever is ready for it.
+pub fn from_shared(
+    socket: Arc<UdpSocket>,
+    external_addr: Option<SocketAddr>,
+) -> io::Result<UdpTransport> {
+    build(
+        socket,
+        external_addr,
+        #[cfg(feature = "sim")]
+        None,
+    )
+}
+
+fn build(
+    socket: Arc<UdpSocket>,
+    external_addr: Option<SocketAddr>,
+    #[cfg(feature = "sim")] member: Option<crate::net::bound_udp::ReuseportMember>,
+) -> io::Result<UdpTransport> {
     let local_addr = external_addr.unwrap_or(socket.local_addr()?);
 
     let reader = UdpTransportReader {
         sock: socket.clone(),
         local_addr,
         arena: vec![0; CHUNK_SIZE].into_boxed_slice(),
+        #[cfg(feature = "sim")]
+        member,
     };
     #[cfg(feature = "sim")]
     let shaper = crate::net::shaper::Shaper::default();
@@ -93,7 +132,7 @@ pub fn from_socket(
     }
 
     let writer = UdpTransportWriter {
-        sock: socket.clone(),
+        sock: socket,
         local_addr,
         drop_count: 0,
         #[cfg(feature = "sim")]
@@ -110,6 +149,11 @@ pub struct UdpTransportReader {
     sock: Arc<UdpSocket>,
     local_addr: SocketAddr,
     arena: Box<[u8]>,
+    /// Set when this socket is one of several bound to the same address. Its
+    /// arrivals then come from the group rather than straight off the socket,
+    /// because which member a datagram belongs to is the group's decision.
+    #[cfg(feature = "sim")]
+    member: Option<crate::net::bound_udp::ReuseportMember>,
 }
 
 impl UdpTransportReader {
@@ -123,6 +167,10 @@ impl UdpTransportReader {
 
     #[inline]
     pub async fn readable(&self) -> io::Result<()> {
+        #[cfg(feature = "sim")]
+        if let Some(member) = &self.member {
+            return member.readable().await;
+        }
         self.sock.readable().await?;
         Ok(())
     }
@@ -130,6 +178,22 @@ impl UdpTransportReader {
     #[inline]
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
         debug_assert_eq!(self.arena.len(), CHUNK_SIZE);
+        #[cfg(feature = "sim")]
+        if let Some(member) = &self.member {
+            let (buf, src) = member.try_recv()?;
+            let n = buf.len();
+            debug_assert!(n <= CHUNK_SIZE, "reuseport datagram exceeds the chunk size");
+            out.push(RecvPacketBatch {
+                transport: Transport::Udp(UdpMode::Scalar),
+                src,
+                dst: self.local_addr,
+                buf,
+                stride: n,
+                len: n,
+                offset: 0,
+            });
+            return Ok(1);
+        }
         match self.sock.try_recv_from(&mut self.arena) {
             Ok((n, source)) => {
                 debug_assert!(
@@ -141,7 +205,7 @@ impl UdpTransportReader {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf: self.arena[..n].to_vec(),
+                    buf: self.arena.get(..n).unwrap_or_default().to_vec(),
                     stride: n,
                     len: n,
                     offset: 0,
@@ -217,7 +281,7 @@ impl UdpTransportWriter {
                 if self.drop_count.is_multiple_of(100) {
                     tracing::warn!("udp_scalar dropped a packet due to full socket");
                 }
-                self.drop_count += 1;
+                self.drop_count = self.drop_count.saturating_add(1);
                 Ok(true)
             }
             Err(err) => {

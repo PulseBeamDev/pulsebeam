@@ -33,15 +33,17 @@ prop_compose! {
         ),
         protected_by in prop::collection::vec(0usize..chain_count.max(1), dt_cnt),
         with_resolutions in any::<bool>(),
-        dims in prop::collection::vec((16u16..=4096, 16u16..=4096), spatial),
+        // Up to the full field, not a plausible-looking 4096: the coded form is
+        // `minus_1`, so the interesting values are at the ends.
+        dims in prop::collection::vec((1u16..=u16::MAX, 1u16..=u16::MAX), spatial),
     ) -> TemplateDependencyStructure {
         let mut templates = ArrayVec::new();
         for s in 0..spatial {
             for t in 0..temporal {
                 let i = s * temporal + t;
                 templates.push(FrameDependencyTemplate {
-                    spatial_id: s as u8,
-                    temporal_id: t as u8,
+                    spatial_id: u8::try_from(s).expect("spatial index fits a u8"),
+                    temporal_id: u8::try_from(t).expect("temporal index fits a u8"),
                     dtis: dti_grid[i].iter().copied().collect(),
                     frame_diffs: fdiff_grid[i].iter().copied().collect(),
                     chain_diffs: chain_grid[i].iter().copied().collect(),
@@ -59,12 +61,15 @@ prop_compose! {
 
         TemplateDependencyStructure {
             template_id_offset,
-            decode_target_count: dt_cnt as u8,
-            chain_count: chain_count as u8,
+            decode_target_count: u8::try_from(dt_cnt).expect("dt count fits a u8"),
+            chain_count: u8::try_from(chain_count).expect("chain count fits a u8"),
             decode_target_protected_by: if chain_count == 0 {
                 ArrayVec::new()
             } else {
-                protected_by.iter().map(|&v| v as u8).collect()
+                protected_by
+                    .iter()
+                    .map(|&v| u8::try_from(v).expect("chain index fits a u8"))
+                    .collect()
             },
             templates,
             resolutions,
@@ -211,7 +216,12 @@ fn delta_frames_are_exactly_three_bytes() {
         w.write(&keyframe(&s), &mut buf).unwrap();
 
         for i in 0..s.templates.len() {
-            let len = w.write(&delta(&s, i, i as u16), &mut buf).unwrap();
+            let len = w
+                .write(
+                    &delta(&s, i, u16::try_from(i).expect("loop index fits a u16")),
+                    &mut buf,
+                )
+                .unwrap();
             assert_eq!(len, MANDATORY_LEN, "template {i} of {s:?}");
         }
     }
@@ -229,7 +239,11 @@ fn structures_survive_a_keyframe_then_delta_exchange() {
         assert_eq!(decoded.attached_structure.as_deref(), Some(&s));
 
         for i in 0..s.templates.len() {
-            let sent = delta(&s, i, 100 + i as u16);
+            let sent = delta(
+                &s,
+                i,
+                100 + u16::try_from(i).expect("loop index fits a u16"),
+            );
             let len = writer.write(&sent, &mut buf).unwrap();
             let got = reader.read(&buf[..len]).unwrap();
             assert_eq!(got, sent, "template {i}");
@@ -248,10 +262,18 @@ fn resolutions_are_reported_per_spatial_layer() {
     reader.read(&buf[..len]).unwrap();
 
     for (i, expected) in s.resolutions.iter().enumerate() {
-        let len = writer.write(&delta(&s, i, i as u16), &mut buf).unwrap();
+        let len = writer
+            .write(
+                &delta(&s, i, u16::try_from(i).expect("loop index fits a u16")),
+                &mut buf,
+            )
+            .unwrap();
         let got = reader.read(&buf[..len]).unwrap();
         assert_eq!(got.resolution.as_ref(), Some(expected));
-        assert_eq!(got.spatial_id(), i as u8);
+        assert_eq!(
+            got.spatial_id(),
+            u8::try_from(i).expect("loop index fits a u8")
+        );
     }
 }
 
@@ -269,11 +291,14 @@ fn reader_resolves_template_across_id_offset_wraparound() {
 
     // Templates 0,1,2 map to wire ids 62, 63, 0.
     for (index, wire_id) in [(0usize, 62u8), (1, 63), (2, 0)] {
-        let sent = delta(&s, index, index as u16);
+        let sent = delta(&s, index, u16::try_from(index).expect("index fits a u16"));
         assert_eq!(sent.template_id, wire_id);
         let len = writer.write(&sent, &mut buf).unwrap();
         let got = reader.read(&buf[..len]).unwrap();
-        assert_eq!(got.temporal_id(), index as u8);
+        assert_eq!(
+            got.temporal_id(),
+            u8::try_from(index).expect("index fits a u8")
+        );
     }
 }
 
@@ -339,7 +364,10 @@ fn active_decode_targets_persist_until_a_new_bitmask_arrives() {
 
     for i in 0..3 {
         let len = writer
-            .write(&delta(&s, i, 10 + i as u16), &mut buf)
+            .write(
+                &delta(&s, i, 10 + u16::try_from(i).expect("loop index fits a u16")),
+                &mut buf,
+            )
             .unwrap();
         reader.read(&buf[..len]).unwrap();
         assert_eq!(reader.active_decode_targets(), 0b011);

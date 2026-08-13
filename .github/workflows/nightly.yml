@@ -1,0 +1,55 @@
+# Seed search. Deliberately not a gate.
+#
+# `ci.yml` runs the simulation at committed seeds, so it is deterministic and
+# can never flake. This job does the opposite job: it runs the same plans at
+# seeds nobody has tried, looking for the interleaving that breaks one.
+#
+# It must never block a merge. A failure here is a lead, not a broken build —
+# the output is a seed to reproduce, fix, and then promote into a plan's seed
+# list so `ci.yml` guards it from then on. See docs/simulation.md.
+name: Nightly seed sweep
+
+on:
+  schedule:
+    # 04:00 UTC, off the working day.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'How many seeds to run'
+        required: false
+        default: '24'
+      from:
+        description: 'First seed'
+        required: false
+        default: '1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    # Seeds run in parallel lanes and skip the plans no seed changes, so the
+    # count is set by the budget rather than by one seed's wall time. The cap
+    # exists so a hung plan cannot burn the runner.
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@v5
+    - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.10
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+    # The seed window advances every night rather than replaying the same one,
+    # which is the whole point — a fixed window would just be slower CI. Derived
+    # from the run number so it is still a known range, not a mystery.
+    - name: Sweep
+      run: |
+        seeds="${{ github.event.inputs.seeds || '24' }}"
+        from="${{ github.event.inputs.from }}"
+        if [ -z "$from" ]; then
+          from=$(( ${{ github.run_number }} * seeds + 1 ))
+        fi
+        SEEDS="$seeds" FROM="$from" make sim-sweep

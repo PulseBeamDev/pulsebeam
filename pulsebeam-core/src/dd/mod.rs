@@ -41,10 +41,10 @@ mod serializer {
                 return 0;
             };
             debug_assert!(raw.0.len() >= MANDATORY_LEN);
-            if buf.len() < raw.0.len() {
+            let Some(dst) = buf.get_mut(..raw.0.len()) else {
                 return 0;
-            }
-            buf[..raw.0.len()].copy_from_slice(&raw.0);
+            };
+            dst.copy_from_slice(&raw.0);
             raw.0.len()
         }
 

@@ -9,6 +9,7 @@ repository.workspace = true
 license.workspace = true
 publish = false
 
+
 [lib]
 
 [dependencies]
@@ -19,7 +20,6 @@ futures-lite = { workspace = true }
 libc = "0.2.186"
 once_cell = "1.21.4"
 parking_lot = { version = "0.12", optional = true }
-loom = { version = "0.7", optional = true, features = ["futures"] }
 pulsebeam-core = { path = "../pulsebeam-core" }
 rand = { workspace = true }
 systemstat = "0.2.7"
@@ -43,6 +43,5 @@ futures-test = "0.3.32"
 [features]
 default = ["parking_lot"]
 deep-metrics = []
-loom = ["dep:loom"]
 parking_lot = ["dep:parking_lot", "once_cell/parking_lot"]
 sim = ["pulsebeam-core/sim", "dep:turmoil"]

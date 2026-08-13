@@ -7,8 +7,17 @@ use super::participants::{LocalParticipantKey, ParticipantHandle};
 const SLOT_COUNT: usize = 256;
 const OCCUPANCY_WORDS: usize = SLOT_COUNT / u64::BITS as usize;
 const DUE_LOCATION: u16 = SLOT_COUNT as u16;
+const _: () = assert!(SLOT_COUNT == 256, "slot_of() relies on a 256-slot wheel");
 const DISARMED_LOCATION: u16 = DUE_LOCATION + 1;
 const MAX_DEADLINE_TICKS: u64 = 101;
+
+/// The wheel slot a tick falls in.
+///
+/// The wheel has exactly `SLOT_COUNT` slots, so this is the tick modulo the
+/// wheel size. The wrap is the addressing scheme, not a lost value.
+fn slot_of(tick: u64) -> u8 {
+    tick as u8
+}
 
 #[derive(Clone, Copy)]
 struct TimerNode {
@@ -71,8 +80,11 @@ impl TimerWheel {
                 ticks_until_deadline <= MAX_DEADLINE_TICKS,
                 "participant deadline exceeds the 100ms scheduling bound"
             );
-            let deadline_tick = requested_tick.min(self.current_tick + (SLOT_COUNT as u64 - 1));
-            (u16::from(deadline_tick as u8), deadline_tick)
+            let deadline_tick = requested_tick.min(
+                self.current_tick
+                    .saturating_add((SLOT_COUNT as u64).saturating_sub(1)),
+            );
+            (u16::from(slot_of(deadline_tick)), deadline_tick)
         };
 
         if let Some(node) = self.nodes.get(handle.key()) {
@@ -113,11 +125,15 @@ impl TimerWheel {
 
         let mut offset = 1;
         while offset < SLOT_COUNT {
-            let tick = self.current_tick + offset as u64;
-            if self.slot_occupied(tick as u8) {
-                return Some(self.epoch + Duration::from_millis(tick));
+            let tick = self.current_tick.saturating_add(offset as u64);
+            if self.slot_occupied(usize::from(slot_of(tick))) {
+                return Some(
+                    self.epoch
+                        .checked_add(Duration::from_millis(tick))
+                        .unwrap_or(self.epoch),
+                );
             }
-            offset += 1;
+            offset = offset.saturating_add(1);
         }
         None
     }
@@ -130,12 +146,12 @@ impl TimerWheel {
         if target_tick.saturating_sub(self.current_tick) >= SLOT_COUNT as u64 {
             self.current_tick = target_tick;
             for slot in 0..SLOT_COUNT {
-                self.drain_location(slot as u16, &mut f);
+                self.drain_location(u16::try_from(slot).unwrap_or(DISARMED_LOCATION), &mut f);
             }
         } else {
             while self.current_tick < target_tick {
-                self.current_tick += 1;
-                self.drain_location(u16::from(self.current_tick as u8), &mut f);
+                self.current_tick = self.current_tick.saturating_add(1);
+                self.drain_location(u16::from(slot_of(self.current_tick)), &mut f);
             }
         }
         debug_assert_eq!(self.current_tick, target_tick);
@@ -147,12 +163,14 @@ impl TimerWheel {
             let id = if location == DUE_LOCATION {
                 self.due_head
             } else {
-                self.heads[location as usize]
+                self.heads.get(usize::from(location)).copied().flatten()
             };
             let Some(id) = id else {
                 break;
             };
-            let node = *self.nodes.get(id.key()).expect("armed timer node missing");
+            let Some(&node) = self.nodes.get(id.key()) else {
+                pulsebeam_runtime::fatal!("timer slot lists a node the wheel does not hold")
+            };
             debug_assert_eq!(node.location, location);
             debug_assert_eq!(node.generation, id.generation());
             if location != DUE_LOCATION {
@@ -172,11 +190,15 @@ impl TimerWheel {
         let old_head = if location == DUE_LOCATION {
             self.due_head
         } else {
-            self.heads[location as usize]
+            self.heads.get(usize::from(location)).copied().flatten()
         };
 
         {
-            let node = self.nodes.get_mut(id.key()).expect("timer node missing");
+            let Some(node) = self.nodes.get_mut(id.key()) else {
+                pulsebeam_runtime::fatal!(
+                    "arming a timer for a participant the wheel does not hold"
+                )
+            };
             debug_assert!(!node.is_armed());
             node.deadline_tick = deadline_tick;
             node.prev = None;
@@ -184,10 +206,11 @@ impl TimerWheel {
             node.location = location;
         }
         if let Some(old_head) = old_head {
-            let head = self
-                .nodes
-                .get_mut(old_head.key())
-                .expect("timer slot head missing");
+            let Some(head) = self.nodes.get_mut(old_head.key()) else {
+                pulsebeam_runtime::fatal!(
+                    "timer slot head points at a node the wheel does not hold"
+                )
+            };
             debug_assert_eq!(head.location, location);
             debug_assert!(head.prev.is_none());
             head.prev = Some(id);
@@ -196,22 +219,29 @@ impl TimerWheel {
         if location == DUE_LOCATION {
             self.due_head = Some(id);
         } else {
-            let slot = location as usize;
-            self.heads[slot] = Some(id);
-            self.set_occupied(slot as u8);
+            let slot = usize::from(location);
+            if let Some(head) = self.heads.get_mut(slot) {
+                *head = Some(id);
+                self.set_occupied(slot);
+            } else {
+                debug_assert!(false, "link target {location} is not a wheel slot");
+            }
         }
     }
 
     fn unlink(&mut self, id: ParticipantHandle) {
-        let node = *self.nodes.get(id.key()).expect("timer node missing");
+        let Some(&node) = self.nodes.get(id.key()) else {
+            pulsebeam_runtime::fatal!("unlinking a timer the wheel does not hold")
+        };
         debug_assert!(node.is_armed());
         debug_assert_eq!(node.generation, id.generation());
 
         if let Some(prev) = node.prev {
-            let prev_node = self
-                .nodes
-                .get_mut(prev.key())
-                .expect("previous timer missing");
+            let Some(prev_node) = self.nodes.get_mut(prev.key()) else {
+                pulsebeam_runtime::fatal!(
+                    "timer list back-link points at a node the wheel does not hold"
+                )
+            };
             debug_assert_eq!(prev_node.location, node.location);
             debug_assert_eq!(prev_node.next.map(|v| v == id), Some(true));
             prev_node.next = node.next;
@@ -219,26 +249,36 @@ impl TimerWheel {
             debug_assert_eq!(self.due_head.map(|v| v == id), Some(true));
             self.due_head = node.next;
         } else {
-            let slot = node.location as usize;
-            debug_assert_eq!(self.heads[slot].map(|v| v == id), Some(true));
-            self.heads[slot] = node.next;
+            let slot = usize::from(node.location);
+            if let Some(head) = self.heads.get_mut(slot) {
+                debug_assert_eq!(head.map(|v| v == id), Some(true));
+                *head = node.next;
+            } else {
+                debug_assert!(false, "unlink target {slot} is not a wheel slot");
+            }
         }
 
         if let Some(next) = node.next {
-            let next_node = self.nodes.get_mut(next.key()).expect("next timer missing");
+            let Some(next_node) = self.nodes.get_mut(next.key()) else {
+                pulsebeam_runtime::fatal!(
+                    "timer list forward-link points at a node the wheel does not hold"
+                )
+            };
             debug_assert_eq!(next_node.location, node.location);
             debug_assert_eq!(next_node.prev.map(|v| v == id), Some(true));
             next_node.prev = node.prev;
         }
 
         if node.location != DUE_LOCATION {
-            let slot = node.location as usize;
-            if self.heads[slot].is_none() {
-                self.clear_occupied(slot as u8);
+            let slot = usize::from(node.location);
+            if self.heads.get(slot).copied().flatten().is_none() {
+                self.clear_occupied(slot);
             }
         }
 
-        let node = self.nodes.get_mut(id.key()).expect("timer node missing");
+        let Some(node) = self.nodes.get_mut(id.key()) else {
+            pulsebeam_runtime::fatal!("clearing a timer the wheel does not hold")
+        };
         node.prev = None;
         node.next = None;
         node.location = DISARMED_LOCATION;
@@ -247,7 +287,9 @@ impl TimerWheel {
     fn deadline_tick(&self, deadline: Instant) -> u64 {
         let elapsed = deadline.saturating_duration_since(self.epoch);
         let millis = elapsed.as_millis();
-        let rounded = millis + u128::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000));
+        let rounded = millis.saturating_add(u128::from(
+            !elapsed.subsec_nanos().is_multiple_of(1_000_000),
+        ));
         u64::try_from(rounded).unwrap_or(u64::MAX)
     }
 
@@ -255,24 +297,29 @@ impl TimerWheel {
         u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
 
-    fn slot_occupied(&self, slot: u8) -> bool {
-        let slot = slot as usize;
-        self.occupied[slot / 64] & (1 << (slot % 64)) != 0
+    fn slot_occupied(&self, slot: usize) -> bool {
+        self.occupied
+            .get(slot / 64)
+            .is_some_and(|word| word & (1 << (slot % 64)) != 0)
     }
 
-    fn set_occupied(&mut self, slot: u8) {
-        let slot = slot as usize;
-        self.occupied[slot / 64] |= 1 << (slot % 64);
+    fn set_occupied(&mut self, slot: usize) {
+        if let Some(word) = self.occupied.get_mut(slot / 64) {
+            *word |= 1 << (slot % 64);
+        }
     }
 
-    fn clear_occupied(&mut self, slot: u8) {
-        let slot = slot as usize;
-        self.occupied[slot / 64] &= !(1 << (slot % 64));
+    fn clear_occupied(&mut self, slot: usize) {
+        if let Some(word) = self.occupied.get_mut(slot / 64) {
+            *word &= !(1 << (slot % 64));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::ParticipantId;
     use slotmap::SlotMap;
@@ -300,11 +347,11 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_micros(1_999), |entry| {
-            expired.push(entry.participant_id())
+            expired.push(entry.participant_id());
         });
         assert!(expired.is_empty());
         wheel.drain_expired(start + Duration::from_millis(2), |entry| {
-            expired.push(entry.participant_id())
+            expired.push(entry.participant_id());
         });
         assert_eq!(expired, vec![handle.participant_id()]);
         assert_eq!(wheel.next_deadline(), None);
@@ -321,14 +368,14 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_millis(10), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         assert_eq!(
             expired,
             vec![(handle.participant_id(), handle.generation())]
         );
         wheel.drain_expired(start + Duration::from_millis(50), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         assert_eq!(expired.len(), 1);
     }
@@ -347,7 +394,7 @@ mod tests {
         );
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_millis(10), |entry| {
-            expired.push(entry.participant_id())
+            expired.push(entry.participant_id());
         });
         assert_eq!(expired, vec![handle.participant_id()]);
     }
@@ -363,7 +410,7 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_millis(10), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         assert_eq!(
             expired,
@@ -382,7 +429,7 @@ mod tests {
 
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_secs(1), |entry| {
-            expired.push((entry.participant_id(), entry.generation()))
+            expired.push((entry.participant_id(), entry.generation()));
         });
         expired.sort_unstable();
         let mut expected = handles

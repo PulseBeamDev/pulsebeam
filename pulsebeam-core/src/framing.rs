@@ -60,12 +60,17 @@ impl FramePacketizer {
         let mtu = self.mtu;
         let total = self.packet_count(frame);
         (0..total).map(move |i| {
-            let start = i * mtu;
-            let end = ((i + 1) * mtu).min(frame.len());
+            let start = i.saturating_mul(mtu);
+            let end = i.saturating_add(1).saturating_mul(mtu).min(frame.len());
+            debug_assert!(
+                start <= end && end <= frame.len(),
+                "chunk {start}..{end} escapes a {}-byte frame",
+                frame.len()
+            );
             FrameChunk {
-                data: &frame[start..end],
+                data: frame.get(start..end).unwrap_or_default(),
                 start_of_frame: i == 0,
-                end_of_frame: i == total - 1,
+                end_of_frame: i == total.saturating_sub(1),
             }
         })
     }
@@ -143,7 +148,9 @@ impl FrameDepacketizer {
             if pkt.end_of_frame {
                 let mut frame = Vec::new();
                 for s in start_seq..=seq {
-                    frame.extend_from_slice(&self.parts[&s].payload);
+                    // The walk above proved every sequence in this range is present.
+                    let part = self.parts.get(&s)?;
+                    frame.extend_from_slice(&part.payload);
                 }
                 for s in start_seq..=seq {
                     self.parts.remove(&s);
@@ -154,7 +161,7 @@ impl FrameDepacketizer {
                     last_seq: seq,
                 });
             }
-            seq += 1;
+            seq = seq.saturating_add(1);
         }
     }
 
@@ -174,6 +181,7 @@ impl FrameDepacketizer {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
     use super::*;
 
     fn chunks(frame: &[u8], mtu: usize) -> Vec<FrameChunk<'_>> {
@@ -198,7 +206,9 @@ mod tests {
 
     #[test]
     fn a_large_frame_splits_with_start_and_end_only_at_the_edges() {
-        let frame: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        let frame: Vec<u8> = (0..2500u32)
+            .map(|i| u8::try_from(i % 256).expect("masked to a byte"))
+            .collect();
         let c = chunks(&frame, 1000);
         assert_eq!(c.len(), 3);
         assert!(c[0].start_of_frame && !c[0].end_of_frame);
@@ -212,7 +222,9 @@ mod tests {
     /// packetize → depacketize, regardless of content (so encrypted media works).
     #[test]
     fn opaque_payload_round_trips_byte_exact() {
-        let frame: Vec<u8> = (0..3333u32).map(|i| (i * 7 + 1) as u8).collect();
+        let frame: Vec<u8> = (0..3333u32)
+            .map(|i| u8::try_from((i * 7 + 1) % 256).expect("masked to a byte"))
+            .collect();
         let p = FramePacketizer::new(1000);
         let mut d = FrameDepacketizer::default();
 
@@ -230,7 +242,9 @@ mod tests {
 
     #[test]
     fn reassembles_across_reordered_packets() {
-        let frame: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        let frame: Vec<u8> = (0..2500u32)
+            .map(|i| u8::try_from(i % 256).expect("masked to a byte"))
+            .collect();
         let p = FramePacketizer::new(1000);
         let chunks: Vec<_> = p.packetize(&frame).collect();
         let mut d = FrameDepacketizer::default();
@@ -247,7 +261,9 @@ mod tests {
 
     #[test]
     fn a_frame_with_a_permanent_gap_is_never_emitted() {
-        let frame: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        let frame: Vec<u8> = (0..2500u32)
+            .map(|i| u8::try_from(i % 256).expect("masked to a byte"))
+            .collect();
         let p = FramePacketizer::new(1000);
         let chunks: Vec<_> = p.packetize(&frame).collect();
         let mut d = FrameDepacketizer::default();

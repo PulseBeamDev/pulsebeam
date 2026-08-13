@@ -1,6 +1,10 @@
-use pulsebeam_runtime::sync::Arc;
-use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::ops::Deref;
+//! Per-stream bitrate and health measurement.
+//!
+//! Overflow is explicit here: `#![deny(clippy::arithmetic_side_effects)]`. The
+//! numbers this produces are what the allocator spends bandwidth against, so a
+//! wrap does not fail — it reports a bitrate that was never observed and the
+//! allocator sizes the ladder to it.
+
 use std::time::Duration;
 use str0m::bwe::Bitrate;
 use tokio::time::Instant;
@@ -102,222 +106,188 @@ pub enum StreamQuality {
     Excellent = 2,
 }
 
-#[derive(Debug, Clone)]
-pub struct StreamState(Arc<StreamStateInner>);
+/// One encoding's measurements, as a value.
+///
+/// Deliberately plain and `Copy`. This was an `Arc` of eight atomics shared
+/// between the publisher's shard and every subscriber's, which was wrong twice
+/// over: the refcount crossed cores on a per-packet path, and eight independent
+/// atomic reads never formed a consistent view — an allocation pass could see
+/// `decode_targets` from a new Dependency Descriptor structure alongside a
+/// `decode_target_kbps` ladder from the previous one, and cost a rung that did
+/// not exist. See `docs/thread-per-core.md`.
+///
+/// A snapshot is produced whole by the shard that measures, and travels to the
+/// shards that consume it. One value is one coherent view by construction, and
+/// it works unchanged when the consumer is on another node, where there is no
+/// memory to share.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamStats {
+    pub inactive: bool,
+    pub healthy: bool,
+    /// Reactive rate estimate (bps).
+    pub bitrate_bps: u32,
+    /// Slow-decay rate estimate (bps), never below `bitrate_bps`.
+    pub stable_bitrate_bps: u32,
+    pub height: u32,
+    pub quality: StreamQuality,
+    /// Decode targets the encoding advertises (>= 1). `1` means no scalability
+    /// structure has been seen, so the encoding is one indivisible rung.
+    pub decode_targets: u8,
+    /// Cumulative bitrate (kbps) per decode target, from the sender's
+    /// per-temporal Video Layers Allocation. `0` = not declared.
+    pub decode_target_kbps: [u32; MAX_LADDER_TARGETS],
+    /// Full frame rate (fps) from VLA. `0` = unknown.
+    pub full_fps: u32,
+}
 
-impl StreamState {
-    pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
-        Self::new_with_height(inactive, bitrate_bps, 0)
+impl Default for StreamStats {
+    fn default() -> Self {
+        Self::new(true, 0, 0)
     }
+}
 
-    pub fn new_with_height(inactive: bool, bitrate_bps: u64, height: u32) -> Self {
-        Self(Arc::new(StreamStateInner::new(
+impl StreamStats {
+    pub fn new(inactive: bool, bitrate_bps: u64, height: u32) -> Self {
+        let bps = u32::try_from(bitrate_bps).unwrap_or(u32::MAX);
+        Self {
             inactive,
-            bitrate_bps,
+            healthy: !inactive,
+            bitrate_bps: bps,
+            stable_bitrate_bps: bps,
             height,
-        )))
+            quality: StreamQuality::Good,
+            decode_targets: 1,
+            decode_target_kbps: [0; MAX_LADDER_TARGETS],
+            full_fps: 0,
+        }
     }
 
-    #[cfg(test)]
-    pub fn update_for_test(&self) -> StreamStateUpdater<'_> {
-        StreamStateUpdater { state: &self.0 }
+    pub fn is_healthy(&self) -> bool {
+        self.healthy
     }
-}
 
-impl Deref for StreamState {
-    type Target = StreamStateInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    pub fn is_inactive(&self) -> bool {
+        self.inactive
     }
-}
 
-impl AsRef<StreamStateInner> for StreamState {
-    fn as_ref(&self) -> &StreamStateInner {
-        &self.0
+    pub fn bitrate_bps(&self) -> f64 {
+        f64::from(self.bitrate_bps)
     }
-}
 
-#[derive(Debug)]
-pub struct StreamStateInner {
-    inactive: AtomicBool,
-    healthy: AtomicBool,
-    /// Both bitrate signals packed into one atomic so they are always written
-    /// and read together — eliminating the race where a snapshot could observe
-    /// a new reactive value paired with a stale stable value (or vice versa).
+    pub fn stable_bitrate_bps(&self) -> f64 {
+        f64::from(self.stable_bitrate_bps)
+    }
+
+    /// Both rate signals. Kept as one call because they must be read together;
+    /// as a value that is now guaranteed rather than arranged.
+    pub fn bitrates_snapshot(&self) -> (f64, f64) {
+        (self.bitrate_bps(), self.stable_bitrate_bps())
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn quality(&self) -> StreamQuality {
+        self.quality
+    }
+
+    /// The number of decode targets the encoding advertises (>= 1).
+    pub fn decode_target_count(&self) -> u8 {
+        self.decode_targets.max(1)
+    }
+
+    /// Cost (bps) of decode target `dt`, or `0` when the sender declared none.
+    pub fn decode_target_bps(&self, dt: usize) -> u64 {
+        self.decode_target_kbps
+            .get(dt)
+            .map(|kbps| u64::from(*kbps).saturating_mul(1000))
+            .unwrap_or(0)
+    }
+
+    pub fn full_fps(&self) -> u32 {
+        self.full_fps
+    }
+
+    /// Whether the last loss classification is good enough that the encoding
+    /// would be worth trying again on the next keyframe.
     ///
-    /// Layout: upper 32 bits = stable_bps, lower 32 bits = reactive_bps.
-    /// Max representable bitrate = u32::MAX ≈ 4.3 Gbps, far above any real stream.
-    bitrates: AtomicU64,
-    height: AtomicU32,
-    /// Number of decode targets the encoding advertises via its Dependency
-    /// Descriptor (temporal/spatial sub-layers the SFU can shed to). `1` means no
-    /// scalability structure has been seen — the allocator then treats the
-    /// encoding as a single indivisible rung.
-    decode_targets: AtomicU8,
-    /// Cumulative bitrate (kbps) of each decode target, from the sender's
-    /// per-temporal Video Layers Allocation. Index `k` = decode target `k` (nested:
-    /// `k` contains temporal layers `0..=k`). `0` = not declared. Lets the allocator
-    /// cost each temporal rung instead of estimating.
-    decode_target_kbps: [AtomicU32; MAX_LADDER_TARGETS],
-    /// The encoding's full frame rate (fps), from VLA. `0` = unknown. With the
-    /// decode-target count it yields each rung's fps for the `min_fps` floor.
-    full_fps: AtomicU32,
+    /// Says nothing about whether it is currently active: a pause must not by
+    /// itself disqualify a layer, which is the property the oscillation tests
+    /// pin.
     #[cfg(test)]
-    quality: AtomicU8,
+    pub fn is_activation_candidate(&self) -> bool {
+        self.quality != StreamQuality::Bad
+    }
+
+    /// Test builder. Plain field writes; kept as a builder only so existing
+    /// call sites read the same.
+    #[cfg(test)]
+    pub fn update_for_test(&mut self) -> &mut Self {
+        self
+    }
+
+    #[cfg(test)]
+    pub fn bitrate(&mut self, bps: u64) -> &mut Self {
+        let v = u32::try_from(bps).unwrap_or(u32::MAX);
+        self.bitrate_bps = v;
+        self.stable_bitrate_bps = v;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn stable_bitrate(&mut self, bps: u64) -> &mut Self {
+        self.stable_bitrate_bps = u32::try_from(bps).unwrap_or(u32::MAX);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn set_height(&mut self, height: u32) -> &mut Self {
+        self.height = height;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn set_quality(&mut self, q: StreamQuality) -> &mut Self {
+        self.quality = q;
+        self.healthy = q != StreamQuality::Bad && !self.inactive;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn set_inactive(&mut self, val: bool) -> &mut Self {
+        self.inactive = val;
+        self.healthy = !val;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn set_decode_target_count(&mut self, count: u8) -> &mut Self {
+        self.decode_targets = count.max(1);
+        self
+    }
+
+    /// Replace the ladder wholesale.
+    ///
+    /// Every rung is written, including ones the sender did not declare: a
+    /// `zip` would leave the tail holding the previous allocation's values, so
+    /// a stream dropping from three temporal layers to one would keep costing
+    /// rungs it no longer has.
+    pub fn set_temporal_ladder(&mut self, cumulative_kbps: &[u64], full_fps: u32) {
+        for (i, slot) in self.decode_target_kbps.iter_mut().enumerate() {
+            *slot = u32::try_from(cumulative_kbps.get(i).copied().unwrap_or(0)).unwrap_or(u32::MAX);
+        }
+        self.full_fps = full_fps;
+    }
 }
 
 /// Decode-target rungs the allocator ladder tracks per encoding (L1T3 tops out
 /// at three temporal targets).
 pub const MAX_LADDER_TARGETS: usize = 3;
 
-impl StreamStateInner {
-    fn pack(reactive_bps: u64, stable_bps: u64) -> u64 {
-        let r = reactive_bps.min(u32::MAX as u64);
-        let s = stable_bps.min(u32::MAX as u64);
-        (s << 32) | r
-    }
-
-    pub fn new(inactive: bool, bitrate_bps: u64, height: u32) -> Self {
-        Self {
-            inactive: AtomicBool::new(inactive),
-            healthy: AtomicBool::new(!inactive),
-            bitrates: AtomicU64::new(Self::pack(bitrate_bps, bitrate_bps)),
-            height: AtomicU32::new(height),
-            decode_targets: AtomicU8::new(1),
-            decode_target_kbps: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
-            full_fps: AtomicU32::new(0),
-            #[cfg(test)]
-            quality: AtomicU8::new(StreamQuality::Good as u8),
-        }
-    }
-
-    /// The number of decode targets the encoding advertises (>= 1).
-    pub fn decode_target_count(&self) -> u8 {
-        self.decode_targets.load(Ordering::Relaxed).max(1)
-    }
-
-    /// Record the decode-target count learned from a Dependency Descriptor
-    /// structure. Written from ingress when a scalable keyframe arrives.
-    pub fn set_decode_target_count(&self, count: u8) {
-        self.decode_targets.store(count.max(1), Ordering::Relaxed);
-    }
-
-    /// Cumulative bitrate (bps) declared for decode target `dt`, or `0` if the
-    /// sender declared no per-temporal ladder for it.
-    pub fn decode_target_bps(&self, dt: usize) -> u64 {
-        self.decode_target_kbps
-            .get(dt)
-            .map_or(0, |a| u64::from(a.load(Ordering::Relaxed)) * 1000)
-    }
-
-    /// The encoding's full frame rate, or `0` if unknown.
-    pub fn full_fps(&self) -> u32 {
-        self.full_fps.load(Ordering::Relaxed)
-    }
-
-    /// Record the sender's per-temporal cumulative bitrates (kbps) and full frame
-    /// rate from a Video Layers Allocation.
-    pub fn set_temporal_ladder(&self, cumulative_kbps: &[u64], full_fps: u32) {
-        for (i, slot) in self.decode_target_kbps.iter().enumerate() {
-            let v = cumulative_kbps
-                .get(i)
-                .copied()
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32;
-            slot.store(v, Ordering::Relaxed);
-        }
-        self.full_fps.store(full_fps, Ordering::Relaxed);
-    }
-
-    pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
-    }
-
-    pub fn is_inactive(&self) -> bool {
-        self.inactive.load(Ordering::Relaxed)
-    }
-
-    pub fn bitrate_bps(&self) -> f64 {
-        (self.bitrates.load(Ordering::Relaxed) & 0xFFFF_FFFF) as f64
-    }
-
-    pub fn stable_bitrate_bps(&self) -> f64 {
-        (self.bitrates.load(Ordering::Relaxed) >> 32) as f64
-    }
-
-    /// Read both signals from a single atomic load — guarantees they come from
-    /// the same write and can never be a (reactive, stable) pair that was never
-    /// stored together.
-    pub fn bitrates_snapshot(&self) -> (f64, f64) {
-        let packed = self.bitrates.load(Ordering::Relaxed);
-        let reactive = (packed & 0xFFFF_FFFF) as f64;
-        let stable = (packed >> 32) as f64;
-        (reactive, stable)
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub fn quality(&self) -> StreamQuality {
-        match self.quality.load(Ordering::Relaxed) {
-            0 => StreamQuality::Bad,
-            2 => StreamQuality::Excellent,
-            _ => StreamQuality::Good,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn is_activation_candidate(&self) -> bool {
-        self.quality() != StreamQuality::Bad
-    }
-}
-
-#[cfg(test)]
-pub struct StreamStateUpdater<'a> {
-    state: &'a StreamStateInner,
-}
-
-#[cfg(test)]
-impl<'a> StreamStateUpdater<'a> {
-    pub fn bitrate(self, bps: u64) -> Self {
-        let packed = StreamStateInner::pack(bps, bps);
-        self.state.bitrates.store(packed, Ordering::Relaxed);
-        self
-    }
-
-    pub fn stable_bitrate(self, bps: u64) -> Self {
-        let current = self.state.bitrates.load(Ordering::Relaxed);
-        let reactive = current & 0xFFFF_FFFF;
-        self.state
-            .bitrates
-            .store(StreamStateInner::pack(reactive, bps), Ordering::Relaxed);
-        self
-    }
-    pub fn height(self, height: u32) -> Self {
-        self.state.height.store(height, Ordering::Relaxed);
-        self
-    }
-    pub fn quality(self, q: StreamQuality) -> Self {
-        self.state.healthy.store(
-            q != StreamQuality::Bad && !self.state.inactive.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.state.quality.store(q as u8, Ordering::Relaxed);
-        self
-    }
-    pub fn inactive(self, val: bool) -> Self {
-        self.state.inactive.store(val, Ordering::Relaxed);
-        self.state.healthy.store(!val, Ordering::Relaxed);
-        self
-    }
-}
-
 #[derive(Debug)]
 pub struct StreamMonitor {
-    shared_state: StreamState,
+    stats: StreamStats,
     nominal_bitrate_bps: u64,
     declared_target_bps: u64,
     vla_inactive: bool,
@@ -344,9 +314,9 @@ pub struct StreamMonitor {
 }
 
 impl StreamMonitor {
-    pub fn new(kind: TrackKind, stream_id: String, shared_state: StreamState) -> Self {
+    pub fn new(kind: TrackKind, stream_id: String, stats: StreamStats) -> Self {
         let now = Instant::now();
-        let nominal_bitrate_bps = shared_state.bitrate_bps() as u64;
+        let nominal_bitrate_bps = crate::bitrate::saturating_bps(stats.bitrate_bps());
         let audio_monitor = match kind {
             TrackKind::Audio => Some(AudioMonitor::new()),
             TrackKind::Video | TrackKind::Data => None,
@@ -359,14 +329,12 @@ impl StreamMonitor {
             TrackKind::Audio => StreamQuality::Excellent,
             TrackKind::Video | TrackKind::Data => StreamQuality::Good,
         };
-        #[cfg(test)]
-        shared_state
-            .quality
-            .store(current_quality as u8, Ordering::Relaxed);
+        let mut stats = stats;
+        stats.quality = current_quality;
         Self {
             stream_id,
             kind,
-            shared_state,
+            stats,
             nominal_bitrate_bps,
             declared_target_bps: 0,
             vla_inactive: false,
@@ -391,7 +359,7 @@ impl StreamMonitor {
     }
 
     pub fn process_packet(&mut self, packet: &RtpPacket) {
-        let was_inactive = self.shared_state.is_inactive();
+        let was_inactive = self.stats.is_inactive();
         let may_activate = !self.vla_inactive;
         self.last_packet_at = packet.arrival_ts;
         if may_activate {
@@ -402,14 +370,13 @@ impl StreamMonitor {
                     self.nominal_bitrate_bps
                 };
                 if activation_bitrate > 0 {
-                    self.shared_state.bitrates.store(
-                        StreamStateInner::pack(activation_bitrate, activation_bitrate),
-                        Ordering::Relaxed,
-                    );
-                    debug_assert_ne!(self.shared_state.bitrate_bps(), 0.0);
+                    let bps = u32::try_from(activation_bitrate).unwrap_or(u32::MAX);
+                    self.stats.bitrate_bps = bps;
+                    self.stats.stable_bitrate_bps = bps;
+                    debug_assert_ne!(self.stats.bitrate_bps, 0);
                 }
             }
-            self.shared_state.inactive.store(false, Ordering::Relaxed);
+            self.stats.inactive = false;
             self.publish_health();
         }
         self.bwe.record(packet);
@@ -429,7 +396,7 @@ impl StreamMonitor {
         } else if seq > self.window_highest_seq.unwrap_or(0) {
             self.window_highest_seq = Some(seq);
         }
-        self.window_actual_packets += 1;
+        self.window_actual_packets = self.window_actual_packets.saturating_add(1);
 
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             let ext = &packet.ext_vals;
@@ -441,24 +408,47 @@ impl StreamMonitor {
         }
     }
 
-    pub fn shared_state(&self) -> &StreamState {
-        &self.shared_state
+    /// This encoding's measurements, as one coherent value.
+    pub fn stats(&self) -> StreamStats {
+        self.stats
     }
 
-    fn publish_health(&self) {
-        let healthy =
-            !self.shared_state.is_inactive() && self.current_quality != StreamQuality::Bad;
-        self.shared_state.healthy.store(healthy, Ordering::Relaxed);
+    /// Record the decode-target count a scalable keyframe's structure taught.
+    pub fn set_decode_target_count(&mut self, count: u8) {
+        self.stats.decode_targets = count.max(1);
+    }
+
+    /// Record the sender's per-temporal cumulative bitrates and full frame rate
+    /// from a Video Layers Allocation.
+    pub fn set_temporal_ladder(&mut self, cumulative_kbps: &[u64], full_fps: u32) {
+        self.stats.set_temporal_ladder(cumulative_kbps, full_fps);
+    }
+
+    /// Whether this encoding has produced a packet recently enough to count as a
+    /// live sibling for another encoding's pause decision.
+    ///
+    /// This reads packet arrivals rather than the published `inactive` flag on
+    /// purpose: `poll` is what writes that flag, so a sibling gate derived from
+    /// it feeds this call's own output back into its input.
+    pub fn has_recent_packets(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_packet_at) <= SIMULCAST_LAYER_PAUSE_TIMEOUT
+    }
+
+    fn publish_health(&mut self) {
+        let healthy = !self.stats.inactive && self.current_quality != StreamQuality::Bad;
+        self.stats.healthy = healthy;
+        self.stats.quality = self.current_quality;
     }
 
     fn publish_inactive(&mut self) {
-        self.shared_state.healthy.store(false, Ordering::Relaxed);
-        self.shared_state.inactive.store(true, Ordering::Relaxed);
-        self.shared_state.bitrates.store(0, Ordering::Relaxed);
+        self.stats.healthy = false;
+        self.stats.inactive = true;
+        self.stats.bitrate_bps = 0;
+        self.stats.stable_bitrate_bps = 0;
         self.stable_filter.reset();
-        debug_assert!(self.shared_state.is_inactive());
-        debug_assert!(!self.shared_state.is_healthy());
-        debug_assert_eq!(self.shared_state.bitrate_bps(), 0.0);
+        debug_assert!(self.stats.inactive);
+        debug_assert!(!self.stats.healthy);
+        debug_assert_eq!(self.stats.bitrate_bps, 0);
     }
 
     pub fn apply_vla(&mut self, target_bps: u64, height: Option<u32>) -> bool {
@@ -467,7 +457,7 @@ impl StreamMonitor {
         self.vla_inactive = target_bps == 0;
         if let Some(height) = height {
             debug_assert_ne!(height, 0);
-            self.shared_state.height.store(height, Ordering::Relaxed);
+            self.stats.height = height;
         }
         if self.vla_inactive {
             self.publish_inactive();
@@ -505,18 +495,19 @@ impl StreamMonitor {
         let reactive = self.cost_filter.current();
         let stable = self.stable_filter.current().max(reactive);
 
-        // Single packed write — reactive and stable are always observed together.
-        self.shared_state.bitrates.store(
-            StreamStateInner::pack(reactive as u64, stable as u64),
-            Ordering::Relaxed,
-        );
+        // Both signals move together. They are fields of one value now, so that
+        // is structural rather than something the packing arranged.
+        self.stats.bitrate_bps =
+            u32::try_from(crate::bitrate::saturating_bps(reactive)).unwrap_or(u32::MAX);
+        self.stats.stable_bitrate_bps =
+            u32::try_from(crate::bitrate::saturating_bps(stable)).unwrap_or(u32::MAX);
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             audio_monitor.poll(now);
         }
 
         // Step A: Inactivity & Flap Prevention
         let time_since_last_packet = now.saturating_duration_since(self.last_packet_at);
-        let was_inactive = self.shared_state.is_inactive();
+        let was_inactive = self.stats.is_inactive();
 
         // The sender's Video Layers Allocation can declare this layer inactive,
         // which lets us deactivate it at once instead of waiting out the packet
@@ -534,7 +525,8 @@ impl StreamMonitor {
             if !was_inactive {
                 tracing::debug!(
                     stream_id = %self.stream_id,
-                    "Simulcast layer paused while siblings active; retaining its last loss classification for keyframe-gated reactivation"
+                    reason = if self.vla_inactive { "sender declared it off" } else { "silent while a sibling kept sending" },
+                    "Simulcast layer paused; retaining its last loss classification for keyframe-gated reactivation"
                 );
                 self.quality_transition_since = None;
                 self.quality_transition_target = None;
@@ -558,7 +550,7 @@ impl StreamMonitor {
             return;
         }
 
-        self.shared_state.inactive.store(false, Ordering::Relaxed);
+        self.stats.inactive = false;
         self.publish_health();
 
         // Resuming from any form of inactivity: reset the measurement window so that
@@ -680,9 +672,7 @@ impl StreamMonitor {
                 self.quality_transition_since = Some(now);
             }
             self.quality_transition_last_evidence = Some(now);
-            let since = self
-                .quality_transition_since
-                .expect("transition start set above");
+            let since = self.quality_transition_since.unwrap_or(now);
             if now.saturating_duration_since(since) < confirmation {
                 return;
             }
@@ -708,10 +698,7 @@ impl StreamMonitor {
             self.quality_transition_since = None;
             self.quality_transition_target = None;
             self.quality_transition_last_evidence = None;
-            #[cfg(test)]
-            self.shared_state
-                .quality
-                .store(new_quality as u8, Ordering::Relaxed);
+            self.stats.quality = new_quality;
             self.publish_health();
         }
     }
@@ -737,10 +724,7 @@ impl StreamMonitor {
             TrackKind::Audio => StreamQuality::Excellent,
             TrackKind::Video | TrackKind::Data => StreamQuality::Good,
         };
-        #[cfg(test)]
-        self.shared_state
-            .quality
-            .store(self.current_quality as u8, Ordering::Relaxed);
+        self.stats.quality = self.current_quality;
         self.declared_target_bps = 0;
         self.vla_inactive = false;
         self.publish_inactive();
@@ -778,7 +762,9 @@ impl BitrateEstimate {
 
     pub fn record(&mut self, pkt: &RtpPacket) {
         self.advance_time(pkt.playout_time);
-        self.accumulated_bytes += pkt.header_len + pkt.payload.len();
+        self.accumulated_bytes = self
+            .accumulated_bytes
+            .saturating_add(pkt.header_len.saturating_add(pkt.payload.len()));
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -787,11 +773,14 @@ impl BitrateEstimate {
 
     fn advance_time(&mut self, time: Instant) {
         let current_tick = *self.tick_start.get_or_insert(time);
-        if time < current_tick + Self::TICK {
+        if time < current_tick.checked_add(Self::TICK).unwrap_or(current_tick) {
             return;
         }
         let elapsed = time.saturating_duration_since(current_tick);
-        let ticks_passed = (elapsed.as_millis() / Self::TICK.as_millis()) as usize;
+        let ticks_passed = elapsed
+            .as_millis()
+            .checked_div(Self::TICK.as_millis())
+            .unwrap_or(1) as usize;
         self.tick_bps = (self.accumulated_bytes as f64 * 8.0) / Self::TICK.as_secs_f64();
         self.accumulated_bytes = 0;
         self.warm = true;
@@ -801,7 +790,10 @@ impl BitrateEstimate {
         if ticks_passed > 1 {
             self.tick_bps = 0.0;
         }
-        self.tick_start = Some(current_tick + Self::TICK * ticks_passed as u32);
+        let advance = Self::TICK
+            .checked_mul(u32::try_from(ticks_passed).unwrap_or(u32::MAX))
+            .unwrap_or(Self::TICK);
+        self.tick_start = Some(current_tick.checked_add(advance).unwrap_or(current_tick));
     }
 
     pub fn tick_bps(&self) -> f64 {
@@ -934,6 +926,10 @@ impl AudioMonitor {
 
 #[cfg(test)]
 mod test {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    // Fixtures build timelines by hand; an overflow in one should fail the
+    // test rather than clamp into a passing state.
     use super::*;
     use more_asserts::{assert_ge, assert_le};
     use std::time::Duration;
@@ -953,15 +949,15 @@ mod test {
     #[test]
     fn video_upstream_bitrate_never_falls_below_nominal_layer_rate() {
         let nominal = 1_250_000u64;
-        let shared = StreamState::new(false, nominal);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
+        let shared = StreamStats::new(false, nominal, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared);
         let now = Instant::now();
 
         // First poll: no declared VLA target and bwe not warm yet (tick_bps=0).
         // The nominal floor must keep bitrate_bps at the nominal rate.
         monitor.process_packet(&packet(1, now));
         monitor.poll(now + Duration::from_millis(600), false);
-        assert_ge!(shared.bitrate_bps(), nominal as f64);
+        assert_ge!(monitor.stats().bitrate_bps(), nominal as f64);
 
         // Drive many ticks at a rate far below nominal — the cost filter starts
         // from the nominal floor, and slow-fall keeps it well above the low rate
@@ -976,28 +972,28 @@ mod test {
         // After sustained low-rate ticks the slow-fall filter still holds
         // close to nominal (4s fall tau: ~e^(-8/4) ≈ 0.135 decay ratio
         // over 8s, so bitrate stays well above nominal * 0.5).
-        assert_ge!(shared.bitrate_bps(), nominal as f64 * 0.5);
+        assert_ge!(monitor.stats().bitrate_bps(), nominal as f64 * 0.5);
     }
 
     #[test]
     fn vla_inactive_deactivates_layer_without_waiting_for_timeout() {
-        let shared = StreamState::new(false, 400_000);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "v0".into(), shared.clone());
+        let shared = StreamStats::new(false, 400_000, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v0".into(), shared);
         let now = Instant::now();
 
         // Fresh packet, no VLA inactivity, no active sibling: stays active.
         monitor.process_packet(&packet(1, now));
         monitor.poll(now, false);
-        assert!(!shared.is_inactive());
+        assert!(!monitor.stats().is_inactive());
 
         // The sender declares this layer inactive via VLA. It deactivates on the
         // next poll even though the packet is recent and there's no sibling — no
         // 1s timeout wait.
         monitor.apply_vla(0, None);
-        assert!(shared.is_inactive());
+        assert!(monitor.stats().is_inactive());
         monitor.poll(now + Duration::from_millis(50), false);
         assert!(
-            shared.is_inactive(),
+            monitor.stats().is_inactive(),
             "VLA-declared-inactive layer must deactivate immediately"
         );
 
@@ -1006,49 +1002,88 @@ mod test {
         monitor.process_packet(&packet(2, now + Duration::from_millis(60)));
         monitor.poll(now + Duration::from_millis(70), false);
         assert!(
-            !shared.is_inactive(),
+            !monitor.stats().is_inactive(),
             "layer must reactivate once the sender declares it active again"
         );
     }
 
     #[test]
     fn packet_cannot_reactivate_vla_inactive_layer() {
-        let shared = StreamState::new(false, 400_000);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "q".into(), shared.clone());
+        let shared = StreamStats::new(false, 400_000, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "q".into(), shared);
         let now = Instant::now();
 
         monitor.apply_vla(0, None);
         monitor.process_packet(&packet(1, now));
 
-        assert!(shared.is_inactive());
-        assert!(!shared.is_healthy());
+        assert!(monitor.stats().is_inactive());
+        assert!(!monitor.stats().is_healthy());
 
         monitor.apply_vla(400_000, None);
         monitor.process_packet(&packet(2, now + Duration::from_millis(10)));
 
-        assert!(!shared.is_inactive());
-        assert!(shared.is_healthy());
-        assert_eq!(shared.bitrate_bps(), 400_000.0);
+        assert!(!monitor.stats().is_inactive());
+        assert!(monitor.stats().is_healthy());
+        assert_eq!(monitor.stats().bitrate_bps(), 400_000.0);
+    }
+
+    /// A snapshot is coherent by construction.
+    ///
+    /// This is the property the atomics could not give: eight independent loads
+    /// could straddle a writer, so an allocation pass could pair a
+    /// `decode_targets` count from a new descriptor structure with a
+    /// `decode_target_kbps` ladder from the previous one. As a value, every
+    /// field a reader sees came from the same moment, and a later update cannot
+    /// reach backwards into a snapshot already taken.
+    #[test]
+    fn a_snapshot_cannot_mix_values_from_two_updates() {
+        let mut monitor = StreamMonitor::new(
+            TrackKind::Video,
+            "v".into(),
+            StreamStats::new(false, 400_000, 360),
+        );
+
+        monitor.set_decode_target_count(3);
+        monitor.set_temporal_ladder(&[100, 200, 300], 30);
+        let before = monitor.stats();
+
+        // A later update moves both the count and the ladder together.
+        monitor.set_decode_target_count(1);
+        monitor.set_temporal_ladder(&[900, 0, 0], 15);
+        let after = monitor.stats();
+
+        assert_eq!(before.decode_target_count(), 3);
+        assert_eq!(before.decode_target_bps(2), 300_000);
+        assert_eq!(before.full_fps(), 30);
+
+        assert_eq!(after.decode_target_count(), 1);
+        assert_eq!(after.decode_target_bps(0), 900_000);
+        assert_eq!(after.full_fps(), 15);
+
+        assert_ne!(
+            before, after,
+            "a snapshot taken earlier must not observe a later update"
+        );
     }
 
     #[test]
     fn height_is_always_resolved_to_fallback_or_vla_value() {
-        let shared = StreamState::new_with_height(true, 400_000, 360);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "h".into(), shared.clone());
+        let shared = StreamStats::new(true, 400_000, 360);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "h".into(), shared);
 
-        assert_eq!(shared.height(), 360);
+        assert_eq!(monitor.stats().height(), 360);
 
         monitor.apply_vla(400_000, None);
-        assert_eq!(shared.height(), 360);
+        assert_eq!(monitor.stats().height(), 360);
 
         monitor.apply_vla(400_000, Some(1056));
-        assert_eq!(shared.height(), 1056);
+        assert_eq!(monitor.stats().height(), 1056);
     }
 
     #[test]
     fn stream_monitor_fast_pause_preserves_keyframe_reactivation_eligibility() {
-        let shared = StreamState::new(false, 123_000);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "v0".into(), shared.clone());
+        let shared = StreamStats::new(false, 123_000, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v0".into(), shared);
         let now = Instant::now();
 
         monitor.process_packet(&packet(1, now));
@@ -1057,18 +1092,18 @@ mod test {
         let paused_now = now + Duration::from_millis(1100);
         monitor.poll(paused_now, true);
 
-        assert!(shared.is_inactive());
-        assert_eq!(shared.quality(), StreamQuality::Good);
-        assert!(!shared.is_healthy());
-        assert!(shared.is_activation_candidate());
-        assert_eq!(shared.bitrate_bps(), 0.0);
+        assert!(monitor.stats().is_inactive());
+        assert_eq!(monitor.stats().quality(), StreamQuality::Good);
+        assert!(!monitor.stats().is_healthy());
+        assert!(monitor.stats().is_activation_candidate());
+        assert_eq!(monitor.stats().bitrate_bps(), 0.0);
         assert_eq!(monitor.smoothed_loss_ratio, 0.0);
     }
 
     #[test]
     fn stream_monitor_dead_timeout_resets_metrics() {
-        let shared = StreamState::new(false, 123_000);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "v1".into(), shared.clone());
+        let shared = StreamStats::new(false, 123_000, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v1".into(), shared);
         let now = Instant::now();
 
         for window in 0..3u64 {
@@ -1077,14 +1112,14 @@ mod test {
             monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
             monitor.poll(t + Duration::from_millis(600), false);
         }
-        assert_eq!(shared.quality(), StreamQuality::Bad);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Bad);
         assert!(monitor.smoothed_loss_ratio > 0.0);
 
         monitor.poll(now + Duration::from_millis(5000), false);
 
-        assert!(shared.is_inactive());
-        assert_eq!(shared.quality(), StreamQuality::Good);
-        assert_eq!(shared.bitrate_bps(), 0.0);
+        assert!(monitor.stats().is_inactive());
+        assert_eq!(monitor.stats().quality(), StreamQuality::Good);
+        assert_eq!(monitor.stats().bitrate_bps(), 0.0);
         assert_eq!(monitor.window_highest_seq, None);
         assert_eq!(monitor.window_start_seq, 0);
         assert_eq!(monitor.window_actual_packets, 0);
@@ -1094,7 +1129,7 @@ mod test {
 
     #[test]
     fn stream_monitor_ewma_is_fast_drop_slow_recover() {
-        let shared = StreamState::new(false, 0);
+        let shared = StreamStats::new(false, 0, 0);
         let mut monitor = StreamMonitor::new(TrackKind::Video, "v2".into(), shared);
         let now = Instant::now();
 
@@ -1116,8 +1151,8 @@ mod test {
 
     #[test]
     fn stream_monitor_hysteresis_prevents_flop() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "v4".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v4".into(), shared);
         let now = Instant::now();
 
         // Drive quality Bad with persistent severe loss, not one report.
@@ -1127,7 +1162,7 @@ mod test {
             monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
             monitor.poll(t + Duration::from_millis(600), false);
         }
-        assert_eq!(shared.quality(), StreamQuality::Bad);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Bad);
         assert!(
             monitor.smoothed_loss_ratio > 0.025,
             "smoothed={} should still be above the Bad-exit threshold",
@@ -1140,7 +1175,7 @@ mod test {
         }
         monitor.poll(now + Duration::from_millis(2400), false);
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Bad,
             "a single clean window must not flip quality back to Good (hysteresis)"
         );
@@ -1158,12 +1193,12 @@ mod test {
             base_seq += 10;
             tick_now += Duration::from_millis(600);
             monitor.poll(tick_now, false);
-            if shared.quality() == StreamQuality::Good {
+            if monitor.stats().quality() == StreamQuality::Good {
                 break;
             }
         }
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Good,
             "quality must eventually recover to Good after sustained clean network"
         );
@@ -1175,8 +1210,8 @@ mod test {
         // (alpha_down=0.2) decays slowly. A single clean window is NOT enough to
         // bring smoothed_loss_ratio below the Bad→Good threshold (2.5% for video).
         // The EWMA's natural time-to-decay is the "consecutive windows" guard.
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "v5".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v5".into(), shared);
         let now = Instant::now();
 
         // Drive Bad with three severe windows. The time confirmation prevents
@@ -1187,7 +1222,7 @@ mod test {
             monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
             monitor.poll(t + Duration::from_millis(600), false);
         }
-        assert_eq!(shared.quality(), StreamQuality::Bad);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Bad);
         assert!(
             monitor.smoothed_loss_ratio >= VIDEO_BAD_LOSS_THRESHOLD,
             "persistent severe loss must leave a substantial EWMA penalty"
@@ -1199,7 +1234,7 @@ mod test {
         }
         monitor.poll(now + Duration::from_millis(2400), false);
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Bad,
             "one clean window must not immediately restore Good; smoothed={:.3}",
             monitor.smoothed_loss_ratio
@@ -1216,7 +1251,7 @@ mod test {
             seq += 10;
             t += Duration::from_millis(600);
             monitor.poll(t, false);
-            if shared.quality() == StreamQuality::Good {
+            if monitor.stats().quality() == StreamQuality::Good {
                 recovered = true;
                 break;
             }
@@ -1226,15 +1261,12 @@ mod test {
 
     #[test]
     fn stream_monitor_severe_downgrade_is_time_confirmed() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "v6".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v6".into(), shared);
         let now = Instant::now();
 
         monitor.current_quality = StreamQuality::Excellent;
-        monitor
-            .shared_state
-            .quality
-            .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
+        monitor.stats.quality = StreamQuality::Excellent;
 
         for window in 0..3u64 {
             let t = now + Duration::from_millis(window * 600);
@@ -1243,7 +1275,7 @@ mod test {
             monitor.poll(t + Duration::from_millis(600), false);
         }
 
-        assert_eq!(shared.quality(), StreamQuality::Bad);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Bad);
     }
 
     /// A 2 fps screen share sees only one expected packet per 500 ms
@@ -1254,9 +1286,8 @@ mod test {
     /// reflects real history instead of a single coin flip.
     #[test]
     fn low_fps_window_defers_evaluation_until_minimum_sample_size() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor =
-            StreamMonitor::new(TrackKind::Video, "screenshare".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "screenshare".into(), shared);
         let now = Instant::now();
 
         // Seed steady-state window bookkeeping directly: window_start_seq
@@ -1302,14 +1333,11 @@ mod test {
 
     #[test]
     fn sparse_video_does_not_combine_separated_loss_observations() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "sparse".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "sparse".into(), shared);
         let now = Instant::now();
         monitor.current_quality = StreamQuality::Excellent;
-        monitor
-            .shared_state
-            .quality
-            .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
+        monitor.stats.quality = StreamQuality::Excellent;
 
         // The first severe observation starts, but cannot complete, a
         // degradation candidate.
@@ -1324,15 +1352,15 @@ mod test {
         monitor.process_packet(&packet(21, later));
         monitor.process_packet(&packet(31, later + Duration::from_millis(1)));
         monitor.poll(later + Duration::from_millis(600), false);
-        assert_eq!(shared.quality(), StreamQuality::Excellent);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Excellent);
     }
 
     #[test]
     fn stream_monitor_thresholds_match_media_kind() {
         let now = Instant::now();
 
-        let audio_shared = StreamState::new(false, 0);
-        let mut audio = StreamMonitor::new(TrackKind::Audio, "a0".into(), audio_shared.clone());
+        let audio_shared = StreamStats::new(false, 0, 0);
+        let mut audio = StreamMonitor::new(TrackKind::Audio, "a0".into(), audio_shared);
         audio.process_packet(&packet(1, now));
         audio.process_packet(&packet(2, now + Duration::from_millis(1)));
         audio.poll(now + Duration::from_millis(600), false);
@@ -1342,7 +1370,7 @@ mod test {
         audio.process_packet(&packet(5, now + Duration::from_millis(1300)));
         audio.process_packet(&packet(6, now + Duration::from_millis(1301)));
         audio.poll(now + Duration::from_millis(1800), false);
-        assert_eq!(audio_shared.quality(), StreamQuality::Excellent);
+        assert_eq!(audio.stats().quality(), StreamQuality::Excellent);
 
         audio.process_packet(&packet(7, now + Duration::from_millis(1900)));
         audio.process_packet(&packet(11, now + Duration::from_millis(1901)));
@@ -1350,10 +1378,10 @@ mod test {
         // Audio has no simulcast layer for a loss-driven quality signal to
         // act on yet, so it's stubbed Excellent and never evaluated here —
         // this lossy window must not move it.
-        assert_eq!(audio_shared.quality(), StreamQuality::Excellent);
+        assert_eq!(audio.stats().quality(), StreamQuality::Excellent);
 
-        let video_shared = StreamState::new(false, 0);
-        let mut video = StreamMonitor::new(TrackKind::Video, "v3".into(), video_shared.clone());
+        let video_shared = StreamStats::new(false, 0, 0);
+        let mut video = StreamMonitor::new(TrackKind::Video, "v3".into(), video_shared);
         video.process_packet(&packet(1, now));
         video.process_packet(&packet(2, now + Duration::from_millis(1)));
         video.poll(now + Duration::from_millis(600), false);
@@ -1368,19 +1396,21 @@ mod test {
         video.poll(now + Duration::from_millis(2400), false);
         // Four two-packet windows are insufficient to establish video
         // quality; retain the conservative initial state.
-        assert_eq!(video_shared.quality(), StreamQuality::Good);
+        assert_eq!(video.stats().quality(), StreamQuality::Good);
 
         video.process_packet(&packet(9, now + Duration::from_millis(2500)));
         video.process_packet(&packet(11, now + Duration::from_millis(2501)));
         video.poll(now + Duration::from_millis(3000), false);
         // A tiny two-packet sample is not evidence of upstream congestion.
-        assert_eq!(video_shared.quality(), StreamQuality::Good);
+        assert_eq!(video.stats().quality(), StreamQuality::Good);
     }
 
     fn make_packet(now: Instant, size_bytes: usize) -> RtpPacket {
-        let mut pkt = RtpPacket::default();
-        pkt.arrival_ts = now;
-        pkt.playout_time = now;
+        let mut pkt = RtpPacket {
+            arrival_ts: now,
+            playout_time: now,
+            ..Default::default()
+        };
         let payload_len = size_bytes.saturating_sub(pkt.header_len);
         pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
         pkt
@@ -1388,7 +1418,10 @@ mod test {
 
     fn send_tick(bwe: &mut BitrateEstimate, now: &mut Instant, tick_dur: Duration, bps: f64) {
         *now += tick_dur;
-        let bytes = (bps * tick_dur.as_secs_f64() / 8.0) as usize;
+        let bytes = usize::try_from(crate::bitrate::saturating_bps(
+            bps * tick_dur.as_secs_f64() / 8.0,
+        ))
+        .unwrap_or(usize::MAX);
         bwe.record(&make_packet(*now, bytes));
         bwe.poll(*now);
     }
@@ -1480,8 +1513,8 @@ mod test {
     fn stream_monitor_cost_filter_unifies_vla_and_measured() {
         // With a declared VLA target, bitrate_bps should reflect the smoothed
         // VLA value, not the raw measured tick rate.
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "vla".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "vla".into(), shared);
         let now = Instant::now();
 
         // Seed one measured-rate tick at a very low rate.
@@ -1495,7 +1528,7 @@ mod test {
 
         // bitrate_bps should now be influenced by the VLA target (rising toward 1M).
         assert_ge!(
-            shared.bitrate_bps(),
+            monitor.stats().bitrate_bps(),
             400_000.0,
             "after 1 rise-tau with VLA=1M, bitrate_bps should have risen substantially"
         );
@@ -1504,8 +1537,8 @@ mod test {
     #[test]
     fn vla_active_layer_survives_packet_silence_with_sibling() {
         let nominal = 400_000u64;
-        let shared = StreamState::new(false, nominal);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "h".into(), shared.clone());
+        let shared = StreamStats::new(false, nominal, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "h".into(), shared);
         let now = Instant::now();
 
         monitor.process_packet(&packet(1, now));
@@ -1515,11 +1548,11 @@ mod test {
         monitor.poll(now + Duration::from_millis(1500), true);
 
         assert!(
-            !shared.is_inactive(),
+            !monitor.stats().is_inactive(),
             "VLA-declared layer must survive 1.5 s packet silence"
         );
         assert!(
-            shared.bitrate_bps() >= 875_000.0 * 0.5,
+            monitor.stats().bitrate_bps() >= 875_000.0 * 0.5,
             "cost should be near VLA target, not zero"
         );
     }
@@ -1527,8 +1560,8 @@ mod test {
     #[test]
     fn no_vla_layer_still_times_out_with_sibling() {
         let nominal = 400_000u64;
-        let shared = StreamState::new(false, nominal);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "h".into(), shared.clone());
+        let shared = StreamStats::new(false, nominal, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "h".into(), shared);
         let now = Instant::now();
 
         monitor.process_packet(&packet(1, now));
@@ -1537,7 +1570,7 @@ mod test {
         monitor.poll(now + Duration::from_millis(1200), true);
 
         assert!(
-            shared.is_inactive(),
+            monitor.stats().is_inactive(),
             "non-VLA layer must time out after 1.2 s with active sibling"
         );
     }
@@ -1547,8 +1580,8 @@ mod test {
     /// Fiber / clean LAN: zero loss for 2.4 s → reaches Excellent and stays.
     #[test]
     fn fiber_clean_network_reaches_and_stays_excellent() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "fiber".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "fiber".into(), shared);
         let now = Instant::now();
 
         // 10 packets per 500-ms window; seq advances by 10 each window.
@@ -1565,7 +1598,7 @@ mod test {
         }
 
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Excellent,
             "clean network must reach Excellent"
         );
@@ -1580,7 +1613,7 @@ mod test {
             monitor.poll(t, false);
         }
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Excellent,
             "must stay Excellent"
         );
@@ -1589,8 +1622,8 @@ mod test {
     /// Regional WAN: ~2% sustained loss → stays Good, never reaches Bad.
     #[test]
     fn wan_low_loss_stays_good() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "wan".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "wan".into(), shared);
         let now = Instant::now();
 
         // 50 packets per window; skip 1 seq in the middle → ~2% loss.
@@ -1609,7 +1642,7 @@ mod test {
             monitor.poll(t, false);
 
             assert_ne!(
-                shared.quality(),
+                monitor.stats().quality(),
                 StreamQuality::Bad,
                 "2% loss must never reach Bad (window ending at t={t:?})"
             );
@@ -1617,14 +1650,13 @@ mod test {
 
         // It may be classified Good rather than Excellent, but it must remain
         // eligible and never create allocator churn.
-        assert_eq!(shared.quality(), StreamQuality::Good);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Good);
     }
 
     #[test]
     fn isolated_loss_windows_do_not_flap_video_quality() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor =
-            StreamMonitor::new(TrackKind::Video, "isolated-loss".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "isolated-loss".into(), shared);
         let now = Instant::now();
         let mut base_seq = 1u64;
         let mut t = now;
@@ -1643,15 +1675,14 @@ mod test {
             monitor.poll(t, false);
         }
 
-        assert_eq!(shared.quality(), StreamQuality::Good);
-        assert!(monitor.shared_state.is_healthy());
+        assert_eq!(monitor.stats().quality(), StreamQuality::Good);
+        assert!(monitor.stats.is_healthy());
     }
 
     #[test]
     fn video_ordinary_loss_does_not_make_a_layer_ineligible() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor =
-            StreamMonitor::new(TrackKind::Video, "confirm-bad".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "confirm-bad".into(), shared);
         let now = Instant::now();
 
         // Repeated ~11% intervals are degraded, but below the high-confidence
@@ -1664,7 +1695,7 @@ mod test {
         monitor.poll(now + Duration::from_millis(600), false);
         // The initial window establishes the sequence baseline, so there is
         // not yet a loss measurement to act on.
-        assert_eq!(shared.quality(), StreamQuality::Good);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Good);
 
         // More ordinary-loss windows still keep the layer eligible.
         let next = now + Duration::from_millis(600);
@@ -1674,7 +1705,7 @@ mod test {
             }
         }
         monitor.poll(next + Duration::from_millis(600), false);
-        assert_eq!(shared.quality(), StreamQuality::Good);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Good);
 
         let third = next + Duration::from_millis(600);
         for i in 0..10u64 {
@@ -1683,15 +1714,15 @@ mod test {
             }
         }
         monitor.poll(third + Duration::from_millis(600), false);
-        assert_eq!(shared.quality(), StreamQuality::Good);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Good);
     }
 
     /// Cross-region WAN: 20% sustained loss → Bad after confirmation, then
     /// recovers to Good after sustained clean traffic.
     #[test]
     fn cross_region_high_loss_detects_bad_then_recovers() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "xr".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "xr".into(), shared);
         let now = Instant::now();
 
         // 10 packets per window; drop two interior packets → ~20% loss.
@@ -1712,7 +1743,7 @@ mod test {
             monitor.poll(t, false);
         }
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Bad,
             "must detect Bad quickly"
         );
@@ -1726,7 +1757,7 @@ mod test {
             base_seq += 10;
             t += Duration::from_millis(600);
             monitor.poll(t, false);
-            if shared.quality() == StreamQuality::Good {
+            if monitor.stats().quality() == StreamQuality::Good {
                 recovered = true;
                 break;
             }
@@ -1740,8 +1771,8 @@ mod test {
     /// screen-share idle: windows with expected==0 must NOT change quality.
     #[test]
     fn cbr_idle_window_does_not_change_quality() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "cbr".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "cbr".into(), shared);
         let now = Instant::now();
 
         // Reach Excellent with 6 clean windows.
@@ -1755,7 +1786,7 @@ mod test {
             t += Duration::from_millis(600);
             monitor.poll(t, false);
         }
-        assert_eq!(shared.quality(), StreamQuality::Excellent);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Excellent);
 
         // Idle: no packets for 2 consecutive 500-ms windows (simulate screen-share freeze).
         // Expected = 0 in both windows → quality must be preserved.
@@ -1763,7 +1794,7 @@ mod test {
             t += Duration::from_millis(600);
             monitor.poll(t, false);
             assert_eq!(
-                shared.quality(),
+                monitor.stats().quality(),
                 StreamQuality::Excellent,
                 "idle window must not degrade quality"
             );
@@ -1773,11 +1804,10 @@ mod test {
         for i in 0..10u64 {
             monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
         }
-        seq += 10;
         t += Duration::from_millis(600);
         monitor.poll(t, false);
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Excellent,
             "quality must survive idle + resume"
         );
@@ -1788,8 +1818,8 @@ mod test {
     /// eligibility for the layer.
     #[test]
     fn no_phantom_loss_on_simulcast_resume() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "sr".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "sr".into(), shared);
         let now = Instant::now();
 
         // Establish stream at seq 1–10.
@@ -1801,10 +1831,10 @@ mod test {
         // Simulcast pause: no packet for > 1 s while a sibling is active.
         let paused_at = now + Duration::from_millis(1100);
         monitor.poll(paused_at, true);
-        assert!(shared.is_inactive());
+        assert!(monitor.stats().is_inactive());
         let smoothed_after_pause = monitor.smoothed_loss_ratio;
         assert_eq!(smoothed_after_pause, 0.0, "pause must not manufacture loss");
-        assert!(shared.is_activation_candidate());
+        assert!(monitor.stats().is_activation_candidate());
 
         // Resume with a large seq gap (encoder advanced by 990 during the pause).
         let resumed_at = paused_at + Duration::from_millis(50);
@@ -1812,7 +1842,7 @@ mod test {
         monitor.poll(resumed_at + Duration::from_millis(10), false);
 
         assert!(
-            !shared.is_inactive(),
+            !monitor.stats().is_inactive(),
             "must be active after first packet arrives"
         );
         assert!(
@@ -1826,8 +1856,8 @@ mod test {
     /// stable — never flipping Good→Bad→Good on each pair of windows.
     #[test]
     fn no_oscillation_under_alternating_loss() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared);
         let now = Instant::now();
 
         // First drive quality to Bad with persistent high loss.
@@ -1837,14 +1867,14 @@ mod test {
             monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
             monitor.poll(t + Duration::from_millis(600), false);
         }
-        assert_eq!(shared.quality(), StreamQuality::Bad);
+        assert_eq!(monitor.stats().quality(), StreamQuality::Bad);
 
         // Alternate: one clean window, one lossy window, 20 pairs.
         // Quality must stay Bad (smoothed stays well above 0.025).
         let mut base_seq = 31u64;
         let mut t = now + Duration::from_millis(1800);
         let mut quality_changes = 0u32;
-        let mut prev_quality = shared.quality();
+        let mut prev_quality = monitor.stats().quality();
 
         for _ in 0..20 {
             // Clean window: 10 consecutive packets.
@@ -1854,7 +1884,7 @@ mod test {
             base_seq += 10;
             t += Duration::from_millis(600);
             monitor.poll(t, false);
-            let q = shared.quality();
+            let q = monitor.stats().quality();
             if q != prev_quality {
                 quality_changes += 1;
                 prev_quality = q;
@@ -1866,7 +1896,7 @@ mod test {
             base_seq += 10;
             t += Duration::from_millis(600);
             monitor.poll(t, false);
-            let q = shared.quality();
+            let q = monitor.stats().quality();
             if q != prev_quality {
                 quality_changes += 1;
                 prev_quality = q;
@@ -1887,8 +1917,8 @@ mod test {
     /// 500-ms receiver report.
     #[test]
     fn publisher_bw_limit_fast_detection() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared);
         let now = Instant::now();
         // is_any_sibling_active=true because mid and low layers are healthy.
         let siblings = true;
@@ -1905,7 +1935,7 @@ mod test {
             monitor.poll(t, siblings);
         }
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Excellent,
             "precondition: high layer healthy"
         );
@@ -1916,7 +1946,7 @@ mod test {
         // actual   = 6  →  interval_loss = 4/10 = 40%
         for _ in 0..3 {
             for i in 0..10u64 {
-                if i < 3 || i >= 7 {
+                if !(3..7).contains(&i) {
                     monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
                 }
             }
@@ -1926,7 +1956,7 @@ mod test {
         }
 
         assert_eq!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Bad,
             "must detect Bad after time-confirmed 40% loss; \
              smoothed={:.3}",
@@ -1943,8 +1973,8 @@ mod test {
     /// the upstream monitor must retain its last real-loss classification.
     #[test]
     fn publisher_oscillating_layer_remains_a_keyframe_reactivation_candidate() {
-        let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared.clone());
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared);
         let now = Instant::now();
 
         let mut seq = 1u64;
@@ -1960,7 +1990,7 @@ mod test {
             monitor.poll(t, true);
         }
         assert_ne!(
-            shared.quality(),
+            monitor.stats().quality(),
             StreamQuality::Bad,
             "precondition: layer must start healthy"
         );
@@ -1972,11 +2002,11 @@ mod test {
             monitor.poll(t, true);
 
             assert!(
-                shared.is_inactive(),
+                monitor.stats().is_inactive(),
                 "cycle {cycle}: must be dormant on pause"
             );
             assert!(
-                shared.is_activation_candidate(),
+                monitor.stats().is_activation_candidate(),
                 "cycle {cycle}: a pause alone must not make the layer Bad"
             );
 
@@ -1996,11 +2026,11 @@ mod test {
             monitor.poll(t, true);
 
             assert!(
-                shared.is_activation_candidate(),
+                monitor.stats().is_activation_candidate(),
                 "cycle {cycle}: clean packets must retain reactivation eligibility"
             );
         }
 
-        assert!(shared.is_activation_candidate());
+        assert!(monitor.stats().is_activation_candidate());
     }
 }

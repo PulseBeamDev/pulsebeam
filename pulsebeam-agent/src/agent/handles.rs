@@ -1,3 +1,10 @@
+//! Handles the application holds on an agent's tracks and topics.
+//!
+//! Crash exception: the `map_err` closures below match on the very command the
+//! same function just constructed, so the other arms cannot be reached, and
+//! each has to produce a differently-typed `SendError` — there is no single
+//! fallback value to return instead. Scoped here rather than workspace-wide.
+
 use crate::RtpPacket;
 use crate::agent::mailbox;
 use crate::manager::VideoSubscription;
@@ -13,7 +20,9 @@ pub(crate) struct PublicationLease {
 
 pub(crate) enum OutgoingCommand {
     SendData(SendData),
-    SendMedia(SendMedia),
+    /// Boxed: it is several times the size of any other variant, and an enum
+    /// is as large as its largest.
+    SendMedia(Box<SendMedia>),
     SetPlayoutDelay(Option<(u32, u32)>),
     Publish {
         kind: str0m::media::MediaKind,
@@ -26,6 +35,14 @@ pub(crate) enum OutgoingCommand {
     SubscribeMedia {
         subscription: VideoSubscription,
         response: tokio::sync::oneshot::Sender<Result<RemoteTrack, super::AgentError>>,
+    },
+    /// Ask to be handed every audio track the SFU decides to forward.
+    ///
+    /// Audio has no per-track subscription: which speakers are forwarded is the SFU's decision,
+    /// taken continuously as people start and stop talking, so a receiver cannot ask for a
+    /// speaker by name and wait. It registers once and is handed each track as it appears.
+    ReceiveAudio {
+        response: tokio::sync::oneshot::Sender<mailbox::Receiver<RemoteTrack>>,
     },
     Shutdown(tokio::sync::oneshot::Sender<()>),
     DeclareOrderedPublisher {
@@ -240,11 +257,11 @@ impl LocalEncoding {
 
     pub async fn send(&self, packet: RtpPacket) -> Result<(), mailbox::SendError<RtpPacket>> {
         self.tx
-            .send(OutgoingCommand::SendMedia(SendMedia {
+            .send(OutgoingCommand::SendMedia(Box::new(SendMedia {
                 lease: self.lease,
                 rid: self.rid,
                 packet,
-            }))
+            })))
             .await
             .map_err(|error| match error.0 {
                 OutgoingCommand::SendMedia(media) => mailbox::SendError(media.packet),
@@ -258,6 +275,12 @@ pub(crate) struct Publication {
     id: String,
     publisher_id: String,
     kind: Option<str0m::media::MediaKind>,
+    /// Whether the SFU has stopped forwarding this track.
+    ///
+    /// A track can be present and not flowing: the SFU pauses a stream it cannot afford rather
+    /// than dropping the subscription. Without this an application sees packets stop and has no
+    /// way to tell that from a dead network, so it renders a blank tile instead of a placeholder.
+    paused: bool,
 }
 
 impl Publication {
@@ -273,7 +296,16 @@ impl Publication {
             id: track.id,
             publisher_id: track.participant_id,
             kind,
+            paused: false,
         }
+    }
+
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused
     }
 
     pub(crate) fn id(&self) -> &str {
@@ -304,6 +336,15 @@ impl RemoteTrack {
 
     pub fn publisher_id(&self) -> &str {
         self.publication.publisher_id()
+    }
+
+    /// Whether this track carries audio or video.
+    ///
+    /// A receiver has to know before it can do anything with the packets - the two need different
+    /// depacketizers and different decoders - and until now the only way to find out was to
+    /// cross-reference the publication list by publisher id.
+    pub fn kind(&self) -> Option<str0m::media::MediaKind> {
+        self.publication.kind()
     }
 
     /// Receive the next RTP packet for this track. Frame reassembly, jitter

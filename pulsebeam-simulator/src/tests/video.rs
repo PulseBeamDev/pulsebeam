@@ -345,3 +345,108 @@ fn simulcast_stream_stability_test() {
             },
         ]);
 }
+
+/// Congestion control across a shard boundary.
+///
+/// The rest of this suite runs single-shard, where the allocator reads a
+/// publisher's measurements from a struct on its own core. Split across shards
+/// those same measurements become `ShardFrame::Stats` messages and the
+/// keyframe requests they provoke become reverse-lane frames, so the feedback
+/// loop that degrades a stream is assembled from parts that cross a core
+/// boundary and arrive late or not at all.
+///
+/// The property is unchanged by any of that: squeeze the downlink and the
+/// subscriber keeps getting renderable frames instead of a stall.
+#[test]
+fn cross_shard_stream_survives_congestion_test() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish flow across the shard boundary",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Bob keeps a floor so the slot must forward something",
+                participant: "bob",
+                targets: &[("alice", 720, 180, 1)],
+            },
+            Step::Run {
+                description: "Soak at full quality",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetBandwidth {
+                description: "Squeeze the downlink so full quality no longer fits",
+                participant: "bob",
+                bits_per_sec: 350_000,
+            },
+            Step::Run {
+                description: "Let the allocator degrade on measurements sent between shards",
+                duration: Duration::from_secs(12),
+            },
+            Step::CheckCrossShardMedia {
+                description: "the stream really did cross a shard boundary",
+                min_frames: 100,
+            },
+            Step::CheckVideoQuality {
+                description: "Bob keeps receiving renderable frames through the squeeze",
+                participant: "bob",
+                quality: VideoQuality::min_frames(60).allow_gaps(30),
+            },
+        ]);
+}
+
+/// Simulcast layer switching across a shard boundary.
+///
+/// Switching picks a different encoding of the same track, which cross-shard
+/// means the destination's fanout re-keys while packets for the previous layer
+/// are still in flight on the old route. The parameter-set replay that makes a
+/// switch decodable has to survive the restamp on arrival.
+#[test]
+fn cross_shard_simulcast_switching_stays_decodable_test() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["f", "h", "q"]))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish flow and discover all three encodings",
+                duration: Duration::from_secs(6),
+            },
+            Step::SetBandwidth {
+                description: "Force a switch down to the lowest encoding",
+                participant: "bob",
+                bits_per_sec: 250_000,
+            },
+            Step::Run {
+                description: "Settle on the low layer",
+                duration: Duration::from_secs(8),
+            },
+            Step::SetBandwidth {
+                description: "Restore headroom so the allocator switches back up",
+                participant: "bob",
+                bits_per_sec: 5_000_000,
+            },
+            Step::Run {
+                description: "Settle on a higher layer",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckCrossShardMedia {
+                description: "the switching stream crossed a shard boundary",
+                min_frames: 100,
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes across every switch",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100).allow_gaps(30),
+            },
+        ]);
+}

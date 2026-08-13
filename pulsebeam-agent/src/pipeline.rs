@@ -77,7 +77,13 @@ impl FrameSender {
         let chunks: Vec<_> = self.packetizer.packetize(&frame.data).collect();
         let mut packets = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            let mut ext_vals = ExtensionValues::default();
+            // Audio level is not optional decoration: the SFU's speaker selector ranks by it and
+            // drops any audio packet that arrives without one.
+            let mut ext_vals = ExtensionValues {
+                audio_level: frame.audio_level,
+                voice_activity: frame.voice_activity,
+                ..ExtensionValues::default()
+            };
             if let Some(raw) = &dd_bytes {
                 let mut bytes = raw.0.clone();
                 if let Some(first) = bytes.first_mut() {
@@ -110,6 +116,7 @@ impl FrameSender {
                 seq,
                 ts: frame.ts,
                 marker: chunk.end_of_frame,
+                ssrc: None,
                 payload: Arc::from(chunk.data),
                 ext_vals,
                 arrival: frame.capture_time,
@@ -132,18 +139,34 @@ struct PendingFrame {
 /// residual loss) via [`FrameReceiver::with_max_wait`].
 pub const DEFAULT_JITTER_MAX_WAIT: Duration = Duration::from_secs(5);
 
+/// How long the buffer absorbs reordering before committing to a first sequence number.
+///
+/// Separate from [`DEFAULT_JITTER_MAX_WAIT`] because the two answer different questions. A gap
+/// budget asks how long to hold a hole open hoping a retransmission fills it, and being generous
+/// there costs nothing until a packet is actually lost. The opening question is only how far a
+/// packet can arrive out of order, which is tens of milliseconds on any real path.
+///
+/// Sharing one constant made every stream pay the gap budget before its first frame: measured at a
+/// 5.1s median time-to-first-frame across the simulation suite, with variance far too tight to be
+/// anything but a fixed wait. A viewer joins a call and the tile is blank for five seconds.
+pub const DEFAULT_INITIAL_COMMIT_WAIT: Duration = Duration::from_millis(100);
+
 /// A time-bounded reorder / jitter buffer.
 ///
 /// Holds incoming RTP briefly so out-of-order and retransmitted (NACK/RTX)
 /// packets can take their place before a gap is declared lost, then releases
-/// packets strictly in sequence order. `max_wait` bounds both the initial
-/// reordering delay and how long any single gap is held open: larger recovers
-/// more under bursty loss, at the cost of buffering latency.
+/// packets strictly in sequence order. `max_wait` bounds how long any single gap
+/// is held open: larger recovers more under bursty loss, at the cost of
+/// buffering latency. Opening the stream is bounded separately by
+/// `initial_wait` — see [`DEFAULT_INITIAL_COMMIT_WAIT`].
 pub struct JitterBuffer {
     buf: BTreeMap<u64, RtpPacket>,
     next: Option<u64>,
     latest_arrival: Option<Instant>,
     max_wait: Duration,
+    initial_wait: Duration,
+    /// Whether anything has reached the screen yet. See the gap budget in [`Self::pop`].
+    delivered_frame: bool,
 }
 
 impl JitterBuffer {
@@ -153,6 +176,10 @@ impl JitterBuffer {
             next: None,
             latest_arrival: None,
             max_wait,
+            // Never longer than the gap budget: a caller that asked for a tight budget wants low
+            // latency, and handing it a slower start than it asked for would be perverse.
+            initial_wait: DEFAULT_INITIAL_COMMIT_WAIT.min(max_wait),
+            delivered_frame: false,
         }
     }
 
@@ -169,9 +196,11 @@ impl JitterBuffer {
         let next = match self.next {
             Some(n) => n,
             None => {
-                // Absorb initial reordering before committing to a first sequence.
+                // Absorb initial reordering before committing to a first sequence. Bounded by
+                // `initial_wait`, not the gap budget: this is "how late can the real first packet
+                // be", not "how long to hope a lost packet is retransmitted".
                 let (&min_seq, min_pkt) = self.buf.iter().next()?;
-                if now.saturating_duration_since(min_pkt.arrival) < self.max_wait {
+                if now.saturating_duration_since(min_pkt.arrival) < self.initial_wait {
                     return None;
                 }
                 min_seq
@@ -181,14 +210,32 @@ impl JitterBuffer {
             self.next = Some(next.wrapping_add(1));
             return Some(pkt);
         }
-        // Gap at `next`: wait up to `max_wait` for it to fill, then skip it (lost).
-        let (&head_seq, head_pkt) = self.buf.iter().next()?;
-        if now.saturating_duration_since(head_pkt.arrival) >= self.max_wait {
-            let pkt = self.buf.remove(&head_seq).unwrap();
-            self.next = Some(head_seq.wrapping_add(1));
-            return Some(pkt);
+        // Gap at `next`: wait for it to fill, then skip it (lost).
+        //
+        // The budget depends on whether anything is on screen yet. `max_wait` protects
+        // *continuity* - it is worth stalling a running picture to recover a packet, because the
+        // alternative is a visible tear. Before the first frame there is no continuity to protect,
+        // and a viewer looking at a blank tile would far rather see the next decodable frame than
+        // wait seconds for a packet that may never come. Measured: two packets went missing right
+        // after the first one the buffer committed to, and the viewer sat blank for 5s of loss
+        // budget before showing anything - on a link configured with no loss at all.
+        let budget = if self.delivered_frame {
+            self.max_wait
+        } else {
+            self.initial_wait
+        };
+        let (_, head_pkt) = self.buf.first_key_value()?;
+        if now.saturating_duration_since(head_pkt.arrival) < budget {
+            return None;
         }
-        None
+        let (head_seq, pkt) = self.buf.pop_first()?;
+        self.next = Some(head_seq.wrapping_add(1));
+        Some(pkt)
+    }
+
+    /// Note that a frame has reached the application, so gaps are now worth waiting out.
+    fn note_frame_delivered(&mut self) {
+        self.delivered_frame = true;
     }
 
     /// Release everything still buffered, in sequence order (end of stream).
@@ -256,6 +303,7 @@ impl FrameReceiver {
         let mut frames = Vec::new();
         while let Some(ordered) = self.jitter.pop() {
             if let Some(frame) = self.reassemble(ordered) {
+                self.jitter.note_frame_delivered();
                 frames.push(frame);
             }
         }
@@ -312,8 +360,7 @@ impl FrameReceiver {
                 },
             );
             while self.pending.len() > 256 {
-                let oldest = *self.pending.keys().next().unwrap();
-                self.pending.remove(&oldest);
+                self.pending.pop_first();
             }
         }
 
@@ -322,10 +369,14 @@ impl FrameReceiver {
             .push(seq, &rtp.payload, start_of_frame, end_of_frame)?;
 
         let meta = self.pending.remove(&frame.first_seq)?;
-        let contiguous = self.prev_last_seq.is_none_or(|p| frame.first_seq == p + 1);
+        let contiguous = self
+            .prev_last_seq
+            .is_none_or(|p| frame.first_seq == p.saturating_add(1));
         self.prev_last_seq = Some(frame.last_seq);
 
         Some(MediaFrame {
+            audio_level: None,
+            voice_activity: None,
             ts: meta.ts,
             data: Arc::from(frame.data.as_slice()),
             capture_time: meta.capture_time,
@@ -382,9 +433,9 @@ fn temporal_cumulative_kbps(
     }
     (0..layers)
         .map(|k| {
-            let frac = 0.5 + 0.5 * (k as f64) / ((layers - 1) as f64);
+            let frac = 0.5 + 0.5 * (k as f64) / (layers.saturating_sub(1) as f64);
             TemporalLayerAllocation {
-                cumulative_kbps: ((full_kbps as f64) * frac).round() as u64,
+                cumulative_kbps: crate::media::saturating_u64_from_f64((full_kbps as f64) * frac),
             }
         })
         .collect()
@@ -392,10 +443,13 @@ fn temporal_cumulative_kbps(
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
     use super::*;
 
     fn frame(data: Vec<u8>, is_keyframe: bool) -> MediaFrame {
         MediaFrame {
+            audio_level: None,
+            voice_activity: None,
             ts: MediaTime::from_90khz(9000),
             data: Arc::from(data.as_slice()),
             capture_time: Instant::now(),
@@ -415,7 +469,9 @@ mod tests {
         let mut sender = FrameSender::new(mid, None, 1, 1);
         let mut receiver = FrameReceiver::new();
 
-        let payload: Vec<u8> = (0..3000u32).map(|i| (i * 5 + 1) as u8).collect();
+        let payload: Vec<u8> = (0..3000u32)
+            .map(|i| u8::try_from((i * 5 + 1) % 256).expect("masked to a byte"))
+            .collect();
         let packets = sender.packetize(&frame(payload.clone(), true));
         assert!(packets.len() > 1, "should split across packets");
         assert!(packets.last().unwrap().marker, "last packet ends the frame");
@@ -443,7 +499,9 @@ mod tests {
         let mut sender = FrameSender::new(mid, None, 1, 1);
         let mut receiver = FrameReceiver::new();
 
-        let payload: Vec<u8> = (0..3000u32).map(|i| (i * 5 + 1) as u8).collect();
+        let payload: Vec<u8> = (0..3000u32)
+            .map(|i| u8::try_from((i * 5 + 1) % 256).expect("masked to a byte"))
+            .collect();
         let mut packets = sender.packetize(&frame(payload.clone(), true));
         assert!(packets.len() >= 3);
         packets.reverse();
@@ -488,12 +546,13 @@ mod tests {
 
         let base = Instant::now();
         let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            ssrc: None,
             mid: Mid::from("v0"),
             rid: None,
             seq: SeqNo::from(seq),
             ts: MediaTime::from_90khz(seq * 3000),
             marker: true,
-            payload: Arc::from([seq as u8].as_slice()),
+            payload: Arc::from([u8::try_from(seq % 256).expect("masked to a byte")].as_slice()),
             ext_vals: ExtensionValues::default(),
             arrival: base + Duration::from_millis(at_ms),
         };
@@ -513,6 +572,87 @@ mod tests {
         }
         // 1 was never delivered; after the wait it is skipped and 2,3 follow in order.
         assert_eq!(seqs, vec![0, 2, 3]);
+    }
+
+    /// Opening a stream costs the reordering window, not the loss-recovery budget.
+    ///
+    /// These are different questions sharing one constant until now: how late the real first
+    /// packet can be, versus how long to hold a hole open hoping a retransmission fills it. With
+    /// the gap budget at its 5s default, every stream paid five seconds before its first frame -
+    /// measured as a 5.1s median time-to-first-frame across the simulation suite.
+    #[test]
+    fn a_stream_opens_without_paying_the_loss_recovery_budget() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            ssrc: None,
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload: Arc::from([u8::try_from(seq % 256).expect("masked to a byte")].as_slice()),
+            ext_vals: ExtensionValues::default(),
+            arrival: base + Duration::from_millis(at_ms),
+        };
+
+        // A generous loss-recovery budget, as a real consumer has.
+        let mut jb = JitterBuffer::new(Duration::from_secs(5));
+        jb.push(pkt(0, 0));
+
+        assert!(
+            jb.pop().is_none(),
+            "the opening packet is held briefly so a reordered predecessor can arrive"
+        );
+
+        // Well past the reordering window, nowhere near the 5s gap budget.
+        jb.push(pkt(1, 150));
+        assert_eq!(
+            jb.pop().map(|p| *p.seq),
+            Some(0),
+            "the stream must open on the reordering window, not the loss-recovery budget: at 5s \
+             a viewer stares at a blank tile for five seconds before the first frame"
+        );
+    }
+
+    /// The shorter opening window must still absorb the reordering it exists for.
+    ///
+    /// Simulated paths push a reordered packet back by 30ms, and real ones are comparable, so the
+    /// window has room to spare. If it were tightened below that, a stream that merely opened out
+    /// of order would commit to the wrong first sequence and drop the true first packet as late.
+    #[test]
+    fn the_opening_window_still_absorbs_reordering() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            ssrc: None,
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload: Arc::from([u8::try_from(seq % 256).expect("masked to a byte")].as_slice()),
+            ext_vals: ExtensionValues::default(),
+            arrival: base + Duration::from_millis(at_ms),
+        };
+
+        let mut jb = JitterBuffer::new(Duration::from_secs(5));
+        // 1 arrives first; 0 is 30ms behind it, the delay the simulated shaper applies.
+        jb.push(pkt(1, 0));
+        jb.push(pkt(0, 30));
+        jb.push(pkt(2, 150));
+
+        let mut seqs = Vec::new();
+        while let Some(p) = jb.pop() {
+            seqs.push(*p.seq);
+        }
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2],
+            "a stream that opened out of order must still be delivered in order"
+        );
     }
 
     #[test]

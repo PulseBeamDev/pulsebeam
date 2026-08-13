@@ -48,12 +48,14 @@ impl From<&str> for MediaType {
     }
 }
 
-impl From<MediaType> for MediaKind {
-    fn from(value: MediaType) -> Self {
+impl TryFrom<MediaType> for MediaKind {
+    type Error = MediaType;
+
+    fn try_from(value: MediaType) -> Result<Self, Self::Error> {
         match value {
-            MediaType::Video => MediaKind::Video,
-            MediaType::Audio => MediaKind::Audio,
-            typ => panic!("unexpected media type: {}", typ),
+            MediaType::Video => Ok(MediaKind::Video),
+            MediaType::Audio => Ok(MediaKind::Audio),
+            other => Err(other),
         }
     }
 }
@@ -147,11 +149,11 @@ impl Negotiator {
     }
 
     fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), NegotiatorError> {
-        let mut video_recv_count = 0;
-        let mut video_send_count = 0;
-        let mut audio_recv_count = 0;
-        let mut audio_send_count = 0;
-        let mut data_channel_count = 0;
+        let mut video_recv_count = 0usize;
+        let mut video_send_count = 0usize;
+        let mut audio_recv_count = 0usize;
+        let mut audio_send_count = 0usize;
+        let mut data_channel_count = 0usize;
 
         for m in &answer.media_lines {
             let kind = m.typ.to_string();
@@ -166,7 +168,7 @@ impl Negotiator {
 
             match (media_type, dir) {
                 (MediaType::Video, Direction::RecvOnly) => {
-                    video_recv_count += 1;
+                    video_recv_count = video_recv_count.saturating_add(1);
                     if video_recv_count > MAX_RECV_VIDEO_SLOTS {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Video,
@@ -176,7 +178,7 @@ impl Negotiator {
                     }
                 }
                 (MediaType::Video, Direction::SendOnly) => {
-                    video_send_count += 1;
+                    video_send_count = video_send_count.saturating_add(1);
                     if video_send_count > MAX_SEND_VIDEO_SLOTS {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Video,
@@ -186,7 +188,7 @@ impl Negotiator {
                     }
                 }
                 (MediaType::Audio, Direction::RecvOnly) => {
-                    audio_recv_count += 1;
+                    audio_recv_count = audio_recv_count.saturating_add(1);
                     if audio_recv_count > MAX_RECV_AUDIO_SLOTS {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Audio,
@@ -196,7 +198,7 @@ impl Negotiator {
                     }
                 }
                 (MediaType::Audio, Direction::SendOnly) => {
-                    audio_send_count += 1;
+                    audio_send_count = audio_send_count.saturating_add(1);
                     if audio_send_count > MAX_SEND_AUDIO_SLOTS {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Audio,
@@ -206,7 +208,7 @@ impl Negotiator {
                     }
                 }
                 (MediaType::Application, dir) => {
-                    data_channel_count += 1;
+                    data_channel_count = data_channel_count.saturating_add(1);
                     if data_channel_count > MAX_DATA_CHANNELS {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Application,
@@ -253,6 +255,9 @@ fn configure_room_codecs(codec_config: &mut CodecConfig) {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
 
     fn chrome_like_offer() -> SdpOffer {

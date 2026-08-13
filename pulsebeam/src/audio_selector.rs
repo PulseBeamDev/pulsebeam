@@ -43,8 +43,7 @@ impl SlotState {
     #[inline]
     fn is_dead(&self, now: Instant) -> bool {
         match (self.owner, self.last_arrival_ts) {
-            (None, _) => true,
-            (Some(_), None) => true,
+            (None, _) | (Some(_), None) => true,
             (Some(_), Some(ts)) => now.duration_since(ts) > DEAD_TIMEOUT,
         }
     }
@@ -105,8 +104,7 @@ impl TopNAudioSelector {
 
         // Step 2: Owner fast-path — update timestamps and forward.
         let owner_slot = self.slots.iter().position(|s| s.owner == Some(stream_id));
-        if let Some(idx) = owner_slot {
-            let slot = &mut self.slots[idx];
+        if let Some((idx, slot)) = owner_slot.and_then(|i| self.slots.get_mut(i).map(|s| (i, s))) {
             slot.last_arrival_ts = Some(now);
             // Peak-hold with decay: a single quiet packet must not instantly demote rank.
             slot.last_power = slot.last_power.max(power);
@@ -151,10 +149,10 @@ impl TopNAudioSelector {
 
         // Step 5: Execute the steal.
         let victim_idx = victim?;
-        let slot = &mut self.slots[victim_idx];
+        let slot = self.slots.get_mut(victim_idx)?;
         slot.owner = Some(stream_id);
         slot.last_arrival_ts = Some(now);
-        slot.immunity_expiry = now + NEWBORN_IMMUNITY;
+        slot.immunity_expiry = now.checked_add(NEWBORN_IMMUNITY).unwrap_or(now);
         slot.last_power = power;
         Self::rewrite_slot_timeline(&mut slot.slot_timeline, true, pkt);
         Some(AudioSelectorSlotId::new(victim_idx))
@@ -220,6 +218,10 @@ fn decayed_power(power: f32, last_arrival_ts: Option<Instant>, now: Instant) -> 
 
 #[cfg(test)]
 mod tests {
+    // Tests assert by panicking; the process ending is the mechanism.
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    // A fixture that overflows should fail the test, not clamp into a pass.
     use super::*;
     use std::time::Duration;
 
@@ -252,8 +254,10 @@ mod tests {
 
     /// Build a packet with the given audio level arriving at `arrival_ts`.
     fn pkt_at(base: Instant, offset_ms: u64, level: i8) -> RtpPacket {
-        let mut ext_vals = ExtensionValues::default();
-        ext_vals.audio_level = Some(level);
+        let ext_vals = ExtensionValues {
+            audio_level: Some(level),
+            ..Default::default()
+        };
         RtpPacket {
             ext_vals,
             arrival_ts: base + Duration::from_millis(offset_ms),
@@ -529,7 +533,7 @@ mod tests {
         // Manually set last_arrival_ts to a time >DEAD_TIMEOUT ago.
         let long_ago = Instant::now()
             .checked_sub(DEAD_TIMEOUT + Duration::from_millis(1))
-            .unwrap_or(Instant::now());
+            .unwrap_or_else(Instant::now);
         for slot in &mut sel.slots {
             if slot.owner == Some(id) {
                 slot.last_arrival_ts = Some(long_ago);

@@ -1,3 +1,11 @@
+//! Shard load counters.
+//!
+//! **The one sanctioned shared-state exception.** A fixed, preallocated
+//! counter set — one per shard, written only by that shard, read by the
+//! controller for load reporting. Bounded, allocation-free, and nothing
+//! reads two counters expecting them to agree, which is the property that
+//! made the stream monitors wrong. See `docs/thread-per-core.md`.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -18,14 +26,18 @@ impl ShardMetrics {
 
     /// Records time spent doing actual work (processing packets, timers, etc.)
     pub fn record_busy(&self, duration: Duration) {
-        self.busy_time_us
-            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        self.busy_time_us.fetch_add(
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Records time spent waiting for events (parked in select! or poll)
     pub fn record_idle(&self, duration: Duration) {
-        self.idle_time_us
-            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        self.idle_time_us.fetch_add(
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Returns the raw cumulative busy and idle times in microseconds.
@@ -63,13 +75,15 @@ impl MetricsSnapshot {
         if total_delta <= 0.0 {
             0.0
         } else {
-            (busy_delta / total_delta).min(1.0).max(0.0)
+            (busy_delta / total_delta).clamp(0.0, 1.0)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
     use super::*;
 
     #[test]

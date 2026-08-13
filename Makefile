@@ -28,8 +28,11 @@ run-profile: profile
 
 test: test-unit test-sim
 
+# `sim` is on because the shaper lives behind it, and the shaper is the authority on what a
+# simulated link can carry. Without the feature its tests are not compiled, so they never ran
+# here and nothing said so.
 test-unit:
-	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --
+	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --features pulsebeam/sim -- $(TEST)
 
 # One plan per process, across all cores.
 #
@@ -44,6 +47,24 @@ test-unit:
 # [scoreboard] lines, keeps --no-capture in bwe-baseline and pays the serial cost there.
 test-sim:
 	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-fail-fast $(TEST)
+
+# Replay one seed. This is what a sweep failure prints.
+test-sim-seed:
+	PULSEBEAM_SIM_SEED=$(SEED) $(CARGO_CMD) nextest run --cargo-profile $(SIM) \
+		-p pulsebeam-simulator --no-fail-fast $(TEST)
+
+# Run the suite over many seeds.
+#
+# The suite is a set of property tests over a simulated network, and a property
+# that holds at one seed is not a property. Every scenario otherwise runs at
+# DEFAULT_SIM_SEED forever, sampling one ordering of arrivals, losses and
+# reorderings and reporting that sample as though it were the space.
+#
+#   make sim-sweep                    20 seeds from 1
+#   make sim-sweep SEEDS=200 FROM=500 200 seeds from 500
+#   make sim-sweep TEST=properties::  one module, many seeds
+sim-sweep:
+	SEEDS=$(SEEDS) FROM=$(FROM) TEST=$(TEST) scripts/seed-sweep.sh
 
 # Regenerate the committed scoreboard. Diff it to see a change's effect on every scenario at
 # once, rather than discovering days later that a fix for one wrecked another.
