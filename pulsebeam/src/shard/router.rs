@@ -169,11 +169,16 @@ pub(crate) struct ShardRoutingTable {
 impl ShardRoutingTable {
     /// The fanout for a track name, creating it if this shard has not seen the
     /// track before. Control path only.
-    fn fanout_key(&mut self, track_id: TrackId) -> LocalTrackKey {
+    fn fanout_key(&mut self, track_id: TrackId, origin: ParticipantId) -> LocalTrackKey {
         if let Some(&key) = self.control.track_keys.get(&track_id) {
+            debug_assert_eq!(
+                self.data.tracks.get(key).map(|r| r.origin),
+                Some(origin),
+                "a track's publisher must not change identity across calls"
+            );
             return key;
         }
-        let key = self.data.tracks.insert(TrackRoute::new(track_id));
+        let key = self.data.tracks.insert(TrackRoute::new(track_id, origin));
         self.control.track_keys.insert(track_id, key);
         key
     }
@@ -190,6 +195,12 @@ impl ShardRoutingTable {
     pub(crate) fn track_descriptor(&self, key: LocalTrackKey) -> Option<(TrackId, &[Option<Rid>])> {
         let route = self.data.tracks.get(key)?;
         Some((route.track_id, &route.encodings))
+    }
+
+    /// A track's publisher, resolved the same way — off `RouteAction::Audio`
+    /// and `RouteAction::Reverse`'s `LocalTrackKey` instead of carried inline.
+    pub(crate) fn track_origin(&self, key: LocalTrackKey) -> Option<ParticipantId> {
+        self.data.tracks.get(key).map(|route| route.origin)
     }
 
     /// Release a track's fanout once nothing consumes it.
@@ -466,13 +477,12 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ReverseRoute> {
-        let key = self.fanout_key(track.meta.id);
+        let key = self.fanout_key(track.meta.id, track.meta.origin);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
         entry.encodings = track.layers.iter().map(|l| l.rid).collect();
         let handle = self.open_reverse_route(
-            track.meta.origin,
             ReverseTarget::Track { track: key },
             RouteNames {
                 room_id: None,
@@ -505,7 +515,6 @@ impl ShardRoutingTable {
         // shard hasn't already registered.
         let stream = self.reliable_stream_key_or_insert(room_id, key.clone());
         let handle = self.open_reverse_route(
-            publisher,
             ReverseTarget::Topic { stream },
             RouteNames {
                 room_id: Some(room_id),
@@ -522,7 +531,6 @@ impl ShardRoutingTable {
 
     fn open_reverse_route(
         &mut self,
-        origin: ParticipantId,
         target: ReverseTarget,
         names: RouteNames,
         now: Instant,
@@ -531,12 +539,7 @@ impl ShardRoutingTable {
         let (route, epoch) = self
             .data
             .routes
-            .install(
-                RouteAction::Reverse { origin, target },
-                names,
-                wall.ntp(),
-                now,
-            )
+            .install(RouteAction::Reverse { target }, names, wall.ntp(), now)
             .inspect_err(|err| tracing::error!(?err, "reverse route install failed"))
             .ok()?;
         Some(ReverseRoute { route, epoch })
@@ -602,13 +605,29 @@ impl ShardRoutingTable {
         route: RouteId,
         epoch: u16,
     ) -> Option<(ParticipantId, &ReverseTarget)> {
-        match self.data.routes.resolve_action(route, epoch)? {
-            RouteAction::Reverse { origin, target } => Some((*origin, target)),
+        let target = match self.data.routes.resolve_action(route, epoch)? {
+            RouteAction::Reverse { target } => target,
             other => {
                 debug_assert!(false, "a reverse frame arrived on a {other:?} route");
-                None
+                return None;
             }
-        }
+        };
+        let origin = match *target {
+            ReverseTarget::Track { track } => self.data.tracks.get(track).map(|r| r.origin),
+            ReverseTarget::Topic { stream } => self
+                .data
+                .reliable_streams
+                .get(stream)
+                .map(|s| s.id.publisher_id),
+        };
+        let Some(origin) = origin else {
+            debug_assert!(
+                false,
+                "a reverse target's key must resolve to its publisher"
+            );
+            return None;
+        };
+        Some((origin, target))
     }
 
     /// Where this shard sends reverse traffic for a track it subscribes to,
@@ -681,8 +700,13 @@ impl ShardRoutingTable {
 
     /// A local participant published a track: register its measurement handles
     /// on the node so any shard that later subscribes can resolve them.
-    pub fn publish_local_track(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
-        let key = self.fanout_key(track_id);
+    pub fn publish_local_track(
+        &mut self,
+        track_id: TrackId,
+        origin: ParticipantId,
+        states: crate::track::TrackStates,
+    ) {
+        let key = self.fanout_key(track_id, origin);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
@@ -817,7 +841,7 @@ impl ShardRoutingTable {
         // Measurements arrive by message from the publisher's shard, so a fresh
         // fanout simply starts empty and fills on the next snapshot. Nothing is
         // read out of another shard's memory to seed it.
-        let key = self.fanout_key(track.id);
+        let key = self.fanout_key(track.id, track.origin);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
@@ -1245,7 +1269,7 @@ impl ShardRoutingTable {
     /// subscribe must not install a second handle for the same shard, which
     /// would double every frame.
     pub fn register_remote_subscriber_shard(&mut self, remote: RemoteRoute, track: TrackMeta) {
-        let key = self.fanout_key(track.id);
+        let key = self.fanout_key(track.id, track.origin);
         let Some(route) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
@@ -1352,6 +1376,7 @@ impl ShardRoutingTable {
         if let ImportEffect::Retire { route, epoch } = self.control.imports.unsubscribe(&track_id) {
             self.data.routes.retire(route, epoch, now);
             self.control.imports.on_retired(&track_id);
+            self.release_fanout_if_idle(&track_id);
         }
     }
 
@@ -1369,6 +1394,7 @@ impl ShardRoutingTable {
             {
                 self.data.routes.retire(route, epoch, now);
                 self.control.imports.on_retired(&track_id);
+                self.release_fanout_if_idle(&track_id);
             }
         }
     }
@@ -1659,12 +1685,15 @@ impl ShardRoutingTable {
             self.control.imports.cancel_install(&meta.id);
             return None;
         };
+        // Gives this imported track the same dense fanout entry a video
+        // subscription gets, so `RouteAction::Audio` can resolve origin and
+        // track_id off it instead of carrying them inline. Never populates
+        // `subscribers`/`remote_routes` — audio's own liveness is the import
+        // table, not this entry — so `retire_audio_route` releases it
+        // directly rather than through the emptiness check video relies on.
+        let track = self.fanout_key(meta.id, meta.origin);
         let installed = self.data.routes.install(
-            RouteAction::Audio {
-                room,
-                origin: meta.origin,
-                track_id: meta.id,
-            },
+            RouteAction::Audio { room, track },
             RouteNames {
                 room_id: Some(room_id),
                 origin: meta.origin,
@@ -1679,6 +1708,7 @@ impl ShardRoutingTable {
             Err(err) => {
                 tracing::error!(?err, track_id = %meta.id, "audio route install failed");
                 self.control.imports.cancel_install(&meta.id);
+                self.release_fanout_if_idle(&meta.id);
                 return None;
             }
         };
@@ -3270,7 +3300,8 @@ mod tests {
     #[test]
     fn route_video_forwards_to_subscribers_and_remote_shards() {
         let mut table = ShardRoutingTable::new();
-        let track_id = pid().derive_track_id(TrackKind::Video, "v");
+        let publisher = pid();
+        let track_id = publisher.derive_track_id(TrackKind::Video, "v");
         let subscriber = pid();
         add_local_subscriber(&mut table, subscriber);
 
@@ -3279,7 +3310,7 @@ mod tests {
             TrackMeta {
                 shard_id: ShardId::new(0),
                 id: track_id,
-                origin: pid(),
+                origin: publisher,
             },
             now(),
             &wall(),
@@ -3291,7 +3322,7 @@ mod tests {
             TrackMeta {
                 shard_id: ShardId::new(0),
                 id: track_id,
-                origin: pid(),
+                origin: publisher,
             },
         );
 

@@ -361,17 +361,12 @@ pub(crate) enum RouteAction {
     /// rather than explicitly subscribed, so the destination installs this as
     /// soon as it learns the track exists and it has members to deliver to.
     ///
-    /// `origin`/`track_id` stay inline rather than resolving through a key:
-    /// unlike video, an audio destination never allocates a `TrackRoute` for
-    /// what it imports, so there is no arena entry to point at without
-    /// paying for one no other part of the audio path needs. Both fields are
-    /// `Copy`, so this does not cost the `Copy` derive on the enum — only the
-    /// "never hashed to find" property doesn't fully hold here yet.
-    Audio {
-        room: RoomKey,
-        origin: ParticipantId,
-        track_id: TrackId,
-    },
+    /// `track` points at a `TrackRoute` the same way `Video::local_track`
+    /// does — an audio import gets the same dense fanout entry a video
+    /// subscription gets (it never populates `subscribers`/`remote_routes`;
+    /// audio's own liveness is the import table, not this entry's
+    /// emptiness). Origin and track_id are read off it, never carried here.
+    Audio { room: RoomKey, track: LocalTrackKey },
     /// One route per (publisher, topic, destination) on the realtime lane.
     /// The destination installs it whether the local subscription named a
     /// publisher or was a wildcard — wildcards resolve to concrete streams as
@@ -390,10 +385,10 @@ pub(crate) enum RouteAction {
     /// repeats if it still needs it, so there is no per-link bookkeeping a
     /// per-sender route would protect — and with a 32-bit id space, paying
     /// `streams x shards` here would make it the largest consumer in the table.
-    Reverse {
-        origin: ParticipantId,
-        target: ReverseTarget,
-    },
+    ///
+    /// No `origin` field: `ReverseTarget::Track` and `::Topic` both resolve to
+    /// an arena entry that already knows its own publisher.
+    Reverse { target: ReverseTarget },
 }
 
 /// What a reverse route points at, holding everything the destination needs to
@@ -852,7 +847,6 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
-    use crate::entity::TrackKind;
 
     fn names() -> RouteNames {
         RouteNames {
@@ -868,8 +862,7 @@ mod tests {
     fn action() -> RouteAction {
         RouteAction::Audio {
             room: RoomKey::default(),
-            origin: names().origin,
-            track_id: names().origin.derive_track_id(TrackKind::Audio, "a"),
+            track: LocalTrackKey::default(),
         }
     }
 

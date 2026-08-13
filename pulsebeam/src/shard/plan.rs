@@ -105,6 +105,10 @@ pub(crate) struct TrackRoute {
     /// for logs — never hashed to find this object, which is the whole point of
     /// addressing it by key.
     pub track_id: TrackId,
+    /// The publisher, carried for the same reason `track_id` is: a resolved
+    /// `RouteAction::Audio` or `RouteAction::Reverse` reads it off here
+    /// instead of carrying it inline.
+    pub origin: crate::entity::ParticipantId,
     pub subscribers: Vec<ParticipantHandle>,
     /// Measurement handles for the publisher's encodings. Reaches this shard
     /// along the media path — from the local publisher, or from the publisher's
@@ -133,9 +137,10 @@ impl TrackRoute {
             .map(|(_, s)| s)
     }
 
-    pub fn new(track_id: TrackId) -> Self {
+    pub fn new(track_id: TrackId, origin: crate::entity::ParticipantId) -> Self {
         Self {
             track_id,
+            origin,
             subscribers: Vec::with_capacity(256),
             layer_states: Vec::new(),
             remote_routes: Vec::new(),

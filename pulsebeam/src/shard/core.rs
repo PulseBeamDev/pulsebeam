@@ -295,21 +295,22 @@ impl ShardCore {
                 };
                 self.routing.route_video(local_track, pkt, &mut ctx);
             }
-            (
-                RouteAction::Audio {
-                    room,
-                    origin,
-                    track_id,
-                },
-                MediaPayload::Audio(mut pkt),
-            ) => {
+            (RouteAction::Audio { room, track }, MediaPayload::Audio(mut pkt)) => {
                 self.restamp(&mut pkt, playout, now);
                 let Some(room_id) = self.routing.room_id_of(room) else {
                     debug_assert!(false, "an audio route's room key must resolve to a room");
                     return;
                 };
+                let Some((track_id, _)) = self.routing.track_descriptor(track) else {
+                    debug_assert!(false, "an audio route's track key must resolve to a track");
+                    return;
+                };
+                let Some(origin) = self.routing.track_origin(track) else {
+                    debug_assert!(false, "an audio route's track key must resolve to a track");
+                    return;
+                };
                 // `room_id` only fills a field the local-origin path still
-                // needs to carry; the lookup below resolves through `room`
+                // needs to carry; the lookup above resolves through `room`
                 // directly, never by hashing it back.
                 let ev = AudioRtpEvent {
                     stream_id: (track_id, None),
@@ -591,7 +592,11 @@ impl ShardCore {
                         ParticipantControlEvent::TrackPublished(mut track, states) => {
                             // Register the handles on the node; only the
                             // stateless descriptor continues to the controller.
-                            self.routing.publish_local_track(track.meta.id, states);
+                            self.routing.publish_local_track(
+                                track.meta.id,
+                                track.meta.origin,
+                                states,
+                            );
                             // Open the reverse path now and stamp it on the
                             // descriptor: by the time any shard can subscribe,
                             // it already knows where to ask for a keyframe.
