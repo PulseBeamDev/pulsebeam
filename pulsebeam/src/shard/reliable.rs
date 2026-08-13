@@ -5,7 +5,7 @@ use super::router::RoutingContext;
 use crate::id::ShardId;
 use crate::route::RemoteRoute;
 use crate::track::Topic;
-use crate::{entity::ParticipantId, shard::participants::ParticipantHandle};
+use crate::{entity::ParticipantId, shard::participants::ParticipantKey};
 
 type FastIndexSet<T> = IndexSet<T, ahash::RandomState>;
 
@@ -17,7 +17,7 @@ pub(super) struct StreamId {
 
 pub(super) struct ReliableRoutes {
     published: HashSet<StreamId>,
-    local_subscribers: HashMap<Topic, FastIndexSet<ParticipantHandle>>,
+    local_subscribers: HashMap<Topic, FastIndexSet<ParticipantKey>>,
     /// Acknowledged destination handles per stream. A reliable subscription
     /// names only a topic, so these are filled in as publishers are announced.
     remote_routes: HashMap<StreamId, HashMap<ShardId, RemoteRoute>>,
@@ -36,16 +36,20 @@ impl ReliableRoutes {
         }
     }
 
-    pub(super) fn remove_participant(&mut self, participant: ParticipantHandle) {
+    pub(super) fn remove_participant(
+        &mut self,
+        participant: ParticipantKey,
+        participant_id: ParticipantId,
+    ) {
         for subscribers in self.local_subscribers.values_mut() {
             subscribers.swap_remove(&participant);
         }
         self.local_subscribers
             .retain(|_, subscribers| !subscribers.is_empty());
         self.published
-            .retain(|stream| stream.publisher != participant.participant_id());
+            .retain(|stream| stream.publisher != participant_id);
         self.remote_routes
-            .retain(|stream, _| stream.publisher != participant.participant_id());
+            .retain(|stream, _| stream.publisher != participant_id);
     }
 
     pub(super) fn publish(&mut self, publisher: ParticipantId, topic: Topic) {
@@ -140,7 +144,7 @@ impl ReliableRoutes {
         debug_assert!(removed);
     }
 
-    pub(super) fn subscribe_local(&mut self, subscriber: ParticipantHandle, topic: Topic) -> bool {
+    pub(super) fn subscribe_local(&mut self, subscriber: ParticipantKey, topic: Topic) -> bool {
         let subscribers = self.local_subscribers.entry(topic).or_insert_with(|| {
             IndexSet::with_capacity_and_hasher(256, ahash::RandomState::default())
         });
@@ -150,11 +154,7 @@ impl ReliableRoutes {
         was_empty
     }
 
-    pub(super) fn unsubscribe_local(
-        &mut self,
-        subscriber: ParticipantHandle,
-        topic: &Topic,
-    ) -> bool {
+    pub(super) fn unsubscribe_local(&mut self, subscriber: ParticipantKey, topic: &Topic) -> bool {
         let Some(subscribers) = self.local_subscribers.get_mut(topic) else {
             debug_assert!(false, "unsubscribing from an unknown reliable topic");
             return false;

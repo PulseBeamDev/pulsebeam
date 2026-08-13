@@ -1,15 +1,10 @@
 #[cfg(test)]
 use crate::entity::ParticipantId;
 
-use super::participants::{ParticipantHandle, ParticipantMeta};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DirtyEntry {
-    pub handle: ParticipantHandle,
-}
+use super::participants::{ParticipantKey, ParticipantMeta};
 
 pub(crate) struct DirtyTracker {
-    participants: Vec<DirtyEntry>,
+    participants: Vec<ParticipantKey>,
     cursor: usize,
     #[cfg(debug_assertions)]
     active: bool,
@@ -25,11 +20,14 @@ impl DirtyTracker {
         }
     }
 
-    pub fn mark(&mut self, handle: ParticipantHandle, participant: &mut ParticipantMeta) {
+    /// `participant` is the object `key` already resolved to — passed in so
+    /// marking never has to re-resolve it, not so this can re-check the key.
+    /// A `&mut ParticipantMeta` obtained through `ParticipantRegistry` is
+    /// already proof the key is current; there is nothing left here for a
+    /// generation field to guard.
+    pub fn mark(&mut self, key: ParticipantKey, participant: &mut ParticipantMeta) {
         #[cfg(debug_assertions)]
         debug_assert!(!self.active, "cannot dirty a participant during polling");
-        debug_assert_eq!(participant.participant_id, handle.participant_id());
-        debug_assert_eq!(participant.generation, handle.generation());
         if participant.queued_dirty {
             return;
         }
@@ -38,11 +36,10 @@ impl DirtyTracker {
                 .participants
                 .get(self.cursor..)
                 .unwrap_or_default()
-                .iter()
-                .any(|entry| entry.handle == handle)
+                .contains(&key)
         );
         participant.queued_dirty = true;
-        self.participants.push(DirtyEntry { handle });
+        self.participants.push(key);
     }
 
     pub fn begin_phase(&mut self) {
@@ -54,7 +51,7 @@ impl DirtyTracker {
         }
     }
 
-    pub fn next(&mut self) -> Option<DirtyEntry> {
+    pub fn next(&mut self) -> Option<ParticipantKey> {
         #[cfg(debug_assertions)]
         debug_assert!(self.active);
         let entry = self.participants.get(self.cursor).copied()?;
@@ -78,12 +75,11 @@ impl DirtyTracker {
     }
 
     #[cfg(test)]
-    pub fn contains(&self, id: &ParticipantId) -> bool {
+    pub fn contains(&self, key: ParticipantKey) -> bool {
         self.participants
             .get(self.cursor..)
             .unwrap_or_default()
-            .iter()
-            .any(|entry| entry.handle.participant_id() == *id)
+            .contains(&key)
     }
 }
 
@@ -97,29 +93,22 @@ mod tests {
         ParticipantId::from_bytes([value; 16])
     }
 
-    fn handle(id: ParticipantId, generation: u64) -> ParticipantHandle {
-        use slotmap::SlotMap;
-
-        let mut slots = SlotMap::<crate::shard::participants::LocalParticipantKey, ()>::with_key();
-        ParticipantHandle::new(slots.insert(()), id, generation)
+    fn key(slots: &mut slotmap::SlotMap<ParticipantKey, ()>) -> ParticipantKey {
+        slots.insert(())
     }
 
     #[test]
     fn phase_iteration_preserves_order_and_capacity() {
+        let mut slots = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
         let mut dirty = DirtyTracker::with_capacity(8);
-        dirty.participants.extend([
-            DirtyEntry {
-                handle: handle(id(1), 10),
-            },
-            DirtyEntry {
-                handle: handle(id(2), 20),
-            },
-        ]);
+        let a = key(&mut slots);
+        let b = key(&mut slots);
+        dirty.participants.extend([a, b]);
         let capacity = dirty.participants.capacity();
 
         dirty.begin_phase();
-        assert_eq!(dirty.next().unwrap().handle.participant_id(), id(1));
-        assert_eq!(dirty.next().unwrap().handle.participant_id(), id(2));
+        assert_eq!(dirty.next().unwrap(), a);
+        assert_eq!(dirty.next().unwrap(), b);
         assert!(dirty.next().is_none());
         dirty.finish_phase();
 
@@ -129,20 +118,18 @@ mod tests {
 
     #[test]
     fn stale_and_replacement_generations_remain_distinct() {
+        let mut slots = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
         let participant = id(1);
+        let _ = participant;
         let mut dirty = DirtyTracker::with_capacity(8);
-        dirty.participants.extend([
-            DirtyEntry {
-                handle: handle(participant, 10),
-            },
-            DirtyEntry {
-                handle: handle(participant, 11),
-            },
-        ]);
+        let stale = key(&mut slots);
+        slots.remove(stale);
+        let replacement = key(&mut slots);
+        dirty.participants.extend([stale, replacement]);
 
         dirty.begin_phase();
-        assert_eq!(dirty.next().unwrap().handle.generation(), 10);
-        assert_eq!(dirty.next().unwrap().handle.generation(), 11);
+        assert_eq!(dirty.next().unwrap(), stale);
+        assert_eq!(dirty.next().unwrap(), replacement);
         assert!(dirty.next().is_none());
         dirty.finish_phase();
     }

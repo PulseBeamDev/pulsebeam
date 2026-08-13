@@ -16,7 +16,7 @@ use crate::rtp::cache::TrackStreamCache;
 use crate::track::Topic;
 
 use super::control::DataStreamId;
-use super::participants::ParticipantHandle;
+use super::participants::ParticipantKey;
 use super::reliable::ReliableRoutes;
 use super::router::{
     DataStreamKey, FastIndexSet, LocalTrackKey, ReliableStreamKey, RoomKey, fast_set,
@@ -24,7 +24,7 @@ use super::router::{
 };
 
 pub(crate) struct AllPublisherSubscriptions {
-    pub local_by_topic: HashMap<Topic, FastIndexSet<ParticipantHandle>>,
+    pub local_by_topic: HashMap<Topic, FastIndexSet<ParticipantKey>>,
     pub remote_by_topic: HashMap<Topic, FastIndexSet<ShardId>>,
 }
 
@@ -50,7 +50,7 @@ pub(crate) struct DataStreamRoute {
     /// the same rule `TrackRoute::track_id` follows.
     pub id: DataStreamId,
     pub published: bool,
-    pub local_subscribers: FastIndexSet<ParticipantHandle>,
+    pub local_subscribers: FastIndexSet<ParticipantKey>,
     pub remote_subscriber_shards: HashMap<ShardId, RemoteDataSubscriber>,
 }
 
@@ -109,7 +109,7 @@ pub(crate) struct TrackRoute {
     /// `RouteAction::Audio` or `RouteAction::Reverse` reads it off here
     /// instead of carrying it inline.
     pub origin: crate::entity::ParticipantId,
-    pub subscribers: Vec<ParticipantHandle>,
+    pub subscribers: Vec<ParticipantKey>,
     /// Measurement handles for the publisher's encodings. Reaches this shard
     /// along the media path — from the local publisher, or from the publisher's
     /// shard on subscribe — never through the controller.
@@ -155,7 +155,7 @@ pub(crate) struct RoomFanout {
     /// never hashed to find this object, the same rule `TrackRoute::track_id`
     /// follows.
     pub room_id: crate::entity::RoomId,
-    pub members: FastIndexSet<ParticipantHandle>,
+    pub members: FastIndexSet<ParticipantKey>,
     pub remote_shards: FastIndexSet<ShardId>,
     /// Audio tracks this shard has installed a destination route for, so they
     /// can be retired when the room goes away.

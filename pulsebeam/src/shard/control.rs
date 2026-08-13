@@ -11,7 +11,7 @@ use crate::id::ShardId;
 use crate::route::{ImportTable, ReverseRoute};
 use crate::track::Topic;
 
-use super::participants::ParticipantHandle;
+use super::participants::ParticipantKey;
 use super::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +66,7 @@ pub(crate) struct ControlPlane {
     /// both the realtime and reliable lanes and needs its own route.
     pub reliable_imports: ImportTable<DataStreamId>,
     pub participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
-    pub local_participants: HashMap<ParticipantId, ParticipantHandle>,
+    pub local_participants: HashMap<ParticipantId, ParticipantKey>,
     pub remote_participant_counts: HashMap<(RoomId, ShardId), usize>,
     /// Reverse routes this shard opened for the streams it publishes, so they
     /// can be retired when those streams go away.

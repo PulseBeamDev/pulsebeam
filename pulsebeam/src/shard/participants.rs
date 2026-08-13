@@ -15,46 +15,23 @@ use crate::{
 };
 
 new_key_type! {
-    pub(crate) struct LocalParticipantKey;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ParticipantHandle {
-    key: LocalParticipantKey,
-    participant_id: ParticipantId,
-    generation: u64,
-}
-
-impl ParticipantHandle {
-    pub(super) fn new(
-        key: LocalParticipantKey,
-        participant_id: ParticipantId,
-        generation: u64,
-    ) -> Self {
-        Self {
-            key,
-            participant_id,
-            generation,
-        }
-    }
-
-    pub(super) fn key(self) -> LocalParticipantKey {
-        self.key
-    }
-
-    pub fn participant_id(self) -> ParticipantId {
-        self.participant_id
-    }
-
-    pub fn generation(self) -> u64 {
-        self.generation
-    }
+    /// A local participant's slot on this shard. Dense, `Copy`, and
+    /// meaningless outside the shard that issued it — the same rule every
+    /// other arena key in `shard/` follows.
+    ///
+    /// Bare: a slotmap key already carries a version distinguishing a slot's
+    /// current occupant from whoever held it before, so there is nothing left
+    /// to pack alongside it. The 32-byte `ParticipantHandle` wrapper this
+    /// replaced re-implemented that version as its own `generation: u64` and
+    /// carried `participant_id` for lookups that never needed a name —
+    /// `resolve_mut` and friends check the key against the arena, not a
+    /// cached copy of who used to be there.
+    pub(crate) struct ParticipantKey;
 }
 
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
     pub(super) queued_dirty: bool,
-    pub(super) generation: u64,
 }
 
 impl Deref for ParticipantMeta {
@@ -73,9 +50,8 @@ impl DerefMut for ParticipantMeta {
 pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
-    participants: SlotMap<LocalParticipantKey, ParticipantMeta>,
-    participant_keys: HashMap<ParticipantId, LocalParticipantKey>,
-    next_generation: u64,
+    participants: SlotMap<ParticipantKey, ParticipantMeta>,
+    participant_keys: HashMap<ParticipantId, ParticipantKey>,
     demuxer: Demuxer,
     /// Addresses freed by a removal/unregister, waiting for the worker to
     /// actually close the sockets during the output phase.
@@ -89,20 +65,13 @@ impl ParticipantRegistry {
             max_gso_segments,
             participants: SlotMap::with_key(),
             participant_keys: HashMap::default(),
-            next_generation: 1,
             demuxer: Demuxer::new(),
             pending_close: VecDeque::new(),
         }
     }
 
-    pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantId {
+    pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantKey {
         let participant_id = cfg.participant_id;
-        let generation = self.next_generation;
-        let Some(next) = self.next_generation.checked_add(1) else {
-            pulsebeam_runtime::fatal!("participant generation counter exhausted on this shard")
-        };
-        self.next_generation = next;
-        debug_assert_ne!(generation, 0);
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -119,12 +88,11 @@ impl ParticipantRegistry {
         let key = self.participants.insert(ParticipantMeta {
             core,
             queued_dirty: false,
-            generation,
         });
         let previous = self.participant_keys.insert(participant_id, key);
         debug_assert!(previous.is_none());
         tracing::info!(%participant_id, "participant added to shard");
-        participant_id
+        key
     }
 
     /// Removes a local participant and queues its addresses for closing.
@@ -158,45 +126,26 @@ impl ParticipantRegistry {
         Some(participant)
     }
 
-    pub fn get_mut_with_handle(
+    pub fn get_mut_with_key(
         &mut self,
         id: &ParticipantId,
-    ) -> Option<(ParticipantHandle, &mut ParticipantMeta)> {
+    ) -> Option<(ParticipantKey, &mut ParticipantMeta)> {
         let key = *self.participant_keys.get(id)?;
         let participant = self.participants.get_mut(key)?;
         debug_assert_eq!(participant.participant_id, *id);
-        let handle = ParticipantHandle::new(key, *id, participant.generation);
-        Some((handle, participant))
-    }
-
-    #[cfg(test)]
-    pub fn get(&self, id: &ParticipantId) -> Option<&ParticipantMeta> {
-        let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get(key)?;
-        debug_assert_eq!(participant.participant_id, *id);
-        Some(participant)
+        Some((key, participant))
     }
 
     pub fn contains(&self, id: &ParticipantId) -> bool {
         self.participant_keys.contains_key(id)
     }
 
-    pub fn handle(&self, id: &ParticipantId) -> Option<ParticipantHandle> {
-        let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get(key)?;
-        debug_assert_eq!(participant.participant_id, *id);
-        Some(ParticipantHandle::new(key, *id, participant.generation))
+    pub fn key_of(&self, id: &ParticipantId) -> Option<ParticipantKey> {
+        self.participant_keys.get(id).copied()
     }
 
-    pub fn resolve_mut(&mut self, handle: ParticipantHandle) -> Option<&mut ParticipantMeta> {
-        let participant = self.participants.get_mut(handle.key)?;
-        if participant.participant_id != handle.participant_id
-            || participant.generation != handle.generation
-        {
-            debug_assert!(false, "stale local participant handle");
-            return None;
-        }
-        Some(participant)
+    pub fn resolve_mut(&mut self, key: ParticipantKey) -> Option<&mut ParticipantMeta> {
+        self.participants.get_mut(key)
     }
 
     pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<ParticipantId> {
@@ -244,9 +193,8 @@ mod tests {
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let p = pid();
 
-        let returned_id = registry.insert(cfg(p, room_id("r1")), &mut rng);
+        registry.insert(cfg(p, room_id("r1")), &mut rng);
 
-        assert_eq!(returned_id, p);
         assert!(registry.contains(&p));
         assert!(registry.get_mut(&p).is_some());
     }
@@ -297,15 +245,15 @@ mod tests {
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant_id = pid();
         registry.insert(cfg(participant_id, room_id("r5")), &mut rng);
-        let removed_handle = registry.handle(&participant_id).unwrap();
+        let removed_key = registry.key_of(&participant_id).unwrap();
 
         assert!(registry.remove(&participant_id).is_some());
         registry.insert(cfg(participant_id, room_id("r5")), &mut rng);
-        let replacement_handle = registry.handle(&participant_id).unwrap();
+        let replacement_key = registry.key_of(&participant_id).unwrap();
 
-        assert_ne!(removed_handle, replacement_handle);
-        assert!(registry.resolve_mut(removed_handle).is_none());
-        assert!(registry.resolve_mut(replacement_handle).is_some());
+        assert_ne!(removed_key, replacement_key);
+        assert!(registry.resolve_mut(removed_key).is_none());
+        assert!(registry.resolve_mut(replacement_key).is_some());
     }
 
     #[test]

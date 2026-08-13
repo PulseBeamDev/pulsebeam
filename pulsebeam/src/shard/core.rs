@@ -17,7 +17,7 @@ use crate::{
     shard::{
         dirty::DirtyTracker,
         events::EventPipeline,
-        participants::{ParticipantHandle, ParticipantRegistry},
+        participants::{ParticipantKey, ParticipantRegistry},
         timer::TimerWheel,
     },
 };
@@ -29,7 +29,10 @@ use super::router::{self, Origin, RoutingContext, ShardRoutingTable};
 pub(crate) use super::router::ShardTransport;
 use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame, Topology};
 
-const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
+/// A starting hint, not a policy cap: nothing rejects the next participant
+/// past this. `TimerWheel`, `DirtyTracker` and `EventPipeline` all grow past
+/// it on demand — this only smooths the allocations ramp-up pays.
+const PARTICIPANT_CAPACITY_HINT: usize = 64;
 
 struct DispatchCtx<'a, R: ShardTransport> {
     registry: &'a mut ParticipantRegistry,
@@ -51,7 +54,7 @@ impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
 impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
     fn forward_video_rtp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
@@ -64,7 +67,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn update_layer_states(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         track_id: TrackId,
         states: &crate::track::TrackStates,
     ) {
@@ -75,7 +78,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_audio_rtp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         slot_idx: AudioSelectorSlotId,
         origin: AudioOrigin,
         pkt: &RtpPacket,
@@ -88,7 +91,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_sctp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         origin: ParticipantId,
         topic: &crate::track::Topic,
         pkt: &[u8],
@@ -101,26 +104,26 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn notify_tracks_published(
         &mut self,
-        participant_id: ParticipantId,
+        participant: ParticipantKey,
         tracks: &[crate::track::Track],
     ) {
-        if let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) {
+        if let Some(p) = self.registry.resolve_mut(participant) {
             p.on_tracks_published(tracks);
-            self.dirty.mark(handle, p);
+            self.dirty.mark(participant, p);
         }
     }
 
     fn notify_tracks_unpublished(
         &mut self,
-        participant_id: ParticipantId,
+        participant: ParticipantKey,
         track_ids: &[crate::entity::TrackId],
     ) {
-        let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) else {
+        let Some(p) = self.registry.resolve_mut(participant) else {
             return;
         };
 
         if p.on_tracks_unpublished(track_ids) {
-            self.dirty.mark(handle, p);
+            self.dirty.mark(participant, p);
         }
     }
 
@@ -131,9 +134,9 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         rid: Option<Rid>,
         kind: str0m::media::KeyframeRequestKind,
     ) {
-        if let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) {
+        if let Some((key, p)) = self.registry.get_mut_with_key(&participant_id) {
             p.handle_remote_keyframe_request((track_id, rid), kind);
-            self.dirty.mark(handle, p);
+            self.dirty.mark(key, p);
         }
     }
 
@@ -147,7 +150,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_reliable_sctp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         origin: ParticipantId,
         topic: &crate::track::Topic,
         frame: &[u8],
@@ -164,9 +167,9 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         topic: &crate::track::Topic,
         bytes: &[u8],
     ) {
-        if let Some((handle, p)) = self.registry.get_mut_with_handle(&publisher) {
+        if let Some((key, p)) = self.registry.get_mut_with_key(&publisher) {
             p.on_deliver_reliable_control(topic, bytes);
-            self.dirty.mark(handle, p);
+            self.dirty.mark(key, p);
         }
     }
 }
@@ -195,10 +198,10 @@ impl ShardCore {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
             routing: ShardRoutingTable::new(),
-            timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
-            dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
+            timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
+            dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
-            pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
+            pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
             rng,
             wall,
         }
@@ -388,9 +391,9 @@ impl ShardCore {
         let Some(participant_id) = self.registry.demux(&batch) else {
             return;
         };
-        if let Some((handle, participant)) = self.registry.get_mut_with_handle(&participant_id) {
+        if let Some((key, participant)) = self.registry.get_mut_with_key(&participant_id) {
             participant.on_ingress(batch);
-            self.dirty.mark(handle, participant);
+            self.dirty.mark(key, participant);
         } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
             router.send_frame(
                 shard_id,
@@ -711,18 +714,15 @@ impl ShardCore {
     ) {
         debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
-        while let Some(entry) = self.dirty.next() {
-            let handle = entry.handle;
+        while let Some(handle) = self.dirty.next() {
             let Some(participant) = self.registry.resolve_mut(handle) else {
                 continue;
             };
             debug_assert!(participant.queued_dirty);
-            debug_assert_eq!(participant.participant_id, handle.participant_id());
             participant.queued_dirty = false;
             let room_id = participant.room_id;
-            let mut sink = self
-                .pipeline
-                .participant_sink(room_id, handle.participant_id());
+            let participant_id = participant.participant_id;
+            let mut sink = self.pipeline.participant_sink(room_id, participant_id);
             let deadline = participant.poll(now, &mut sink);
             if let Some(deadline) = deadline {
                 self.timers.schedule(handle, deadline);
@@ -996,11 +996,9 @@ impl ShardCore {
                 participant_id,
                 batch,
             } => {
-                if let Some((handle, participant)) =
-                    self.registry.get_mut_with_handle(&participant_id)
-                {
+                if let Some((key, participant)) = self.registry.get_mut_with_key(&participant_id) {
                     participant.on_ingress(batch);
-                    self.dirty.mark(handle, participant);
+                    self.dirty.mark(key, participant);
                 }
             }
             ShardFrame::Reverse { env, body } => {
@@ -1114,20 +1112,15 @@ impl ShardCore {
         self.remove_participant(&participant_id, now);
         let _ = router; // reserved: re-add currently needs no cross-shard notice
         let known_tracks = cfg.available_tracks.clone();
-        let participant_id = self.registry.insert(cfg, &mut self.rng);
-        let Some(handle) = self.registry.handle(&participant_id) else {
-            pulsebeam_runtime::fatal!(
-                "registry accepted participant {participant_id} but has no handle for it"
-            )
-        };
+        let key = self.registry.insert(cfg, &mut self.rng);
         self.routing
-            .add_local_member(participant_id, handle, room_id, &mut self.rng);
+            .add_local_member(participant_id, key, room_id, &mut self.rng);
         let Some(participant) = self.registry.get_mut(&participant_id) else {
             pulsebeam_runtime::fatal!(
                 "registry accepted participant {participant_id} but cannot resolve it"
             )
         };
-        self.dirty.mark(handle, participant);
+        self.dirty.mark(key, participant);
 
         // Tracks already published when this member arrived never went through
         // `publish_track` here, so their audio routes are installed now.
@@ -1145,8 +1138,8 @@ impl ShardCore {
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId, now: Instant) -> Option<()> {
-        if let Some(handle) = self.registry.handle(participant_id) {
-            self.timers.cancel(handle);
+        if let Some(key) = self.registry.key_of(participant_id) {
+            self.timers.cancel(key);
         }
         let meta = self.registry.remove(participant_id)?;
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
@@ -1262,8 +1255,8 @@ mod test {
 
     fn clear_dirty(core: &mut ShardCore) {
         core.dirty.begin_phase();
-        while let Some(entry) = core.dirty.next() {
-            if let Some(participant) = core.registry.resolve_mut(entry.handle) {
+        while let Some(key) = core.dirty.next() {
+            if let Some(participant) = core.registry.resolve_mut(key) {
                 participant.queued_dirty = false;
             }
         }
@@ -1287,8 +1280,9 @@ mod test {
             now(),
             &router,
         );
+        let key = core2.registry.key_of(&p).unwrap();
         assert!(
-            core2.dirty.contains(&p),
+            core2.dirty.contains(key),
             "newly added participant must be dirty"
         );
     }
@@ -1313,8 +1307,13 @@ mod test {
         );
     }
 
+    /// A stale dirty entry for a participant's *previous* incarnation must
+    /// not be silently mistaken for the current one when both are queued at
+    /// once — the property `removed_handle_never_resolves_to_replacement_with_same_id`
+    /// pins for the registry directly, exercised here through the path that
+    /// actually queues dirty entries.
     #[test]
-    fn readding_dirty_participant_ignores_stale_generation() {
+    fn readding_dirty_participant_does_not_resolve_the_stale_incarnation() {
         let router = TestRouter::new();
         let mut core = new_core();
         let participant = pid();
@@ -1331,17 +1330,20 @@ mod test {
             &router,
         );
 
-        let current_generation = core.registry.get(&participant).unwrap().generation;
+        let current_key = core.registry.key_of(&participant).unwrap();
         core.dirty.begin_phase();
         let stale = core.dirty.next().unwrap();
         let current = core.dirty.next().unwrap();
         assert!(core.dirty.next().is_none());
         core.dirty.finish_phase();
 
-        assert_eq!(stale.handle.participant_id(), participant);
-        assert_ne!(stale.handle.generation(), current_generation);
-        assert_eq!(current.handle.participant_id(), participant);
-        assert_eq!(current.handle.generation(), current_generation);
+        assert_ne!(stale, current, "the two incarnations must be distinct keys");
+        assert_eq!(current, current_key);
+        assert!(
+            core.registry.resolve_mut(stale).is_none(),
+            "the first incarnation's key must not resolve to the replacement"
+        );
+        assert!(core.registry.resolve_mut(current).is_some());
     }
 
     #[test]
@@ -1476,7 +1478,7 @@ mod test {
         );
 
         assert!(
-            core.dirty.contains(&p),
+            core.dirty.contains(core.registry.key_of(&p).unwrap()),
             "keyframe delivery must dirty the target participant"
         );
     }
@@ -1502,7 +1504,10 @@ mod test {
             now(),
             &router,
         );
-        assert!(core.dirty.contains(&subscriber));
+        assert!(
+            core.dirty
+                .contains(core.registry.key_of(&subscriber).unwrap())
+        );
         clear_dirty(&mut core);
         let subscribed = core
             .routing
@@ -1537,7 +1542,8 @@ mod test {
         );
 
         assert!(
-            core.dirty.contains(&subscriber),
+            core.dirty
+                .contains(core.registry.key_of(&subscriber).unwrap()),
             "forwarded RTP must dirty the subscriber"
         );
     }
@@ -1591,7 +1597,7 @@ mod test {
         clear_dirty(&mut core);
 
         core.fire_timers(tokio::time::Instant::now());
-        assert!(!core.dirty.contains(&p));
+        assert!(!core.dirty.contains(core.registry.key_of(&p).unwrap()));
 
         core.on_command(ShardCommand::RemoveParticipant(p), now(), &router);
         assert!(!core.registry.contains(&p));

@@ -6,7 +6,7 @@ use str0m::media::{KeyframeRequestKind, Rid};
 
 use super::control::{ControlPlane, DataStreamId, ParticipantShardMeta, TrackReverseTarget};
 use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
-use super::participants::ParticipantHandle;
+use super::participants::ParticipantKey;
 use super::plan::{DataPlane, DataStreamRoute, ReliableStream, RoomFanout, TrackRoute};
 use slotmap::new_key_type;
 
@@ -57,7 +57,7 @@ pub(crate) trait ShardTransport {
 pub(crate) trait RoutingContext: ShardTransport {
     fn forward_video_rtp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&TrackStreamCache>,
@@ -69,26 +69,26 @@ pub(crate) trait RoutingContext: ShardTransport {
     /// packet would otherwise decide against the previous one.
     fn update_layer_states(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         track_id: TrackId,
         states: &crate::track::TrackStates,
     );
     fn forward_audio_rtp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         slot_idx: AudioSelectorSlotId,
         origin: AudioOrigin,
         pkt: &RtpPacket,
     );
     fn forward_sctp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         origin: ParticipantId,
         topic: &Topic,
         pkt: &[u8],
     );
-    fn notify_tracks_published(&mut self, participant_id: ParticipantId, tracks: &[Track]);
-    fn notify_tracks_unpublished(&mut self, participant_id: ParticipantId, track_ids: &[TrackId]);
+    fn notify_tracks_published(&mut self, participant: ParticipantKey, tracks: &[Track]);
+    fn notify_tracks_unpublished(&mut self, participant: ParticipantKey, track_ids: &[TrackId]);
     fn notify_keyframe_request(
         &mut self,
         participant_id: ParticipantId,
@@ -103,7 +103,7 @@ pub(crate) trait RoutingContext: ShardTransport {
 
     fn forward_reliable_sctp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         origin: ParticipantId,
         topic: &Topic,
         frame: &[u8],
@@ -379,11 +379,10 @@ impl ShardRoutingTable {
     pub fn add_local_member(
         &mut self,
         participant_id: ParticipantId,
-        handle: ParticipantHandle,
+        handle: ParticipantKey,
         room_id: RoomId,
         rng: &mut impl rand::RngCore,
     ) {
-        debug_assert_eq!(participant_id, handle.participant_id());
         let previous = self
             .control
             .local_participants
@@ -450,7 +449,8 @@ impl ShardRoutingTable {
         room.all_publisher_subscriptions
             .local_by_topic
             .retain(|_, subscribers| !subscribers.is_empty());
-        room.reliable.remove_participant(removed_handle);
+        room.reliable
+            .remove_participant(removed_handle, *participant_id);
         for key in audio_track_keys {
             room.audio_selector.remove_track((key, None));
         }
@@ -838,7 +838,6 @@ impl ShardRoutingTable {
         wall: &WallAnchor,
     ) -> Option<ShardEvent> {
         let handle = *self.control.local_participants.get(&subscriber)?;
-        debug_assert_eq!(handle.participant_id(), subscriber);
         // Resolve the publisher's handles from the node rather than waiting for
         // them to be sent: they are ready before any subscribe can happen, so
         // the fanout is never briefly live with no measurements behind it.
@@ -849,13 +848,8 @@ impl ShardRoutingTable {
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
-        let already_subscribed = entry
-            .subscribers
-            .iter()
-            .any(|existing| existing.participant_id() == subscriber);
-        entry
-            .subscribers
-            .retain(|existing| existing.participant_id() != subscriber);
+        let already_subscribed = entry.subscribers.contains(&handle);
+        entry.subscribers.retain(|&existing| existing != handle);
         entry.subscribers.push(handle);
         if already_subscribed {
             return None;
@@ -901,14 +895,13 @@ impl ShardRoutingTable {
         track: TrackMeta,
         now: Instant,
     ) -> Option<ShardEvent> {
+        let handle = *self.control.local_participants.get(&subscriber)?;
         let entry = self
             .data
             .tracks
             .get_mut(self.control.track_keys.get(&track.id).copied()?)?;
         let previous_len = entry.subscribers.len();
-        entry
-            .subscribers
-            .retain(|handle| handle.participant_id() != subscriber);
+        entry.subscribers.retain(|&existing| existing != handle);
         if entry.subscribers.len() == previous_len {
             return None;
         }
@@ -1351,14 +1344,15 @@ impl ShardRoutingTable {
             return None;
         };
         self.adopt_track_reverse_target(&track);
+        let publisher_key = self.control.local_participants.get(&publisher).copied();
         let room = self.room(&room_id)?;
         let tracks = std::slice::from_ref(&track);
         let has_members = !room.members.is_empty();
         for &participant in &room.members {
-            if participant.participant_id() == publisher {
+            if Some(participant) == publisher_key {
                 continue;
             }
-            ctx.notify_tracks_published(participant.participant_id(), tracks);
+            ctx.notify_tracks_published(participant, tracks);
         }
 
         // Audio has no explicit subscribe: membership in the room is the
@@ -1501,7 +1495,7 @@ impl ShardRoutingTable {
         room_id: RoomId,
         publisher: ParticipantId,
         topic: &Topic,
-        handle: ParticipantHandle,
+        handle: ParticipantKey,
     ) {
         let key = DataStreamId::new(publisher, topic.clone());
         let Some(route) = self.data_stream_mut(&key) else {
@@ -1753,7 +1747,7 @@ impl ShardRoutingTable {
             return;
         };
         for &participant in &room.members {
-            ctx.notify_tracks_unpublished(participant.participant_id(), track_ids);
+            ctx.notify_tracks_unpublished(participant, track_ids);
         }
     }
 
@@ -1828,6 +1822,14 @@ impl ShardRoutingTable {
             "audio packet entered shard audio fanout"
         );
 
+        // One lookup for the whole packet, not one per subscriber: resolving
+        // the sender's own key is what lets the fan-out below skip them by
+        // key instead of hashing `ev.origin` against every member's name.
+        let origin_key = origin
+            .is_local()
+            .then(|| self.control.local_participants.get(&ev.origin).copied())
+            .flatten();
+
         // Split the borrow: the room owns the selector and members, while the
         // per-stream sender handles live in `tracks`.
         let Self { data, .. } = self;
@@ -1857,7 +1859,7 @@ impl ShardRoutingTable {
             return;
         };
         for &participant in &room.members {
-            if participant.participant_id() == ev.origin {
+            if Some(participant) == origin_key {
                 continue;
             }
             ctx.forward_audio_rtp(
@@ -2121,7 +2123,23 @@ mod tests {
     use std::collections::HashSet as StdHashSet;
 
     use crate::entity::ExternalRoomId;
-    use crate::shard::participants::LocalParticipantKey;
+    use crate::shard::participants::ParticipantKey;
+
+    thread_local! {
+        static PARTICIPANT_KEYS: RefCell<SlotMap<ParticipantKey, ()>> =
+            RefCell::new(SlotMap::with_key());
+    }
+
+    /// A fresh, distinct participant key. Every test-fixture site used to mint
+    /// one from its own throwaway `SlotMap`, which happened to work only
+    /// because `ParticipantHandle` carried a `ParticipantId` alongside the key
+    /// and comparisons went by that — the key itself collided across calls,
+    /// silently. Now the key *is* the handle, so this shares one map for the
+    /// whole test module the way `add_local_member`'s caller in production
+    /// always does (one registry, minting keys that never repeat).
+    fn new_participant_key() -> ParticipantKey {
+        PARTICIPANT_KEYS.with(|slots| slots.borrow_mut().insert(()))
+    }
 
     /// A `RoutingContext` fake that just records calls. No `ParticipantCore`,
     /// no tracing spans, no `ShardCore` — this is the whole point of the
@@ -2141,11 +2159,11 @@ mod tests {
         wall: WallAnchor,
         local: StdHashSet<ParticipantId>,
         sent: RefCell<Vec<(ShardId, ShardFrame)>>,
-        forwarded_video: RefCell<Vec<ParticipantId>>,
-        forwarded_audio: RefCell<Vec<(ParticipantId, AudioSelectorSlotId)>>,
-        forwarded_sctp: RefCell<Vec<ParticipantId>>,
-        published: RefCell<Vec<ParticipantId>>,
-        unpublished: RefCell<Vec<ParticipantId>>,
+        forwarded_video: RefCell<Vec<ParticipantKey>>,
+        forwarded_audio: RefCell<Vec<(ParticipantKey, AudioSelectorSlotId)>>,
+        forwarded_sctp: RefCell<Vec<ParticipantKey>>,
+        published: RefCell<Vec<ParticipantKey>>,
+        unpublished: RefCell<Vec<ParticipantKey>>,
         keyframed: RefCell<Vec<ParticipantId>>,
     }
 
@@ -2184,7 +2202,7 @@ mod tests {
 
         fn update_layer_states(
             &mut self,
-            _subscriber: ParticipantHandle,
+            _subscriber: ParticipantKey,
             _track_id: TrackId,
             _states: &crate::track::TrackStates,
         ) {
@@ -2192,46 +2210,42 @@ mod tests {
 
         fn forward_video_rtp(
             &mut self,
-            subscriber: ParticipantHandle,
+            subscriber: ParticipantKey,
             _track_id: TrackId,
             _pkt: &RtpPacket,
             _cache: Option<&TrackStreamCache>,
         ) {
-            self.forwarded_video
-                .borrow_mut()
-                .push(subscriber.participant_id());
+            self.forwarded_video.borrow_mut().push(subscriber);
         }
         fn forward_audio_rtp(
             &mut self,
-            subscriber: ParticipantHandle,
+            subscriber: ParticipantKey,
             slot_idx: AudioSelectorSlotId,
             _origin: AudioOrigin,
             _pkt: &RtpPacket,
         ) {
             self.forwarded_audio
                 .borrow_mut()
-                .push((subscriber.participant_id(), slot_idx));
+                .push((subscriber, slot_idx));
         }
         fn forward_sctp(
             &mut self,
-            subscriber: ParticipantHandle,
+            subscriber: ParticipantKey,
             _origin: ParticipantId,
             _topic: &Topic,
             _pkt: &[u8],
         ) {
-            self.forwarded_sctp
-                .borrow_mut()
-                .push(subscriber.participant_id());
+            self.forwarded_sctp.borrow_mut().push(subscriber);
         }
-        fn notify_tracks_published(&mut self, participant_id: ParticipantId, _tracks: &[Track]) {
-            self.published.borrow_mut().push(participant_id);
+        fn notify_tracks_published(&mut self, participant: ParticipantKey, _tracks: &[Track]) {
+            self.published.borrow_mut().push(participant);
         }
         fn notify_tracks_unpublished(
             &mut self,
-            participant_id: ParticipantId,
+            participant: ParticipantKey,
             _track_ids: &[TrackId],
         ) {
-            self.unpublished.borrow_mut().push(participant_id);
+            self.unpublished.borrow_mut().push(participant);
         }
         fn notify_keyframe_request(
             &mut self,
@@ -2248,14 +2262,12 @@ mod tests {
 
         fn forward_reliable_sctp(
             &mut self,
-            subscriber: ParticipantHandle,
+            subscriber: ParticipantKey,
             _origin: ParticipantId,
             _topic: &Topic,
             _frame: &[u8],
         ) {
-            self.forwarded_sctp
-                .borrow_mut()
-                .push(subscriber.participant_id());
+            self.forwarded_sctp.borrow_mut().push(subscriber);
         }
 
         fn deliver_reliable_control(
@@ -2300,9 +2312,7 @@ mod tests {
     }
 
     fn add_local_subscriber(table: &mut ShardRoutingTable, participant_id: ParticipantId) {
-        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
-        let key = slots.insert(());
-        let handle = ParticipantHandle::new(key, participant_id, 1);
+        let handle = new_participant_key();
         table
             .control
             .local_participants
@@ -2312,10 +2322,8 @@ mod tests {
     fn replace_local_subscriber(
         table: &mut ShardRoutingTable,
         participant_id: ParticipantId,
-    ) -> ParticipantHandle {
-        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
-        let key = slots.insert(());
-        let handle = ParticipantHandle::new(key, participant_id, 2);
+    ) -> ParticipantKey {
+        let handle = new_participant_key();
         table
             .control
             .local_participants
@@ -2408,8 +2416,19 @@ mod tests {
         assert!(ev2.is_none(), "second subscriber must not re-notify");
     }
 
+    /// A reconnect (same `ParticipantId`, a fresh `ParticipantKey`) must not
+    /// leave the old connection's key behind in a track's subscriber list.
+    ///
+    /// Route and key now share a lifetime by construction — "created and
+    /// removed together" — so the connection that owned the old key must be
+    /// torn down (`unregister_subscriber`) before the new one takes its place
+    /// in `local_participants`, the same order `ShardCore::add_participant`
+    /// already enforces by removing the old participant first. This is what
+    /// makes the fanout resolvable-by-key safe: there is no name left on the
+    /// entry for `register_subscriber` to deduplicate by, so nothing but
+    /// teardown-before-replace can prevent two keys for one person.
     #[test]
-    fn replacement_subscriber_evicts_stale_route_without_duplicate_notification() {
+    fn a_reconnect_only_leaves_the_new_key_in_the_fanout() {
         let mut table = ShardRoutingTable::new();
         let subscriber = pid();
         let track = TrackMeta {
@@ -2424,11 +2443,18 @@ mod tests {
                 .is_some()
         );
 
+        assert!(
+            table
+                .unregister_subscriber(subscriber, track.clone(), now())
+                .is_some(),
+            "the old connection must be torn down before the new one replaces it"
+        );
         let replacement = replace_local_subscriber(&mut table, subscriber);
         assert!(
             table
                 .register_subscriber(subscriber, track.clone(), now(), &wall())
-                .is_none()
+                .is_some(),
+            "the new connection is a fresh subscriber, not a churn no-op"
         );
 
         assert_eq!(fanout(&table, &track.id).subscribers, vec![replacement]);
@@ -2450,11 +2476,7 @@ mod tests {
         let mut rng = rand::seeded_rng(13);
         let room = room_id("reliable-room");
         let subscriber = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            subscriber,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(subscriber, handle, room, &mut rng);
 
         let topic = Topic::for_test("chat");
@@ -2509,12 +2531,12 @@ mod tests {
         let mut rng = rand::seeded_rng(13);
         let room = room_id("wildcard-late");
         let topic = Topic::for_test("chat");
-        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+        let mut slots = SlotMap::<ParticipantKey, ()>::with_key();
 
         let mut subscribers = Vec::new();
         for _ in 0..2 {
             let id = pid();
-            let handle = ParticipantHandle::new(slots.insert(()), id, 1);
+            let handle = slots.insert(());
             table.add_local_member(id, handle, room, &mut rng);
             subscribers.push((id, handle));
         }
@@ -2551,21 +2573,21 @@ mod tests {
         let mut rng = rand::seeded_rng(13);
         let room = room_id("reliable-fanout");
         let topic = Topic::for_test("chat");
-        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+        let mut slots = SlotMap::<ParticipantKey, ()>::with_key();
 
         let mut ctx = RecordingCtx::default();
         let mut subscribers = Vec::new();
         for _ in 0..2 {
             let id = pid();
-            let handle = ParticipantHandle::new(slots.insert(()), id, 1);
+            let handle = slots.insert(());
             table.add_local_member(id, handle, room, &mut rng);
-            subscribers.push(id);
+            subscribers.push((id, handle));
         }
 
         let publisher = pid();
-        table.register_reliable_data_subscriber(room, subscribers[0], topic.clone());
+        table.register_reliable_data_subscriber(room, subscribers[0].0, topic.clone());
         table.on_remote_reliable_publisher(room, publisher, &topic, now(), &wall());
-        table.register_reliable_data_subscriber(room, subscribers[1], topic.clone());
+        table.register_reliable_data_subscriber(room, subscribers[1].0, topic.clone());
 
         let stream = table
             .reliable_stream_key(&DataStreamId::new(publisher, topic.clone()))
@@ -2573,9 +2595,9 @@ mod tests {
         table.route_reliable_data(stream, Origin::Remote, b"hello", &mut ctx);
 
         let delivered = ctx.forwarded_sctp.borrow().clone();
-        for (n, subscriber) in subscribers.iter().enumerate() {
+        for (n, (_, handle)) in subscribers.iter().enumerate() {
             assert!(
-                delivered.contains(subscriber),
+                delivered.contains(handle),
                 "subscriber {n} received nothing; a topic fan-out that serves only \
                  some of its subscribers loses data silently (delivered to {delivered:?})"
             );
@@ -2590,11 +2612,7 @@ mod tests {
         let mut rng = rand::seeded_rng(11);
         let room = room_id("data-room");
         let subscriber = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            subscriber,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(subscriber, handle, room, &mut rng);
 
         let publisher = pid();
@@ -2620,11 +2638,7 @@ mod tests {
         assert_eq!(table.data.routes.len(), 1);
 
         let second = pid();
-        let h2 = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            second,
-            1,
-        );
+        let h2 = new_participant_key();
         table.add_local_member(second, h2, room, &mut rng);
         assert!(
             table
@@ -2651,11 +2665,7 @@ mod tests {
         let mut rng = rand::seeded_rng(23);
         let room = room_id("data-room");
         let subscriber = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            subscriber,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(subscriber, handle, room, &mut rng);
 
         let publisher = pid();
@@ -2677,11 +2687,7 @@ mod tests {
 
         table.data.routes = crate::route::RouteTable::new();
         let second = pid();
-        let h2 = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            second,
-            1,
-        );
+        let h2 = new_participant_key();
         table.add_local_member(second, h2, room, &mut rng);
         assert!(
             matches!(
@@ -2721,11 +2727,7 @@ mod tests {
             origin: publisher,
         };
         let subscriber = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            subscriber,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(subscriber, handle, room, &mut rng);
         table.register_subscriber(subscriber, track.clone(), now(), &wall());
 
@@ -2780,11 +2782,7 @@ mod tests {
             origin: publisher,
         };
         let subscriber = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            subscriber,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(subscriber, handle, room, &mut rng);
 
         table.register_subscriber(subscriber, track.clone(), now(), &wall());
@@ -2812,11 +2810,7 @@ mod tests {
         let room = room_id("reliable-reverse");
         let publisher = pid();
         let topic = Topic::for_test("chat");
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            publisher,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(publisher, handle, room, &mut rng);
 
         let target = table
@@ -3034,11 +3028,7 @@ mod tests {
         let topic = Topic::for_test("chat");
 
         let subscribe = |table: &mut ShardRoutingTable, who: ParticipantId, rng: &mut _| {
-            let handle = ParticipantHandle::new(
-                SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-                who,
-                1,
-            );
+            let handle = new_participant_key();
             table.add_local_member(who, handle, room, rng);
             table.register_data_subscriber(
                 room,
@@ -3092,11 +3082,7 @@ mod tests {
         let mut rng = rand::seeded_rng(12);
         let room = room_id("data-wildcard");
         let subscriber = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            subscriber,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(subscriber, handle, room, &mut rng);
 
         let topic = Topic::for_test("chat");
@@ -3140,11 +3126,7 @@ mod tests {
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room");
         let local = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            local,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(local, handle, room, &mut rng);
 
         let remote_origin = pid();
@@ -3197,19 +3179,11 @@ mod tests {
         // Somebody has to stay, or the room empties and takes its routes with it - which would
         // make this pass for the wrong reason.
         let bystander = pid();
-        let bystander_handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            bystander,
-            1,
-        );
+        let bystander_handle = new_participant_key();
         table.add_local_member(bystander, bystander_handle, room, &mut rng);
 
         for _ in 0..2 {
-            let handle = ParticipantHandle::new(
-                SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-                participant,
-                1,
-            );
+            let handle = new_participant_key();
             table.add_local_member(participant, handle, room, &mut rng);
             // The same participant id comes back, exactly as a reconnect does.
             table.register_data_publisher(room, participant, topic.clone());
@@ -3223,11 +3197,7 @@ mod tests {
         let mut rng = rand::seeded_rng(7);
         let room = room_id("audio-room-local");
         let origin = pid();
-        let handle = ParticipantHandle::new(
-            SlotMap::<LocalParticipantKey, ()>::with_key().insert(()),
-            origin,
-            1,
-        );
+        let handle = new_participant_key();
         table.add_local_member(origin, handle, room, &mut rng);
 
         let audio = TrackMeta {
@@ -3344,7 +3314,13 @@ mod tests {
             .expect("published track has a fanout");
         table.route_video(fanout_key, RtpPacket::default(), &mut ctx);
 
-        assert_eq!(ctx.forwarded_video.borrow().as_slice(), &[subscriber]);
+        let subscriber_key = table
+            .control
+            .local_participants
+            .get(&subscriber)
+            .copied()
+            .expect("subscriber registered above");
+        assert_eq!(ctx.forwarded_video.borrow().as_slice(), &[subscriber_key]);
         assert_eq!(ctx.sent.borrow().len(), 1);
     }
 }
