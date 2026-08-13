@@ -1,3 +1,12 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice,
+    clippy::indexing_slicing
+)] // test / simulation support
 //! Test-only observation points for the simulator.
 //!
 //! The simulator runs the SFU in-process under turmoil, so a task-local sink is enough to get

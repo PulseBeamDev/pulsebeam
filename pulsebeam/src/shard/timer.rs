@@ -6,6 +6,10 @@ use super::participants::{LocalParticipantKey, ParticipantHandle};
 
 const SLOT_COUNT: usize = 256;
 const OCCUPANCY_WORDS: usize = SLOT_COUNT / u64::BITS as usize;
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "SLOT_COUNT is 256, asserted below"
+)]
 const DUE_LOCATION: u16 = SLOT_COUNT as u16;
 const _: () = assert!(SLOT_COUNT == 256, "slot_of() relies on a 256-slot wheel");
 const DISARMED_LOCATION: u16 = DUE_LOCATION + 1;
@@ -16,7 +20,13 @@ const MAX_DEADLINE_TICKS: u64 = 101;
 /// The wheel has exactly `SLOT_COUNT` slots, so this is the tick modulo the
 /// wheel size. The wrap is the addressing scheme, not a lost value.
 fn slot_of(tick: u64) -> u8 {
-    tick as u8
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "SLOT_COUNT is 256, so the low byte is the slot index"
+    )]
+    {
+        tick as u8
+    }
 }
 
 #[derive(Clone, Copy)]

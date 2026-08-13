@@ -8,6 +8,17 @@
 //! files compiled into it, and it is only ever linked by tests. An index that
 //! leaves the buffer is a broken fixture, and failing the test run is the
 //! reporting mechanism — unlike the SFU, there is no session here to protect.
+#![allow(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unreachable,
+        clippy::string_slice,
+        clippy::disallowed_methods,
+        clippy::float_cmp,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 pub const RAW_H264_FULL_CBR: &[u8] = include_bytes!("full_f_cbr.h264");
 pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");

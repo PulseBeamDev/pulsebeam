@@ -1,3 +1,12 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice,
+    clippy::indexing_slicing
+)] // test / simulation support
 //! Per-packet cost on the shard-local forwarding path, measured on real types.
 //!
 //! Not a criterion suite — the point is a repeatable number for the work one
@@ -5,6 +14,7 @@
 
 //! Exceptions: this measures the cost of the very primitives the crate
 //! restricts, and printing the numbers is the entire output.
+#![allow(clippy::disallowed_types, clippy::print_stdout)]
 
 use std::hint::black_box;
 use std::time::Instant;

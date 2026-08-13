@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice,
+    clippy::indexing_slicing
+)] // test / simulation support
 use std::{future::Future, net::IpAddr};
 
 pub fn test_host_ip(sim_host_ip: &str) -> IpAddr {

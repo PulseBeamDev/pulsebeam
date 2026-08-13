@@ -5,6 +5,7 @@
 //! controller for load reporting. Bounded, allocation-free, and nothing
 //! reads two counters expecting them to agree, which is the property that
 //! made the stream monitors wrong. See `docs/thread-per-core.md`.
+#![allow(clippy::disallowed_types)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

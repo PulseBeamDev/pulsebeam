@@ -10,6 +10,9 @@ license.workspace = true
 publish = false
 
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 anyhow.workspace = true
 bytes = "1"

@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::arithmetic_side_effects)] // simulation support
 //! Failure injection at points production code already knows can fail.
 //!
 //! The recovery code beside a fallible call is usually the least tested code in a system: it runs

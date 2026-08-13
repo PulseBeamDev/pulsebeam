@@ -4,6 +4,7 @@
 //! same function just constructed, so the other arms cannot be reached, and
 //! each has to produce a differently-typed `SendError` — there is no single
 //! fallback value to return instead. Scoped here rather than workspace-wide.
+#![allow(clippy::unreachable)]
 
 use crate::RtpPacket;
 use crate::agent::mailbox;

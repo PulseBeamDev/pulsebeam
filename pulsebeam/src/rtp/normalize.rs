@@ -8,9 +8,6 @@
 //! Normalizing is the **only** stage allowed to mutate a packet. Measurement
 //! reads the result and never writes to it, so the two can run on different
 //! nodes without either duplicating the other's work.
-//! Shared-state exception, imposed by str0m: the parsed descriptor goes
-//! back into an extension map that stores `Arc<dyn Any>`. Core-local; see
-//! `rtp` for the full note.
 
 use str0m::media::{Mid, Rid};
 use str0m::rtp::vla::VideoLayersAllocation;
@@ -80,6 +77,10 @@ impl StreamNormalizer {
         }
     }
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "parsed descriptor is anchored in an Arc<dyn Any> extension map entry, core-local; see rtp::mod"
+    )]
     fn read_dependency_descriptor(&mut self, pkt: &mut RtpPacket) -> Option<u8> {
         let raw = pkt.ext_vals.user_values.get::<RawDependencyDescriptor>()?;
         match self.dd.read(&raw.0) {

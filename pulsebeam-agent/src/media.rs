@@ -92,7 +92,14 @@ pub(crate) fn saturating_u64_from_f64(v: f64) -> u64 {
     if !v.is_finite() || v <= 0.0 {
         return 0;
     }
-    v.min(u64::MAX as f64) as u64
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to a positive, finite value below u64::MAX above"
+    )]
+    {
+        v.min(u64::MAX as f64) as u64
+    }
 }
 
 /// Rewrite every Annex-B NAL unit type to a non-IDR coded slice (type 1),
