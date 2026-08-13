@@ -11,7 +11,7 @@ use slotmap::SlotMap;
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::TrackId;
 use crate::id::ShardId;
-use crate::route::{RemoteRoute, RouteTable};
+use crate::route::{RemoteRoute, ReverseRoute, RouteTable};
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::Topic;
 
@@ -121,6 +121,13 @@ impl DataStreamRoute {
     }
 }
 
+/// Where to send keyframe requests for a track published on another shard, and
+/// the encoding order needed to name one of its layers.
+pub(crate) struct TrackReverseTarget {
+    pub route: ReverseRoute,
+    pub encodings: Vec<Option<str0m::media::Rid>>,
+}
+
 pub(crate) struct TrackRoute {
     /// The track this fanout serves. Carried for the downstream slot match and
     /// for logs — never hashed to find this object, which is the whole point of
@@ -143,7 +150,22 @@ pub(crate) struct TrackRoute {
     /// reverse path. A reverse frame names one by index instead of carrying a
     /// rid, so resolving it needs the same order both ends used.
     pub encodings: Vec<Option<str0m::media::Rid>>,
-    pub cache: TrackStreamCache,
+    /// Whole packets for replay to a new subscriber — a 512-slot ring per
+    /// encoding, hundreds of kilobytes once populated. Dropped as soon as
+    /// nothing consumes it, independent of whether the track stays published,
+    /// so a departed audience does not keep paying for it.
+    pub cache: Option<TrackStreamCache>,
+    /// Whether this shard currently hosts the track's publisher. Distinct
+    /// from having subscribers: a published track with none right now must
+    /// still not be collected, or a late subscriber finds nothing here.
+    pub published: bool,
+    /// This shard's own reverse route for the track, opened alongside
+    /// `published` and retired with it.
+    pub reverse_route: Option<ReverseRoute>,
+    /// Where *this* shard sends its own reverse traffic when it is a
+    /// destination for a track published elsewhere — learned from the
+    /// publish announcement or the late-join replay, whichever comes first.
+    pub reverse_target: Option<TrackReverseTarget>,
 }
 
 impl TrackRoute {
@@ -166,8 +188,21 @@ impl TrackRoute {
             layer_states: Vec::new(),
             remote_routes: Vec::new(),
             encodings: Vec::new(),
-            cache: TrackStreamCache::new(),
+            cache: None,
+            published: false,
+            reverse_route: None,
+            reverse_target: None,
         }
+    }
+
+    /// Nothing left that needs this entry: not published here, nobody local
+    /// subscribes, no destination shard has a route, and no other shard is
+    /// known to be waiting on a reverse target from it.
+    pub fn is_unused(&self) -> bool {
+        !self.published
+            && self.subscribers.is_empty()
+            && self.remote_routes.is_empty()
+            && self.reverse_target.is_none()
     }
 }
 
@@ -301,6 +336,12 @@ pub(crate) struct ReliableStream {
     /// Acknowledged destination handles, one per subscribing shard. Small and
     /// scanned linearly rather than indexed by `ShardId` — same trade `TrackRoute::remote_routes` already makes.
     pub remote_routes: Vec<RemoteRoute>,
+    /// This shard's own reverse route for the topic, opened alongside
+    /// `published` and retired with it.
+    pub reverse_route: Option<ReverseRoute>,
+    /// Where this shard sends acks when it is a destination for a topic
+    /// published elsewhere — learned from the publish announcement.
+    pub reverse_target: Option<ReverseRoute>,
 }
 
 impl ReliableStream {
@@ -311,11 +352,16 @@ impl ReliableStream {
             published: false,
             imported: false,
             remote_routes: Vec::new(),
+            reverse_route: None,
+            reverse_target: None,
         }
     }
 
     pub fn is_unused(&self) -> bool {
-        !self.published && !self.imported && self.remote_routes.is_empty()
+        !self.published
+            && !self.imported
+            && self.remote_routes.is_empty()
+            && self.reverse_target.is_none()
     }
 }
 

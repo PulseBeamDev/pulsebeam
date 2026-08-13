@@ -4,11 +4,9 @@
 
 use ahash::{HashMap, HashMapExt};
 
-use str0m::media::Rid;
-
 use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::id::ShardId;
-use crate::route::{ImportTable, ReverseRoute};
+use crate::route::ImportTable;
 use crate::track::Topic;
 
 use super::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
@@ -32,13 +30,6 @@ impl DataStreamId {
             topic,
         }
     }
-}
-
-/// Where to send keyframe requests for a track published on another shard, and
-/// the encoding order needed to name one of its layers.
-pub(crate) struct TrackReverseTarget {
-    pub route: ReverseRoute,
-    pub encodings: Vec<Option<Rid>>,
 }
 
 pub(crate) struct ControlPlane {
@@ -65,24 +56,6 @@ pub(crate) struct ControlPlane {
     /// both the realtime and reliable lanes and needs its own route.
     pub reliable_imports: ImportTable<DataStreamId>,
     pub participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
-    /// Reverse routes this shard opened for the streams it publishes, so they
-    /// can be retired when those streams go away.
-    pub track_reverse_routes: HashMap<TrackId, ReverseRoute>,
-    pub topic_reverse_routes: HashMap<DataStreamId, ReverseRoute>,
-    /// Handles for reverse routes *other* shards opened, learned from publisher
-    /// announcements — the addresses this shard sends acks to.
-    pub topic_reverse_targets: HashMap<DataStreamId, ReverseRoute>,
-    /// The same for tracks: where this shard addresses keyframe requests.
-    ///
-    /// Keyed by track rather than kept in the fanout entry, because it
-    /// describes the track and not this shard's subscribers to it. The two have
-    /// different lifetimes, and both differences lost the handle: a fanout is
-    /// released once its last subscriber leaves, and a shard that gains its
-    /// first room member *after* a track was published never runs
-    /// `publish_track` for that track at all — so a descriptor kept there was
-    /// missing in exactly the case a late subscriber needs it, and its keyframe
-    /// requests went nowhere for the life of the track.
-    pub track_reverse_targets: HashMap<TrackId, TrackReverseTarget>,
 }
 
 impl ControlPlane {
@@ -96,10 +69,6 @@ impl ControlPlane {
             data_imports: ImportTable::new(),
             reliable_imports: ImportTable::new(),
             participant_shards: HashMap::new(),
-            track_reverse_routes: HashMap::new(),
-            topic_reverse_routes: HashMap::new(),
-            topic_reverse_targets: HashMap::new(),
-            track_reverse_targets: HashMap::new(),
         }
     }
 }

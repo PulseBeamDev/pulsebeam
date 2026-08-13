@@ -4,10 +4,12 @@ use indexmap::IndexSet;
 use pulsebeam_runtime::rand;
 use str0m::media::{KeyframeRequestKind, Rid};
 
-use super::control::{ControlPlane, DataStreamId, ParticipantShardMeta, TrackReverseTarget};
+use super::control::{ControlPlane, DataStreamId, ParticipantShardMeta};
 use super::events::{AudioRtpEvent, ParticipantControlEvent};
 use super::participants::ParticipantKey;
-use super::plan::{DataPlane, DataStreamRoute, ReliableStream, RoomFanout, TrackRoute};
+use super::plan::{
+    DataPlane, DataStreamRoute, ReliableStream, RoomFanout, TrackReverseTarget, TrackRoute,
+};
 use slotmap::new_key_type;
 
 use crate::clock::WallAnchor;
@@ -229,21 +231,28 @@ impl ShardRoutingTable {
         self.data.tracks.get(key).map(|route| route.origin)
     }
 
-    /// Release a track's fanout once nothing consumes it.
+    /// Drop a track's packet cache once nothing local or remote consumes it,
+    /// and release the whole fanout entry once nothing needs it at all.
     ///
-    /// Worth doing rather than leaving to the map: a `TrackRoute` owns a
-    /// `TrackStreamCache`, which is a 512-slot ring per encoding holding whole
-    /// packets. A track that has ended pins that until the shard does, so
-    /// leaving them behind is hundreds of kilobytes per departed publisher.
+    /// The two are different thresholds on purpose: a `TrackStreamCache` is a
+    /// 512-slot ring per encoding holding whole packets, real memory that a
+    /// departed audience should stop costing immediately — but the ~64-byte
+    /// descriptor around it (track id, publisher, reverse target) has to
+    /// survive as long as the track is *published* or *addressed*, even with
+    /// zero subscribers right now, or a late subscriber and a keyframe
+    /// request both find nothing here.
     fn release_fanout_if_idle(&mut self, track_id: &TrackId) {
         let Some(&key) = self.control.track_keys.get(track_id) else {
             return;
         };
-        let Some(route) = self.data.tracks.get(key) else {
+        let Some(route) = self.data.tracks.get_mut(key) else {
             self.control.track_keys.remove(track_id);
             return;
         };
         if route.subscribers.is_empty() && route.remote_routes.is_empty() {
+            route.cache = None;
+        }
+        if route.is_unused() {
             self.data.tracks.remove(key);
             self.control.track_keys.remove(track_id);
         }
@@ -610,9 +619,11 @@ impl ShardRoutingTable {
             now,
             wall,
         )?;
-        self.control
-            .track_reverse_routes
-            .insert(track.meta.id, handle);
+        let Some(entry) = self.data.tracks.get_mut(key) else {
+            pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+        };
+        entry.published = true;
+        entry.reverse_route = Some(handle);
         Some(handle)
     }
 
@@ -630,7 +641,7 @@ impl ShardRoutingTable {
         // Minted before the route install, alongside the reverse route it
         // will point at: `RouteAction::Reverse` never resolves to a key this
         // shard hasn't already registered.
-        let stream = self.reliable_stream_key_or_insert(room_id, key.clone());
+        let stream = self.reliable_stream_key_or_insert(room_id, key);
         let handle = self.open_reverse_route(
             ReverseTarget::Topic { stream },
             RouteNames {
@@ -642,7 +653,9 @@ impl ShardRoutingTable {
             now,
             wall,
         )?;
-        self.control.topic_reverse_routes.insert(key, handle);
+        if let Some(entry) = self.data.reliable_streams.get_mut(stream) {
+            entry.reverse_route = Some(handle);
+        }
         Some(handle)
     }
 
@@ -664,9 +677,17 @@ impl ShardRoutingTable {
 
     /// Close a track's reverse path when its publisher goes away.
     pub fn close_track_reverse_route(&mut self, track_id: &TrackId, now: Instant) {
-        if let Some(handle) = self.control.track_reverse_routes.remove(track_id) {
+        let Some(&key) = self.control.track_keys.get(track_id) else {
+            return;
+        };
+        let Some(entry) = self.data.tracks.get_mut(key) else {
+            return;
+        };
+        entry.published = false;
+        if let Some(handle) = entry.reverse_route.take() {
             self.data.routes.retire(handle.route, handle.epoch, now);
         }
+        self.release_fanout_if_idle(track_id);
     }
 
     pub fn close_topic_reverse_route(
@@ -676,7 +697,10 @@ impl ShardRoutingTable {
         now: Instant,
     ) {
         let key = DataStreamId::new(publisher, topic.clone());
-        if let Some(handle) = self.control.topic_reverse_routes.remove(&key) {
+        let Some(entry) = self.reliable_stream_mut(&key) else {
+            return;
+        };
+        if let Some(handle) = entry.reverse_route.take() {
             self.data.routes.retire(handle.route, handle.epoch, now);
         }
     }
@@ -688,10 +712,8 @@ impl ShardRoutingTable {
         publisher: ParticipantId,
         topic: &Topic,
     ) -> Option<ReverseRoute> {
-        self.control
-            .topic_reverse_routes
-            .get(&DataStreamId::new(publisher, topic.clone()))
-            .copied()
+        let key = self.reliable_stream_key(&DataStreamId::new(publisher, topic.clone()))?;
+        self.reliable_stream(key)?.reverse_route
     }
 
     /// Learn where to send acks for a topic another shard publishes.
@@ -702,14 +724,11 @@ impl ShardRoutingTable {
         reverse: Option<ReverseRoute>,
     ) {
         let key = DataStreamId::new(publisher, topic.clone());
-        match reverse {
-            Some(handle) => {
-                self.control.topic_reverse_targets.insert(key, handle);
-            }
-            None => {
-                self.control.topic_reverse_targets.remove(&key);
-            }
-        }
+        let Some(entry) = self.reliable_stream_mut(&key) else {
+            debug_assert!(false, "learning a reverse target for an unknown stream");
+            return;
+        };
+        entry.reverse_target = reverse;
     }
 
     /// Resolve an arriving feedback frame to the publisher it is aimed at.
@@ -754,7 +773,8 @@ impl ShardRoutingTable {
         track_id: &TrackId,
         rid: Option<Rid>,
     ) -> Option<(ReverseRoute, u8)> {
-        let target = self.control.track_reverse_targets.get(track_id)?;
+        let key = self.fanout_of(track_id)?;
+        let target = self.data.tracks.get(key)?.reverse_target.as_ref()?;
         let layer = target.encodings.iter().position(|r| *r == rid)?;
         Some((target.route, u8::try_from(layer).ok()?))
     }
@@ -1512,13 +1532,17 @@ impl ShardRoutingTable {
             // in-process and never addressed.
             return;
         };
-        self.control.track_reverse_targets.insert(
-            track.meta.id,
-            TrackReverseTarget {
-                route,
-                encodings: track.layers.iter().map(|l| l.rid).collect(),
-            },
-        );
+        // Minted here rather than assumed to exist: this is also the
+        // late-join path, which never runs `publish_track` and so would
+        // otherwise have nowhere to record the target at all.
+        let key = self.fanout_key(track.meta.id, track.meta.origin);
+        let Some(entry) = self.data.tracks.get_mut(key) else {
+            pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+        };
+        entry.reverse_target = Some(TrackReverseTarget {
+            route,
+            encodings: track.layers.iter().map(|l| l.rid).collect(),
+        });
     }
 
     /// Install a destination route for a concrete data stream. Returns the
@@ -1831,7 +1855,11 @@ impl ShardRoutingTable {
         }
         for &track_id in track_ids {
             self.retire_audio_route(room_id, track_id, now);
-            self.control.track_reverse_targets.remove(&track_id);
+            if let Some(key) = self.fanout_of(&track_id)
+                && let Some(entry) = self.data.tracks.get_mut(key)
+            {
+                entry.reverse_target = None;
+            }
             self.release_fanout_if_idle(&track_id);
         }
         let Some(room) = self.room(&room_id) else {
@@ -1871,19 +1899,23 @@ impl ShardRoutingTable {
         // Hand the packet to the cache and read it back rather than cloning it
         // in: the cache stores every packet anyway, so a clone here is a second
         // copy of the same bytes — and an `RtpPacket` clone heap-allocates,
-        // because str0m's `ExtensionValues` carries a type-keyed map.
+        // because str0m's `ExtensionValues` carries a type-keyed map. Created
+        // lazily here rather than at `TrackRoute::new`, matching the fact that
+        // it is also dropped as soon as nothing consumes it.
         let (rid, seq) = (pkt.ext_vals.rid, pkt.seq_no);
-        let too_old = route.cache.push(pkt);
+        let cache = route.cache.get_or_insert_with(TrackStreamCache::new);
+        let too_old = cache.push(pkt);
+        let cache: &TrackStreamCache = cache;
         let Some(pkt) = too_old
             .as_ref()
-            .or_else(|| route.cache.encoding(rid).and_then(|c| c.get(seq)))
+            .or_else(|| cache.encoding(rid).and_then(|c| c.get(seq)))
         else {
             debug_assert!(false, "a stored packet must be readable back");
             return;
         };
 
         for &subscriber in &route.subscribers {
-            ctx.forward_video_rtp(subscriber, track_id, pkt, Some(&route.cache));
+            ctx.forward_video_rtp(subscriber, track_id, pkt, Some(cache));
         }
         let playout = ctx.wall().to_ntp(pkt.playout_time);
         let transit: Vec<(ShardId, MediaEnvelope)> = route
@@ -2144,7 +2176,11 @@ impl ShardRoutingTable {
             return;
         }
         let key = DataStreamId::new(publisher, topic.clone());
-        let Some(target) = self.control.topic_reverse_targets.get(&key) else {
+        let target = self
+            .reliable_stream_key(&key)
+            .and_then(|stream| self.reliable_stream(stream))
+            .and_then(|entry| entry.reverse_target);
+        let Some(target) = target else {
             // The handle arrives with the publisher announcement, so a
             // subscription cannot predate it.
             debug_assert!(false, "no reverse route for a remote reliable publisher");
@@ -2155,7 +2191,7 @@ impl ShardRoutingTable {
         ctx.send_frame(
             target.route.shard(),
             ShardFrame::Reverse {
-                env: RouteEnvelope::new(*target),
+                env: RouteEnvelope::new(target),
                 body: Reverse::DataAck(bytes.to_vec()),
             },
         );
@@ -2895,6 +2931,70 @@ mod tests {
         assert!(
             table.fanout_of(&track.id).is_none(),
             "the name index must be released with it"
+        );
+    }
+
+    /// A published track's descriptor must outlive its last local subscriber
+    /// — losing all consumers is not the same as being unpublished, and a
+    /// late subscriber or a keyframe request both need the entry to still be
+    /// there. Only the packet cache, which is real memory, is released early.
+    #[test]
+    fn a_published_track_keeps_its_descriptor_but_drops_its_cache_when_idle() {
+        let mut table = ShardRoutingTable::new(ShardId::new(0));
+        let mut rng = rand::seeded_rng(54);
+        let room = room_id("publish-survives-idle");
+        let publisher = pid();
+        let track_meta = TrackMeta {
+            shard_id: ShardId::new(0),
+            id: publisher.derive_track_id(TrackKind::Video, "v"),
+            origin: publisher,
+        };
+        let track = video_track_with(&track_meta);
+
+        assert!(
+            table
+                .open_track_reverse_route(&track, now(), &wall())
+                .is_some(),
+            "publishing opens the reverse route"
+        );
+        let fanout_key = table
+            .fanout_of(&track_meta.id)
+            .expect("publishing creates the fanout entry");
+
+        let handle = new_participant_key();
+        table.add_local_member(handle, room, &mut rng);
+        table.register_subscriber(handle, track_meta.clone(), now(), &wall());
+        table.route_video(
+            fanout_key,
+            RtpPacket::default(),
+            &mut RecordingCtx::default(),
+        );
+        assert!(
+            table.data.tracks[fanout_key].cache.is_some(),
+            "a delivered packet must populate the cache"
+        );
+
+        table.unregister_subscriber(handle, track_meta.clone(), now());
+        assert_eq!(
+            table.data.tracks.len(),
+            1,
+            "a published track with zero subscribers must not be collected"
+        );
+        assert!(
+            table.data.tracks[fanout_key].cache.is_none(),
+            "losing every subscriber must still free the packet cache"
+        );
+        assert!(
+            table.fanout_of(&track_meta.id).is_some(),
+            "the name index must still resolve while the track is published"
+        );
+
+        table.close_track_reverse_route(&track_meta.id, now());
+        table.unpublish_local_track(&track_meta.id);
+        assert_eq!(
+            table.data.tracks.len(),
+            0,
+            "unpublishing an idle track must release its descriptor too"
         );
     }
 
