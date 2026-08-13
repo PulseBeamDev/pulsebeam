@@ -53,7 +53,29 @@ const FLAGS_RESERVED: u8 = !FLAG_LANE;
 /// recycled slot; this is the second line of defence, and what makes the
 /// "a slot cannot complete 65,536 generations within one stale-datagram
 /// lifetime" invariant trivially true.
-pub const ROUTE_QUARANTINE: Duration = Duration::from_secs(60);
+///
+/// 2 seconds, not the 60 a first-cut number lands on: at 60s, slot
+/// consumption under a reconnect storm is `concurrent + installs/sec × 60`,
+/// so the quarantine — not the traffic — is what would exhaust a
+/// preallocated table. 2s still gives an epoch 1,092× the margin a 2-minute
+/// MSL needs (below), which is three orders of magnitude nobody asked for
+/// while costing far less of the working set.
+pub const ROUTE_QUARANTINE: Duration = Duration::from_secs(2);
+
+/// A delayed duplicate cannot outlive a TCP-style maximum segment lifetime;
+/// this is that bound, and what the const assertion below checks the
+/// quarantine against.
+const ASSUMED_MAX_SEGMENT_LIFETIME_SECS: u64 = 120;
+
+/// Ties [`ROUTE_QUARANTINE`] to the epoch's 16-bit width so tuning one can't
+/// silently break the safety margin the other depends on: a slot must
+/// complete `u16::MAX` recycles before quarantine could let a stale
+/// datagram land on the incarnation that replaced it, and this asserts that
+/// takes orders of magnitude longer than any datagram could stay in flight.
+const _: () = assert!(
+    ROUTE_QUARANTINE.as_secs() * (u16::MAX as u64)
+        >= ASSUMED_MAX_SEGMENT_LIFETIME_SECS.saturating_mul(500)
+);
 
 /// `shard(12) | slot(20)`, so a packet landing on the wrong shard — which
 /// happens on every node, because `SO_REUSEPORT` picks the shard by 5-tuple
@@ -518,6 +540,14 @@ enum Slot {
     Live(Box<RouteEntry>),
 }
 
+// `Free` carries nothing and `Live` is a `Box`, whose pointer is never null —
+// so the niche optimization makes this enum exactly the size of the pointer,
+// not the pointer plus a discriminant. That is what makes a working set of
+// slots cheap enough to preallocate; if this ever regresses (a new variant, a
+// wrapper type without the niche), preallocation silently gets `1 << 14`
+// times more expensive, so it is checked here rather than trusted.
+const _: () = assert!(size_of::<Slot>() == size_of::<usize>());
+
 /// Destination-owned table of installed routes.
 ///
 /// # Id budget
@@ -540,9 +570,10 @@ enum Slot {
 /// per-link accounting, so a per-sender route would buy nothing and would cost
 /// 32x on a 32-shard node.
 ///
-/// [`MAX_ROUTES_PER_SHARD`] enforces that reasoning rather than leaving it as
-/// prose: the families above are all bounded, so passing the cap means one of
-/// them is not behaving as described, and failing the install says so while
+/// There is no policy cap here — the families above are all bounded, so
+/// exhaustion means the address space itself ran out: [`RouteId`]'s slot
+/// field is 20 bits, `1 << ROUTE_SLOT_BITS` routes, full stop. Nothing to
+/// tune, and failing the install at that limit says what happened while
 /// there is still a process to say it in.
 #[derive(Debug)]
 pub(crate) struct RouteTable {
@@ -554,15 +585,11 @@ pub(crate) struct RouteTable {
     max_slots: u32,
 }
 
-/// Ceiling on slots one shard's table may grow to.
-///
-/// Sized for headroom, not for fit: every route family is proportional to
-/// participants on this shard, so a healthy shard uses orders of magnitude
-/// fewer. It exists to convert unbounded growth — a reconnect storm churning
-/// routes faster than [`ROUTE_QUARANTINE`] returns them — into a bounded
-/// failure that names itself, instead of an allocator death spiral 4 billion
-/// slots later.
-pub const MAX_ROUTES_PER_SHARD: u32 = 1 << 20;
+/// Working set preallocated up front so steady-state operation never
+/// allocates. A guess, not a bound — [`RouteTable::allocate`] grows past it
+/// with a `tracing::warn!` naming the shard and the new size, and only fails
+/// at the address space's own limit (`1 << ROUTE_SLOT_BITS`).
+const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
@@ -576,14 +603,17 @@ pub(crate) enum RouteError {
 
 impl RouteTable {
     pub fn new(shard_id: ShardId) -> Self {
-        Self::with_max_slots(shard_id, MAX_ROUTES_PER_SHARD)
+        Self::with_max_slots(shard_id, ROUTE_SLOT_MASK.saturating_add(1))
     }
 
     pub fn with_max_slots(shard_id: ShardId, max_slots: u32) -> Self {
+        let prealloc = usize::try_from(max_slots)
+            .unwrap_or(usize::MAX)
+            .min(ROUTE_TABLE_PREALLOCATED_SLOTS);
         Self {
             shard_id,
-            slots: Vec::new(),
-            epochs: Vec::new(),
+            slots: Vec::with_capacity(prealloc),
+            epochs: Vec::with_capacity(prealloc),
             quarantine: VecDeque::new(),
             max_slots,
         }
@@ -712,6 +742,14 @@ impl RouteTable {
             return Err(RouteError::Exhausted {
                 max_slots: self.max_slots,
             });
+        }
+        if self.slots.len() == self.slots.capacity() {
+            let new_capacity = self.slots.capacity().saturating_mul(2).max(1);
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                new_capacity,
+                "route table working set exceeded, growing"
+            );
         }
         self.slots.push(Slot::Free);
         self.epochs.push(0);
