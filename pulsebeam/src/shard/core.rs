@@ -7,6 +7,7 @@ use crate::route::{MediaEnvelope, RemoteRoute, RouteAction, RouteEnvelope};
 
 use super::events::{
     AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
+    ParticipantTopologyEvent,
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
@@ -328,7 +329,7 @@ impl ShardCore {
                     wall: &self.wall,
                 };
                 self.routing
-                    .route_audio(room, track, Origin::Remote, ev, &mut ctx);
+                    .route_audio(room, track, Origin::Remote, None, ev, &mut ctx);
             }
             (RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let mut ctx = DispatchCtx {
@@ -424,8 +425,9 @@ impl ShardCore {
             let Some(track) = self.routing.fanout_of(&ev.stream_id.0) else {
                 continue;
             };
+            let origin_key = ctx.registry.key_of(&ev.origin);
             self.routing
-                .route_audio(room, track, Origin::Local, ev, &mut ctx);
+                .route_audio(room, track, Origin::Local, origin_key, ev, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
@@ -460,9 +462,20 @@ impl ShardCore {
         while let Some(event) = self.pipeline.pop_participant_event() {
             match event {
                 ParticipantEvent::Topology(ev) => {
-                    if let Some(shard_event) =
-                        self.routing.handle_topology_event(ev, now, &self.wall)
-                    {
+                    let shard_event = match ev {
+                        ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
+                            self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing
+                                    .register_subscriber(handle, track, now, &self.wall)
+                            })
+                        }
+                        ParticipantTopologyEvent::TrackUnsubscribed { track, subscriber } => {
+                            self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing.unregister_subscriber(handle, track, now)
+                            })
+                        }
+                    };
+                    if let Some(shard_event) = shard_event {
                         self.pipeline.push_shard_event(shard_event);
                     }
                 }
@@ -504,14 +517,16 @@ impl ShardCore {
                             topic,
                             publisher,
                         } => {
-                            if let Some(ev) = self.routing.register_data_subscriber(
-                                room_id,
-                                subscriber,
-                                topic.clone(),
-                                publisher,
-                                now,
-                                &self.wall,
-                            ) {
+                            if let Some(ev) = self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing.register_data_subscriber(
+                                    room_id,
+                                    handle,
+                                    topic.clone(),
+                                    publisher,
+                                    now,
+                                    &self.wall,
+                                )
+                            }) {
                                 self.pipeline.push_shard_event(ev);
                             }
                         }
@@ -521,9 +536,13 @@ impl ShardCore {
                             topic,
                             publisher,
                         } => {
-                            if self.routing.unregister_data_subscriber(
-                                room_id, subscriber, &topic, publisher, now,
-                            ) {
+                            let unsubscribed =
+                                self.registry.key_of(&subscriber).is_some_and(|handle| {
+                                    self.routing.unregister_data_subscriber(
+                                        room_id, handle, &topic, publisher, now,
+                                    )
+                                });
+                            if unsubscribed {
                                 self.pipeline.push_shard_event(ShardEvent::Relay(
                                     Topology::DataTopicUnsubscribed {
                                         room_id,
@@ -568,10 +587,10 @@ impl ShardCore {
                             subscriber,
                             topic,
                         } => {
-                            if let Some(ev) = self
-                                .routing
-                                .register_reliable_data_subscriber(room_id, subscriber, topic)
-                            {
+                            if let Some(ev) = self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing
+                                    .register_reliable_data_subscriber(room_id, handle, topic)
+                            }) {
                                 self.pipeline.push_shard_event(ev);
                             }
                         }
@@ -580,9 +599,13 @@ impl ShardCore {
                             subscriber,
                             topic,
                         } => {
-                            if self.routing.unregister_reliable_data_subscriber(
-                                room_id, subscriber, &topic, now,
-                            ) {
+                            let unsubscribed =
+                                self.registry.key_of(&subscriber).is_some_and(|handle| {
+                                    self.routing.unregister_reliable_data_subscriber(
+                                        room_id, handle, &topic, now,
+                                    )
+                                });
+                            if unsubscribed {
                                 self.pipeline.push_shard_event(ShardEvent::Relay(
                                     Topology::ReliableTopicUnsubscribed { room_id, topic },
                                 ));
@@ -812,6 +835,7 @@ impl ShardCore {
                 self.registry.unregister_remote_demux(participant_id);
             }
             ShardCommand::PublishTrack(track, room_id) => {
+                let publisher_key = self.registry.key_of(&track.meta.origin);
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
@@ -820,10 +844,14 @@ impl ShardCore {
                 };
                 // An audio track published elsewhere makes this shard a
                 // destination, so it installs a route and hands back the handle.
-                if let Some(ev) = self
-                    .routing
-                    .publish_track(track, room_id, now, &self.wall, &mut ctx)
-                {
+                if let Some(ev) = self.routing.publish_track(
+                    track,
+                    room_id,
+                    publisher_key,
+                    now,
+                    &self.wall,
+                    &mut ctx,
+                ) {
                     self.pipeline.push_shard_event(ev);
                 }
             }
@@ -1113,8 +1141,7 @@ impl ShardCore {
         let _ = router; // reserved: re-add currently needs no cross-shard notice
         let known_tracks = cfg.available_tracks.clone();
         let key = self.registry.insert(cfg, &mut self.rng);
-        self.routing
-            .add_local_member(participant_id, key, room_id, &mut self.rng);
+        self.routing.add_local_member(key, room_id, &mut self.rng);
         let Some(participant) = self.registry.get_mut(&participant_id) else {
             pulsebeam_runtime::fatal!(
                 "registry accepted participant {participant_id} but cannot resolve it"
@@ -1138,13 +1165,12 @@ impl ShardCore {
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId, now: Instant) -> Option<()> {
-        if let Some(key) = self.registry.key_of(participant_id) {
-            self.timers.cancel(key);
-        }
+        let key = self.registry.key_of(participant_id)?;
+        self.timers.cancel(key);
         let meta = self.registry.remove(participant_id)?;
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
-            .remove_local_member(participant_id, meta.room_id, audio_ids, now);
+            .remove_local_member(participant_id, key, meta.room_id, audio_ids, now);
         Some(())
     }
 }
@@ -1509,10 +1535,11 @@ mod test {
                 .contains(core.registry.key_of(&subscriber).unwrap())
         );
         clear_dirty(&mut core);
+        let subscriber_key = core.registry.key_of(&subscriber).unwrap();
         let subscribed = core
             .routing
             .register_subscriber(
-                subscriber,
+                subscriber_key,
                 video_track(publisher, 1),
                 tokio::time::Instant::now(),
                 &WallAnchor::new(std::time::SystemTime::now(), Instant::now()),

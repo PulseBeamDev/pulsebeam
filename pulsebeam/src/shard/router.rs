@@ -5,7 +5,7 @@ use pulsebeam_runtime::rand;
 use str0m::media::{KeyframeRequestKind, Rid};
 
 use super::control::{ControlPlane, DataStreamId, ParticipantShardMeta, TrackReverseTarget};
-use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
+use super::events::{AudioRtpEvent, ParticipantControlEvent};
 use super::participants::ParticipantKey;
 use super::plan::{DataPlane, DataStreamRoute, ReliableStream, RoomFanout, TrackRoute};
 use slotmap::new_key_type;
@@ -478,16 +478,10 @@ impl ShardRoutingTable {
 
     pub fn add_local_member(
         &mut self,
-        participant_id: ParticipantId,
         handle: ParticipantKey,
         room_id: RoomId,
         rng: &mut impl rand::RngCore,
     ) {
-        let previous = self
-            .control
-            .local_participants
-            .insert(participant_id, handle);
-        debug_assert!(previous.is_none(), "duplicate local participant route");
         self.room_or_insert(room_id, rng)
             .members
             .insert_unique(handle);
@@ -499,16 +493,11 @@ impl ShardRoutingTable {
     pub fn remove_local_member(
         &mut self,
         participant_id: &ParticipantId,
+        removed_handle: ParticipantKey,
         room_id: RoomId,
         audio_track_ids: impl IntoIterator<Item = TrackId>,
         now: Instant,
     ) {
-        let removed_handle = self.control.local_participants.remove(participant_id);
-        debug_assert!(removed_handle.is_some());
-        let Some(removed_handle) = removed_handle else {
-            return;
-        };
-
         let stream_keys = self.room_data_stream_keys(&room_id);
         for &key in &stream_keys {
             let Some(route) = self.data.data_streams.get_mut(key) else {
@@ -936,12 +925,11 @@ impl ShardRoutingTable {
     /// publisher shard to start forwarding.
     pub fn register_subscriber(
         &mut self,
-        subscriber: ParticipantId,
+        handle: ParticipantKey,
         track: TrackMeta,
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ShardEvent> {
-        let handle = *self.control.local_participants.get(&subscriber)?;
         // Resolve the publisher's handles from the node rather than waiting for
         // them to be sent: they are ready before any subscribe can happen, so
         // the fanout is never briefly live with no measurements behind it.
@@ -995,11 +983,10 @@ impl ShardRoutingTable {
     /// the caller can tell the publisher shard to stop forwarding.
     pub fn unregister_subscriber(
         &mut self,
-        subscriber: ParticipantId,
+        handle: ParticipantKey,
         track: TrackMeta,
         now: Instant,
     ) -> Option<ShardEvent> {
-        let handle = *self.control.local_participants.get(&subscriber)?;
         let entry = self
             .data
             .tracks
@@ -1032,22 +1019,6 @@ impl ShardRoutingTable {
             route,
             epoch,
         }))
-    }
-
-    pub fn handle_topology_event(
-        &mut self,
-        ev: ParticipantTopologyEvent,
-        now: Instant,
-        wall: &WallAnchor,
-    ) -> Option<ShardEvent> {
-        match ev {
-            ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
-                self.register_subscriber(subscriber, track, now, wall)
-            }
-            ParticipantTopologyEvent::TrackUnsubscribed { track, subscriber } => {
-                self.unregister_subscriber(subscriber, track, now)
-            }
-        }
     }
 
     pub fn register_data_publisher(
@@ -1102,13 +1073,12 @@ impl ShardRoutingTable {
     pub fn register_data_subscriber(
         &mut self,
         room_id: RoomId,
-        subscriber: ParticipantId,
+        handle: ParticipantKey,
         topic: Topic,
         publisher: Option<ParticipantId>,
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ShardEvent> {
-        let handle = self.control.local_participants.get(&subscriber).copied()?;
         self.room(&room_id)?;
         match publisher {
             Some(publisher) => {
@@ -1180,14 +1150,11 @@ impl ShardRoutingTable {
     pub fn unregister_data_subscriber(
         &mut self,
         room_id: RoomId,
-        subscriber: ParticipantId,
+        handle: ParticipantKey,
         topic: &Topic,
         publisher: Option<ParticipantId>,
         now: Instant,
     ) -> bool {
-        let Some(handle) = self.control.local_participants.get(&subscriber).copied() else {
-            return false;
-        };
         if self.room(&room_id).is_none() {
             return false;
         }
@@ -1444,6 +1411,9 @@ impl ShardRoutingTable {
         &mut self,
         track: Track,
         room_id: RoomId,
+        // The publisher's own key, if it is local to this shard — resolved
+        // once by the caller instead of hashed here.
+        publisher_key: Option<ParticipantKey>,
         now: Instant,
         wall: &WallAnchor,
         ctx: &mut impl RoutingContext,
@@ -1454,7 +1424,6 @@ impl ShardRoutingTable {
             return None;
         };
         self.adopt_track_reverse_target(&track);
-        let publisher_key = self.control.local_participants.get(&publisher).copied();
         let room = self.room(&room_id)?;
         let tracks = std::slice::from_ref(&track);
         let has_members = !room.members.is_empty();
@@ -1933,9 +1902,19 @@ impl ShardRoutingTable {
         room: RoomKey,
         track_key: LocalTrackKey,
         origin: Origin,
+        // The sender's own key, resolved once by the caller — not looked up
+        // here, so the room fan-out below can skip the sender by key instead
+        // of hashing `ev.origin` against every member's name on every
+        // packet. `None` whenever `origin` is remote, since a remote
+        // sender's key was never local to begin with.
+        origin_key: Option<ParticipantKey>,
         mut ev: AudioRtpEvent,
         ctx: &mut impl RoutingContext,
     ) {
+        debug_assert!(
+            origin.is_local() || origin_key.is_none(),
+            "a remote origin must never carry a local key"
+        );
         tracing::trace!(
             target: crate::log::TARGET_AUDIO,
             room = ?room,
@@ -1944,14 +1923,6 @@ impl ShardRoutingTable {
             seq_no = %ev.pkt.seq_no,
             "audio packet entered shard audio fanout"
         );
-
-        // One lookup for the whole packet, not one per subscriber: resolving
-        // the sender's own key is what lets the fan-out below skip them by
-        // key instead of hashing `ev.origin` against every member's name.
-        let origin_key = origin
-            .is_local()
-            .then(|| self.control.local_participants.get(&ev.origin).copied())
-            .flatten();
 
         // Split the borrow: the room owns the selector and members, while the
         // per-stream sender handles live in `tracks`.
@@ -2060,10 +2031,9 @@ impl ShardRoutingTable {
     pub fn register_reliable_data_subscriber(
         &mut self,
         room_id: RoomId,
-        subscriber: ParticipantId,
+        handle: ParticipantKey,
         topic: Topic,
     ) -> Option<ShardEvent> {
-        let handle = self.control.local_participants.get(&subscriber).copied()?;
         let room = self.room_mut(&room_id)?;
         let was_empty = room.reliable.subscribe_local(handle, topic.clone());
         // A reliable subscription names only a topic, so there is no stream to
@@ -2080,13 +2050,10 @@ impl ShardRoutingTable {
     pub fn unregister_reliable_data_subscriber(
         &mut self,
         room_id: RoomId,
-        subscriber: ParticipantId,
+        handle: ParticipantKey,
         topic: &Topic,
         now: Instant,
     ) -> bool {
-        let Some(handle) = self.control.local_participants.get(&subscriber).copied() else {
-            return false;
-        };
         let Some(room) = self.room_mut(&room_id) else {
             return false;
         };
@@ -2462,24 +2429,18 @@ mod tests {
         ))
     }
 
-    fn add_local_subscriber(table: &mut ShardRoutingTable, participant_id: ParticipantId) {
-        let handle = new_participant_key();
-        table
-            .control
-            .local_participants
-            .insert(participant_id, handle);
+    fn add_local_subscriber(
+        _table: &mut ShardRoutingTable,
+        _participant_id: ParticipantId,
+    ) -> ParticipantKey {
+        new_participant_key()
     }
 
     fn replace_local_subscriber(
-        table: &mut ShardRoutingTable,
-        participant_id: ParticipantId,
+        _table: &mut ShardRoutingTable,
+        _participant_id: ParticipantId,
     ) -> ParticipantKey {
-        let handle = new_participant_key();
-        table
-            .control
-            .local_participants
-            .insert(participant_id, handle);
-        handle
+        new_participant_key()
     }
 
     // -- the bug this refactor exists to prevent recurring ------------------
@@ -2554,16 +2515,16 @@ mod tests {
 
         let first = pid();
         let second = pid();
-        add_local_subscriber(&mut table, first);
-        add_local_subscriber(&mut table, second);
+        let first_key = add_local_subscriber(&mut table, first);
+        let second_key = add_local_subscriber(&mut table, second);
 
-        let ev = table.register_subscriber(first, track.clone(), now(), &wall());
+        let ev = table.register_subscriber(first_key, track.clone(), now(), &wall());
         assert!(
             matches!(ev, Some(ShardEvent::Relay(Topology::TrackSubscribed { track: t, .. })) if t == track),
             "the first subscriber installs a route and hands over the handle"
         );
 
-        let ev2 = table.register_subscriber(second, track, now(), &wall());
+        let ev2 = table.register_subscriber(second_key, track, now(), &wall());
         assert!(ev2.is_none(), "second subscriber must not re-notify");
     }
 
@@ -2587,23 +2548,23 @@ mod tests {
             id: pid().derive_track_id(TrackKind::Video, "v"),
             origin: pid(),
         };
-        add_local_subscriber(&mut table, subscriber);
+        let subscriber_key = add_local_subscriber(&mut table, subscriber);
         assert!(
             table
-                .register_subscriber(subscriber, track.clone(), now(), &wall())
+                .register_subscriber(subscriber_key, track.clone(), now(), &wall())
                 .is_some()
         );
 
         assert!(
             table
-                .unregister_subscriber(subscriber, track.clone(), now())
+                .unregister_subscriber(subscriber_key, track.clone(), now())
                 .is_some(),
             "the old connection must be torn down before the new one replaces it"
         );
         let replacement = replace_local_subscriber(&mut table, subscriber);
         assert!(
             table
-                .register_subscriber(subscriber, track.clone(), now(), &wall())
+                .register_subscriber(replacement, track.clone(), now(), &wall())
                 .is_some(),
             "the new connection is a fresh subscriber, not a churn no-op"
         );
@@ -2611,7 +2572,7 @@ mod tests {
         assert_eq!(fanout(&table, &track.id).subscribers, vec![replacement]);
         assert!(
             table
-                .unregister_subscriber(subscriber, track, now())
+                .unregister_subscriber(replacement, track, now())
                 .is_some()
         );
     }
@@ -2626,12 +2587,11 @@ mod tests {
         let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(13);
         let room = room_id("reliable-room");
-        let subscriber = pid();
         let handle = new_participant_key();
-        table.add_local_member(subscriber, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
         let topic = Topic::for_test("chat");
-        let ev = table.register_reliable_data_subscriber(room, subscriber, topic.clone());
+        let ev = table.register_reliable_data_subscriber(room, handle, topic.clone());
         assert!(
             matches!(
                 ev,
@@ -2660,7 +2620,7 @@ mod tests {
         );
         assert_eq!(table.data.routes.len(), 1);
 
-        assert!(table.unregister_reliable_data_subscriber(room, subscriber, &topic, now()));
+        assert!(table.unregister_reliable_data_subscriber(room, handle, &topic, now()));
         assert_eq!(
             table.data.routes.len(),
             0,
@@ -2688,14 +2648,14 @@ mod tests {
         for _ in 0..2 {
             let id = pid();
             let handle = slots.insert(());
-            table.add_local_member(id, handle, room, &mut rng);
+            table.add_local_member(handle, room, &mut rng);
             subscribers.push((id, handle));
         }
         let publisher = pid();
 
-        table.register_data_subscriber(room, subscribers[0].0, topic.clone(), None, now(), &wall());
+        table.register_data_subscriber(room, subscribers[0].1, topic.clone(), None, now(), &wall());
         table.on_remote_data_publisher(room, publisher, &topic, now(), &wall());
-        table.register_data_subscriber(room, subscribers[1].0, topic.clone(), None, now(), &wall());
+        table.register_data_subscriber(room, subscribers[1].1, topic.clone(), None, now(), &wall());
 
         let fanout = table
             .data_stream(&DataStreamId::new(publisher, topic.clone()))
@@ -2731,14 +2691,14 @@ mod tests {
         for _ in 0..2 {
             let id = pid();
             let handle = slots.insert(());
-            table.add_local_member(id, handle, room, &mut rng);
+            table.add_local_member(handle, room, &mut rng);
             subscribers.push((id, handle));
         }
 
         let publisher = pid();
-        table.register_reliable_data_subscriber(room, subscribers[0].0, topic.clone());
+        table.register_reliable_data_subscriber(room, subscribers[0].1, topic.clone());
         table.on_remote_reliable_publisher(room, publisher, &topic, now(), &wall());
-        table.register_reliable_data_subscriber(room, subscribers[1].0, topic.clone());
+        table.register_reliable_data_subscriber(room, subscribers[1].1, topic.clone());
 
         let stream = table
             .reliable_stream_key(&DataStreamId::new(publisher, topic.clone()))
@@ -2762,15 +2722,14 @@ mod tests {
         let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(11);
         let room = room_id("data-room");
-        let subscriber = pid();
         let handle = new_participant_key();
-        table.add_local_member(subscriber, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
         let publisher = pid();
         let topic = Topic::for_test("chat");
         let ev = table.register_data_subscriber(
             room,
-            subscriber,
+            handle,
             topic.clone(),
             Some(publisher),
             now(),
@@ -2788,12 +2747,11 @@ mod tests {
         );
         assert_eq!(table.data.routes.len(), 1);
 
-        let second = pid();
         let h2 = new_participant_key();
-        table.add_local_member(second, h2, room, &mut rng);
+        table.add_local_member(h2, room, &mut rng);
         assert!(
             table
-                .register_data_subscriber(room, second, topic, Some(publisher), now(), &wall())
+                .register_data_subscriber(room, h2, topic, Some(publisher), now(), &wall())
                 .is_none(),
             "local churn must not touch the cluster route"
         );
@@ -2815,9 +2773,8 @@ mod tests {
         table.data.routes = crate::route::RouteTable::with_max_slots(ShardId::new(0), 0);
         let mut rng = rand::seeded_rng(23);
         let room = room_id("data-room");
-        let subscriber = pid();
         let handle = new_participant_key();
-        table.add_local_member(subscriber, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
         let publisher = pid();
         let topic = Topic::for_test("chat");
@@ -2825,7 +2782,7 @@ mod tests {
             table
                 .register_data_subscriber(
                     room,
-                    subscriber,
+                    handle,
                     topic.clone(),
                     Some(publisher),
                     now(),
@@ -2837,19 +2794,11 @@ mod tests {
         assert_eq!(table.data.routes.len(), 0);
 
         table.data.routes = crate::route::RouteTable::new(ShardId::new(0));
-        let second = pid();
         let h2 = new_participant_key();
-        table.add_local_member(second, h2, room, &mut rng);
+        table.add_local_member(h2, room, &mut rng);
         assert!(
             matches!(
-                table.register_data_subscriber(
-                    room,
-                    second,
-                    topic,
-                    Some(publisher),
-                    now(),
-                    &wall()
-                ),
+                table.register_data_subscriber(room, h2, topic, Some(publisher), now(), &wall()),
                 Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     route: Some(_),
                     ..
@@ -2877,10 +2826,9 @@ mod tests {
             id: publisher.derive_track_id(TrackKind::Video, "v"),
             origin: publisher,
         };
-        let subscriber = pid();
         let handle = new_participant_key();
-        table.add_local_member(subscriber, handle, room, &mut rng);
-        table.register_subscriber(subscriber, track.clone(), now(), &wall());
+        table.add_local_member(handle, room, &mut rng);
+        table.register_subscriber(handle, track.clone(), now(), &wall());
 
         let fanout_key = table.fanout_of(&track.id).expect("subscribing creates it");
         assert!(
@@ -2932,14 +2880,13 @@ mod tests {
             id: publisher.derive_track_id(TrackKind::Video, "v"),
             origin: publisher,
         };
-        let subscriber = pid();
         let handle = new_participant_key();
-        table.add_local_member(subscriber, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
-        table.register_subscriber(subscriber, track.clone(), now(), &wall());
+        table.register_subscriber(handle, track.clone(), now(), &wall());
         assert_eq!(table.data.tracks.len(), 1, "subscribing creates the fanout");
 
-        table.unregister_subscriber(subscriber, track.clone(), now());
+        table.unregister_subscriber(handle, track.clone(), now());
         assert_eq!(
             table.data.tracks.len(),
             0,
@@ -2962,7 +2909,7 @@ mod tests {
         let publisher = pid();
         let topic = Topic::for_test("chat");
         let handle = new_participant_key();
-        table.add_local_member(publisher, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
         let target = table
             .register_reliable_data_publisher(room, publisher, topic.clone(), now(), &wall())
@@ -3178,23 +3125,22 @@ mod tests {
         let publisher = pid();
         let topic = Topic::for_test("chat");
 
-        let subscribe = |table: &mut ShardRoutingTable, who: ParticipantId, rng: &mut _| {
+        let subscribe = |table: &mut ShardRoutingTable, rng: &mut _| -> ParticipantKey {
             let handle = new_participant_key();
-            table.add_local_member(who, handle, room, rng);
+            table.add_local_member(handle, room, rng);
             table.register_data_subscriber(
                 room,
-                who,
+                handle,
                 topic.clone(),
                 Some(publisher),
                 now(),
                 &wall(),
-            )
+            );
+            handle
         };
 
-        let a = pid();
-        let b = pid();
-        subscribe(&mut table, a, &mut rng);
-        subscribe(&mut table, b, &mut rng);
+        let a = subscribe(&mut table, &mut rng);
+        let b = subscribe(&mut table, &mut rng);
         assert_eq!(
             table.data.routes.len(),
             1,
@@ -3216,8 +3162,7 @@ mod tests {
         );
 
         // And the slot must be usable again: resubscribing installs a new one.
-        let c = pid();
-        subscribe(&mut table, c, &mut rng);
+        subscribe(&mut table, &mut rng);
         assert_eq!(
             table.data.routes.len(),
             1,
@@ -3232,13 +3177,11 @@ mod tests {
         let mut table = ShardRoutingTable::new(ShardId::new(0));
         let mut rng = rand::seeded_rng(12);
         let room = room_id("data-wildcard");
-        let subscriber = pid();
         let handle = new_participant_key();
-        table.add_local_member(subscriber, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
         let topic = Topic::for_test("chat");
-        let ev =
-            table.register_data_subscriber(room, subscriber, topic.clone(), None, now(), &wall());
+        let ev = table.register_data_subscriber(room, handle, topic.clone(), None, now(), &wall());
         assert!(
             matches!(
                 ev,
@@ -3278,7 +3221,7 @@ mod tests {
         let room = room_id("audio-room");
         let local = pid();
         let handle = new_participant_key();
-        table.add_local_member(local, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
         let remote_origin = pid();
         let audio = TrackMeta {
@@ -3295,14 +3238,14 @@ mod tests {
         let mut ctx = RecordingCtx {
             ..Default::default()
         };
-        let ev = table.publish_track(track, room, now(), &wall(), &mut ctx);
+        let ev = table.publish_track(track, room, None, now(), &wall(), &mut ctx);
         assert!(
             matches!(ev, Some(ShardEvent::Relay(Topology::TrackSubscribed { track: t, .. })) if t == audio),
             "a remote audio publish installs a destination route"
         );
         assert_eq!(table.data.routes.len(), 1);
 
-        table.remove_local_member(&local, room, std::iter::empty(), now());
+        table.remove_local_member(&local, handle, room, std::iter::empty(), now());
         assert_eq!(
             table.data.routes.len(),
             0,
@@ -3329,16 +3272,15 @@ mod tests {
 
         // Somebody has to stay, or the room empties and takes its routes with it - which would
         // make this pass for the wrong reason.
-        let bystander = pid();
         let bystander_handle = new_participant_key();
-        table.add_local_member(bystander, bystander_handle, room, &mut rng);
+        table.add_local_member(bystander_handle, room, &mut rng);
 
         for _ in 0..2 {
             let handle = new_participant_key();
-            table.add_local_member(participant, handle, room, &mut rng);
+            table.add_local_member(handle, room, &mut rng);
             // The same participant id comes back, exactly as a reconnect does.
             table.register_data_publisher(room, participant, topic.clone());
-            table.remove_local_member(&participant, room, std::iter::empty(), now());
+            table.remove_local_member(&participant, handle, room, std::iter::empty(), now());
         }
     }
 
@@ -3349,7 +3291,7 @@ mod tests {
         let room = room_id("audio-room-local");
         let origin = pid();
         let handle = new_participant_key();
-        table.add_local_member(origin, handle, room, &mut rng);
+        table.add_local_member(handle, room, &mut rng);
 
         let audio = TrackMeta {
             shard_id: ShardId::new(0),
@@ -3367,6 +3309,7 @@ mod tests {
                 reverse: None,
             },
             room,
+            Some(handle),
             now(),
             &wall(),
             &mut ctx,
@@ -3386,11 +3329,11 @@ mod tests {
             origin: pid(),
         };
         let (first, second) = (pid(), pid());
-        add_local_subscriber(&mut table, first);
-        add_local_subscriber(&mut table, second);
+        let first_key = add_local_subscriber(&mut table, first);
+        let second_key = add_local_subscriber(&mut table, second);
 
         let Some(ShardEvent::Relay(Topology::TrackSubscribed { route, epoch, .. })) =
-            table.register_subscriber(first, track.clone(), now(), &wall())
+            table.register_subscriber(first_key, track.clone(), now(), &wall())
         else {
             panic!("the first subscriber must install a route");
         };
@@ -3398,7 +3341,7 @@ mod tests {
 
         assert!(
             table
-                .register_subscriber(second, track.clone(), now(), &wall())
+                .register_subscriber(second_key, track.clone(), now(), &wall())
                 .is_none(),
             "local churn must not touch the cluster route"
         );
@@ -3406,13 +3349,15 @@ mod tests {
 
         assert!(
             table
-                .unregister_subscriber(first, track.clone(), now())
+                .unregister_subscriber(first_key, track.clone(), now())
                 .is_none()
         );
         assert_eq!(table.data.routes.len(), 1, "still one consumer left");
 
         assert!(
-            table.unregister_subscriber(second, track, now()).is_some(),
+            table
+                .unregister_subscriber(second_key, track, now())
+                .is_some(),
             "the last subscriber leaving tells the publisher to stop"
         );
         assert_eq!(table.data.routes.len(), 0, "the route is retired");
@@ -3433,10 +3378,10 @@ mod tests {
         let publisher = pid();
         let track_id = publisher.derive_track_id(TrackKind::Video, "v");
         let subscriber = pid();
-        add_local_subscriber(&mut table, subscriber);
+        let subscriber_key = add_local_subscriber(&mut table, subscriber);
 
         table.register_subscriber(
-            subscriber,
+            subscriber_key,
             TrackMeta {
                 shard_id: ShardId::new(0),
                 id: track_id,
@@ -3465,12 +3410,6 @@ mod tests {
             .expect("published track has a fanout");
         table.route_video(fanout_key, RtpPacket::default(), &mut ctx);
 
-        let subscriber_key = table
-            .control
-            .local_participants
-            .get(&subscriber)
-            .copied()
-            .expect("subscriber registered above");
         assert_eq!(ctx.forwarded_video.borrow().as_slice(), &[subscriber_key]);
         assert_eq!(ctx.sent.borrow().len(), 1);
     }
