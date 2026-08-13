@@ -29,8 +29,34 @@ pub(crate) fn fast_set<T>() -> FastIndexSet<T> {
     IndexSet::with_hasher(ahash::RandomState::default())
 }
 
-pub(crate) fn fast_set_with_capacity<T>(cap: usize) -> FastIndexSet<T> {
-    IndexSet::with_capacity_and_hasher(cap, ahash::RandomState::default())
+/// Dedup and removal for the small, dense-key membership lists on the
+/// forwarding path — room membership, per-topic subscribers — where the key
+/// (`ParticipantKey`) is already a dense integer, so a hash index buys
+/// nothing over a linear scan.
+pub(crate) trait VecSet<T> {
+    fn insert_unique(&mut self, value: T) -> bool;
+    fn remove_value(&mut self, value: &T) -> bool;
+}
+
+impl<T: PartialEq> VecSet<T> for Vec<T> {
+    fn insert_unique(&mut self, value: T) -> bool {
+        if self.contains(&value) {
+            false
+        } else {
+            self.push(value);
+            true
+        }
+    }
+
+    fn remove_value(&mut self, value: &T) -> bool {
+        match self.iter().position(|v| v == value) {
+            Some(pos) => {
+                self.swap_remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// The seam between the data plane and whatever carries it between shards.
@@ -454,7 +480,9 @@ impl ShardRoutingTable {
             .local_participants
             .insert(participant_id, handle);
         debug_assert!(previous.is_none(), "duplicate local participant route");
-        self.room_or_insert(room_id, rng).members.insert(handle);
+        self.room_or_insert(room_id, rng)
+            .members
+            .insert_unique(handle);
     }
 
     /// Removes a local participant from its room and evicts its audio
@@ -478,7 +506,7 @@ impl ShardRoutingTable {
             let Some(route) = self.data.data_streams.get_mut(key) else {
                 continue;
             };
-            route.local_subscribers.swap_remove(&removed_handle);
+            route.local_subscribers.remove_value(&removed_handle);
             // And retire whatever they were publishing. `is_unused` deliberately keeps a route
             // that is still published, so without this the route outlives the publisher - and a
             // reconnect keeps the participant id on purpose, so the returning participant
@@ -531,9 +559,9 @@ impl ShardRoutingTable {
         let Some(room) = self.room_mut(&room_id) else {
             return;
         };
-        room.members.swap_remove(&removed_handle);
+        room.members.remove_value(&removed_handle);
         for subscribers in room.all_publisher_subscriptions.local_by_topic.values_mut() {
-            subscribers.swap_remove(&removed_handle);
+            subscribers.remove_value(&removed_handle);
         }
         room.all_publisher_subscriptions
             .local_by_topic
@@ -1028,12 +1056,12 @@ impl ShardRoutingTable {
             .local_by_topic
             .get(&topic)
             .cloned()
-            .unwrap_or_else(fast_set);
+            .unwrap_or_default();
         let route = self.data_stream_or_insert(room_id, DataStreamId::new(publisher, topic));
         debug_assert!(!route.published);
         route.published = true;
         for subscriber in all_publisher_subscribers {
-            route.local_subscribers.insert(subscriber);
+            route.local_subscribers.insert_unique(subscriber);
         }
         // Remote wildcard subscribers are not attached here: a destination must
         // allocate its own route, so it is announced to and hands a handle back.
@@ -1050,7 +1078,7 @@ impl ShardRoutingTable {
             .room(&room_id)
             .and_then(|room| room.all_publisher_subscriptions.local_by_topic.get(topic))
             .cloned()
-            .unwrap_or_else(fast_set);
+            .unwrap_or_default();
         let Some(route) = self.data_stream_mut(&key) else {
             debug_assert!(false, "unregistering an unknown data stream");
             return;
@@ -1058,7 +1086,7 @@ impl ShardRoutingTable {
         debug_assert!(route.published);
         route.published = false;
         for subscriber in &subscribers {
-            route.local_subscribers.swap_remove(subscriber);
+            route.local_subscribers.remove_value(subscriber);
         }
         self.release_data_stream_if_unused(&room_id, &key);
     }
@@ -1079,7 +1107,7 @@ impl ShardRoutingTable {
                 let route = self
                     .data_stream_or_insert(room_id, DataStreamId::new(publisher, topic.clone()));
                 let was_empty = route.local_subscribers.is_empty();
-                route.local_subscribers.insert(handle);
+                route.local_subscribers.insert_unique(handle);
                 if !was_empty {
                     return None;
                 }
@@ -1109,9 +1137,9 @@ impl ShardRoutingTable {
                         .all_publisher_subscriptions
                         .local_by_topic
                         .entry(topic.clone())
-                        .or_insert_with(fast_set);
+                        .or_default();
                     let was_empty = subscribers.is_empty();
-                    let inserted = subscribers.insert(handle);
+                    let inserted = subscribers.insert_unique(handle);
                     debug_assert!(inserted);
                     was_empty
                 };
@@ -1127,7 +1155,7 @@ impl ShardRoutingTable {
                         continue;
                     };
                     if route.id.topic == topic {
-                        route.local_subscribers.insert(handle);
+                        route.local_subscribers.insert_unique(handle);
                     }
                 }
                 was_empty.then_some(ShardEvent::Relay(Topology::DataTopicSubscribed {
@@ -1167,7 +1195,7 @@ impl ShardRoutingTable {
                 };
                 let was_one =
                     route.local_subscribers.len() == 1 && route.local_subscribers.contains(&handle);
-                route.local_subscribers.swap_remove(&handle);
+                route.local_subscribers.remove_value(&handle);
                 if route.is_unused() {
                     orphaned.push(publisher);
                     self.remove_data_stream(&room_id, &key);
@@ -1187,7 +1215,7 @@ impl ShardRoutingTable {
                         return false;
                     };
                     let was_one = subscribers.len() == 1 && subscribers.contains(&handle);
-                    subscribers.swap_remove(&handle);
+                    subscribers.remove_value(&handle);
                     if subscribers.is_empty() {
                         room.all_publisher_subscriptions
                             .local_by_topic
@@ -1204,7 +1232,7 @@ impl ShardRoutingTable {
                     if route.id.topic != *topic {
                         continue;
                     }
-                    route.local_subscribers.swap_remove(&handle);
+                    route.local_subscribers.remove_value(&handle);
                     let unused = route.is_unused();
                     let id = route.id.clone();
                     if unused {
@@ -1575,7 +1603,7 @@ impl ShardRoutingTable {
         let Some(route) = self.data_stream_mut(&key) else {
             return;
         };
-        route.local_subscribers.swap_remove(&handle);
+        route.local_subscribers.remove_value(&handle);
         self.release_data_stream_if_unused(&room_id, &key);
     }
 
@@ -1614,7 +1642,7 @@ impl ShardRoutingTable {
         let fanout =
             self.data_stream_or_insert(room_id, DataStreamId::new(publisher, topic.clone()));
         for subscriber in wildcard_subscribers {
-            fanout.local_subscribers.insert(subscriber);
+            fanout.local_subscribers.insert_unique(subscriber);
         }
 
         let (route, epoch) = self.install_data_route(room_id, publisher, topic, now, wall)?;

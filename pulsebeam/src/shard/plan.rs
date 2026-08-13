@@ -20,11 +20,12 @@ use super::participants::ParticipantKey;
 use super::reliable::ReliableRoutes;
 use super::router::{
     DataStreamKey, FastIndexSet, LocalTrackKey, ReliableStreamKey, RoomKey, fast_set,
-    fast_set_with_capacity,
 };
 
 pub(crate) struct AllPublisherSubscriptions {
-    pub local_by_topic: HashMap<Topic, FastIndexSet<ParticipantKey>>,
+    /// Per topic, wildcard local subscribers. `ParticipantKey` is already a
+    /// dense slotmap key — same trade `RoomFanout::members` makes.
+    pub local_by_topic: HashMap<Topic, Vec<ParticipantKey>>,
     /// Wildcard remote subscribers per topic. A node's shard count is small
     /// and bounded, so linear-scanning it beats hashing `ShardId`, the same
     /// trade-off `RoomFanout::remote_shards` makes.
@@ -53,7 +54,9 @@ pub(crate) struct DataStreamRoute {
     /// the same rule `TrackRoute::track_id` follows.
     pub id: DataStreamId,
     pub published: bool,
-    pub local_subscribers: FastIndexSet<ParticipantKey>,
+    /// `ParticipantKey` is already a dense slotmap key, so dedup is a linear
+    /// scan (`VecSet`) rather than a hash index — the same trade `RoomFanout::members` makes.
+    pub local_subscribers: Vec<ParticipantKey>,
     /// Remote destination shards for this stream. A shard's fan-out is
     /// bounded by node size, not room size, so a linear scan beats a hash
     /// lookup here — the same trade-off `RoomFanout::remote_shards` makes.
@@ -65,7 +68,7 @@ impl DataStreamRoute {
         Self {
             id,
             published: false,
-            local_subscribers: fast_set_with_capacity(256),
+            local_subscribers: Vec::with_capacity(256),
             remote_subscriber_shards: Vec::new(),
         }
     }
@@ -170,7 +173,9 @@ pub(crate) struct RoomFanout {
     /// never hashed to find this object, the same rule `TrackRoute::track_id`
     /// follows.
     pub room_id: crate::entity::RoomId,
-    pub members: FastIndexSet<ParticipantKey>,
+    /// `ParticipantKey` is already a dense slotmap key, so membership is a
+    /// `VecSet`-deduped `Vec` rather than a hash index.
+    pub members: Vec<ParticipantKey>,
     /// Shards with at least one remote member in this room. `ShardId` is
     /// already a dense index bounded by worker count, so this is a small
     /// linearly-scanned `Vec` rather than a hash index — the same trade
@@ -202,7 +207,7 @@ impl RoomFanout {
     ) -> Self {
         Self {
             room_id,
-            members: fast_set(),
+            members: Vec::new(),
             remote_shards: Vec::new(),
             remote_participant_counts: Vec::new(),
             audio_imports: fast_set(),

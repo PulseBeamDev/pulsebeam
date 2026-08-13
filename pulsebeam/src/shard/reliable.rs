@@ -1,18 +1,20 @@
 use ahash::HashMap;
-use indexmap::IndexSet;
 
 use crate::shard::participants::ParticipantKey;
+use crate::shard::router::VecSet;
 use crate::track::Topic;
-
-type FastIndexSet<T> = IndexSet<T, ahash::RandomState>;
 
 /// Local topic subscriptions for the reliable lane. Everything else about a
 /// reliable stream — publish/import flags, remote destination handles — lives
 /// in `DataPlane::reliable_streams`, keyed by `ReliableStreamKey`; a
 /// subscription names a topic, not a stream, so it has no key to live under
 /// there.
+///
+/// `ParticipantKey` is already a dense slotmap key, so a subscriber set is a
+/// `VecSet`-deduped `Vec` rather than a hash index — the same trade
+/// `RoomFanout::members` makes.
 pub(super) struct ReliableRoutes {
-    local_subscribers: HashMap<Topic, FastIndexSet<ParticipantKey>>,
+    local_subscribers: HashMap<Topic, Vec<ParticipantKey>>,
 }
 
 impl ReliableRoutes {
@@ -24,7 +26,7 @@ impl ReliableRoutes {
 
     pub(super) fn remove_participant(&mut self, participant: ParticipantKey) {
         for subscribers in self.local_subscribers.values_mut() {
-            subscribers.swap_remove(&participant);
+            subscribers.remove_value(&participant);
         }
         self.local_subscribers
             .retain(|_, subscribers| !subscribers.is_empty());
@@ -36,16 +38,17 @@ impl ReliableRoutes {
             .is_some_and(|s| !s.is_empty())
     }
 
-    pub(super) fn local_subscribers(&self, topic: &Topic) -> Option<&FastIndexSet<ParticipantKey>> {
+    pub(super) fn local_subscribers(&self, topic: &Topic) -> Option<&Vec<ParticipantKey>> {
         self.local_subscribers.get(topic)
     }
 
     pub(super) fn subscribe_local(&mut self, subscriber: ParticipantKey, topic: Topic) -> bool {
-        let subscribers = self.local_subscribers.entry(topic).or_insert_with(|| {
-            IndexSet::with_capacity_and_hasher(256, ahash::RandomState::default())
-        });
+        let subscribers = self
+            .local_subscribers
+            .entry(topic)
+            .or_insert_with(|| Vec::with_capacity(256));
         let was_empty = subscribers.is_empty();
-        let inserted = subscribers.insert(subscriber);
+        let inserted = subscribers.insert_unique(subscriber);
         debug_assert!(inserted);
         was_empty
     }
@@ -56,7 +59,7 @@ impl ReliableRoutes {
             return false;
         };
         let was_last = subscribers.len() == 1;
-        let removed = subscribers.swap_remove(&subscriber);
+        let removed = subscribers.remove_value(&subscriber);
         debug_assert!(removed);
         if subscribers.is_empty() {
             self.local_subscribers.remove(topic);
