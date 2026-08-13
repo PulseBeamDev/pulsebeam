@@ -7,7 +7,7 @@ use str0m::media::{KeyframeRequestKind, Rid};
 use super::control::{ControlPlane, DataStreamId, ParticipantShardMeta, TrackReverseTarget};
 use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
 use super::participants::ParticipantHandle;
-use super::plan::{DataPlane, DataStreamRoute, RoomFanout, TrackRoute};
+use super::plan::{DataPlane, DataStreamRoute, ReliableStream, RoomFanout, TrackRoute};
 use slotmap::new_key_type;
 
 use crate::clock::WallAnchor;
@@ -282,6 +282,29 @@ impl ShardRoutingTable {
             .unwrap_or_default()
     }
 
+    /// The key for a reliable stream name, creating its arena entry if this
+    /// shard has not seen the stream before. Control path only — mints and
+    /// retires alongside the reverse route the same stream opens, so a key
+    /// handed to `RouteAction::Reverse` always resolves.
+    fn reliable_stream_key_or_insert(&mut self, id: DataStreamId) -> ReliableStreamKey {
+        let Self { data, control } = self;
+        *control
+            .reliable_stream_keys
+            .entry(id.clone())
+            .or_insert_with(|| data.reliable_streams.insert(ReliableStream { id }))
+    }
+
+    fn remove_reliable_stream(&mut self, id: &DataStreamId) {
+        if let Some(key) = self.control.reliable_stream_keys.remove(id) {
+            self.data.reliable_streams.remove(key);
+        }
+    }
+
+    #[cfg(test)]
+    fn reliable_stream(&self, key: ReliableStreamKey) -> Option<&ReliableStream> {
+        self.data.reliable_streams.get(key)
+    }
+
     // -- local room membership -------------------------------------------
 
     pub fn add_local_member(
@@ -417,6 +440,10 @@ impl ShardRoutingTable {
         wall: &WallAnchor,
     ) -> Option<ReverseRoute> {
         let key = DataStreamId::new(publisher, topic.clone());
+        // Minted before the route install, alongside the reverse route it
+        // will point at: `RouteAction::Reverse` never resolves to a key this
+        // shard hasn't already registered.
+        self.reliable_stream_key_or_insert(key.clone());
         let handle = self.open_reverse_route(
             publisher,
             ReverseTarget::Topic {
@@ -475,6 +502,7 @@ impl ShardRoutingTable {
         if let Some(handle) = self.control.topic_reverse_routes.remove(&key) {
             self.data.routes.retire(handle.route, handle.epoch, now);
         }
+        self.remove_reliable_stream(&key);
     }
 
     /// The reverse handle this shard opened for a topic it publishes, so a
@@ -2702,11 +2730,28 @@ mod tests {
             "an ack resolves to its publisher and topic through the route alone"
         );
 
+        let stream_id = DataStreamId::new(publisher, topic.clone());
+        let stream_key = table
+            .control
+            .reliable_stream_keys
+            .get(&stream_id)
+            .copied()
+            .expect("publishing a reliable topic must mint its arena key");
+        assert_eq!(
+            table.reliable_stream(stream_key).map(|s| &s.id),
+            Some(&stream_id),
+            "the arena entry must resolve back to its own name"
+        );
+
         table.unregister_reliable_data_publisher(room, publisher, &topic, now());
         assert_eq!(
             table.data.routes.len(),
             0,
             "unpublishing must free the reverse route"
+        );
+        assert!(
+            table.reliable_stream(stream_key).is_none(),
+            "unpublishing must free the reliable stream key too"
         );
     }
 

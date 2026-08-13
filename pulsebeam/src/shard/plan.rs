@@ -19,7 +19,8 @@ use super::control::DataStreamId;
 use super::participants::ParticipantHandle;
 use super::reliable::ReliableRoutes;
 use super::router::{
-    DataStreamKey, FastIndexSet, LocalTrackKey, RoomKey, fast_set, fast_set_with_capacity,
+    DataStreamKey, FastIndexSet, LocalTrackKey, ReliableStreamKey, RoomKey, fast_set,
+    fast_set_with_capacity,
 };
 
 pub(crate) struct AllPublisherSubscriptions {
@@ -169,6 +170,17 @@ impl RoomFanout {
     }
 }
 
+/// The reverse-route descriptor for one published reliable stream: enough to
+/// resolve an arriving reverse frame's `topic` by key instead of carrying it
+/// inline in [`crate::route::ReverseTarget`]. The forward-direction state
+/// (subscribers, publish/import flags, remote handles) still lives in
+/// `ReliableRoutes`, inside `RoomFanout` — this arena exists only to give the
+/// reverse path a `Copy` key, not yet the full per-stream collapse the
+/// hash-container audit describes.
+pub(crate) struct ReliableStream {
+    pub id: DataStreamId,
+}
+
 pub(crate) struct DataPlane {
     /// Fanout objects, addressed densely. Arrivals resolve to a key, never a
     /// name: a `RoomId` is a 16-byte value to hash, a key is an index.
@@ -181,6 +193,7 @@ pub(crate) struct DataPlane {
     /// (publisher, topic) is already unique across rooms, since a publisher
     /// belongs to exactly one room.
     pub data_streams: SlotMap<DataStreamKey, DataStreamRoute>,
+    pub reliable_streams: SlotMap<ReliableStreamKey, ReliableStream>,
     /// Routes this shard has installed as a *destination*, indexed by the id it
     /// handed out. Frames arriving from other shards resolve here.
     pub routes: RouteTable,
@@ -192,6 +205,7 @@ impl DataPlane {
             rooms: SlotMap::with_key(),
             tracks: SlotMap::with_key(),
             data_streams: SlotMap::with_key(),
+            reliable_streams: SlotMap::with_key(),
             routes: RouteTable::new(),
         }
     }
