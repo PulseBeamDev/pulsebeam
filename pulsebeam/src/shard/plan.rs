@@ -109,7 +109,10 @@ impl DataStreamRoute {
             debug_assert!(false, "detaching an unknown remote subscriber shard");
             return;
         };
-        let entry = &mut self.remote_subscriber_shards[pos];
+        let Some(entry) = self.remote_subscriber_shards.get_mut(pos) else {
+            debug_assert!(false, "position() returned an index outside the vec");
+            return;
+        };
         debug_assert!(entry.refs > 0, "refcount underflow would leak this route");
         entry.refs = entry.refs.saturating_sub(1);
         if entry.refs == 0 {
@@ -262,7 +265,10 @@ impl RoomFanout {
         else {
             return true;
         };
-        let count = &mut self.remote_participant_counts[pos].1;
+        let Some((_, count)) = self.remote_participant_counts.get_mut(pos) else {
+            debug_assert!(false, "position() returned an index outside the vec");
+            return true;
+        };
         *count = count.saturating_sub(1);
         if *count == 0 {
             self.remote_participant_counts.swap_remove(pos);

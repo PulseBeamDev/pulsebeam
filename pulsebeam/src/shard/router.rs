@@ -2008,7 +2008,7 @@ impl ShardRoutingTable {
 
         if origin.is_local() {
             let playout = ctx.wall().ntp();
-            for entry in route.remote_subscriber_shards.iter_mut() {
+            for entry in &mut route.remote_subscriber_shards {
                 let env = entry.remote.next_envelope(playout);
                 ctx.send_media(entry.remote.shard_id, env, MediaPayload::Data(pkt.to_vec()));
             }
