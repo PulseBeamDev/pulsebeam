@@ -826,9 +826,21 @@ impl ShardCore {
         Some(())
     }
 
+    /// Bounded retries for a transient install failure — buggify's
+    /// exhaustion fault fires independently per call, so a few attempts
+    /// clear it almost certainly; a genuinely full table fails every attempt
+    /// just as fast, so the retry costs nothing in that case either.
+    const INGRESS_INSTALL_ATTEMPTS: u32 = 10;
+
     /// Mint a participant slot and its ingress route in one step, so the
     /// caller's ufrag always names a route that already resolves — a
     /// reservation the route install failed for leaves nothing behind.
+    ///
+    /// Every other install failure in this codebase recovers by a later,
+    /// externally-triggered retry (the next subscribe, the next publish).
+    /// Connection setup has no such later trigger to lean on — a client
+    /// only gets this one attempt before it sees the join itself fail — so
+    /// the retry has to happen here instead.
     fn reserve_ingress(
         &mut self,
         participant_id: ParticipantId,
@@ -837,19 +849,23 @@ impl ShardCore {
         reply: tokio::sync::oneshot::Sender<Option<(crate::route::RouteId, u16)>>,
     ) {
         let key = self.registry.reserve(participant_id);
-        let installed =
-            self.routing
-                .install_ingress_route(key, participant_id, room_id, now, &self.wall);
-        match installed {
-            Some((route, epoch)) => {
+        for attempt in 1..=Self::INGRESS_INSTALL_ATTEMPTS {
+            if let Some((route, epoch)) =
+                self.routing
+                    .install_ingress_route(key, participant_id, room_id, now, &self.wall)
+            {
                 self.registry.stash_ingress(key, route, epoch);
                 let _ = reply.send(Some((route, epoch)));
+                return;
             }
-            None => {
-                self.registry.release_reserved(key);
-                let _ = reply.send(None);
-            }
+            tracing::warn!(
+                %participant_id,
+                attempt,
+                "ingress route install failed, retrying"
+            );
         }
+        self.registry.release_reserved(key);
+        let _ = reply.send(None);
     }
 
     fn cancel_reservation(&mut self, participant_id: &ParticipantId, now: Instant) {
