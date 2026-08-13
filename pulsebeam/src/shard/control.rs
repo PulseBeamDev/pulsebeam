@@ -8,7 +8,7 @@ use str0m::media::Rid;
 
 use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::id::ShardId;
-use crate::route::{ImportTable, ReverseRoute, RouteId};
+use crate::route::{ImportTable, ReverseRoute};
 use crate::track::Topic;
 
 use super::participants::ParticipantHandle;
@@ -64,7 +64,7 @@ pub(crate) struct ControlPlane {
     pub remote_participant_counts: HashMap<(RoomId, ShardId), usize>,
     /// Reverse routes this shard opened for the streams it publishes, so they
     /// can be retired when those streams go away.
-    pub track_reverse_routes: HashMap<TrackId, RouteId>,
+    pub track_reverse_routes: HashMap<TrackId, ReverseRoute>,
     pub topic_reverse_routes: HashMap<DataStreamId, ReverseRoute>,
     /// Handles for reverse routes *other* shards opened, learned from publisher
     /// announcements — the addresses this shard sends acks to.

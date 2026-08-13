@@ -319,7 +319,7 @@ impl ShardRoutingTable {
         )?;
         self.control
             .track_reverse_routes
-            .insert(track.meta.id, handle.route);
+            .insert(track.meta.id, handle);
         Some(handle)
     }
 
@@ -377,8 +377,8 @@ impl ShardRoutingTable {
 
     /// Close a track's reverse path when its publisher goes away.
     pub fn close_track_reverse_route(&mut self, track_id: &TrackId, now: Instant) {
-        if let Some(route) = self.control.track_reverse_routes.remove(track_id) {
-            self.data.routes.retire(route, now);
+        if let Some(handle) = self.control.track_reverse_routes.remove(track_id) {
+            self.data.routes.retire(handle.route, handle.epoch, now);
         }
     }
 
@@ -390,7 +390,7 @@ impl ShardRoutingTable {
     ) {
         let key = DataStreamId::new(publisher, topic.clone());
         if let Some(handle) = self.control.topic_reverse_routes.remove(&key) {
-            self.data.routes.retire(handle.route, now);
+            self.data.routes.retire(handle.route, handle.epoch, now);
         }
     }
 
@@ -723,7 +723,7 @@ impl ShardRoutingTable {
         // tell it apart from a resubscription that overtook it.
         let retired = match self.control.imports.unsubscribe(&track.id) {
             ImportEffect::Retire { route, epoch } => {
-                self.data.routes.retire(route, now);
+                self.data.routes.retire(route, epoch, now);
                 self.control.imports.on_retired(&track.id);
                 Some((route, epoch))
             }
@@ -1166,8 +1166,8 @@ impl ShardRoutingTable {
         {
             return;
         }
-        if let ImportEffect::Retire { route, .. } = self.control.imports.unsubscribe(&track_id) {
-            self.data.routes.retire(route, now);
+        if let ImportEffect::Retire { route, epoch } = self.control.imports.unsubscribe(&track_id) {
+            self.data.routes.retire(route, epoch, now);
             self.control.imports.on_retired(&track_id);
         }
     }
@@ -1181,9 +1181,10 @@ impl ShardRoutingTable {
         let tracks: Vec<TrackId> = room.audio_imports.iter().copied().collect();
         room.audio_imports.clear();
         for track_id in tracks {
-            if let ImportEffect::Retire { route, .. } = self.control.imports.unsubscribe(&track_id)
+            if let ImportEffect::Retire { route, epoch } =
+                self.control.imports.unsubscribe(&track_id)
             {
-                self.data.routes.retire(route, now);
+                self.data.routes.retire(route, epoch, now);
                 self.control.imports.on_retired(&track_id);
             }
         }
@@ -1302,8 +1303,8 @@ impl ShardRoutingTable {
 
     fn retire_data_route(&mut self, publisher: ParticipantId, topic: &Topic, now: Instant) {
         let key = DataStreamId::new(publisher, topic.clone());
-        if let ImportEffect::Retire { route, .. } = self.control.data_imports.unsubscribe(&key) {
-            self.data.routes.retire(route, now);
+        if let ImportEffect::Retire { route, epoch } = self.control.data_imports.unsubscribe(&key) {
+            self.data.routes.retire(route, epoch, now);
             self.control.data_imports.on_retired(&key);
         }
     }
@@ -1760,10 +1761,10 @@ impl ShardRoutingTable {
                 room.reliable.clear_imported(publisher, topic);
             }
             let key = DataStreamId::new(publisher, topic.clone());
-            if let ImportEffect::Retire { route, .. } =
+            if let ImportEffect::Retire { route, epoch } =
                 self.control.reliable_imports.unsubscribe(&key)
             {
-                self.data.routes.retire(route, now);
+                self.data.routes.retire(route, epoch, now);
                 self.control.reliable_imports.on_retired(&key);
             }
         }

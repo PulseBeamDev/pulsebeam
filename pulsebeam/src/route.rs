@@ -602,12 +602,18 @@ impl RouteTable {
 
     /// Idempotent: retiring an already-free slot is a no-op, so a redelivered
     /// teardown cannot desync the table.
-    pub fn retire(&mut self, id: RouteId, now: Instant) -> bool {
+    ///
+    /// `epoch` must match the live incarnation. Every other operation on this
+    /// table checks it; retire was the one exception, and it is the one
+    /// operation here that destroys state — a teardown for a superseded
+    /// incarnation must not retire the one that replaced it.
+    pub fn retire(&mut self, id: RouteId, epoch: u16, now: Instant) -> bool {
         let Some(slot) = self.slots.get_mut(id.index()) else {
             return false;
         };
-        if matches!(slot, Slot::Free) {
-            return false;
+        match slot {
+            Slot::Live(entry) if entry.epoch == epoch => {}
+            _ => return false,
         }
         *slot = Slot::Free;
         self.quarantine.push_back((id.get(), now));
@@ -1028,7 +1034,7 @@ mod tests {
 
         // Quarantine still returns slots, so the cap bounds concurrency rather
         // than the total number of routes a shard may ever install.
-        table.retire(RouteId::new(0), now);
+        table.retire(RouteId::new(0), 0, now);
         table
             .install(action(), names(), NtpTime::ZERO, now + ROUTE_QUARANTINE)
             .expect("a quarantined slot comes back");
@@ -1042,7 +1048,7 @@ mod tests {
             .install(action(), names(), NtpTime::ZERO, now)
             .unwrap();
 
-        table.retire(id, now);
+        table.retire(id, epoch, now);
         let later = now + ROUTE_QUARANTINE;
         let (id2, epoch2) = table
             .install(action(), names(), NtpTime::ZERO, later)
@@ -1061,10 +1067,10 @@ mod tests {
     async fn a_slot_is_not_reused_inside_its_quarantine() {
         let mut table = RouteTable::new();
         let now = Instant::now();
-        let (id, _) = table
+        let (id, epoch) = table
             .install(action(), names(), NtpTime::ZERO, now)
             .unwrap();
-        table.retire(id, now);
+        table.retire(id, epoch, now);
 
         let too_soon = now + ROUTE_QUARANTINE - Duration::from_millis(1);
         let (id2, _) = table
@@ -1087,7 +1093,7 @@ mod tests {
             Some(RouteError::OutOfRange { route: far })
         );
 
-        table.retire(id, now);
+        table.retire(id, epoch, now);
         assert_eq!(
             table.resolve(&envelope(id, epoch)).err(),
             Some(RouteError::Stale { route: id, epoch })
@@ -1098,12 +1104,43 @@ mod tests {
     async fn retire_is_idempotent() {
         let mut table = RouteTable::new();
         let now = Instant::now();
-        let (id, _) = table
+        let (id, epoch) = table
             .install(action(), names(), NtpTime::ZERO, now)
             .unwrap();
-        assert!(table.retire(id, now));
-        assert!(!table.retire(id, now), "a second retire must be a no-op");
+        assert!(table.retire(id, epoch, now));
+        assert!(
+            !table.retire(id, epoch, now),
+            "a second retire must be a no-op"
+        );
         assert_eq!(table.len(), 0);
+    }
+
+    /// A teardown in flight for a superseded incarnation must not retire the
+    /// one that replaced it — the epoch check is what makes `retire` safe to
+    /// call with a stale handle, the same way `resolve` already is.
+    #[tokio::test(start_paused = true)]
+    async fn retire_with_a_stale_epoch_does_not_touch_the_live_incarnation() {
+        let mut table = RouteTable::with_max_slots(1);
+        let now = Instant::now();
+        let (id, epoch) = table
+            .install(action(), names(), NtpTime::ZERO, now)
+            .unwrap();
+        table.retire(id, epoch, now);
+        let later = now + ROUTE_QUARANTINE;
+        let (id2, epoch2) = table
+            .install(action(), names(), NtpTime::ZERO, later)
+            .unwrap();
+        assert_eq!(id2, id, "single-slot table must reuse the same slot");
+        assert_ne!(epoch2, epoch);
+
+        assert!(
+            !table.retire(id, epoch, later),
+            "retiring the old incarnation's stale epoch must be a no-op"
+        );
+        assert!(
+            table.resolve(&envelope(id2, epoch2)).is_ok(),
+            "the live incarnation must survive a stale-epoch retire"
+        );
     }
 
     #[tokio::test(start_paused = true)]
