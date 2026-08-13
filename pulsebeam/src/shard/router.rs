@@ -384,16 +384,24 @@ impl ShardRoutingTable {
         id: DataStreamId,
     ) -> ReliableStreamKey {
         let Self { data, control } = self;
+        // Every caller reaches here only after confirming the room exists
+        // (`register_reliable_data_publisher`, `on_remote_reliable_publisher`,
+        // and their callers all check first) — resolved once, here, so the
+        // new stream entry can carry a dense `RoomKey` instead of hashing
+        // `room_id` again on every dispatched frame.
+        let Some(&room_key) = control.room_keys.get(&room_id) else {
+            pulsebeam_runtime::fatal!(
+                "reliable_stream_key_or_insert called for a room that does not exist"
+            )
+        };
         let key = *control
             .reliable_stream_keys
             .entry(id.clone())
             .or_insert_with(|| {
                 data.reliable_streams
-                    .insert(ReliableStream::new(id, room_id))
+                    .insert(ReliableStream::new(id, room_key))
             });
-        if let Some(&room_key) = control.room_keys.get(&room_id)
-            && let Some(room) = data.rooms.get_mut(room_key)
-        {
+        if let Some(room) = data.rooms.get_mut(room_key) {
             room.reliable_stream_keys.insert(key);
         }
         key
@@ -2123,7 +2131,7 @@ impl ShardRoutingTable {
             debug_assert!(false, "a reliable fanout key must resolve to a stream");
             return;
         };
-        let room_id = entry.room_id;
+        let room_key = entry.room;
         let publisher = entry.id.publisher_id;
         let topic = entry.id.topic.clone();
         let local_origin = origin.is_local();
@@ -2146,7 +2154,8 @@ impl ShardRoutingTable {
                 ctx.send_media(shard_id, env, MediaPayload::Data(frame.to_vec()));
             }
         }
-        let Some(room) = self.room(&room_id) else {
+        let Some(room) = self.data.rooms.get(room_key) else {
+            debug_assert!(false, "a reliable stream's room key must resolve to a room");
             return;
         };
         if let Some(subscribers) = room.reliable.local_subscribers(&topic) {

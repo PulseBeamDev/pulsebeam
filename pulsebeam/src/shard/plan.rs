@@ -290,7 +290,12 @@ impl RoomFanout {
 /// `ReliableStreamKey` to live under here.
 pub(crate) struct ReliableStream {
     pub id: DataStreamId,
-    pub room_id: crate::entity::RoomId,
+    /// The room's own dense key, resolved once at creation so the hot
+    /// dispatch path (`route_reliable_data`) reaches `DataPlane::rooms` by
+    /// index instead of hashing a `RoomId` back through the control plane on
+    /// every frame. The room's name travels separately, in `RouteNames`, for
+    /// whatever needs it for logs.
+    pub room: RoomKey,
     pub published: bool,
     pub imported: bool,
     /// Acknowledged destination handles, one per subscribing shard. Small and
@@ -299,10 +304,10 @@ pub(crate) struct ReliableStream {
 }
 
 impl ReliableStream {
-    pub fn new(id: DataStreamId, room_id: crate::entity::RoomId) -> Self {
+    pub fn new(id: DataStreamId, room: RoomKey) -> Self {
         Self {
             id,
-            room_id,
+            room,
             published: false,
             imported: false,
             remote_routes: Vec::new(),
