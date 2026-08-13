@@ -7,10 +7,16 @@ use crate::{
     control::MAX_SEND_AUDIO_SLOTS,
     id::AudioSelectorSlotId,
     rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline},
-    track::StreamId,
+    shard::router::LocalTrackKey,
 };
+use str0m::media::Rid;
 
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
+
+/// A stream's identity for slot ownership, addressed by the shard's own
+/// fanout key rather than the track's name — resolving a `TrackId` here
+/// measured the same cost the rest of the forwarding path stopped paying.
+pub(crate) type AudioStreamKey = (LocalTrackKey, Option<Rid>);
 
 /// Slot is considered dead if no packet has arrived within this window.
 const DEAD_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -27,7 +33,7 @@ struct SlotTimeline {
 }
 
 struct SlotState {
-    owner: Option<StreamId>,
+    owner: Option<AudioStreamKey>,
     /// Wall-clock time of the most recent packet. `None` means the
     /// slot has never been used.
     last_arrival_ts: Option<Instant>,
@@ -79,16 +85,16 @@ impl TopNAudioSelector {
     }
 
     #[inline]
-    pub fn filter(
+    pub(crate) fn filter(
         &mut self,
-        stream_id: StreamId,
+        stream_id: AudioStreamKey,
         pkt: &mut RtpPacket,
     ) -> Option<AudioSelectorSlotId> {
         // Step 1: Parse relative power and wall-clock arrival time.
         let Some(audio_level) = pkt.ext_vals.audio_level else {
             tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
-                stream_id = %stream_id.0,
+                stream_id = ?stream_id.0,
                 "audio selector dropped packet due to missing audio level"
             );
             return None;
@@ -137,7 +143,7 @@ impl TopNAudioSelector {
             } else {
                 tracing::debug!(
                     target: crate::log::TARGET_AUDIO,
-                    stream_id = %stream_id.0,
+                    stream_id = ?stream_id.0,
                     incoming_power = power,
                     quietest_power = quietest_slot.last_power,
                     quietest_slot = quietest_idx,
@@ -171,7 +177,7 @@ impl TopNAudioSelector {
         }
     }
 
-    pub fn remove_track(&mut self, id: StreamId) {
+    pub(crate) fn remove_track(&mut self, id: AudioStreamKey) {
         for slot in &mut self.slots {
             if slot.owner == Some(id) {
                 slot.owner = None;
@@ -223,12 +229,12 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     // A fixture that overflows should fail the test, not clamp into a pass.
     use super::*;
+    use std::cell::RefCell;
     use std::time::Duration;
 
     use str0m::rtp::ExtensionValues;
     use tokio::time::Instant;
 
-    use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp::RtpPacket;
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
 
@@ -242,14 +248,16 @@ mod tests {
         TopNAudioSelector::new(&mut test_rng())
     }
 
-    fn make_stream() -> StreamId {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        (
-            ParticipantId::new(&mut seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed)))
-                .derive_track_id(TrackKind::Audio, "test"),
-            None,
-        )
+    thread_local! {
+        static TRACK_KEYS: RefCell<slotmap::SlotMap<LocalTrackKey, ()>> =
+            RefCell::new(slotmap::SlotMap::with_key());
+    }
+
+    /// A fresh, distinct fanout key — the selector never looks the key back
+    /// up, so an unbacked one is fine here.
+    fn make_stream() -> AudioStreamKey {
+        let key = TRACK_KEYS.with(|keys| keys.borrow_mut().insert(()));
+        (key, None)
     }
 
     /// Build a packet with the given audio level arriving at `arrival_ts`.
@@ -323,7 +331,7 @@ mod tests {
         base: Instant,
         start_ms: u64,
         level: i8,
-    ) -> StreamId {
+    ) -> AudioStreamKey {
         let id = make_stream();
         for t in 0..5u64 {
             sel.filter(id, &mut pkt_at(base, start_ms + t * TICK_MS, level));
@@ -337,13 +345,13 @@ mod tests {
         base: Instant,
         start_ms: u64,
         level: i8,
-    ) -> Vec<StreamId> {
+    ) -> Vec<AudioStreamKey> {
         (0..SELECTOR_SLOTS)
             .map(|_| add_stream_at_level(sel, base, start_ms, level))
             .collect()
     }
 
-    fn slot_owners(sel: &TopNAudioSelector) -> Vec<Option<StreamId>> {
+    fn slot_owners(sel: &TopNAudioSelector) -> Vec<Option<AudioStreamKey>> {
         sel.slots.iter().map(|s| s.owner).collect()
     }
 

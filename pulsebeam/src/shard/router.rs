@@ -436,6 +436,10 @@ impl ShardRoutingTable {
             self.release_data_stream_if_unused(&room_id, &id);
         }
 
+        let audio_track_keys: Vec<LocalTrackKey> = audio_track_ids
+            .into_iter()
+            .filter_map(|id| self.fanout_of(&id))
+            .collect();
         let Some(room) = self.room_mut(&room_id) else {
             return;
         };
@@ -447,8 +451,8 @@ impl ShardRoutingTable {
             .local_by_topic
             .retain(|_, subscribers| !subscribers.is_empty());
         room.reliable.remove_participant(removed_handle);
-        for id in audio_track_ids {
-            room.audio_selector.remove_track((id, None));
+        for key in audio_track_keys {
+            room.audio_selector.remove_track((key, None));
         }
         // With nobody left to deliver to, the shard stops being a destination
         // for this room's audio.
@@ -1730,9 +1734,13 @@ impl ShardRoutingTable {
         now: Instant,
         ctx: &mut impl RoutingContext,
     ) {
+        let track_keys: Vec<LocalTrackKey> = track_ids
+            .iter()
+            .filter_map(|id| self.fanout_of(id))
+            .collect();
         if let Some(room) = self.room_mut(&room_id) {
-            for &track_id in track_ids {
-                room.audio_selector.remove_track((track_id, None));
+            for key in track_keys {
+                room.audio_selector.remove_track((key, None));
             }
         }
         for &track_id in track_ids {
@@ -1827,12 +1835,13 @@ impl ShardRoutingTable {
             tracing::warn!(target: crate::log::TARGET_AUDIO, "audio packet dropped: room missing");
             return;
         };
+        let Some(&track_key) = control.track_keys.get(&ev.stream_id.0) else {
+            debug_assert!(false, "an audio stream's fanout key must already exist");
+            return;
+        };
 
         if origin.is_local()
-            && let Some(track) = control
-                .track_keys
-                .get(&ev.stream_id.0)
-                .and_then(|k| tracks.get_mut(*k))
+            && let Some(track) = tracks.get_mut(track_key)
         {
             for remote in &mut track.remote_routes {
                 let env = remote.next_envelope(ctx.wall().to_ntp(ev.pkt.playout_time));
@@ -1844,7 +1853,10 @@ impl ShardRoutingTable {
             }
         }
 
-        let Some(slot_idx) = room.audio_selector.filter(ev.stream_id, &mut ev.pkt) else {
+        let Some(slot_idx) = room
+            .audio_selector
+            .filter((track_key, ev.stream_id.1), &mut ev.pkt)
+        else {
             return;
         };
         for &participant in &room.members {
