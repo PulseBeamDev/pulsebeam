@@ -20,9 +20,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId};
-use crate::shard::router::LocalTrackKey;
-use crate::track::{DataLane, Topic};
-use str0m::media::Rid;
+use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
+use crate::track::Topic;
 
 pub const MEDIA_ENVELOPE_LEN: usize = 16;
 pub const ROUTE_ENVELOPE_LEN: usize = 8;
@@ -341,11 +340,16 @@ impl std::fmt::Display for RouteNames {
 
 /// What the destination does with a frame that arrives on a route.
 ///
+/// Every variant holds keys, never names — `Copy`, and nothing here is ever
+/// hashed to resolve it further. A dispatch function that takes a
+/// `RouteAction` apart has nothing left to look up; whatever it needs next
+/// comes off the object the key already resolved to.
+///
 /// Video and data point at a *shard-local* object rather than embedding
 /// subscriber membership: local subscribe/unsubscribe is frequent and purely
 /// local, while a cluster route is expensive to install. Churn mutates the
 /// local object and leaves the route untouched.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum RouteAction {
     Video {
         /// The destination's own fanout handle — a dense index, not a name.
@@ -356,25 +360,27 @@ pub(crate) enum RouteAction {
     /// One route per (audio stream, destination). Audio is broadcast to a room
     /// rather than explicitly subscribed, so the destination installs this as
     /// soon as it learns the track exists and it has members to deliver to.
+    ///
+    /// `origin`/`track_id` stay inline rather than resolving through a key:
+    /// unlike video, an audio destination never allocates a `TrackRoute` for
+    /// what it imports, so there is no arena entry to point at without
+    /// paying for one no other part of the audio path needs. Both fields are
+    /// `Copy`, so this does not cost the `Copy` derive on the enum — only the
+    /// "never hashed to find" property doesn't fully hold here yet.
     Audio {
-        room_id: RoomId,
+        room: RoomKey,
         origin: ParticipantId,
         track_id: TrackId,
     },
-    /// One route per (publisher, topic, lane, destination). The destination
-    /// installs it whether the local subscription named a publisher or was a
-    /// wildcard — wildcards resolve to concrete streams as publishers are
-    /// announced.
-    ///
-    /// `lane` is the client's channel semantics and lives only here, in the
-    /// compiled plan. It never rides a frame: the destination already knows it,
-    /// and it says nothing about how this hop is delivered.
-    Data {
-        lane: DataLane,
-        room_id: RoomId,
-        origin: ParticipantId,
-        topic: Topic,
-    },
+    /// One route per (publisher, topic, destination) on the realtime lane.
+    /// The destination installs it whether the local subscription named a
+    /// publisher or was a wildcard — wildcards resolve to concrete streams as
+    /// publishers are announced.
+    Data { stream: DataStreamKey },
+    /// The reliable-lane counterpart of `Data`. A separate variant rather
+    /// than a `lane: DataLane` field on `Data`, because the two lanes now
+    /// resolve through different arenas — the variant *is* the lane.
+    Reliable { stream: ReliableStreamKey },
     /// The reverse path for one published stream, resolving at the shard that
     /// owns the publisher.
     ///
@@ -392,18 +398,16 @@ pub(crate) enum RouteAction {
 
 /// What a reverse route points at, holding everything the destination needs to
 /// act on a frame that names nothing but the route.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReverseTarget {
     Track {
-        track_id: TrackId,
-        /// Encodings in declared order. A frame names one by index, so the rid
-        /// itself never travels; both ends order them from the same track
-        /// descriptor the control plane distributed.
-        encodings: Vec<Option<Rid>>,
+        /// The publisher's own fanout handle. Encodings live on the
+        /// `TrackRoute` this resolves to, in declared order — a frame names
+        /// one by index, so the rid itself never travels.
+        track: LocalTrackKey,
     },
     Topic {
-        room_id: RoomId,
-        topic: Topic,
+        stream: ReliableStreamKey,
     },
 }
 
@@ -863,7 +867,7 @@ mod tests {
 
     fn action() -> RouteAction {
         RouteAction::Audio {
-            room_id: names().room_id.unwrap(),
+            room: RoomKey::default(),
             origin: names().origin,
             track_id: names().origin.derive_track_id(TrackKind::Audio, "a"),
         }

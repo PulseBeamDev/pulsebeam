@@ -146,6 +146,10 @@ impl TrackRoute {
 }
 
 pub(crate) struct RoomFanout {
+    /// The room this fanout serves. Carried for the downstream slot match —
+    /// never hashed to find this object, the same rule `TrackRoute::track_id`
+    /// follows.
+    pub room_id: crate::entity::RoomId,
     pub members: FastIndexSet<ParticipantHandle>,
     pub remote_shards: FastIndexSet<ShardId>,
     /// Audio tracks this shard has installed a destination route for, so they
@@ -162,8 +166,12 @@ pub(crate) struct RoomFanout {
 }
 
 impl RoomFanout {
-    pub fn new(rng: &mut impl pulsebeam_runtime::rand::RngCore) -> Self {
+    pub fn new(
+        room_id: crate::entity::RoomId,
+        rng: &mut impl pulsebeam_runtime::rand::RngCore,
+    ) -> Self {
         Self {
+            room_id,
             members: fast_set(),
             remote_shards: fast_set(),
             audio_imports: fast_set(),
@@ -175,15 +183,18 @@ impl RoomFanout {
     }
 }
 
-/// The reverse-route descriptor for one published reliable stream: enough to
-/// resolve an arriving reverse frame's `topic` by key instead of carrying it
-/// inline in [`crate::route::ReverseTarget`]. The forward-direction state
+/// The descriptor for one reliable stream on this shard, in either role —
+/// publisher (reverse route target) or destination (forward route target).
+/// Enough to resolve an arriving frame or ack by key instead of carrying
+/// `room_id`/`origin`/`topic` inline in [`crate::route::RouteAction`] and
+/// [`crate::route::ReverseTarget`]. The forward-direction bookkeeping
 /// (subscribers, publish/import flags, remote handles) still lives in
-/// `ReliableRoutes`, inside `RoomFanout` — this arena exists only to give the
-/// reverse path a `Copy` key, not yet the full per-stream collapse the
+/// `ReliableRoutes`, inside `RoomFanout` — this arena exists only to give
+/// both routes a `Copy` key, not yet the full per-stream collapse the
 /// hash-container audit describes.
 pub(crate) struct ReliableStream {
     pub id: DataStreamId,
+    pub room_id: crate::entity::RoomId,
 }
 
 pub(crate) struct DataPlane {

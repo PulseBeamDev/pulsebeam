@@ -269,56 +269,23 @@ impl ShardCore {
             }
         };
 
-        // Copy out only what dispatch needs, rather than cloning the action —
-        // `RouteAction::Data` owns a `Topic`, and this runs per frame.
-        enum Target {
-            Video(crate::shard::router::LocalTrackKey),
-            Audio {
-                room_id: crate::entity::RoomId,
-                origin: ParticipantId,
-                track_id: TrackId,
-            },
-            Data {
-                lane: crate::track::DataLane,
-                room_id: crate::entity::RoomId,
-                origin: ParticipantId,
-                topic: crate::track::Topic,
-            },
+        // A plain `Copy` out of the action, not a clone: every variant is a
+        // key now, so there is nothing left to allocate on the forwarding
+        // path. This is what `Target` (a hand-rolled key-only shadow of
+        // `RouteAction`) used to buy; with the action itself `Copy`, it
+        // added a second enum for no reason and is gone.
+        let action = entry.action;
+        if matches!(action, RouteAction::Reverse { .. }) {
+            debug_assert!(
+                false,
+                "no media dispatch for route action {action:?} on {} ({})",
+                env.route, entry.names
+            );
+            return;
         }
-        let target = match &entry.action {
-            RouteAction::Video { local_track, .. } => Target::Video(*local_track),
-            RouteAction::Audio {
-                room_id,
-                origin,
-                track_id,
-            } => Target::Audio {
-                room_id: *room_id,
-                origin: *origin,
-                track_id: *track_id,
-            },
-            RouteAction::Data {
-                lane,
-                room_id,
-                origin,
-                topic,
-            } => Target::Data {
-                lane: *lane,
-                room_id: *room_id,
-                origin: *origin,
-                topic: topic.clone(),
-            },
-            other => {
-                debug_assert!(
-                    false,
-                    "no media dispatch for route action {other:?} on {} ({})",
-                    env.route, entry.names
-                );
-                return;
-            }
-        };
 
-        match (target, payload) {
-            (Target::Video(local_track), MediaPayload::Video(mut pkt)) => {
+        match (action, payload) {
+            (RouteAction::Video { local_track }, MediaPayload::Video(mut pkt)) => {
                 self.restamp(&mut pkt, playout, now);
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
@@ -329,14 +296,18 @@ impl ShardCore {
                 self.routing.route_video(local_track, pkt, &mut ctx);
             }
             (
-                Target::Audio {
-                    room_id,
+                RouteAction::Audio {
+                    room,
                     origin,
                     track_id,
                 },
                 MediaPayload::Audio(mut pkt),
             ) => {
                 self.restamp(&mut pkt, playout, now);
+                let Some(room_id) = self.routing.room_id_of(room) else {
+                    debug_assert!(false, "an audio route's room key must resolve to a room");
+                    return;
+                };
                 let ev = AudioRtpEvent {
                     stream_id: (track_id, None),
                     pkt,
@@ -351,29 +322,23 @@ impl ShardCore {
                 };
                 self.routing.route_audio(ev, &mut ctx);
             }
-            (
-                Target::Data {
-                    lane,
-                    room_id,
-                    origin,
-                    topic,
-                },
-                MediaPayload::Data(bytes),
-            ) => {
+            (RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
                     wall: &self.wall,
                 };
-                match lane {
-                    crate::track::DataLane::Realtime => self
-                        .routing
-                        .route_data(room_id, origin, &topic, &bytes, &mut ctx),
-                    crate::track::DataLane::Reliable => self
-                        .routing
-                        .route_reliable_data(room_id, origin, &topic, &bytes, &mut ctx),
-                }
+                self.routing.route_data(stream, &bytes, &mut ctx);
+            }
+            (RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    router,
+                    wall: &self.wall,
+                };
+                self.routing.route_reliable_data(stream, &bytes, &mut ctx);
             }
             _ => debug_assert!(false, "payload does not match the route action"),
         }
@@ -454,13 +419,17 @@ impl ShardCore {
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {
-            self.routing
-                .route_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
+            let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
+            if let Some(stream) = self.routing.data_stream_key(&id) {
+                self.routing.route_data(stream, &ev.pkt, &mut ctx);
+            }
         }
 
         while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
-            self.routing
-                .route_reliable_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
+            let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
+            if let Some(stream) = self.routing.reliable_stream_key(&id) {
+                self.routing.route_reliable_data(stream, &ev.pkt, &mut ctx);
+            }
         }
     }
 
@@ -1062,27 +1031,29 @@ impl ShardCore {
                 tracing::debug!(%route, "dropping a reverse frame on an unusable route");
                 return;
             };
-            let act = match (target, body) {
-                (
-                    ReverseTarget::Track {
-                        track_id,
-                        encodings,
-                    },
-                    Reverse::Keyframe { layer, kind },
-                ) => {
+            let act = match (*target, body) {
+                (ReverseTarget::Track { track }, Reverse::Keyframe { layer, kind }) => {
+                    let Some((track_id, encodings)) = self.routing.track_descriptor(track) else {
+                        debug_assert!(false, "a reverse frame's fanout key must resolve");
+                        return;
+                    };
                     let Some(rid) = encodings.get(usize::from(layer)).copied() else {
                         debug_assert!(false, "a reverse frame named an encoding the track lacks");
                         return;
                     };
-                    Act::Keyframe(*track_id, rid, kind)
+                    Act::Keyframe(track_id, rid, kind)
                 }
                 (ReverseTarget::Track { .. }, Reverse::Nack { .. }) => {
                     // Nothing raises these yet; the route resolves, so the only
                     // missing piece is the retransmission path itself.
                     return;
                 }
-                (ReverseTarget::Topic { topic, .. }, Reverse::DataAck(bytes)) => {
-                    Act::Data(topic.clone(), bytes)
+                (ReverseTarget::Topic { stream }, Reverse::DataAck(bytes)) => {
+                    let Some(entry) = self.routing.reliable_stream(stream) else {
+                        debug_assert!(false, "a reverse frame's fanout key must resolve");
+                        return;
+                    };
+                    Act::Data(entry.id.topic.clone(), bytes)
                 }
                 (target, _) => {
                     debug_assert!(false, "reverse body does not match a {target:?} route");

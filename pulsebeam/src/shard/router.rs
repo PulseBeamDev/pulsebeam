@@ -14,7 +14,7 @@ use crate::clock::WallAnchor;
 use crate::entity::{AudioOrigin, ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
-use crate::track::{DataLane, Topic, Track, TrackMeta};
+use crate::track::{Topic, Track, TrackMeta};
 use tokio::time::Instant;
 
 use super::worker::{MediaPayload, Reverse, ShardEvent, ShardFrame, Topology};
@@ -160,6 +160,15 @@ impl ShardRoutingTable {
         self.control.track_keys.get(track_id).copied()
     }
 
+    /// A published track's own name and encoding order, resolved by its
+    /// fanout key rather than carried inline on `ReverseTarget::Track` — the
+    /// same reason `TrackRoute::track_id` is never hashed to find this
+    /// object in the first place.
+    pub(crate) fn track_descriptor(&self, key: LocalTrackKey) -> Option<(TrackId, &[Option<Rid>])> {
+        let route = self.data.tracks.get(key)?;
+        Some((route.track_id, &route.encodings))
+    }
+
     /// Release a track's fanout once nothing consumes it.
     ///
     /// Worth doing rather than leaving to the map: a `TrackRoute` owns a
@@ -202,6 +211,15 @@ impl ShardRoutingTable {
         self.control.room_keys.contains_key(room_id)
     }
 
+    /// The room name a `RoomKey` was minted for. The data path's only use of
+    /// this is to fill in a value a downstream consumer still wants by name
+    /// (`AudioRtpEvent::room_id`) — resolving it stays a key lookup, not a
+    /// hash, so it costs nothing an index-addressed path wasn't already
+    /// paying.
+    pub(crate) fn room_id_of(&self, room: RoomKey) -> Option<RoomId> {
+        self.data.rooms.get(room).map(|r| r.room_id)
+    }
+
     /// The fanout for a room name, creating it if this shard has not seen the
     /// room before. Control path only.
     fn room_or_insert(&mut self, room_id: RoomId, rng: &mut impl rand::RngCore) -> &mut RoomFanout {
@@ -209,7 +227,7 @@ impl ShardRoutingTable {
         let key = *control
             .room_keys
             .entry(room_id)
-            .or_insert_with(|| data.rooms.insert(RoomFanout::new(rng)));
+            .or_insert_with(|| data.rooms.insert(RoomFanout::new(room_id, rng)));
         let Some(room) = data.rooms.get_mut(key) else {
             pulsebeam_runtime::fatal!("room_keys and rooms are created together")
         };
@@ -220,6 +238,18 @@ impl ShardRoutingTable {
         if let Some(key) = self.control.room_keys.remove(room_id) {
             self.data.rooms.remove(key);
         }
+    }
+
+    /// The key for a realtime data stream name, if this shard already knows
+    /// it. The one control-path lookup a locally originated frame still pays
+    /// — the pipeline event that reaches it carries a name, not a key — to
+    /// join the same key-addressed dispatch a cross-shard arrival uses.
+    pub(crate) fn data_stream_key(&self, id: &DataStreamId) -> Option<DataStreamKey> {
+        self.control.data_stream_keys.get(id).copied()
+    }
+
+    pub(crate) fn reliable_stream_key(&self, id: &DataStreamId) -> Option<ReliableStreamKey> {
+        self.control.reliable_stream_keys.get(id).copied()
     }
 
     /// The fanout for a realtime data stream name. Control path only.
@@ -283,26 +313,31 @@ impl ShardRoutingTable {
     }
 
     /// The key for a reliable stream name, creating its arena entry if this
-    /// shard has not seen the stream before. Control path only — mints and
-    /// retires alongside the reverse route the same stream opens, so a key
-    /// handed to `RouteAction::Reverse` always resolves.
-    fn reliable_stream_key_or_insert(&mut self, id: DataStreamId) -> ReliableStreamKey {
+    /// shard has not seen the stream before — as a publisher (the reverse
+    /// route) or as a destination (the forward route), whichever comes
+    /// first. Control path only — mints and retires alongside the route it
+    /// backs, so a key handed to `RouteAction` or `ReverseTarget` always
+    /// resolves.
+    fn reliable_stream_key_or_insert(
+        &mut self,
+        room_id: RoomId,
+        id: DataStreamId,
+    ) -> ReliableStreamKey {
         let Self { data, control } = self;
         *control
             .reliable_stream_keys
             .entry(id.clone())
-            .or_insert_with(|| data.reliable_streams.insert(ReliableStream { id }))
+            .or_insert_with(|| data.reliable_streams.insert(ReliableStream { id, room_id }))
+    }
+
+    pub(crate) fn reliable_stream(&self, key: ReliableStreamKey) -> Option<&ReliableStream> {
+        self.data.reliable_streams.get(key)
     }
 
     fn remove_reliable_stream(&mut self, id: &DataStreamId) {
         if let Some(key) = self.control.reliable_stream_keys.remove(id) {
             self.data.reliable_streams.remove(key);
         }
-    }
-
-    #[cfg(test)]
-    fn reliable_stream(&self, key: ReliableStreamKey) -> Option<&ReliableStream> {
-        self.data.reliable_streams.get(key)
     }
 
     // -- local room membership -------------------------------------------
@@ -408,18 +443,14 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ReverseRoute> {
-        let encodings: Vec<Option<Rid>> = track.layers.iter().map(|l| l.rid).collect();
         let key = self.fanout_key(track.meta.id);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
-        entry.encodings = encodings.clone();
+        entry.encodings = track.layers.iter().map(|l| l.rid).collect();
         let handle = self.open_reverse_route(
             track.meta.origin,
-            ReverseTarget::Track {
-                track_id: track.meta.id,
-                encodings,
-            },
+            ReverseTarget::Track { track: key },
             RouteNames {
                 room_id: None,
                 origin: track.meta.origin,
@@ -449,13 +480,10 @@ impl ShardRoutingTable {
         // Minted before the route install, alongside the reverse route it
         // will point at: `RouteAction::Reverse` never resolves to a key this
         // shard hasn't already registered.
-        self.reliable_stream_key_or_insert(key.clone());
+        let stream = self.reliable_stream_key_or_insert(room_id, key.clone());
         let handle = self.open_reverse_route(
             publisher,
-            ReverseTarget::Topic {
-                room_id,
-                topic: topic.clone(),
-            },
+            ReverseTarget::Topic { stream },
             RouteNames {
                 room_id: Some(room_id),
                 origin: publisher,
@@ -1383,13 +1411,15 @@ impl ShardRoutingTable {
         if self.control.data_imports.subscribe(key.clone()) != ImportEffect::Install {
             return None;
         }
+        // The local fanout entry exists before the route is installed, so an
+        // installed route always resolves to something.
+        let Some(&stream) = self.control.data_stream_keys.get(&key) else {
+            debug_assert!(false, "installing a data route with no local fanout entry");
+            self.control.data_imports.cancel_install(&key);
+            return None;
+        };
         let installed = self.data.routes.install(
-            RouteAction::Data {
-                lane: DataLane::Realtime,
-                room_id,
-                origin: publisher,
-                topic: topic.clone(),
-            },
+            RouteAction::Data { stream },
             RouteNames {
                 room_id: Some(room_id),
                 origin: publisher,
@@ -1490,13 +1520,11 @@ impl ShardRoutingTable {
         if self.control.reliable_imports.subscribe(key.clone()) != ImportEffect::Install {
             return None;
         }
+        // Minted before the route install, same rule as the reverse route:
+        // an installed route always resolves to something that exists.
+        let stream = self.reliable_stream_key_or_insert(room_id, key.clone());
         let installed = self.data.routes.install(
-            RouteAction::Data {
-                lane: DataLane::Reliable,
-                room_id,
-                origin: publisher,
-                topic: topic.clone(),
-            },
+            RouteAction::Reliable { stream },
             RouteNames {
                 room_id: Some(room_id),
                 origin: publisher,
@@ -1605,9 +1633,14 @@ impl ShardRoutingTable {
         if self.control.imports.subscribe(meta.id) != ImportEffect::Install {
             return None;
         }
+        let Some(&room) = self.control.room_keys.get(&room_id) else {
+            debug_assert!(false, "installing an audio route for an unknown room");
+            self.control.imports.cancel_install(&meta.id);
+            return None;
+        };
         let installed = self.data.routes.install(
             RouteAction::Audio {
-                room_id,
+                room,
                 origin: meta.origin,
                 track_id: meta.id,
             },
@@ -1778,32 +1811,26 @@ impl ShardRoutingTable {
     }
 
     #[inline]
-    pub fn route_data(
-        &mut self,
-        _room_id: RoomId,
-        origin: ParticipantId,
-        topic: &Topic,
-        pkt: &[u8],
-        ctx: &mut impl RoutingContext,
-    ) {
-        let stream_id = DataStreamId::new(origin, topic.clone());
-        let Some(route) = self.data_stream_mut(&stream_id) else {
+    pub fn route_data(&mut self, stream: DataStreamKey, pkt: &[u8], ctx: &mut impl RoutingContext) {
+        let Some(route) = self.data.data_streams.get_mut(stream) else {
+            debug_assert!(false, "a data fanout key must resolve to a stream");
             return;
         };
+        let origin = route.id.publisher_id;
+        let local_origin = ctx.is_local(&origin);
         // `published` marks the shard that hosts the publisher, and only that
         // shard sets it. A destination reaches here too — with a route it
         // installed for the stream and a publisher that is not its own — so the
         // flag tracks locality rather than being universally true.
         debug_assert_eq!(
-            route.published,
-            ctx.is_local(&origin),
+            route.published, local_origin,
             "the published flag must mean 'this shard hosts the publisher'"
         );
         for &subscriber in &route.local_subscribers {
-            ctx.forward_sctp(subscriber, origin, topic, pkt);
+            ctx.forward_sctp(subscriber, origin, &route.id.topic, pkt);
         }
 
-        if ctx.is_local(&origin) {
+        if local_origin {
             let playout = ctx.wall().ntp();
             for entry in route.remote_subscriber_shards.values_mut() {
                 let env = entry.remote.next_envelope(playout);
@@ -1897,19 +1924,24 @@ impl ShardRoutingTable {
 
     pub fn route_reliable_data(
         &mut self,
-        room_id: RoomId,
-        origin: ParticipantId,
-        topic: &Topic,
+        stream: ReliableStreamKey,
         frame: &[u8],
         ctx: &mut impl RoutingContext,
     ) {
+        let Some(entry) = self.data.reliable_streams.get(stream) else {
+            debug_assert!(false, "a reliable fanout key must resolve to a stream");
+            return;
+        };
+        let room_id = entry.room_id;
+        let origin = entry.id.publisher_id;
+        let topic = entry.id.topic.clone();
         let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let local_origin = ctx.is_local(&origin);
         if local_origin {
             let playout = ctx.wall().ntp();
-            if let Some(remotes) = room.reliable.remote_routes_mut(origin, topic) {
+            if let Some(remotes) = room.reliable.remote_routes_mut(origin, &topic) {
                 let frames: Vec<(ShardId, MediaEnvelope)> = remotes
                     .map(|remote| (remote.shard_id, remote.next_envelope(playout)))
                     .collect();
@@ -1918,7 +1950,8 @@ impl ShardRoutingTable {
                 }
             }
         }
-        room.reliable.route(origin, topic, frame, local_origin, ctx);
+        room.reliable
+            .route(origin, &topic, frame, local_origin, ctx);
     }
 
     pub fn route_reliable_control(
@@ -2474,7 +2507,10 @@ mod tests {
         table.on_remote_reliable_publisher(room, publisher, &topic, now(), &wall());
         table.register_reliable_data_subscriber(room, subscribers[1], topic.clone());
 
-        table.route_reliable_data(room, publisher, &topic, b"hello", &mut ctx);
+        let stream = table
+            .reliable_stream_key(&DataStreamId::new(publisher, topic.clone()))
+            .expect("the imported stream should exist once its publisher is announced");
+        table.route_reliable_data(stream, b"hello", &mut ctx);
 
         let delivered = ctx.forwarded_sctp.borrow().clone();
         for (n, subscriber) in subscribers.iter().enumerate() {
@@ -2727,14 +2763,6 @@ mod tests {
             .register_reliable_data_publisher(room, publisher, topic.clone(), now(), &wall())
             .expect("publishing a reliable topic opens its reverse route");
         assert_eq!(table.data.routes.len(), 1);
-        assert!(
-            matches!(
-                table.resolve_reverse(target.route, target.epoch),
-                Some((origin, ReverseTarget::Topic { topic: t, .. }))
-                    if origin == publisher && *t == topic
-            ),
-            "an ack resolves to its publisher and topic through the route alone"
-        );
 
         let stream_id = DataStreamId::new(publisher, topic.clone());
         let stream_key = table
@@ -2743,6 +2771,14 @@ mod tests {
             .get(&stream_id)
             .copied()
             .expect("publishing a reliable topic must mint its arena key");
+        assert!(
+            matches!(
+                table.resolve_reverse(target.route, target.epoch),
+                Some((origin, ReverseTarget::Topic { stream }))
+                    if origin == publisher && *stream == stream_key
+            ),
+            "an ack resolves to its publisher and topic through the route alone"
+        );
         assert_eq!(
             table.reliable_stream(stream_key).map(|s| &s.id),
             Some(&stream_id),
@@ -2833,14 +2869,17 @@ mod tests {
             "opening the reverse route must also stamp the track's own descriptor"
         );
 
+        let fanout_key = table
+            .fanout_of(&track.id)
+            .expect("track known to this shard");
         // Every subscribing shard addresses the same id.
         for shard in 1..8u8 {
             let _ = shard;
             assert!(
                 matches!(
                     table.resolve_reverse(target.route, target.epoch),
-                    Some((origin, ReverseTarget::Track { track_id, .. }))
-                        if origin == publisher && *track_id == track.id
+                    Some((origin, ReverseTarget::Track { track }))
+                        if origin == publisher && *track == fanout_key
                 ),
                 "every subscriber resolves through the one route"
             );
