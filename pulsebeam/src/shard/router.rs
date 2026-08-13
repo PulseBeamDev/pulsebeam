@@ -1553,6 +1553,11 @@ impl ShardRoutingTable {
         ctx: &mut impl RoutingContext,
     ) {
         let Some(route) = self.data.tracks.get_mut(fanout) else {
+            // Unreachable unless the arenas have desynced: a fanout key only
+            // ever comes from a route the control plane installed, and
+            // `track_keys`/`tracks` are created and removed together. A
+            // silent drop here is vanishing media.
+            debug_assert!(false, "a video fanout key must resolve to a track");
             return;
         };
         let track_id = route.track_id;
