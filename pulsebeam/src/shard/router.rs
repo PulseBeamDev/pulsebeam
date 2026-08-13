@@ -130,6 +130,29 @@ new_key_type! {
     pub(crate) struct ReliableStreamKey;
 }
 
+/// Whether an arriving frame's publisher lives on this shard, decided once by
+/// the caller instead of re-derived per packet.
+///
+/// Every dispatch function that used to compute this itself did so by
+/// hashing the publisher's `ParticipantId` into the registry
+/// (`ctx.is_local`) — despite every call site already knowing the answer
+/// statically: `on_media_frame` only ever dispatches frames that arrived
+/// from another shard (always `Remote`), and the local pipeline only ever
+/// dispatches this shard's own participants (always `Local`). Passing the
+/// fact instead of re-deriving it removes that hash from the forwarding path
+/// entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    Local,
+    Remote,
+}
+
+impl Origin {
+    fn is_local(self) -> bool {
+        matches!(self, Origin::Local)
+    }
+}
+
 /// Pure pub/sub state for a shard: which participants are in which rooms,
 /// which shards subscribe to which tracks, and where remote participants
 /// live.
@@ -1752,10 +1775,16 @@ impl ShardRoutingTable {
     }
 
     #[inline]
-    pub fn route_audio(&mut self, mut ev: AudioRtpEvent, ctx: &mut impl RoutingContext) {
+    pub fn route_audio(
+        &mut self,
+        room: RoomKey,
+        origin: Origin,
+        mut ev: AudioRtpEvent,
+        ctx: &mut impl RoutingContext,
+    ) {
         tracing::trace!(
             target: crate::log::TARGET_AUDIO,
-            room_id = %ev.room_id,
+            room = ?room,
             origin = %ev.origin,
             stream_id = %ev.stream_id.0,
             seq_no = %ev.pkt.seq_no,
@@ -1766,16 +1795,12 @@ impl ShardRoutingTable {
         // per-stream sender handles live in `tracks`.
         let Self { data, control } = self;
         let DataPlane { rooms, tracks, .. } = data;
-        let Some(room_key) = control.room_keys.get(&ev.room_id).copied() else {
-            tracing::warn!(target: crate::log::TARGET_AUDIO, room_id = %ev.room_id, "audio packet dropped: room missing");
-            return;
-        };
-        let Some(room) = rooms.get_mut(room_key) else {
-            tracing::warn!(target: crate::log::TARGET_AUDIO, room_id = %ev.room_id, "audio packet dropped: room missing");
+        let Some(room) = rooms.get_mut(room) else {
+            tracing::warn!(target: crate::log::TARGET_AUDIO, "audio packet dropped: room missing");
             return;
         };
 
-        if ctx.is_local(&ev.origin)
+        if origin.is_local()
             && let Some(track) = control
                 .track_keys
                 .get(&ev.stream_id.0)
@@ -1811,26 +1836,23 @@ impl ShardRoutingTable {
     }
 
     #[inline]
-    pub fn route_data(&mut self, stream: DataStreamKey, pkt: &[u8], ctx: &mut impl RoutingContext) {
+    pub fn route_data(
+        &mut self,
+        stream: DataStreamKey,
+        origin: Origin,
+        pkt: &[u8],
+        ctx: &mut impl RoutingContext,
+    ) {
         let Some(route) = self.data.data_streams.get_mut(stream) else {
             debug_assert!(false, "a data fanout key must resolve to a stream");
             return;
         };
-        let origin = route.id.publisher_id;
-        let local_origin = ctx.is_local(&origin);
-        // `published` marks the shard that hosts the publisher, and only that
-        // shard sets it. A destination reaches here too — with a route it
-        // installed for the stream and a publisher that is not its own — so the
-        // flag tracks locality rather than being universally true.
-        debug_assert_eq!(
-            route.published, local_origin,
-            "the published flag must mean 'this shard hosts the publisher'"
-        );
+        let publisher = route.id.publisher_id;
         for &subscriber in &route.local_subscribers {
-            ctx.forward_sctp(subscriber, origin, &route.id.topic, pkt);
+            ctx.forward_sctp(subscriber, publisher, &route.id.topic, pkt);
         }
 
-        if local_origin {
+        if origin.is_local() {
             let playout = ctx.wall().ntp();
             for entry in route.remote_subscriber_shards.values_mut() {
                 let env = entry.remote.next_envelope(playout);
@@ -1925,6 +1947,7 @@ impl ShardRoutingTable {
     pub fn route_reliable_data(
         &mut self,
         stream: ReliableStreamKey,
+        origin: Origin,
         frame: &[u8],
         ctx: &mut impl RoutingContext,
     ) {
@@ -1933,15 +1956,15 @@ impl ShardRoutingTable {
             return;
         };
         let room_id = entry.room_id;
-        let origin = entry.id.publisher_id;
+        let publisher = entry.id.publisher_id;
         let topic = entry.id.topic.clone();
         let Some(room) = self.room_mut(&room_id) else {
             return;
         };
-        let local_origin = ctx.is_local(&origin);
+        let local_origin = origin.is_local();
         if local_origin {
             let playout = ctx.wall().ntp();
-            if let Some(remotes) = room.reliable.remote_routes_mut(origin, &topic) {
+            if let Some(remotes) = room.reliable.remote_routes_mut(publisher, &topic) {
                 let frames: Vec<(ShardId, MediaEnvelope)> = remotes
                     .map(|remote| (remote.shard_id, remote.next_envelope(playout)))
                     .collect();
@@ -1951,7 +1974,7 @@ impl ShardRoutingTable {
             }
         }
         room.reliable
-            .route(origin, &topic, frame, local_origin, ctx);
+            .route(publisher, &topic, frame, local_origin, ctx);
     }
 
     pub fn route_reliable_control(
@@ -2510,7 +2533,7 @@ mod tests {
         let stream = table
             .reliable_stream_key(&DataStreamId::new(publisher, topic.clone()))
             .expect("the imported stream should exist once its publisher is announced");
-        table.route_reliable_data(stream, b"hello", &mut ctx);
+        table.route_reliable_data(stream, Origin::Remote, b"hello", &mut ctx);
 
         let delivered = ctx.forwarded_sctp.borrow().clone();
         for (n, subscriber) in subscribers.iter().enumerate() {

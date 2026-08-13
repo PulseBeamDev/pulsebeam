@@ -24,7 +24,7 @@ use crate::{
 use str0m::media::Rid;
 
 use super::control::ParticipantShardMeta;
-use super::router::{self, RoutingContext, ShardRoutingTable};
+use super::router::{self, Origin, RoutingContext, ShardRoutingTable};
 
 pub(crate) use super::router::ShardTransport;
 use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame, Topology};
@@ -308,6 +308,9 @@ impl ShardCore {
                     debug_assert!(false, "an audio route's room key must resolve to a room");
                     return;
                 };
+                // `room_id` only fills a field the local-origin path still
+                // needs to carry; the lookup below resolves through `room`
+                // directly, never by hashing it back.
                 let ev = AudioRtpEvent {
                     stream_id: (track_id, None),
                     pkt,
@@ -320,7 +323,7 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.routing.route_audio(ev, &mut ctx);
+                self.routing.route_audio(room, Origin::Remote, ev, &mut ctx);
             }
             (RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let mut ctx = DispatchCtx {
@@ -329,7 +332,8 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.routing.route_data(stream, &bytes, &mut ctx);
+                self.routing
+                    .route_data(stream, Origin::Remote, &bytes, &mut ctx);
             }
             (RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
                 let mut ctx = DispatchCtx {
@@ -338,7 +342,8 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.routing.route_reliable_data(stream, &bytes, &mut ctx);
+                self.routing
+                    .route_reliable_data(stream, Origin::Remote, &bytes, &mut ctx);
             }
             _ => debug_assert!(false, "payload does not match the route action"),
         }
@@ -404,7 +409,9 @@ impl ShardCore {
         };
         while let Some(ev) = self.pipeline.pop_audio_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Audio);
-            self.routing.route_audio(ev, &mut ctx);
+            if let Some(room) = self.routing.control.room_keys.get(&ev.room_id).copied() {
+                self.routing.route_audio(room, Origin::Local, ev, &mut ctx);
+            }
         }
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
@@ -421,14 +428,16 @@ impl ShardCore {
         while let Some(ev) = self.pipeline.pop_data_sctp() {
             let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
             if let Some(stream) = self.routing.data_stream_key(&id) {
-                self.routing.route_data(stream, &ev.pkt, &mut ctx);
+                self.routing
+                    .route_data(stream, Origin::Local, &ev.pkt, &mut ctx);
             }
         }
 
         while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
             let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
             if let Some(stream) = self.routing.reliable_stream_key(&id) {
-                self.routing.route_reliable_data(stream, &ev.pkt, &mut ctx);
+                self.routing
+                    .route_reliable_data(stream, Origin::Local, &ev.pkt, &mut ctx);
             }
         }
     }
