@@ -2,6 +2,10 @@
 //! startup and never again. Carries the sanctioned exception in
 //! `shard::metrics`; nothing else here may share.
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "Arc<ShardMetrics>, one per shard, see module note"
+)]
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
@@ -281,6 +285,10 @@ pub enum ShardEvent {
 #[derive(Clone)]
 pub struct ShardContext {
     pub command_tx: mailbox::Sender<ShardCommand>,
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Arc<ShardMetrics>, one per shard, see module note"
+    )]
     pub metrics: Arc<ShardMetrics>,
 }
 
@@ -338,6 +346,10 @@ pub struct ShardWorker {
     event_tx: mailbox::Sender<ShardEventWrapper>,
     frame_rx: mailbox::Receiver<ShardFrame>,
     router: ChannelTransport,
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Arc<ShardMetrics>, one per shard, see module note"
+    )]
     metrics: Arc<ShardMetrics>,
 
     // Mark !Send
@@ -349,6 +361,11 @@ impl ShardWorker {
     // two sockets, three channel ends, metrics, RNG, clock. Grouping them into
     // a parameter struct would move the same list one level out and add a type
     // whose only purpose is to be destructured here.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::disallowed_types,
+        reason = "Arc<ShardMetrics>, one per shard, see module note"
+    )]
     pub fn new(
         shard_id: ShardId,
         udp_socket: UnifiedSocket,

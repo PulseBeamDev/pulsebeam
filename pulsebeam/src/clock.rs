@@ -90,7 +90,13 @@ impl NtpTime {
 
     /// Bits 47..16 — what the envelope carries.
     pub const fn middle32(self) -> u32 {
-        (self.0 >> MID_SHIFT) as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the middle 32 bits are the wire format; the truncation is the encoding"
+        )]
+        {
+            (self.0 >> MID_SHIFT) as u32
+        }
     }
 
     /// Signed distance to `earlier`, in NTP 32.32 units. Positive when `self` is
@@ -308,6 +314,11 @@ mod tests {
     // Tests assert by panicking; the process ending is the mechanism.
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
+    #![allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp
+    )]
     use super::*;
 
     fn ntp(secs: u64, frac: u64) -> NtpTime {

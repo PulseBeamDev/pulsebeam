@@ -35,6 +35,10 @@
 #[macro_export]
 macro_rules! fatal {
     ($($arg:tt)+) => {{
+        #[allow(
+            clippy::panic,
+            reason = "the sanctioned crash point; see pulsebeam_runtime::fatal"
+        )]
         {
             panic!($($arg)+)
         }

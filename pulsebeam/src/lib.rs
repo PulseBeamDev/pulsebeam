@@ -1,4 +1,15 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unreachable,
+        clippy::string_slice,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::float_cmp,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 //! # Thread-per-core
 //!

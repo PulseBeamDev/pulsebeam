@@ -12,6 +12,10 @@ use pulsebeam_runtime::rand::{RngCore, SeedableRng};
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
+#[allow(
+    clippy::disallowed_types,
+    reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
+)]
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
@@ -384,7 +388,15 @@ impl NodeBuilder {
                 mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
             let shard_event_tx = shard_event_tx.clone();
             let frame_txs = frame_txs.clone();
+            #[allow(
+                clippy::disallowed_types,
+                reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
+            )]
             let occupancy = Arc::new(ShardMetrics::new());
+            #[allow(
+                clippy::disallowed_types,
+                reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
+            )]
             let shard_occupancy = Arc::new(ShardMetrics::new());
 
             if use_shared_runtime {
@@ -432,6 +444,10 @@ impl NodeBuilder {
                                     )
                                 });
                             tune_current_data_thread(core_id);
+                            #[allow(
+                                clippy::disallowed_methods,
+                                reason = "the shard's dedicated OS thread enters its async runtime exactly once, here"
+                            )]
                             rt.block_on(async move {
                                 let udp_sock = match udp_sock.into_unified_socket() {
                                     Ok(sock) => sock,

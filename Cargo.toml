@@ -82,3 +82,140 @@ overflow-checks = true
 
 # Enough symbols for useful backtraces/profiling.
 debug = 1
+
+# Lints shared by every hand-written crate. `make lint-check` gates on these.
+#
+# Three tiers, and the tiering is measured rather than guessed — the counts came
+# from a clippy JSON run over `pulsebeam/src`, split at each file's first
+# `#[cfg(test)]`:
+#
+#   deny     already clean, so the gate stays green and a regression is loud.
+#   warn     small, mostly auto-fixable; promoted to deny once they settle.
+#   absent   deliberately not enabled — see the note at the bottom. A lint that
+#            fires 246 times is not a rule, it is a background hum.
+#
+# Architectural rules (Arc/Mutex/atomics, wall clock, blocking) live in
+# clippy.toml, because they need a `reason` string per entry.
+[workspace.lints.clippy]
+
+# -- whole groups ------------------------------------------------------------
+# `correctness` is deny-by-default already; `suspicious` is only warn, so it was
+# passing through this gate unenforced. Both are clean, so promoting costs
+# nothing and a regression stops the build instead of scrolling past.
+suspicious = { level = "deny", priority = -1 }
+
+# -- architecture (configured in clippy.toml, levelled here) -----------------
+# Shared state, ambient clock, blocking. Each entry there carries a `reason`.
+disallowed_types = "deny"
+disallowed_methods = "deny"
+await_holding_lock = "deny"     # mostly covered by the `disallowed_types` ban
+                                # on Mutex/RwLock; this catches parking_lot
+
+# -- overflow ----------------------------------------------------------------
+# `overflow-checks` is off in release, so a bare `+`/`-`/`*` that leaves range
+# does not stop — it yields a plausible number the pacer, the allocator or a
+# parser then treats as real. Every operation says which behaviour it wants:
+# `saturating_` to clamp, `checked_` to fall back, `wrapping_` where a sequence
+# or era boundary makes wrapping correct.
+#
+# Test modules allow it in their own blocks: a fixture that overflows should
+# fail the test rather than clamp into a passing state.
+arithmetic_side_effects = "deny"
+
+# Narrowing is the same failure with a different shape: `as` never fails, so a
+# value that does not fit becomes a smaller plausible one — the truncation that
+# produced a zero-width render target and a bogus `StreamStats` bitrate. Say
+# which behaviour is wanted: `try_into()` to handle it, `u32::try_from(x)
+# .unwrap_or(MAX)` to clamp, `as` behind an `#[allow]` only where the range is
+# established locally.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+
+# -- indexing ----------------------------------------------------------------
+# An out-of-bounds index is a panic, and a panic is the whole node under
+# `panic = "abort"`. `debug_assert!` does not cover this: it compiles out in
+# release, which is precisely where the malformed packet arrives.
+#
+# The fix is almost never an `#[allow]` — it is `.get()?`, `first()`, or
+# `get_mut()`, which turns a crash into the error the caller already handles.
+# Where indexing is genuinely proven (a fixed-size array indexed by a masked
+# value), take an `#[allow]` with a reason saying what bounds it, the same way
+# the overflow rule above is escaped.
+indexing_slicing = "deny"
+
+# -- crashing --------------------------------------------------------------
+# `panic = "abort"`, one process, every participant on the node inside it. A
+# panic in one request handler drops calls that had nothing to do with it, so
+# ending the process is a decision that has to be written down rather than a
+# thing an expression does.
+#
+# There is exactly one sanctioned crash point, `pulsebeam::fatal!`, which
+# carries the `#[allow]` internally. Everything below routes through it or does
+# not compile. Tests allow these in their own module blocks: a test process
+# ending is the assertion mechanism, not an outage.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+exit = "deny"
+string_slice = "deny"           # panics on a non-char-boundary byte index
+unimplemented = "deny"
+todo = "deny"
+
+# -- correctness -------------------------------------------------------------
+float_cmp = "deny"              # bitrates and loss ratios are compared all over
+mem_forget = "deny"
+
+# -- debug output must not reach a release build -----------------------------
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"           # tracing, not eprintln; a stray one survived a
+                                # debugging session more than once
+
+# -- allocation and copying on the forwarding path ---------------------------
+# The costs this codebase keeps having to find by hand.
+redundant_clone = "deny"
+assigning_clones = "deny"
+or_fun_call = "deny"            # eager allocation in an `unwrap_or`
+needless_collect = "deny"
+inefficient_to_string = "deny"
+box_collection = "deny"
+rc_buffer = "deny"
+large_stack_arrays = "deny"
+result_large_err = "deny"
+large_enum_variant = "deny"     # a big variant makes every value of the enum big
+mutex_atomic = "deny"
+
+# -- readability -------------------------------------------------------------
+manual_clamp = "deny"
+question_mark = "deny"
+manual_let_else = "deny"
+match_same_arms = "deny"
+semicolon_if_nothing_returned = "deny"
+uninlined_format_args = "deny"
+explicit_iter_loop = "deny"
+redundant_closure_for_method_calls = "deny"
+empty_line_after_doc_comments = "deny"
+too_many_arguments = "deny"
+
+# Deliberately NOT enabled, so nobody re-litigates it from scratch:
+#
+#   items_after_statements  Enabled on the assumption its hits were sloppiness.
+#                      They were not: every one is an enum or const deliberately
+#                      scoped to the function that uses it — `Target` and `Act`
+#                      in shard/core.rs exist so a dispatch shape cannot be
+#                      referenced from anywhere else. Satisfying the lint means
+#                      hoisting private types to module scope, which is worse.
+#   unused_results     171 production sites, nearly all `HashMap::insert`
+#                      returning the old value or `HashSet::insert` returning a
+#                      bool. `#[must_use]` on our own fallible types plus
+#                      `unused_must_use` gets the property; this lint would only
+#                      spend the meaning of `let _ =`, which currently marks a
+#                      deliberately dropped value.
+#   must_use_candidate,
+#   missing_panics_doc  pedantic noise for a crate with no external consumers.
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+# Not enabled: `unreachable_pub` (179 hits). Visibility hygiene worth having,
+# but not at that volume in the same change as everything else.

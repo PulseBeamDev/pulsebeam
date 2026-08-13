@@ -167,6 +167,10 @@ impl TemporalDdGenerator {
             .get(template_index)
             .cloned()
             .unwrap_or_default();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "reduced mod MAX_TEMPLATES, which is 64"
+        )]
         let template_id = ((template_index
             .saturating_add(usize::from(self.structure.template_id_offset)))
             % crate::dd::model::MAX_TEMPLATES) as u8;

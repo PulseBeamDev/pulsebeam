@@ -9,6 +9,17 @@
 //!
 //! The restriction applies above this line. See `docs/thread-per-core.md`;
 //! nothing here licenses an `Arc` inside a shard.
+#![allow(clippy::disallowed_types)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unreachable,
+        clippy::string_slice,
+        clippy::disallowed_methods,
+        clippy::float_cmp,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 pub mod buggify;
 pub mod collections;

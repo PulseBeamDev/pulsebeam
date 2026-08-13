@@ -1,3 +1,12 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::string_slice,
+    clippy::indexing_slicing
+)] // test / simulation support
 //! A bottleneck link for the simulator: capacity, queueing delay, loss, and tail drop.
 //!
 //! turmoil models latency and loss but has no notion of capacity, so a simulated path will carry
@@ -66,7 +75,14 @@ impl Capacity {
         if !v.is_finite() || v <= 0.0 {
             return 0;
         }
-        v.min(u64::MAX as f64) as u64
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to a positive, finite value below u64::MAX above"
+        )]
+        {
+            v.min(u64::MAX as f64) as u64
+        }
     }
 
     fn bits_per_sec_at(&self, elapsed: Duration) -> u64 {

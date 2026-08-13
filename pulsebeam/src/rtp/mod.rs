@@ -21,6 +21,10 @@ pub mod conformance;
 #[cfg(test)]
 mod switch_test;
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "str0m's RtpWrite::new takes payload: Arc<[u8]>; kept core-local, see module note"
+)]
 use std::sync::Arc;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::rtcp::SenderInfo;
@@ -55,6 +59,10 @@ pub struct AudioRtpPacket {
 /// redundant header data (sequence_number, timestamp, csrc list, etc.) is dropped
 /// at ingress so every ring-slot stays as small as possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "str0m's RtpWrite::new takes payload: Arc<[u8]>; kept core-local, see module note"
+)]
 pub struct RtpPacket {
     pub ssrc: Ssrc,
     pub marker: bool,
@@ -78,6 +86,10 @@ pub struct RtpPacket {
 }
 
 impl Default for RtpPacket {
+    #[allow(
+        clippy::disallowed_types,
+        reason = "str0m's RtpWrite::new takes payload: Arc<[u8]>; kept core-local, see module note"
+    )]
     fn default() -> Self {
         Self {
             ssrc: 1234.into(),
@@ -137,6 +149,10 @@ impl RtpPacket {
     /// a compromise — str0m's `RtpWrite::new` demands `Arc<[u8]>` at egress, so a
     /// pooled block or `Rc<[u8]>` would cost a second copy on the way out.
     /// Revisit only if the str0m fork stops requiring `Arc<[u8]>`.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "copies into a fresh Arc<[u8]> rather than sharing, see module note"
+    )]
     pub fn to_transit(&self) -> Self {
         let mut ext_vals = self.ext_vals.clone();
 
@@ -176,6 +192,10 @@ impl RtpPacket {
     /// Done here rather than in `to_transit` because the publisher pays that
     /// once per destination while a destination pays it once, and the publisher
     /// is the busier core: it also normalizes, caches, and fans out locally.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "re-anchors the Arc<dyn Any> extension map entry to this core, see module note"
+    )]
     pub fn rehome_extensions(&mut self) {
         let Some(dd) = self
             .ext_vals
