@@ -23,7 +23,8 @@ use crate::{
 };
 use str0m::media::Rid;
 
-use super::router::{self, ParticipantShardMeta, RoutingContext, ShardRoutingTable};
+use super::control::ParticipantShardMeta;
+use super::router::{self, RoutingContext, ShardRoutingTable};
 
 pub(crate) use super::router::ShardTransport;
 use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame, Topology};
@@ -242,7 +243,7 @@ impl ShardCore {
         now: Instant,
         router: &impl ShardTransport,
     ) {
-        let entry = match self.routing.routes.resolve(&env) {
+        let entry = match self.routing.data.routes.resolve(&env) {
             Ok(entry) => entry,
             Err(err) => {
                 // A stale epoch is expected after a teardown and must never
@@ -1013,8 +1014,11 @@ impl ShardCore {
                 self.on_reverse_frame(env, body, router);
             }
             ShardFrame::Stats { env, stats } => {
-                let Some(RouteAction::Video { local_track, .. }) =
-                    self.routing.routes.resolve_action(env.route, env.epoch)
+                let Some(RouteAction::Video { local_track, .. }) = self
+                    .routing
+                    .data
+                    .routes
+                    .resolve_action(env.route, env.epoch)
                 else {
                     // The route was retired while this was in flight.
                     return;
@@ -1281,7 +1285,7 @@ mod test {
         add_participant(&mut core, &router, p, r);
 
         assert!(core.registry.contains(&p));
-        assert!(core.routing.rooms.contains_key(&r));
+        assert!(core.routing.data.rooms.contains_key(&r));
         let mut core2 = new_core();
         core2.on_command(
             ShardCommand::AddParticipant(Box::new(make_participant_cfg(p, r))),
@@ -1309,7 +1313,7 @@ mod test {
             "participant must be gone from the registry"
         );
         assert!(
-            !core.routing.rooms.contains_key(&r),
+            !core.routing.data.rooms.contains_key(&r),
             "last member leaving must remove the room"
         );
     }
@@ -1375,7 +1379,7 @@ mod test {
         );
 
         assert!(
-            !core.routing.rooms.contains_key(&rid),
+            !core.routing.data.rooms.contains_key(&rid),
             "one register (deduplicated) + one unregister must fully release the room; \
          a leaked refcount would leave a phantom remote_shards entry forever"
         );
@@ -1413,7 +1417,7 @@ mod test {
         );
 
         assert!(
-            core.routing.rooms[&rid]
+            core.routing.data.rooms[&rid]
                 .remote_shards
                 .contains(&remote_shard),
             "shard must stay registered while participant b is still remote there"
@@ -1430,7 +1434,7 @@ mod test {
         );
 
         assert!(
-            !core.routing.rooms.contains_key(&rid),
+            !core.routing.data.rooms.contains_key(&rid),
             "room must be removed once the final remote leaves"
         );
     }
