@@ -67,7 +67,6 @@ pub(crate) struct ControlPlane {
     pub reliable_imports: ImportTable<DataStreamId>,
     pub participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
     pub local_participants: HashMap<ParticipantId, ParticipantKey>,
-    pub remote_participant_counts: HashMap<(RoomId, ShardId), usize>,
     /// Reverse routes this shard opened for the streams it publishes, so they
     /// can be retired when those streams go away.
     pub track_reverse_routes: HashMap<TrackId, ReverseRoute>,
@@ -100,7 +99,6 @@ impl ControlPlane {
             reliable_imports: ImportTable::new(),
             participant_shards: HashMap::new(),
             local_participants: HashMap::new(),
-            remote_participant_counts: HashMap::new(),
             track_reverse_routes: HashMap::new(),
             topic_reverse_routes: HashMap::new(),
             topic_reverse_targets: HashMap::new(),

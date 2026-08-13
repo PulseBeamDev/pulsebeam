@@ -846,14 +846,9 @@ impl ShardRoutingTable {
         }
 
         self.control.participant_shards.insert(participant_id, meta);
-        self.room_or_insert(room_id, rng)
-            .insert_remote_shard(shard_id);
-        let count = self
-            .control
-            .remote_participant_counts
-            .entry((room_id, shard_id))
-            .or_insert(0);
-        *count = count.saturating_add(1);
+        let room = self.room_or_insert(room_id, rng);
+        room.insert_remote_shard(shard_id);
+        room.increment_remote_participant_count(shard_id);
     }
 
     pub fn unregister_remote_participant(
@@ -885,29 +880,16 @@ impl ShardRoutingTable {
     }
 
     fn release_remote_count(&mut self, meta: ParticipantShardMeta) {
-        let key = (meta.room_id, meta.shard_id);
-        let should_remove_shard = match self.control.remote_participant_counts.get_mut(&key) {
-            Some(count) => {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.control.remote_participant_counts.remove(&key);
-                    true
-                } else {
-                    false
-                }
-            }
-            None => true,
+        let Some(room) = self.room_mut(&meta.room_id) else {
+            return;
         };
-
-        if !should_remove_shard {
+        if !room.decrement_remote_participant_count(meta.shard_id) {
             return;
         }
 
-        if let Some(room) = self.room_mut(&meta.room_id) {
-            room.remove_remote_shard(meta.shard_id);
-            if room.members.is_empty() && room.remote_shards.is_empty() {
-                self.remove_room(&meta.room_id);
-            }
+        room.remove_remote_shard(meta.shard_id);
+        if room.members.is_empty() && room.remote_shards.is_empty() {
+            self.remove_room(&meta.room_id);
         }
     }
 

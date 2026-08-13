@@ -176,6 +176,10 @@ pub(crate) struct RoomFanout {
     /// linearly-scanned `Vec` rather than a hash index — the same trade
     /// `TrackRoute::remote_routes` makes for the same reason.
     pub remote_shards: Vec<ShardId>,
+    /// How many remote participants each shard has registered into this
+    /// room, refcounted so `remote_shards` can be dropped once the count on
+    /// its shard reaches zero. Same linear-scan trade as `remote_shards`.
+    remote_participant_counts: Vec<(ShardId, u32)>,
     /// Audio tracks this shard has installed a destination route for, so they
     /// can be retired when the room goes away.
     pub audio_imports: FastIndexSet<TrackId>,
@@ -200,6 +204,7 @@ impl RoomFanout {
             room_id,
             members: fast_set(),
             remote_shards: Vec::new(),
+            remote_participant_counts: Vec::new(),
             audio_imports: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
             data_stream_keys: fast_set(),
@@ -220,6 +225,45 @@ impl RoomFanout {
     pub fn remove_remote_shard(&mut self, shard_id: ShardId) {
         if let Some(pos) = self.remote_shards.iter().position(|&s| s == shard_id) {
             self.remote_shards.swap_remove(pos);
+        }
+    }
+
+    /// Bumps this shard's remote-participant refcount and returns the new
+    /// value.
+    pub fn increment_remote_participant_count(&mut self, shard_id: ShardId) -> u32 {
+        match self
+            .remote_participant_counts
+            .iter_mut()
+            .find(|(s, _)| *s == shard_id)
+        {
+            Some((_, count)) => {
+                *count = count.saturating_add(1);
+                *count
+            }
+            None => {
+                self.remote_participant_counts.push((shard_id, 1));
+                1
+            }
+        }
+    }
+
+    /// Drops this shard's remote-participant refcount by one and reports
+    /// whether it reached zero (and was removed).
+    pub fn decrement_remote_participant_count(&mut self, shard_id: ShardId) -> bool {
+        let Some(pos) = self
+            .remote_participant_counts
+            .iter()
+            .position(|(s, _)| *s == shard_id)
+        else {
+            return true;
+        };
+        let count = &mut self.remote_participant_counts[pos].1;
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.remote_participant_counts.swap_remove(pos);
+            true
+        } else {
+            false
         }
     }
 }
