@@ -12,7 +12,7 @@ use crate::route::{ImportTable, ReverseRoute, RouteId};
 use crate::track::Topic;
 
 use super::participants::ParticipantHandle;
-use super::router::LocalTrackKey;
+use super::router::{LocalTrackKey, RoomKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParticipantShardMeta {
@@ -43,11 +43,15 @@ pub(crate) struct TrackReverseTarget {
 }
 
 pub(crate) struct ControlPlane {
+    /// Names to keys. Read when a room gets its first member or remote
+    /// registration, never per packet.
+    pub room_keys: HashMap<RoomId, RoomKey>,
     /// Names to keys. Read when a track is published, subscribed or torn
     /// down, never per packet.
     pub track_keys: HashMap<TrackId, LocalTrackKey>,
-    // Invariant: `track_keys` and `DataPlane::tracks` are created and removed
-    // together, so a key handed to a route always resolves.
+    // Invariant: `room_keys`/`track_keys` and `DataPlane::rooms`/`tracks` are
+    // created and removed together, so a key handed to a route always
+    // resolves.
     /// Lifecycle of each stream imported from another shard, deciding when a
     /// cluster route is installed and retired.
     pub imports: ImportTable<TrackId>,
@@ -81,6 +85,7 @@ pub(crate) struct ControlPlane {
 impl ControlPlane {
     pub fn new() -> Self {
         Self {
+            room_keys: HashMap::new(),
             track_keys: HashMap::new(),
             imports: ImportTable::new(),
             data_imports: ImportTable::new(),

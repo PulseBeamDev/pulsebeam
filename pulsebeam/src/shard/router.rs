@@ -117,6 +117,9 @@ new_key_type! {
     /// point, since a name that means something everywhere is a name every hop
     /// has to hash.
     pub(crate) struct LocalTrackKey;
+
+    /// A room's fanout on this shard, dense and `Copy` for the same reason.
+    pub(crate) struct RoomKey;
 }
 
 /// Pure pub/sub state for a shard: which participants are in which rooms,
@@ -176,6 +179,41 @@ impl ShardRoutingTable {
         }
     }
 
+    /// The fanout for a room name. Control path only, like [`Self::fanout_of`].
+    pub(crate) fn room(&self, room_id: &RoomId) -> Option<&RoomFanout> {
+        let key = *self.control.room_keys.get(room_id)?;
+        self.data.rooms.get(key)
+    }
+
+    fn room_mut(&mut self, room_id: &RoomId) -> Option<&mut RoomFanout> {
+        let key = *self.control.room_keys.get(room_id)?;
+        self.data.rooms.get_mut(key)
+    }
+
+    pub(crate) fn has_room(&self, room_id: &RoomId) -> bool {
+        self.control.room_keys.contains_key(room_id)
+    }
+
+    /// The fanout for a room name, creating it if this shard has not seen the
+    /// room before. Control path only.
+    fn room_or_insert(&mut self, room_id: RoomId, rng: &mut impl rand::RngCore) -> &mut RoomFanout {
+        let Self { data, control } = self;
+        let key = *control
+            .room_keys
+            .entry(room_id)
+            .or_insert_with(|| data.rooms.insert(RoomFanout::new(rng)));
+        let Some(room) = data.rooms.get_mut(key) else {
+            pulsebeam_runtime::fatal!("room_keys and rooms are created together")
+        };
+        room
+    }
+
+    fn remove_room(&mut self, room_id: &RoomId) {
+        if let Some(key) = self.control.room_keys.remove(room_id) {
+            self.data.rooms.remove(key);
+        }
+    }
+
     // -- local room membership -------------------------------------------
 
     pub fn add_local_member(
@@ -191,12 +229,7 @@ impl ShardRoutingTable {
             .local_participants
             .insert(participant_id, handle);
         debug_assert!(previous.is_none(), "duplicate local participant route");
-        self.data
-            .rooms
-            .entry(room_id)
-            .or_insert_with(|| RoomFanout::new(rng))
-            .members
-            .insert(handle);
+        self.room_or_insert(room_id, rng).members.insert(handle);
     }
 
     /// Removes a local participant from its room and evicts its audio
@@ -211,7 +244,7 @@ impl ShardRoutingTable {
     ) {
         let removed_handle = self.control.local_participants.remove(participant_id);
         debug_assert!(removed_handle.is_some());
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let Some(removed_handle) = removed_handle else {
@@ -247,11 +280,11 @@ impl ShardRoutingTable {
         if room.members.is_empty() {
             self.retire_room_audio_routes(room_id, now);
         }
-        let Some(room) = self.data.rooms.get(&room_id) else {
+        let Some(room) = self.room(&room_id) else {
             return;
         };
         if room.members.is_empty() && room.remote_shards.is_empty() {
-            self.data.rooms.remove(&room_id);
+            self.remove_room(&room_id);
         }
     }
 
@@ -530,10 +563,7 @@ impl ShardRoutingTable {
         }
 
         self.control.participant_shards.insert(participant_id, meta);
-        self.data
-            .rooms
-            .entry(room_id)
-            .or_insert_with(|| RoomFanout::new(rng))
+        self.room_or_insert(room_id, rng)
             .remote_shards
             .insert(shard_id);
         let count = self
@@ -591,10 +621,10 @@ impl ShardRoutingTable {
             return;
         }
 
-        if let Some(room) = self.data.rooms.get_mut(&meta.room_id) {
+        if let Some(room) = self.room_mut(&meta.room_id) {
             room.remote_shards.swap_remove(&meta.shard_id);
             if room.members.is_empty() && room.remote_shards.is_empty() {
-                self.data.rooms.remove(&meta.room_id);
+                self.remove_room(&meta.room_id);
             }
         }
     }
@@ -733,7 +763,7 @@ impl ShardRoutingTable {
         publisher: ParticipantId,
         topic: Topic,
     ) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let all_publisher_subscribers = room
@@ -761,7 +791,7 @@ impl ShardRoutingTable {
         publisher: ParticipantId,
         topic: &Topic,
     ) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let key = DataStreamId::new(publisher, topic.clone());
@@ -791,7 +821,7 @@ impl ShardRoutingTable {
         wall: &WallAnchor,
     ) -> Option<ShardEvent> {
         let handle = self.control.local_participants.get(&subscriber).copied()?;
-        let room = self.data.rooms.get_mut(&room_id)?;
+        let room = self.room_mut(&room_id)?;
         match publisher {
             Some(publisher) => {
                 let route = room
@@ -865,7 +895,7 @@ impl ShardRoutingTable {
         let Some(handle) = self.control.local_participants.get(&subscriber).copied() else {
             return false;
         };
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return false;
         };
         // Publishers whose destination route this shard no longer needs. Held
@@ -941,7 +971,7 @@ impl ShardRoutingTable {
         publisher: Option<ParticipantId>,
         remote: Option<RemoteRoute>,
     ) -> Vec<ParticipantId> {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return Vec::new();
         };
         match publisher {
@@ -984,7 +1014,7 @@ impl ShardRoutingTable {
         topic: &Topic,
         publisher: Option<ParticipantId>,
     ) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         match publisher {
@@ -1105,12 +1135,12 @@ impl ShardRoutingTable {
         ctx: &mut impl RoutingContext,
     ) -> Option<ShardEvent> {
         let publisher = track.meta.origin;
-        let Some(_room) = self.data.rooms.get(&room_id) else {
+        let Some(_room) = self.room(&room_id) else {
             tracing::debug!(%room_id, "publish_track: room missing on this shard");
             return None;
         };
         self.adopt_track_reverse_target(&track);
-        let room = self.data.rooms.get(&room_id)?;
+        let room = self.room(&room_id)?;
         let tracks = std::slice::from_ref(&track);
         let has_members = !room.members.is_empty();
         for &participant in &room.members {
@@ -1131,7 +1161,7 @@ impl ShardRoutingTable {
     /// Retire a destination-side audio route. Idempotent, so a redelivered
     /// unpublish or a room teardown that races it cannot desync the table.
     fn retire_audio_route(&mut self, room_id: RoomId, track_id: TrackId, now: Instant) {
-        if let Some(room) = self.data.rooms.get_mut(&room_id)
+        if let Some(room) = self.room_mut(&room_id)
             && !room.audio_imports.swap_remove(&track_id)
         {
             return;
@@ -1145,7 +1175,7 @@ impl ShardRoutingTable {
     /// Every audio route this shard installed for `room_id`, retired together
     /// when the room no longer has local members.
     fn retire_room_audio_routes(&mut self, room_id: RoomId, now: Instant) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let tracks: Vec<TrackId> = room.audio_imports.iter().copied().collect();
@@ -1257,7 +1287,7 @@ impl ShardRoutingTable {
         topic: &Topic,
         handle: ParticipantHandle,
     ) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let key = DataStreamId::new(publisher, topic.clone());
@@ -1288,7 +1318,7 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ShardEvent> {
-        let room = self.data.rooms.get_mut(&room_id)?;
+        let room = self.room_mut(&room_id)?;
         let wildcard_subscribers = room
             .all_publisher_subscriptions
             .local_by_topic
@@ -1372,12 +1402,12 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ShardEvent> {
-        let room = self.data.rooms.get(&room_id)?;
+        let room = self.room(&room_id)?;
         if !room.reliable.has_local_subscribers(topic) {
             return None;
         }
         let (route, epoch) = self.install_reliable_route(room_id, publisher, topic, now, wall)?;
-        if let Some(room) = self.data.rooms.get_mut(&room_id) {
+        if let Some(room) = self.room_mut(&room_id) {
             room.reliable.mark_imported(publisher, topic.clone());
         }
         Some(ShardEvent::Relay(Topology::ReliableTopicSubscribed {
@@ -1400,7 +1430,7 @@ impl ShardRoutingTable {
         publisher: Option<ParticipantId>,
         remote: Option<RemoteRoute>,
     ) -> Vec<ParticipantId> {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return Vec::new();
         };
         match (publisher, remote) {
@@ -1424,7 +1454,7 @@ impl ShardRoutingTable {
         topic: &Topic,
         publisher: Option<ParticipantId>,
     ) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         match publisher {
@@ -1471,7 +1501,7 @@ impl ShardRoutingTable {
             }
         };
         self.control.imports.on_installed(&meta.id, route, epoch);
-        if let Some(room) = self.data.rooms.get_mut(&room_id) {
+        if let Some(room) = self.room_mut(&room_id) {
             room.audio_imports.insert(meta.id);
         }
         Some(ShardEvent::Relay(Topology::TrackSubscribed {
@@ -1488,7 +1518,7 @@ impl ShardRoutingTable {
         now: Instant,
         ctx: &mut impl RoutingContext,
     ) {
-        if let Some(room) = self.data.rooms.get_mut(&room_id) {
+        if let Some(room) = self.room_mut(&room_id) {
             for &track_id in track_ids {
                 room.audio_selector.remove_track((track_id, None));
             }
@@ -1498,7 +1528,7 @@ impl ShardRoutingTable {
             self.control.track_reverse_targets.remove(&track_id);
             self.release_fanout_if_idle(&track_id);
         }
-        let Some(room) = self.data.rooms.get(&room_id) else {
+        let Some(room) = self.room(&room_id) else {
             tracing::debug!(%room_id, "unpublish_tracks: room missing on this shard");
             return;
         };
@@ -1570,7 +1600,11 @@ impl ShardRoutingTable {
         // per-stream sender handles live in `tracks`.
         let Self { data, control } = self;
         let DataPlane { rooms, tracks, .. } = data;
-        let Some(room) = rooms.get_mut(&ev.room_id) else {
+        let Some(room_key) = control.room_keys.get(&ev.room_id).copied() else {
+            tracing::warn!(target: crate::log::TARGET_AUDIO, room_id = %ev.room_id, "audio packet dropped: room missing");
+            return;
+        };
+        let Some(room) = rooms.get_mut(room_key) else {
             tracing::warn!(target: crate::log::TARGET_AUDIO, room_id = %ev.room_id, "audio packet dropped: room missing");
             return;
         };
@@ -1619,7 +1653,7 @@ impl ShardRoutingTable {
         pkt: &[u8],
         ctx: &mut impl RoutingContext,
     ) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let stream_id = DataStreamId::new(origin, topic.clone());
@@ -1658,7 +1692,7 @@ impl ShardRoutingTable {
         now: Instant,
         wall: &WallAnchor,
     ) -> Option<ReverseRoute> {
-        let room = self.data.rooms.get_mut(&room_id)?;
+        let room = self.room_mut(&room_id)?;
         room.reliable.publish(publisher, topic.clone());
         self.open_topic_reverse_route(room_id, publisher, topic, now, wall)
     }
@@ -1670,7 +1704,7 @@ impl ShardRoutingTable {
         topic: &Topic,
         now: Instant,
     ) {
-        if let Some(room) = self.data.rooms.get_mut(&room_id) {
+        if let Some(room) = self.room_mut(&room_id) {
             room.reliable.unpublish(publisher, topic);
         }
         self.close_topic_reverse_route(publisher, topic, now);
@@ -1683,7 +1717,7 @@ impl ShardRoutingTable {
         topic: Topic,
     ) -> Option<ShardEvent> {
         let handle = self.control.local_participants.get(&subscriber).copied()?;
-        let room = self.data.rooms.get_mut(&room_id)?;
+        let room = self.room_mut(&room_id)?;
         let was_empty = room.reliable.subscribe_local(handle, topic.clone());
         // A reliable subscription names only a topic, so there is no stream to
         // install a route for yet; publishers announce themselves in response.
@@ -1706,7 +1740,7 @@ impl ShardRoutingTable {
         let Some(handle) = self.control.local_participants.get(&subscriber).copied() else {
             return false;
         };
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return false;
         };
         let was_last = room.reliable.unsubscribe_local(handle, topic);
@@ -1717,7 +1751,7 @@ impl ShardRoutingTable {
         // the shard installed for it retires.
         let imported = room.reliable.imported_on(topic);
         for publisher in imported {
-            if let Some(room) = self.data.rooms.get_mut(&room_id) {
+            if let Some(room) = self.room_mut(&room_id) {
                 room.reliable.clear_imported(publisher, topic);
             }
             let key = DataStreamId::new(publisher, topic.clone());
@@ -1739,7 +1773,7 @@ impl ShardRoutingTable {
         frame: &[u8],
         ctx: &mut impl RoutingContext,
     ) {
-        let Some(room) = self.data.rooms.get_mut(&room_id) else {
+        let Some(room) = self.room_mut(&room_id) else {
             return;
         };
         let local_origin = ctx.is_local(&origin);
@@ -2092,7 +2126,7 @@ mod tests {
         );
 
         assert!(
-            !table.data.rooms.contains_key(&room),
+            !table.has_room(&room),
             "room must be fully cleaned up after one register + one unregister"
         );
     }
@@ -2109,8 +2143,20 @@ mod tests {
         table.register_remote_participant(participant, room, old_shard, &mut rng);
         table.register_remote_participant(participant, room, new_shard, &mut rng);
 
-        assert!(!table.data.rooms[&room].remote_shards.contains(&old_shard));
-        assert!(table.data.rooms[&room].remote_shards.contains(&new_shard));
+        assert!(
+            !table
+                .room(&room)
+                .unwrap()
+                .remote_shards
+                .contains(&old_shard)
+        );
+        assert!(
+            table
+                .room(&room)
+                .unwrap()
+                .remote_shards
+                .contains(&new_shard)
+        );
     }
 
     // -- topology ------------------------------------------------------------
@@ -2256,9 +2302,7 @@ mod tests {
         table.register_data_subscriber(room, subscribers[1].0, topic.clone(), None, now(), &wall());
 
         let fanout = table
-            .data
-            .rooms
-            .get(&room)
+            .room(&room)
             .and_then(|r| {
                 r.data_streams
                     .get(&DataStreamId::new(publisher, topic.clone()))

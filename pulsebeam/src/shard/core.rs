@@ -1285,7 +1285,7 @@ mod test {
         add_participant(&mut core, &router, p, r);
 
         assert!(core.registry.contains(&p));
-        assert!(core.routing.data.rooms.contains_key(&r));
+        assert!(core.routing.has_room(&r));
         let mut core2 = new_core();
         core2.on_command(
             ShardCommand::AddParticipant(Box::new(make_participant_cfg(p, r))),
@@ -1313,7 +1313,7 @@ mod test {
             "participant must be gone from the registry"
         );
         assert!(
-            !core.routing.data.rooms.contains_key(&r),
+            !core.routing.has_room(&r),
             "last member leaving must remove the room"
         );
     }
@@ -1379,7 +1379,7 @@ mod test {
         );
 
         assert!(
-            !core.routing.data.rooms.contains_key(&rid),
+            !core.routing.has_room(&rid),
             "one register (deduplicated) + one unregister must fully release the room; \
          a leaked refcount would leave a phantom remote_shards entry forever"
         );
@@ -1417,7 +1417,9 @@ mod test {
         );
 
         assert!(
-            core.routing.data.rooms[&rid]
+            core.routing
+                .room(&rid)
+                .unwrap()
                 .remote_shards
                 .contains(&remote_shard),
             "shard must stay registered while participant b is still remote there"
@@ -1434,7 +1436,7 @@ mod test {
         );
 
         assert!(
-            !core.routing.data.rooms.contains_key(&rid),
+            !core.routing.has_room(&rid),
             "room must be removed once the final remote leaves"
         );
     }

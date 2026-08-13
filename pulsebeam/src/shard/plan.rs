@@ -4,12 +4,12 @@
 //! `router.rs`. Names never appear here except as values already resolved by
 //! the control plane — see `shard/control.rs`.
 
-use ahash::{HashMap, HashMapExt};
+use ahash::HashMap;
 
 use slotmap::SlotMap;
 
 use crate::audio_selector::TopNAudioSelector;
-use crate::entity::{RoomId, TrackId};
+use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::route::{RemoteRoute, RouteTable};
 use crate::rtp::cache::TrackStreamCache;
@@ -18,7 +18,7 @@ use crate::track::Topic;
 use super::control::DataStreamId;
 use super::participants::ParticipantHandle;
 use super::reliable::ReliableRoutes;
-use super::router::{FastIndexSet, LocalTrackKey, fast_set, fast_set_with_capacity};
+use super::router::{FastIndexSet, LocalTrackKey, RoomKey, fast_set, fast_set_with_capacity};
 
 pub(crate) struct AllPublisherSubscriptions {
     pub local_by_topic: HashMap<Topic, FastIndexSet<ParticipantHandle>>,
@@ -159,7 +159,9 @@ impl RoomFanout {
 }
 
 pub(crate) struct DataPlane {
-    pub rooms: HashMap<RoomId, RoomFanout>,
+    /// Fanout objects, addressed densely. Arrivals resolve to a key, never a
+    /// name: a `RoomId` is a 16-byte value to hash, a key is an index.
+    pub rooms: SlotMap<RoomKey, RoomFanout>,
     /// Fanout objects, addressed densely. Arrivals resolve to a key, never a
     /// name: a `TrackId` is a 17-byte value to hash, a key is an index.
     pub tracks: SlotMap<LocalTrackKey, TrackRoute>,
@@ -171,7 +173,7 @@ pub(crate) struct DataPlane {
 impl DataPlane {
     pub fn new() -> Self {
         Self {
-            rooms: HashMap::new(),
+            rooms: SlotMap::with_key(),
             tracks: SlotMap::with_key(),
             routes: RouteTable::new(),
         }
