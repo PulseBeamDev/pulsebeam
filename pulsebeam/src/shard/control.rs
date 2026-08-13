@@ -12,7 +12,7 @@ use crate::route::{ImportTable, ReverseRoute};
 use crate::track::Topic;
 
 use super::participants::ParticipantHandle;
-use super::router::{LocalTrackKey, RoomKey};
+use super::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParticipantShardMeta {
@@ -49,9 +49,15 @@ pub(crate) struct ControlPlane {
     /// Names to keys. Read when a track is published, subscribed or torn
     /// down, never per packet.
     pub track_keys: HashMap<TrackId, LocalTrackKey>,
-    // Invariant: `room_keys`/`track_keys` and `DataPlane::rooms`/`tracks` are
-    // created and removed together, so a key handed to a route always
-    // resolves.
+    /// Names to keys for realtime and reliable data streams, same lifecycle
+    /// rule. Two indexes because the same (publisher, topic) can be a stream
+    /// on both lanes at once, each with its own arena entry.
+    pub data_stream_keys: HashMap<DataStreamId, DataStreamKey>,
+    pub reliable_stream_keys: HashMap<DataStreamId, ReliableStreamKey>,
+    // Invariant: `room_keys`/`track_keys`/`data_stream_keys`/
+    // `reliable_stream_keys` and `DataPlane::rooms`/`tracks`/`data_streams`/
+    // `reliable_streams` are created and removed together, so a key handed to
+    // a route always resolves.
     /// Lifecycle of each stream imported from another shard, deciding when a
     /// cluster route is installed and retired.
     pub imports: ImportTable<TrackId>,
@@ -87,6 +93,8 @@ impl ControlPlane {
         Self {
             room_keys: HashMap::new(),
             track_keys: HashMap::new(),
+            data_stream_keys: HashMap::new(),
+            reliable_stream_keys: HashMap::new(),
             imports: ImportTable::new(),
             data_imports: ImportTable::new(),
             reliable_imports: ImportTable::new(),

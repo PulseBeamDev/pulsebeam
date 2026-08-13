@@ -18,7 +18,9 @@ use crate::track::Topic;
 use super::control::DataStreamId;
 use super::participants::ParticipantHandle;
 use super::reliable::ReliableRoutes;
-use super::router::{FastIndexSet, LocalTrackKey, RoomKey, fast_set, fast_set_with_capacity};
+use super::router::{
+    DataStreamKey, FastIndexSet, LocalTrackKey, RoomKey, fast_set, fast_set_with_capacity,
+};
 
 pub(crate) struct AllPublisherSubscriptions {
     pub local_by_topic: HashMap<Topic, FastIndexSet<ParticipantHandle>>,
@@ -42,14 +44,19 @@ pub(crate) struct RemoteDataSubscriber {
 }
 
 pub(crate) struct DataStreamRoute {
+    /// The stream this fanout serves. Carried for filtered iteration (by
+    /// topic, by publisher) and for logs — never hashed to find this object,
+    /// the same rule `TrackRoute::track_id` follows.
+    pub id: DataStreamId,
     pub published: bool,
     pub local_subscribers: FastIndexSet<ParticipantHandle>,
     pub remote_subscriber_shards: HashMap<ShardId, RemoteDataSubscriber>,
 }
 
 impl DataStreamRoute {
-    pub fn new() -> Self {
+    pub fn new(id: DataStreamId) -> Self {
         Self {
+            id,
             published: false,
             local_subscribers: fast_set_with_capacity(256),
             remote_subscriber_shards: HashMap::default(),
@@ -139,7 +146,11 @@ pub(crate) struct RoomFanout {
     /// can be retired when the room goes away.
     pub audio_imports: FastIndexSet<TrackId>,
     pub audio_selector: TopNAudioSelector,
-    pub data_streams: HashMap<DataStreamId, DataStreamRoute>,
+    /// Realtime data streams that belong to this room, so a room-wide
+    /// operation (release on empty, filter by topic) does not have to scan
+    /// every stream on the shard. The arena entries themselves live in
+    /// `DataPlane::data_streams`; this is bookkeeping, not the fanout.
+    pub data_stream_keys: FastIndexSet<DataStreamKey>,
     pub all_publisher_subscriptions: AllPublisherSubscriptions,
     pub(super) reliable: ReliableRoutes,
 }
@@ -151,7 +162,7 @@ impl RoomFanout {
             remote_shards: fast_set(),
             audio_imports: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
-            data_streams: HashMap::default(),
+            data_stream_keys: fast_set(),
             all_publisher_subscriptions: AllPublisherSubscriptions::new(),
             reliable: ReliableRoutes::new(),
         }
@@ -165,6 +176,11 @@ pub(crate) struct DataPlane {
     /// Fanout objects, addressed densely. Arrivals resolve to a key, never a
     /// name: a `TrackId` is a 17-byte value to hash, a key is an index.
     pub tracks: SlotMap<LocalTrackKey, TrackRoute>,
+    /// Realtime data stream fanout objects, addressed densely for the same
+    /// reason. Shard-global rather than nested per room — `DataStreamId`
+    /// (publisher, topic) is already unique across rooms, since a publisher
+    /// belongs to exactly one room.
+    pub data_streams: SlotMap<DataStreamKey, DataStreamRoute>,
     /// Routes this shard has installed as a *destination*, indexed by the id it
     /// handed out. Frames arriving from other shards resolve here.
     pub routes: RouteTable,
@@ -175,6 +191,7 @@ impl DataPlane {
         Self {
             rooms: SlotMap::with_key(),
             tracks: SlotMap::with_key(),
+            data_streams: SlotMap::with_key(),
             routes: RouteTable::new(),
         }
     }
