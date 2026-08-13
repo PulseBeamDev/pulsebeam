@@ -7,28 +7,33 @@ use crate::route::{MediaEnvelope, RemoteRoute, RouteAction, RouteEnvelope};
 
 use super::events::{
     AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
+    ParticipantTopologyEvent,
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
-    entity::{AudioOrigin, ParticipantId, TrackId, TrackKind},
+    entity::{AudioOrigin, ParticipantId, RoomId, TrackId, TrackKind},
     id::ShardId,
     participant::{ParticipantConfig, batcher::GsoSendBatch},
     rtp::RtpPacket,
     shard::{
         dirty::DirtyTracker,
         events::EventPipeline,
-        participants::{ParticipantHandle, ParticipantRegistry},
+        participants::{ParticipantKey, ParticipantRegistry},
         timer::TimerWheel,
     },
 };
 use str0m::media::Rid;
 
-use super::router::{self, ParticipantShardMeta, RoutingContext, ShardRoutingTable};
+use super::control::ParticipantShardMeta;
+use super::router::{self, Origin, RoutingContext, ShardRoutingTable};
 
 pub(crate) use super::router::ShardTransport;
 use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame, Topology};
 
-const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
+/// A starting hint, not a policy cap: nothing rejects the next participant
+/// past this. `TimerWheel`, `DirtyTracker` and `EventPipeline` all grow past
+/// it on demand — this only smooths the allocations ramp-up pays.
+const PARTICIPANT_CAPACITY_HINT: usize = 64;
 
 struct DispatchCtx<'a, R: ShardTransport> {
     registry: &'a mut ParticipantRegistry,
@@ -50,7 +55,7 @@ impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
 impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
     fn forward_video_rtp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         track_id: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
@@ -63,7 +68,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn update_layer_states(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         track_id: TrackId,
         states: &crate::track::TrackStates,
     ) {
@@ -74,7 +79,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_audio_rtp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         slot_idx: AudioSelectorSlotId,
         origin: AudioOrigin,
         pkt: &RtpPacket,
@@ -87,7 +92,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_sctp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         origin: ParticipantId,
         topic: &crate::track::Topic,
         pkt: &[u8],
@@ -100,26 +105,26 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn notify_tracks_published(
         &mut self,
-        participant_id: ParticipantId,
+        participant: ParticipantKey,
         tracks: &[crate::track::Track],
     ) {
-        if let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) {
+        if let Some(p) = self.registry.resolve_mut(participant) {
             p.on_tracks_published(tracks);
-            self.dirty.mark(handle, p);
+            self.dirty.mark(participant, p);
         }
     }
 
     fn notify_tracks_unpublished(
         &mut self,
-        participant_id: ParticipantId,
+        participant: ParticipantKey,
         track_ids: &[crate::entity::TrackId],
     ) {
-        let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) else {
+        let Some(p) = self.registry.resolve_mut(participant) else {
             return;
         };
 
         if p.on_tracks_unpublished(track_ids) {
-            self.dirty.mark(handle, p);
+            self.dirty.mark(participant, p);
         }
     }
 
@@ -130,9 +135,9 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         rid: Option<Rid>,
         kind: str0m::media::KeyframeRequestKind,
     ) {
-        if let Some((handle, p)) = self.registry.get_mut_with_handle(&participant_id) {
+        if let Some((key, p)) = self.registry.get_mut_with_key(&participant_id) {
             p.handle_remote_keyframe_request((track_id, rid), kind);
-            self.dirty.mark(handle, p);
+            self.dirty.mark(key, p);
         }
     }
 
@@ -146,7 +151,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
     fn forward_reliable_sctp(
         &mut self,
-        subscriber: ParticipantHandle,
+        subscriber: ParticipantKey,
         origin: ParticipantId,
         topic: &crate::track::Topic,
         frame: &[u8],
@@ -163,9 +168,9 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         topic: &crate::track::Topic,
         bytes: &[u8],
     ) {
-        if let Some((handle, p)) = self.registry.get_mut_with_handle(&publisher) {
+        if let Some((key, p)) = self.registry.get_mut_with_key(&publisher) {
             p.on_deliver_reliable_control(topic, bytes);
-            self.dirty.mark(handle, p);
+            self.dirty.mark(key, p);
         }
     }
 }
@@ -193,11 +198,11 @@ impl ShardCore {
         Self {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
-            routing: ShardRoutingTable::new(),
-            timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
-            dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
+            routing: ShardRoutingTable::new(shard_id),
+            timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
+            dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
-            pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
+            pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
             rng,
             wall,
         }
@@ -242,7 +247,7 @@ impl ShardCore {
         now: Instant,
         router: &impl ShardTransport,
     ) {
-        let entry = match self.routing.routes.resolve(&env) {
+        let entry = match self.routing.data.routes.resolve(&env) {
             Ok(entry) => entry,
             Err(err) => {
                 // A stale epoch is expected after a teardown and must never
@@ -268,56 +273,23 @@ impl ShardCore {
             }
         };
 
-        // Copy out only what dispatch needs, rather than cloning the action —
-        // `RouteAction::Data` owns a `Topic`, and this runs per frame.
-        enum Target {
-            Video(crate::shard::router::LocalTrackKey),
-            Audio {
-                room_id: crate::entity::RoomId,
-                origin: ParticipantId,
-                track_id: TrackId,
-            },
-            Data {
-                lane: crate::track::DataLane,
-                room_id: crate::entity::RoomId,
-                origin: ParticipantId,
-                topic: crate::track::Topic,
-            },
+        // A plain `Copy` out of the action, not a clone: every variant is a
+        // key now, so there is nothing left to allocate on the forwarding
+        // path. This is what `Target` (a hand-rolled key-only shadow of
+        // `RouteAction`) used to buy; with the action itself `Copy`, it
+        // added a second enum for no reason and is gone.
+        let action = entry.action;
+        if matches!(action, RouteAction::Reverse { .. }) {
+            debug_assert!(
+                false,
+                "no media dispatch for route action {action:?} on {} ({})",
+                env.route, entry.names
+            );
+            return;
         }
-        let target = match &entry.action {
-            RouteAction::Video { local_track, .. } => Target::Video(*local_track),
-            RouteAction::Audio {
-                room_id,
-                origin,
-                track_id,
-            } => Target::Audio {
-                room_id: *room_id,
-                origin: *origin,
-                track_id: *track_id,
-            },
-            RouteAction::Data {
-                lane,
-                room_id,
-                origin,
-                topic,
-            } => Target::Data {
-                lane: *lane,
-                room_id: *room_id,
-                origin: *origin,
-                topic: topic.clone(),
-            },
-            other => {
-                debug_assert!(
-                    false,
-                    "no media dispatch for route action {other:?} on {} ({})",
-                    env.route, entry.names
-                );
-                return;
-            }
-        };
 
-        match (target, payload) {
-            (Target::Video(local_track), MediaPayload::Video(mut pkt)) => {
+        match (action, payload) {
+            (RouteAction::Video { local_track }, MediaPayload::Video(mut pkt)) => {
                 self.restamp(&mut pkt, playout, now);
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
@@ -327,15 +299,23 @@ impl ShardCore {
                 };
                 self.routing.route_video(local_track, pkt, &mut ctx);
             }
-            (
-                Target::Audio {
-                    room_id,
-                    origin,
-                    track_id,
-                },
-                MediaPayload::Audio(mut pkt),
-            ) => {
+            (RouteAction::Audio { room, track }, MediaPayload::Audio(mut pkt)) => {
                 self.restamp(&mut pkt, playout, now);
+                let Some(room_id) = self.routing.room_id_of(room) else {
+                    debug_assert!(false, "an audio route's room key must resolve to a room");
+                    return;
+                };
+                let Some((track_id, _)) = self.routing.track_descriptor(track) else {
+                    debug_assert!(false, "an audio route's track key must resolve to a track");
+                    return;
+                };
+                let Some(origin) = self.routing.track_origin(track) else {
+                    debug_assert!(false, "an audio route's track key must resolve to a track");
+                    return;
+                };
+                // `room_id` only fills a field the local-origin path still
+                // needs to carry; the lookup above resolves through `room`
+                // directly, never by hashing it back.
                 let ev = AudioRtpEvent {
                     stream_id: (track_id, None),
                     pkt,
@@ -348,31 +328,28 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.routing.route_audio(ev, &mut ctx);
+                self.routing
+                    .route_audio(room, track, Origin::Remote, None, ev, &mut ctx);
             }
-            (
-                Target::Data {
-                    lane,
-                    room_id,
-                    origin,
-                    topic,
-                },
-                MediaPayload::Data(bytes),
-            ) => {
+            (RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
                     router,
                     wall: &self.wall,
                 };
-                match lane {
-                    crate::track::DataLane::Realtime => self
-                        .routing
-                        .route_data(room_id, origin, &topic, &bytes, &mut ctx),
-                    crate::track::DataLane::Reliable => self
-                        .routing
-                        .route_reliable_data(room_id, origin, &topic, &bytes, &mut ctx),
-                }
+                self.routing
+                    .route_data(stream, Origin::Remote, &bytes, &mut ctx);
+            }
+            (RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    router,
+                    wall: &self.wall,
+                };
+                self.routing
+                    .route_reliable_data(stream, Origin::Remote, &bytes, &mut ctx);
             }
             _ => debug_assert!(false, "payload does not match the route action"),
         }
@@ -412,21 +389,42 @@ impl ShardCore {
         batch: pulsebeam_runtime::net::RecvPacketBatch,
         router: &impl ShardTransport,
     ) {
-        let Some(participant_id) = self.registry.demux(&batch) else {
+        let Some((route, epoch)) = self.registry.demux(&batch) else {
             return;
         };
-        if let Some((handle, participant)) = self.registry.get_mut_with_handle(&participant_id) {
-            participant.on_ingress(batch);
-            self.dirty.mark(handle, participant);
-        } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
+        self.dispatch_ingress(route, epoch, batch, router);
+    }
+
+    /// Everything downstream of here is index-addressed: `route.shard()` is
+    /// read once to decide forward-or-resolve, never hashed, and a route
+    /// this shard owns resolves straight to the participant key it was
+    /// installed for.
+    fn dispatch_ingress(
+        &mut self,
+        route: crate::route::RouteId,
+        epoch: u16,
+        batch: pulsebeam_runtime::net::RecvPacketBatch,
+        router: &impl ShardTransport,
+    ) {
+        if route.shard() != self.shard_id {
             router.send_frame(
-                shard_id,
+                route.shard(),
                 ShardFrame::Ingress {
-                    participant_id,
+                    route,
+                    epoch,
                     batch,
                 },
             );
+            return;
         }
+        let Some(key) = self.routing.resolve_ingress(route, epoch) else {
+            return;
+        };
+        let Some(participant) = self.registry.resolve_mut(key) else {
+            return;
+        };
+        participant.on_ingress(batch);
+        self.dirty.mark(key, participant);
     }
 
     pub(crate) fn flush_stream_buffers(&mut self, router: &impl ShardTransport) {
@@ -438,7 +436,19 @@ impl ShardCore {
         };
         while let Some(ev) = self.pipeline.pop_audio_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Audio);
-            self.routing.route_audio(ev, &mut ctx);
+            // A locally published track still costs one lookup to reach its
+            // fanout: the publishing participant does not hold the key yet.
+            // Same race video already tolerates (TrackPublished may not have
+            // drained yet) — a silent skip here self-heals on the next packet.
+            let Some(room) = self.routing.control.room_keys.get(&ev.room_id).copied() else {
+                continue;
+            };
+            let Some(track) = self.routing.fanout_of(&ev.stream_id.0) else {
+                continue;
+            };
+            let origin_key = ctx.registry.key_of(&ev.origin);
+            self.routing
+                .route_audio(room, track, Origin::Local, origin_key, ev, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
@@ -453,13 +463,19 @@ impl ShardCore {
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {
-            self.routing
-                .route_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
+            let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
+            if let Some(stream) = self.routing.data_stream_key(&id) {
+                self.routing
+                    .route_data(stream, Origin::Local, &ev.pkt, &mut ctx);
+            }
         }
 
         while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
-            self.routing
-                .route_reliable_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
+            let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
+            if let Some(stream) = self.routing.reliable_stream_key(&id) {
+                self.routing
+                    .route_reliable_data(stream, Origin::Local, &ev.pkt, &mut ctx);
+            }
         }
     }
 
@@ -467,9 +483,20 @@ impl ShardCore {
         while let Some(event) = self.pipeline.pop_participant_event() {
             match event {
                 ParticipantEvent::Topology(ev) => {
-                    if let Some(shard_event) =
-                        self.routing.handle_topology_event(ev, now, &self.wall)
-                    {
+                    let shard_event = match ev {
+                        ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
+                            self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing
+                                    .register_subscriber(handle, track, now, &self.wall)
+                            })
+                        }
+                        ParticipantTopologyEvent::TrackUnsubscribed { track, subscriber } => {
+                            self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing.unregister_subscriber(handle, track, now)
+                            })
+                        }
+                    };
+                    if let Some(shard_event) = shard_event {
                         self.pipeline.push_shard_event(shard_event);
                     }
                 }
@@ -511,14 +538,16 @@ impl ShardCore {
                             topic,
                             publisher,
                         } => {
-                            if let Some(ev) = self.routing.register_data_subscriber(
-                                room_id,
-                                subscriber,
-                                topic.clone(),
-                                publisher,
-                                now,
-                                &self.wall,
-                            ) {
+                            if let Some(ev) = self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing.register_data_subscriber(
+                                    room_id,
+                                    handle,
+                                    topic.clone(),
+                                    publisher,
+                                    now,
+                                    &self.wall,
+                                )
+                            }) {
                                 self.pipeline.push_shard_event(ev);
                             }
                         }
@@ -528,9 +557,13 @@ impl ShardCore {
                             topic,
                             publisher,
                         } => {
-                            if self.routing.unregister_data_subscriber(
-                                room_id, subscriber, &topic, publisher, now,
-                            ) {
+                            let unsubscribed =
+                                self.registry.key_of(&subscriber).is_some_and(|handle| {
+                                    self.routing.unregister_data_subscriber(
+                                        room_id, handle, &topic, publisher, now,
+                                    )
+                                });
+                            if unsubscribed {
                                 self.pipeline.push_shard_event(ShardEvent::Relay(
                                     Topology::DataTopicUnsubscribed {
                                         room_id,
@@ -575,10 +608,10 @@ impl ShardCore {
                             subscriber,
                             topic,
                         } => {
-                            if let Some(ev) = self
-                                .routing
-                                .register_reliable_data_subscriber(room_id, subscriber, topic)
-                            {
+                            if let Some(ev) = self.registry.key_of(&subscriber).and_then(|handle| {
+                                self.routing
+                                    .register_reliable_data_subscriber(room_id, handle, topic)
+                            }) {
                                 self.pipeline.push_shard_event(ev);
                             }
                         }
@@ -587,9 +620,13 @@ impl ShardCore {
                             subscriber,
                             topic,
                         } => {
-                            if self.routing.unregister_reliable_data_subscriber(
-                                room_id, subscriber, &topic, now,
-                            ) {
+                            let unsubscribed =
+                                self.registry.key_of(&subscriber).is_some_and(|handle| {
+                                    self.routing.unregister_reliable_data_subscriber(
+                                        room_id, handle, &topic, now,
+                                    )
+                                });
+                            if unsubscribed {
                                 self.pipeline.push_shard_event(ShardEvent::Relay(
                                     Topology::ReliableTopicUnsubscribed { room_id, topic },
                                 ));
@@ -612,7 +649,11 @@ impl ShardCore {
                         ParticipantControlEvent::TrackPublished(mut track, states) => {
                             // Register the handles on the node; only the
                             // stateless descriptor continues to the controller.
-                            self.routing.publish_local_track(track.meta.id, states);
+                            self.routing.publish_local_track(
+                                track.meta.id,
+                                track.meta.origin,
+                                states,
+                            );
                             // Open the reverse path now and stamp it on the
                             // descriptor: by the time any shard can subscribe,
                             // it already knows where to ask for a keyframe.
@@ -717,18 +758,15 @@ impl ShardCore {
     ) {
         debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
-        while let Some(entry) = self.dirty.next() {
-            let handle = entry.handle;
+        while let Some(handle) = self.dirty.next() {
             let Some(participant) = self.registry.resolve_mut(handle) else {
                 continue;
             };
             debug_assert!(participant.queued_dirty);
-            debug_assert_eq!(participant.participant_id, handle.participant_id());
             participant.queued_dirty = false;
             let room_id = participant.room_id;
-            let mut sink = self
-                .pipeline
-                .participant_sink(room_id, handle.participant_id());
+            let participant_id = participant.participant_id;
+            let mut sink = self.pipeline.participant_sink(room_id, participant_id);
             let deadline = participant.poll(now, &mut sink);
             if let Some(deadline) = deadline {
                 self.timers.schedule(handle, deadline);
@@ -775,9 +813,75 @@ impl ShardCore {
             ShardCommand::AddTcpConnection { .. } => {
                 // Handled by the shard worker directly; no core action needed.
             }
+            ShardCommand::ReserveIngress {
+                participant_id,
+                room_id,
+                reply,
+            } => self.reserve_ingress(participant_id, room_id, now, reply),
+            ShardCommand::CancelReservation { participant_id } => {
+                self.cancel_reservation(&participant_id, now);
+            }
             cmd => self.on_control_command(cmd, now, router)?,
         }
         Some(())
+    }
+
+    /// Bounded retries for a transient install failure — buggify's
+    /// exhaustion fault fires independently per call, so a few attempts
+    /// clear it almost certainly; a genuinely full table fails every attempt
+    /// just as fast, so the retry costs nothing in that case either.
+    const INGRESS_INSTALL_ATTEMPTS: u32 = 10;
+
+    /// Mint a participant slot and its ingress route in one step, so the
+    /// caller's ufrag always names a route that already resolves — a
+    /// reservation the route install failed for leaves nothing behind.
+    ///
+    /// Every other install failure in this codebase recovers by a later,
+    /// externally-triggered retry (the next subscribe, the next publish).
+    /// Connection setup has no such later trigger to lean on — a client
+    /// only gets this one attempt before it sees the join itself fail — so
+    /// the retry has to happen here instead.
+    fn reserve_ingress(
+        &mut self,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+        now: Instant,
+        reply: tokio::sync::oneshot::Sender<Option<(crate::route::RouteId, u16)>>,
+    ) {
+        let key = self.registry.reserve(participant_id);
+        for attempt in 1..=Self::INGRESS_INSTALL_ATTEMPTS {
+            if let Some((route, epoch)) =
+                self.routing
+                    .install_ingress_route(key, participant_id, room_id, now, &self.wall)
+            {
+                self.registry.stash_ingress(key, route, epoch);
+                let _ = reply.send(Some((route, epoch)));
+                return;
+            }
+            tracing::warn!(
+                %participant_id,
+                attempt,
+                "ingress route install failed, retrying"
+            );
+        }
+        self.registry.release_reserved(key);
+        let _ = reply.send(None);
+    }
+
+    fn cancel_reservation(&mut self, participant_id: &ParticipantId, now: Instant) {
+        let Some(key) = self.registry.key_of(participant_id) else {
+            return;
+        };
+        // A redelivered or stale cancel racing a populate that already
+        // succeeded must never tear down a live participant — release_reserved
+        // itself refuses a populated slot only in debug builds.
+        if self.registry.resolve_mut(key).is_some() {
+            return;
+        }
+        if let Some((route, epoch)) = self.registry.pending_ingress_of(key) {
+            self.routing.retire_ingress_route(route, epoch, now);
+        }
+        self.registry.release_reserved(key);
     }
 
     fn on_control_command(
@@ -789,7 +893,9 @@ impl ShardCore {
         match cmd {
             ShardCommand::AddParticipant(_)
             | ShardCommand::RemoveParticipant(_)
-            | ShardCommand::AddTcpConnection { .. } => pulsebeam_runtime::fatal!(
+            | ShardCommand::AddTcpConnection { .. }
+            | ShardCommand::ReserveIngress { .. }
+            | ShardCommand::CancelReservation { .. } => pulsebeam_runtime::fatal!(
                 "a command handled by the outer match reached the inner one; the two have drifted apart"
             ),
             ShardCommand::RegisterParticipant {
@@ -811,13 +917,17 @@ impl ShardCore {
                 room_id,
                 participant_id,
             } => {
+                // Only the owning shard's demux entries are keyed by this
+                // participant's route, and only that shard can retire them —
+                // a shard the kernel misrouted a packet to caches by route,
+                // not by name, and ages out on its own bounded cap.
                 self.routing.unregister_remote_participant(
                     participant_id,
                     ParticipantShardMeta { shard_id, room_id },
                 );
-                self.registry.unregister_remote_demux(participant_id);
             }
             ShardCommand::PublishTrack(track, room_id) => {
+                let publisher_key = self.registry.key_of(&track.meta.origin);
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
@@ -826,10 +936,14 @@ impl ShardCore {
                 };
                 // An audio track published elsewhere makes this shard a
                 // destination, so it installs a route and hands back the handle.
-                if let Some(ev) = self
-                    .routing
-                    .publish_track(track, room_id, now, &self.wall, &mut ctx)
-                {
+                if let Some(ev) = self.routing.publish_track(
+                    track,
+                    room_id,
+                    publisher_key,
+                    now,
+                    &self.wall,
+                    &mut ctx,
+                ) {
                     self.pipeline.push_shard_event(ev);
                 }
             }
@@ -999,22 +1113,21 @@ impl ShardCore {
                 self.on_media_frame(env, payload, now, router);
             }
             ShardFrame::Ingress {
-                participant_id,
+                route,
+                epoch,
                 batch,
             } => {
-                if let Some((handle, participant)) =
-                    self.registry.get_mut_with_handle(&participant_id)
-                {
-                    participant.on_ingress(batch);
-                    self.dirty.mark(handle, participant);
-                }
+                self.dispatch_ingress(route, epoch, batch, router);
             }
             ShardFrame::Reverse { env, body } => {
                 self.on_reverse_frame(env, body, router);
             }
             ShardFrame::Stats { env, stats } => {
-                let Some(RouteAction::Video { local_track, .. }) =
-                    self.routing.routes.resolve_action(env.route, env.epoch)
+                let Some(RouteAction::Video { local_track, .. }) = self
+                    .routing
+                    .data
+                    .routes
+                    .resolve_action(env.route, env.epoch)
                 else {
                     // The route was retired while this was in flight.
                     return;
@@ -1058,27 +1171,29 @@ impl ShardCore {
                 tracing::debug!(%route, "dropping a reverse frame on an unusable route");
                 return;
             };
-            let act = match (target, body) {
-                (
-                    ReverseTarget::Track {
-                        track_id,
-                        encodings,
-                    },
-                    Reverse::Keyframe { layer, kind },
-                ) => {
+            let act = match (*target, body) {
+                (ReverseTarget::Track { track }, Reverse::Keyframe { layer, kind }) => {
+                    let Some((track_id, encodings)) = self.routing.track_descriptor(track) else {
+                        debug_assert!(false, "a reverse frame's fanout key must resolve");
+                        return;
+                    };
                     let Some(rid) = encodings.get(usize::from(layer)).copied() else {
                         debug_assert!(false, "a reverse frame named an encoding the track lacks");
                         return;
                     };
-                    Act::Keyframe(*track_id, rid, kind)
+                    Act::Keyframe(track_id, rid, kind)
                 }
                 (ReverseTarget::Track { .. }, Reverse::Nack { .. }) => {
                     // Nothing raises these yet; the route resolves, so the only
                     // missing piece is the retransmission path itself.
                     return;
                 }
-                (ReverseTarget::Topic { topic, .. }, Reverse::DataAck(bytes)) => {
-                    Act::Data(topic.clone(), bytes)
+                (ReverseTarget::Topic { stream }, Reverse::DataAck(bytes)) => {
+                    let Some(entry) = self.routing.reliable_stream(stream) else {
+                        debug_assert!(false, "a reverse frame's fanout key must resolve");
+                        return;
+                    };
+                    Act::Data(entry.id.topic.clone(), bytes)
                 }
                 (target, _) => {
                     debug_assert!(false, "reverse body does not match a {target:?} route");
@@ -1112,23 +1227,32 @@ impl ShardCore {
     ) {
         let room_id = cfg.room_id;
         let participant_id = cfg.participant_id;
-        self.remove_participant(&participant_id, now);
         let _ = router; // reserved: re-add currently needs no cross-shard notice
         let known_tracks = cfg.available_tracks.clone();
-        let participant_id = self.registry.insert(cfg, &mut self.rng);
-        let Some(handle) = self.registry.handle(&participant_id) else {
-            pulsebeam_runtime::fatal!(
-                "registry accepted participant {participant_id} but has no handle for it"
-            )
+        // The common case: `ReserveIngress` already minted this key and
+        // installed its route, so the ufrag the client is using already
+        // resolves — populate the reservation rather than minting a second
+        // key the route doesn't point at. Anything else (an already-populated
+        // participant under the same id, or no reservation at all) falls
+        // back to the old tear-down-and-insert behavior tests still rely on.
+        let key = match self.registry.key_of(&participant_id) {
+            Some(key) if self.registry.resolve_mut(key).is_none() => {
+                self.registry.populate(key, cfg, &mut self.rng);
+                key
+            }
+            Some(_) => {
+                self.remove_participant(&participant_id, now);
+                self.registry.insert(cfg, &mut self.rng)
+            }
+            None => self.registry.insert(cfg, &mut self.rng),
         };
-        self.routing
-            .add_local_member(participant_id, handle, room_id, &mut self.rng);
+        self.routing.add_local_member(key, room_id, &mut self.rng);
         let Some(participant) = self.registry.get_mut(&participant_id) else {
             pulsebeam_runtime::fatal!(
                 "registry accepted participant {participant_id} but cannot resolve it"
             )
         };
-        self.dirty.mark(handle, participant);
+        self.dirty.mark(key, participant);
 
         // Tracks already published when this member arrived never went through
         // `publish_track` here, so their audio routes are installed now.
@@ -1146,13 +1270,14 @@ impl ShardCore {
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId, now: Instant) -> Option<()> {
-        if let Some(handle) = self.registry.handle(participant_id) {
-            self.timers.cancel(handle);
-        }
+        let key = self.registry.key_of(participant_id)?;
+        self.timers.cancel(key);
         let meta = self.registry.remove(participant_id)?;
+        self.routing
+            .retire_ingress_route(meta.ingress_route, meta.ingress_epoch, now);
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
-            .remove_local_member(participant_id, meta.room_id, audio_ids, now);
+            .remove_local_member(participant_id, key, meta.room_id, audio_ids, now);
         Some(())
     }
 }
@@ -1263,8 +1388,8 @@ mod test {
 
     fn clear_dirty(core: &mut ShardCore) {
         core.dirty.begin_phase();
-        while let Some(entry) = core.dirty.next() {
-            if let Some(participant) = core.registry.resolve_mut(entry.handle) {
+        while let Some(key) = core.dirty.next() {
+            if let Some(participant) = core.registry.resolve_mut(key) {
                 participant.queued_dirty = false;
             }
         }
@@ -1281,15 +1406,16 @@ mod test {
         add_participant(&mut core, &router, p, r);
 
         assert!(core.registry.contains(&p));
-        assert!(core.routing.rooms.contains_key(&r));
+        assert!(core.routing.has_room(&r));
         let mut core2 = new_core();
         core2.on_command(
             ShardCommand::AddParticipant(Box::new(make_participant_cfg(p, r))),
             now(),
             &router,
         );
+        let key = core2.registry.key_of(&p).unwrap();
         assert!(
-            core2.dirty.contains(&p),
+            core2.dirty.contains(key),
             "newly added participant must be dirty"
         );
     }
@@ -1309,13 +1435,18 @@ mod test {
             "participant must be gone from the registry"
         );
         assert!(
-            !core.routing.rooms.contains_key(&r),
+            !core.routing.has_room(&r),
             "last member leaving must remove the room"
         );
     }
 
+    /// A stale dirty entry for a participant's *previous* incarnation must
+    /// not be silently mistaken for the current one when both are queued at
+    /// once — the property `removed_handle_never_resolves_to_replacement_with_same_id`
+    /// pins for the registry directly, exercised here through the path that
+    /// actually queues dirty entries.
     #[test]
-    fn readding_dirty_participant_ignores_stale_generation() {
+    fn readding_dirty_participant_does_not_resolve_the_stale_incarnation() {
         let router = TestRouter::new();
         let mut core = new_core();
         let participant = pid();
@@ -1332,17 +1463,20 @@ mod test {
             &router,
         );
 
-        let current_generation = core.registry.get(&participant).unwrap().generation;
+        let current_key = core.registry.key_of(&participant).unwrap();
         core.dirty.begin_phase();
         let stale = core.dirty.next().unwrap();
         let current = core.dirty.next().unwrap();
         assert!(core.dirty.next().is_none());
         core.dirty.finish_phase();
 
-        assert_eq!(stale.handle.participant_id(), participant);
-        assert_ne!(stale.handle.generation(), current_generation);
-        assert_eq!(current.handle.participant_id(), participant);
-        assert_eq!(current.handle.generation(), current_generation);
+        assert_ne!(stale, current, "the two incarnations must be distinct keys");
+        assert_eq!(current, current_key);
+        assert!(
+            core.registry.resolve_mut(stale).is_none(),
+            "the first incarnation's key must not resolve to the replacement"
+        );
+        assert!(core.registry.resolve_mut(current).is_some());
     }
 
     #[test]
@@ -1375,7 +1509,7 @@ mod test {
         );
 
         assert!(
-            !core.routing.rooms.contains_key(&rid),
+            !core.routing.has_room(&rid),
             "one register (deduplicated) + one unregister must fully release the room; \
          a leaked refcount would leave a phantom remote_shards entry forever"
         );
@@ -1413,7 +1547,9 @@ mod test {
         );
 
         assert!(
-            core.routing.rooms[&rid]
+            core.routing
+                .room(&rid)
+                .unwrap()
                 .remote_shards
                 .contains(&remote_shard),
             "shard must stay registered while participant b is still remote there"
@@ -1430,7 +1566,7 @@ mod test {
         );
 
         assert!(
-            !core.routing.rooms.contains_key(&rid),
+            !core.routing.has_room(&rid),
             "room must be removed once the final remote leaves"
         );
     }
@@ -1475,7 +1611,7 @@ mod test {
         );
 
         assert!(
-            core.dirty.contains(&p),
+            core.dirty.contains(core.registry.key_of(&p).unwrap()),
             "keyframe delivery must dirty the target participant"
         );
     }
@@ -1494,19 +1630,23 @@ mod test {
                 from_shard_id: ShardId::new(0),
                 topology: Topology::TrackSubscribed {
                     track: video_track(publisher, 1),
-                    route: crate::route::RouteId::new(0),
+                    route: crate::route::RouteId::from_raw(0),
                     epoch: 0,
                 },
             },
             now(),
             &router,
         );
-        assert!(core.dirty.contains(&subscriber));
+        assert!(
+            core.dirty
+                .contains(core.registry.key_of(&subscriber).unwrap())
+        );
         clear_dirty(&mut core);
+        let subscriber_key = core.registry.key_of(&subscriber).unwrap();
         let subscribed = core
             .routing
             .register_subscriber(
-                subscriber,
+                subscriber_key,
                 video_track(publisher, 1),
                 tokio::time::Instant::now(),
                 &WallAnchor::new(std::time::SystemTime::now(), Instant::now()),
@@ -1536,7 +1676,8 @@ mod test {
         );
 
         assert!(
-            core.dirty.contains(&subscriber),
+            core.dirty
+                .contains(core.registry.key_of(&subscriber).unwrap()),
             "forwarded RTP must dirty the subscriber"
         );
     }
@@ -1590,7 +1731,7 @@ mod test {
         clear_dirty(&mut core);
 
         core.fire_timers(tokio::time::Instant::now());
-        assert!(!core.dirty.contains(&p));
+        assert!(!core.dirty.contains(core.registry.key_of(&p).unwrap()));
 
         core.on_command(ShardCommand::RemoveParticipant(p), now(), &router);
         assert!(!core.registry.contains(&p));

@@ -22,7 +22,6 @@ pub struct VideoRtpEvent {
 pub struct SctpEvent {
     pub topic: Topic,
     pub pkt: Vec<u8>,
-    pub room_id: RoomId,
     pub origin: ParticipantId,
 }
 
@@ -335,7 +334,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline.data_queue.push_back(SctpEvent {
             topic,
             pkt,
-            room_id: self.room_id,
             origin: self.id,
         });
     }
@@ -397,7 +395,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline.reliable_data_queue.push_back(SctpEvent {
             topic,
             pkt: frame,
-            room_id: self.room_id,
             origin: self.id,
         });
     }

@@ -1,9 +1,11 @@
+pub(crate) mod control;
 pub(crate) mod core;
 pub(crate) mod demux;
 mod dirty;
 mod events;
 pub mod metrics;
 pub(crate) mod participants;
+pub(crate) mod plan;
 mod reliable;
 pub mod router;
 mod timer;

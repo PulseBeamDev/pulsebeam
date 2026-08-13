@@ -11,50 +11,34 @@ use crate::{
     entity::ParticipantId,
     id::ShardId,
     participant::{ParticipantConfig, ParticipantCore},
+    route::RouteId,
     shard::demux::Demuxer,
 };
 
 new_key_type! {
-    pub(crate) struct LocalParticipantKey;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ParticipantHandle {
-    key: LocalParticipantKey,
-    participant_id: ParticipantId,
-    generation: u64,
-}
-
-impl ParticipantHandle {
-    pub(super) fn new(
-        key: LocalParticipantKey,
-        participant_id: ParticipantId,
-        generation: u64,
-    ) -> Self {
-        Self {
-            key,
-            participant_id,
-            generation,
-        }
-    }
-
-    pub(super) fn key(self) -> LocalParticipantKey {
-        self.key
-    }
-
-    pub fn participant_id(self) -> ParticipantId {
-        self.participant_id
-    }
-
-    pub fn generation(self) -> u64 {
-        self.generation
-    }
+    /// A local participant's slot on this shard. Dense, `Copy`, and
+    /// meaningless outside the shard that issued it — the same rule every
+    /// other arena key in `shard/` follows.
+    ///
+    /// Bare: a slotmap key already carries a version distinguishing a slot's
+    /// current occupant from whoever held it before, so there is nothing left
+    /// to pack alongside it. The 32-byte `ParticipantHandle` wrapper this
+    /// replaced re-implemented that version as its own `generation: u64` and
+    /// carried `participant_id` for lookups that never needed a name —
+    /// `resolve_mut` and friends check the key against the arena, not a
+    /// cached copy of who used to be there.
+    pub(crate) struct ParticipantKey;
 }
 
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
     pub(super) queued_dirty: bool,
-    pub(super) generation: u64,
+    /// This connection's ICE association, so teardown can retire the route
+    /// and free the demuxer's cache entries for it. Route and key share a
+    /// lifetime by construction, but the route table and the demuxer are
+    /// reached separately, so both need the value.
+    pub(super) ingress_route: RouteId,
+    pub(super) ingress_epoch: u16,
 }
 
 impl Deref for ParticipantMeta {
@@ -73,9 +57,20 @@ impl DerefMut for ParticipantMeta {
 pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
-    participants: SlotMap<LocalParticipantKey, ParticipantMeta>,
-    participant_keys: HashMap<ParticipantId, LocalParticipantKey>,
-    next_generation: u64,
+    /// `None` between `reserve` and `populate` — an ingress route may already
+    /// point at the key while connection setup (ICE/DTLS negotiation) is
+    /// still in flight, so the slot has to exist before `ParticipantCore`
+    /// does. Every lookup here treats a reserved-but-unpopulated slot the
+    /// same as a missing one.
+    participants: SlotMap<ParticipantKey, Option<ParticipantMeta>>,
+    participant_keys: HashMap<ParticipantId, ParticipantKey>,
+    /// The ingress route for a key between `reserve` and `populate` — the
+    /// route is installed (via `install_ingress_route`) in a separate step
+    /// from `reserve`, itself separate from `populate`, because the ufrag
+    /// built from the route has to exist before negotiation can produce the
+    /// `ParticipantConfig` `populate` needs. Entries here never outlive a
+    /// reservation: `populate` consumes one, `release_reserved` drops it.
+    pending_ingress: HashMap<ParticipantKey, (RouteId, u16)>,
     demuxer: Demuxer,
     /// Addresses freed by a removal/unregister, waiting for the worker to
     /// actually close the sockets during the output phase.
@@ -89,20 +84,48 @@ impl ParticipantRegistry {
             max_gso_segments,
             participants: SlotMap::with_key(),
             participant_keys: HashMap::default(),
-            next_generation: 1,
+            pending_ingress: HashMap::default(),
             demuxer: Demuxer::new(),
             pending_close: VecDeque::new(),
         }
     }
 
-    pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantId {
+    /// Reserve a slot for a connection whose ICE/DTLS setup is still in
+    /// flight. The key is real immediately — `install_ingress_route` can
+    /// address it — but `resolve_mut` returns `None` until `populate` fills
+    /// it in, or the reservation is abandoned via `release_reserved`.
+    pub fn reserve(&mut self, participant_id: ParticipantId) -> ParticipantKey {
+        debug_assert!(
+            !self.participant_keys.contains_key(&participant_id),
+            "duplicate participant registry reservation"
+        );
+        let key = self.participants.insert(None);
+        let previous = self.participant_keys.insert(participant_id, key);
+        debug_assert!(previous.is_none());
+        key
+    }
+
+    /// Record the route `install_ingress_route` installed for a reserved
+    /// key, so `populate` can carry it onto the finished `ParticipantMeta`
+    /// once negotiation completes.
+    pub fn stash_ingress(&mut self, key: ParticipantKey, route: RouteId, epoch: u16) {
+        debug_assert!(
+            self.participants.get(key).is_some_and(Option::is_none),
+            "stash_ingress called on a key that isn't a bare reservation"
+        );
+        self.pending_ingress.insert(key, (route, epoch));
+    }
+
+    /// Fill in a slot `reserve` minted, once negotiation completes. Consumes
+    /// the route `stash_ingress` recorded; a key populated without ever
+    /// having a route stashed for it (test-only, local-only creation) falls
+    /// back to an unaddressable placeholder.
+    pub fn populate(&mut self, key: ParticipantKey, cfg: ParticipantConfig, rng: &mut Rng) {
         let participant_id = cfg.participant_id;
-        let generation = self.next_generation;
-        let Some(next) = self.next_generation.checked_add(1) else {
-            pulsebeam_runtime::fatal!("participant generation counter exhausted on this shard")
-        };
-        self.next_generation = next;
-        debug_assert_ne!(generation, 0);
+        let (ingress_route, ingress_epoch) = self
+            .pending_ingress
+            .remove(&key)
+            .unwrap_or((RouteId::from_raw(0), 0));
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -111,20 +134,41 @@ impl ParticipantRegistry {
             1,
             &mut participant_rng,
         );
-        let previous = self.participant_keys.get(&participant_id);
+        let Some(slot) = self.participants.get_mut(key) else {
+            pulsebeam_runtime::fatal!("populate called on a key the registry does not hold")
+        };
         debug_assert!(
-            previous.is_none(),
-            "duplicate participant registry insertion"
+            slot.is_none(),
+            "populate called on an already-populated slot"
         );
-        let key = self.participants.insert(ParticipantMeta {
+        *slot = Some(ParticipantMeta {
             core,
             queued_dirty: false,
-            generation,
+            ingress_route,
+            ingress_epoch,
         });
-        let previous = self.participant_keys.insert(participant_id, key);
-        debug_assert!(previous.is_none());
         tracing::info!(%participant_id, "participant added to shard");
-        participant_id
+    }
+
+    /// `reserve` immediately followed by `populate`, for callers that have
+    /// no real connection to address — tests, and any local participant
+    /// creation that doesn't route through connection setup.
+    pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantKey {
+        let key = self.reserve(cfg.participant_id);
+        self.populate(key, cfg, rng);
+        key
+    }
+
+    /// Free a reservation that never got to `populate` — negotiation failed,
+    /// or the connection was abandoned before setup completed.
+    pub fn release_reserved(&mut self, key: ParticipantKey) {
+        let slot = self.participants.remove(key);
+        debug_assert!(
+            !matches!(slot, Some(Some(_))),
+            "release_reserved called on an already-populated slot"
+        );
+        self.pending_ingress.remove(&key);
+        self.participant_keys.retain(|_, k| *k != key);
     }
 
     /// Removes a local participant and queues its addresses for closing.
@@ -132,75 +176,61 @@ impl ParticipantRegistry {
     /// (room_id, upstream track ids) before it's dropped.
     pub fn remove(&mut self, id: &ParticipantId) -> Option<ParticipantMeta> {
         let key = self.participant_keys.remove(id)?;
-        let Some(meta) = self.participants.remove(key) else {
+        let Some(slot) = self.participants.remove(key) else {
             pulsebeam_runtime::fatal!(
                 "participant {id} is keyed to a slot the registry does not hold"
             )
         };
+        let meta = slot?;
         debug_assert_eq!(meta.participant_id, *id);
-        let addrs = self.demuxer.unregister(*id);
+        let addrs = self.demuxer.unregister(meta.ingress_route);
         self.pending_close.extend(addrs);
         Some(meta)
     }
 
-    /// Frees demux entries for a participant that lives on a *different*
-    /// shard (used when a remote registration is torn down) — there's no
-    /// local `ParticipantMeta` to remove, just stale routing state.
-    pub fn unregister_remote_demux(&mut self, id: ParticipantId) {
-        let addrs = self.demuxer.unregister(id);
-        self.pending_close.extend(addrs);
-    }
-
     pub fn get_mut(&mut self, id: &ParticipantId) -> Option<&mut ParticipantMeta> {
         let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get_mut(key)?;
+        let participant = self.participants.get_mut(key)?.as_mut()?;
         debug_assert_eq!(participant.participant_id, *id);
         Some(participant)
     }
 
-    pub fn get_mut_with_handle(
+    pub fn get_mut_with_key(
         &mut self,
         id: &ParticipantId,
-    ) -> Option<(ParticipantHandle, &mut ParticipantMeta)> {
+    ) -> Option<(ParticipantKey, &mut ParticipantMeta)> {
         let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get_mut(key)?;
+        let participant = self.participants.get_mut(key)?.as_mut()?;
         debug_assert_eq!(participant.participant_id, *id);
-        let handle = ParticipantHandle::new(key, *id, participant.generation);
-        Some((handle, participant))
+        Some((key, participant))
     }
 
-    #[cfg(test)]
-    pub fn get(&self, id: &ParticipantId) -> Option<&ParticipantMeta> {
-        let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get(key)?;
-        debug_assert_eq!(participant.participant_id, *id);
-        Some(participant)
-    }
-
+    /// True once the participant is fully populated — a bare reservation
+    /// does not count, since nothing downstream can act on it yet.
     pub fn contains(&self, id: &ParticipantId) -> bool {
-        self.participant_keys.contains_key(id)
+        self.participant_keys
+            .get(id)
+            .and_then(|&key| self.participants.get(key))
+            .is_some_and(Option::is_some)
     }
 
-    pub fn handle(&self, id: &ParticipantId) -> Option<ParticipantHandle> {
-        let key = *self.participant_keys.get(id)?;
-        let participant = self.participants.get(key)?;
-        debug_assert_eq!(participant.participant_id, *id);
-        Some(ParticipantHandle::new(key, *id, participant.generation))
+    pub fn key_of(&self, id: &ParticipantId) -> Option<ParticipantKey> {
+        self.participant_keys.get(id).copied()
     }
 
-    pub fn resolve_mut(&mut self, handle: ParticipantHandle) -> Option<&mut ParticipantMeta> {
-        let participant = self.participants.get_mut(handle.key)?;
-        if participant.participant_id != handle.participant_id
-            || participant.generation != handle.generation
-        {
-            debug_assert!(false, "stale local participant handle");
-            return None;
-        }
-        Some(participant)
+    pub fn resolve_mut(&mut self, key: ParticipantKey) -> Option<&mut ParticipantMeta> {
+        self.participants.get_mut(key)?.as_mut()
     }
 
-    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<ParticipantId> {
+    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<(RouteId, u16)> {
         self.demuxer.demux(batch)
+    }
+
+    /// The route `stash_ingress` recorded for a reservation that never
+    /// reached `populate` — read (without consuming) by the cancellation
+    /// path so it can retire the route before calling `release_reserved`.
+    pub fn pending_ingress_of(&self, key: ParticipantKey) -> Option<(RouteId, u16)> {
+        self.pending_ingress.get(&key).copied()
     }
 
     pub fn drain_pending_close(&mut self) -> impl Iterator<Item = SocketAddr> + '_ {
@@ -244,9 +274,8 @@ mod tests {
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let p = pid();
 
-        let returned_id = registry.insert(cfg(p, room_id("r1")), &mut rng);
+        registry.insert(cfg(p, room_id("r1")), &mut rng);
 
-        assert_eq!(returned_id, p);
         assert!(registry.contains(&p));
         assert!(registry.get_mut(&p).is_some());
     }
@@ -297,37 +326,58 @@ mod tests {
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
         let participant_id = pid();
         registry.insert(cfg(participant_id, room_id("r5")), &mut rng);
-        let removed_handle = registry.handle(&participant_id).unwrap();
+        let removed_key = registry.key_of(&participant_id).unwrap();
 
         assert!(registry.remove(&participant_id).is_some());
         registry.insert(cfg(participant_id, room_id("r5")), &mut rng);
-        let replacement_handle = registry.handle(&participant_id).unwrap();
+        let replacement_key = registry.key_of(&participant_id).unwrap();
 
-        assert_ne!(removed_handle, replacement_handle);
-        assert!(registry.resolve_mut(removed_handle).is_none());
-        assert!(registry.resolve_mut(replacement_handle).is_some());
+        assert_ne!(removed_key, replacement_key);
+        assert!(registry.resolve_mut(removed_key).is_none());
+        assert!(registry.resolve_mut(replacement_key).is_some());
     }
 
     #[test]
-    fn unregister_remote_demux_does_not_touch_local_participants() {
-        // A remote-registration teardown has no local ParticipantMeta to
-        // remove — this must be a pure demux-table operation and must not
-        // panic or affect any locally-registered participant.
+    fn a_reserved_key_resolves_only_after_populate() {
         let mut registry = ParticipantRegistry::new(ShardId::new(0), 1);
         let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
-        let local = pid();
-        let remote = pid();
-        registry.insert(cfg(local, room_id("r4")), &mut rng);
+        let p = pid();
 
-        registry.unregister_remote_demux(remote);
-
+        let key = registry.reserve(p);
         assert!(
-            registry.contains(&local),
-            "unrelated local participant must be unaffected"
+            registry.resolve_mut(key).is_none(),
+            "a bare reservation must not resolve to a participant"
         );
         assert!(
-            !registry.contains(&remote),
-            "remote id was never local to begin with"
+            !registry.contains(&p),
+            "a bare reservation must not count as present"
+        );
+
+        registry.stash_ingress(key, RouteId::from_raw(1), 3);
+        registry.populate(key, cfg(p, room_id("r6")), &mut rng);
+        assert!(
+            registry.resolve_mut(key).is_some(),
+            "the same key must resolve once populated"
+        );
+        assert!(registry.contains(&p));
+    }
+
+    #[test]
+    fn releasing_a_reservation_frees_its_name_and_key() {
+        let mut registry = ParticipantRegistry::new(ShardId::new(0), 1);
+        let p = pid();
+
+        let key = registry.reserve(p);
+        registry.release_reserved(key);
+
+        assert!(
+            !registry.contains(&p),
+            "a released reservation must not be resolvable by name"
+        );
+        assert!(registry.resolve_mut(key).is_none());
+        assert!(
+            registry.key_of(&p).is_none(),
+            "the name index must be freed too, or a retry can never reserve again"
         );
     }
 }

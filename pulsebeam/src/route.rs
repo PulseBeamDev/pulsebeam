@@ -1,8 +1,11 @@
 //! Compiled routes and the wire envelope that addresses them.
 //!
-//! A route id is allocated by the *destination*, because it indexes that
-//! destination's table. Semantic ids (participant, track, room, topic) never
-//! appear on the wire; they survive only in [`RouteNames`] for logs.
+//! A route id's slot is allocated by the *destination*, because it indexes
+//! that destination's table — but the id also carries which shard that
+//! table belongs to (see [`RouteId`]), so it is a node-scoped address, not
+//! purely a destination-local one. Semantic ids (participant, track, room,
+//! topic) never appear on the wire; they survive only in [`RouteNames`] for
+//! logs.
 //!
 //! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
 //!
@@ -20,9 +23,10 @@ use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId};
-use crate::shard::router::LocalTrackKey;
-use crate::track::{DataLane, Topic};
-use str0m::media::Rid;
+use crate::id::ShardId;
+use crate::shard::participants::ParticipantKey;
+use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
+use crate::track::Topic;
 
 pub const MEDIA_ENVELOPE_LEN: usize = 16;
 pub const ROUTE_ENVELOPE_LEN: usize = 8;
@@ -53,18 +57,85 @@ const FLAGS_RESERVED: u8 = !FLAG_LANE;
 /// recycled slot; this is the second line of defence, and what makes the
 /// "a slot cannot complete 65,536 generations within one stale-datagram
 /// lifetime" invariant trivially true.
-pub const ROUTE_QUARANTINE: Duration = Duration::from_secs(60);
+///
+/// 2 seconds, not the 60 a first-cut number lands on: at 60s, slot
+/// consumption under a reconnect storm is `concurrent + installs/sec × 60`,
+/// so the quarantine — not the traffic — is what would exhaust a
+/// preallocated table. 2s still gives an epoch 1,092× the margin a 2-minute
+/// MSL needs (below), which is three orders of magnitude nobody asked for
+/// while costing far less of the working set.
+pub const ROUTE_QUARANTINE: Duration = Duration::from_secs(2);
 
+/// A delayed duplicate cannot outlive a TCP-style maximum segment lifetime;
+/// this is that bound, and what the const assertion below checks the
+/// quarantine against.
+const ASSUMED_MAX_SEGMENT_LIFETIME_SECS: u64 = 120;
+
+/// Ties [`ROUTE_QUARANTINE`] to the epoch's 16-bit width so tuning one can't
+/// silently break the safety margin the other depends on: a slot must
+/// complete `u16::MAX` recycles before quarantine could let a stale
+/// datagram land on the incarnation that replaced it, and this asserts that
+/// takes orders of magnitude longer than any datagram could stay in flight.
+const _: () = assert!(
+    ROUTE_QUARANTINE.as_secs() * (u16::MAX as u64)
+        >= ASSUMED_MAX_SEGMENT_LIFETIME_SECS.saturating_mul(500)
+);
+
+/// `shard(12) | slot(20)`, so a packet landing on the wrong shard — which
+/// happens on every node, because `SO_REUSEPORT` picks the shard by 5-tuple
+/// hash and knows nothing about routes — is forwarded by reading 12 bits
+/// instead of hashing a name back to a shard. 4096 shards, 1M slots per
+/// shard: core counts grow predictably, per-shard route counts don't.
+///
+/// This makes `RouteId` a node-scoped address with a network part (the
+/// shard) and a host part (the slot), not purely "allocated by the
+/// destination, because it indexes that destination's table" the way the
+/// module doc otherwise describes it — the destination still allocates the
+/// slot, but the shard bits are fixed by which table it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RouteId(u32);
 
+const ROUTE_SLOT_BITS: u32 = 20;
+const ROUTE_SHARD_BITS: u32 = 12;
+const ROUTE_SLOT_MASK: u32 = (1 << ROUTE_SLOT_BITS) - 1;
+const ROUTE_SHARD_MASK: u32 = (1 << ROUTE_SHARD_BITS) - 1;
+
 impl RouteId {
-    pub const fn new(index: u32) -> Self {
-        Self(index)
+    /// Packs a destination shard and its local slot into one wire id.
+    /// `slot` must fit in 20 bits and `shard` in 12 — both are asserted, not
+    /// silently truncated, because a truncated shard id would forward a
+    /// packet to the wrong worker without ever failing loudly.
+    pub const fn new(shard: ShardId, slot: u32) -> Self {
+        debug_assert!(slot <= ROUTE_SLOT_MASK, "route slot overflows 20 bits");
+        // Asserted below to fit in 12 bits, so the truncation clippy warns
+        // about cannot happen for any shard this format actually supports.
+        #[allow(clippy::cast_possible_truncation)]
+        let shard_bits = shard.index() as u32;
+        debug_assert!(shard_bits <= ROUTE_SHARD_MASK, "shard id overflows 12 bits");
+        Self(((shard_bits & ROUTE_SHARD_MASK) << ROUTE_SLOT_BITS) | (slot & ROUTE_SLOT_MASK))
+    }
+
+    /// Reconstructs a `RouteId` from its wire representation. Unlike `new`,
+    /// this trusts the bits as given — the network handed them to us already
+    /// packed, and re-deriving shard/slot from them is exactly `shard()`/
+    /// `slot()`.
+    pub const fn from_raw(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// The destination shard this route was allocated on.
+    pub const fn shard(self) -> ShardId {
+        ShardId::new((self.0 >> ROUTE_SLOT_BITS) as usize)
+    }
+
+    /// The route's index within its shard's own table — what a `RouteTable`
+    /// indexes by.
+    pub const fn slot(self) -> u32 {
+        self.0 & ROUTE_SLOT_MASK
     }
 
     pub const fn index(self) -> usize {
-        self.0 as usize
+        self.slot() as usize
     }
 
     pub const fn get(self) -> u32 {
@@ -163,16 +234,42 @@ pub struct MediaEnvelope {
     pub playout_ntp32: u32,
 }
 
+/// The exact byte layout of [`MediaEnvelope`] on the wire. `Unaligned` plus
+/// the big-endian integer wrappers make encode/decode a memory copy instead
+/// of sixteen individual byte-slice operations — `repr(C)` is still not a
+/// portable wire format on its own (padding, host endianness), but paired
+/// with `zerocopy`'s byte-order types it is one, and the compiler checks it
+/// rather than the manual offsets that used to encode this.
+#[derive(
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
+#[repr(C)]
+struct MediaEnvelopeWire {
+    ver: u8,
+    flags: u8,
+    epoch: zerocopy::big_endian::U16,
+    route: zerocopy::big_endian::U32,
+    link_seq: zerocopy::big_endian::U32,
+    playout_ntp32: zerocopy::big_endian::U32,
+}
+
+const _: () = assert!(size_of::<MediaEnvelopeWire>() == MEDIA_ENVELOPE_LEN);
+
 impl MediaEnvelope {
     pub fn encode(&self) -> [u8; MEDIA_ENVELOPE_LEN] {
-        let mut out = [0u8; MEDIA_ENVELOPE_LEN];
-        out[0] = ENVELOPE_VERSION;
-        out[1] = FLAG_LANE_MEDIA;
-        out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
-        out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
-        out[8..12].copy_from_slice(&self.link_seq.to_be_bytes());
-        out[12..16].copy_from_slice(&self.playout_ntp32.to_be_bytes());
-        out
+        let wire = MediaEnvelopeWire {
+            ver: ENVELOPE_VERSION,
+            flags: FLAG_LANE_MEDIA,
+            epoch: self.epoch.into(),
+            route: self.route.get().into(),
+            link_seq: self.link_seq.into(),
+            playout_ntp32: self.playout_ntp32.into(),
+        };
+        zerocopy::transmute!(wire)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
@@ -182,33 +279,14 @@ impl MediaEnvelope {
         if peek_lane(buf)? != Lane::Media {
             return Err(EnvelopeError::WrongLane { want: Lane::Media });
         }
-        let [
-            _,
-            _,
-            e0,
-            e1,
-            r0,
-            r1,
-            r2,
-            r3,
-            s0,
-            s1,
-            s2,
-            s3,
-            p0,
-            p1,
-            p2,
-            p3,
-            ..,
-        ] = *buf
-        else {
-            return Err(EnvelopeError::Truncated { len: buf.len() });
-        };
+        let (wire, _rest) = zerocopy::FromBytes::ref_from_prefix(buf)
+            .map_err(|_| EnvelopeError::Truncated { len: buf.len() })?;
+        let wire: &MediaEnvelopeWire = wire;
         Ok(Self {
-            epoch: u16::from_be_bytes([e0, e1]),
-            route: RouteId::new(u32::from_be_bytes([r0, r1, r2, r3])),
-            link_seq: u32::from_be_bytes([s0, s1, s2, s3]),
-            playout_ntp32: u32::from_be_bytes([p0, p1, p2, p3]),
+            epoch: wire.epoch.get(),
+            route: RouteId::from_raw(wire.route.get()),
+            link_seq: wire.link_seq.get(),
+            playout_ntp32: wire.playout_ntp32.get(),
         })
     }
 }
@@ -236,6 +314,25 @@ pub struct RouteEnvelope {
     pub route: RouteId,
 }
 
+/// The exact byte layout of [`RouteEnvelope`] on the wire — see
+/// [`MediaEnvelopeWire`], the same trade applied to the shorter header.
+#[derive(
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
+#[repr(C)]
+struct RouteEnvelopeWire {
+    ver: u8,
+    flags: u8,
+    epoch: zerocopy::big_endian::U16,
+    route: zerocopy::big_endian::U32,
+}
+
+const _: () = assert!(size_of::<RouteEnvelopeWire>() == ROUTE_ENVELOPE_LEN);
+
 impl RouteEnvelope {
     pub fn new(handle: ReverseRoute) -> Self {
         Self {
@@ -245,12 +342,13 @@ impl RouteEnvelope {
     }
 
     pub fn encode(&self) -> [u8; ROUTE_ENVELOPE_LEN] {
-        let mut out = [0u8; ROUTE_ENVELOPE_LEN];
-        out[0] = ENVELOPE_VERSION;
-        out[1] = FLAG_LANE_REVERSE;
-        out[2..4].copy_from_slice(&self.epoch.to_be_bytes());
-        out[4..8].copy_from_slice(&self.route.get().to_be_bytes());
-        out
+        let wire = RouteEnvelopeWire {
+            ver: ENVELOPE_VERSION,
+            flags: FLAG_LANE_REVERSE,
+            epoch: self.epoch.into(),
+            route: self.route.get().into(),
+        };
+        zerocopy::transmute!(wire)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
@@ -262,12 +360,12 @@ impl RouteEnvelope {
                 want: Lane::Reverse,
             });
         }
-        let [_, _, e0, e1, r0, r1, r2, r3, ..] = *buf else {
-            return Err(EnvelopeError::Truncated { len: buf.len() });
-        };
+        let (wire, _rest) = zerocopy::FromBytes::ref_from_prefix(buf)
+            .map_err(|_| EnvelopeError::Truncated { len: buf.len() })?;
+        let wire: &RouteEnvelopeWire = wire;
         Ok(Self {
-            epoch: u16::from_be_bytes([e0, e1]),
-            route: RouteId::new(u32::from_be_bytes([r0, r1, r2, r3])),
+            epoch: wire.epoch.get(),
+            route: RouteId::from_raw(wire.route.get()),
         })
     }
 }
@@ -341,12 +439,23 @@ impl std::fmt::Display for RouteNames {
 
 /// What the destination does with a frame that arrives on a route.
 ///
+/// Every variant holds keys, never names — `Copy`, and nothing here is ever
+/// hashed to resolve it further. A dispatch function that takes a
+/// `RouteAction` apart has nothing left to look up; whatever it needs next
+/// comes off the object the key already resolved to.
+///
 /// Video and data point at a *shard-local* object rather than embedding
 /// subscriber membership: local subscribe/unsubscribe is frequent and purely
 /// local, while a cluster route is expensive to install. Churn mutates the
 /// local object and leaves the route untouched.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum RouteAction {
+    /// A client's ICE association. The route and the participant's key share
+    /// a lifetime by construction — minted together at connection setup,
+    /// destroyed together at teardown — the same argument that already
+    /// justifies `ReverseTarget` holding no epoch of its own: a key handed to
+    /// a route always resolves.
+    Ingress { participant: ParticipantKey },
     Video {
         /// The destination's own fanout handle — a dense index, not a name.
         /// Resolving a route hands dispatch something it can use directly,
@@ -356,25 +465,22 @@ pub(crate) enum RouteAction {
     /// One route per (audio stream, destination). Audio is broadcast to a room
     /// rather than explicitly subscribed, so the destination installs this as
     /// soon as it learns the track exists and it has members to deliver to.
-    Audio {
-        room_id: RoomId,
-        origin: ParticipantId,
-        track_id: TrackId,
-    },
-    /// One route per (publisher, topic, lane, destination). The destination
-    /// installs it whether the local subscription named a publisher or was a
-    /// wildcard — wildcards resolve to concrete streams as publishers are
-    /// announced.
     ///
-    /// `lane` is the client's channel semantics and lives only here, in the
-    /// compiled plan. It never rides a frame: the destination already knows it,
-    /// and it says nothing about how this hop is delivered.
-    Data {
-        lane: DataLane,
-        room_id: RoomId,
-        origin: ParticipantId,
-        topic: Topic,
-    },
+    /// `track` points at a `TrackRoute` the same way `Video::local_track`
+    /// does — an audio import gets the same dense fanout entry a video
+    /// subscription gets (it never populates `subscribers`/`remote_routes`;
+    /// audio's own liveness is the import table, not this entry's
+    /// emptiness). Origin and track_id are read off it, never carried here.
+    Audio { room: RoomKey, track: LocalTrackKey },
+    /// One route per (publisher, topic, destination) on the realtime lane.
+    /// The destination installs it whether the local subscription named a
+    /// publisher or was a wildcard — wildcards resolve to concrete streams as
+    /// publishers are announced.
+    Data { stream: DataStreamKey },
+    /// The reliable-lane counterpart of `Data`. A separate variant rather
+    /// than a `lane: DataLane` field on `Data`, because the two lanes now
+    /// resolve through different arenas — the variant *is* the lane.
+    Reliable { stream: ReliableStreamKey },
     /// The reverse path for one published stream, resolving at the shard that
     /// owns the publisher.
     ///
@@ -384,26 +490,24 @@ pub(crate) enum RouteAction {
     /// repeats if it still needs it, so there is no per-link bookkeeping a
     /// per-sender route would protect — and with a 32-bit id space, paying
     /// `streams x shards` here would make it the largest consumer in the table.
-    Reverse {
-        origin: ParticipantId,
-        target: ReverseTarget,
-    },
+    ///
+    /// No `origin` field: `ReverseTarget::Track` and `::Topic` both resolve to
+    /// an arena entry that already knows its own publisher.
+    Reverse { target: ReverseTarget },
 }
 
 /// What a reverse route points at, holding everything the destination needs to
 /// act on a frame that names nothing but the route.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReverseTarget {
     Track {
-        track_id: TrackId,
-        /// Encodings in declared order. A frame names one by index, so the rid
-        /// itself never travels; both ends order them from the same track
-        /// descriptor the control plane distributed.
-        encodings: Vec<Option<Rid>>,
+        /// The publisher's own fanout handle. Encodings live on the
+        /// `TrackRoute` this resolves to, in declared order — a frame names
+        /// one by index, so the rid itself never travels.
+        track: LocalTrackKey,
     },
     Topic {
-        room_id: RoomId,
-        topic: Topic,
+        stream: ReliableStreamKey,
     },
 }
 
@@ -473,6 +577,14 @@ enum Slot {
     Live(Box<RouteEntry>),
 }
 
+// `Free` carries nothing and `Live` is a `Box`, whose pointer is never null —
+// so the niche optimization makes this enum exactly the size of the pointer,
+// not the pointer plus a discriminant. That is what makes a working set of
+// slots cheap enough to preallocate; if this ever regresses (a new variant, a
+// wrapper type without the niche), preallocation silently gets `1 << 14`
+// times more expensive, so it is checked here rather than trusted.
+const _: () = assert!(size_of::<Slot>() == size_of::<usize>());
+
 /// Destination-owned table of installed routes.
 ///
 /// # Id budget
@@ -495,12 +607,14 @@ enum Slot {
 /// per-link accounting, so a per-sender route would buy nothing and would cost
 /// 32x on a 32-shard node.
 ///
-/// [`MAX_ROUTES_PER_SHARD`] enforces that reasoning rather than leaving it as
-/// prose: the families above are all bounded, so passing the cap means one of
-/// them is not behaving as described, and failing the install says so while
+/// There is no policy cap here — the families above are all bounded, so
+/// exhaustion means the address space itself ran out: [`RouteId`]'s slot
+/// field is 20 bits, `1 << ROUTE_SLOT_BITS` routes, full stop. Nothing to
+/// tune, and failing the install at that limit says what happened while
 /// there is still a process to say it in.
 #[derive(Debug)]
 pub(crate) struct RouteTable {
+    shard_id: ShardId,
     slots: Vec<Slot>,
     epochs: Vec<u16>,
     /// Retired slots, oldest first, with the instant they were retired.
@@ -508,15 +622,11 @@ pub(crate) struct RouteTable {
     max_slots: u32,
 }
 
-/// Ceiling on slots one shard's table may grow to.
-///
-/// Sized for headroom, not for fit: every route family is proportional to
-/// participants on this shard, so a healthy shard uses orders of magnitude
-/// fewer. It exists to convert unbounded growth — a reconnect storm churning
-/// routes faster than [`ROUTE_QUARANTINE`] returns them — into a bounded
-/// failure that names itself, instead of an allocator death spiral 4 billion
-/// slots later.
-pub const MAX_ROUTES_PER_SHARD: u32 = 1 << 20;
+/// Working set preallocated up front so steady-state operation never
+/// allocates. A guess, not a bound — [`RouteTable::allocate`] grows past it
+/// with a `tracing::warn!` naming the shard and the new size, and only fails
+/// at the address space's own limit (`1 << ROUTE_SLOT_BITS`).
+const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
@@ -528,21 +638,19 @@ pub(crate) enum RouteError {
     OutOfRange { route: RouteId },
 }
 
-impl Default for RouteTable {
-    fn default() -> Self {
-        Self::with_max_slots(MAX_ROUTES_PER_SHARD)
-    }
-}
-
 impl RouteTable {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(shard_id: ShardId) -> Self {
+        Self::with_max_slots(shard_id, ROUTE_SLOT_MASK.saturating_add(1))
     }
 
-    pub fn with_max_slots(max_slots: u32) -> Self {
+    pub fn with_max_slots(shard_id: ShardId, max_slots: u32) -> Self {
+        let prealloc = usize::try_from(max_slots)
+            .unwrap_or(usize::MAX)
+            .min(ROUTE_TABLE_PREALLOCATED_SLOTS);
         Self {
-            slots: Vec::new(),
-            epochs: Vec::new(),
+            shard_id,
+            slots: Vec::with_capacity(prealloc),
+            epochs: Vec::with_capacity(prealloc),
             quarantine: VecDeque::new(),
             max_slots,
         }
@@ -602,12 +710,18 @@ impl RouteTable {
 
     /// Idempotent: retiring an already-free slot is a no-op, so a redelivered
     /// teardown cannot desync the table.
-    pub fn retire(&mut self, id: RouteId, now: Instant) -> bool {
+    ///
+    /// `epoch` must match the live incarnation. Every other operation on this
+    /// table checks it; retire was the one exception, and it is the one
+    /// operation here that destroys state — a teardown for a superseded
+    /// incarnation must not retire the one that replaced it.
+    pub fn retire(&mut self, id: RouteId, epoch: u16, now: Instant) -> bool {
         let Some(slot) = self.slots.get_mut(id.index()) else {
             return false;
         };
-        if matches!(slot, Slot::Free) {
-            return false;
+        match slot {
+            Slot::Live(entry) if entry.epoch == epoch => {}
+            _ => return false,
         }
         *slot = Slot::Free;
         self.quarantine.push_back((id.get(), now));
@@ -657,7 +771,7 @@ impl RouteTable {
                 }
                 *epoch = epoch.wrapping_add(1);
             }
-            return Ok(RouteId::new(idx));
+            return Ok(RouteId::new(self.shard_id, idx));
         }
 
         let idx = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
@@ -666,9 +780,17 @@ impl RouteTable {
                 max_slots: self.max_slots,
             });
         }
+        if self.slots.len() == self.slots.capacity() {
+            let new_capacity = self.slots.capacity().saturating_mul(2).max(1);
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                new_capacity,
+                "route table working set exceeded, growing"
+            );
+        }
         self.slots.push(Slot::Free);
         self.epochs.push(0);
-        Ok(RouteId::new(idx))
+        Ok(RouteId::new(self.shard_id, idx))
     }
 }
 
@@ -842,7 +964,6 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
-    use crate::entity::TrackKind;
 
     fn names() -> RouteNames {
         RouteNames {
@@ -857,9 +978,8 @@ mod tests {
 
     fn action() -> RouteAction {
         RouteAction::Audio {
-            room_id: names().room_id.unwrap(),
-            origin: names().origin,
-            track_id: names().origin.derive_track_id(TrackKind::Audio, "a"),
+            room: RoomKey::default(),
+            track: LocalTrackKey::default(),
         }
     }
 
@@ -873,16 +993,53 @@ mod tests {
     }
 
     #[test]
+    fn route_id_shard_and_slot_round_trip() {
+        let id = RouteId::new(ShardId::new(0xABC), 0xF_FFFF);
+        assert_eq!(id.shard(), ShardId::new(0xABC));
+        assert_eq!(id.slot(), 0xF_FFFF);
+
+        let zero = RouteId::new(ShardId::new(0), 0);
+        assert_eq!(zero.shard(), ShardId::new(0));
+        assert_eq!(zero.slot(), 0);
+    }
+
+    #[test]
+    fn route_id_shard_bits_do_not_bleed_into_the_slot() {
+        let same_slot_different_shards: Vec<RouteId> = (0..8)
+            .map(|shard| RouteId::new(ShardId::new(shard), 42))
+            .collect();
+        for id in &same_slot_different_shards {
+            assert_eq!(id.slot(), 42, "the slot must not depend on the shard bits");
+        }
+        let mut shards: Vec<_> = same_slot_different_shards
+            .iter()
+            .map(|id| id.shard())
+            .collect();
+        shards.dedup();
+        assert_eq!(
+            shards.len(),
+            8,
+            "each shard must decode back to a distinct value"
+        );
+    }
+
+    #[test]
+    fn route_id_wire_value_round_trips_through_from_raw() {
+        let id = RouteId::new(ShardId::new(3), 100);
+        assert_eq!(RouteId::from_raw(id.get()), id);
+    }
+
+    #[test]
     fn envelope_is_exactly_sixteen_bytes() {
         assert_eq!(MEDIA_ENVELOPE_LEN, 16);
-        assert_eq!(envelope(RouteId::new(1), 1).encode().len(), 16);
+        assert_eq!(envelope(RouteId::from_raw(1), 1).encode().len(), 16);
     }
 
     #[test]
     fn envelope_encodes_big_endian_at_documented_offsets() {
         let env = MediaEnvelope {
             epoch: 0x1122,
-            route: RouteId::new(0x3344_5566),
+            route: RouteId::from_raw(0x3344_5566),
             link_seq: 0x7788_99AA,
             playout_ntp32: 0xBBCC_DDEE,
         };
@@ -916,7 +1073,7 @@ mod tests {
         assert_eq!(
             RouteEnvelope {
                 epoch: 1,
-                route: RouteId::new(1),
+                route: RouteId::from_raw(1),
             }
             .encode()
             .len(),
@@ -929,7 +1086,7 @@ mod tests {
     fn reverse_envelope_round_trips() {
         let env = RouteEnvelope {
             epoch: u16::MAX,
-            route: RouteId::new(u32::MAX),
+            route: RouteId::from_raw(u32::MAX),
         };
         assert_eq!(RouteEnvelope::decode(&env.encode()).unwrap(), env);
     }
@@ -939,10 +1096,10 @@ mod tests {
     /// fixed offset both envelopes agree on, so peeking never needs the length.
     #[test]
     fn the_two_lanes_are_distinguishable_on_the_wire() {
-        let media = envelope(RouteId::new(3), 4).encode();
+        let media = envelope(RouteId::from_raw(3), 4).encode();
         let reverse = RouteEnvelope {
             epoch: 4,
-            route: RouteId::new(3),
+            route: RouteId::from_raw(3),
         }
         .encode();
 
@@ -969,7 +1126,7 @@ mod tests {
     fn envelope_round_trips() {
         let env = MediaEnvelope {
             epoch: 65_535,
-            route: RouteId::new(u32::MAX),
+            route: RouteId::from_raw(u32::MAX),
             link_seq: u32::MAX,
             playout_ntp32: u32::MAX,
         };
@@ -978,7 +1135,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_input() {
-        let full = envelope(RouteId::new(1), 1).encode();
+        let full = envelope(RouteId::from_raw(1), 1).encode();
         for len in 0..MEDIA_ENVELOPE_LEN {
             assert_eq!(
                 MediaEnvelope::decode(&full[..len]),
@@ -989,7 +1146,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_version_and_reserved_flags() {
-        let mut bytes = envelope(RouteId::new(1), 1).encode();
+        let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
         bytes[0] = ENVELOPE_VERSION + 1;
         assert_eq!(
             MediaEnvelope::decode(&bytes),
@@ -998,7 +1155,7 @@ mod tests {
             })
         );
 
-        let mut bytes = envelope(RouteId::new(1), 1).encode();
+        let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
         bytes[1] = 0b0000_0010;
         assert_eq!(
             MediaEnvelope::decode(&bytes),
@@ -1006,11 +1163,23 @@ mod tests {
         );
     }
 
+    /// A route this table installs must carry this table's own shard, not a
+    /// bare sequential index — that is what lets a misrouted packet be
+    /// forwarded by reading the id's high bits alone.
+    #[tokio::test(start_paused = true)]
+    async fn an_installed_route_carries_its_table_s_shard() {
+        let mut table = RouteTable::new(ShardId::new(41));
+        let (route, _epoch) = table
+            .install(action(), names(), NtpTime::ZERO, Instant::now())
+            .unwrap();
+        assert_eq!(route.shard(), ShardId::new(41));
+    }
+
     /// Growth is bounded, so a churn storm fails an install rather than
     /// consuming the node's memory until the allocator decides for us.
     #[tokio::test(start_paused = true)]
     async fn a_table_at_its_cap_refuses_instead_of_growing() {
-        let mut table = RouteTable::with_max_slots(2);
+        let mut table = RouteTable::with_max_slots(ShardId::new(0), 2);
         let now = Instant::now();
 
         for _ in 0..2 {
@@ -1028,7 +1197,7 @@ mod tests {
 
         // Quarantine still returns slots, so the cap bounds concurrency rather
         // than the total number of routes a shard may ever install.
-        table.retire(RouteId::new(0), now);
+        table.retire(RouteId::from_raw(0), 0, now);
         table
             .install(action(), names(), NtpTime::ZERO, now + ROUTE_QUARANTINE)
             .expect("a quarantined slot comes back");
@@ -1036,13 +1205,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_stale_epoch_never_resolves_to_a_recycled_slot() {
-        let mut table = RouteTable::new();
+        let mut table = RouteTable::new(ShardId::new(0));
         let now = Instant::now();
         let (id, epoch) = table
             .install(action(), names(), NtpTime::ZERO, now)
             .unwrap();
 
-        table.retire(id, now);
+        table.retire(id, epoch, now);
         let later = now + ROUTE_QUARANTINE;
         let (id2, epoch2) = table
             .install(action(), names(), NtpTime::ZERO, later)
@@ -1059,12 +1228,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_slot_is_not_reused_inside_its_quarantine() {
-        let mut table = RouteTable::new();
+        let mut table = RouteTable::new(ShardId::new(0));
         let now = Instant::now();
-        let (id, _) = table
+        let (id, epoch) = table
             .install(action(), names(), NtpTime::ZERO, now)
             .unwrap();
-        table.retire(id, now);
+        table.retire(id, epoch, now);
 
         let too_soon = now + ROUTE_QUARANTINE - Duration::from_millis(1);
         let (id2, _) = table
@@ -1075,19 +1244,19 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn resolve_rejects_free_and_out_of_range_slots() {
-        let mut table = RouteTable::new();
+        let mut table = RouteTable::new(ShardId::new(0));
         let now = Instant::now();
         let (id, epoch) = table
             .install(action(), names(), NtpTime::ZERO, now)
             .unwrap();
 
-        let far = RouteId::new(999);
+        let far = RouteId::from_raw(999);
         assert_eq!(
             table.resolve(&envelope(far, 0)).err(),
             Some(RouteError::OutOfRange { route: far })
         );
 
-        table.retire(id, now);
+        table.retire(id, epoch, now);
         assert_eq!(
             table.resolve(&envelope(id, epoch)).err(),
             Some(RouteError::Stale { route: id, epoch })
@@ -1096,19 +1265,50 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retire_is_idempotent() {
-        let mut table = RouteTable::new();
+        let mut table = RouteTable::new(ShardId::new(0));
         let now = Instant::now();
-        let (id, _) = table
+        let (id, epoch) = table
             .install(action(), names(), NtpTime::ZERO, now)
             .unwrap();
-        assert!(table.retire(id, now));
-        assert!(!table.retire(id, now), "a second retire must be a no-op");
+        assert!(table.retire(id, epoch, now));
+        assert!(
+            !table.retire(id, epoch, now),
+            "a second retire must be a no-op"
+        );
         assert_eq!(table.len(), 0);
+    }
+
+    /// A teardown in flight for a superseded incarnation must not retire the
+    /// one that replaced it — the epoch check is what makes `retire` safe to
+    /// call with a stale handle, the same way `resolve` already is.
+    #[tokio::test(start_paused = true)]
+    async fn retire_with_a_stale_epoch_does_not_touch_the_live_incarnation() {
+        let mut table = RouteTable::with_max_slots(ShardId::new(0), 1);
+        let now = Instant::now();
+        let (id, epoch) = table
+            .install(action(), names(), NtpTime::ZERO, now)
+            .unwrap();
+        table.retire(id, epoch, now);
+        let later = now + ROUTE_QUARANTINE;
+        let (id2, epoch2) = table
+            .install(action(), names(), NtpTime::ZERO, later)
+            .unwrap();
+        assert_eq!(id2, id, "single-slot table must reuse the same slot");
+        assert_ne!(epoch2, epoch);
+
+        assert!(
+            !table.retire(id, epoch, later),
+            "retiring the old incarnation's stale epoch must be a no-op"
+        );
+        assert!(
+            table.resolve(&envelope(id2, epoch2)).is_ok(),
+            "the live incarnation must survive a stale-epoch retire"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn link_seq_accounting_is_modulo_2_32() {
-        let mut table = RouteTable::new();
+        let mut table = RouteTable::new(ShardId::new(0));
         let now = Instant::now();
         let (id, epoch) = table
             .install(
@@ -1162,7 +1362,7 @@ mod tests {
             "one subscriber remains; the import stays pending"
         );
 
-        let (route, epoch) = (RouteId::new(0), 0);
+        let (route, epoch) = (RouteId::from_raw(0), 0);
         assert_eq!(imports.on_installed(&key, route, epoch), ImportEffect::None);
         assert_eq!(
             imports.state(&key),
@@ -1186,7 +1386,7 @@ mod tests {
         assert_eq!(imports.subscribe(key), ImportEffect::Install);
         assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
 
-        let (route, epoch) = (RouteId::new(3), 9);
+        let (route, epoch) = (RouteId::from_raw(3), 9);
         assert_eq!(
             imports.on_installed(&key, route, epoch),
             ImportEffect::Retire { route, epoch },
@@ -1214,7 +1414,7 @@ mod tests {
             ImportEffect::Install,
             "the next subscriber drives a fresh install"
         );
-        let (route, epoch) = (RouteId::new(7), 2);
+        let (route, epoch) = (RouteId::from_raw(7), 2);
         assert_eq!(imports.on_installed(&key, route, epoch), ImportEffect::None);
         assert_eq!(
             imports.state(&key),
@@ -1249,7 +1449,7 @@ mod tests {
         let mut imports = ImportTable::new();
         let key = "trk";
         imports.subscribe(key);
-        let (route, epoch) = (RouteId::new(1), 0);
+        let (route, epoch) = (RouteId::from_raw(1), 0);
         imports.on_installed(&key, route, epoch);
 
         for _ in 0..100 {
@@ -1268,7 +1468,7 @@ mod tests {
         let mut imports = ImportTable::new();
         let key = "trk";
         imports.subscribe(key);
-        let (route, epoch) = (RouteId::new(1), 0);
+        let (route, epoch) = (RouteId::from_raw(1), 0);
         imports.on_installed(&key, route, epoch);
         assert_eq!(
             imports.unsubscribe(&key),
@@ -1292,7 +1492,7 @@ mod tests {
         assert_eq!(imports.on_retired(&key), ImportEffect::None);
 
         imports.subscribe(key);
-        imports.on_installed(&key, RouteId::new(0), 0);
+        imports.on_installed(&key, RouteId::from_raw(0), 0);
         imports.unsubscribe(&key);
         imports.on_retired(&key);
         assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
@@ -1301,7 +1501,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn link_seq_detects_loss_duplication_and_reorder() {
-        let mut table = RouteTable::new();
+        let mut table = RouteTable::new(ShardId::new(0));
         let now = Instant::now();
         let (id, epoch) = table
             .install(action(), names(), NtpTime::ZERO, now)
