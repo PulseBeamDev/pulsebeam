@@ -103,6 +103,34 @@ was never reading memory it did not own.
 Do not reintroduce a shared handle to make this cheaper. It is a control-rate
 message carrying a small value; the cost is not where the pressure is.
 
+### Metrics travel the same way
+
+`metrics::counter!` and friends are welcome anywhere, including the packet
+path — what matters is which recorder they resolve against. A process-global
+recorder is the failure this document is about: `metrics_util::Registry` is a
+locked map whose cache lines every shard writes and which `render()` walks from
+the control thread, and it put spikes in the forwarding tail in production.
+
+So each shard installs its own `shard::recorder::ShardRecorder` around its tick
+(`with_local_recorder`), and once a second copies out a `ShardStatsReport` — a
+plain value, counters and fixed histogram buckets, no keys — and `try_send`s it
+to `control::stats_aggregator`, which sums across shards and renders the
+Prometheus text. Two properties make that lane free to drop:
+
+- The values are **cumulative and absolute**, never deltas, so a lost report
+  costs staleness until the next one and nothing else.
+- The aggregator **replaces** a shard's contribution and never clears it. A
+  shard leaving the sum would make an exported counter fall, and Prometheus
+  reads any counter decrease as a reset.
+
+Metric names are summed across shards by default. Only the short allowlist in
+`stats_aggregator` keeps a `shard` label, because a shard dimension on every
+series multiplies cardinality by core count.
+
+Installing the recorder per tick rather than per thread is deliberate: under
+`WorkerExecution::SharedRuntime` every shard of a node shares one thread, so
+attribution has to come from the installed recorder, not from thread identity.
+
 ## Escape hatches
 
 `#[allow(clippy::disallowed_types)]` with a comment saying which of these it is.
@@ -116,8 +144,10 @@ these, it is rule 1 and the answer is a message.
   touched again (`Arc<ShardMetrics>`).
 - **Fixed preallocated counters.** `ShardMetrics`, per the rule above.
 - **Forced by a dependency.** str0m's `RtpWrite` takes `Arc<[u8]>` and its
-  extension map stores `Arc<dyn Any>`. Keep them core-local; do not let one
-  cross a shard boundary.
+  extension map stores `Arc<dyn Any>`. `metrics::Counter::from_arc` demands
+  `Arc<F: Send + Sync>`, so `shard::recorder`'s slots are `Arc<AtomicU64>` —
+  registered, written and read by one shard on one core, so nothing contends.
+  Keep them core-local; do not let one cross a shard boundary.
 - **Below the shard model.** `pulsebeam-runtime` implements the seams shards are
   built from. Nothing there licenses an `Arc` inside a shard.
 - **Not a shard.** The agent, simulator and CLI are ordinary async programs.

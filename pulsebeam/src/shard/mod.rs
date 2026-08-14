@@ -4,6 +4,7 @@ mod dirty;
 pub(crate) mod events;
 pub mod metrics;
 pub(crate) mod participants;
+pub(crate) mod recorder;
 pub(crate) mod router;
 mod timer;
 pub(crate) mod worker;

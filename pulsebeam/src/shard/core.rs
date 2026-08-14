@@ -730,6 +730,10 @@ impl ShardCore {
         Some(())
     }
 
+    pub(crate) fn participant_count(&self) -> usize {
+        self.registry.len()
+    }
+
     pub(crate) fn next_timer_deadline(&mut self) -> Option<Instant> {
         self.timers.next_deadline()
     }

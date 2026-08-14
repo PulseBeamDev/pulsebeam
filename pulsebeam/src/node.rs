@@ -276,18 +276,23 @@ impl NodeBuilder {
         let primary_external_addr = advertised_addrs.first().copied();
 
         let mut join_set = JoinSet::new();
-        if let Some(source) = self.internal_metrics {
-            let listener = match source {
-                ListenerSource::Bind(addr) => bind_tcp_listener(addr)
-                    .await
-                    .context("binding internal metrics")?,
-                ListenerSource::PreBound(l) => l,
-            };
-
-            let ctx = internal::InternalContext::init(listener)
-                .context("failed to spawn internal server")?;
-            join_set.spawn(ignore(ctx.serve_internal_http(shutdown.child_token())));
-        }
+        // Initialised here so the global recorder is in place before anything
+        // runs, but served after the shards exist — it needs their metrics lane.
+        let internal_ctx = match self.internal_metrics {
+            Some(source) => {
+                let listener = match source {
+                    ListenerSource::Bind(addr) => bind_tcp_listener(addr)
+                        .await
+                        .context("binding internal metrics")?,
+                    ListenerSource::PreBound(l) => l,
+                };
+                Some(
+                    internal::InternalContext::init(listener)
+                        .context("failed to spawn internal server")?,
+                )
+            }
+            None => None,
+        };
 
         let cpu_cores = get_core_ids().unwrap_or_default();
         if cpu_cores.is_empty() {
@@ -376,6 +381,18 @@ impl NodeBuilder {
 
         let mut shard_contexts = Vec::new();
 
+        // Only built when something will scrape it, so a node without the
+        // internal server never pays for a snapshot it would throw away.
+        let stats_lane = internal_ctx.is_some().then(|| {
+            mailbox::new::<Box<crate::shard::recorder::ShardStatsReport>>(
+                crate::shard::worker::STATS_CAPACITY.saturating_mul(workers_count.max(1)),
+            )
+        });
+        let (stats_tx, stats_rx) = match stats_lane {
+            Some((tx, rx)) => (Some(tx), Some(rx)),
+            None => (None, None),
+        };
+
         let mut view_writers = Vec::with_capacity(workers_count);
 
         for (shard_idx, (((udp_sock, tcp_sock), frame_rx), shard_rng)) in udp_sockets
@@ -398,6 +415,7 @@ impl NodeBuilder {
             )]
             let occupancy = Arc::new(ShardMetrics::new());
             let worker_occupancy = occupancy.clone();
+            let shard_stats_tx = stats_tx.clone();
 
             if use_shared_runtime {
                 let shard = ShardWorker::new(
@@ -410,6 +428,7 @@ impl NodeBuilder {
                     frame_rx,
                     frame_txs,
                     worker_occupancy,
+                    shard_stats_tx,
                     shard_rng,
                     wall_anchor,
                 );
@@ -466,6 +485,7 @@ impl NodeBuilder {
                                     frame_rx,
                                     frame_txs,
                                     worker_occupancy,
+                                    shard_stats_tx,
                                     shard_rng,
                                     wall_anchor,
                                 );
@@ -485,6 +505,14 @@ impl NodeBuilder {
                 command_tx: shard_command_tx,
                 metrics: occupancy,
             });
+        }
+
+        if let (Some(ctx), Some(stats_rx)) = (internal_ctx, stats_rx) {
+            join_set.spawn(ignore(ctx.serve_internal_http(
+                workers_count,
+                stats_rx,
+                shutdown.child_token(),
+            )));
         }
 
         // set current thread to lower priority after spawning worker threads so
@@ -758,6 +786,7 @@ mod internal {
     use pprof::protos::Message;
     use serde::Deserialize;
     use tokio::runtime::Handle;
+    use tokio::sync::oneshot;
 
     #[derive(Deserialize)]
     pub struct ProfileParams {
@@ -788,6 +817,10 @@ mod internal {
 
     impl InternalContext {
         pub fn init(listener: TcpListener) -> anyhow::Result<Self> {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the one global recorder in the process, for control-plane, HTTP and runtime metrics. Shards never write to it — they install their own per tick and report by message. See clippy.toml."
+            )]
             let prometheus = PrometheusBuilder::new()
                 .set_buckets_for_metric(
                     Matcher::Suffix("_delay_us".to_string()),
@@ -802,7 +835,12 @@ mod internal {
             })
         }
 
-        pub async fn serve_internal_http(self, shutdown: CancellationToken) -> Result<()> {
+        pub async fn serve_internal_http(
+            self,
+            shard_count: usize,
+            stats_rx: mailbox::Receiver<Box<crate::shard::recorder::ShardStatsReport>>,
+            shutdown: CancellationToken,
+        ) -> Result<()> {
             const INDEX_HTML: &str = r#"
 <ul>
   <li><a href="/healthz">Healthcheck</a></li>
@@ -814,6 +852,16 @@ mod internal {
 </ul>
 "#;
 
+            // One scrape at a time is plenty; a queue here would only serve
+            // several callers the same numbers a moment apart.
+            let (scrape_tx, scrape_rx) = mailbox::new(1);
+            let aggregator_join = tokio::spawn(crate::control::stats_aggregator::run(
+                shard_count,
+                stats_rx,
+                scrape_rx,
+                shutdown.child_token(),
+            ));
+
             let router = {
                 let prometheus = self.prometheus.clone();
                 Router::new()
@@ -821,7 +869,16 @@ mod internal {
                     // .route("/debug/pprof/allocs", get(heap_profile))
                     .route("/healthz", get(healthcheck))
                     .route("/", get(async move || Html(INDEX_HTML)))
-                    .route("/metrics", get(async move || prometheus.render()))
+                    .route(
+                        "/metrics",
+                        get(async move || {
+                            // The exporter still owns control-plane, HTTP and
+                            // runtime metrics; the shards' own numbers arrive
+                            // as values and are rendered separately.
+                            let shards = scrape_shards(&scrape_tx).await;
+                            format!("{}{shards}", prometheus.render())
+                        }),
+                    )
             };
             let rt_monitor_join = tokio::spawn(rt_background_monitor(self.prometheus));
 
@@ -836,6 +893,7 @@ mod internal {
                         tracing::error!("internal http server error: {e}");
                     }
                 }
+                _ = aggregator_join => {}
                 _ = rt_monitor_join => {}
                 _ = shutdown.cancelled() => {
                     tracing::info!("internal http server shutting down");
@@ -844,6 +902,19 @@ mod internal {
 
             Ok(())
         }
+    }
+
+    /// Ask the aggregator for the shards' exposition.
+    ///
+    /// A scrape must never be able to stall the node, so a wedged or departed
+    /// aggregator yields an empty block: the exporter's own metrics still get
+    /// served, and the missing shard series say plainly that something is wrong.
+    async fn scrape_shards(scrape_tx: &mailbox::Sender<oneshot::Sender<String>>) -> String {
+        let (tx, rx) = oneshot::channel();
+        if scrape_tx.try_send(tx).is_err() {
+            return String::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     async fn rt_background_monitor(prometheus: PrometheusHandle) {

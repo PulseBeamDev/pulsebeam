@@ -6,7 +6,7 @@
     clippy::disallowed_types,
     reason = "Arc<ShardMetrics>, one per shard, see module note"
 )]
-use std::{marker::PhantomData, pin::Pin, sync::Arc};
+use std::{marker::PhantomData, pin::Pin, rc::Rc, sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
 use crate::route::Envelope;
@@ -25,6 +25,7 @@ use crate::{
     participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::metrics::ShardMetrics,
+    shard::recorder::{ShardRecorder, ShardStatsReport},
     track::Track,
 };
 
@@ -63,10 +64,60 @@ pub(crate) const SHARD_FRAME_CAPACITY: usize = 1024;
 
 pub(crate) const SHARD_VIEW_CAPACITY: usize = 1024;
 
+/// How often a shard hands its metrics to the control plane.
+///
+/// The values are cumulative and absolute, so this is a staleness bound and
+/// nothing more — a lost report costs a stale scrape, never a lost count.
+pub(crate) const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Depth of the shard -> aggregator metrics queue.
+///
+/// Shallow on purpose. At one report per second per shard a backlog means the
+/// aggregator is wedged, and the newest report supersedes every older one, so
+/// queueing them would only export staler numbers more slowly.
+pub(crate) const STATS_CAPACITY: usize = 4;
+
+/// A tick busier than this defers its metrics report to the next one.
+///
+/// The snapshot is sub-microsecond, but there is no reason to spend it on top
+/// of a tick that is already long when the next tick will almost certainly be
+/// cheaper. [`STATS_DEADLINE_SLACK`] bounds how long that can go on.
+const STATS_BUSY_TICK: Duration = Duration::from_micros(200);
+
+/// How far past its due time a report may be deferred waiting for a cheap
+/// tick. A shard saturated for this long reports anyway: stale metrics from a
+/// struggling shard are exactly the ones worth having.
+const STATS_DEADLINE_SLACK: Duration = STATS_REPORT_INTERVAL;
+
 const _: () = assert!(
     SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
     "the queue a shard cannot block on must have far more headroom than the one it can"
 );
+
+/// Registered once per shard so `/metrics` carries `# HELP` for what every
+/// shard always reports. Repeating these per tick would be harmless but
+/// pointless; the recorder ignores a description it already has.
+fn describe_shard_metrics() {
+    metrics::describe_gauge!(
+        "participants_live",
+        "participants this shard currently owns"
+    );
+    metrics::describe_counter!(
+        "busy_us",
+        metrics::Unit::Microseconds,
+        "cumulative time this shard spent processing"
+    );
+    metrics::describe_counter!(
+        "idle_us",
+        metrics::Unit::Microseconds,
+        "cumulative time this shard spent parked"
+    );
+    metrics::describe_histogram!(
+        "tick_us",
+        metrics::Unit::Microseconds,
+        "how long one shard loop iteration took"
+    );
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ShardError {
@@ -272,6 +323,13 @@ pub(crate) struct ShardWorker {
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
     metrics: Arc<ShardMetrics>,
+    /// This shard's own `metrics` recorder. `Rc` because it never leaves the
+    /// core; the handles it hands out are the only things that must be `Sync`,
+    /// and only because the `metrics` crate's signatures say so.
+    recorder: Rc<ShardRecorder>,
+    stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
+    stats_due: Instant,
+    last_busy: Duration,
 
     // Mark !Send
     _marker: PhantomData<*mut ()>,
@@ -297,6 +355,7 @@ impl ShardWorker {
         frame_rx: mailbox::Receiver<ShardFrame>,
         frame_txs: Vec<mailbox::Sender<ShardFrame>>,
         metrics: Arc<ShardMetrics>,
+        stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
         rng: Rng,
         wall: WallAnchor,
     ) -> Self {
@@ -316,6 +375,16 @@ impl ShardWorker {
             frame_rx,
             router,
             metrics,
+            recorder: {
+                let recorder = Rc::new(ShardRecorder::new());
+                metrics::with_local_recorder(&*recorder, describe_shard_metrics);
+                recorder
+            },
+            stats_tx,
+            stats_due: Instant::now()
+                .checked_add(STATS_REPORT_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            last_busy: Duration::ZERO,
             _marker: PhantomData,
         }
     }
@@ -338,19 +407,82 @@ impl ShardWorker {
             self.metrics
                 .record_idle(busy_start.saturating_duration_since(loop_start));
 
-            self.tick(busy_start);
-            self.flush_shard_events()?;
+            // Every `metrics::*` call reached from here resolves against this
+            // shard's own recorder rather than the process-global one, so an
+            // increment touches memory no other core does. Installed per tick
+            // rather than per thread because under `SharedRuntime` every shard
+            // of a node shares one thread, and attribution must come from the
+            // installed recorder rather than from thread identity.
+            let recorder = Rc::clone(&self.recorder);
+            let previous_busy = self.last_busy;
+            metrics::with_local_recorder(&*recorder, || {
+                self.observe_health(previous_busy);
+                self.tick(busy_start);
+                self.flush_shard_events()
+            })?;
 
             // TODO: record forwarding latency
             let busy_end = Instant::now();
             loop_start = busy_end;
             let busy_duration = busy_end.duration_since(busy_start);
             self.metrics.record_busy(busy_duration);
+            self.last_busy = busy_duration;
+
+            self.report_stats(busy_end, busy_duration);
         }
     }
 
+    /// What every shard reports whether or not it is carrying traffic.
+    ///
+    /// Without these a quiet shard registers no metrics at all, and `/metrics`
+    /// cannot distinguish a healthy idle shard from one that died — which is
+    /// the first question worth asking of a thread-per-core node.
+    ///
+    /// Recorded for the previous tick so it costs one recorder scope per loop
+    /// rather than two.
+    fn observe_health(&self, previous_busy: Duration) {
+        metrics::gauge!("participants_live").set(self.core.participant_count() as f64);
+        let (busy_us, idle_us) = self.metrics.read_raw();
+        metrics::counter!("busy_us").absolute(busy_us);
+        metrics::counter!("idle_us").absolute(idle_us);
+        metrics::histogram!("tick_us")
+            .record(u64::try_from(previous_busy.as_micros()).unwrap_or(u64::MAX) as f64);
+    }
+
+    /// Hand this shard's cumulative metrics to the control plane.
+    ///
+    /// Runs after the tick's work is done and the shard is on its way back to
+    /// the park, never between packets. It waits for a cheap tick when it can,
+    /// so the snapshot lands in slack rather than on top of a long tick, and
+    /// gives up waiting after [`STATS_DEADLINE_SLACK`] so a saturated shard —
+    /// the one whose numbers matter most — still reports.
+    fn report_stats(&mut self, now: Instant, busy: Duration) {
+        let Some(tx) = &self.stats_tx else {
+            return;
+        };
+        if now < self.stats_due {
+            return;
+        }
+        let hard_deadline = self.stats_due.checked_add(STATS_DEADLINE_SLACK);
+        if busy > STATS_BUSY_TICK && hard_deadline.is_some_and(|hard| now < hard) {
+            return;
+        }
+
+        // Dropping is free: the values are cumulative and absolute, so the
+        // next report carries everything this one would have.
+        let _ = tx.try_send(Box::new(self.recorder.snapshot(self.router.shard_id)));
+        self.stats_due = now.checked_add(STATS_REPORT_INTERVAL).unwrap_or(now);
+    }
+
     async fn wait_for_inputs(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), ShardError> {
-        let has_timer = if let Some(d) = self.core.next_timer_deadline() {
+        // A quiet shard must still wake to report, or its metrics would freeze
+        // at whatever it last had traffic for.
+        let stats_deadline = self.stats_tx.as_ref().map(|_| self.stats_due);
+        let deadline = match (self.core.next_timer_deadline(), stats_deadline) {
+            (Some(timer), Some(stats)) => Some(timer.min(stats)),
+            (timer, stats) => timer.or(stats),
+        };
+        let has_timer = if let Some(d) = deadline {
             sleep.as_mut().reset(d);
             true
         } else {

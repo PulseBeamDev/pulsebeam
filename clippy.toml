@@ -66,6 +66,8 @@ disallowed-methods = [
     { path = "std::thread::sleep", reason = "blocks the whole shard. In a test it also blocks the simulated world and waits on real time, which is what makes a plan slow and flaky rather than deterministic. Use tokio::time::sleep or a deterministic tick." },
     { path = "tokio::task::block_in_place", reason = "a shard runs on a current-thread runtime; there is no pool to hand the work to." },
     { path = "futures::executor::block_on", reason = "blocks the shard's own executor. Restricted to runtime startup." },
+    { path = "metrics::set_global_recorder", reason = "a global recorder is shared mutable state on the packet path: its registry locks and its render walk the same cache lines every shard writes, which is what put spikes in the forwarding tail. Shards install their own recorder per tick (shard::recorder) and report by message. The one legitimate global is the Prometheus exporter for control-plane metrics, in node.rs." },
+    { path = "metrics_exporter_prometheus::PrometheusBuilder::install_recorder", reason = "same as metrics::set_global_recorder — this is the call that installs one. Pinned to the single site in node.rs so a second one cannot appear without review." },
 ]
 # Not listed: `tokio::runtime::Runtime::block_on`. `#[tokio::test]` expands to
 # it, so the rule fires on every async test and cannot be satisfied. The two

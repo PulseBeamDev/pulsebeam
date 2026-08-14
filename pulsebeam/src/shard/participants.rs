@@ -44,6 +44,10 @@ pub(crate) struct ParticipantRegistry {
 }
 
 impl ParticipantRegistry {
+    pub fn len(&self) -> usize {
+        self.participants.len()
+    }
+
     pub fn new(shard_id: ShardId, max_gso_segments: usize) -> Self {
         Self {
             shard_id,
