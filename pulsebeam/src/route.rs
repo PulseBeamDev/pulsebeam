@@ -897,122 +897,6 @@ impl RouteTable {
 
 }
 
-/// The shard's table of client ICE associations, addressed by
-/// [`TransportRoute`].
-///
-/// Separate from [`RouteTable`] rather than a variant inside it because the
-/// two are different address families with different lifetimes: a transport
-/// route is minted once per connection before ICE credentials exist and lives
-/// as long as the `Rtc` does, while an endpoint route is installed and retired
-/// as subscriptions churn underneath it. Keeping the namespaces apart is what
-/// makes the two `Route*` types distinct rather than decorative — a slot
-/// number means nothing without knowing which table it indexes.
-///
-/// Entries hold only a [`ParticipantKey`]: the route and the key are minted
-/// together at connection setup and destroyed together at teardown, so a key
-/// handed to a live transport route always resolves.
-#[derive(Debug)]
-pub(crate) struct TransportTable {
-    alloc: SlotAllocator,
-    slots: Vec<Option<TransportEntry>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TransportEntry {
-    epoch: u16,
-    participant: ParticipantKey,
-}
-
-impl TransportTable {
-    pub fn new(shard_id: ShardId) -> Self {
-        Self::with_max_slots(shard_id, PackedRoute::MAX_SLOT.saturating_add(1))
-    }
-
-    pub fn with_max_slots(shard_id: ShardId, max_slots: u32) -> Self {
-        let alloc = SlotAllocator::with_max_slots(shard_id, max_slots);
-        let prealloc = alloc.epochs.capacity();
-        Self {
-            alloc,
-            slots: Vec::with_capacity(prealloc),
-        }
-    }
-
-    /// Mint a transport route for a participant key that is already reserved.
-    pub fn install(
-        &mut self,
-        participant: ParticipantKey,
-        now: Instant,
-    ) -> Result<TransportHandle, RouteError> {
-        if pulsebeam_runtime::buggify!("transport table exhausted") {
-            return Err(RouteError::Exhausted {
-                max_slots: self.alloc.max_slots,
-            });
-        }
-        let fresh = self.alloc.high_water();
-        let (slot_idx, epoch) = self.alloc.allocate(now)?;
-        let entry = Some(TransportEntry { epoch, participant });
-        if slot_idx as usize == fresh {
-            self.slots.push(entry);
-        } else {
-            let Some(slot) = self.slots.get_mut(slot_idx as usize) else {
-                debug_assert!(false, "allocate() returned a slot outside the table");
-                return Err(RouteError::Exhausted {
-                    max_slots: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
-                });
-            };
-            debug_assert!(slot.is_none(), "a quarantined slot must still be free");
-            *slot = entry;
-        }
-        Ok(TransportHandle::new(
-            TransportRoute::new(self.alloc.shard_id(), slot_idx),
-            epoch,
-        ))
-    }
-
-    /// Idempotent, and epoch-checked for the same reason [`RouteTable::retire`]
-    /// is: a redelivered teardown must not retire the incarnation that
-    /// replaced the one it names.
-    pub fn retire(&mut self, handle: TransportHandle, now: Instant) -> bool {
-        debug_assert_eq!(
-            handle.shard(),
-            self.alloc.shard_id(),
-            "a transport route is only retirable at the shard that owns it"
-        );
-        let Some(slot) = self.slots.get_mut(handle.route.index()) else {
-            return false;
-        };
-        match slot {
-            Some(entry) if entry.epoch == handle.epoch => {}
-            _ => return false,
-        }
-        *slot = None;
-        self.alloc.retire(handle.route.slot(), now);
-        true
-    }
-
-    /// Resolve an arriving client packet to the participant it addresses.
-    ///
-    /// Ownership is the caller's check, not this one's — a route for another
-    /// shard would index this table's slots meaninglessly, so it is asserted
-    /// rather than silently missed.
-    pub fn resolve(&self, handle: TransportHandle) -> Option<ParticipantKey> {
-        debug_assert_eq!(
-            handle.shard(),
-            self.alloc.shard_id(),
-            "a transport route only resolves at the shard that owns it"
-        );
-        match self.slots.get(handle.route.index()) {
-            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry.participant),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
-    }
-}
-
 /// Lifecycle of one imported stream on a destination shard.
 ///
 /// A cluster route is installed when the *first* local subscriber appears and
@@ -1826,49 +1710,8 @@ mod tests {
         ParticipantKey::from(KeyData::from_ffi(u64::from(n) | (1 << 32)))
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_transport_route_resolves_to_its_participant_until_retired() {
-        let mut table = TransportTable::new(ShardId::new(5));
-        let key = participant(1);
-        let handle = table.install(key, Instant::now()).unwrap();
 
-        assert_eq!(handle.shard(), ShardId::new(5), "the route carries its owner");
-        assert_eq!(table.resolve(handle), Some(key));
 
-        assert!(table.retire(handle, Instant::now()));
-        assert_eq!(table.resolve(handle), None, "a retired route resolves to nothing");
-        assert_eq!(table.len(), 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retiring_a_transport_route_twice_is_harmless() {
-        let mut table = TransportTable::new(ShardId::new(0));
-        let handle = table.install(participant(1), Instant::now()).unwrap();
-        assert!(table.retire(handle, Instant::now()));
-        assert!(
-            !table.retire(handle, Instant::now()),
-            "a redelivered teardown must not report success"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_stale_epoch_cannot_reach_the_participant_that_replaced_it() {
-        let mut table = TransportTable::new(ShardId::new(0));
-        let first = table.install(participant(1), Instant::now()).unwrap();
-        assert!(table.retire(first, Instant::now()));
-
-        tokio::time::advance(ROUTE_QUARANTINE).await;
-        let second = table.install(participant(2), Instant::now()).unwrap();
-
-        assert_eq!(second.route, first.route, "the slot should come back");
-        assert_ne!(second.epoch, first.epoch, "but as a new incarnation");
-        assert_eq!(
-            table.resolve(first),
-            None,
-            "the old handle must not reach the new tenant"
-        );
-        assert_eq!(table.resolve(second), Some(participant(2)));
-    }
 
     /// A retired slot is quarantined by its *slot* number. Storing the packed
     /// route instead worked only on shard 0, where the shard bits are zero —
@@ -1902,26 +1745,4 @@ mod tests {
         }
     }
 
-    /// The two families index different tables, so the same slot number is
-    /// two unrelated things. Nothing may leak between them.
-    #[tokio::test(start_paused = true)]
-    async fn the_two_namespaces_allocate_independently() {
-        let shard = ShardId::new(2);
-        let mut routes = RouteTable::new(shard);
-        let mut transports = TransportTable::new(shard);
-        let now = Instant::now();
-
-        let (endpoint, _) = routes
-            .install(action(), names(), NtpTime::ZERO, now)
-            .unwrap();
-        let transport = transports.install(participant(1), now).unwrap();
-
-        assert_eq!(
-            endpoint.slot(),
-            transport.route.slot(),
-            "both namespaces start at slot zero, which is the point"
-        );
-        assert_eq!(transports.resolve(transport), Some(participant(1)));
-        assert!(routes.get(endpoint).is_some());
-    }
 }

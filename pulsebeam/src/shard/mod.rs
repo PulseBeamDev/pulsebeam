@@ -1,5 +1,6 @@
 pub(crate) mod control;
 pub(crate) mod core;
+pub(crate) mod keyset;
 pub(crate) mod demux;
 mod dirty;
 mod events;

@@ -263,7 +263,7 @@ pub enum MediaPayload {
 /// the control plane ([`ShardCommand`] / [`ShardEvent`]) and never this way.
 #[allow(
     clippy::large_enum_variant,
-    reason = "boxing MediaPayload would put a heap allocation on every forwarded media frame; the mesh moves these by value precisely to avoid that, and the ratio only became visible once ShardFrame::Ingress was deleted"
+    reason = "boxing MediaPayload would put a heap allocation on every forwarded media frame; the mesh moves these by value precisely to avoid that, and the ratio only became visible once the client-packet variant was deleted"
 )]
 pub enum ShardFrame {
     /// Forward payload, addressed by the destination's own route. Carries no

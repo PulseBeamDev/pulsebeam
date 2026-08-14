@@ -23,6 +23,10 @@ pub struct SctpEvent {
     pub topic: Topic,
     pub pkt: Vec<u8>,
     pub origin: ParticipantId,
+    /// Carried rather than looked up: a data stream's identity is room-scoped,
+    /// and the emitting participant already knows its room, so the dispatch
+    /// path never hashes a name back to one.
+    pub room_id: RoomId,
 }
 
 pub enum ParticipantEvent {
@@ -105,6 +109,7 @@ pub enum ParticipantControlEvent {
         topic: Topic,
     },
     ReliableControlReceived {
+        room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
         bytes: Vec<u8>,
@@ -335,6 +340,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             topic,
             pkt,
             origin: self.id,
+            room_id: self.room_id,
         });
     }
 
@@ -396,6 +402,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             topic,
             pkt: frame,
             origin: self.id,
+            room_id: self.room_id,
         });
     }
 
@@ -405,6 +412,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ParticipantControlEvent::ReliableControlReceived {
+                    room_id: self.room_id,
                     publisher,
                     topic,
                     bytes,

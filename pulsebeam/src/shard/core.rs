@@ -470,7 +470,7 @@ impl ShardCore {
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {
-            let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
+            let id = crate::shard::control::DataStreamId::new(ev.room_id, ev.origin, ev.topic);
             if let Some(stream) = self.routing.data_stream_key(&id) {
                 self.routing
                     .route_data(stream, Origin::Local, &ev.pkt, &mut ctx);
@@ -478,7 +478,7 @@ impl ShardCore {
         }
 
         while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
-            let id = crate::shard::control::DataStreamId::new(ev.origin, ev.topic);
+            let id = crate::shard::control::DataStreamId::new(ev.room_id, ev.origin, ev.topic);
             if let Some(stream) = self.routing.reliable_stream_key(&id) {
                 self.routing
                     .route_reliable_data(stream, Origin::Local, &ev.pkt, &mut ctx);
@@ -640,6 +640,7 @@ impl ShardCore {
                             }
                         }
                         ParticipantControlEvent::ReliableControlReceived {
+                            room_id,
                             publisher,
                             topic,
                             bytes,
@@ -651,7 +652,7 @@ impl ShardCore {
                                 wall: &self.wall,
                             };
                             self.routing
-                                .route_reliable_control(publisher, &topic, &bytes, &mut ctx);
+                                .route_reliable_control(room_id, publisher, &topic, &bytes, &mut ctx);
                         }
                         ParticipantControlEvent::TrackPublished(mut track, states) => {
                             // Register the handles on the node; only the
@@ -1065,7 +1066,7 @@ impl ShardCore {
                     remote,
                 );
                 for publisher in announce {
-                    let reverse = self.routing.topic_reverse_handle(publisher, &topic);
+                    let reverse = self.routing.topic_reverse_handle(room_id, publisher, &topic);
                     self.pipeline.push_shard_event(ShardEvent::Relay(
                         Topology::ReliableTopicPublished {
                             room_id,
@@ -1091,7 +1092,7 @@ impl ShardCore {
                 reverse,
             } => {
                 self.routing
-                    .learn_topic_reverse_target(publisher, &topic, reverse);
+                    .learn_topic_reverse_target(room_id, publisher, &topic, reverse);
                 if let Some(ev) = self
                     .routing
                     .on_remote_reliable_publisher(room_id, publisher, &topic, now, &self.wall)
@@ -1286,10 +1287,6 @@ impl ShardCore {
         let key = self.registry.key_of(participant_id)?;
         self.timers.cancel(key);
         let meta = self.registry.remove(participant_id)?;
-        self.routing.retire_ingress_route(
-            crate::route::TransportHandle::new(meta.ingress_route, meta.ingress_epoch),
-            now,
-        );
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
             .remove_local_member(participant_id, key, meta.room_id, audio_ids, now);

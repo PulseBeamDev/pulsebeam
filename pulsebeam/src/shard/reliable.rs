@@ -1,7 +1,7 @@
 use ahash::HashMap;
 
 use crate::shard::participants::ParticipantKey;
-use crate::shard::router::VecSet;
+use crate::shard::keyset::KeySet;
 use crate::track::Topic;
 
 /// Local topic subscriptions for the reliable lane. Everything else about a
@@ -10,11 +10,11 @@ use crate::track::Topic;
 /// subscription names a topic, not a stream, so it has no key to live under
 /// there.
 ///
-/// `ParticipantKey` is already a dense slotmap key, so a subscriber set is a
-/// `VecSet`-deduped `Vec` rather than a hash index — the same trade
-/// `RoomFanout::members` makes.
+/// `ParticipantKey` is already a dense slotmap key, so a subscriber set
+/// indexes by it directly ([`KeySet`]) rather than scanning — these sets run
+/// to hundreds, and both the forwarding and teardown paths touch them.
 pub(super) struct ReliableRoutes {
-    local_subscribers: HashMap<Topic, Vec<ParticipantKey>>,
+    local_subscribers: HashMap<Topic, KeySet<ParticipantKey>>,
 }
 
 impl ReliableRoutes {
@@ -38,7 +38,7 @@ impl ReliableRoutes {
             .is_some_and(|s| !s.is_empty())
     }
 
-    pub(super) fn local_subscribers(&self, topic: &Topic) -> Option<&Vec<ParticipantKey>> {
+    pub(super) fn local_subscribers(&self, topic: &Topic) -> Option<&KeySet<ParticipantKey>> {
         self.local_subscribers.get(topic)
     }
 
@@ -46,7 +46,7 @@ impl ReliableRoutes {
         let subscribers = self
             .local_subscribers
             .entry(topic)
-            .or_insert_with(|| Vec::with_capacity(256));
+            .or_insert_with(|| KeySet::with_capacity(256));
         let was_empty = subscribers.is_empty();
         let inserted = subscribers.insert_unique(subscriber);
         debug_assert!(inserted);

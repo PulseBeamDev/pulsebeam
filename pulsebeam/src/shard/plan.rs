@@ -11,7 +11,8 @@ use slotmap::SlotMap;
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::TrackId;
 use crate::id::ShardId;
-use crate::route::{RemoteRoute, RouteHandle, RouteTable, TransportTable};
+use super::keyset::KeySet;
+use crate::route::{RemoteRoute, RouteHandle, RouteTable};
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::Topic;
 
@@ -25,7 +26,7 @@ use super::router::{
 pub(crate) struct AllPublisherSubscriptions {
     /// Per topic, wildcard local subscribers. `ParticipantKey` is already a
     /// dense slotmap key — same trade `RoomFanout::members` makes.
-    pub local_by_topic: HashMap<Topic, Vec<ParticipantKey>>,
+    pub local_by_topic: HashMap<Topic, KeySet<ParticipantKey>>,
     /// Wildcard remote subscribers per topic. A node's shard count is small
     /// and bounded, so linear-scanning it beats hashing `ShardId`, the same
     /// trade-off `RoomFanout::remote_shards` makes.
@@ -56,7 +57,7 @@ pub(crate) struct DataStreamRoute {
     pub published: bool,
     /// `ParticipantKey` is already a dense slotmap key, so dedup is a linear
     /// scan (`VecSet`) rather than a hash index — the same trade `RoomFanout::members` makes.
-    pub local_subscribers: Vec<ParticipantKey>,
+    pub local_subscribers: KeySet<ParticipantKey>,
     /// Remote destination shards for this stream. A shard's fan-out is
     /// bounded by node size, not room size, so a linear scan beats a hash
     /// lookup here — the same trade-off `RoomFanout::remote_shards` makes.
@@ -68,7 +69,7 @@ impl DataStreamRoute {
         Self {
             id,
             published: false,
-            local_subscribers: Vec::with_capacity(256),
+            local_subscribers: KeySet::with_capacity(256),
             remote_subscriber_shards: Vec::new(),
         }
     }
@@ -137,7 +138,7 @@ pub(crate) struct TrackRoute {
     /// `RouteAction::Audio` or `RouteAction::Reverse` reads it off here
     /// instead of carrying it inline.
     pub origin: crate::entity::ParticipantId,
-    pub subscribers: Vec<ParticipantKey>,
+    pub subscribers: KeySet<ParticipantKey>,
     /// Measurement handles for the publisher's encodings. Reaches this shard
     /// along the media path — from the local publisher, or from the publisher's
     /// shard on subscribe — never through the controller.
@@ -184,7 +185,7 @@ impl TrackRoute {
         Self {
             track_id,
             origin,
-            subscribers: Vec::with_capacity(256),
+            subscribers: KeySet::with_capacity(256),
             layer_states: Vec::new(),
             remote_routes: Vec::new(),
             encodings: Vec::new(),
@@ -211,9 +212,9 @@ pub(crate) struct RoomFanout {
     /// never hashed to find this object, the same rule `TrackRoute::track_id`
     /// follows.
     pub room_id: crate::entity::RoomId,
-    /// `ParticipantKey` is already a dense slotmap key, so membership is a
+    /// `ParticipantKey` is already a dense slotmap key, so membership indexes
     /// `VecSet`-deduped `Vec` rather than a hash index.
-    pub members: Vec<ParticipantKey>,
+    pub members: KeySet<ParticipantKey>,
     /// Shards with at least one remote member in this room. `ShardId` is
     /// already a dense index bounded by worker count, so this is a small
     /// linearly-scanned `Vec` rather than a hash index — the same trade
@@ -245,7 +246,7 @@ impl RoomFanout {
     ) -> Self {
         Self {
             room_id,
-            members: Vec::new(),
+            members: KeySet::new(),
             remote_shards: Vec::new(),
             remote_participant_counts: Vec::new(),
             audio_imports: fast_set(),
@@ -381,10 +382,6 @@ pub(crate) struct DataPlane {
     /// Routes this shard has installed as a *destination*, indexed by the id it
     /// handed out. Frames arriving from other shards resolve here.
     pub routes: RouteTable,
-    /// Client ICE associations this shard owns, indexed by the transport route
-    /// its ufrag carries. A separate namespace from `routes` — see
-    /// [`TransportTable`].
-    pub transports: TransportTable,
 }
 
 impl DataPlane {
@@ -395,7 +392,6 @@ impl DataPlane {
             data_streams: SlotMap::with_key(),
             reliable_streams: SlotMap::with_key(),
             routes: RouteTable::new(shard_id),
-            transports: TransportTable::new(shard_id),
         }
     }
 }

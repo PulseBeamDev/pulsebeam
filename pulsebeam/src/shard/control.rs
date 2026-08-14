@@ -17,15 +17,25 @@ pub(crate) struct ParticipantShardMeta {
     pub room_id: RoomId,
 }
 
+/// A data stream's control-plane identity: `(publisher, topic)` **within a
+/// room**.
+///
+/// The room is part of the key rather than an argument callers may forget,
+/// because a route being globally unique on the node does not make a
+/// cross-room publish, subscribe or teardown legal. With the room inside the
+/// key there is no lookup that can omit it, and an operation aimed at the
+/// wrong room misses instead of hitting a stream it has no business reaching.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DataStreamId {
+    pub room_id: RoomId,
     pub publisher_id: ParticipantId,
     pub topic: Topic,
 }
 
 impl DataStreamId {
-    pub fn new(publisher_id: ParticipantId, topic: Topic) -> Self {
+    pub fn new(room_id: RoomId, publisher_id: ParticipantId, topic: Topic) -> Self {
         Self {
+            room_id,
             publisher_id,
             topic,
         }
