@@ -75,3 +75,22 @@ rather than partway through name resolution.
   in the separate `ebpf-smoke` job under `sudo`, kept distinct from `build` so
   a kernel/capability failure there can never mask or be masked by an
   ordinary compile/test failure.
+
+## Building `bpf-linker`
+
+`cargo install bpf-linker --locked` against a stock LLVM does **not** work, and
+the failure is not a missing header or a permissions problem. bpf-linker 0.11.0
+links `LLVMParseIRInContext2`, which stock LLVM does not export — Aya carries a
+patched LLVM and ships prebuilt binaries for this reason, and the crate's own
+build script warns that `cargo install` is not the supported path.
+
+Verified here against LLVM 21.1.8: the build gets all the way to linking and
+fails with `rust-lld: error: undefined symbol: LLVMParseIRInContext2`. Setting
+`LLVM_SYS_211_PREFIX` does not help; it selects which LLVM is used, not which
+symbols it has.
+
+So CI must install bpf-linker from Aya's prebuilt release rather than building
+it, and `make build-ebpf` cannot run on a machine that only has a distribution
+LLVM. `cargo check -p pulsebeam-ebpf` (host target) still compiles the program
+and its use of the shared classifier, which is the part worth gating on every
+change; it just does not run the BPF verifier.
