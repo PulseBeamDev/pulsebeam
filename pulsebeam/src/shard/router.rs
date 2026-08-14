@@ -181,7 +181,6 @@ pub(crate) struct ShardRoutingTable {
 /// What the shard should finish once a route it asked for is granted.
 #[derive(Debug, Clone)]
 enum PendingRoute {
-    Video(TrackMeta),
     Audio {
         meta: TrackMeta,
         room_id: RoomId,
@@ -195,9 +194,6 @@ enum PendingRoute {
         subscriber: Option<ParticipantKey>,
     },
     Reliable(DataStreamId),
-    /// The descriptor waits on its reverse route: a track is announced with
-    /// somewhere to send keyframe requests, or not announced at all.
-    ReverseTrack(Box<Track>),
     ReverseTopic(DataStreamId),
 }
 
@@ -350,18 +346,13 @@ impl ShardRoutingTable {
             return None;
         };
         if let Some(names) = names {
-            self.data.routes.install(handle, names, wall.ntp());
+            self.data.routes.install(handle, wall.ntp());
         }
         self.complete_pending(pending, handle)
     }
 
     fn cancel_pending(&mut self, pending: PendingRoute) {
         match pending {
-            PendingRoute::Video(meta) => {
-                if let Some(import) = self.track_import(&meta.id) {
-                    import.cancel_install();
-                }
-            }
             PendingRoute::Audio { meta, .. } => {
                 if let Some(import) = self.track_import(&meta.id) {
                     import.cancel_install();
@@ -386,7 +377,7 @@ impl ShardRoutingTable {
                     import.cancel_install();
                 }
             }
-            PendingRoute::ReverseTrack { .. } | PendingRoute::ReverseTopic(_) => {}
+            PendingRoute::ReverseTopic(_) => {}
         }
     }
 
@@ -396,16 +387,6 @@ impl ShardRoutingTable {
         handle: RouteHandle,
     ) -> Option<ShardEvent> {
         match pending {
-            PendingRoute::Video(track) => {
-                if let Some(import) = self.track_import(&track.id) {
-                    import.on_installed(handle.route, handle.epoch);
-                }
-                Some(ShardEvent::Relay(Topology::TrackSubscribed {
-                    track,
-                    route: handle.route,
-                    epoch: handle.epoch,
-                }))
-            }
             PendingRoute::Audio { meta, room_id } => {
                 if let Some(import) = self.track_import(&meta.id) {
                     import.on_installed(handle.route, handle.epoch);
@@ -442,17 +423,6 @@ impl ShardRoutingTable {
                     route: Some(handle.route),
                     epoch: handle.epoch,
                 }))
-            }
-            PendingRoute::ReverseTrack(track) => {
-                let mut track = *track;
-                if let Some(key) = self.control.track_keys.get(&track.meta.id).copied()
-                    && let Some(entry) = self.data.tracks.get_mut(key)
-                {
-                    entry.published = true;
-                    entry.reverse_route = Some(handle);
-                }
-                track.reverse = Some(handle);
-                Some(ShardEvent::TrackPublished(track))
             }
             PendingRoute::ReverseTopic(id) => {
                 if let Some(key) = self.control.reliable_stream_keys.get(&id).copied()
@@ -900,23 +870,30 @@ impl ShardRoutingTable {
     /// Ask for the reverse path a published track needs, and hold the
     /// descriptor until it exists. The announcement carries the handle, so a
     /// subscriber never learns about a track it cannot ask for a keyframe on.
-    pub fn open_track_reverse_route(&mut self, track: Track) {
+    /// Build the local state a published track needs and report it.
+    ///
+    /// The reverse route it will be reachable on is the control plane's to
+    /// allocate; this returns the fanout key so it can compile one without
+    /// asking, and the track is announced once that route exists.
+    pub fn publish_local_track_fanout(&mut self, track: &Track) -> LocalTrackKey {
         let key = self.fanout_key(track.meta.id, track.meta.origin);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
         entry.encodings = track.layers.iter().map(|l| l.rid).collect();
-        let names = RouteNames {
-            room_id: None,
-            origin: track.meta.origin,
-            track_id: Some(track.meta.id),
-            topic: None,
+        entry.published = true;
+        key
+    }
+
+    /// Record the reverse route the control plane opened for a track this
+    /// shard publishes.
+    pub fn set_track_reverse_route(&mut self, track_id: &TrackId, handle: RouteHandle) {
+        let Some(key) = self.control.track_keys.get(track_id).copied() else {
+            return;
         };
-        self.request_reverse_route(
-            ReverseTarget::Track { track: key },
-            names,
-            PendingRoute::ReverseTrack(Box::new(track)),
-        );
+        if let Some(entry) = self.data.tracks.get_mut(key) {
+            entry.reverse_route = Some(handle);
+        }
     }
 
     /// The same, for a reliable data topic this shard publishes. Its reverse
@@ -1153,11 +1130,15 @@ impl ShardRoutingTable {
 
     // -- track subscription topology (local subscribers) -----------------
 
-    /// Registers a local subscriber for `track`. Returns a `ShardEvent` iff
-    /// this is the *first* subscriber, so the caller can notify the
-    /// publisher shard to start forwarding.
+    /// Record a local consumer for a track and report it.
+    ///
+    /// No decision here: whether this shard now needs a route is the control
+    /// plane's call, and it is told the fanout key so it can compile one into
+    /// the view without asking. The fanout entry is created first because the
+    /// route the control plane installs will point at it.
     pub fn register_subscriber(
         &mut self,
+        subscriber: ParticipantId,
         handle: ParticipantKey,
         track: TrackMeta,
     ) -> Option<ShardEvent> {
@@ -1167,36 +1148,24 @@ impl ShardRoutingTable {
         // Measurements arrive by message from the publisher's shard, so a fresh
         // fanout simply starts empty and fills on the next snapshot. Nothing is
         // read out of another shard's memory to seed it.
-        let key = self.fanout_key(track.id, track.origin);
-        let Some(entry) = self.data.tracks.get_mut(key) else {
+        let fanout = self.fanout_key(track.id, track.origin);
+        let Some(entry) = self.data.tracks.get_mut(fanout) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
         if !entry.subscribers.insert(handle) {
             return None;
         }
-
-        // The local fanout object (`TrackRoute`) exists before the route is
-        // installed, so an installed route always resolves to something.
-        if self.track_import(&track.id).map(ImportSlot::subscribe) != Some(ImportEffect::Install) {
-            return None;
-        }
-        self.request_route(
-            RouteAction::Video { local_track: key },
-            RouteNames {
-                room_id: None,
-                origin: track.origin,
-                track_id: Some(track.id),
-                topic: None,
-            },
-            PendingRoute::Video(track),
-        );
-        None
+        Some(ShardEvent::TrackSubscribed {
+            subscriber,
+            track,
+            fanout,
+        })
     }
 
-    /// Returns a `ShardEvent` iff this was the *last* local subscriber, so
-    /// the caller can tell the publisher shard to stop forwarding.
+    /// The inverse, and equally decision-free.
     pub fn unregister_subscriber(
         &mut self,
+        subscriber: ParticipantId,
         handle: ParticipantKey,
         track: TrackMeta,
     ) -> Option<ShardEvent> {
@@ -1207,34 +1176,8 @@ impl ShardRoutingTable {
         if !entry.subscribers.remove(&handle) {
             return None;
         }
-
-        // Retire the destination-side route only when the last local consumer
-        // leaves; everything before that is churn the cluster never sees. The
-        // retired incarnation is named in the unsubscribe so the publisher can
-        // tell it apart from a resubscription that overtook it.
-        let effect = self
-            .track_import(&track.id)
-            .map_or(ImportEffect::None, ImportSlot::unsubscribe);
-        let retired = match effect {
-            ImportEffect::Retire { route, epoch } => {
-                self.release_route(RouteHandle::new(route, epoch));
-                if let Some(import) = self.track_import(&track.id) {
-                    import.on_retired();
-                }
-                Some((route, epoch))
-            }
-            _ => None,
-        };
-        let Some((route, epoch)) = retired else {
-            self.release_fanout_if_idle(&track.id);
-            return None;
-        };
         self.release_fanout_if_idle(&track.id);
-        Some(ShardEvent::Relay(Topology::TrackUnsubscribed {
-            track,
-            route,
-            epoch,
-        }))
+        Some(ShardEvent::TrackUnsubscribed { subscriber, track })
     }
 
     /// Returns the compiled stream so the caller can bind it to the
@@ -1576,14 +1519,14 @@ impl ShardRoutingTable {
     pub fn unregister_remote_subscriber_shard(
         &mut self,
         from_shard_id: ShardId,
-        track: TrackMeta,
+        track_id: TrackId,
         route: RouteId,
         epoch: u16,
     ) {
         let Some(entry) = self
             .control
             .track_keys
-            .get(&track.id)
+            .get(&track_id)
             .copied()
             .and_then(|k| self.data.tracks.get_mut(k))
         else {
@@ -2348,8 +2291,8 @@ pub(crate) fn route_participant_control_event(
     shard_events: &mut VecDeque<ShardEvent>,
 ) {
     match ev {
-        ParticipantControlEvent::TrackPublished(track, _states) => {
-            shard_events.push_back(ShardEvent::TrackPublished(track));
+        ParticipantControlEvent::TrackPublished(..) => {
+            debug_assert!(false, "a published track is reported with its fanout key by the caller");
         }
         ParticipantControlEvent::TrackUnpublished { origin, track_id } => {
             shard_events.push_back(ShardEvent::TrackUnpublished { origin, track_id });
@@ -2572,6 +2515,21 @@ mod tests {
         }
     }
 
+    /// The control plane's half of publishing a track: build the fanout,
+    /// allocate the reverse route, and stamp it. Only for unit tests — in
+    /// production the controller does this on `TrackPublished`.
+    fn publish_with_reverse(table: &mut ShardRoutingTable, track: Track) -> RouteHandle {
+        let fanout = table.publish_local_track_fanout(&track);
+        let (slot, epoch) = table
+            .test_alloc
+            .allocate(now())
+            .expect("the test allocator has room");
+        let handle = RouteHandle::new(RouteId::new(ShardId::new(0), slot), epoch);
+        table.set_track_reverse_route(&track.meta.id, handle);
+        let _ = fanout;
+        handle
+    }
+
     /// Run the control plane's half of any route the call just asked for and
     /// return what the shard announces once it lands. Registration is a
     /// request now, so a test that wants the announcement has to let the
@@ -2646,17 +2604,25 @@ mod tests {
         let first_key = add_local_subscriber(&mut table, first);
         let second_key = add_local_subscriber(&mut table, second);
 
-        table.register_subscriber(first_key, track.clone());
-        let ev = settled(&mut table);
-        assert!(
-            matches!(ev, Some(ShardEvent::Relay(Topology::TrackSubscribed { track: t, .. })) if t == track),
-            "the first subscriber asks for a route and hands over the handle once granted"
-        );
+        let ev = table.register_subscriber(first, first_key, track.clone());
+        let Some(ShardEvent::TrackSubscribed {
+            subscriber, track: t, ..
+        }) = ev
+        else {
+            panic!("subscribing must report the fact to the control plane");
+        };
+        assert_eq!(subscriber, first);
+        assert_eq!(t, track);
 
-        table.register_subscriber(second_key, track);
+        // Every subscriber is reported. Deciding that the second one needs no
+        // new route is the control plane's job — it is the only thing that
+        // knows what the first one already caused. See
+        // `control::subscriptions`.
         assert!(
-            settled(&mut table).is_none(),
-            "second subscriber must not re-notify"
+            table
+                .register_subscriber(second, second_key, track)
+                .is_some(),
+            "the shard reports and does not decide"
         );
     }
 
@@ -2681,26 +2647,30 @@ mod tests {
             origin: pid(),
         };
         let subscriber_key = add_local_subscriber(&mut table, subscriber);
-        table.register_subscriber(subscriber_key, track.clone());
-        assert!(settled(&mut table).is_some());
+        assert!(
+            table
+                .register_subscriber(subscriber, subscriber_key, track.clone())
+                .is_some()
+        );
 
         assert!(
             table
-                .unregister_subscriber(subscriber_key, track.clone())
+                .unregister_subscriber(subscriber, subscriber_key, track.clone())
                 .is_some(),
             "the old connection must be torn down before the new one replaces it"
         );
         let replacement = replace_local_subscriber(&mut table, subscriber);
-        table.register_subscriber(replacement, track.clone());
         assert!(
-            settled(&mut table).is_some(),
+            table
+                .register_subscriber(subscriber, replacement, track.clone())
+                .is_some(),
             "the new connection is a fresh subscriber, not a churn no-op"
         );
 
         assert_eq!(fanout(&table, &track.id).subscribers.as_slice(), [replacement]);
         assert!(
             table
-                .unregister_subscriber(replacement, track)
+                .unregister_subscriber(pid(), replacement, track)
                 .is_some()
         );
     }
@@ -3085,7 +3055,7 @@ mod tests {
         };
         let handle = new_participant_key();
         table.add_local_member(handle, room, &mut rng);
-        table.register_subscriber(handle, track.clone());
+        table.register_subscriber(pid(), handle, track.clone());
 
         let fanout_key = table.fanout_of(&track.id).expect("subscribing creates it");
         assert!(
@@ -3140,11 +3110,11 @@ mod tests {
         let handle = new_participant_key();
         table.add_local_member(handle, room, &mut rng);
 
-        table.register_subscriber(handle, track.clone());
+        table.register_subscriber(pid(), handle, track.clone());
         table.settle_routes(now(), &wall());
         assert_eq!(table.data.tracks.len(), 1, "subscribing creates the fanout");
 
-        table.unregister_subscriber(handle, track.clone());
+        table.unregister_subscriber(pid(), handle, track.clone());
         assert_eq!(
             table.data.tracks.len(),
             0,
@@ -3173,10 +3143,10 @@ mod tests {
         };
         let track = video_track_with(&track_meta);
 
-        table.open_track_reverse_route(track);
+        publish_with_reverse(&mut table, track);
         assert!(
-            !table.settle_routes(now(), &wall()).is_empty(),
-            "publishing opens the reverse route and announces the track"
+            table.track_reverse_handle(&track_meta.id).is_some(),
+            "publishing stamps the reverse route the control plane opened"
         );
         let fanout_key = table
             .fanout_of(&track_meta.id)
@@ -3184,7 +3154,7 @@ mod tests {
 
         let handle = new_participant_key();
         table.add_local_member(handle, room, &mut rng);
-        table.register_subscriber(handle, track_meta.clone());
+        table.register_subscriber(pid(), handle, track_meta.clone());
         table.settle_routes(now(), &wall());
         table.route_video(
             fanout_key,
@@ -3196,7 +3166,7 @@ mod tests {
             "a delivered packet must populate the cache"
         );
 
-        table.unregister_subscriber(handle, track_meta.clone());
+        table.unregister_subscriber(pid(), handle, track_meta.clone());
         assert_eq!(
             table.data.tracks.len(),
             1,
@@ -3298,7 +3268,7 @@ mod tests {
         // The publishing shard stamps the descriptor, exactly as it does on
         // `ParticipantControlEvent::TrackPublished`.
         let mut track = video_track_with(&meta);
-        publisher_shard.open_track_reverse_route(track.clone());
+        publish_with_reverse(&mut publisher_shard, track.clone());
         publisher_shard.settle_routes(now(), &wall());
         track.reverse = publisher_shard.track_reverse_handle(&track.meta.id);
         assert!(
@@ -3339,12 +3309,10 @@ mod tests {
             origin: publisher,
         };
 
-        table.open_track_reverse_route(video_track_with(&track));
-        table.settle_routes(now(), &wall());
+        publish_with_reverse(&mut table, video_track_with(&track));
         table
             .track_reverse_handle(&track.id)
             .expect("publishing opens the reverse route");
-        assert_eq!(table.live_routes(), 1);
         assert_eq!(
             fanout(&table, &track.id).encodings,
             vec![None],
@@ -3368,17 +3336,16 @@ mod tests {
                 "every subscriber resolves through the one route"
             );
         }
-        assert_eq!(
-            table.live_routes(),
-            1,
-            "subscriber count must not grow the reverse table"
-        );
+        // One handle for the track, however many shards address it — the
+        // reverse direction is proportional to streams, not streams x shards.
+        let handle = table
+            .track_reverse_handle(&track.id)
+            .expect("the track keeps its one reverse route");
 
         table.close_track_reverse_route(&track.id);
-        assert_eq!(
-            table.live_routes(),
-            0,
-            "unpublishing must free the reverse route"
+        assert!(
+            table.track_reverse_handle(&track.id).is_none(),
+            "unpublishing must give up the reverse route {handle}"
         );
     }
 
@@ -3394,7 +3361,7 @@ mod tests {
             origin: publisher,
         };
 
-        table.open_track_reverse_route(video_track_with(&track));
+        publish_with_reverse(&mut table, video_track_with(&track));
         table.settle_routes(now(), &wall());
         let stale = table
             .track_reverse_handle(&track.id)
@@ -3439,14 +3406,14 @@ mod tests {
         );
         assert_eq!(fanout(&table, &track.id).remote_routes.len(), 1);
 
-        table.unregister_remote_subscriber_shard(subscriber_shard, track.clone(), stale, 0);
+        table.unregister_remote_subscriber_shard(subscriber_shard, track.id, stale, 0);
         assert_eq!(
             fanout(&table, &track.id).remote_routes.len(),
             1,
             "an unsubscribe naming a superseded route must be ignored"
         );
 
-        table.unregister_remote_subscriber_shard(subscriber_shard, track.clone(), fresh, 1);
+        table.unregister_remote_subscriber_shard(subscriber_shard, track.id, fresh, 1);
         assert!(
             fanout(&table, &track.id).remote_routes.is_empty(),
             "an unsubscribe naming the live route must retire it"
@@ -3658,58 +3625,6 @@ mod tests {
         assert_eq!(table.live_routes(), 0);
     }
 
-    /// The destination allocates a route, the publisher receives the handle,
-    /// and only then does media flow — addressed by route, not by track id.
-    #[test]
-    fn a_route_is_installed_once_and_retired_with_the_last_subscriber() {
-        let mut table = ShardRoutingTable::new(ShardId::new(0));
-        let track = TrackMeta {
-            shard_id: ShardId::new(1),
-            id: pid().derive_track_id(TrackKind::Video, "v"),
-            origin: pid(),
-        };
-        let (first, second) = (pid(), pid());
-        let first_key = add_local_subscriber(&mut table, first);
-        let second_key = add_local_subscriber(&mut table, second);
-
-        table.register_subscriber(first_key, track.clone());
-        let Some(ShardEvent::Relay(Topology::TrackSubscribed { route, epoch, .. })) =
-            settled(&mut table)
-        else {
-            panic!("the first subscriber must get a route");
-        };
-        assert_eq!(table.live_routes(), 1);
-
-        table.register_subscriber(second_key, track.clone());
-        assert!(
-            settled(&mut table).is_none(),
-            "local churn must not touch the cluster route"
-        );
-        assert_eq!(table.live_routes(), 1, "exactly one route installation");
-
-        assert!(
-            table
-                .unregister_subscriber(first_key, track.clone())
-                .is_none()
-        );
-        assert_eq!(table.live_routes(), 1, "still one consumer left");
-
-        assert!(
-            table
-                .unregister_subscriber(second_key, track)
-                .is_some(),
-            "the last subscriber leaving tells the publisher to stop"
-        );
-        // A frame still in flight for the retired incarnation must not land:
-        // the accounting behind `(route, epoch)` is gone, and the published
-        // view no longer carries it either — see `view::tests`.
-        assert_eq!(table.live_routes(), 0, "the route is retired");
-        assert!(
-            table
-                .route_accounting(RouteHandle::new(route, epoch))
-                .is_none()
-        );
-    }
 
     #[test]
     fn route_video_forwards_to_subscribers_and_remote_shards() {
@@ -3720,6 +3635,7 @@ mod tests {
         let subscriber_key = add_local_subscriber(&mut table, subscriber);
 
         table.register_subscriber(
+            pid(),
             subscriber_key,
             TrackMeta {
                 shard_id: ShardId::new(0),

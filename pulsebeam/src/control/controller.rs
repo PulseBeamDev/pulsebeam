@@ -14,7 +14,7 @@ use crate::{
     route::{RouteHandle, TransportHandle},
     shard::{
         ShardContext,
-        worker::{ShardCommand, ShardEvent, ShardEventWrapper},
+        worker::{ShardCommand, ShardEvent, ShardEventWrapper, Topology},
     },
 };
 use pulsebeam_runtime::mailbox;
@@ -106,6 +106,9 @@ pub struct ControllerActor {
     /// The canonical lifecycle state. Only this actor mutates it, and no
     /// shard ever reads it — a shard reads the view projected from it.
     state: ControlPlaneState,
+    /// Who consumes what, and therefore which routes exist. The decision the
+    /// shard used to make by counting its own subscribers.
+    subscriptions: crate::control::subscriptions::TrackSubscriptions,
     /// One writer per shard. Never shared, never locked, and never handed to
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
@@ -139,6 +142,7 @@ impl ControllerActor {
             cluster_id: 0,
             node_id: 0,
             state: ControlPlaneState::new(shard_count),
+            subscriptions: crate::control::subscriptions::TrackSubscriptions::new(),
             views,
         }
     }
@@ -250,6 +254,7 @@ impl ControllerActor {
             ControllerCommand::DeleteParticipant(m) => {
                 self.core
                     .delete_participant(&m.participant_id, &mut self.eq);
+                self.retire_participant_subscriptions(&m.participant_id).await;
                 self.retire_participant_transport(&m.participant_id).await;
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
@@ -279,6 +284,7 @@ impl ControllerActor {
     ) -> Result<SdpAnswer, ControllerError> {
         self.core
             .delete_participant(&state.participant_id, &mut self.eq);
+        self.retire_participant_subscriptions(&state.participant_id).await;
         self.retire_participant_transport(&state.participant_id).await;
         self.handle_create_participant(state, offer).await
     }
@@ -331,11 +337,142 @@ impl ControllerActor {
                 self.release_route(shard_id, handle).await;
                 None
             }
+            ShardEvent::TrackSubscribed {
+                subscriber,
+                track,
+                fanout,
+            } => {
+                self.on_track_subscribed(shard_id, subscriber, track, fanout)
+                    .await;
+                None
+            }
+            ShardEvent::TrackUnsubscribed { subscriber, track } => {
+                self.on_track_unsubscribed(shard_id, subscriber, track).await;
+                None
+            }
+            ShardEvent::TrackPublished(track, fanout) => {
+                let announced = self.on_track_published(shard_id, *track, fanout).await;
+                announced.map(|track| ShardEventWrapper {
+                    from_shard_id: shard_id,
+                    ev: ShardEvent::TrackPublished(Box::new(track), fanout),
+                })
+            }
             ev => Some(ShardEventWrapper {
                 from_shard_id: shard_id,
                 ev,
             }),
         }
+    }
+
+    /// A shard reported a newly published track.
+    ///
+    /// Its reverse route is opened here, before anything learns the track
+    /// exists — a subscriber that heard about it first would have nowhere to
+    /// send a keyframe request. Returns the descriptor with the handle
+    /// stamped on, for the ordinary topology projection to distribute.
+    async fn on_track_published(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        mut track: crate::track::Track,
+        fanout: crate::shard::router::LocalTrackKey,
+    ) -> Option<crate::track::Track> {
+        let handle = self
+            .grant_route(
+                shard_id,
+                crate::route::RouteAction::Reverse {
+                    target: crate::route::ReverseTarget::Track { track: fanout },
+                },
+            )
+            .await?;
+        self.router
+            .send(
+                shard_id,
+                ShardCommand::TrackReverseRoute {
+                    track_id: track.meta.id,
+                    handle,
+                },
+            )
+            .await;
+        track.reverse = Some(handle);
+        Some(track)
+    }
+
+    /// A shard reported a new local consumer for a track.
+    ///
+    /// The shard did not ask for anything. This decides whether that shard
+    /// now needs a route, installs one if so, and tells the publisher's shard
+    /// to start forwarding — the three things the shard used to do by asking.
+    async fn on_track_subscribed(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        subscriber: ParticipantId,
+        track: crate::track::TrackMeta,
+        fanout: crate::shard::router::LocalTrackKey,
+    ) {
+        if self
+            .subscriptions
+            .subscribe(shard_id, track.id, subscriber, track.shard_id)
+            != crate::control::subscriptions::InterestChange::Install
+        {
+            return;
+        }
+        let Some(handle) = self
+            .grant_route(shard_id, crate::route::RouteAction::Video { local_track: fanout })
+            .await
+        else {
+            // Nothing to unwind on the shard: it built its fanout entry as
+            // part of subscribing and never expected an answer. A later
+            // subscriber asks again.
+            self.subscriptions
+                .unsubscribe(shard_id, &track.id, &subscriber);
+            return;
+        };
+        self.subscriptions.installed(shard_id, track.id, handle);
+
+        // Only now may the publisher emit to it.
+        self.router
+            .send(
+                track.shard_id,
+                ShardCommand::Relay {
+                    from_shard_id: shard_id,
+                    topology: Topology::TrackSubscribed {
+                        track,
+                        route: handle.route,
+                        epoch: handle.epoch,
+                    },
+                },
+            )
+            .await;
+    }
+
+    /// The inverse. Only the last consumer on a shard retires its route, and
+    /// the publisher is told to stop before the route leaves the view.
+    async fn on_track_unsubscribed(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        subscriber: ParticipantId,
+        track: crate::track::TrackMeta,
+    ) {
+        let crate::control::subscriptions::InterestChange::Retire { route } = self
+            .subscriptions
+            .unsubscribe(shard_id, &track.id, &subscriber)
+        else {
+            return;
+        };
+        self.router
+            .send(
+                track.shard_id,
+                ShardCommand::Relay {
+                    from_shard_id: shard_id,
+                    topology: Topology::TrackUnsubscribed {
+                        track,
+                        route: route.route,
+                        epoch: route.epoch,
+                    },
+                },
+            )
+            .await;
+        self.release_route(shard_id, route).await;
     }
 
     /// Allocate, publish and confirm one endpoint route.
@@ -572,6 +709,29 @@ impl ControllerActor {
             return view.is_acknowledged(generation);
         }
         false
+    }
+
+    /// Release everything a departing participant was consuming.
+    ///
+    /// Its subscriptions go with it, and any route that only it kept alive is
+    /// retired — otherwise a shard keeps a route for a stream nobody there
+    /// receives any more, and the slot never returns to the allocator.
+    async fn retire_participant_subscriptions(&mut self, participant_id: &ParticipantId) {
+        for retired in self.subscriptions.remove_participant(participant_id) {
+            if let Some(publisher_shard) = retired.publisher_shard {
+                self.router
+                    .send(
+                        publisher_shard,
+                        ShardCommand::StopForwarding {
+                            track_id: retired.stream,
+                            route: retired.route.route,
+                            epoch: retired.route.epoch,
+                        },
+                    )
+                    .await;
+            }
+            self.release_route(retired.destination, retired.route).await;
+        }
     }
 
     /// Retire whatever transport route a participant holds, if the registry

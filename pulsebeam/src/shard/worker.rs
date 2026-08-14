@@ -107,6 +107,22 @@ pub enum ShardCommand {
         request: RouteRequestId,
         handle: Option<RouteHandle>,
     },
+    /// A destination has no consumers left for a track this shard publishes.
+    ///
+    /// Carries the route it is retiring so teardown is idempotent: an
+    /// instruction overtaken by a fresh subscription names the old
+    /// incarnation and is ignored, instead of tearing down the new one.
+    StopForwarding {
+        track_id: TrackId,
+        route: RouteId,
+        epoch: u16,
+    },
+    /// The reverse route the control plane opened for a track this shard
+    /// publishes, so feedback can resolve to it.
+    TrackReverseRoute {
+        track_id: TrackId,
+        handle: RouteHandle,
+    },
     /// The generation barrier. The shard replies with the generation it can
     /// currently resolve against, which is at least `generation` because the
     /// control plane published before sending this and the mailbox preserves
@@ -306,7 +322,11 @@ pub struct ShardEventWrapper {
 pub enum ShardEvent {
     /// A local participant published a track. The controller owns the room, so
     /// it turns this into `PublishTrack` for the shards that need to know.
-    TrackPublished(Track),
+    /// A local participant published a track, with this shard's own fanout
+    /// key for it. The control plane opens the reverse route and announces
+    /// the track; the shard has already built everything the route will
+    /// point at.
+    TrackPublished(Box<Track>, crate::shard::router::LocalTrackKey),
     TrackUnpublished {
         origin: ParticipantId,
         track_id: TrackId,
@@ -329,6 +349,23 @@ pub enum ShardEvent {
     /// This shard no longer needs a route it was granted. The control plane
     /// removes it from the published view and only then returns its slot.
     RouteReleased { handle: RouteHandle },
+    /// A local participant started consuming a track.
+    ///
+    /// A fact, not a request. Whether that means this shard now needs a route
+    /// is the control plane's decision — it knows who else subscribes and is
+    /// the only thing that may allocate one. `fanout` is this shard's own
+    /// arena key for the track, carried so the control plane can compile it
+    /// into the view without a second round trip to ask; it is opaque there.
+    TrackSubscribed {
+        subscriber: ParticipantId,
+        track: TrackMeta,
+        fanout: crate::shard::router::LocalTrackKey,
+    },
+    /// A local participant stopped consuming a track.
+    TrackUnsubscribed {
+        subscriber: ParticipantId,
+        track: TrackMeta,
+    },
 }
 
 /// Names one outstanding route request from one shard.

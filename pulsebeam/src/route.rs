@@ -568,7 +568,6 @@ pub(crate) enum ReverseTarget {
 #[derive(Debug)]
 pub(crate) struct RouteRuntimeEntry {
     pub epoch: u16,
-    pub names: RouteNames,
     /// Expands the envelope's middle-32 against this route's own reference.
     pub expander: NtpExpander,
     /// Last `link_seq` seen, for hop-local loss/reorder/duplicate accounting.
@@ -723,7 +722,13 @@ impl SlotAllocator {
 #[derive(Debug)]
 pub(crate) struct RouteRuntime {
     shard_id: ShardId,
-    slots: Vec<Option<Box<RouteRuntimeEntry>>>,
+    /// Inline, not boxed. One packet touches exactly one entry, so a boxed
+    /// slot would cost a pointer fetch and then a second line for the target;
+    /// at 56 bytes the entry fits a cache line on its own. The counters stay
+    /// beside the timeline state for the same reason — `observe` writes them
+    /// on every packet, so moving them out would touch two lines rather than
+    /// making one colder.
+    slots: Vec<Option<RouteRuntimeEntry>>,
 }
 
 /// Working set preallocated up front so steady-state operation never
@@ -746,8 +751,38 @@ impl RouteRuntime {
         }
     }
 
+    /// The accounting behind a route, created on first use.
+    ///
+    /// Nothing tells the shard a route exists: the published view is the
+    /// announcement, and this materialises when a packet actually arrives on
+    /// it. A stale entry for a slot the view has since reused is harmless —
+    /// it is epoch-checked, and the next install overwrites it — so there is
+    /// no retirement message either.
+    pub fn accounting_mut(
+        &mut self,
+        handle: RouteHandle,
+        ntp_ref: NtpTime,
+    ) -> &mut RouteRuntimeEntry {
+        let idx = handle.route.index();
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx.saturating_add(1), || None);
+        }
+        let stale = self
+            .slots
+            .get(idx)
+            .and_then(Option::as_ref)
+            .is_none_or(|entry| entry.epoch != handle.epoch);
+        if stale {
+            self.install(handle, ntp_ref);
+        }
+        let Some(Some(entry)) = self.slots.get_mut(idx) else {
+            pulsebeam_runtime::fatal!("route accounting must exist after installing it")
+        };
+        entry
+    }
+
     /// Build the accounting behind an address the control plane granted.
-    pub fn install(&mut self, handle: RouteHandle, names: RouteNames, ntp_ref: NtpTime) {
+    pub fn install(&mut self, handle: RouteHandle, ntp_ref: NtpTime) {
         debug_assert_eq!(
             handle.shard(),
             self.shard_id,
@@ -761,13 +796,12 @@ impl RouteRuntime {
             debug_assert!(false, "the resize above guarantees this slot exists");
             return;
         };
-        *slot = Some(Box::new(RouteRuntimeEntry {
+        *slot = Some(RouteRuntimeEntry {
             epoch: handle.epoch,
-            names,
             expander: NtpExpander::new(ntp_ref),
             last_link_seq: None,
             stats: RouteStats::default(),
-        }));
+        });
     }
 
     /// Idempotent, and epoch-checked: a redelivered teardown must not drop the
@@ -1244,7 +1278,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn accounting_is_scoped_to_one_incarnation() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        runtime.install(handle(0, 0, 1), names(), NtpTime::ZERO);
+        runtime.install(handle(0, 0, 1), NtpTime::ZERO);
 
         assert!(runtime.entry_mut(handle(0, 0, 1)).is_some());
         assert!(
@@ -1260,7 +1294,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retiring_accounting_is_idempotent_and_epoch_checked() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        runtime.install(handle(0, 0, 4), names(), NtpTime::ZERO);
+        runtime.install(handle(0, 0, 4), NtpTime::ZERO);
 
         assert!(
             !runtime.retire(handle(0, 0, 3)),
@@ -1429,7 +1463,7 @@ mod tests {
     async fn link_seq_detects_loss_duplication_and_reorder() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let route = handle(0, 0, 0);
-        runtime.install(route, names(), NtpTime::ZERO);
+        runtime.install(route, NtpTime::ZERO);
 
         for seq in [10u32, 11, 14, 14, 13] {
             let entry = runtime.entry_mut(route).unwrap();
@@ -1536,5 +1570,29 @@ mod tests {
                 "shard {shard}: a reused route still carries its owner"
             );
         }
+    }
+}
+
+
+#[cfg(test)]
+mod layout {
+    use super::*;
+
+    /// A packet touches exactly one runtime entry and one view binding. Both
+    /// are indexed inline, so the only way either costs more than a single
+    /// cache line is if it grows past one — which is what this pins.
+    #[test]
+    fn the_per_packet_entries_each_fit_a_cache_line() {
+        const CACHE_LINE: usize = 64;
+        assert!(
+            size_of::<Option<RouteRuntimeEntry>>() <= CACHE_LINE,
+            "route accounting is {} bytes; a packet would straddle two lines",
+            size_of::<Option<RouteRuntimeEntry>>()
+        );
+        assert!(
+            size_of::<Option<crate::view::RouteBinding>>() <= CACHE_LINE / 2,
+            "a view binding is {} bytes; several should share a line",
+            size_of::<Option<crate::view::RouteBinding>>()
+        );
     }
 }

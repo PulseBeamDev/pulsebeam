@@ -276,13 +276,12 @@ impl ShardCore {
             );
             return;
         };
-        let Some(entry) = self.routing.data.routes.entry_mut(handle) else {
-            debug_assert!(
-                false,
-                "a route live in the view must have accounting on its owner"
-            );
-            return;
-        };
+        // Materialised on first arrival rather than announced: the published
+        // view is what makes a route real, so there is no install message to
+        // this shard and no retirement message either — a stale entry for a
+        // slot the view has since reused is epoch-checked and overwritten.
+        let ntp_ref = self.wall.ntp();
+        let entry = self.routing.data.routes.accounting_mut(handle, ntp_ref);
         entry.observe(env.link_seq);
         #[cfg(feature = "sim")]
         crate::sim_metrics::record_cross_shard_media();
@@ -292,7 +291,7 @@ impl ShardCore {
                 tracing::warn!(
                     shard_id = %self.shard_id,
                     route = %env.route,
-                    stream = %entry.names,
+                    ?action,
                     ?err,
                     "route timeline is ambiguous; needs a fresh NTP reference"
                 );
@@ -303,8 +302,8 @@ impl ShardCore {
         if matches!(action, RouteAction::Reverse { .. }) {
             debug_assert!(
                 false,
-                "no media dispatch for route action {action:?} on {} ({})",
-                env.route, entry.names
+                "no media dispatch for route action {action:?} on {}",
+                env.route
             );
             return;
         }
@@ -527,12 +526,13 @@ impl ShardCore {
                         ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
                             self.registry.key_of(&subscriber).and_then(|handle| {
                                 self.routing
-                                    .register_subscriber(handle, track)
+                                    .register_subscriber(subscriber, handle, track)
                             })
                         }
                         ParticipantTopologyEvent::TrackUnsubscribed { track, subscriber } => {
                             self.registry.key_of(&subscriber).and_then(|handle| {
-                                self.routing.unregister_subscriber(handle, track)
+                                self.routing
+                                    .unregister_subscriber(subscriber, handle, track)
                             })
                         }
                     };
@@ -699,11 +699,13 @@ impl ShardCore {
                             if let Some(p) = self.registry.get_mut(&track.meta.origin) {
                                 p.bind_published_track(track.meta.id, fanout);
                             }
-                            // The descriptor is announced by the routing
-                            // table once its reverse path is granted, not
-                            // here: a subscriber must never learn about a
-                            // track before it can ask for a keyframe on it.
-                            self.routing.open_track_reverse_route(track);
+                            // Reported, not announced: the control plane
+                            // opens the reverse path and announces the track
+                            // once it exists, so a subscriber never learns
+                            // about a track it cannot request a keyframe on.
+                            let fanout = self.routing.publish_local_track_fanout(&track);
+                            self.pipeline
+                                .push_shard_event(ShardEvent::TrackPublished(Box::new(track), fanout));
                         }
                         // Measurements go straight to the shards holding a
                         // route for the track. The controller has nothing to add
@@ -863,6 +865,23 @@ impl ShardCore {
                 handle,
                 reply,
             } => self.prepare_transport(participant_id, handle, reply),
+            ShardCommand::TrackReverseRoute { track_id, handle } => {
+                self.routing.set_track_reverse_route(&track_id, handle);
+            }
+            ShardCommand::StopForwarding {
+                track_id,
+                route,
+                epoch,
+            } => {
+                // The control plane decided this destination has no consumers
+                // left; the shard only stops sending.
+                self.routing.unregister_remote_subscriber_shard(
+                    self.shard_id,
+                    track_id,
+                    route,
+                    epoch,
+                );
+            }
             ShardCommand::AckGeneration { generation, reply } => {
                 self.ack_generation(generation, reply);
             }
@@ -958,6 +977,8 @@ impl ShardCore {
             | ShardCommand::PrepareTransport { .. }
             | ShardCommand::AckGeneration { .. }
             | ShardCommand::RouteGranted { .. }
+            | ShardCommand::StopForwarding { .. }
+            | ShardCommand::TrackReverseRoute { .. }
             | ShardCommand::CancelReservation { .. } => pulsebeam_runtime::fatal!(
                 "a command handled by the outer match reached the inner one; the two have drifted apart"
             ),
@@ -1031,7 +1052,7 @@ impl ShardCore {
                 epoch,
             } => {
                 self.routing
-                    .unregister_remote_subscriber_shard(from_shard_id, track, route, epoch);
+                    .unregister_remote_subscriber_shard(from_shard_id, track.id, route, epoch);
             }
             Topology::DataTopicSubscribed {
                 room_id,
@@ -1603,7 +1624,8 @@ mod test {
         // Feedback reaches the publisher's shard directly, never through the
         // controller, so this is the only path a remote keyframe request takes.
         let router = TestRouter::new();
-        let mut core = new_core();
+        let (mut core, mut writer) = new_core_with_view();
+        let mut generation = 0u64;
         let p = pid();
         let r = room_id("kf1");
         add_participant(&mut core, &router, p, r);
@@ -1620,12 +1642,28 @@ mod test {
             }],
             reverse: None,
         };
-        core.routing.open_track_reverse_route(descriptor.clone());
-        core.routing.settle_routes(now(), &core.wall);
-        let target = core
-            .routing
-            .track_reverse_handle(&descriptor.meta.id)
-            .expect("a published track opens a reverse route");
+        let fanout = core.routing.publish_local_track_fanout(&descriptor);
+        // The control plane's half: allocate the reverse route and stamp it.
+        let target = crate::route::RouteHandle::new(
+            crate::route::RouteId::new(core.shard_id, 900),
+            0,
+        );
+        core.routing
+            .set_track_reverse_route(&descriptor.meta.id, target);
+        generation = generation.saturating_add(1);
+        writer.stage(
+            generation,
+            crate::view::ViewOp::InstallRoute {
+                route: target.route,
+                binding: crate::view::RouteBinding {
+                    epoch: target.epoch,
+                    action: RouteAction::Reverse {
+                        target: crate::route::ReverseTarget::Track { track: fanout },
+                    },
+                },
+            },
+        );
+        writer.publish();
 
         core.on_shard_frame(
             ShardFrame::Reverse {
@@ -1672,14 +1710,32 @@ mod test {
         );
         clear_dirty(&mut core);
         let subscriber_key = core.registry.key_of(&subscriber).unwrap();
-        core.routing
-            .register_subscriber(subscriber_key, video_track(publisher, 1));
-        let announced = settle_routes(&mut core, &mut writer, &mut next_slot, &mut generation);
-        let Some(ShardEvent::Relay(Topology::TrackSubscribed { route, epoch, .. })) =
-            announced.into_iter().next()
-        else {
-            panic!("the first subscriber must be granted a route and announced");
+        let Some(ShardEvent::TrackSubscribed { fanout, .. }) = core.routing.register_subscriber(
+            subscriber,
+            subscriber_key,
+            video_track(publisher, 1),
+        ) else {
+            panic!("subscribing must report the fact to the control plane");
         };
+        // The control plane's half: allocate the address and publish it into
+        // this shard's view. The shard never sees a grant — the view is the
+        // announcement.
+        let (route, epoch) = (crate::route::RouteId::new(core.shard_id, next_slot), 0);
+        next_slot = next_slot.saturating_add(1);
+        generation = generation.saturating_add(1);
+        writer.stage(
+            generation,
+            crate::view::ViewOp::InstallRoute {
+                route,
+                binding: crate::view::RouteBinding {
+                    epoch,
+                    action: RouteAction::Video {
+                        local_track: fanout,
+                    },
+                },
+            },
+        );
+        writer.publish();
 
         // Address the frame the way a remote publisher would: by the route the
         // destination just handed out, with no semantic ids on the wire, and

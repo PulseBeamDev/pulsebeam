@@ -123,13 +123,18 @@ impl ControllerCore {
 
     pub fn process_shard_event(&mut self, e: ShardEventWrapper, eq: &mut ControllerEventQueue) {
         match e.ev {
-            // Route lifecycle is a control-plane transaction, handled by the
-            // actor itself before this sees the event — it needs to await a
-            // publication barrier, which this synchronous projection cannot.
-            ShardEvent::RouteNeeded { .. } | ShardEvent::RouteReleased { .. } => {
+            // Route and subscription lifecycle are control-plane
+            // transactions, handled by the actor itself before this sees the
+            // event — they need to await a publication barrier, which this
+            // synchronous projection cannot.
+            ShardEvent::RouteNeeded { .. }
+            | ShardEvent::RouteReleased { .. }
+            | ShardEvent::TrackSubscribed { .. }
+            | ShardEvent::TrackUnsubscribed { .. } => {
                 debug_assert!(false, "route events are intercepted by the controller actor");
             }
-            ShardEvent::TrackPublished(track) => {
+            ShardEvent::TrackPublished(track, _) => {
+                let track = *track;
                 let Some((room_id, other_participants)) = self.registry.add_track(track.clone())
                 else {
                     return;
@@ -385,7 +390,7 @@ mod tests {
         core.process_shard_event(
             ShardEventWrapper {
                 from_shard_id: ShardId::new(0),
-                ev: ShardEvent::TrackPublished(track.clone()),
+                ev: ShardEvent::TrackPublished(Box::new(track.clone()), Default::default()),
             },
             &mut eq,
         );
@@ -431,7 +436,7 @@ mod tests {
         core.process_shard_event(
             ShardEventWrapper {
                 from_shard_id: ShardId::new(0),
-                ev: ShardEvent::TrackPublished(track),
+                ev: ShardEvent::TrackPublished(Box::new(track), Default::default()),
             },
             &mut eq,
         );
@@ -490,7 +495,7 @@ mod tests {
         core.process_shard_event(
             ShardEventWrapper {
                 from_shard_id: ShardId::new(0),
-                ev: ShardEvent::TrackPublished(track.clone()),
+                ev: ShardEvent::TrackPublished(Box::new(track.clone()), Default::default()),
             },
             &mut eq,
         );
