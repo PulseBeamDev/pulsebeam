@@ -2,10 +2,10 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{
     control::room::Room,
-    route::TransportHandle,
-    shard::participants::ParticipantKey,
     entity::{ParticipantId, RoomId, TrackId},
     id::ShardId,
+    route::TransportHandle,
+    shard::participants::ParticipantKey,
     track::Track,
 };
 use futures_lite::StreamExt;
@@ -86,8 +86,7 @@ impl RoomRegistry {
                 transport,
                 binding,
             },
-        )
-            && let Some(room) = self.rooms.get_mut(&previous.room_id)
+        ) && let Some(room) = self.rooms.get_mut(&previous.room_id)
         {
             room.remove_participant(&participant_id, previous.shard_id);
             if room.participant_count() == 0 {
@@ -103,6 +102,21 @@ impl RoomRegistry {
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
         self.participants.get(participant_id)
+    }
+
+    pub fn participants_in_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Vec<(ParticipantId, ShardId, Option<ParticipantKey>)> {
+        let Some(room) = self.rooms.get(room_id) else {
+            return Vec::new();
+        };
+        room.participant_ids()
+            .filter_map(|participant| {
+                let meta = self.participants.get(participant)?;
+                Some((*participant, meta.shard_id, meta.binding))
+            })
+            .collect()
     }
 
     /// Record the arena key the owning shard reported for this participant.
@@ -385,10 +399,8 @@ mod tests {
         let mut reg = RoomRegistry::new();
         let participant = participant_id();
         let room = room_id("one-index");
-        let transport = TransportHandle::new(
-            crate::route::TransportRoute::new(ShardId::new(3), 7),
-            2,
-        );
+        let transport =
+            TransportHandle::new(crate::route::TransportRoute::new(ShardId::new(3), 7), 2);
 
         reg.add_participant(participant, room, ShardId::new(3), Some(transport));
 

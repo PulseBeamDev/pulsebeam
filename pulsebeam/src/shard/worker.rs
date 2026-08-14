@@ -9,9 +9,7 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
-use crate::route::{
-    MediaEnvelope, RouteAction, RouteEnvelope, RouteHandle, RouteId, TransportHandle,
-};
+use crate::route::Envelope;
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -22,12 +20,12 @@ use str0m::media::KeyframeRequestKind;
 use tokio::time::{Instant, Sleep};
 
 use crate::{
-    entity::{ParticipantId, RoomId, TrackId},
+    entity::{ParticipantId, TrackId},
     id::ShardId,
     participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::metrics::ShardMetrics,
-    track::{Topic, Track, TrackMeta},
+    track::Track,
 };
 
 use super::core::{ShardCore, ShardTransport};
@@ -40,7 +38,7 @@ use super::core::{ShardCore, ShardTransport};
 /// so that filling it is unambiguous evidence of a stalled controller rather
 /// than a burst, which is what lets [`ShardWorker::flush_shard_events`] treat
 /// it as fatal instead of blocking.
-pub const SHARD_EVENT_CAPACITY: usize = 65_536;
+pub(crate) const SHARD_EVENT_CAPACITY: usize = 65_536;
 
 /// Depth of the controller -> shard command queue.
 ///
@@ -51,7 +49,7 @@ pub const SHARD_EVENT_CAPACITY: usize = 65_536;
 /// Both directions must read this from here. Restating the depth at the call
 /// site would let the two drift apart, and the ratio below would then be
 /// asserted about a number nothing uses.
-pub const SHARD_COMMAND_CAPACITY: usize = 1024;
+pub(crate) const SHARD_COMMAND_CAPACITY: usize = 1024;
 
 /// Depth of the shard -> shard media queue, one per receiving shard.
 ///
@@ -61,7 +59,9 @@ pub const SHARD_COMMAND_CAPACITY: usize = 1024;
 /// backlog — deep enough to absorb one scheduling hiccup on the receiving
 /// core, shallow enough that a stalled shard sheds load promptly instead of
 /// holding a second of stale video.
-pub const SHARD_FRAME_CAPACITY: usize = 1024;
+pub(crate) const SHARD_FRAME_CAPACITY: usize = 1024;
+
+pub(crate) const SHARD_VIEW_CAPACITY: usize = 1024;
 
 const _: () = assert!(
     SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
@@ -69,157 +69,24 @@ const _: () = assert!(
 );
 
 #[derive(Debug, thiserror::Error)]
-pub enum ShardError {
+pub(crate) enum ShardError {
     #[error("IO error: {0}")]
     IO(#[from] std::io::Error),
     #[error("Manager hung up")]
     ManagerDisconnected,
 }
 
-/// Everything the controller sends a shard. This is the control plane: it is
-/// reliable, it is semantic, and it is the only source of topology — shards
-/// never send each other any of this.
+/// The only imperative operations the controller may request from a shard.
+/// Topology and lifecycle changes are published through `ShardView`.
 #[derive(Debug)]
-pub enum ShardCommand {
-    /// Reserve a participant slot and install its ingress route, replying
-    /// with `(route, epoch)` so the controller can encode it into the ICE
-    /// ufrag before it has anything else to build one from — the route can
-    /// only be minted by the shard that will own it, and the ufrag has to
-    /// carry a real one. `None` means the route table is exhausted; nothing
-    /// is left reserved in that case.
-    /// Build the runtime binding a control-plane transaction has allocated a
-    /// transport route for.
-    ///
-    /// The shard decides nothing: the address arrives already chosen, and the
-    /// shard replies with the arena key it reserved on its own core. The route
-    /// does not resolve until the control plane publishes the view carrying
-    /// it. `None` means the shard could not reserve a key; nothing is left
-    /// behind in that case.
-    PrepareTransport {
-        participant_id: ParticipantId,
-        handle: TransportHandle,
-        reply: tokio::sync::oneshot::Sender<Option<crate::shard::participants::ParticipantKey>>,
+pub(crate) enum ShardCommand {
+    MaterializeParticipant {
+        key: crate::shard::participants::ParticipantKey,
+        config: Box<ParticipantConfig>,
     },
-    /// The answer to a [`ShardEvent::RouteNeeded`]. `None` means the control
-    /// plane could not produce a usable route, and the shard must unwind
-    /// whatever it built expecting one.
-    RouteGranted {
-        request: RouteRequestId,
-        handle: Option<RouteHandle>,
-    },
-    /// A destination has no consumers left for a track this shard publishes.
-    ///
-    /// Carries the route it is retiring so teardown is idempotent: an
-    /// instruction overtaken by a fresh subscription names the old
-    /// incarnation and is ignored, instead of tearing down the new one.
-    StopForwarding {
-        track_id: TrackId,
-        route: RouteId,
-        epoch: u16,
-    },
-    /// The reverse route the control plane opened for a track this shard
-    /// publishes, so feedback can resolve to it.
-    TrackReverseRoute {
-        track_id: TrackId,
-        handle: RouteHandle,
-    },
-    /// The generation barrier. The shard replies with the generation it can
-    /// currently resolve against, which is at least `generation` because the
-    /// control plane published before sending this and the mailbox preserves
-    /// that order.
-    AckGeneration {
-        generation: u64,
-        reply: tokio::sync::oneshot::Sender<u64>,
-    },
-    /// Release a reservation that never reached `AddParticipant` — the
-    /// negotiation that would have populated it failed after the route was
-    /// already installed. Fire-and-forget: a redelivered or late cancel for
-    /// an already-populated or already-gone key is a no-op.
-    CancelReservation {
-        participant_id: ParticipantId,
-    },
-    /// Boxed because it dwarfs every other variant: an inline
-    /// `ParticipantConfig` would set the size of the enum, and the command
-    /// queue preallocates [`SHARD_COMMAND_CAPACITY`] of them per shard.
-    AddParticipant(Box<ParticipantConfig>),
-    RemoveParticipant(ParticipantId),
-    AddTcpConnection {
+    AdoptTcpConnection {
         stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
         peer_addr: std::net::SocketAddr,
-    },
-    PublishTrack(Track, RoomId),
-    UnpublishTracks {
-        room_id: RoomId,
-        origin: ParticipantId,
-        track_ids: Vec<TrackId>,
-    },
-    /// A [`Topology`] one shard raised, relayed by the controller to the shards
-    /// it picked. The controller adds nothing but the origin.
-    Relay {
-        from_shard_id: ShardId,
-        topology: Topology,
-    },
-}
-
-/// A topology change one shard announces and the controller relays verbatim.
-///
-/// Both directions carry the same value, so the controller's whole job for
-/// these is choosing recipients — it never re-encodes, and there is no second
-/// enum to keep in step.
-#[derive(Debug, Clone)]
-pub enum Topology {
-    /// The destination installed a route and is handing over the sender handle.
-    /// Only on receiving this may the publisher emit media to it.
-    TrackSubscribed {
-        track: TrackMeta,
-        route: RouteId,
-        epoch: u16,
-    },
-    /// No more local subscribers; stop forwarding. Carries the route it is
-    /// retiring so teardown is idempotent: a stale unsubscribe overtaken by a
-    /// fresh subscription names the old incarnation and is ignored, instead of
-    /// tearing down the new one.
-    TrackUnsubscribed {
-        track: TrackMeta,
-        route: RouteId,
-        epoch: u16,
-    },
-    /// The destination installed a route for this concrete stream, or (with no
-    /// publisher) registered a wildcard interest in the topic.
-    DataTopicSubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-        route: Option<RouteId>,
-        epoch: u16,
-    },
-    DataTopicUnsubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-    },
-    /// A data publisher appeared, so destinations holding a wildcard
-    /// subscription for the topic can resolve it into a concrete route.
-    DataTopicPublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-    },
-    ReliableTopicSubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-        route: Option<RouteId>,
-        epoch: u16,
-    },
-    /// Drop every handle held for this topic; the destination retired its routes.
-    ReliableTopicUnsubscribed { room_id: RoomId, topic: Topic },
-    ReliableTopicPublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-        /// Where subscribers send this topic's application-level acks.
-        reverse: Option<RouteHandle>,
     },
 }
 
@@ -242,7 +109,7 @@ pub enum Topology {
 /// route offset on the wire, which is the one thing the steering program
 /// cannot afford to have two of.
 #[derive(Debug, Clone)]
-pub enum Reverse {
+pub(crate) enum Reverse {
     /// Ask for a keyframe on one encoding.
     Keyframe {
         layer: u8,
@@ -260,9 +127,9 @@ pub enum Reverse {
     DataAck(Vec<u8>),
 }
 
-/// Payload carried under an [`MediaEnvelope`]. Still typed this pass; byte
+/// Payload carried under an [`Envelope`]. Still typed this pass; byte
 /// serialization arrives with the UDP transport.
-pub enum MediaPayload {
+pub(crate) enum MediaPayload {
     Video(RtpPacket),
     Audio(RtpPacket),
     /// SCTP bytes for a client data channel. Which lane the client asked for is
@@ -280,19 +147,19 @@ pub enum MediaPayload {
     clippy::large_enum_variant,
     reason = "boxing MediaPayload would put a heap allocation on every forwarded media frame; the mesh moves these by value precisely to avoid that, and the ratio only became visible once the client-packet variant was deleted"
 )]
-pub enum ShardFrame {
+pub(crate) enum ShardFrame {
     /// Forward payload, addressed by the destination's own route. Carries no
     /// semantic ids: everything needed to deliver it lives in the destination's
     /// compiled route entry.
     Media {
-        env: MediaEnvelope,
+        env: Envelope,
         payload: MediaPayload,
     },
     /// Anything travelling back toward a publisher, addressed by the reverse
     /// route its shard opened. One variant for all of it because they share a
     /// contract: every one is an idempotent request the sender repeats if it
     /// still needs it, so losing one costs a round trip and nothing else.
-    Reverse { env: RouteEnvelope, body: Reverse },
+    Reverse { env: Envelope, body: Reverse },
     /// Forward telemetry: what a publisher's encodings currently measure,
     /// addressed by the destination's own route.
     ///
@@ -304,86 +171,49 @@ pub enum ShardFrame {
     ///
     /// Latest-wins: losing one costs a slightly stale allocation and nothing
     /// else, so it belongs on the best-effort lane.
-    Stats {
-        env: RouteEnvelope,
+    Telemetry {
+        env: Envelope,
         stats: crate::track::TrackStates,
     },
 }
 
-#[derive(Debug)]
-pub struct ShardEventWrapper {
-    pub from_shard_id: ShardId,
-    pub ev: ShardEvent,
-}
+pub(crate) type ShardEventMessage = (ShardId, ShardEvent);
 
-/// Everything a shard tells the controller. The other half of the control
-/// plane; like [`ShardCommand`] it is reliable and semantic.
+/// Runtime facts observed by a shard. The controller converts these facts into
+/// canonical state and publishes the resulting execution image.
 #[derive(Debug)]
-pub enum ShardEvent {
-    /// A local participant published a track. The controller owns the room, so
-    /// it turns this into `PublishTrack` for the shards that need to know.
-    /// A local participant published a track, with this shard's own fanout
-    /// key for it. The control plane opens the reverse route and announces
-    /// the track; the shard has already built everything the route will
-    /// point at.
-    TrackPublished(Box<Track>, crate::shard::router::LocalTrackKey),
-    TrackUnpublished {
+pub(crate) enum ShardEvent {
+    TrackObserved {
+        track: Box<Track>,
+        states: crate::track::TrackStates,
+    },
+    TrackClosed {
         origin: ParticipantId,
         track_id: TrackId,
     },
-    ParticipantExited(ParticipantId),
-    /// A topology change for the controller to relay, unchanged, to whichever
-    /// shards it decides are concerned.
-    Relay(Topology),
-    /// This shard needs an endpoint route for a destination it has just built.
-    ///
-    /// It does not allocate one: the address and the published view are the
-    /// control plane's, so the shard states the need and waits for a grant.
-    /// The action travels with it because that is what the control plane
-    /// compiles into the view — it is opaque to the controller, which never
-    /// looks inside a key that means something only on this shard.
-    RouteNeeded {
-        request: RouteRequestId,
-        action: RouteAction,
+    ParticipantClosed {
+        participant: ParticipantId,
     },
-    /// This shard no longer needs a route it was granted. The control plane
-    /// removes it from the published view and only then returns its slot.
-    RouteReleased { handle: RouteHandle },
-    /// A local participant started consuming a track.
-    ///
-    /// A fact, not a request. Whether that means this shard now needs a route
-    /// is the control plane's decision — it knows who else subscribes and is
-    /// the only thing that may allocate one. `fanout` is this shard's own
-    /// arena key for the track, carried so the control plane can compile it
-    /// into the view without a second round trip to ask; it is opaque there.
-    TrackSubscribed {
-        subscriber: ParticipantId,
-        track: TrackMeta,
-        fanout: crate::shard::router::LocalTrackKey,
+    DataChannelObserved {
+        intent: crate::shard::events::ClientIntent,
     },
-    /// A local participant stopped consuming a track.
-    TrackUnsubscribed {
-        subscriber: ParticipantId,
-        track: TrackMeta,
+    SubscriptionIntent {
+        intent: crate::shard::events::ClientIntent,
+    },
+    TrackStatsObserved {
+        track_id: TrackId,
+        states: crate::track::TrackStates,
     },
 }
 
-/// Names one outstanding route request from one shard.
-///
-/// Scoped to the shard that minted it, so the control plane never needs it to
-/// be globally unique — it exists only to match a grant back to the work that
-/// asked for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RouteRequestId(pub u64);
-
 #[derive(Clone)]
-pub struct ShardContext {
-    pub command_tx: mailbox::Sender<ShardCommand>,
+pub(crate) struct ShardContext {
+    pub(crate) command_tx: mailbox::Sender<ShardCommand>,
     #[allow(
         clippy::disallowed_types,
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
-    pub metrics: Arc<ShardMetrics>,
+    pub(crate) metrics: Arc<ShardMetrics>,
 }
 
 /// Carries the best-effort lane over in-process channels. Cross-node this
@@ -396,9 +226,6 @@ struct ChannelTransport {
 
 impl ChannelTransport {
     fn enqueue(&self, dst: ShardId, ev: ShardFrame) -> bool {
-        if dst == self.shard_id {
-            return true;
-        }
         let Some(tx) = self.frame_txs.get(dst.index()) else {
             debug_assert!(
                 false,
@@ -412,7 +239,7 @@ impl ChannelTransport {
 }
 
 impl ShardTransport for ChannelTransport {
-    fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
+    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
         // Dropping under backpressure is the media contract: this lane is
         // lossy by design, and `link_seq` makes the loss visible downstream.
         let _ = self.enqueue(dst, ShardFrame::Media { env, payload });
@@ -431,13 +258,13 @@ impl ShardTransport for ChannelTransport {
     }
 }
 
-pub struct ShardWorker {
+pub(crate) struct ShardWorker {
     core: ShardCore,
     recv_batch: Vec<RecvPacketBatch>,
     udp_socket: UnifiedSocket,
     tcp_socket: net::tcp::TcpTransport,
     command_rx: mailbox::Receiver<ShardCommand>,
-    event_tx: mailbox::Sender<ShardEventWrapper>,
+    event_tx: mailbox::Sender<ShardEventMessage>,
     frame_rx: mailbox::Receiver<ShardFrame>,
     router: ChannelTransport,
     #[allow(
@@ -465,15 +292,15 @@ impl ShardWorker {
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
         command_rx: mailbox::Receiver<ShardCommand>,
-        event_tx: mailbox::Sender<ShardEventWrapper>,
+        view_rx: mailbox::Receiver<Box<crate::view::ShardViewDelta>>,
+        event_tx: mailbox::Sender<ShardEventMessage>,
         frame_rx: mailbox::Receiver<ShardFrame>,
         frame_txs: Vec<mailbox::Sender<ShardFrame>>,
         metrics: Arc<ShardMetrics>,
         rng: Rng,
         wall: WallAnchor,
-        view: crate::view::ShardViewReader,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall, view);
+        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall, view_rx);
         let router = ChannelTransport {
             shard_id,
             frame_txs,
@@ -512,7 +339,6 @@ impl ShardWorker {
                 .record_idle(busy_start.saturating_duration_since(loop_start));
 
             self.tick(busy_start);
-            self.core.flush_route_work();
             self.flush_shard_events()?;
 
             // TODO: record forwarding latency
@@ -534,6 +360,7 @@ impl ShardWorker {
         // Block until at least one source is ready.
         tokio::select! {
             biased;
+            Some(_) = self.core.view_readable() => {}
             Ok(_) = self.udp_socket.readable() => {}
             Some(_) = self.frame_rx.readable() => {}
             Ok(_) = self.tcp_socket.readable() => {}
@@ -546,10 +373,11 @@ impl ShardWorker {
     }
 
     fn tick(&mut self, now: Instant) {
+        self.core.apply_view_deltas();
         // phase 1: input
         while let Ok(cmd) = self.command_rx.try_recv() {
             match cmd {
-                ShardCommand::AddTcpConnection { stream, peer_addr } => {
+                ShardCommand::AdoptTcpConnection { stream, peer_addr } => {
                     if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
                         tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
                     }
@@ -597,25 +425,17 @@ impl ShardWorker {
     /// there would silently drop subscriptions and teardowns.
     fn flush_shard_events(&mut self) -> Result<(), ShardError> {
         while let Some(event) = self.core.pop_shard_event() {
-            let wrapped = ShardEventWrapper {
-                from_shard_id: self.router.shard_id,
-                ev: event,
-            };
-            match self.event_tx.try_send(wrapped) {
+            match self.event_tx.try_send((self.router.shard_id, event)) {
                 Ok(()) => {}
                 Err(mailbox::TrySendError::Closed(_)) => {
                     tracing::warn!("shard event channel is closed, exiting");
                     return Err(ShardError::ManagerDisconnected);
                 }
-                Err(mailbox::TrySendError::Full(ev)) => {
-                    pulsebeam_runtime::fatal!(
-                        "shard {} filled the {SHARD_EVENT_CAPACITY}-slot control queue to the \
-                         controller and cannot block on it without deadlocking (the controller \
-                         awaits on the reverse channel). The controller has stopped draining \
-                         topology events, so cluster routing state is already diverging. \
-                         Dropped: {:?}",
-                        self.router.shard_id,
-                        ev.ev
+                Err(mailbox::TrySendError::Full(_ev)) => {
+                    metrics::counter!("shard_event_shed").increment(1);
+                    tracing::error!(
+                        shard = %self.router.shard_id,
+                        "shard event queue is full; shedding a recoverable control event"
                     );
                 }
             }

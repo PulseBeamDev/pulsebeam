@@ -185,9 +185,7 @@ mod tests {
             PackedRoute::try_new(u16::try_from(PackedRoute::MAX_SHARD + 1).unwrap(), 0).is_none()
         );
         assert!(PackedRoute::try_new(0, PackedRoute::MAX_SLOT).is_some());
-        assert!(
-            PackedRoute::try_new(u16::try_from(PackedRoute::MAX_SHARD).unwrap(), 0).is_some()
-        );
+        assert!(PackedRoute::try_new(u16::try_from(PackedRoute::MAX_SHARD).unwrap(), 0).is_some());
     }
 
     #[test]

@@ -14,9 +14,7 @@ pub const ENVELOPE_VERSION: u8 = 1;
 pub enum EnvelopeType {
     Media = 0,
     Feedback = 1,
-    Sctp = 2,
-    Telemetry = 3,
-    Control = 4,
+    Telemetry = 2,
 }
 
 impl EnvelopeType {
@@ -24,9 +22,7 @@ impl EnvelopeType {
         match v {
             0 => Some(Self::Media),
             1 => Some(Self::Feedback),
-            2 => Some(Self::Sctp),
-            3 => Some(Self::Telemetry),
-            4 => Some(Self::Control),
+            2 => Some(Self::Telemetry),
             _ => None,
         }
     }
@@ -92,7 +88,8 @@ impl Envelope {
         if wire.version != ENVELOPE_VERSION {
             return Err(EnvelopeError::UnsupportedVersion { ver: wire.version });
         }
-        let ty = EnvelopeType::from_u8(wire.ty).ok_or(EnvelopeError::UnknownType { ty: wire.ty })?;
+        let ty =
+            EnvelopeType::from_u8(wire.ty).ok_or(EnvelopeError::UnknownType { ty: wire.ty })?;
         Ok(Self {
             ty,
             epoch: wire.epoch.get(),
@@ -134,11 +131,14 @@ mod tests {
         for ty in [
             EnvelopeType::Media,
             EnvelopeType::Feedback,
-            EnvelopeType::Sctp,
             EnvelopeType::Telemetry,
-            EnvelopeType::Control,
         ] {
-            let env = envelope(ty, RouteId::from_raw(0x1234_5678), 42, 0xdead_beef_cafe_babe);
+            let env = envelope(
+                ty,
+                RouteId::from_raw(0x1234_5678),
+                42,
+                0xdead_beef_cafe_babe,
+            );
             let bytes = env.encode();
             assert_eq!(bytes.len(), ENVELOPE_LEN);
             let decoded = Envelope::decode(&bytes).unwrap();
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn peek_route_agrees_with_full_decode() {
         for route in [0u32, 1, 0x0FFF_FFFF, u32::MAX] {
-            let env = envelope(EnvelopeType::Control, RouteId::from_raw(route), 7, 9);
+            let env = envelope(EnvelopeType::Telemetry, RouteId::from_raw(route), 7, 9);
             let bytes = env.encode();
             let decoded = Envelope::decode(&bytes).unwrap();
             assert_eq!(peek_route(&bytes), Some(decoded.route));
@@ -211,7 +211,8 @@ mod tests {
 
     #[test]
     fn peek_route_ignores_bad_version_and_type() {
-        let mut bytes = envelope(EnvelopeType::Media, RouteId::from_raw(0x2222_3333), 1, 1).encode();
+        let mut bytes =
+            envelope(EnvelopeType::Media, RouteId::from_raw(0x2222_3333), 1, 1).encode();
         bytes[0] = 0xFF;
         bytes[1] = 0xFF;
         assert_eq!(peek_route(&bytes), Some(RouteId::from_raw(0x2222_3333)));

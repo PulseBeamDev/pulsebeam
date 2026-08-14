@@ -1,13 +1,14 @@
 use std::time::Duration;
 
 use pulsebeam_runtime::rand::RngCore;
+use slotmap::SecondaryMap;
 use tokio::time::Instant;
 
 use crate::{
     control::MAX_SEND_AUDIO_SLOTS,
     id::AudioSelectorSlotId,
     rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline},
-    shard::router::LocalTrackKey,
+    shard::router::TrackKey,
 };
 use str0m::media::Rid;
 
@@ -16,7 +17,7 @@ pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
 /// A stream's identity for slot ownership, addressed by the shard's own
 /// fanout key rather than the track's name — resolving a `TrackId` here
 /// measured the same cost the rest of the forwarding path stopped paying.
-pub(crate) type AudioStreamKey = (LocalTrackKey, Option<Rid>);
+pub(crate) type AudioStreamKey = (TrackKey, Option<Rid>);
 
 /// Slot is considered dead if no packet has arrived within this window.
 const DEAD_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -63,6 +64,7 @@ impl SlotState {
 
 pub struct TopNAudioSelector {
     slots: [SlotState; SELECTOR_SLOTS],
+    owner_slots: SecondaryMap<TrackKey, AudioSelectorSlotId>,
 }
 
 impl TopNAudioSelector {
@@ -81,6 +83,7 @@ impl TopNAudioSelector {
                     pending_marker: false,
                 },
             }),
+            owner_slots: SecondaryMap::new(),
         }
     }
 
@@ -109,8 +112,13 @@ impl TopNAudioSelector {
         }
 
         // Step 2: Owner fast-path — update timestamps and forward.
-        let owner_slot = self.slots.iter().position(|s| s.owner == Some(stream_id));
-        if let Some((idx, slot)) = owner_slot.and_then(|i| self.slots.get_mut(i).map(|s| (i, s))) {
+        let owner_slot = self.owner_slots.get(stream_id.0).copied();
+        if let Some((idx, slot)) = owner_slot.and_then(|slot_id| {
+            self.slots
+                .get_mut(slot_id.index())
+                .filter(|slot| slot.owner == Some(stream_id))
+                .map(|slot| (slot_id.index(), slot))
+        }) {
             slot.last_arrival_ts = Some(now);
             // Peak-hold with decay: a single quiet packet must not instantly demote rank.
             slot.last_power = slot.last_power.max(power);
@@ -156,7 +164,12 @@ impl TopNAudioSelector {
         // Step 5: Execute the steal.
         let victim_idx = victim?;
         let slot = self.slots.get_mut(victim_idx)?;
+        if let Some(previous) = slot.owner {
+            let _ = self.owner_slots.remove(previous.0);
+        }
         slot.owner = Some(stream_id);
+        let slot_id = AudioSelectorSlotId::new(victim_idx);
+        let _ = self.owner_slots.insert(stream_id.0, slot_id);
         slot.last_arrival_ts = Some(now);
         slot.immunity_expiry = now.checked_add(NEWBORN_IMMUNITY).unwrap_or(now);
         slot.last_power = power;
@@ -177,10 +190,12 @@ impl TopNAudioSelector {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_track(&mut self, id: AudioStreamKey) {
         for slot in &mut self.slots {
             if slot.owner == Some(id) {
                 slot.owner = None;
+                let _ = self.owner_slots.remove(id.0);
                 break;
             }
         }
@@ -189,8 +204,11 @@ impl TopNAudioSelector {
     pub fn cleanup(&mut self) -> Option<()> {
         let now = Instant::now();
         for slot in &mut self.slots {
-            if slot.owner.is_some() && slot.is_dead(now) {
-                slot.owner = None;
+            if slot.owner.is_some()
+                && slot.is_dead(now)
+                && let Some(owner) = slot.owner.take()
+            {
+                let _ = self.owner_slots.remove(owner.0);
             }
         }
         Some(())
@@ -249,7 +267,7 @@ mod tests {
     }
 
     thread_local! {
-        static TRACK_KEYS: RefCell<slotmap::SlotMap<LocalTrackKey, ()>> =
+        static TRACK_KEYS: RefCell<slotmap::SlotMap<TrackKey, ()>> =
             RefCell::new(slotmap::SlotMap::with_key());
     }
 

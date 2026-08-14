@@ -21,7 +21,7 @@ fn main() {}
 /// eBPF build.
 #[cfg(all(not(target_arch = "bpf"), test))]
 mod host_tests {
-    use pulsebeam_routing::classify::{classify_client_for_node, classify_node, ClientVerdict};
+    use pulsebeam_routing::classify::{ClientVerdict, classify_client_for_node, classify_node};
     use pulsebeam_routing::envelope::{Envelope, EnvelopeType};
     use pulsebeam_routing::{RouteId, TransportRoute};
 

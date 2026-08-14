@@ -1,8 +1,7 @@
+use arrayvec::ArrayVec;
 use pulsebeam_runtime::net;
 
-use crate::{
-    route::{TransportHandle, TransportRoute},
-};
+use crate::route::{TransportHandle, TransportRoute};
 
 use ahash::{HashMap, HashMapExt};
 use std::net::SocketAddr;
@@ -57,14 +56,14 @@ pub struct Demuxer {
     /// Fast-path cache: maps a known remote `SocketAddr` to a route.
     addr_map: HashMap<SocketAddr, TransportHandle>,
     /// Reverse: maps a route to all its known source addresses (for cleanup).
-    route_addrs: HashMap<TransportRoute, Vec<SocketAddr>>,
+    route_addrs: HashMap<TransportRoute, ArrayVec<SocketAddr, MAX_ADDRS_PER_ROUTE>>,
 }
 
 impl Demuxer {
     pub fn new() -> Self {
         Self {
-            addr_map: HashMap::with_capacity(MAX_ADDR_ENTRIES),
-            route_addrs: HashMap::with_capacity(MAX_ADDR_ENTRIES),
+            addr_map: HashMap::new(),
+            route_addrs: HashMap::new(),
         }
     }
 
@@ -75,7 +74,7 @@ impl Demuxer {
             for addr in &addrs {
                 self.addr_map.remove(addr);
             }
-            addrs
+            addrs.into_iter().collect()
         } else {
             vec![]
         }
@@ -108,6 +107,7 @@ impl Demuxer {
         if self.addr_map.len() < MAX_ADDR_ENTRIES {
             let route_entry = self.route_addrs.entry(addressed.route).or_default();
             if route_entry.len() < MAX_ADDRS_PER_ROUTE {
+                debug_assert!(route_entry.len() < MAX_ADDRS_PER_ROUTE);
                 route_entry.push(src);
                 self.addr_map.insert(src, addressed);
             }
@@ -115,7 +115,6 @@ impl Demuxer {
 
         Some(addressed)
     }
-
 }
 
 impl Default for Demuxer {

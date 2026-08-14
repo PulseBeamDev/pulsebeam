@@ -111,14 +111,19 @@ fn parse_udp_v4(start: usize, end: usize) -> Option<UdpPacket> {
     src_addr.get_mut(..4)?.copy_from_slice(&src4);
     dst_addr.get_mut(..4)?.copy_from_slice(&dst4);
 
-    finish_udp(start, end, ihl, FlowKey {
-        src_addr,
-        dst_addr,
-        src_port: 0,
-        dst_port: 0,
-        is_ipv6: 0,
-        _pad: [0; 3],
-    })
+    finish_udp(
+        start,
+        end,
+        ihl,
+        FlowKey {
+            src_addr,
+            dst_addr,
+            src_port: 0,
+            dst_port: 0,
+            is_ipv6: 0,
+            _pad: [0; 3],
+        },
+    )
 }
 
 fn parse_udp_v6(start: usize, end: usize) -> Option<UdpPacket> {
@@ -133,14 +138,19 @@ fn parse_udp_v6(start: usize, end: usize) -> Option<UdpPacket> {
     read_at(start, end, 8, &mut src_addr)?;
     read_at(start, end, 24, &mut dst_addr)?;
 
-    finish_udp(start, end, IPV6_HEADER_LEN, FlowKey {
-        src_addr,
-        dst_addr,
-        src_port: 0,
-        dst_port: 0,
-        is_ipv6: 1,
-        _pad: [0; 3],
-    })
+    finish_udp(
+        start,
+        end,
+        IPV6_HEADER_LEN,
+        FlowKey {
+            src_addr,
+            dst_addr,
+            src_port: 0,
+            dst_port: 0,
+            is_ipv6: 1,
+            _pad: [0; 3],
+        },
+    )
 }
 
 fn finish_udp(start: usize, end: usize, l4_offset: usize, mut flow: FlowKey) -> Option<UdpPacket> {

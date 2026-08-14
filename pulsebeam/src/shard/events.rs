@@ -1,20 +1,20 @@
+use pulsebeam_proto::prelude::Message;
+use pulsebeam_proto::reliable::RelDelivery;
 use std::collections::VecDeque;
+use str0m::channel::ChannelId;
 use str0m::media::KeyframeRequestKind;
 
 use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
-use crate::shard::participants::ParticipantKey;
-use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
+use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
+use crate::shard::router::{DataStreamKey, ReliableStreamKey, TrackKey};
 use crate::track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackLayer, TrackMeta};
 
 pub struct AudioRtpEvent {
     pub stream_id: StreamId,
     pub pkt: RtpPacket,
-    /// Compiled, not named: the emitting participant already holds its room's
-    /// key, so audio dispatch never hashes a `RoomId` to find the fanout.
-    pub room: RoomKey,
     /// The semantic origin, which subscribers need in order to attribute the
     /// audio. Read once per delivery, never hashed.
     pub origin: ParticipantId,
@@ -24,7 +24,7 @@ pub struct AudioRtpEvent {
     /// no member of this room to skip.
     pub origin_key: Option<ParticipantKey>,
     /// The publisher's compiled fanout — see [`VideoRtpEvent::fanout`].
-    pub fanout: Option<LocalTrackKey>,
+    pub fanout: Option<TrackKey>,
 }
 
 pub struct VideoRtpEvent {
@@ -32,21 +32,11 @@ pub struct VideoRtpEvent {
     pub pkt: RtpPacket,
     /// The publisher's compiled fanout, resolved once per SSRC rather than
     /// hashed per packet. `None` only until the shard binds one.
-    pub fanout: Option<LocalTrackKey>,
+    pub fanout: Option<TrackKey>,
 }
 
 pub struct SctpEvent<K> {
-    pub topic: Topic,
     pub pkt: Vec<u8>,
-    pub origin: ParticipantId,
-    /// Carried rather than looked up: a data stream's identity is room-scoped,
-    /// and the emitting participant already knows its room, so the dispatch
-    /// path never hashes a name back to one.
-    pub room_id: RoomId,
-    /// The compiled stream, once the shard has bound it to this channel.
-    /// `None` only in the window between a topic being announced and the
-    /// shard minting its arena entry, where the caller falls back to a
-    /// room-scoped lookup.
     pub stream: Option<K>,
 }
 
@@ -60,31 +50,48 @@ pub(crate) struct SinkIdentity {
     pub id: ParticipantId,
     pub key: ParticipantKey,
     pub room_id: RoomId,
-    pub room_key: RoomKey,
 }
 
 pub enum ParticipantEvent {
-    Topology(ParticipantTopologyEvent),
+    Subscription(ParticipantSubscriptionEvent),
     Lifecycle(ParticipantLifecycleEvent),
-    Control(ParticipantControlEvent),
+    Control(ClientIntent),
 }
 
-pub enum ParticipantTopologyEvent {
-    TrackSubscribed {
+pub enum ParticipantSubscriptionEvent {
+    Subscribed {
         subscriber: ParticipantId,
+        subscriber_key: ParticipantKey,
+        slot: DownstreamSlotKey,
         track: TrackMeta,
     },
-    TrackUnsubscribed {
+    Unsubscribed {
         subscriber: ParticipantId,
+        slot: DownstreamSlotKey,
         track: TrackMeta,
     },
 }
 
 pub enum ParticipantLifecycleEvent {
-    Exited { participant_id: ParticipantId },
+    Exited {
+        participant_id: ParticipantId,
+        participant_key: ParticipantKey,
+    },
 }
 
-pub enum ParticipantControlEvent {
+#[derive(Debug)]
+pub enum ClientIntent {
+    TrackSubscribed {
+        subscriber: ParticipantId,
+        subscriber_key: ParticipantKey,
+        slot: DownstreamSlotKey,
+        track: TrackMeta,
+    },
+    TrackUnsubscribed {
+        subscriber: ParticipantId,
+        slot: DownstreamSlotKey,
+        track: TrackMeta,
+    },
     TrackPublished(Track, crate::track::TrackStates),
     /// A published track's latest measurements, refreshed on the slow poll.
     ///
@@ -114,6 +121,7 @@ pub enum ParticipantControlEvent {
         subscriber: ParticipantId,
         topic: Topic,
         publisher: Option<ParticipantId>,
+        channel: ChannelId,
     },
     DataTopicUnsubscribed {
         room_id: RoomId,
@@ -136,6 +144,7 @@ pub enum ParticipantControlEvent {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: Topic,
+        channel: ChannelId,
     },
     ReliableDataTopicUnsubscribed {
         room_id: RoomId,
@@ -143,9 +152,7 @@ pub enum ParticipantControlEvent {
         topic: Topic,
     },
     ReliableControlReceived {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
+        stream: Option<ReliableStreamKey>,
         bytes: Vec<u8>,
     },
 }
@@ -176,7 +183,6 @@ impl EventPipeline {
             id: who.id,
             key: who.key,
             room_id: who.room_id,
-            room_key: who.room_key,
             pipeline: self,
         }
     }
@@ -208,40 +214,38 @@ impl EventPipeline {
     pub fn pop_shard_event(&mut self) -> Option<ShardEvent> {
         self.shard_events.pop_front()
     }
-
-    pub fn shard_events_mut(&mut self) -> &mut VecDeque<ShardEvent> {
-        &mut self.shard_events
-    }
 }
 
 pub struct PipelineSinkRef<'a> {
     id: ParticipantId,
     key: ParticipantKey,
     room_id: RoomId,
-    room_key: RoomKey,
     pipeline: &'a mut EventPipeline,
 }
 
 impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     #[inline]
-    fn subscribe(&mut self, track: TrackMeta) {
+    fn subscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Topology(
-                ParticipantTopologyEvent::TrackSubscribed {
+            .push_back(ParticipantEvent::Subscription(
+                ParticipantSubscriptionEvent::Subscribed {
                     subscriber: self.id,
+                    subscriber_key: self.key,
+                    slot,
                     track,
                 },
             ));
     }
 
     #[inline]
-    fn unsubscribe(&mut self, track: TrackMeta) {
+    fn unsubscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Topology(
-                ParticipantTopologyEvent::TrackUnsubscribed {
+            .push_back(ParticipantEvent::Subscription(
+                ParticipantSubscriptionEvent::Unsubscribed {
                     subscriber: self.id,
+                    slot,
                     track,
                 },
             ));
@@ -251,51 +255,61 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     fn publish_track_stats(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::TrackStatsUpdated { track_id, states },
-            ));
+            .push_back(ParticipantEvent::Control(ClientIntent::TrackStatsUpdated {
+                track_id,
+                states,
+            }));
     }
 
     fn publish_track(&mut self, track: Track, states: crate::track::TrackStates) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::TrackPublished(track, states),
-            ));
+            .push_back(ParticipantEvent::Control(ClientIntent::TrackPublished(
+                track, states,
+            )));
     }
 
     #[inline]
     fn unpublish_track(&mut self, track_id: TrackId) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::TrackUnpublished {
-                    origin: self.id,
-                    track_id,
-                },
-            ));
+            .push_back(ParticipantEvent::Control(ClientIntent::TrackUnpublished {
+                origin: self.id,
+                track_id,
+            }));
     }
 
     #[inline]
-    fn subscribe_data_topic(&mut self, topic: Topic, publisher: Option<ParticipantId>) {
+    fn subscribe_data_topic(
+        &mut self,
+        topic: Topic,
+        publisher: Option<ParticipantId>,
+        channel: ChannelId,
+    ) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::DataTopicSubscribed {
+                ClientIntent::DataTopicSubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
                     publisher,
+                    channel,
                 },
             ));
     }
 
     #[inline]
-    fn unsubscribe_data_topic(&mut self, topic: Topic, publisher: Option<ParticipantId>) {
+    fn unsubscribe_data_topic(
+        &mut self,
+        topic: Topic,
+        publisher: Option<ParticipantId>,
+        _channel: ChannelId,
+    ) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::DataTopicUnsubscribed {
+                ClientIntent::DataTopicUnsubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
@@ -309,7 +323,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::DataTopicPublished {
+                ClientIntent::DataTopicPublished {
                     room_id: self.room_id,
                     publisher: self.id,
                     topic,
@@ -322,7 +336,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::DataTopicUnpublished {
+                ClientIntent::DataTopicUnpublished {
                     room_id: self.room_id,
                     publisher: self.id,
                     topic,
@@ -334,14 +348,14 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     fn request_keyframe(&mut self, layer: &TrackLayer) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::KeyframeRequested(GlobalKeyframeRequest {
+            .push_back(ParticipantEvent::Control(ClientIntent::KeyframeRequested(
+                GlobalKeyframeRequest {
                     shard_id: layer.meta.shard_id,
                     origin: layer.meta.origin,
                     stream_id: layer.stream_id(),
                     kind: KeyframeRequestKind::Pli,
-                }),
-            ));
+                },
+            )));
     }
 
     #[inline]
@@ -351,17 +365,17 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Lifecycle(
                 ParticipantLifecycleEvent::Exited {
                     participant_id: self.id,
+                    participant_key: self.key,
                 },
             ));
     }
 
     #[inline]
-    fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<LocalTrackKey>, pkt: RtpPacket) {
+    fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<TrackKey>, pkt: RtpPacket) {
         match stream_id.0.kind() {
             TrackKind::Audio => self.pipeline.audio_queue.push_back(AudioRtpEvent {
                 stream_id,
                 pkt,
-                room: self.room_key,
                 origin: self.id,
                 origin_key: Some(self.key),
                 fanout,
@@ -376,14 +390,10 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_sctp(&mut self, topic: Topic, stream: Option<DataStreamKey>, pkt: Vec<u8>) {
-        self.pipeline.data_queue.push_back(SctpEvent {
-            topic,
-            pkt,
-            origin: self.id,
-            room_id: self.room_id,
-            stream,
-        });
+    fn publish_sctp(&mut self, _topic: Topic, stream: Option<DataStreamKey>, pkt: Vec<u8>) {
+        self.pipeline
+            .data_queue
+            .push_back(SctpEvent { pkt, stream });
     }
 
     #[inline]
@@ -391,7 +401,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::ReliableDataTopicPublished {
+                ClientIntent::ReliableDataTopicPublished {
                     room_id: self.room_id,
                     publisher: self.id,
                     topic,
@@ -404,7 +414,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::ReliableDataTopicUnpublished {
+                ClientIntent::ReliableDataTopicUnpublished {
                     room_id: self.room_id,
                     publisher: self.id,
                     topic,
@@ -413,24 +423,25 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn subscribe_reliable_data_topic(&mut self, topic: Topic) {
+    fn subscribe_reliable_data_topic(&mut self, topic: Topic, channel: ChannelId) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::ReliableDataTopicSubscribed {
+                ClientIntent::ReliableDataTopicSubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
+                    channel,
                 },
             ));
     }
 
     #[inline]
-    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic) {
+    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic, _channel: ChannelId) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::ReliableDataTopicUnsubscribed {
+                ClientIntent::ReliableDataTopicUnsubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
@@ -441,30 +452,32 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     #[inline]
     fn publish_reliable_sctp(
         &mut self,
-        topic: Topic,
+        _topic: Topic,
         stream: Option<ReliableStreamKey>,
         frame: Vec<u8>,
     ) {
-        self.pipeline.reliable_data_queue.push_back(SctpEvent {
-            topic,
-            pkt: frame,
-            origin: self.id,
-            room_id: self.room_id,
-            stream,
-        });
+        let frame = RelDelivery {
+            publisher_id: self.id.as_str(),
+            frame,
+        }
+        .encode_to_vec();
+        self.pipeline
+            .reliable_data_queue
+            .push_back(SctpEvent { pkt: frame, stream });
     }
 
     #[inline]
-    fn forward_reliable_control(&mut self, publisher: ParticipantId, topic: Topic, bytes: Vec<u8>) {
+    fn forward_reliable_control(
+        &mut self,
+        _publisher: ParticipantId,
+        _topic: Topic,
+        stream: Option<ReliableStreamKey>,
+        bytes: Vec<u8>,
+    ) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::ReliableControlReceived {
-                    room_id: self.room_id,
-                    publisher,
-                    topic,
-                    bytes,
-                },
+                ClientIntent::ReliableControlReceived { stream, bytes },
             ));
     }
 }

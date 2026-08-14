@@ -12,12 +12,12 @@ use aya_ebpf::{
     programs::SkReuseportContext,
 };
 use pulsebeam_routing::{
-    classify::{classify_client_for_node, classify_node, ClientVerdict, DropReason, NodeVerdict},
+    classify::{ClientVerdict, DropReason, NodeVerdict, classify_client_for_node, classify_node},
     envelope::peek_shard,
 };
 
-use crate::common::{counters, MAX_FLOWS, MAX_SHARDS};
-use net::{parse_udp, FlowKey};
+use crate::common::{MAX_FLOWS, MAX_SHARDS, counters};
+use net::{FlowKey, parse_udp};
 
 const SK_PASS: u32 = aya_ebpf::bindings::sk_action::SK_PASS;
 const SK_DROP: u32 = aya_ebpf::bindings::sk_action::SK_DROP;
@@ -141,8 +141,13 @@ pub fn pulsebeam_node(ctx: SkReuseportContext) -> u32 {
     };
 
     match classify_node(udp.payload(), shard_count) {
-        NodeVerdict::Steer { shard: verdict_shard } => {
-            debug_assert_eq!(shard, verdict_shard, "peek_shard must agree with classify_node");
+        NodeVerdict::Steer {
+            shard: verdict_shard,
+        } => {
+            debug_assert_eq!(
+                shard, verdict_shard,
+                "peek_shard must agree with classify_node"
+            );
             select_shard(&ctx, verdict_shard)
         }
         NodeVerdict::Drop(reason) => {

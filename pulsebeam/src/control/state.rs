@@ -12,6 +12,7 @@
 //! a participant, room or track the owning shard has not built yet.
 #![deny(clippy::arithmetic_side_effects)]
 
+use slotmap::SlotMap;
 use tokio::time::Instant;
 
 use crate::id::ShardId;
@@ -71,8 +72,42 @@ impl PerShardAllocator {
 pub(crate) struct RouteReservation {
     pub shard_id: ShardId,
     pub slot: u32,
+    pub family: RouteFamily,
 }
 
+#[derive(Debug)]
+pub(crate) struct ParticipantRecord;
+
+#[derive(Debug)]
+pub(crate) struct TrackRecord;
+
+#[derive(Debug)]
+pub(crate) struct StreamRecord;
+
+#[derive(Debug)]
+pub(crate) struct ShardArenas {
+    pub participants: SlotMap<crate::keys::ParticipantKey, ParticipantRecord>,
+    pub tracks: SlotMap<crate::keys::TrackKey, TrackRecord>,
+    pub data: SlotMap<crate::keys::DataStreamKey, StreamRecord>,
+    pub reliable: SlotMap<crate::keys::ReliableStreamKey, StreamRecord>,
+}
+
+impl ShardArenas {
+    fn new() -> Self {
+        Self {
+            participants: SlotMap::with_key(),
+            tracks: SlotMap::with_key(),
+            data: SlotMap::with_key(),
+            reliable: SlotMap::with_key(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RouteFamily {
+    Transport,
+    Endpoint,
+}
 
 #[derive(Debug)]
 pub(crate) struct LifecycleTransaction {
@@ -87,8 +122,6 @@ impl LifecycleTransaction {
             reservations: Vec::new(),
         }
     }
-
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +142,7 @@ pub(crate) enum TransactionError {
 #[derive(Debug)]
 pub(crate) struct ControlPlaneState {
     pending: Option<LifecycleTransaction>,
+    pub arenas: Vec<ShardArenas>,
     pub transport: PerShardAllocator,
     pub endpoint: PerShardAllocator,
     generation: u64,
@@ -118,12 +152,77 @@ impl ControlPlaneState {
     pub fn new(shard_count: usize) -> Self {
         Self {
             pending: None,
+            arenas: (0..shard_count).map(|_| ShardArenas::new()).collect(),
             transport: PerShardAllocator::new(shard_count),
             endpoint: PerShardAllocator::new(shard_count),
             generation: 0,
         }
     }
 
+    pub fn mint_participant(&mut self, shard: ShardId) -> Option<crate::keys::ParticipantKey> {
+        self.arenas
+            .get_mut(shard.index())
+            .map(|arena| arena.participants.insert(ParticipantRecord))
+    }
+
+    pub fn mint_track(
+        &mut self,
+        shard: ShardId,
+        _id: crate::entity::TrackId,
+        _origin: crate::entity::ParticipantId,
+    ) -> Option<crate::keys::TrackKey> {
+        self.arenas
+            .get_mut(shard.index())
+            .map(|arena| arena.tracks.insert(TrackRecord))
+    }
+
+    pub fn mint_data(
+        &mut self,
+        shard: ShardId,
+        _id: crate::shard::router::DataStreamId,
+    ) -> Option<crate::keys::DataStreamKey> {
+        self.arenas
+            .get_mut(shard.index())
+            .map(|arena| arena.data.insert(StreamRecord))
+    }
+
+    pub fn mint_reliable(
+        &mut self,
+        shard: ShardId,
+        _id: crate::shard::router::DataStreamId,
+    ) -> Option<crate::keys::ReliableStreamKey> {
+        self.arenas
+            .get_mut(shard.index())
+            .map(|arena| arena.reliable.insert(StreamRecord))
+    }
+
+    pub fn remove_participant(&mut self, shard: ShardId, key: crate::keys::ParticipantKey) {
+        let _ = self
+            .arenas
+            .get_mut(shard.index())
+            .and_then(|arena| arena.participants.remove(key));
+    }
+
+    pub fn remove_track(&mut self, shard: ShardId, key: crate::keys::TrackKey) {
+        let _ = self
+            .arenas
+            .get_mut(shard.index())
+            .and_then(|arena| arena.tracks.remove(key));
+    }
+
+    pub fn remove_data(&mut self, shard: ShardId, key: crate::keys::DataStreamKey) {
+        let _ = self
+            .arenas
+            .get_mut(shard.index())
+            .and_then(|arena| arena.data.remove(key));
+    }
+
+    pub fn remove_reliable(&mut self, shard: ShardId, key: crate::keys::ReliableStreamKey) {
+        let _ = self
+            .arenas
+            .get_mut(shard.index())
+            .and_then(|arena| arena.reliable.remove(key));
+    }
 
     pub fn pending(&self) -> Option<&LifecycleTransaction> {
         self.pending.as_ref()
@@ -166,7 +265,11 @@ impl ControlPlaneState {
             "a reserved route must carry the shard it was reserved on"
         );
         let tx = self.tx_mut()?;
-        tx.reservations.push(RouteReservation { shard_id, slot });
+        tx.reservations.push(RouteReservation {
+            shard_id,
+            slot,
+            family: RouteFamily::Transport,
+        });
         Ok(handle)
     }
 
@@ -183,7 +286,11 @@ impl ControlPlaneState {
             .map_err(TransactionError::Allocation)?;
         let handle = RouteHandle::new(RouteId::new(shard_id, slot), epoch);
         let tx = self.tx_mut()?;
-        tx.reservations.push(RouteReservation { shard_id, slot });
+        tx.reservations.push(RouteReservation {
+            shard_id,
+            slot,
+            family: RouteFamily::Endpoint,
+        });
         Ok(handle)
     }
 
@@ -221,8 +328,16 @@ impl ControlPlaneState {
     pub fn abort(&mut self, now: Instant) -> Option<LifecycleTransaction> {
         let tx = self.pending.take()?;
         for reservation in &tx.reservations {
-            self.transport
-                .retire(reservation.shard_id, reservation.slot, now);
+            match reservation.family {
+                RouteFamily::Transport => {
+                    self.transport
+                        .retire(reservation.shard_id, reservation.slot, now);
+                }
+                RouteFamily::Endpoint => {
+                    self.endpoint
+                        .retire(reservation.shard_id, reservation.slot, now);
+                }
+            }
         }
         Some(tx)
     }
@@ -257,8 +372,6 @@ mod tests {
         );
     }
 
-
-
     /// An abandoned transaction must not leak the address it took, or a
     /// reconnect storm would exhaust the namespace one failed join at a time.
     #[tokio::test(start_paused = true)]
@@ -278,13 +391,10 @@ mod tests {
         assert_ne!(second.epoch, first.epoch, "as a new incarnation");
     }
 
-
-
     #[tokio::test(start_paused = true)]
     async fn only_one_transaction_stages_at_a_time() {
         let mut state = ControlPlaneState::new(2);
         state.begin().unwrap();
         assert_eq!(state.begin(), Err(TransactionError::Busy));
     }
-
 }

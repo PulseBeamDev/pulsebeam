@@ -645,7 +645,7 @@ mod data_track {
     /// cross-core traffic, which is the wrong direction.
     ///
     /// The clones are not inherent: they exist only to build lookup keys, and a
-    /// dense key in `RouteAction::Data` removes them the way `LocalTrackKey`
+    /// dense key in `RouteAction::Data` removes them the way `TrackKey`
     /// did for video. Fix the cause, not the symptom.
     pub struct Topic(String);
 

@@ -37,6 +37,7 @@ pub mod clock;
 pub mod control;
 pub mod entity;
 pub mod id;
+pub(crate) mod keys;
 pub(crate) mod log;
 pub mod message;
 pub mod node;
@@ -44,10 +45,10 @@ pub mod participant;
 pub mod route;
 pub mod rtp;
 pub mod shard;
-pub(crate) mod view;
 #[cfg(feature = "sim")]
 pub mod sim_metrics;
 pub mod track;
+pub(crate) mod view;
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

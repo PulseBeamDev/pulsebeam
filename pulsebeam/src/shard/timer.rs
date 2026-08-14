@@ -320,11 +320,12 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
-    use slotmap::SlotMap;
-
     fn keys(count: u8) -> Vec<ParticipantKey> {
-        let mut slots = SlotMap::<ParticipantKey, ()>::with_key();
-        (0..count).map(|_| slots.insert(())).collect()
+        (0..count)
+            .map(|index| {
+                ParticipantKey::from(slotmap::KeyData::from_ffi((1_u64 << 32) | u64::from(index)))
+            })
+            .collect()
     }
 
     #[test]

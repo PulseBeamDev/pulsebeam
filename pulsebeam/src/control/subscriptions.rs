@@ -18,6 +18,7 @@ use ahash::{HashMap, HashMapExt};
 
 use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
+use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::route::RouteHandle;
 
 /// One destination shard's interest in one stream.
@@ -27,11 +28,8 @@ struct Interest {
     /// for somebody who never subscribed must not retire a live route, and a
     /// repeated subscribe must not inflate a count that then never returns to
     /// zero.
-    subscribers: ahash::HashSet<ParticipantId>,
+    subscribers: ahash::HashMap<ParticipantId, (ParticipantKey, DownstreamSlotKey)>,
     route: Option<RouteHandle>,
-    /// The publisher's shard, so retiring can tell it to stop forwarding
-    /// without a second lookup. Set when the interest is created.
-    publisher_shard: Option<ShardId>,
 }
 
 /// What the caller must do about a change in interest.
@@ -76,12 +74,15 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
         shard: ShardId,
         stream: K,
         subscriber: ParticipantId,
-        publisher_shard: ShardId,
+        subscriber_key: ParticipantKey,
+        slot: DownstreamSlotKey,
+        _publisher_shard: ShardId,
     ) -> InterestChange {
         let interest = self.interest.entry((shard, stream)).or_default();
-        interest.publisher_shard = Some(publisher_shard);
         let was_empty = interest.subscribers.is_empty();
-        interest.subscribers.insert(subscriber);
+        interest
+            .subscribers
+            .insert(subscriber, (subscriber_key, slot));
         if was_empty && interest.route.is_none() {
             InterestChange::Install
         } else {
@@ -111,7 +112,7 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
         let Some(interest) = self.interest.get_mut(&key) else {
             return InterestChange::None;
         };
-        if !interest.subscribers.remove(subscriber) {
+        if interest.subscribers.remove(subscriber).is_none() {
             return InterestChange::None;
         }
         if !interest.subscribers.is_empty() {
@@ -129,22 +130,38 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
         }
     }
 
-    /// Drop a participant from every stream it subscribed to, returning the
-    /// routes that lose their last consumer as a result.
-    pub fn remove_participant(&mut self, subscriber: &ParticipantId) -> Vec<Retired<K>> {
+    pub fn plan_destinations(
+        &self,
+        stream: &K,
+    ) -> Vec<(
+        ShardId,
+        Option<RouteHandle>,
+        Vec<(ParticipantKey, DownstreamSlotKey)>,
+    )> {
+        self.interest
+            .iter()
+            .filter_map(|((shard, candidate), interest)| {
+                if candidate != stream {
+                    return None;
+                }
+                Some((
+                    *shard,
+                    interest.route,
+                    interest.subscribers.values().copied().collect(),
+                ))
+            })
+            .collect()
+    }
+
+    pub fn remove_stream(&mut self, stream: &K) -> Vec<Retired> {
         let mut retired = Vec::new();
-        self.interest.retain(|(shard, stream), interest| {
-            if !interest.subscribers.remove(subscriber) {
-                return true;
-            }
-            if !interest.subscribers.is_empty() {
+        self.interest.retain(|(shard, candidate), interest| {
+            if candidate != stream {
                 return true;
             }
             if let Some(route) = interest.route.take() {
                 retired.push(Retired {
                     destination: *shard,
-                    publisher_shard: interest.publisher_shard,
-                    stream: stream.clone(),
                     route,
                 });
             }
@@ -153,6 +170,29 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
         retired
     }
 
+    /// Drop a participant from every stream it subscribed to, returning the
+    /// routes that lose their last consumer as a result.
+    pub fn remove_participant(&mut self, subscriber: &ParticipantId) -> Vec<Retired> {
+        let mut retired = Vec::new();
+        self.interest.retain(|(shard, _stream), interest| {
+            if interest.subscribers.remove(subscriber).is_none() {
+                return true;
+            }
+            if !interest.subscribers.is_empty() {
+                return true;
+            }
+            if let Some(route) = interest.route.take() {
+                retired.push(Retired {
+                    destination: *shard,
+                    route,
+                });
+            }
+            false
+        });
+        retired
+    }
+
+    #[cfg(test)]
     pub fn route_for(&self, shard: ShardId, stream: &K) -> Option<RouteHandle> {
         self.interest
             .get(&(shard, stream.clone()))
@@ -169,10 +209,8 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
 
 /// A route that lost its last consumer.
 #[derive(Debug, Clone)]
-pub(crate) struct Retired<K> {
+pub(crate) struct Retired {
     pub destination: ShardId,
-    pub publisher_shard: Option<ShardId>,
-    pub stream: K,
     pub route: RouteHandle,
 }
 
@@ -205,13 +243,27 @@ mod tests {
         let t = track(9);
 
         assert_eq!(
-            subs.subscribe(shard, t, pid(1), ShardId::new(9)),
+            subs.subscribe(
+                shard,
+                t,
+                pid(1),
+                ParticipantKey::default(),
+                DownstreamSlotKey::default(),
+                ShardId::new(9)
+            ),
             InterestChange::Install,
             "the first subscriber creates the route"
         );
         subs.installed(shard, t, handle(0));
         assert_eq!(
-            subs.subscribe(shard, t, pid(2), ShardId::new(9)),
+            subs.subscribe(
+                shard,
+                t,
+                pid(2),
+                ParticipantKey::default(),
+                DownstreamSlotKey::default(),
+                ShardId::new(9)
+            ),
             InterestChange::None,
             "a second subscriber joins the route that exists"
         );
@@ -223,9 +275,23 @@ mod tests {
         let shard = ShardId::new(1);
         let t = track(9);
 
-        subs.subscribe(shard, t, pid(1), ShardId::new(9));
+        subs.subscribe(
+            shard,
+            t,
+            pid(1),
+            ParticipantKey::default(),
+            DownstreamSlotKey::default(),
+            ShardId::new(9),
+        );
         subs.installed(shard, t, handle(0));
-        subs.subscribe(shard, t, pid(2), ShardId::new(9));
+        subs.subscribe(
+            shard,
+            t,
+            pid(2),
+            ParticipantKey::default(),
+            DownstreamSlotKey::default(),
+            ShardId::new(9),
+        );
 
         assert_eq!(subs.unsubscribe(shard, &t, &pid(1)), InterestChange::None);
         assert_eq!(
@@ -242,11 +308,25 @@ mod tests {
         let t = track(9);
 
         assert_eq!(
-            subs.subscribe(ShardId::new(1), t, pid(1), ShardId::new(9)),
+            subs.subscribe(
+                ShardId::new(1),
+                t,
+                pid(1),
+                ParticipantKey::default(),
+                DownstreamSlotKey::default(),
+                ShardId::new(9)
+            ),
             InterestChange::Install
         );
         assert_eq!(
-            subs.subscribe(ShardId::new(2), t, pid(2), ShardId::new(9)),
+            subs.subscribe(
+                ShardId::new(2),
+                t,
+                pid(2),
+                ParticipantKey::default(),
+                DownstreamSlotKey::default(),
+                ShardId::new(9)
+            ),
             InterestChange::Install,
             "a second shard needs its own route"
         );
@@ -260,9 +340,26 @@ mod tests {
         let shard = ShardId::new(0);
         let t = track(9);
 
-        subs.subscribe(shard, t, pid(1), ShardId::new(9));
+        subs.subscribe(
+            shard,
+            t,
+            pid(1),
+            ParticipantKey::default(),
+            DownstreamSlotKey::default(),
+            ShardId::new(9),
+        );
         subs.installed(shard, t, handle(0));
-        assert_eq!(subs.subscribe(shard, t, pid(1), ShardId::new(9)), InterestChange::None);
+        assert_eq!(
+            subs.subscribe(
+                shard,
+                t,
+                pid(1),
+                ParticipantKey::default(),
+                DownstreamSlotKey::default(),
+                ShardId::new(9)
+            ),
+            InterestChange::None
+        );
         assert_eq!(subs.subscriber_count(shard, &t), 1);
 
         assert_eq!(
@@ -284,11 +381,32 @@ mod tests {
         let (a, b) = (ShardId::new(0), ShardId::new(1));
         let (t1, t2) = (track(1), track(2));
 
-        subs.subscribe(a, t1, pid(1), ShardId::new(9));
+        subs.subscribe(
+            a,
+            t1,
+            pid(1),
+            ParticipantKey::default(),
+            DownstreamSlotKey::default(),
+            ShardId::new(9),
+        );
         subs.installed(a, t1, handle(0));
-        subs.subscribe(a, t2, pid(1), ShardId::new(9));
+        subs.subscribe(
+            a,
+            t2,
+            pid(1),
+            ParticipantKey::default(),
+            DownstreamSlotKey::default(),
+            ShardId::new(9),
+        );
         subs.installed(a, t2, handle(1));
-        subs.subscribe(b, t1, pid(2), ShardId::new(9));
+        subs.subscribe(
+            b,
+            t1,
+            pid(2),
+            ParticipantKey::default(),
+            DownstreamSlotKey::default(),
+            ShardId::new(9),
+        );
         subs.installed(b, t1, handle(2));
 
         let retired = subs.remove_participant(&pid(1));

@@ -195,8 +195,12 @@ mod tests {
     #[test]
     fn matches_shared_crate_encoding_for_the_same_fields() {
         let u = IceUfrag::new(0xabc, 0x1234, route(7, 12345), 42);
-        let shared =
-            pulsebeam_routing::ufrag::IceUfrag::new(0xabc, 0x1234, pulsebeam_routing::TransportRoute::new(7, 12345), 42);
+        let shared = pulsebeam_routing::ufrag::IceUfrag::new(
+            0xabc,
+            0x1234,
+            pulsebeam_routing::TransportRoute::new(7, 12345),
+            42,
+        );
         assert_eq!(u.encode().as_bytes(), shared.encode_ascii().as_slice());
     }
 }

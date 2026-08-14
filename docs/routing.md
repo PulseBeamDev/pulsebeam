@@ -1,5 +1,10 @@
 # PulseBeam Routing Protocol Architecture
 
+The current implementation follows the ownership and data-plane constraints
+in [`plans/routing-v5.md`](plans/routing-v5.md). That plan is the authoritative
+implementation guide for shard views, control-minted runtime keys, and compiled
+fanout routes.
+
 ## Status
 
 This document defines the routing architecture for PulseBeam's distributed WebRTC SFU.

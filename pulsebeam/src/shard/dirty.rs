@@ -70,16 +70,9 @@ impl DirtyTracker {
         }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.participants.is_empty()
-    }
-
-    #[cfg(test)]
-    pub fn contains(&self, key: ParticipantKey) -> bool {
-        self.participants
-            .get(self.cursor..)
-            .unwrap_or_default()
-            .contains(&key)
     }
 }
 
@@ -93,16 +86,17 @@ mod tests {
         ParticipantId::from_bytes([value; 16])
     }
 
-    fn key(slots: &mut slotmap::SlotMap<ParticipantKey, ()>) -> ParticipantKey {
-        slots.insert(())
+    fn key(index: u32, version: u32) -> ParticipantKey {
+        ParticipantKey::from(slotmap::KeyData::from_ffi(
+            (u64::from(version) << 32) | u64::from(index),
+        ))
     }
 
     #[test]
     fn phase_iteration_preserves_order_and_capacity() {
-        let mut slots = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
         let mut dirty = DirtyTracker::with_capacity(8);
-        let a = key(&mut slots);
-        let b = key(&mut slots);
+        let a = key(0, 1);
+        let b = key(1, 1);
         dirty.participants.extend([a, b]);
         let capacity = dirty.participants.capacity();
 
@@ -118,13 +112,11 @@ mod tests {
 
     #[test]
     fn stale_and_replacement_generations_remain_distinct() {
-        let mut slots = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
         let participant = id(1);
         let _ = participant;
         let mut dirty = DirtyTracker::with_capacity(8);
-        let stale = key(&mut slots);
-        slots.remove(stale);
-        let replacement = key(&mut slots);
+        let stale = key(0, 1);
+        let replacement = key(0, 3);
         dirty.participants.extend([stale, replacement]);
 
         dirty.begin_phase();

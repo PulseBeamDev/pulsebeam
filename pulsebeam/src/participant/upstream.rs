@@ -146,10 +146,7 @@ impl UpstreamAllocator {
     /// The descriptor and announced state for the track on `mid`, plus a way
     /// to flip that state — the whole of what the two per-participant maps
     /// used to hold.
-    pub fn announce_state_mut(
-        &mut self,
-        mid: Mid,
-    ) -> Option<(&crate::track::Track, &mut bool)> {
+    pub fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {
         let slot = self.published_tracks.iter_mut().find(|s| s.mid == mid)?;
         Some((&slot.descriptor, &mut slot.in_topology))
     }

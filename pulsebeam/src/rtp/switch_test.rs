@@ -1,6 +1,7 @@
 //! End-to-end stream-switching tests.
 //!
-//! The harness mirrors production wiring exactly: `ShardRoutingTable::route_video`
+//! The harness mirrors production wiring exactly: the shard runtime's video
+//! forwarding path
 //! pushes every packet into the per-layer `StreamCache` and then hands the packet
 //! plus that cache to each subscriber's `Slot::on_rtp`, which feeds the `Switcher`.
 //! Tests here drive that same pair and assert on what the subscriber's decoder

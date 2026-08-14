@@ -5,7 +5,7 @@
 
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::ufrag::{self, UfragDecodeError};
-use crate::{stun, TransportHandle};
+use crate::{TransportHandle, stun};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {

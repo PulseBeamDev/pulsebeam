@@ -80,7 +80,24 @@ impl IceUfrag {
 
 pub(crate) fn decode_ascii_detailed(s: &[u8]) -> Result<IceUfrag, UfragDecodeError> {
     let arr: [u8; ENCODED_LEN] = s.try_into().map_err(|_| UfragDecodeError::BadEncoding)?;
-    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] = arr;
+    let [
+        c0,
+        c1,
+        c2,
+        c3,
+        c4,
+        c5,
+        c6,
+        c7,
+        c8,
+        c9,
+        c10,
+        c11,
+        c12,
+        c13,
+        c14,
+        c15,
+    ] = arr;
     let v0 = crockford_value(c0).ok_or(UfragDecodeError::BadEncoding)?;
     let v1 = crockford_value(c1).ok_or(UfragDecodeError::BadEncoding)?;
     let v2 = crockford_value(c2).ok_or(UfragDecodeError::BadEncoding)?;

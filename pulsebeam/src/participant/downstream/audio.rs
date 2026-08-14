@@ -72,25 +72,27 @@ impl AudioAllocator {
             );
             return;
         }
-        if let Some(entry) = self.slots.iter_mut().find(|s| s.is_none()) {
-            *entry = Some(Slot {
-                mid: slot.mid,
-                pt: slot.pt,
-                ssrc: slot.ssrc,
-                pending_marker: true,
-                occupant: None,
-            });
-        } else {
-            plog_warn!(
-                self.ctx,
-                target: crate::log::TARGET_AUDIO,
-                mid = %slot.mid,
-                pt = %slot.pt,
-                ssrc = %slot.ssrc,
-                slots = SELECTOR_SLOTS,
-                "audio allocator has no free slot; dropping slot provisioning"
-            );
+        for entry in &mut self.slots {
+            if entry.is_none() {
+                *entry = Some(Slot {
+                    mid: slot.mid,
+                    pt: slot.pt,
+                    ssrc: slot.ssrc,
+                    pending_marker: true,
+                    occupant: None,
+                });
+                return;
+            }
         }
+        plog_warn!(
+            self.ctx,
+            target: crate::log::TARGET_AUDIO,
+            mid = %slot.mid,
+            pt = %slot.pt,
+            ssrc = %slot.ssrc,
+            slots = SELECTOR_SLOTS,
+            "audio allocator has no free slot; dropping slot provisioning"
+        );
     }
 
     /// Forget a speaker who has left, so nothing goes on announcing them.
@@ -117,11 +119,15 @@ impl AudioAllocator {
     }
 
     pub fn refresh_ssrc(&mut self, mid: Mid, ssrc: Ssrc) -> bool {
-        let Some(slot) = self.slots.iter_mut().flatten().find(|slot| slot.mid == mid) else {
-            return false;
-        };
-        slot.ssrc = ssrc;
-        true
+        for slot_entry in &mut self.slots {
+            if let Some(slot) = slot_entry.as_mut()
+                && slot.mid == mid
+            {
+                slot.ssrc = ssrc;
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether someone new took over a slot since this was last asked.
@@ -152,7 +158,7 @@ impl AudioAllocator {
         heard.sort_by(|a, b| {
             b.level_dbov
                 .cmp(&a.level_dbov)
-                .then_with(|| a.mid.to_string().cmp(&b.mid.to_string()))
+                .then_with(|| a.mid.as_bytes().cmp(b.mid.as_bytes()))
         });
         heard
     }

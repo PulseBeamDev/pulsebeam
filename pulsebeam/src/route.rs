@@ -4,8 +4,7 @@
 //! that destination's table — but the id also carries which shard that
 //! table belongs to (see [`RouteId`]), so it is a node-scoped address, not
 //! purely a destination-local one. Semantic ids (participant, track, room,
-//! topic) never appear on the wire; they survive only in [`RouteNames`] for
-//! logs.
+//! topic) never appear on the wire.
 //!
 //! Overflow is explicit in this module: `#![deny(clippy::arithmetic_side_effects)]`.
 //!
@@ -22,10 +21,8 @@ use std::collections::VecDeque;
 use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
-use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::id::ShardId;
-use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
-use crate::track::Topic;
+use crate::shard::router::{DataStreamKey, ReliableStreamKey, TrackKey};
 
 /// How long a retired slot waits before it can be handed out again.
 ///
@@ -280,14 +277,92 @@ pub fn peek_shard(buf: &[u8]) -> Option<ShardId> {
     pulsebeam_routing::envelope::peek_shard(buf).map(|shard| ShardId::new(usize::from(shard)))
 }
 
+/// The one typed view of the fixed wire header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Envelope {
+    pub ty: EnvelopeType,
+    pub epoch: u16,
+    pub route: RouteId,
+    pub extension: u64,
+}
+
+/// The extension interpretation selected by the envelope type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBody {
+    Media { link_seq: u32, playout_ntp32: u32 },
+    Feedback,
+    Telemetry,
+}
+
+impl Envelope {
+    pub fn media(handle: RouteHandle, link_seq: u32, playout_ntp32: u32) -> Self {
+        Self {
+            ty: EnvelopeType::Media,
+            epoch: handle.epoch,
+            route: handle.route,
+            extension: (u64::from(link_seq) << 32) | u64::from(playout_ntp32),
+        }
+    }
+
+    pub fn feedback(handle: RouteHandle) -> Self {
+        Self {
+            ty: EnvelopeType::Feedback,
+            epoch: handle.epoch,
+            route: handle.route,
+            extension: 0,
+        }
+    }
+
+    pub fn telemetry(handle: RouteHandle) -> Self {
+        Self {
+            ty: EnvelopeType::Telemetry,
+            epoch: handle.epoch,
+            route: handle.route,
+            extension: 0,
+        }
+    }
+
+    pub fn encode(self) -> [u8; ENVELOPE_LEN] {
+        pulsebeam_routing::envelope::Envelope {
+            ty: self.ty,
+            epoch: self.epoch,
+            route: to_wire_route(self.route),
+            extension: self.extension,
+        }
+        .encode()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
+        let wire = pulsebeam_routing::envelope::Envelope::decode(buf)?;
+        Ok(Self {
+            ty: wire.ty,
+            epoch: wire.epoch,
+            route: from_wire_route(wire.route),
+            extension: wire.extension,
+        })
+    }
+}
+
+/// Decode the shared header and its type-specific extension in one operation.
+pub fn decode_frame(buf: &[u8]) -> Result<(Envelope, FrameBody), EnvelopeError> {
+    let env = Envelope::decode(buf)?;
+    let body = match env.ty {
+        EnvelopeType::Media => FrameBody::Media {
+            #[allow(clippy::cast_possible_truncation)]
+            link_seq: (env.extension >> 32) as u32,
+            #[allow(clippy::cast_possible_truncation)]
+            playout_ntp32: env.extension as u32,
+        },
+        EnvelopeType::Feedback => FrameBody::Feedback,
+        EnvelopeType::Telemetry => FrameBody::Telemetry,
+    };
+    Ok((env, body))
+}
+
 /// Read the type tag of an encoded frame, which is what says how to interpret
 /// its `extension` and its payload.
 pub fn peek_type(buf: &[u8]) -> Result<EnvelopeType, EnvelopeError> {
-    decode_wire(buf).map(|env| env.ty)
-}
-
-fn decode_wire(buf: &[u8]) -> Result<pulsebeam_routing::envelope::Envelope, EnvelopeError> {
-    pulsebeam_routing::envelope::Envelope::decode(buf)
+    Envelope::decode(buf).map(|env| env.ty)
 }
 
 fn to_wire_route(route: RouteId) -> pulsebeam_routing::RouteId {
@@ -296,197 +371,6 @@ fn to_wire_route(route: RouteId) -> pulsebeam_routing::RouteId {
 
 fn from_wire_route(route: pulsebeam_routing::RouteId) -> RouteId {
     RouteId::from_raw(route.get())
-}
-
-/// The typed body of a media frame, above the shared wire header.
-///
-/// `link_seq` and `playout_ntp32` are the Media type's interpretation of the
-/// envelope's `extension` word — the header itself has no idea they exist,
-/// which is what lets a new payload family be added without touching the
-/// framing or the steering program.
-///
-/// ```text
-/// extension: | link_seq (u32) | playout_ntp32 (u32) |
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MediaEnvelope {
-    pub epoch: u16,
-    pub route: RouteId,
-    /// Scoped to `(route, epoch)` — a route incarnation. Wrapping `u32`, one
-    /// step per transmitted media frame. Hop-local only: it does not survive a
-    /// reinstall and a relay does not forward it.
-    pub link_seq: u32,
-    /// Middle 32 bits of the playout [`NtpTime`].
-    pub playout_ntp32: u32,
-}
-
-impl MediaEnvelope {
-    fn pack_extension(link_seq: u32, playout_ntp32: u32) -> u64 {
-        (u64::from(link_seq) << 32) | u64::from(playout_ntp32)
-    }
-
-    fn unpack_extension(extension: u64) -> (u32, u32) {
-        // Both halves are exactly 32 bits of a 64-bit word, so neither
-        // conversion can lose anything.
-        #[allow(clippy::cast_possible_truncation)]
-        let link_seq = (extension >> 32) as u32;
-        #[allow(clippy::cast_possible_truncation)]
-        let playout_ntp32 = extension as u32;
-        (link_seq, playout_ntp32)
-    }
-
-    pub fn encode(&self) -> [u8; ENVELOPE_LEN] {
-        pulsebeam_routing::envelope::Envelope {
-            ty: EnvelopeType::Media,
-            epoch: self.epoch,
-            route: to_wire_route(self.route),
-            extension: Self::pack_extension(self.link_seq, self.playout_ntp32),
-        }
-        .encode()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        let wire = decode_wire(buf)?;
-        if wire.ty != EnvelopeType::Media {
-            return Err(EnvelopeError::UnknownType {
-                ty: wire.ty.as_u8(),
-            });
-        }
-        let (link_seq, playout_ntp32) = Self::unpack_extension(wire.extension);
-        Ok(Self {
-            epoch: wire.epoch,
-            route: from_wire_route(wire.route),
-            link_seq,
-            playout_ntp32,
-        })
-    }
-}
-
-/// A frame that carries no timeline: an upstream request travelling back to a
-/// publisher, or forward telemetry travelling out to a destination.
-///
-/// The two are different `EnvelopeType`s over the same header rather than a
-/// second header — a reverse message that needs a compact body uses `type` and
-/// `extension`, which is why there is only one route offset on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RouteEnvelope {
-    pub ty: EnvelopeType,
-    pub epoch: u16,
-    pub route: RouteId,
-}
-
-impl RouteEnvelope {
-    /// An upstream request addressed to a publisher's reverse route.
-    pub fn feedback(handle: RouteHandle) -> Self {
-        Self {
-            ty: EnvelopeType::Feedback,
-            epoch: handle.epoch,
-            route: handle.route,
-        }
-    }
-
-    /// Forward telemetry addressed to a destination.
-    pub fn telemetry(handle: RouteHandle) -> Self {
-        Self {
-            ty: EnvelopeType::Telemetry,
-            epoch: handle.epoch,
-            route: handle.route,
-        }
-    }
-
-    pub fn encode(&self) -> [u8; ENVELOPE_LEN] {
-        debug_assert!(
-            matches!(self.ty, EnvelopeType::Feedback | EnvelopeType::Telemetry),
-            "a timeline-free frame is feedback or telemetry, not {:?}",
-            self.ty
-        );
-        pulsebeam_routing::envelope::Envelope {
-            ty: self.ty,
-            epoch: self.epoch,
-            route: to_wire_route(self.route),
-            extension: 0,
-        }
-        .encode()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        let wire = decode_wire(buf)?;
-        match wire.ty {
-            EnvelopeType::Feedback | EnvelopeType::Telemetry => Ok(Self {
-                ty: wire.ty,
-                epoch: wire.epoch,
-                route: from_wire_route(wire.route),
-            }),
-            other => Err(EnvelopeError::UnknownType { ty: other.as_u8() }),
-        }
-    }
-}
-
-/// A sender-side handle to a route installed at a destination.
-///
-/// Holding one is the *only* way to address a destination, so "media must not
-/// be emitted before the receiver route is installed" is structural: the
-/// handle does not exist until the destination has installed and acknowledged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RemoteRoute {
-    pub shard_id: crate::id::ShardId,
-    pub route: RouteId,
-    pub epoch: u16,
-    link_seq: u32,
-}
-
-impl RemoteRoute {
-    pub fn new(shard_id: crate::id::ShardId, route: RouteId, epoch: u16) -> Self {
-        Self {
-            shard_id,
-            route,
-            epoch,
-            link_seq: 0,
-        }
-    }
-
-    /// Build the envelope for the next frame on this route, advancing
-    /// `link_seq`. Wrapping, because `link_seq` is modulo 2^32.
-    pub fn next_envelope(&mut self, playout: NtpTime) -> MediaEnvelope {
-        let env = MediaEnvelope {
-            epoch: self.epoch,
-            route: self.route,
-            link_seq: self.link_seq,
-            playout_ntp32: playout.middle32(),
-        };
-        self.link_seq = self.link_seq.wrapping_add(1);
-        env
-    }
-}
-
-/// Semantic identity, for logs and assertions only. Never read on the hot path.
-///
-/// A route on the wire names nothing, which is the point and also the reason a
-/// route-level fault is otherwise unreadable: `rt41 epoch 3` says nothing about
-/// whose stream stopped. This is the only place that mapping survives, so the
-/// paths that report a fault holding a live entry render it.
-#[derive(Debug, Clone)]
-pub(crate) struct RouteNames {
-    pub room_id: Option<RoomId>,
-    pub origin: ParticipantId,
-    pub track_id: Option<TrackId>,
-    pub topic: Option<Topic>,
-}
-
-impl std::fmt::Display for RouteNames {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.origin)?;
-        if let Some(room_id) = &self.room_id {
-            write!(f, " in {room_id}")?;
-        }
-        if let Some(track_id) = &self.track_id {
-            write!(f, " track {track_id}")?;
-        }
-        if let Some(topic) = &self.topic {
-            write!(f, " topic {topic}")?;
-        }
-        Ok(())
-    }
 }
 
 /// What the destination does with a frame that arrives on a route.
@@ -506,18 +390,11 @@ pub(crate) enum RouteAction {
         /// The destination's own fanout handle — a dense index, not a name.
         /// Resolving a route hands dispatch something it can use directly,
         /// rather than a `TrackId` it would have to hash back into a map.
-        local_track: LocalTrackKey,
+        local_track: TrackKey,
     },
-    /// One route per (audio stream, destination). Audio is broadcast to a room
-    /// rather than explicitly subscribed, so the destination installs this as
-    /// soon as it learns the track exists and it has members to deliver to.
-    ///
-    /// `track` points at a `TrackRoute` the same way `Video::local_track`
-    /// does — an audio import gets the same dense fanout entry a video
-    /// subscription gets (it never populates `subscribers`/`remote_routes`;
-    /// audio's own liveness is the import table, not this entry's
-    /// emptiness). Origin and track_id are read off it, never carried here.
-    Audio { room: RoomKey, track: LocalTrackKey },
+    /// One route per audio stream and destination. The track key resolves the
+    /// destination's compiled audio plan directly.
+    Audio { track: TrackKey },
     /// One route per (publisher, topic, destination) on the realtime lane.
     /// The destination installs it whether the local subscription named a
     /// publisher or was a wildcard — wildcards resolve to concrete streams as
@@ -550,7 +427,7 @@ pub(crate) enum ReverseTarget {
         /// The publisher's own fanout handle. Encodings live on the
         /// `TrackRoute` this resolves to, in declared order — a frame names
         /// one by index, so the rid itself never travels.
-        track: LocalTrackKey,
+        track: TrackKey,
     },
     Topic {
         stream: ReliableStreamKey,
@@ -647,8 +524,6 @@ impl SlotAllocator {
             max_slots,
         }
     }
-
-
 
     /// `Ok((slot, epoch))`. A `slot` equal to the pre-call [`Self::high_water`]
     /// is fresh and the caller must push one entry; anything lower is a
@@ -818,6 +693,7 @@ impl RouteRuntime {
         true
     }
 
+    #[cfg(test)]
     pub fn entry_mut(&mut self, handle: RouteHandle) -> Option<&mut RouteRuntimeEntry> {
         match self.slots.get_mut(handle.route.index()) {
             Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
@@ -825,7 +701,6 @@ impl RouteRuntime {
         }
     }
 
-    #[cfg(test)]
     pub fn entry(&self, handle: RouteHandle) -> Option<&RouteRuntimeEntry> {
         match self.slots.get(handle.route.index()) {
             Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
@@ -834,168 +709,10 @@ impl RouteRuntime {
     }
 
     #[cfg(test)]
-    pub fn shard_id(&self) -> ShardId {
-        self.shard_id
-    }
-
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 }
-
-/// Lifecycle of one imported stream on a destination shard.
-///
-/// A cluster route is installed when the *first* local subscriber appears and
-/// retired when the last one leaves. Everything in between mutates the local
-/// fanout object and leaves the route alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImportState {
-    Installing,
-    Active { route: RouteId, epoch: u16 },
-    Retiring { route: RouteId, epoch: u16 },
-}
-
-/// Work the caller must perform after a lifecycle transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImportEffect {
-    None,
-    /// Allocate and install a route at the destination, then acknowledge the
-    /// sender. The local fanout object already exists.
-    Install,
-    Retire {
-        route: RouteId,
-        epoch: u16,
-    },
-}
-
-/// One imported stream's route lifecycle, stored on the arena entry it
-/// describes.
-///
-/// It used to be a `HashMap<name, _>` per lane — three of them — sitting
-/// beside the arenas. That meant a second subscriber count next to the
-/// fanout's own subscriber set, and a name hash to reach state belonging to an
-/// object the caller already had by key. Absent is `None`, so the state
-/// machine still cannot leak empty rows.
-#[derive(Debug, Default)]
-pub(crate) struct ImportSlot(Option<Import>);
-
-#[derive(Debug)]
-struct Import {
-    state: ImportState,
-    subscribers: usize,
-}
-
-impl ImportSlot {
-    pub fn state(&self) -> Option<ImportState> {
-        self.0.as_ref().map(|i| i.state)
-    }
-
-    #[cfg(test)]
-    pub fn subscribers(&self) -> usize {
-        self.0.as_ref().map_or(0, |i| i.subscribers)
-    }
-
-    /// Returns [`ImportEffect::Install`] only for the first subscriber. Later
-    /// subscribers attach to the pending or active import and produce no
-    /// cluster traffic.
-    pub fn subscribe(&mut self) -> ImportEffect {
-        match &mut self.0 {
-            Some(import) => {
-                import.subscribers = import.subscribers.saturating_add(1);
-                ImportEffect::None
-            }
-            None => {
-                self.0 = Some(Import {
-                    state: ImportState::Installing,
-                    subscribers: 1,
-                });
-                ImportEffect::Install
-            }
-        }
-    }
-
-    /// The destination acknowledged the install.
-    ///
-    /// If every subscriber left while the install was in flight, the route is
-    /// retired immediately rather than cancelled — a cancel would have to race
-    /// the acknowledgement, which is unwinnable once a network is involved.
-    pub fn on_installed(&mut self, route: RouteId, epoch: u16) -> ImportEffect {
-        let Some(import) = &mut self.0 else {
-            // Retirement already completed; nothing references this route.
-            return ImportEffect::Retire { route, epoch };
-        };
-        debug_assert_eq!(
-            import.state,
-            ImportState::Installing,
-            "install acknowledged for an import that was not installing"
-        );
-        if import.subscribers == 0 {
-            import.state = ImportState::Retiring { route, epoch };
-            return ImportEffect::Retire { route, epoch };
-        }
-        import.state = ImportState::Active { route, epoch };
-        ImportEffect::None
-    }
-
-    /// Returns [`ImportEffect::Retire`] only when the last subscriber leaves an
-    /// active import. Leaving during `Installing` defers to
-    /// [`Self::on_installed`].
-    pub fn unsubscribe(&mut self) -> ImportEffect {
-        let Some(import) = &mut self.0 else {
-            return ImportEffect::None;
-        };
-        import.subscribers = import.subscribers.saturating_sub(1);
-        if import.subscribers > 0 {
-            return ImportEffect::None;
-        }
-        match import.state {
-            ImportState::Active { route, epoch } => {
-                import.state = ImportState::Retiring { route, epoch };
-                ImportEffect::Retire { route, epoch }
-            }
-            ImportState::Installing | ImportState::Retiring { .. } => ImportEffect::None,
-        }
-    }
-
-    /// The install never happened, so the import returns to Absent.
-    ///
-    /// [`Self::subscribe`] moves to `Installing` before the caller has a route,
-    /// which means a failed install would otherwise leave an entry no later
-    /// subscribe can advance and no unsubscribe can clear — the stream becomes
-    /// permanently undeliverable on this shard.
-    ///
-    /// Only legal while `Installing`: once a route exists, retirement is the
-    /// way back, and cancelling would leak it.
-    pub fn cancel_install(&mut self) {
-        let Some(import) = &self.0 else {
-            return;
-        };
-        debug_assert_eq!(
-            import.state,
-            ImportState::Installing,
-            "cancel_install on an import that already has a route"
-        );
-        if matches!(import.state, ImportState::Installing) {
-            self.0 = None;
-        }
-    }
-
-    /// Retirement completed. A subscriber that arrived while it was in flight
-    /// reinstalls rather than resurrecting the retired route.
-    pub fn on_retired(&mut self) -> ImportEffect {
-        let Some(import) = &mut self.0 else {
-            return ImportEffect::None;
-        };
-        if import.subscribers > 0 {
-            import.state = ImportState::Installing;
-            return ImportEffect::Install;
-        }
-        self.0 = None;
-        ImportEffect::None
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -1003,25 +720,8 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
 
-    fn names() -> RouteNames {
-        RouteNames {
-            room_id: Some(RoomId::from_external(
-                &crate::entity::ExternalRoomId::new("room1").unwrap(),
-            )),
-            origin: ParticipantId::from_bytes([7u8; 16]),
-            track_id: None,
-            topic: None,
-        }
-    }
-
-
-    fn envelope(route: RouteId, epoch: u16) -> MediaEnvelope {
-        MediaEnvelope {
-            epoch,
-            route,
-            link_seq: 0,
-            playout_ntp32: 0,
-        }
+    fn envelope(route: RouteId, epoch: u16) -> Envelope {
+        Envelope::media(RouteHandle::new(route, epoch), 0, 0)
     }
 
     #[test]
@@ -1069,11 +769,11 @@ mod tests {
 
     #[test]
     fn envelope_encodes_big_endian_at_documented_offsets() {
-        let env = MediaEnvelope {
+        let env = Envelope {
+            ty: EnvelopeType::Media,
             epoch: 0x1122,
             route: RouteId::from_raw(0x3344_5566),
-            link_seq: 0x7788_99AA,
-            playout_ntp32: 0xBBCC_DDEE,
+            extension: (u64::from(0x7788_99AAu32) << 32) | u64::from(0xBBCC_DDEE_u32),
         };
         let bytes = env.encode();
         assert_eq!(
@@ -1105,7 +805,7 @@ mod tests {
     /// route offset on the wire for the steering program to read.
     #[test]
     fn a_timeline_free_frame_uses_the_same_sixteen_byte_header() {
-        let encoded = RouteEnvelope::feedback(RouteHandle::new(RouteId::from_raw(1), 1)).encode();
+        let encoded = Envelope::feedback(RouteHandle::new(RouteId::from_raw(1), 1)).encode();
         assert_eq!(encoded.len(), ENVELOPE_LEN);
         assert_eq!(
             crate::route::peek_shard(&encoded),
@@ -1117,10 +817,10 @@ mod tests {
     #[test]
     fn reverse_envelope_round_trips() {
         for env in [
-            RouteEnvelope::feedback(RouteHandle::new(RouteId::from_raw(u32::MAX), u16::MAX)),
-            RouteEnvelope::telemetry(RouteHandle::new(RouteId::from_raw(0), 0)),
+            Envelope::feedback(RouteHandle::new(RouteId::from_raw(u32::MAX), u16::MAX)),
+            Envelope::telemetry(RouteHandle::new(RouteId::from_raw(0), 0)),
         ] {
-            assert_eq!(RouteEnvelope::decode(&env.encode()).unwrap(), env);
+            assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
         }
     }
 
@@ -1131,10 +831,8 @@ mod tests {
     #[test]
     fn the_payload_families_are_distinguishable_on_the_wire() {
         let media = envelope(RouteId::from_raw(3), 4).encode();
-        let feedback =
-            RouteEnvelope::feedback(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
-        let telemetry =
-            RouteEnvelope::telemetry(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
+        let feedback = Envelope::feedback(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
+        let telemetry = Envelope::telemetry(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
 
         assert_eq!(peek_type(&media).unwrap(), EnvelopeType::Media);
         assert_eq!(peek_type(&feedback).unwrap(), EnvelopeType::Feedback);
@@ -1148,30 +846,26 @@ mod tests {
             );
         }
 
-        // And decoding one family as another is refused rather than misread.
         assert_eq!(
-            MediaEnvelope::decode(&feedback),
-            Err(EnvelopeError::UnknownType {
-                ty: EnvelopeType::Feedback.as_u8()
-            })
+            decode_frame(&media).unwrap().1,
+            FrameBody::Media {
+                link_seq: 0,
+                playout_ntp32: 0
+            }
         );
-        assert_eq!(
-            RouteEnvelope::decode(&media),
-            Err(EnvelopeError::UnknownType {
-                ty: EnvelopeType::Media.as_u8()
-            })
-        );
+        assert_eq!(decode_frame(&feedback).unwrap().1, FrameBody::Feedback);
+        assert_eq!(decode_frame(&telemetry).unwrap().1, FrameBody::Telemetry);
     }
 
     #[test]
     fn envelope_round_trips() {
-        let env = MediaEnvelope {
+        let env = Envelope {
+            ty: EnvelopeType::Media,
             epoch: 65_535,
             route: RouteId::from_raw(u32::MAX),
-            link_seq: u32::MAX,
-            playout_ntp32: u32::MAX,
+            extension: u64::MAX,
         };
-        assert_eq!(MediaEnvelope::decode(&env.encode()).unwrap(), env);
+        assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
     }
 
     #[test]
@@ -1179,7 +873,7 @@ mod tests {
         let full = envelope(RouteId::from_raw(1), 1).encode();
         for len in 0..ENVELOPE_LEN {
             assert_eq!(
-                MediaEnvelope::decode(&full[..len]),
+                Envelope::decode(&full[..len]),
                 Err(EnvelopeError::Truncated { len })
             );
         }
@@ -1190,7 +884,7 @@ mod tests {
         let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
         bytes[0] = ENVELOPE_VERSION + 1;
         assert_eq!(
-            MediaEnvelope::decode(&bytes),
+            Envelope::decode(&bytes),
             Err(EnvelopeError::UnsupportedVersion {
                 ver: ENVELOPE_VERSION + 1
             })
@@ -1199,7 +893,7 @@ mod tests {
         let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
         bytes[1] = 0xff;
         assert_eq!(
-            MediaEnvelope::decode(&bytes),
+            Envelope::decode(&bytes),
             Err(EnvelopeError::UnknownType { ty: 0xff }),
             "an unrecognised payload family is rejected, not skipped past"
         );
@@ -1303,160 +997,11 @@ mod tests {
         assert!(runtime.entry(handle(0, 0, 4)).is_some());
 
         assert!(runtime.retire(handle(0, 0, 4)));
-        assert!(!runtime.retire(handle(0, 0, 4)), "a redelivered teardown is a no-op");
+        assert!(
+            !runtime.retire(handle(0, 0, 4)),
+            "a redelivered teardown is a no-op"
+        );
         assert_eq!(runtime.len(), 0);
-    }
-
-    #[test]
-    fn churn_before_the_install_ack_installs_exactly_once() {
-        let mut imports = ImportSlot::default();
-        let mut installs = 0;
-        let mut retires = 0;
-
-        if imports.subscribe() == ImportEffect::Install {
-            installs += 1;
-        }
-        if imports.subscribe() == ImportEffect::Install {
-            installs += 1;
-        }
-        assert_eq!(imports.state(), Some(ImportState::Installing));
-
-        assert_eq!(imports.unsubscribe(), ImportEffect::None);
-        assert_eq!(
-            imports.subscribers(),
-            1,
-            "one subscriber remains; the import stays pending"
-        );
-
-        let (route, epoch) = (RouteId::from_raw(0), 0);
-        assert_eq!(imports.on_installed(route, epoch), ImportEffect::None);
-        assert_eq!(
-            imports.state(),
-            Some(ImportState::Active { route, epoch })
-        );
-
-        if let ImportEffect::Retire { .. } = imports.unsubscribe() {
-            retires += 1;
-        }
-        assert_eq!(imports.on_retired(), ImportEffect::None);
-        assert_eq!(imports.state(), None);
-
-        assert_eq!(installs, 1, "exactly one route installation");
-        assert_eq!(retires, 1);
-    }
-
-    #[test]
-    fn losing_every_subscriber_mid_install_finishes_then_retires() {
-        let mut imports = ImportSlot::default();
-        assert_eq!(imports.subscribe(), ImportEffect::Install);
-        assert_eq!(imports.unsubscribe(), ImportEffect::None);
-
-        let (route, epoch) = (RouteId::from_raw(3), 9);
-        assert_eq!(
-            imports.on_installed(route, epoch),
-            ImportEffect::Retire { route, epoch },
-            "the install completes, then retires immediately"
-        );
-        assert_eq!(imports.on_retired(), ImportEffect::None);
-        assert_eq!(imports.state(), None);
-    }
-
-    /// A failed install must leave no trace, or the stream is undeliverable on
-    /// this shard forever: `Installing` absorbs later subscribes and ignores
-    /// unsubscribes, so nothing would ever retry.
-    #[test]
-    fn an_install_that_failed_can_be_attempted_again() {
-        let mut imports = ImportSlot::default();
-        assert_eq!(imports.subscribe(), ImportEffect::Install);
-
-        imports.cancel_install();
-        assert_eq!(imports.state(), None, "back to Absent");
-        assert_eq!(imports.subscribers(), 0);
-
-        assert_eq!(
-            imports.subscribe(),
-            ImportEffect::Install,
-            "the next subscriber drives a fresh install"
-        );
-        let (route, epoch) = (RouteId::from_raw(7), 2);
-        assert_eq!(imports.on_installed(route, epoch), ImportEffect::None);
-        assert_eq!(
-            imports.state(),
-            Some(ImportState::Active { route, epoch })
-        );
-    }
-
-    /// Without a rollback the entry is stuck: this pins the two transitions
-    /// that would otherwise silently absorb every later attempt.
-    #[test]
-    fn an_import_wedged_in_installing_absorbs_everything() {
-        let mut imports = ImportSlot::default();
-        imports.subscribe();
-
-        assert_eq!(
-            imports.subscribe(),
-            ImportEffect::None,
-            "a later subscriber attaches to the pending install"
-        );
-        assert_eq!(imports.unsubscribe(), ImportEffect::None);
-        assert_eq!(imports.unsubscribe(), ImportEffect::None);
-        assert_eq!(
-            imports.state(),
-            Some(ImportState::Installing),
-            "no unsubscribe can clear an import that never installed"
-        );
-    }
-
-    #[test]
-    fn local_churn_with_a_subscriber_remaining_touches_no_route() {
-        let mut imports = ImportSlot::default();
-        imports.subscribe();
-        let (route, epoch) = (RouteId::from_raw(1), 0);
-        imports.on_installed(route, epoch);
-
-        for _ in 0..100 {
-            assert_eq!(imports.subscribe(), ImportEffect::None);
-            assert_eq!(imports.unsubscribe(), ImportEffect::None);
-        }
-        assert_eq!(
-            imports.state(),
-            Some(ImportState::Active { route, epoch }),
-            "the cluster route is untouched by local churn"
-        );
-    }
-
-    #[test]
-    fn subscribing_during_retirement_reinstalls() {
-        let mut imports = ImportSlot::default();
-        imports.subscribe();
-        let (route, epoch) = (RouteId::from_raw(1), 0);
-        imports.on_installed(route, epoch);
-        assert_eq!(
-            imports.unsubscribe(),
-            ImportEffect::Retire { route, epoch }
-        );
-
-        assert_eq!(imports.subscribe(), ImportEffect::None);
-        assert_eq!(
-            imports.on_retired(),
-            ImportEffect::Install,
-            "the late subscriber gets a fresh route, not the retired one"
-        );
-        assert_eq!(imports.state(), Some(ImportState::Installing));
-    }
-
-    #[test]
-    fn unsubscribe_and_retire_are_idempotent() {
-        let mut imports = ImportSlot::default();
-        assert_eq!(imports.unsubscribe(), ImportEffect::None);
-        assert_eq!(imports.on_retired(), ImportEffect::None);
-
-        imports.subscribe();
-        imports.on_installed(RouteId::from_raw(0), 0);
-        imports.unsubscribe();
-        imports.on_retired();
-        assert_eq!(imports.unsubscribe(), ImportEffect::None);
-        assert_eq!(imports.on_retired(), ImportEffect::None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1491,7 +1036,11 @@ mod tests {
         ];
         for (shard, slot) in corners {
             let packed = PackedRoute::new(ShardId::new(shard), slot);
-            assert_eq!(packed.shard(), ShardId::new(shard), "shard {shard} slot {slot}");
+            assert_eq!(
+                packed.shard(),
+                ShardId::new(shard),
+                "shard {shard} slot {slot}"
+            );
             assert_eq!(packed.slot(), slot, "shard {shard} slot {slot}");
             assert_eq!(
                 PackedRoute::from_raw(packed.get()),
@@ -1507,8 +1056,16 @@ mod tests {
     fn the_two_fields_partition_the_whole_word() {
         let all_slot = PackedRoute::new(ShardId::new(0), PackedRoute::MAX_SLOT);
         let all_shard = PackedRoute::new(ShardId::new(PackedRoute::MAX_SHARD as usize), 0);
-        assert_eq!(all_slot.get() & all_shard.get(), 0, "fields must not overlap");
-        assert_eq!(all_slot.get() | all_shard.get(), u32::MAX, "fields must cover the word");
+        assert_eq!(
+            all_slot.get() & all_shard.get(),
+            0,
+            "fields must not overlap"
+        );
+        assert_eq!(
+            all_slot.get() | all_shard.get(),
+            u32::MAX,
+            "fields must cover the word"
+        );
     }
 
     #[test]
@@ -1546,7 +1103,6 @@ mod tests {
         );
     }
 
-
     /// A retired slot is quarantined by its *slot* number. Storing the packed
     /// route instead worked only on shard 0, where the shard bits are zero —
     /// on any other shard the queue held a number far outside the namespace
@@ -1563,7 +1119,10 @@ mod tests {
             let (reused, reused_epoch) = allocator.allocate(Instant::now()).unwrap();
 
             assert_eq!(reused, slot, "shard {shard}: the slot must come back");
-            assert_ne!(reused_epoch, epoch, "shard {shard}: reuse must bump the epoch");
+            assert_ne!(
+                reused_epoch, epoch,
+                "shard {shard}: reuse must bump the epoch"
+            );
             assert_eq!(
                 RouteId::new(ShardId::new(shard), reused).shard(),
                 ShardId::new(shard),
@@ -1572,7 +1131,6 @@ mod tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod layout {

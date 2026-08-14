@@ -397,11 +397,7 @@ impl NodeBuilder {
                 reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
             )]
             let occupancy = Arc::new(ShardMetrics::new());
-            #[allow(
-                clippy::disallowed_types,
-                reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
-            )]
-            let shard_occupancy = Arc::new(ShardMetrics::new());
+            let worker_occupancy = occupancy.clone();
 
             if use_shared_runtime {
                 let shard = ShardWorker::new(
@@ -409,13 +405,13 @@ impl NodeBuilder {
                     udp_sock.into_unified_socket()?,
                     tcp_sock,
                     shard_command_rx,
+                    view_reader,
                     shard_event_tx,
                     frame_rx,
                     frame_txs,
-                    shard_occupancy,
+                    worker_occupancy,
                     shard_rng,
                     wall_anchor,
-                    view_reader,
                 );
                 join_set.spawn_local(ignore(shard.run()));
             } else {
@@ -465,13 +461,13 @@ impl NodeBuilder {
                                     udp_sock,
                                     tcp_sock,
                                     shard_command_rx,
+                                    view_reader,
                                     shard_event_tx,
                                     frame_rx,
                                     frame_txs,
-                                    shard_occupancy,
+                                    worker_occupancy,
                                     shard_rng,
                                     wall_anchor,
-                                    view_reader,
                                 );
                                 tokio::task::unconstrained(shard.run()).await;
                             });
@@ -603,24 +599,24 @@ async fn bind_udp_sockets(
 
     for shard_index in 0..workers {
         let shard_index = u16::try_from(shard_index).unwrap_or(u16::MAX);
-        let socket = match net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await
-        {
-            Ok(s) => s,
-            Err(e) if sockets.is_empty() => {
-                return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
-            }
-            Err(e) => {
-                // Shedding workers here is not a capacity trade-off: a
-                // single-shard node never executes a cross-shard path at all.
-                tracing::warn!(
-                    requested = workers,
-                    running = sockets.len(),
-                    "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
+        let socket =
+            match net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await {
+                Ok(s) => s,
+                Err(e) if sockets.is_empty() => {
+                    return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
+                }
+                Err(e) => {
+                    // Shedding workers here is not a capacity trade-off: a
+                    // single-shard node never executes a cross-shard path at all.
+                    tracing::warn!(
+                        requested = workers,
+                        running = sockets.len(),
+                        "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
                      workers than requested: {e}"
-                );
-                break;
-            }
-        };
+                    );
+                    break;
+                }
+            };
         sockets.push(socket);
     }
     Ok(sockets)

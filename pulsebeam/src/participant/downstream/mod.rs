@@ -133,10 +133,6 @@ fn starvation_reset_target(
 const BWE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
 const BWE_FALL_TIME_CONSTANT: Duration = Duration::from_millis(800);
 
-slotmap::new_key_type! {
-    pub struct SlotKey;
-}
-
 #[derive(Debug)]
 struct BweFilter {
     filtered_bps: f64,
@@ -379,12 +375,12 @@ impl DownstreamAllocator {
         self.available_bandwidth = BweFilter::new(target);
     }
 
-    pub fn reconcile_routes(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+    pub(crate) fn reconcile_routes(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         self.video
             .poll_slow(now, self.available_bandwidth.current(), events);
     }
 
-    pub fn poll_slow(
+    pub(crate) fn poll_slow(
         &mut self,
         now: Instant,
         bwe: &mut Bwe,
@@ -401,6 +397,14 @@ impl DownstreamAllocator {
         self.video.update_layer_states(track_id, states);
     }
 
+    pub fn update_layer_states_slot(
+        &mut self,
+        slot: crate::keys::DownstreamSlotKey,
+        states: &crate::track::TrackStates,
+    ) {
+        self.video.update_layer_states_slot(slot, states);
+    }
+
     pub fn on_forward_rtp(
         &mut self,
         track_id: TrackId,
@@ -409,6 +413,16 @@ impl DownstreamAllocator {
         writer: &mut StreamWriter,
     ) -> bool {
         self.video.on_rtp(track_id, pkt, cache, writer)
+    }
+
+    pub fn on_forward_rtp_slot(
+        &mut self,
+        slot: crate::keys::DownstreamSlotKey,
+        pkt: &RtpPacket,
+        cache: Option<&crate::rtp::cache::TrackStreamCache>,
+        writer: &mut StreamWriter,
+    ) -> bool {
+        self.video.on_rtp_slot(slot, pkt, cache, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.
