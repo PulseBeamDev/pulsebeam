@@ -152,10 +152,7 @@ impl<K: Key> KeySet<K> {
         self.dense.is_empty()
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, K> {
-        self.dense.iter()
-    }
-
+    #[cfg(test)]
     pub fn as_slice(&self) -> &[K] {
         &self.dense
     }
@@ -170,14 +167,6 @@ impl<K: Key> KeySet<K> {
         self.remove(key)
     }
 
-    pub fn clear(&mut self) {
-        for key in &self.dense {
-            if let Some(slot) = self.sparse.get_mut(Self::index_of(*key)) {
-                *slot = ABSENT;
-            }
-        }
-        self.dense.clear();
-    }
 }
 
 impl<'a, K: Key> IntoIterator for &'a KeySet<K> {
@@ -307,23 +296,6 @@ mod tests {
         assert!(!set.contains(&first));
     }
 
-    #[test]
-    fn clear_empties_the_set_without_stranding_indexes() {
-        let members = keys(8);
-        let mut set: KeySet<ParticipantKey> = members.iter().copied().collect();
-
-        set.clear();
-        assert!(set.is_empty());
-        for key in &members {
-            assert!(!set.contains(key));
-        }
-
-        // And it is reusable afterwards.
-        for key in &members {
-            assert!(set.insert(*key));
-        }
-        assert_eq!(set.len(), members.len());
-    }
 
     #[test]
     fn iteration_yields_every_member_exactly_once() {
@@ -332,7 +304,7 @@ mod tests {
         set.remove(&members[7]);
         set.remove(&members[31]);
 
-        let mut seen: Vec<_> = set.iter().copied().collect();
+        let mut seen: Vec<_> = set.as_slice().to_vec();
         assert_eq!(seen.len(), 30);
         seen.sort();
         seen.dedup();

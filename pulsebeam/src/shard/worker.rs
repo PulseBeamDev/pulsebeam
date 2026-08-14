@@ -22,7 +22,7 @@ use str0m::media::KeyframeRequestKind;
 use tokio::time::{Instant, Sleep};
 
 use crate::{
-    entity::{self, ParticipantId, RoomId, TrackId},
+    entity::{ParticipantId, RoomId, TrackId},
     id::ShardId,
     participant::ParticipantConfig,
     rtp::RtpPacket,
@@ -130,16 +130,6 @@ pub enum ShardCommand {
     AddTcpConnection {
         stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
         peer_addr: std::net::SocketAddr,
-    },
-    RegisterParticipant {
-        shard_id: ShardId,
-        room_id: RoomId,
-        participant_id: entity::ParticipantId,
-    },
-    UnregisterParticipant {
-        shard_id: ShardId,
-        room_id: RoomId,
-        participant_id: ParticipantId,
     },
     PublishTrack(Track, RoomId),
     UnpublishTracks {
@@ -528,7 +518,7 @@ impl ShardWorker {
                     }
                 }
                 cmd => {
-                    let _ = self.core.on_command(cmd, now, &self.router);
+                    let _ = self.core.on_command(cmd, &self.router);
                 }
             }
         }
@@ -548,7 +538,7 @@ impl ShardWorker {
         self.core.flush_stream_buffers(&self.router);
         self.core
             .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
-        self.core.flush_participant_events(now, &self.router);
+        self.core.flush_participant_events(&self.router);
 
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);

@@ -59,6 +59,7 @@ impl RouteImage {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
@@ -105,10 +106,6 @@ impl TransportImage {
             Some(Some(binding)) if binding.epoch == handle.epoch => Some(binding.participant),
             _ => None,
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
     }
 
     fn install(&mut self, route: TransportRoute, binding: TransportBinding) {
@@ -228,7 +225,6 @@ impl left_right::Absorb<ShardViewDelta> for ShardView {
 /// budget is one call per affected shard per committed generation, and that
 /// is only enforceable if there is exactly one caller.
 pub(crate) struct ShardViewWriter {
-    shard_id: ShardId,
     write: left_right::WriteHandle<ShardView, ShardViewDelta>,
     /// The generation staged but not yet published.
     pending: Option<ShardViewDelta>,
@@ -240,10 +236,6 @@ pub(crate) struct ShardViewWriter {
 }
 
 impl ShardViewWriter {
-    pub fn shard_id(&self) -> ShardId {
-        self.shard_id
-    }
-
     /// Stage an operation into the generation currently being built. Nothing
     /// is visible to the shard until [`Self::publish`].
     pub fn stage(&mut self, generation: u64, op: ViewOp) {
@@ -257,9 +249,6 @@ impl ShardViewWriter {
         delta.ops.push(op);
     }
 
-    pub fn has_pending(&self) -> bool {
-        self.pending.as_ref().is_some_and(|d| !d.is_empty())
-    }
 
     /// Discard the staged generation. The previously committed view stays
     /// valid, which is what makes a failed prepare recoverable without the
@@ -291,9 +280,6 @@ impl ShardViewWriter {
         self.acknowledged >= generation
     }
 
-    pub fn published(&self) -> u64 {
-        self.published
-    }
 
     #[cfg(test)]
     pub fn publications(&self) -> u64 {
@@ -307,7 +293,6 @@ pub(crate) fn new_shard_view(shard_id: ShardId) -> (ShardViewWriter, ShardViewRe
     let (write, read) = left_right::new::<ShardView, ShardViewDelta>();
     (
         ShardViewWriter {
-            shard_id,
             write,
             pending: None,
             published: 0,
@@ -619,5 +604,44 @@ mod tests {
             None,
             "installing an endpoint route must not populate a transport slot"
         );
+    }
+
+    /// An abandoned generation must not leave its ops staged. They would
+    /// otherwise be published by whatever generation came next, which is a
+    /// transaction that never happened becoming externally visible.
+    #[test]
+    fn an_aborted_generation_does_not_ride_along_with_the_next_one() {
+        let (mut writer, reader) = new_shard_view(shard());
+
+        writer.stage(
+            1,
+            ViewOp::InstallRoute {
+                route: route(1),
+                binding: RouteBinding {
+                    epoch: 0,
+                    action: action(),
+                },
+            },
+        );
+        writer.abort();
+
+        writer.stage(
+            2,
+            ViewOp::InstallRoute {
+                route: route(2),
+                binding: RouteBinding {
+                    epoch: 0,
+                    action: action(),
+                },
+            },
+        );
+        assert_eq!(writer.publish(), Some(2));
+
+        let guard = reader.enter().expect("published");
+        assert!(
+            guard.routes.resolve(route(1), 0).is_none(),
+            "the abandoned generation's route must not appear"
+        );
+        assert!(guard.routes.resolve(route(2), 0).is_some());
     }
 }

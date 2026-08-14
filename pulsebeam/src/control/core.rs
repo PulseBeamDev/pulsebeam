@@ -234,7 +234,6 @@ impl ControllerCore {
         // Collect track IDs before removing from registry so we can notify all shards.
         let tracks: Vec<_> = room.tracks_published_by(participant_id);
         let track_ids: Vec<_> = tracks.iter().map(|t| t.meta.id).collect();
-        let shard_id = meta.shard_id;
         let room_id = meta.room_id;
 
         if let Some(removed_shard_id) = self.registry.remove_participant(participant_id) {
@@ -243,11 +242,6 @@ impl ControllerCore {
                 ShardCommand::RemoveParticipant(*participant_id),
             );
         }
-        eq.broadcast(|| ShardCommand::UnregisterParticipant {
-            shard_id,
-            room_id,
-            participant_id: *participant_id,
-        });
         if !tracks.is_empty() {
             eq.broadcast(|| ShardCommand::UnpublishTracks {
                 room_id,
@@ -467,47 +461,6 @@ mod tests {
         assert!(eq.pop().is_none());
     }
 
-    #[tokio::test]
-    async fn delete_participant_broadcasts_scoped_unregister() {
-        let mut core = ControllerCore::new();
-        let mut eq = ControllerEventQueue::new(4);
-        let room = room_id(2);
-        let participant = pid(20);
-
-        core.registry
-            .add_participant(participant, room, ShardId::new(6), None);
-        core.delete_participant(&participant, &mut eq);
-
-        let Some(ControllerEvent::ShardCommandSent(
-            shard_id,
-            ShardCommand::RemoveParticipant(removed),
-        )) = eq.pop()
-        else {
-            panic!("expected local shard removal command");
-        };
-        assert_eq!(shard_id, ShardId::new(6));
-        assert_eq!(removed, participant);
-
-        // A broadcast is one targeted command per shard now, so every shard
-        // sees the same unregister.
-        for expected in 0..4 {
-            let Some(ControllerEvent::ShardCommandSent(
-                to,
-                ShardCommand::UnregisterParticipant {
-                    shard_id,
-                    room_id,
-                    participant_id,
-                },
-            )) = eq.pop()
-            else {
-                panic!("expected an unregister for every shard");
-            };
-            assert_eq!(to, ShardId::new(expected));
-            assert_eq!(shard_id, ShardId::new(6));
-            assert_eq!(room_id, room);
-            assert_eq!(participant_id, participant);
-        }
-    }
 
     #[test]
     fn track_published_targets_latest_subscriber_shard_after_move() {

@@ -143,6 +143,19 @@ impl ControllerActor {
         }
     }
 
+    /// Abandon the staged generation on both halves.
+    ///
+    /// The view writer accumulates a generation's ops before publishing, so
+    /// dropping the control-plane transaction without dropping them would
+    /// leave the abandoned ops staged — and the next generation would publish
+    /// them as if they had been part of it.
+    fn abort_transaction(&mut self, shard_id: crate::id::ShardId, now: tokio::time::Instant) {
+        if let Some(view) = self.view_mut(shard_id) {
+            view.abort();
+        }
+        self.state.abort(now);
+    }
+
     fn view_mut(&mut self, shard_id: crate::id::ShardId) -> Option<&mut crate::view::ShardViewWriter> {
         self.views.get_mut(shard_id.index())
     }
@@ -344,7 +357,7 @@ impl ControllerActor {
             Ok(handle) => handle,
             Err(err) => {
                 tracing::warn!(%shard_id, ?err, "endpoint route allocation failed");
-                self.state.abort(now);
+                self.abort_transaction(shard_id, now);
                 return None;
             }
         };
@@ -364,15 +377,15 @@ impl ControllerActor {
             view.publish()
         });
         let Some(published) = published else {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         };
         if !self.await_generation(shard_id, published).await {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         }
         if self.state.commit().is_err() {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         }
         Some(handle)
@@ -400,15 +413,15 @@ impl ControllerActor {
             view.publish()
         });
         let Some(published) = published else {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return;
         };
         if !self.await_generation(shard_id, published).await {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return;
         }
         if self.state.commit().is_err() {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return;
         }
         self.state
@@ -464,28 +477,28 @@ impl ControllerActor {
             }
         }
         let Some(handle) = reserved else {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         };
 
         let Some(participant_key) = self.prepare_transport(shard_id, participant_id, handle).await
         else {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         };
 
         let Some(generation) = self.publish_pending(shard_id, handle, participant_key) else {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         };
 
         if !self.await_generation(shard_id, generation).await {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         }
 
         if self.state.commit().is_err() {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return None;
         }
         Some((handle, participant_key))
@@ -587,11 +600,11 @@ impl ControllerActor {
             view.publish()
         });
         let Some(published) = published else {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return;
         };
         if !self.await_generation(shard_id, published).await {
-            self.state.abort(now);
+            self.abort_transaction(shard_id, now);
             return;
         }
         let _ = self.state.commit();
@@ -665,11 +678,6 @@ impl ControllerActor {
             .registry
             .bind_participant(&cfg.participant_id, binding);
 
-        self.eq.broadcast(|| ShardCommand::RegisterParticipant {
-            shard_id,
-            room_id: cfg.room_id,
-            participant_id: cfg.participant_id,
-        });
         self.eq
             .send(shard_id, ShardCommand::AddParticipant(Box::new(cfg)));
         Ok(answer)

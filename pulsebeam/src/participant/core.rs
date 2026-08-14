@@ -43,16 +43,6 @@ use str0m::rtp::{RtpWrite, Ssrc};
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-struct TrackAvailability {
-    in_topology: bool,
-}
-
-impl TrackAvailability {
-    fn unpublished() -> Self {
-        Self { in_topology: false }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct IncomingRtpRoute {
     mid: Mid,
@@ -183,8 +173,6 @@ pub struct ParticipantCore {
     pub participant_id: entity::ParticipantId,
     last_keyframe_request: HashMap<StreamId, Instant>,
 
-    published_tracks: HashMap<TrackId, Track>,
-    track_availability: HashMap<TrackId, TrackAvailability>,
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
     /// The compiled stream a published channel forwards into, recorded by the
@@ -301,8 +289,6 @@ impl ParticipantCore {
             signaling,
             last_slow_poll: Instant::now(),
             last_keyframe_request: HashMap::new(),
-            published_tracks: HashMap::new(),
-            track_availability: HashMap::new(),
             data_topic_channels: HashMap::new(),
             published_track_fanouts: HashMap::new(),
             data_pub_streams: HashMap::new(),
@@ -1122,34 +1108,29 @@ impl ParticipantCore {
         active: bool,
         events: &mut impl ParticipantSink,
     ) {
-        let Some(track_id) = self.upstream.track_id_for_mid(mid) else {
-            return;
-        };
-
-        let state = self
-            .track_availability
-            .entry(track_id)
-            .or_insert_with(TrackAvailability::unpublished);
-
         if active {
-            if state.in_topology {
+            let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
+                return;
+            };
+            if *in_topology {
                 return;
             }
-
-            if let Some(track) = self.published_tracks.get(&track_id) {
-                let states = self.upstream.layer_states_for(track_id);
-                events.publish_track(track.clone(), states);
-                state.in_topology = true;
-            }
+            let track = descriptor.clone();
+            *in_topology = true;
+            let states = self.upstream.layer_states_for(track.meta.id);
+            events.publish_track(track, states);
             return;
         }
 
-        if !state.in_topology {
+        let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
+            return;
+        };
+        if !*in_topology {
             return;
         }
-
+        let track_id = descriptor.meta.id;
+        *in_topology = false;
         events.unpublish_track(track_id);
-        state.in_topology = false;
     }
 
     fn handle_stream_paused(&mut self, mid: Mid, paused: bool, events: &mut impl ParticipantSink) {
@@ -1175,14 +1156,10 @@ impl ParticipantCore {
                 match media.kind {
                     MediaKind::Audio => {
                         let (tx, track) = track::new_audio(media.mid, track_meta);
-                        let accepted = self.upstream.add_published_track(media.mid, tx);
-                        if !accepted {
+                        if !self.upstream.add_published_track(media.mid, tx, track) {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                             return;
                         }
-                        self.published_tracks.insert(track.meta.id, track.clone());
-                        self.track_availability
-                            .insert(track.meta.id, TrackAvailability::unpublished());
                     }
                     MediaKind::Video => {
                         let (tx, track) = track::new_video(
@@ -1190,14 +1167,10 @@ impl ParticipantCore {
                             track_meta,
                             media.simulcast.map(|s| s.recv).unwrap_or_default(),
                         );
-                        let accepted = self.upstream.add_published_track(media.mid, tx);
-                        if !accepted {
+                        if !self.upstream.add_published_track(media.mid, tx, track) {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                             return;
                         }
-                        self.published_tracks.insert(track.meta.id, track.clone());
-                        self.track_availability
-                            .insert(track.meta.id, TrackAvailability::unpublished());
                     }
                 }
             }

@@ -1,7 +1,6 @@
 use pulsebeam_runtime::net;
 
 use crate::{
-    id::ShardId,
     route::{TransportHandle, TransportRoute},
 };
 
@@ -117,15 +116,6 @@ impl Demuxer {
         Some(addressed)
     }
 
-    /// Whether `shard_id` is the shard `handle`'s route belongs to.
-    ///
-    /// `demux` only resolves a packet to a route; it never decides
-    /// forwarding. The caller uses this to drop (and count) a packet that
-    /// resolved to a route owned by a different shard, rather than acting on
-    /// it directly.
-    pub fn owns(&self, handle: TransportHandle, shard_id: ShardId) -> bool {
-        handle.shard() == shard_id
-    }
 }
 
 impl Default for Demuxer {
@@ -251,19 +241,22 @@ mod demux_tests {
 
     /// A ufrag for another shard resolves rather than being dropped:
     /// resolving a route and deciding whether this shard owns it are
-    /// separate concerns now. Which socket `SO_REUSEPORT` chose says nothing
-    /// about which shard owns the route, so `demux` still decodes it; the
-    /// caller is the one that checks `owns` and decides whether to forward,
-    /// process, or drop.
+    /// separate concerns. Which socket steering chose says nothing about
+    /// which shard owns the route, so `demux` decodes it either way; the
+    /// caller compares `handle.shard()` against its own and drops a
+    /// misdelivery.
     #[test]
-    fn a_ufrag_for_another_shard_still_resolves_but_is_not_owned() {
+    fn a_ufrag_for_another_shard_still_resolves_so_the_caller_can_drop_it() {
         let mut d = Demuxer::new();
         let (ice, handle) = ufrag(4, 2);
         let batch = make_batch(src(1000), stun_with_ufrag(&ice.encode()));
 
         assert_eq!(d.demux(&batch), Some(handle));
-        assert!(!d.owns(handle, ShardId::new(0)));
-        assert!(d.owns(handle, ShardId::new(4)));
+        assert_eq!(
+            handle.shard(),
+            ShardId::new(4),
+            "the route names its owner, which is all the caller needs"
+        );
     }
 
     #[test]

@@ -39,7 +39,6 @@ pub(crate) struct ParticipantMeta {
     /// lifetime by construction, but the route table and the demuxer are
     /// reached separately, so both need the value.
     pub(super) ingress_route: TransportRoute,
-    pub(super) ingress_epoch: u16,
     /// This participant's room, already compiled. Set when it joins, so
     /// nothing on the packet path hashes a `RoomId` to find the fanout it
     /// belongs to.
@@ -131,7 +130,7 @@ impl ParticipantRegistry {
             .pending_ingress
             .remove(&key)
             .unwrap_or(TransportHandle::new(TransportRoute::from_raw(0), 0));
-        let (ingress_route, ingress_epoch) = (handle.route, handle.epoch);
+        let ingress_route = handle.route;
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -151,7 +150,6 @@ impl ParticipantRegistry {
             core,
             queued_dirty: false,
             ingress_route,
-            ingress_epoch,
             // Filled in by `join_room` once the room's arena entry exists,
             // which is a step later than this one.
             room_key: RoomKey::default(),

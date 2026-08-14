@@ -18,19 +18,6 @@ use crate::id::ShardId;
 use crate::route::{
     PackedRoute, RouteError, RouteHandle, RouteId, SlotAllocator, TransportHandle, TransportRoute,
 };
-use crate::shard::participants::ParticipantKey;
-
-/// Identifies one in-flight transaction, so a late acknowledgement for a
-/// transaction that has already been abandoned is recognisable as stale
-/// rather than applied to whatever is in flight now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct TransactionId(u64);
-
-impl std::fmt::Display for TransactionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "tx{}", self.0)
-    }
-}
 
 /// One shard's slot namespace for one route family.
 ///
@@ -86,43 +73,22 @@ pub(crate) struct RouteReservation {
     pub slot: u32,
 }
 
-/// A runtime binding an owning shard reported having prepared.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PreparedBinding {
-    pub transaction: TransactionId,
-    pub shard_id: ShardId,
-    pub participant: ParticipantKey,
-}
 
 #[derive(Debug)]
 pub(crate) struct LifecycleTransaction {
-    pub id: TransactionId,
     pub generation: u64,
     pub reservations: Vec<RouteReservation>,
-    pub prepared: Vec<PreparedBinding>,
-    affected: Vec<ShardId>,
 }
 
 impl LifecycleTransaction {
-    fn new(id: TransactionId, generation: u64) -> Self {
+    fn new(generation: u64) -> Self {
         Self {
-            id,
             generation,
             reservations: Vec::new(),
-            prepared: Vec::new(),
-            affected: Vec::new(),
         }
     }
 
-    pub fn affected(&self) -> &[ShardId] {
-        &self.affected
-    }
 
-    fn touch(&mut self, shard: ShardId) {
-        if !self.affected.contains(&shard) {
-            self.affected.push(shard);
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,7 +112,6 @@ pub(crate) struct ControlPlaneState {
     pub transport: PerShardAllocator,
     pub endpoint: PerShardAllocator,
     generation: u64,
-    next_transaction: u64,
 }
 
 impl ControlPlaneState {
@@ -156,13 +121,9 @@ impl ControlPlaneState {
             transport: PerShardAllocator::new(shard_count),
             endpoint: PerShardAllocator::new(shard_count),
             generation: 0,
-            next_transaction: 0,
         }
     }
 
-    pub fn committed_generation(&self) -> u64 {
-        self.generation
-    }
 
     pub fn pending(&self) -> Option<&LifecycleTransaction> {
         self.pending.as_ref()
@@ -171,15 +132,13 @@ impl ControlPlaneState {
     /// Open the next generation. One at a time: the control plane is a single
     /// actor, and a second concurrent staging would make "generation N+1" a
     /// lie.
-    pub fn begin(&mut self) -> Result<TransactionId, TransactionError> {
+    pub fn begin(&mut self) -> Result<(), TransactionError> {
         if self.pending.is_some() {
             return Err(TransactionError::Busy);
         }
-        let id = TransactionId(self.next_transaction);
-        self.next_transaction = self.next_transaction.saturating_add(1);
         let generation = self.generation.saturating_add(1);
-        self.pending = Some(LifecycleTransaction::new(id, generation));
-        Ok(id)
+        self.pending = Some(LifecycleTransaction::new(generation));
+        Ok(())
     }
 
     fn tx_mut(&mut self) -> Result<&mut LifecycleTransaction, TransactionError> {
@@ -208,7 +167,6 @@ impl ControlPlaneState {
         );
         let tx = self.tx_mut()?;
         tx.reservations.push(RouteReservation { shard_id, slot });
-        tx.touch(shard_id);
         Ok(handle)
     }
 
@@ -226,7 +184,6 @@ impl ControlPlaneState {
         let handle = RouteHandle::new(RouteId::new(shard_id, slot), epoch);
         let tx = self.tx_mut()?;
         tx.reservations.push(RouteReservation { shard_id, slot });
-        tx.touch(shard_id);
         Ok(handle)
     }
 
@@ -330,17 +287,4 @@ mod tests {
         assert_eq!(state.begin(), Err(TransactionError::Busy));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_transaction_records_every_shard_it_touches() {
-        let mut state = ControlPlaneState::new(4);
-        state.begin().unwrap();
-        state.reserve_transport(ShardId::new(2), Instant::now()).unwrap();
-        state.reserve_transport(ShardId::new(2), Instant::now()).unwrap();
-        state.reserve_transport(ShardId::new(3), Instant::now()).unwrap();
-
-        let affected = state.pending().map(LifecycleTransaction::affected).unwrap();
-        assert_eq!(affected.len(), 2, "two distinct shards, however many routes");
-        assert!(affected.contains(&ShardId::new(2)));
-        assert!(affected.contains(&ShardId::new(3)));
-    }
 }

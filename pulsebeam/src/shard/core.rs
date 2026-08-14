@@ -24,7 +24,6 @@ use crate::{
 };
 use str0m::media::Rid;
 
-use super::control::ParticipantShardMeta;
 use super::router::{self, Origin, RoutingContext, ShardRoutingTable};
 
 pub(crate) use super::router::ShardTransport;
@@ -323,10 +322,6 @@ impl ShardCore {
             }
             (RouteAction::Audio { room, track }, MediaPayload::Audio(mut pkt)) => {
                 self.restamp(&mut pkt, playout, now);
-                let Some(room_id) = self.routing.room_id_of(room) else {
-                    debug_assert!(false, "an audio route's room key must resolve to a room");
-                    return;
-                };
                 let Some((track_id, _)) = self.routing.track_descriptor(track) else {
                     debug_assert!(false, "an audio route's track key must resolve to a track");
                     return;
@@ -524,7 +519,7 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn flush_participant_events(&mut self, now: Instant, router: &impl ShardTransport) {
+    pub(crate) fn flush_participant_events(&mut self, router: &impl ShardTransport) {
         while let Some(event) = self.pipeline.pop_participant_event() {
             match event {
                 ParticipantEvent::Topology(ev) => {
@@ -532,12 +527,12 @@ impl ShardCore {
                         ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
                             self.registry.key_of(&subscriber).and_then(|handle| {
                                 self.routing
-                                    .register_subscriber(handle, track, now, &self.wall)
+                                    .register_subscriber(handle, track)
                             })
                         }
                         ParticipantTopologyEvent::TrackUnsubscribed { track, subscriber } => {
                             self.registry.key_of(&subscriber).and_then(|handle| {
-                                self.routing.unregister_subscriber(handle, track, now)
+                                self.routing.unregister_subscriber(handle, track)
                             })
                         }
                     };
@@ -548,7 +543,7 @@ impl ShardCore {
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
                     participant_id,
                 }) => {
-                    self.remove_participant(&participant_id, now);
+                    self.remove_participant(&participant_id);
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
@@ -595,8 +590,6 @@ impl ShardCore {
                                     handle,
                                     topic.clone(),
                                     publisher,
-                                    now,
-                                    &self.wall,
                                 )
                             }) {
                                 self.pipeline.push_shard_event(ev);
@@ -611,7 +604,7 @@ impl ShardCore {
                             let unsubscribed =
                                 self.registry.key_of(&subscriber).is_some_and(|handle| {
                                     self.routing.unregister_data_subscriber(
-                                        room_id, handle, &topic, publisher, now,
+                                        room_id, handle, &topic, publisher,
                                     )
                                 });
                             if unsubscribed {
@@ -649,9 +642,8 @@ impl ShardCore {
                             publisher,
                             topic,
                         } => {
-                            self.routing.unregister_reliable_data_publisher(
-                                room_id, publisher, &topic, now,
-                            );
+                            self.routing
+                                .unregister_reliable_data_publisher(room_id, publisher, &topic);
                         }
                         ParticipantControlEvent::ReliableDataTopicSubscribed {
                             room_id,
@@ -672,9 +664,8 @@ impl ShardCore {
                         } => {
                             let unsubscribed =
                                 self.registry.key_of(&subscriber).is_some_and(|handle| {
-                                    self.routing.unregister_reliable_data_subscriber(
-                                        room_id, handle, &topic, now,
-                                    )
+                                    self.routing
+                                        .unregister_reliable_data_subscriber(room_id, handle, &topic)
                                 });
                             if unsubscribed {
                                 self.pipeline.push_shard_event(ShardEvent::Relay(
@@ -784,7 +775,7 @@ impl ShardCore {
                             if let ParticipantControlEvent::TrackUnpublished { track_id, .. } = &ev
                             {
                                 self.routing.unpublish_local_track(track_id);
-                                self.routing.close_track_reverse_route(track_id, now);
+                                self.routing.close_track_reverse_route(track_id);
                             }
                             router::route_participant_control_event(
                                 ev,
@@ -857,13 +848,12 @@ impl ShardCore {
     pub(crate) fn on_command(
         &mut self,
         cmd: ShardCommand,
-        now: Instant,
         router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
-            ShardCommand::AddParticipant(cfg) => self.add_participant(*cfg, now, router),
+            ShardCommand::AddParticipant(cfg) => self.add_participant(*cfg, router),
             ShardCommand::RemoveParticipant(participant_id) => {
-                self.remove_participant(&participant_id, now);
+                self.remove_participant(&participant_id);
             }
             ShardCommand::AddTcpConnection { .. } => {
                 // Handled by the shard worker directly; no core action needed.
@@ -884,7 +874,7 @@ impl ShardCore {
             ShardCommand::CancelReservation { participant_id } => {
                 self.cancel_reservation(&participant_id);
             }
-            cmd => self.on_control_command(cmd, now, router)?,
+            cmd => self.on_control_command(cmd, router)?,
         }
         Some(())
     }
@@ -959,7 +949,6 @@ impl ShardCore {
     fn on_control_command(
         &mut self,
         cmd: ShardCommand,
-        now: Instant,
         router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
@@ -972,34 +961,6 @@ impl ShardCore {
             | ShardCommand::CancelReservation { .. } => pulsebeam_runtime::fatal!(
                 "a command handled by the outer match reached the inner one; the two have drifted apart"
             ),
-            ShardCommand::RegisterParticipant {
-                shard_id,
-                room_id,
-                participant_id,
-            } => {
-                if shard_id != self.shard_id {
-                    self.routing.register_remote_participant(
-                        participant_id,
-                        room_id,
-                        shard_id,
-                        &mut self.rng,
-                    );
-                }
-            }
-            ShardCommand::UnregisterParticipant {
-                shard_id,
-                room_id,
-                participant_id,
-            } => {
-                // Only the owning shard's demux entries are keyed by this
-                // participant's route, and only that shard can retire them —
-                // a shard the kernel misrouted a packet to caches by route,
-                // not by name, and ages out on its own bounded cap.
-                self.routing.unregister_remote_participant(
-                    participant_id,
-                    ParticipantShardMeta { shard_id, room_id },
-                );
-            }
             ShardCommand::PublishTrack(track, room_id) => {
                 let publisher_key = self.registry.key_of(&track.meta.origin);
                 let mut ctx = DispatchCtx {
@@ -1014,8 +975,6 @@ impl ShardCore {
                     track,
                     room_id,
                     publisher_key,
-                    now,
-                    &self.wall,
                     &mut ctx,
                 ) {
                     self.pipeline.push_shard_event(ev);
@@ -1033,12 +992,12 @@ impl ShardCore {
                     wall: &self.wall,
                 };
                 self.routing
-                    .unpublish_tracks(room_id, &track_ids, now, &mut ctx);
+                    .unpublish_tracks(room_id, &track_ids, &mut ctx);
             }
             ShardCommand::Relay {
                 from_shard_id,
                 topology,
-            } => self.on_topology(from_shard_id, topology, now)?,
+            } => self.on_topology(from_shard_id, topology)?,
         }
         Some(())
     }
@@ -1051,7 +1010,6 @@ impl ShardCore {
         &mut self,
         from_shard_id: ShardId,
         topology: Topology,
-        now: Instant,
     ) -> Option<()> {
         match topology {
             Topology::TrackSubscribed {
@@ -1148,7 +1106,7 @@ impl ShardCore {
                     .learn_topic_reverse_target(room_id, publisher, &topic, reverse);
                 if let Some(ev) = self
                     .routing
-                    .on_remote_reliable_publisher(room_id, publisher, &topic, now, &self.wall)
+                    .on_remote_reliable_publisher(room_id, publisher, &topic,)
                 {
                     self.pipeline.push_shard_event(ev);
                 }
@@ -1160,7 +1118,7 @@ impl ShardCore {
             } => {
                 if let Some(ev) = self
                     .routing
-                    .on_remote_data_publisher(room_id, publisher, &topic, now, &self.wall)
+                    .on_remote_data_publisher(room_id, publisher, &topic,)
                 {
                     self.pipeline.push_shard_event(ev);
                 }
@@ -1295,7 +1253,6 @@ impl ShardCore {
     fn add_participant(
         &mut self,
         cfg: ParticipantConfig,
-        now: Instant,
         router: &impl ShardTransport,
     ) {
         let room_id = cfg.room_id;
@@ -1314,7 +1271,7 @@ impl ShardCore {
                 key
             }
             Some(_) => {
-                self.remove_participant(&participant_id, now);
+                self.remove_participant(&participant_id);
                 self.registry.insert(cfg, &mut self.rng)
             }
             None => self.registry.insert(cfg, &mut self.rng),
@@ -1335,21 +1292,19 @@ impl ShardCore {
             room_id,
             &known_tracks,
             &|id| registry.contains(id),
-            now,
-            &self.wall,
         );
         for ev in events {
             self.pipeline.push_shard_event(ev);
         }
     }
 
-    fn remove_participant(&mut self, participant_id: &ParticipantId, now: Instant) -> Option<()> {
+    fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<()> {
         let key = self.registry.key_of(participant_id)?;
         self.timers.cancel(key);
         let meta = self.registry.remove(participant_id)?;
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
-            .remove_local_member(participant_id, key, meta.room_id, audio_ids, now);
+            .remove_local_member(participant_id, key, meta.room_id, audio_ids);
         Some(())
     }
 }
@@ -1439,7 +1394,6 @@ mod test {
     ) {
         core.on_command(
             ShardCommand::AddParticipant(Box::new(make_participant_cfg(participant_id, room_id))),
-            now(),
             router,
         );
         router.take_sent();
@@ -1552,7 +1506,6 @@ mod test {
         let mut core2 = new_core();
         core2.on_command(
             ShardCommand::AddParticipant(Box::new(make_participant_cfg(p, r))),
-            now(),
             &router,
         );
         let key = core2.registry.key_of(&p).unwrap();
@@ -1578,10 +1531,11 @@ mod test {
         let key = core.registry.key_of(&p).expect("participant is present");
         let meta = core.registry.resolve_mut(key).expect("participant resolves");
         let room_key = meta.room_key;
-        assert_eq!(
-            core.routing.room_id_of(room_key),
-            Some(r),
-            "the participant's compiled room key must resolve back to the room it joined"
+        assert!(
+            core.routing
+                .room_members(room_key)
+                .is_some_and(|members| members.contains(&key)),
+            "the participant's compiled room key must resolve to the fanout it is a member of"
         );
     }
 
@@ -1593,7 +1547,7 @@ mod test {
         let r = room_id("leave1");
 
         add_participant(&mut core, &router, p, r);
-        core.on_command(ShardCommand::RemoveParticipant(p), now(), &router);
+        core.on_command(ShardCommand::RemoveParticipant(p), &router);
 
         assert!(
             !core.registry.contains(&p),
@@ -1619,12 +1573,10 @@ mod test {
 
         core.on_command(
             ShardCommand::AddParticipant(Box::new(make_participant_cfg(participant, room))),
-            now(),
             &router,
         );
         core.on_command(
             ShardCommand::AddParticipant(Box::new(make_participant_cfg(participant, room))),
-            now(),
             &router,
         );
 
@@ -1644,97 +1596,7 @@ mod test {
         assert!(core.registry.resolve_mut(current).is_some());
     }
 
-    #[test]
-    fn duplicate_register_participant_command_does_not_leak_remote_shard() {
-        let router = TestRouter::new();
-        let mut core = new_core();
-        let participant = pid();
-        let rid = room_id("no-leak");
-        let remote_shard = ShardId::new(1);
 
-        let register = || ShardCommand::RegisterParticipant {
-            shard_id: remote_shard,
-            room_id: rid,
-            participant_id: participant,
-        };
-
-        // Simulate a redelivered/duplicate RegisterParticipant for the exact
-        // same (participant, shard, room).
-        core.on_command(register(), now(), &router);
-        core.on_command(register(), now(), &router);
-
-        core.on_command(
-            ShardCommand::UnregisterParticipant {
-                shard_id: remote_shard,
-                room_id: rid,
-                participant_id: participant,
-            },
-            now(),
-            &router,
-        );
-
-        assert!(
-            !core.routing.has_room(&rid),
-            "one register (deduplicated) + one unregister must fully release the room; \
-         a leaked refcount would leave a phantom remote_shards entry forever"
-        );
-    }
-
-    #[test]
-    fn register_remote_participant_keeps_shard_until_last_peer_leaves() {
-        let router = TestRouter::new();
-        let mut core = new_core();
-        let a = pid();
-        let b = pid();
-        let rid = room_id("keep-shard");
-        let remote_shard = ShardId::new(1);
-
-        for participant in [a, b] {
-            core.on_command(
-                ShardCommand::RegisterParticipant {
-                    shard_id: remote_shard,
-                    room_id: rid,
-                    participant_id: participant,
-                },
-                now(),
-                &router,
-            );
-        }
-
-        core.on_command(
-            ShardCommand::UnregisterParticipant {
-                shard_id: remote_shard,
-                room_id: rid,
-                participant_id: a,
-            },
-            now(),
-            &router,
-        );
-
-        assert!(
-            core.routing
-                .room(&rid)
-                .unwrap()
-                .remote_shards
-                .contains(&remote_shard),
-            "shard must stay registered while participant b is still remote there"
-        );
-
-        core.on_command(
-            ShardCommand::UnregisterParticipant {
-                shard_id: remote_shard,
-                room_id: rid,
-                participant_id: b,
-            },
-            now(),
-            &router,
-        );
-
-        assert!(
-            !core.routing.has_room(&rid),
-            "room must be removed once the final remote leaves"
-        );
-    }
 
     #[test]
     fn keyframe_request_from_a_peer_shard_marks_participant_dirty() {
@@ -1802,7 +1664,6 @@ mod test {
                     epoch: 0,
                 },
             },
-            now(),
             &router,
         );
         assert!(
@@ -1811,12 +1672,8 @@ mod test {
         );
         clear_dirty(&mut core);
         let subscriber_key = core.registry.key_of(&subscriber).unwrap();
-        core.routing.register_subscriber(
-            subscriber_key,
-            video_track(publisher, 1),
-            tokio::time::Instant::now(),
-            &WallAnchor::new(std::time::SystemTime::now(), Instant::now()),
-        );
+        core.routing
+            .register_subscriber(subscriber_key, video_track(publisher, 1));
         let announced = settle_routes(&mut core, &mut writer, &mut next_slot, &mut generation);
         let Some(ShardEvent::Relay(Topology::TrackSubscribed { route, epoch, .. })) =
             announced.into_iter().next()
@@ -1901,7 +1758,7 @@ mod test {
         core.fire_timers(tokio::time::Instant::now());
         assert!(!core.dirty.contains(core.registry.key_of(&p).unwrap()));
 
-        core.on_command(ShardCommand::RemoveParticipant(p), now(), &router);
+        core.on_command(ShardCommand::RemoveParticipant(p), &router);
         assert!(!core.registry.contains(&p));
     }
 }

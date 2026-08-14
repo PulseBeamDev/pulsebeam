@@ -24,7 +24,6 @@ use tokio::time::{Duration, Instant};
 use crate::clock::{NtpExpander, NtpTime};
 use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::id::ShardId;
-use crate::shard::participants::ParticipantKey;
 use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
 use crate::track::Topic;
 
@@ -650,15 +649,7 @@ impl SlotAllocator {
         }
     }
 
-    pub(crate) fn shard_id(&self) -> ShardId {
-        self.shard_id
-    }
 
-    /// The slot high-water mark — a fresh allocation returns exactly this, so
-    /// the caller knows to grow its storage by one rather than overwrite.
-    pub(crate) fn high_water(&self) -> usize {
-        self.epochs.len()
-    }
 
     /// `Ok((slot, epoch))`. A `slot` equal to the pre-call [`Self::high_water`]
     /// is fresh and the caller must push one entry; anything lower is a
@@ -739,14 +730,12 @@ pub(crate) struct RouteRuntime {
 /// allocates.
 const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
 
+/// The only way allocation fails now that resolution belongs to the view: a
+/// stale or out-of-range address is the view's `None`, not an error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
     /// No slot is out of quarantine and the allocator is at its cap.
     Exhausted { max_slots: u32 },
-    /// The envelope named a slot that is free, or an incarnation that is gone.
-    Stale { route: RouteId, epoch: u16 },
-    /// The envelope named a slot past the end of the table.
-    OutOfRange { route: RouteId },
 }
 
 impl RouteRuntime {
@@ -802,6 +791,7 @@ impl RouteRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn entry(&self, handle: RouteHandle) -> Option<&RouteRuntimeEntry> {
         match self.slots.get(handle.route.index()) {
             Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
@@ -809,6 +799,7 @@ impl RouteRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn shard_id(&self) -> ShardId {
         self.shard_id
     }
@@ -844,59 +835,47 @@ pub enum ImportEffect {
     },
 }
 
+/// One imported stream's route lifecycle, stored on the arena entry it
+/// describes.
+///
+/// It used to be a `HashMap<name, _>` per lane — three of them — sitting
+/// beside the arenas. That meant a second subscriber count next to the
+/// fanout's own subscriber set, and a name hash to reach state belonging to an
+/// object the caller already had by key. Absent is `None`, so the state
+/// machine still cannot leak empty rows.
+#[derive(Debug, Default)]
+pub(crate) struct ImportSlot(Option<Import>);
+
 #[derive(Debug)]
 struct Import {
     state: ImportState,
     subscribers: usize,
 }
 
-/// Tracks [`ImportState`] per imported stream.
-///
-/// Absent is represented by the absence of an entry, so the state machine
-/// cannot leak empty rows.
-#[derive(Debug)]
-pub struct ImportTable<K> {
-    entries: ahash::HashMap<K, Import>,
-}
-
-impl<K> Default for ImportTable<K> {
-    fn default() -> Self {
-        Self {
-            entries: ahash::HashMap::default(),
-        }
-    }
-}
-
-impl<K: std::hash::Hash + Eq> ImportTable<K> {
-    pub fn new() -> Self {
-        Self::default()
+impl ImportSlot {
+    pub fn state(&self) -> Option<ImportState> {
+        self.0.as_ref().map(|i| i.state)
     }
 
-    pub fn state(&self, key: &K) -> Option<ImportState> {
-        self.entries.get(key).map(|i| i.state)
-    }
-
-    pub fn subscribers(&self, key: &K) -> usize {
-        self.entries.get(key).map_or(0, |i| i.subscribers)
+    #[cfg(test)]
+    pub fn subscribers(&self) -> usize {
+        self.0.as_ref().map_or(0, |i| i.subscribers)
     }
 
     /// Returns [`ImportEffect::Install`] only for the first subscriber. Later
     /// subscribers attach to the pending or active import and produce no
     /// cluster traffic.
-    pub fn subscribe(&mut self, key: K) -> ImportEffect {
-        match self.entries.get_mut(&key) {
+    pub fn subscribe(&mut self) -> ImportEffect {
+        match &mut self.0 {
             Some(import) => {
                 import.subscribers = import.subscribers.saturating_add(1);
                 ImportEffect::None
             }
             None => {
-                self.entries.insert(
-                    key,
-                    Import {
-                        state: ImportState::Installing,
-                        subscribers: 1,
-                    },
-                );
+                self.0 = Some(Import {
+                    state: ImportState::Installing,
+                    subscribers: 1,
+                });
                 ImportEffect::Install
             }
         }
@@ -907,8 +886,8 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
     /// If every subscriber left while the install was in flight, the route is
     /// retired immediately rather than cancelled — a cancel would have to race
     /// the acknowledgement, which is unwinnable once a network is involved.
-    pub fn on_installed(&mut self, key: &K, route: RouteId, epoch: u16) -> ImportEffect {
-        let Some(import) = self.entries.get_mut(key) else {
+    pub fn on_installed(&mut self, route: RouteId, epoch: u16) -> ImportEffect {
+        let Some(import) = &mut self.0 else {
             // Retirement already completed; nothing references this route.
             return ImportEffect::Retire { route, epoch };
         };
@@ -926,9 +905,10 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
     }
 
     /// Returns [`ImportEffect::Retire`] only when the last subscriber leaves an
-    /// active import. Leaving during `Installing` defers to [`Self::on_installed`].
-    pub fn unsubscribe(&mut self, key: &K) -> ImportEffect {
-        let Some(import) = self.entries.get_mut(key) else {
+    /// active import. Leaving during `Installing` defers to
+    /// [`Self::on_installed`].
+    pub fn unsubscribe(&mut self) -> ImportEffect {
+        let Some(import) = &mut self.0 else {
             return ImportEffect::None;
         };
         import.subscribers = import.subscribers.saturating_sub(1);
@@ -949,14 +929,12 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
     /// [`Self::subscribe`] moves to `Installing` before the caller has a route,
     /// which means a failed install would otherwise leave an entry no later
     /// subscribe can advance and no unsubscribe can clear — the stream becomes
-    /// permanently undeliverable on this shard. Cross-node an install is a
-    /// request to a peer and failing is ordinary, so this is the normal path,
-    /// not an exceptional one.
+    /// permanently undeliverable on this shard.
     ///
     /// Only legal while `Installing`: once a route exists, retirement is the
     /// way back, and cancelling would leak it.
-    pub fn cancel_install(&mut self, key: &K) {
-        let Some(import) = self.entries.get(key) else {
+    pub fn cancel_install(&mut self) {
+        let Some(import) = &self.0 else {
             return;
         };
         debug_assert_eq!(
@@ -965,24 +943,25 @@ impl<K: std::hash::Hash + Eq> ImportTable<K> {
             "cancel_install on an import that already has a route"
         );
         if matches!(import.state, ImportState::Installing) {
-            self.entries.remove(key);
+            self.0 = None;
         }
     }
 
     /// Retirement completed. A subscriber that arrived while it was in flight
     /// reinstalls rather than resurrecting the retired route.
-    pub fn on_retired(&mut self, key: &K) -> ImportEffect {
-        let Some(import) = self.entries.get_mut(key) else {
+    pub fn on_retired(&mut self) -> ImportEffect {
+        let Some(import) = &mut self.0 else {
             return ImportEffect::None;
         };
         if import.subscribers > 0 {
             import.state = ImportState::Installing;
             return ImportEffect::Install;
         }
-        self.entries.remove(key);
+        self.0 = None;
         ImportEffect::None
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1001,12 +980,6 @@ mod tests {
         }
     }
 
-    fn action() -> RouteAction {
-        RouteAction::Audio {
-            room: RoomKey::default(),
-            track: LocalTrackKey::default(),
-        }
-    }
 
     fn envelope(route: RouteId, epoch: u16) -> MediaEnvelope {
         MediaEnvelope {
@@ -1302,38 +1275,37 @@ mod tests {
 
     #[test]
     fn churn_before_the_install_ack_installs_exactly_once() {
-        let mut imports = ImportTable::new();
-        let key = "trk";
+        let mut imports = ImportSlot::default();
         let mut installs = 0;
         let mut retires = 0;
 
-        if imports.subscribe(key) == ImportEffect::Install {
+        if imports.subscribe() == ImportEffect::Install {
             installs += 1;
         }
-        if imports.subscribe(key) == ImportEffect::Install {
+        if imports.subscribe() == ImportEffect::Install {
             installs += 1;
         }
-        assert_eq!(imports.state(&key), Some(ImportState::Installing));
+        assert_eq!(imports.state(), Some(ImportState::Installing));
 
-        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+        assert_eq!(imports.unsubscribe(), ImportEffect::None);
         assert_eq!(
-            imports.subscribers(&key),
+            imports.subscribers(),
             1,
             "one subscriber remains; the import stays pending"
         );
 
         let (route, epoch) = (RouteId::from_raw(0), 0);
-        assert_eq!(imports.on_installed(&key, route, epoch), ImportEffect::None);
+        assert_eq!(imports.on_installed(route, epoch), ImportEffect::None);
         assert_eq!(
-            imports.state(&key),
+            imports.state(),
             Some(ImportState::Active { route, epoch })
         );
 
-        if let ImportEffect::Retire { .. } = imports.unsubscribe(&key) {
+        if let ImportEffect::Retire { .. } = imports.unsubscribe() {
             retires += 1;
         }
-        assert_eq!(imports.on_retired(&key), ImportEffect::None);
-        assert_eq!(imports.state(&key), None);
+        assert_eq!(imports.on_retired(), ImportEffect::None);
+        assert_eq!(imports.state(), None);
 
         assert_eq!(installs, 1, "exactly one route installation");
         assert_eq!(retires, 1);
@@ -1341,19 +1313,18 @@ mod tests {
 
     #[test]
     fn losing_every_subscriber_mid_install_finishes_then_retires() {
-        let mut imports = ImportTable::new();
-        let key = "trk";
-        assert_eq!(imports.subscribe(key), ImportEffect::Install);
-        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+        let mut imports = ImportSlot::default();
+        assert_eq!(imports.subscribe(), ImportEffect::Install);
+        assert_eq!(imports.unsubscribe(), ImportEffect::None);
 
         let (route, epoch) = (RouteId::from_raw(3), 9);
         assert_eq!(
-            imports.on_installed(&key, route, epoch),
+            imports.on_installed(route, epoch),
             ImportEffect::Retire { route, epoch },
             "the install completes, then retires immediately"
         );
-        assert_eq!(imports.on_retired(&key), ImportEffect::None);
-        assert_eq!(imports.state(&key), None);
+        assert_eq!(imports.on_retired(), ImportEffect::None);
+        assert_eq!(imports.state(), None);
     }
 
     /// A failed install must leave no trace, or the stream is undeliverable on
@@ -1361,23 +1332,22 @@ mod tests {
     /// unsubscribes, so nothing would ever retry.
     #[test]
     fn an_install_that_failed_can_be_attempted_again() {
-        let mut imports = ImportTable::new();
-        let key = "trk";
-        assert_eq!(imports.subscribe(key), ImportEffect::Install);
+        let mut imports = ImportSlot::default();
+        assert_eq!(imports.subscribe(), ImportEffect::Install);
 
-        imports.cancel_install(&key);
-        assert_eq!(imports.state(&key), None, "back to Absent");
-        assert_eq!(imports.subscribers(&key), 0);
+        imports.cancel_install();
+        assert_eq!(imports.state(), None, "back to Absent");
+        assert_eq!(imports.subscribers(), 0);
 
         assert_eq!(
-            imports.subscribe(key),
+            imports.subscribe(),
             ImportEffect::Install,
             "the next subscriber drives a fresh install"
         );
         let (route, epoch) = (RouteId::from_raw(7), 2);
-        assert_eq!(imports.on_installed(&key, route, epoch), ImportEffect::None);
+        assert_eq!(imports.on_installed(route, epoch), ImportEffect::None);
         assert_eq!(
-            imports.state(&key),
+            imports.state(),
             Some(ImportState::Active { route, epoch })
         );
     }
@@ -1386,19 +1356,18 @@ mod tests {
     /// that would otherwise silently absorb every later attempt.
     #[test]
     fn an_import_wedged_in_installing_absorbs_everything() {
-        let mut imports = ImportTable::new();
-        let key = "trk";
-        imports.subscribe(key);
+        let mut imports = ImportSlot::default();
+        imports.subscribe();
 
         assert_eq!(
-            imports.subscribe(key),
+            imports.subscribe(),
             ImportEffect::None,
             "a later subscriber attaches to the pending install"
         );
-        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
-        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+        assert_eq!(imports.unsubscribe(), ImportEffect::None);
+        assert_eq!(imports.unsubscribe(), ImportEffect::None);
         assert_eq!(
-            imports.state(&key),
+            imports.state(),
             Some(ImportState::Installing),
             "no unsubscribe can clear an import that never installed"
         );
@@ -1406,18 +1375,17 @@ mod tests {
 
     #[test]
     fn local_churn_with_a_subscriber_remaining_touches_no_route() {
-        let mut imports = ImportTable::new();
-        let key = "trk";
-        imports.subscribe(key);
+        let mut imports = ImportSlot::default();
+        imports.subscribe();
         let (route, epoch) = (RouteId::from_raw(1), 0);
-        imports.on_installed(&key, route, epoch);
+        imports.on_installed(route, epoch);
 
         for _ in 0..100 {
-            assert_eq!(imports.subscribe(key), ImportEffect::None);
-            assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
+            assert_eq!(imports.subscribe(), ImportEffect::None);
+            assert_eq!(imports.unsubscribe(), ImportEffect::None);
         }
         assert_eq!(
-            imports.state(&key),
+            imports.state(),
             Some(ImportState::Active { route, epoch }),
             "the cluster route is untouched by local churn"
         );
@@ -1425,38 +1393,36 @@ mod tests {
 
     #[test]
     fn subscribing_during_retirement_reinstalls() {
-        let mut imports = ImportTable::new();
-        let key = "trk";
-        imports.subscribe(key);
+        let mut imports = ImportSlot::default();
+        imports.subscribe();
         let (route, epoch) = (RouteId::from_raw(1), 0);
-        imports.on_installed(&key, route, epoch);
+        imports.on_installed(route, epoch);
         assert_eq!(
-            imports.unsubscribe(&key),
+            imports.unsubscribe(),
             ImportEffect::Retire { route, epoch }
         );
 
-        assert_eq!(imports.subscribe(key), ImportEffect::None);
+        assert_eq!(imports.subscribe(), ImportEffect::None);
         assert_eq!(
-            imports.on_retired(&key),
+            imports.on_retired(),
             ImportEffect::Install,
             "the late subscriber gets a fresh route, not the retired one"
         );
-        assert_eq!(imports.state(&key), Some(ImportState::Installing));
+        assert_eq!(imports.state(), Some(ImportState::Installing));
     }
 
     #[test]
     fn unsubscribe_and_retire_are_idempotent() {
-        let mut imports = ImportTable::new();
-        let key = "trk";
-        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
-        assert_eq!(imports.on_retired(&key), ImportEffect::None);
+        let mut imports = ImportSlot::default();
+        assert_eq!(imports.unsubscribe(), ImportEffect::None);
+        assert_eq!(imports.on_retired(), ImportEffect::None);
 
-        imports.subscribe(key);
-        imports.on_installed(&key, RouteId::from_raw(0), 0);
-        imports.unsubscribe(&key);
-        imports.on_retired(&key);
-        assert_eq!(imports.unsubscribe(&key), ImportEffect::None);
-        assert_eq!(imports.on_retired(&key), ImportEffect::None);
+        imports.subscribe();
+        imports.on_installed(RouteId::from_raw(0), 0);
+        imports.unsubscribe();
+        imports.on_retired();
+        assert_eq!(imports.unsubscribe(), ImportEffect::None);
+        assert_eq!(imports.on_retired(), ImportEffect::None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1545,15 +1511,6 @@ mod tests {
             "they must at least be distinguishable in a log line"
         );
     }
-
-    // ── Phase 1: the transport table ─────────────────────────────────────
-
-    fn participant(n: u32) -> ParticipantKey {
-        use slotmap::KeyData;
-        ParticipantKey::from(KeyData::from_ffi(u64::from(n) | (1 << 32)))
-    }
-
-
 
 
     /// A retired slot is quarantined by its *slot* number. Storing the packed

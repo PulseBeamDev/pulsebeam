@@ -18,6 +18,13 @@ struct UpstreamSlot {
     track: UpstreamTrack,
     /// What was last handed to the shard, so only changes are published.
     last_published_stats: crate::track::TrackStates,
+    /// The descriptor the control plane distributes for this track, and
+    /// whether it is currently announced. Both used to live in maps keyed by
+    /// `TrackId` on the participant, which meant resolving a `mid` to a slot
+    /// and then hashing that slot's own track id twice to reach data the slot
+    /// already had.
+    descriptor: crate::track::Track,
+    in_topology: bool,
 }
 
 impl PartialEq for UpstreamSlot {
@@ -42,7 +49,12 @@ impl UpstreamAllocator {
     }
 
     /// Adds a new locally published track that will receive RTP packets.
-    pub fn add_published_track(&mut self, mid: Mid, track: UpstreamTrack) -> bool {
+    pub fn add_published_track(
+        &mut self,
+        mid: Mid,
+        track: UpstreamTrack,
+        descriptor: crate::track::Track,
+    ) -> bool {
         if self.published_tracks.iter().any(|s| s.mid == mid) {
             plog_warn!(self.ctx, "duplicated slot mid={}.", mid);
             return false;
@@ -84,6 +96,8 @@ impl UpstreamAllocator {
             mid,
             track,
             last_published_stats: Vec::new(),
+            descriptor,
+            in_topology: false,
         };
         self.published_tracks.push(slot);
         true
@@ -127,6 +141,17 @@ impl UpstreamAllocator {
             .find(|t| t.track.meta.id == track_id)
             .map(|t| t.track.layer_states())
             .unwrap_or_default()
+    }
+
+    /// The descriptor and announced state for the track on `mid`, plus a way
+    /// to flip that state — the whole of what the two per-participant maps
+    /// used to hold.
+    pub fn announce_state_mut(
+        &mut self,
+        mid: Mid,
+    ) -> Option<(&crate::track::Track, &mut bool)> {
+        let slot = self.published_tracks.iter_mut().find(|s| s.mid == mid)?;
+        Some((&slot.descriptor, &mut slot.in_topology))
     }
 
     pub fn track_id_for_mid(&self, mid: Mid) -> Option<TrackId> {
