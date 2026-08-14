@@ -27,10 +27,15 @@ impl BoundUdpSocket {
     }
 }
 
+/// `shard_index` is unused here: a real kernel `SO_REUSEPORT` group spreads
+/// arrivals itself and needs no explicit membership index. It exists so this
+/// function's signature matches the simulation adapter's, which does need it
+/// to steer deterministically — see `bound_udp_sim.rs`.
 pub async fn bind_udp_socket(
     addr: SocketAddr,
     mode: UdpMode,
     external_addr: Option<SocketAddr>,
+    _shard_index: u16,
 ) -> io::Result<BoundUdpSocket> {
     let socket = match mode {
         UdpMode::Batch => udp::bind_socket(addr)?,

@@ -28,29 +28,6 @@ use crate::shard::participants::ParticipantKey;
 use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
 use crate::track::Topic;
 
-pub const MEDIA_ENVELOPE_LEN: usize = 16;
-pub const ROUTE_ENVELOPE_LEN: usize = 8;
-pub const ENVELOPE_VERSION: u8 = 1;
-
-/// Which direction a frame is travelling, carried in `flags` bit 0.
-///
-/// Both lanes share one socket cross-node, so the receiver has to demux them
-/// before it can know how long the header is. `ver` and `flags` sit at the same
-/// two offsets in both envelopes precisely so this bit can be read first.
-///
-/// This is the first defined flag bit. It is an addition to a field that was
-/// wholly reserved, not a reinterpretation of one that meant something else —
-/// the distinction the version rules turn on.
-const FLAG_LANE: u8 = 0b0000_0001;
-const FLAG_LANE_MEDIA: u8 = 0;
-const FLAG_LANE_REVERSE: u8 = FLAG_LANE;
-
-/// Bits with no meaning yet. They are the reserved surface for further
-/// compatible v1 extensions, and must be zero until one is defined — a set bit
-/// we do not understand is a bug or a version mismatch, not something to skip
-/// past.
-const FLAGS_RESERVED: u8 = !FLAG_LANE;
-
 /// How long a retired slot waits before it can be handed out again.
 ///
 /// `epoch` is the primary guard against a delayed datagram landing on a
@@ -83,53 +60,70 @@ const _: () = assert!(
 
 /// `shard(12) | slot(20)`, so a packet landing on the wrong shard — which
 /// happens on every node, because `SO_REUSEPORT` picks the shard by 5-tuple
-/// hash and knows nothing about routes — is forwarded by reading 12 bits
+/// hash and knows nothing about routes — is steered by reading 12 bits
 /// instead of hashing a name back to a shard. 4096 shards, 1M slots per
 /// shard: core counts grow predictably, per-shard route counts don't.
 ///
-/// This makes `RouteId` a node-scoped address with a network part (the
-/// shard) and a host part (the slot), not purely "allocated by the
-/// destination, because it indexes that destination's table" the way the
-/// module doc otherwise describes it — the destination still allocates the
-/// slot, but the shard bits are fixed by which table it is.
+/// This is the one place route bits are packed and unpacked. The two route
+/// families ([`TransportRoute`] and [`RouteId`]) wrap it rather than
+/// re-deriving the layout, so a change to the widths cannot leave one family
+/// disagreeing with the other, with the ufrag, or with the eBPF classifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RouteId(u32);
+pub struct PackedRoute(u32);
 
-const ROUTE_SLOT_BITS: u32 = 20;
-const ROUTE_SHARD_BITS: u32 = 12;
+pub const ROUTE_SLOT_BITS: u32 = 20;
+pub const ROUTE_SHARD_BITS: u32 = 12;
 const ROUTE_SLOT_MASK: u32 = (1 << ROUTE_SLOT_BITS) - 1;
 const ROUTE_SHARD_MASK: u32 = (1 << ROUTE_SHARD_BITS) - 1;
 
-impl RouteId {
-    /// Packs a destination shard and its local slot into one wire id.
-    /// `slot` must fit in 20 bits and `shard` in 12 — both are asserted, not
-    /// silently truncated, because a truncated shard id would forward a
-    /// packet to the wrong worker without ever failing loudly.
+const _: () = assert!(ROUTE_SLOT_BITS + ROUTE_SHARD_BITS == u32::BITS);
+
+impl PackedRoute {
+    pub const MAX_SLOT: u32 = ROUTE_SLOT_MASK;
+    pub const MAX_SHARD: u32 = ROUTE_SHARD_MASK;
+
+    /// Packs a shard and its local slot. `slot` must fit in 20 bits and
+    /// `shard` in 12 — both are asserted, not silently truncated, because a
+    /// truncated shard id would steer a packet to the wrong worker without
+    /// ever failing loudly.
     pub const fn new(shard: ShardId, slot: u32) -> Self {
-        debug_assert!(slot <= ROUTE_SLOT_MASK, "route slot overflows 20 bits");
+        debug_assert!(slot <= Self::MAX_SLOT, "route slot overflows 20 bits");
         // Asserted below to fit in 12 bits, so the truncation clippy warns
         // about cannot happen for any shard this format actually supports.
         #[allow(clippy::cast_possible_truncation)]
         let shard_bits = shard.index() as u32;
-        debug_assert!(shard_bits <= ROUTE_SHARD_MASK, "shard id overflows 12 bits");
+        debug_assert!(shard_bits <= Self::MAX_SHARD, "shard id overflows 12 bits");
         Self(((shard_bits & ROUTE_SHARD_MASK) << ROUTE_SLOT_BITS) | (slot & ROUTE_SLOT_MASK))
     }
 
-    /// Reconstructs a `RouteId` from its wire representation. Unlike `new`,
-    /// this trusts the bits as given — the network handed them to us already
-    /// packed, and re-deriving shard/slot from them is exactly `shard()`/
-    /// `slot()`.
+    /// The checked constructor, for anywhere the shard or slot is derived
+    /// from configuration or arithmetic rather than from an allocator that
+    /// already bounds them.
+    pub const fn try_new(shard: ShardId, slot: u32) -> Option<Self> {
+        if slot > Self::MAX_SLOT {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let shard_bits = shard.index() as u32;
+        if shard_bits > Self::MAX_SHARD {
+            return None;
+        }
+        Some(Self((shard_bits << ROUTE_SLOT_BITS) | slot))
+    }
+
+    /// Reconstructs from a wire representation. Unlike `new`, this trusts the
+    /// bits as given — the network handed them to us already packed, and
+    /// re-deriving shard/slot from them is exactly `shard()`/`slot()`. Every
+    /// bit pattern is a syntactically valid packed route; whether that shard
+    /// exists and that slot is live is the receiver's check, not this one's.
     pub const fn from_raw(bits: u32) -> Self {
         Self(bits)
     }
 
-    /// The destination shard this route was allocated on.
     pub const fn shard(self) -> ShardId {
         ShardId::new((self.0 >> ROUTE_SLOT_BITS) as usize)
     }
 
-    /// The route's index within its shard's own table — what a `RouteTable`
-    /// indexes by.
     pub const fn slot(self) -> u32 {
         self.0 & ROUTE_SLOT_MASK
     }
@@ -143,84 +137,177 @@ impl RouteId {
     }
 }
 
-impl std::fmt::Display for RouteId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "rt{}", self.0)
-    }
-}
+/// Declares one route family over [`PackedRoute`].
+///
+/// [`TransportRoute`] and [`RouteId`] are the same 32 bits and deliberately
+/// not the same type: they address different things (a client's ICE
+/// association versus a distributed endpoint), they are allocated from
+/// separate slot namespaces, and they appear at different places on the wire.
+/// A `From` impl between them would make that boundary a typo away from
+/// disappearing, so there is none — crossing it costs an explicit
+/// `from_packed`/`packed` pair that greps.
+macro_rules! route_family {
+    ($(#[$meta:meta])* $name:ident, $prefix:literal) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(PackedRoute);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvelopeError {
-    Truncated {
-        len: usize,
-    },
-    UnsupportedVersion {
-        ver: u8,
-    },
-    ReservedFlags {
-        flags: u8,
-    },
-    /// Decoded as one lane but the header says the other.
-    WrongLane {
-        want: Lane,
-    },
-}
+        impl $name {
+            pub const fn new(shard: ShardId, slot: u32) -> Self {
+                Self(PackedRoute::new(shard, slot))
+            }
 
-impl std::fmt::Display for EnvelopeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Truncated { len } => write!(f, "envelope truncated: {len} bytes"),
-            Self::UnsupportedVersion { ver } => write!(f, "unsupported envelope version {ver}"),
-            Self::ReservedFlags { flags } => write!(f, "reserved envelope flags set: {flags:#04x}"),
-            Self::WrongLane { want } => write!(f, "envelope is not on the {want:?} lane"),
+            pub const fn try_new(shard: ShardId, slot: u32) -> Option<Self> {
+                match PackedRoute::try_new(shard, slot) {
+                    Some(packed) => Some(Self(packed)),
+                    None => None,
+                }
+            }
+
+            pub const fn from_raw(bits: u32) -> Self {
+                Self(PackedRoute::from_raw(bits))
+            }
+
+            pub const fn from_packed(packed: PackedRoute) -> Self {
+                Self(packed)
+            }
+
+            pub const fn packed(self) -> PackedRoute {
+                self.0
+            }
+
+            pub const fn shard(self) -> ShardId {
+                self.0.shard()
+            }
+
+            pub const fn slot(self) -> u32 {
+                self.0.slot()
+            }
+
+            pub const fn index(self) -> usize {
+                self.0.index()
+            }
+
+            pub const fn get(self) -> u32 {
+                self.0.get()
+            }
         }
-    }
-}
 
-/// Which lane a frame on the wire belongs to, read before anything else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lane {
-    Media,
-    Reverse,
-}
-
-/// Read the lane of an encoded frame without committing to a header length.
-///
-/// Cross-node both lanes arrive on one socket, so this is the first thing a
-/// receiver does; the two envelopes deliberately agree on `ver` and `flags`
-/// offsets so it can.
-pub fn peek_lane(buf: &[u8]) -> Result<Lane, EnvelopeError> {
-    let (ver, flags) = match buf {
-        [ver, flags, ..] => (*ver, *flags),
-        _ => return Err(EnvelopeError::Truncated { len: buf.len() }),
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!($prefix, "{}"), self.0.get())
+            }
+        }
     };
-    if ver != ENVELOPE_VERSION {
-        return Err(EnvelopeError::UnsupportedVersion { ver });
-    }
-    if flags & FLAGS_RESERVED != 0 {
-        return Err(EnvelopeError::ReservedFlags { flags });
-    }
-    Ok(if flags & FLAG_LANE == FLAG_LANE_REVERSE {
-        Lane::Reverse
-    } else {
-        Lane::Media
-    })
 }
 
-/// The 16-byte header on every media frame crossing a link.
+route_family!(
+    /// A client's WebRTC transport association, addressing the shard that owns
+    /// its `str0m::Rtc`. Travels on the wire inside the ICE ufrag, which is
+    /// what lets the kernel steer a client's very first STUN packet to the
+    /// owning shard before any userspace lookup exists.
+    TransportRoute,
+    "tr"
+);
+
+route_family!(
+    /// A distributed endpoint — an imported track, an audio stream, a data or
+    /// reliable stream, or a reverse path. Travels on the wire at a fixed
+    /// offset in the inter-node envelope.
+    RouteId,
+    "rt"
+);
+
+/// The only safe way to name a live [`RouteId`].
 ///
-/// Encoded big-endian at fixed offsets rather than by casting a Rust struct —
-/// `repr(C)` layout is not a portable wire format.
+/// A slot is dense and reused, so the u32 alone identifies a *slot*, not an
+/// incarnation. Pairing it with the epoch is what makes a delayed datagram
+/// addressed to the previous tenant fail closed instead of being delivered to
+/// the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RouteHandle {
+    pub route: RouteId,
+    pub epoch: u16,
+}
+
+impl RouteHandle {
+    pub const fn new(route: RouteId, epoch: u16) -> Self {
+        Self { route, epoch }
+    }
+
+    pub const fn shard(self) -> ShardId {
+        self.route.shard()
+    }
+}
+
+impl std::fmt::Display for RouteHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}e{}", self.route, self.epoch)
+    }
+}
+
+/// [`RouteHandle`]'s transport-side twin — see [`TransportRoute`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TransportHandle {
+    pub route: TransportRoute,
+    pub epoch: u16,
+}
+
+impl TransportHandle {
+    pub const fn new(route: TransportRoute, epoch: u16) -> Self {
+        Self { route, epoch }
+    }
+
+    pub const fn shard(self) -> ShardId {
+        self.route.shard()
+    }
+}
+
+impl std::fmt::Display for TransportHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}e{}", self.route, self.epoch)
+    }
+}
+
+pub use pulsebeam_routing::envelope::{
+    ENVELOPE_LEN, ENVELOPE_VERSION, EnvelopeError, EnvelopeType, ROUTE_OFFSET,
+};
+
+/// Read the destination shard out of an encoded frame without parsing the
+/// payload — the same fixed-offset read the eBPF steering program does, so a
+/// userspace fallback cannot disagree with the kernel about where a datagram
+/// belongs.
+pub fn peek_shard(buf: &[u8]) -> Option<ShardId> {
+    pulsebeam_routing::envelope::peek_shard(buf).map(|shard| ShardId::new(usize::from(shard)))
+}
+
+/// Read the type tag of an encoded frame, which is what says how to interpret
+/// its `extension` and its payload.
+pub fn peek_type(buf: &[u8]) -> Result<EnvelopeType, EnvelopeError> {
+    decode_wire(buf).map(|env| env.ty)
+}
+
+fn decode_wire(buf: &[u8]) -> Result<pulsebeam_routing::envelope::Envelope, EnvelopeError> {
+    pulsebeam_routing::envelope::Envelope::decode(buf)
+}
+
+fn to_wire_route(route: RouteId) -> pulsebeam_routing::RouteId {
+    pulsebeam_routing::RouteId::from_raw(route.get())
+}
+
+fn from_wire_route(route: pulsebeam_routing::RouteId) -> RouteId {
+    RouteId::from_raw(route.get())
+}
+
+/// The typed body of a media frame, above the shared wire header.
+///
+/// `link_seq` and `playout_ntp32` are the Media type's interpretation of the
+/// envelope's `extension` word — the header itself has no idea they exist,
+/// which is what lets a new payload family be added without touching the
+/// framing or the steering program.
 ///
 /// ```text
-/// 0       1       2               4                       8
-/// +-------+-------+---------------+-----------------------+
-/// | ver   | flags | epoch         | route (u32)           |
-/// +-------+-------+---------------+-----------------------+
-/// 8                              12                      16
-/// +-------------------------------+-----------------------+
-/// | link_seq (u32)                | playout_ntp32 (u32)   |
-/// +-------------------------------+-----------------------+
+/// extension: | link_seq (u32) | playout_ntp32 (u32) |
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaEnvelope {
@@ -234,139 +321,105 @@ pub struct MediaEnvelope {
     pub playout_ntp32: u32,
 }
 
-/// The exact byte layout of [`MediaEnvelope`] on the wire. `Unaligned` plus
-/// the big-endian integer wrappers make encode/decode a memory copy instead
-/// of sixteen individual byte-slice operations — `repr(C)` is still not a
-/// portable wire format on its own (padding, host endianness), but paired
-/// with `zerocopy`'s byte-order types it is one, and the compiler checks it
-/// rather than the manual offsets that used to encode this.
-#[derive(
-    zerocopy::FromBytes,
-    zerocopy::IntoBytes,
-    zerocopy::KnownLayout,
-    zerocopy::Immutable,
-    zerocopy::Unaligned,
-)]
-#[repr(C)]
-struct MediaEnvelopeWire {
-    ver: u8,
-    flags: u8,
-    epoch: zerocopy::big_endian::U16,
-    route: zerocopy::big_endian::U32,
-    link_seq: zerocopy::big_endian::U32,
-    playout_ntp32: zerocopy::big_endian::U32,
-}
-
-const _: () = assert!(size_of::<MediaEnvelopeWire>() == MEDIA_ENVELOPE_LEN);
-
 impl MediaEnvelope {
-    pub fn encode(&self) -> [u8; MEDIA_ENVELOPE_LEN] {
-        let wire = MediaEnvelopeWire {
-            ver: ENVELOPE_VERSION,
-            flags: FLAG_LANE_MEDIA,
-            epoch: self.epoch.into(),
-            route: self.route.get().into(),
-            link_seq: self.link_seq.into(),
-            playout_ntp32: self.playout_ntp32.into(),
-        };
-        zerocopy::transmute!(wire)
+    fn pack_extension(link_seq: u32, playout_ntp32: u32) -> u64 {
+        (u64::from(link_seq) << 32) | u64::from(playout_ntp32)
+    }
+
+    fn unpack_extension(extension: u64) -> (u32, u32) {
+        // Both halves are exactly 32 bits of a 64-bit word, so neither
+        // conversion can lose anything.
+        #[allow(clippy::cast_possible_truncation)]
+        let link_seq = (extension >> 32) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let playout_ntp32 = extension as u32;
+        (link_seq, playout_ntp32)
+    }
+
+    pub fn encode(&self) -> [u8; ENVELOPE_LEN] {
+        pulsebeam_routing::envelope::Envelope {
+            ty: EnvelopeType::Media,
+            epoch: self.epoch,
+            route: to_wire_route(self.route),
+            extension: Self::pack_extension(self.link_seq, self.playout_ntp32),
+        }
+        .encode()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        if buf.len() < MEDIA_ENVELOPE_LEN {
-            return Err(EnvelopeError::Truncated { len: buf.len() });
+        let wire = decode_wire(buf)?;
+        if wire.ty != EnvelopeType::Media {
+            return Err(EnvelopeError::UnknownType {
+                ty: wire.ty.as_u8(),
+            });
         }
-        if peek_lane(buf)? != Lane::Media {
-            return Err(EnvelopeError::WrongLane { want: Lane::Media });
-        }
-        let (wire, _rest) = zerocopy::FromBytes::ref_from_prefix(buf)
-            .map_err(|_| EnvelopeError::Truncated { len: buf.len() })?;
-        let wire: &MediaEnvelopeWire = wire;
+        let (link_seq, playout_ntp32) = Self::unpack_extension(wire.extension);
         Ok(Self {
-            epoch: wire.epoch.get(),
-            route: RouteId::from_raw(wire.route.get()),
-            link_seq: wire.link_seq.get(),
-            playout_ntp32: wire.playout_ntp32.get(),
+            epoch: wire.epoch,
+            route: from_wire_route(wire.route),
+            link_seq,
+            playout_ntp32,
         })
     }
 }
 
-/// The 8-byte header on every frame that carries no timeline.
+/// A frame that carries no timeline: an upstream request travelling back to a
+/// publisher, or forward telemetry travelling out to a destination.
 ///
-/// Used by both directions that need addressing without one: upstream requests
-/// travelling back to a publisher, and forward telemetry travelling out to a
-/// destination. Half the size of [`MediaEnvelope`] because neither needs the
-/// two fields that make up the difference. `link_seq` exists to observe
-/// loss on a link, but every reverse body is a request the sender repeats if it
-/// still needs it, so a lost one costs a round trip and there is nothing to
-/// account for. `playout_ntp32` places a packet on a timeline; a request has
-/// none.
-///
-/// ```text
-/// 0       1       2               4                       8
-/// +-------+-------+---------------+-----------------------+
-/// | ver   | flags | epoch         | route (u32)           |
-/// +-------+-------+---------------+-----------------------+
-/// ```
+/// The two are different `EnvelopeType`s over the same header rather than a
+/// second header — a reverse message that needs a compact body uses `type` and
+/// `extension`, which is why there is only one route offset on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteEnvelope {
+    pub ty: EnvelopeType,
     pub epoch: u16,
     pub route: RouteId,
 }
 
-/// The exact byte layout of [`RouteEnvelope`] on the wire — see
-/// [`MediaEnvelopeWire`], the same trade applied to the shorter header.
-#[derive(
-    zerocopy::FromBytes,
-    zerocopy::IntoBytes,
-    zerocopy::KnownLayout,
-    zerocopy::Immutable,
-    zerocopy::Unaligned,
-)]
-#[repr(C)]
-struct RouteEnvelopeWire {
-    ver: u8,
-    flags: u8,
-    epoch: zerocopy::big_endian::U16,
-    route: zerocopy::big_endian::U32,
-}
-
-const _: () = assert!(size_of::<RouteEnvelopeWire>() == ROUTE_ENVELOPE_LEN);
-
 impl RouteEnvelope {
-    pub fn new(handle: ReverseRoute) -> Self {
+    /// An upstream request addressed to a publisher's reverse route.
+    pub fn feedback(handle: RouteHandle) -> Self {
         Self {
+            ty: EnvelopeType::Feedback,
             epoch: handle.epoch,
             route: handle.route,
         }
     }
 
-    pub fn encode(&self) -> [u8; ROUTE_ENVELOPE_LEN] {
-        let wire = RouteEnvelopeWire {
-            ver: ENVELOPE_VERSION,
-            flags: FLAG_LANE_REVERSE,
-            epoch: self.epoch.into(),
-            route: self.route.get().into(),
-        };
-        zerocopy::transmute!(wire)
+    /// Forward telemetry addressed to a destination.
+    pub fn telemetry(handle: RouteHandle) -> Self {
+        Self {
+            ty: EnvelopeType::Telemetry,
+            epoch: handle.epoch,
+            route: handle.route,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; ENVELOPE_LEN] {
+        debug_assert!(
+            matches!(self.ty, EnvelopeType::Feedback | EnvelopeType::Telemetry),
+            "a timeline-free frame is feedback or telemetry, not {:?}",
+            self.ty
+        );
+        pulsebeam_routing::envelope::Envelope {
+            ty: self.ty,
+            epoch: self.epoch,
+            route: to_wire_route(self.route),
+            extension: 0,
+        }
+        .encode()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        if buf.len() < ROUTE_ENVELOPE_LEN {
-            return Err(EnvelopeError::Truncated { len: buf.len() });
+        let wire = decode_wire(buf)?;
+        match wire.ty {
+            EnvelopeType::Feedback | EnvelopeType::Telemetry => Ok(Self {
+                ty: wire.ty,
+                epoch: wire.epoch,
+                route: from_wire_route(wire.route),
+            }),
+            other => Err(EnvelopeError::UnknownType { ty: other.as_u8() }),
         }
-        if peek_lane(buf)? != Lane::Reverse {
-            return Err(EnvelopeError::WrongLane {
-                want: Lane::Reverse,
-            });
-        }
-        let (wire, _rest) = zerocopy::FromBytes::ref_from_prefix(buf)
-            .map_err(|_| EnvelopeError::Truncated { len: buf.len() })?;
-        let wire: &RouteEnvelopeWire = wire;
-        Ok(Self {
-            epoch: wire.epoch.get(),
-            route: RouteId::from_raw(wire.route.get()),
-        })
     }
 }
 
@@ -450,12 +503,6 @@ impl std::fmt::Display for RouteNames {
 /// local object and leaves the route untouched.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RouteAction {
-    /// A client's ICE association. The route and the participant's key share
-    /// a lifetime by construction — minted together at connection setup,
-    /// destroyed together at teardown — the same argument that already
-    /// justifies `ReverseTarget` holding no epoch of its own: a key handed to
-    /// a route always resolves.
-    Ingress { participant: ParticipantKey },
     Video {
         /// The destination's own fanout handle — a dense index, not a name.
         /// Resolving a route hands dispatch something it can use directly,
@@ -509,14 +556,6 @@ pub(crate) enum ReverseTarget {
     Topic {
         stream: ReliableStreamKey,
     },
-}
-
-/// A sender-side handle to a reverse route, handed out with the stream it
-/// belongs to by the control plane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ReverseRoute {
-    pub route: RouteId,
-    pub epoch: u16,
 }
 
 #[derive(Debug)]
@@ -614,19 +653,111 @@ const _: () = assert!(size_of::<Slot>() == size_of::<usize>());
 /// there is still a process to say it in.
 #[derive(Debug)]
 pub(crate) struct RouteTable {
-    shard_id: ShardId,
+    alloc: SlotAllocator,
     slots: Vec<Slot>,
+}
+
+/// Working set preallocated up front so steady-state operation never
+/// allocates. A guess, not a bound — [`SlotAllocator::allocate`] grows past it
+/// with a `tracing::warn!` naming the shard and the new size, and only fails
+/// at the address space's own limit (`1 << ROUTE_SLOT_BITS`).
+const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
+
+/// Hands out `(slot, epoch)` pairs within one shard's slot namespace.
+///
+/// Split out from the tables it serves because the two route families need
+/// the identical allocation discipline over *separate* namespaces — a
+/// [`TransportRoute`] slot and a [`RouteId`] slot may collide numerically and
+/// must not share a quarantine queue or an epoch. It is deliberately storage
+/// agnostic: it owns the epochs and the quarantine, the table owns the
+/// entries, and `allocate` returns a slot the table is responsible for making
+/// room for.
+#[derive(Debug)]
+pub(crate) struct SlotAllocator {
+    shard_id: ShardId,
+    /// One entry per slot ever handed out; its length *is* the slot high-water
+    /// mark, which is what makes a fresh allocation a push.
     epochs: Vec<u16>,
     /// Retired slots, oldest first, with the instant they were retired.
     quarantine: VecDeque<(u32, Instant)>,
     max_slots: u32,
 }
 
-/// Working set preallocated up front so steady-state operation never
-/// allocates. A guess, not a bound — [`RouteTable::allocate`] grows past it
-/// with a `tracing::warn!` naming the shard and the new size, and only fails
-/// at the address space's own limit (`1 << ROUTE_SLOT_BITS`).
-const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
+impl SlotAllocator {
+    pub(crate) fn with_max_slots(shard_id: ShardId, max_slots: u32) -> Self {
+        let prealloc = usize::try_from(max_slots)
+            .unwrap_or(usize::MAX)
+            .min(ROUTE_TABLE_PREALLOCATED_SLOTS);
+        Self {
+            shard_id,
+            epochs: Vec::with_capacity(prealloc),
+            quarantine: VecDeque::new(),
+            max_slots,
+        }
+    }
+
+    pub(crate) fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
+    /// The slot high-water mark — a fresh allocation returns exactly this, so
+    /// the caller knows to grow its storage by one rather than overwrite.
+    pub(crate) fn high_water(&self) -> usize {
+        self.epochs.len()
+    }
+
+    /// `Ok((slot, epoch))`. A `slot` equal to the pre-call [`Self::high_water`]
+    /// is fresh and the caller must push one entry; anything lower is a
+    /// quarantined slot coming back, already bumped to a new epoch.
+    pub(crate) fn allocate(&mut self, now: Instant) -> Result<(u32, u16), RouteError> {
+        // FIFO from the oldest retirement, so a slot is only reused once no
+        // datagram addressed to its previous incarnation could still arrive.
+        if let Some(&(slot, retired_at)) = self.quarantine.front()
+            && now.saturating_duration_since(retired_at) >= ROUTE_QUARANTINE
+        {
+            self.quarantine.pop_front();
+            let Some(epoch) = self.epochs.get_mut(slot as usize) else {
+                debug_assert!(false, "a quarantined slot must be within the namespace");
+                return Err(RouteError::Exhausted {
+                    max_slots: self.max_slots,
+                });
+            };
+            if *epoch == u16::MAX {
+                tracing::warn!(slot, "route epoch wrapped");
+            }
+            *epoch = epoch.wrapping_add(1);
+            return Ok((slot, *epoch));
+        }
+
+        let slot = u32::try_from(self.epochs.len()).unwrap_or(u32::MAX);
+        if slot >= self.max_slots || slot > PackedRoute::MAX_SLOT {
+            return Err(RouteError::Exhausted {
+                max_slots: self.max_slots,
+            });
+        }
+        if self.epochs.len() == self.epochs.capacity() {
+            let new_capacity = self.epochs.capacity().saturating_mul(2).max(1);
+            tracing::warn!(
+                shard_id = %self.shard_id,
+                new_capacity,
+                "route table working set exceeded, growing"
+            );
+        }
+        self.epochs.push(0);
+        Ok((slot, 0))
+    }
+
+    /// Quarantines a slot. Takes the *slot*, never the packed route: the
+    /// quarantine queue indexes this shard's namespace, and a packed route
+    /// carries shard bits that would land it far outside it on any shard but 0.
+    pub(crate) fn retire(&mut self, slot: u32, now: Instant) {
+        debug_assert!(
+            (slot as usize) < self.epochs.len(),
+            "retired a slot that was never allocated"
+        );
+        self.quarantine.push_back((slot, now));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
@@ -640,19 +771,15 @@ pub(crate) enum RouteError {
 
 impl RouteTable {
     pub fn new(shard_id: ShardId) -> Self {
-        Self::with_max_slots(shard_id, ROUTE_SLOT_MASK.saturating_add(1))
+        Self::with_max_slots(shard_id, PackedRoute::MAX_SLOT.saturating_add(1))
     }
 
     pub fn with_max_slots(shard_id: ShardId, max_slots: u32) -> Self {
-        let prealloc = usize::try_from(max_slots)
-            .unwrap_or(usize::MAX)
-            .min(ROUTE_TABLE_PREALLOCATED_SLOTS);
+        let alloc = SlotAllocator::with_max_slots(shard_id, max_slots);
+        let prealloc = alloc.epochs.capacity();
         Self {
-            shard_id,
+            alloc,
             slots: Vec::with_capacity(prealloc),
-            epochs: Vec::with_capacity(prealloc),
-            quarantine: VecDeque::new(),
-            max_slots,
         }
     }
 
@@ -686,18 +813,12 @@ impl RouteTable {
         // is what puts those four recovery paths under test at all.
         if pulsebeam_runtime::buggify!("route table exhausted") {
             return Err(RouteError::Exhausted {
-                max_slots: self.max_slots,
+                max_slots: self.alloc.max_slots,
             });
         }
-        let id = self.allocate(now)?;
-        let epoch = self.epochs.get(id.index()).copied().unwrap_or(0);
-        let Some(slot) = self.slots.get_mut(id.index()) else {
-            debug_assert!(false, "allocate() returned a slot outside the table");
-            return Err(RouteError::Exhausted {
-                max_slots: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
-            });
-        };
-        *slot = Slot::Live(Box::new(RouteEntry {
+        let fresh = self.alloc.high_water();
+        let (slot_idx, epoch) = self.alloc.allocate(now)?;
+        let entry = Slot::Live(Box::new(RouteEntry {
             epoch,
             action,
             names,
@@ -705,7 +826,22 @@ impl RouteTable {
             last_link_seq: None,
             stats: RouteStats::default(),
         }));
-        Ok((id, epoch))
+        if slot_idx as usize == fresh {
+            self.slots.push(entry);
+        } else {
+            let Some(slot) = self.slots.get_mut(slot_idx as usize) else {
+                debug_assert!(false, "allocate() returned a slot outside the table");
+                return Err(RouteError::Exhausted {
+                    max_slots: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
+                });
+            };
+            debug_assert!(
+                matches!(slot, Slot::Free),
+                "a quarantined slot must still be free"
+            );
+            *slot = entry;
+        }
+        Ok((RouteId::new(self.alloc.shard_id(), slot_idx), epoch))
     }
 
     /// Idempotent: retiring an already-free slot is a no-op, so a redelivered
@@ -716,6 +852,11 @@ impl RouteTable {
     /// operation here that destroys state — a teardown for a superseded
     /// incarnation must not retire the one that replaced it.
     pub fn retire(&mut self, id: RouteId, epoch: u16, now: Instant) -> bool {
+        debug_assert_eq!(
+            id.shard(),
+            self.alloc.shard_id(),
+            "a route is only retirable at the shard that owns it"
+        );
         let Some(slot) = self.slots.get_mut(id.index()) else {
             return false;
         };
@@ -724,7 +865,7 @@ impl RouteTable {
             _ => return false,
         }
         *slot = Slot::Free;
-        self.quarantine.push_back((id.get(), now));
+        self.alloc.retire(id.slot(), now);
         true
     }
 
@@ -754,43 +895,121 @@ impl RouteTable {
         }
     }
 
-    fn allocate(&mut self, now: Instant) -> Result<RouteId, RouteError> {
-        // FIFO from the oldest retirement, so a slot is only reused once no
-        // datagram addressed to its previous incarnation could still arrive.
-        if let Some(&(idx, retired_at)) = self.quarantine.front()
-            && now.saturating_duration_since(retired_at) >= ROUTE_QUARANTINE
-        {
-            self.quarantine.pop_front();
-            debug_assert!(
-                matches!(self.slots.get(idx as usize), Some(Slot::Free)),
-                "a quarantined slot must still be free"
-            );
-            if let Some(epoch) = self.epochs.get_mut(idx as usize) {
-                if *epoch == u16::MAX {
-                    tracing::warn!(route = idx, "route epoch wrapped");
-                }
-                *epoch = epoch.wrapping_add(1);
-            }
-            return Ok(RouteId::new(self.shard_id, idx));
-        }
+}
 
-        let idx = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
-        if idx >= self.max_slots {
+/// The shard's table of client ICE associations, addressed by
+/// [`TransportRoute`].
+///
+/// Separate from [`RouteTable`] rather than a variant inside it because the
+/// two are different address families with different lifetimes: a transport
+/// route is minted once per connection before ICE credentials exist and lives
+/// as long as the `Rtc` does, while an endpoint route is installed and retired
+/// as subscriptions churn underneath it. Keeping the namespaces apart is what
+/// makes the two `Route*` types distinct rather than decorative — a slot
+/// number means nothing without knowing which table it indexes.
+///
+/// Entries hold only a [`ParticipantKey`]: the route and the key are minted
+/// together at connection setup and destroyed together at teardown, so a key
+/// handed to a live transport route always resolves.
+#[derive(Debug)]
+pub(crate) struct TransportTable {
+    alloc: SlotAllocator,
+    slots: Vec<Option<TransportEntry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransportEntry {
+    epoch: u16,
+    participant: ParticipantKey,
+}
+
+impl TransportTable {
+    pub fn new(shard_id: ShardId) -> Self {
+        Self::with_max_slots(shard_id, PackedRoute::MAX_SLOT.saturating_add(1))
+    }
+
+    pub fn with_max_slots(shard_id: ShardId, max_slots: u32) -> Self {
+        let alloc = SlotAllocator::with_max_slots(shard_id, max_slots);
+        let prealloc = alloc.epochs.capacity();
+        Self {
+            alloc,
+            slots: Vec::with_capacity(prealloc),
+        }
+    }
+
+    /// Mint a transport route for a participant key that is already reserved.
+    pub fn install(
+        &mut self,
+        participant: ParticipantKey,
+        now: Instant,
+    ) -> Result<TransportHandle, RouteError> {
+        if pulsebeam_runtime::buggify!("transport table exhausted") {
             return Err(RouteError::Exhausted {
-                max_slots: self.max_slots,
+                max_slots: self.alloc.max_slots,
             });
         }
-        if self.slots.len() == self.slots.capacity() {
-            let new_capacity = self.slots.capacity().saturating_mul(2).max(1);
-            tracing::warn!(
-                shard_id = %self.shard_id,
-                new_capacity,
-                "route table working set exceeded, growing"
-            );
+        let fresh = self.alloc.high_water();
+        let (slot_idx, epoch) = self.alloc.allocate(now)?;
+        let entry = Some(TransportEntry { epoch, participant });
+        if slot_idx as usize == fresh {
+            self.slots.push(entry);
+        } else {
+            let Some(slot) = self.slots.get_mut(slot_idx as usize) else {
+                debug_assert!(false, "allocate() returned a slot outside the table");
+                return Err(RouteError::Exhausted {
+                    max_slots: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
+                });
+            };
+            debug_assert!(slot.is_none(), "a quarantined slot must still be free");
+            *slot = entry;
         }
-        self.slots.push(Slot::Free);
-        self.epochs.push(0);
-        Ok(RouteId::new(self.shard_id, idx))
+        Ok(TransportHandle::new(
+            TransportRoute::new(self.alloc.shard_id(), slot_idx),
+            epoch,
+        ))
+    }
+
+    /// Idempotent, and epoch-checked for the same reason [`RouteTable::retire`]
+    /// is: a redelivered teardown must not retire the incarnation that
+    /// replaced the one it names.
+    pub fn retire(&mut self, handle: TransportHandle, now: Instant) -> bool {
+        debug_assert_eq!(
+            handle.shard(),
+            self.alloc.shard_id(),
+            "a transport route is only retirable at the shard that owns it"
+        );
+        let Some(slot) = self.slots.get_mut(handle.route.index()) else {
+            return false;
+        };
+        match slot {
+            Some(entry) if entry.epoch == handle.epoch => {}
+            _ => return false,
+        }
+        *slot = None;
+        self.alloc.retire(handle.route.slot(), now);
+        true
+    }
+
+    /// Resolve an arriving client packet to the participant it addresses.
+    ///
+    /// Ownership is the caller's check, not this one's — a route for another
+    /// shard would index this table's slots meaninglessly, so it is asserted
+    /// rather than silently missed.
+    pub fn resolve(&self, handle: TransportHandle) -> Option<ParticipantKey> {
+        debug_assert_eq!(
+            handle.shard(),
+            self.alloc.shard_id(),
+            "a transport route only resolves at the shard that owns it"
+        );
+        match self.slots.get(handle.route.index()) {
+            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry.participant),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
     }
 }
 
@@ -1031,7 +1250,7 @@ mod tests {
 
     #[test]
     fn envelope_is_exactly_sixteen_bytes() {
-        assert_eq!(MEDIA_ENVELOPE_LEN, 16);
+        assert_eq!(ENVELOPE_LEN, 16);
         assert_eq!(envelope(RouteId::from_raw(1), 1).encode().len(), 16);
     }
 
@@ -1048,7 +1267,7 @@ mod tests {
             bytes,
             [
                 ENVELOPE_VERSION,
-                0x00,
+                EnvelopeType::Media.as_u8(),
                 0x11,
                 0x22,
                 0x33,
@@ -1067,57 +1286,66 @@ mod tests {
         );
     }
 
+    /// The reverse lane shares the one header rather than paying for a
+    /// second: what used to be a shorter frame is now the same 16 bytes with
+    /// an unused `extension`, which is the trade that leaves exactly one
+    /// route offset on the wire for the steering program to read.
     #[test]
-    fn reverse_envelope_is_exactly_eight_bytes() {
-        assert_eq!(ROUTE_ENVELOPE_LEN, 8);
+    fn a_timeline_free_frame_uses_the_same_sixteen_byte_header() {
+        let encoded = RouteEnvelope::feedback(RouteHandle::new(RouteId::from_raw(1), 1)).encode();
+        assert_eq!(encoded.len(), ENVELOPE_LEN);
         assert_eq!(
-            RouteEnvelope {
-                epoch: 1,
-                route: RouteId::from_raw(1),
-            }
-            .encode()
-            .len(),
-            8,
-            "the reverse lane pays for addressing and nothing else"
+            crate::route::peek_shard(&encoded),
+            Some(RouteId::from_raw(1).shard()),
+            "the route sits at the same offset as it does on a media frame"
         );
     }
 
     #[test]
     fn reverse_envelope_round_trips() {
-        let env = RouteEnvelope {
-            epoch: u16::MAX,
-            route: RouteId::from_raw(u32::MAX),
-        };
-        assert_eq!(RouteEnvelope::decode(&env.encode()).unwrap(), env);
+        for env in [
+            RouteEnvelope::feedback(RouteHandle::new(RouteId::from_raw(u32::MAX), u16::MAX)),
+            RouteEnvelope::telemetry(RouteHandle::new(RouteId::from_raw(0), 0)),
+        ] {
+            assert_eq!(RouteEnvelope::decode(&env.encode()).unwrap(), env);
+        }
     }
 
-    /// Cross-node both lanes share a socket, so a receiver must be able to tell
-    /// them apart before it knows how long the header is. The lane bit is at a
-    /// fixed offset both envelopes agree on, so peeking never needs the length.
+    /// Cross-node every payload family shares one socket and one header, so a
+    /// receiver tells them apart by the `type` byte rather than by guessing a
+    /// header length. That is what lets the steering program read `route`
+    /// without knowing what the payload is.
     #[test]
-    fn the_two_lanes_are_distinguishable_on_the_wire() {
+    fn the_payload_families_are_distinguishable_on_the_wire() {
         let media = envelope(RouteId::from_raw(3), 4).encode();
-        let reverse = RouteEnvelope {
-            epoch: 4,
-            route: RouteId::from_raw(3),
+        let feedback =
+            RouteEnvelope::feedback(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
+        let telemetry =
+            RouteEnvelope::telemetry(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
+
+        assert_eq!(peek_type(&media).unwrap(), EnvelopeType::Media);
+        assert_eq!(peek_type(&feedback).unwrap(), EnvelopeType::Feedback);
+        assert_eq!(peek_type(&telemetry).unwrap(), EnvelopeType::Telemetry);
+
+        // The route is at one offset for all of them, whatever the type.
+        for encoded in [&media, &feedback, &telemetry] {
+            assert_eq!(
+                crate::route::peek_shard(encoded),
+                Some(RouteId::from_raw(3).shard())
+            );
         }
-        .encode();
 
-        assert_eq!(peek_lane(&media).unwrap(), Lane::Media);
-        assert_eq!(peek_lane(&reverse).unwrap(), Lane::Reverse);
-
-        // Peeking works on the shorter of the two, so it never over-reads.
-        assert_eq!(peek_lane(&reverse[..2]).unwrap(), Lane::Reverse);
-
-        // And decoding one as the other is refused rather than misread.
+        // And decoding one family as another is refused rather than misread.
         assert_eq!(
-            MediaEnvelope::decode(&reverse),
-            Err(EnvelopeError::Truncated { len: 8 })
+            MediaEnvelope::decode(&feedback),
+            Err(EnvelopeError::UnknownType {
+                ty: EnvelopeType::Feedback.as_u8()
+            })
         );
         assert_eq!(
             RouteEnvelope::decode(&media),
-            Err(EnvelopeError::WrongLane {
-                want: Lane::Reverse
+            Err(EnvelopeError::UnknownType {
+                ty: EnvelopeType::Media.as_u8()
             })
         );
     }
@@ -1136,7 +1364,7 @@ mod tests {
     #[test]
     fn decode_rejects_truncated_input() {
         let full = envelope(RouteId::from_raw(1), 1).encode();
-        for len in 0..MEDIA_ENVELOPE_LEN {
+        for len in 0..ENVELOPE_LEN {
             assert_eq!(
                 MediaEnvelope::decode(&full[..len]),
                 Err(EnvelopeError::Truncated { len })
@@ -1145,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_unknown_version_and_reserved_flags() {
+    fn decode_rejects_unknown_version_and_unknown_type() {
         let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
         bytes[0] = ENVELOPE_VERSION + 1;
         assert_eq!(
@@ -1156,10 +1384,11 @@ mod tests {
         );
 
         let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
-        bytes[1] = 0b0000_0010;
+        bytes[1] = 0xff;
         assert_eq!(
             MediaEnvelope::decode(&bytes),
-            Err(EnvelopeError::ReservedFlags { flags: 0b0000_0010 })
+            Err(EnvelopeError::UnknownType { ty: 0xff }),
+            "an unrecognised payload family is rejected, not skipped past"
         );
     }
 
@@ -1519,5 +1748,180 @@ mod tests {
         assert_eq!(stats.duplicated, 1, "14 seen twice");
         assert_eq!(stats.reordered, 1, "13 arrived after 14");
         assert_eq!(stats.lost, 1, "12 never arrived; 13 was late, not lost");
+    }
+
+    // ── Phase 1: packed route primitives ─────────────────────────────────
+
+    #[test]
+    fn a_packed_route_round_trips_every_corner_of_its_two_fields() {
+        let corners = [
+            (0usize, 0u32),
+            (0, PackedRoute::MAX_SLOT),
+            (PackedRoute::MAX_SHARD as usize, 0),
+            (PackedRoute::MAX_SHARD as usize, PackedRoute::MAX_SLOT),
+            (0xa5c, 0x5_a5a5),
+            (1, 1),
+        ];
+        for (shard, slot) in corners {
+            let packed = PackedRoute::new(ShardId::new(shard), slot);
+            assert_eq!(packed.shard(), ShardId::new(shard), "shard {shard} slot {slot}");
+            assert_eq!(packed.slot(), slot, "shard {shard} slot {slot}");
+            assert_eq!(
+                PackedRoute::from_raw(packed.get()),
+                packed,
+                "raw round trip for shard {shard} slot {slot}"
+            );
+        }
+    }
+
+    /// The two fields must partition the u32 exactly: no bit belongs to both
+    /// and none to neither, or a route would decode as a different one.
+    #[test]
+    fn the_two_fields_partition_the_whole_word() {
+        let all_slot = PackedRoute::new(ShardId::new(0), PackedRoute::MAX_SLOT);
+        let all_shard = PackedRoute::new(ShardId::new(PackedRoute::MAX_SHARD as usize), 0);
+        assert_eq!(all_slot.get() & all_shard.get(), 0, "fields must not overlap");
+        assert_eq!(all_slot.get() | all_shard.get(), u32::MAX, "fields must cover the word");
+    }
+
+    #[test]
+    fn try_new_rejects_out_of_range_rather_than_truncating() {
+        assert!(PackedRoute::try_new(ShardId::new(0), PackedRoute::MAX_SLOT).is_some());
+        assert!(
+            PackedRoute::try_new(ShardId::new(0), PackedRoute::MAX_SLOT.saturating_add(1))
+                .is_none(),
+            "a slot one past the field must fail, not wrap into the shard bits"
+        );
+        let max_shard = PackedRoute::MAX_SHARD as usize;
+        assert!(PackedRoute::try_new(ShardId::new(max_shard), 0).is_some());
+        assert!(
+            PackedRoute::try_new(ShardId::new(max_shard.saturating_add(1)), 0).is_none(),
+            "a shard one past the field must fail, not truncate"
+        );
+    }
+
+    /// The families share a representation and must not share a meaning: the
+    /// same bits read as a transport route and as a route id decode
+    /// identically, which is exactly why nothing may convert between them
+    /// implicitly.
+    #[test]
+    fn the_two_route_families_share_bits_but_not_identity() {
+        let bits = PackedRoute::new(ShardId::new(9), 1234);
+        let transport = TransportRoute::from_packed(bits);
+        let endpoint = RouteId::from_packed(bits);
+        assert_eq!(transport.shard(), endpoint.shard());
+        assert_eq!(transport.slot(), endpoint.slot());
+        assert_eq!(transport.get(), endpoint.get());
+        assert_ne!(
+            transport.to_string(),
+            endpoint.to_string(),
+            "they must at least be distinguishable in a log line"
+        );
+    }
+
+    // ── Phase 1: the transport table ─────────────────────────────────────
+
+    fn participant(n: u32) -> ParticipantKey {
+        use slotmap::KeyData;
+        ParticipantKey::from(KeyData::from_ffi(u64::from(n) | (1 << 32)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_route_resolves_to_its_participant_until_retired() {
+        let mut table = TransportTable::new(ShardId::new(5));
+        let key = participant(1);
+        let handle = table.install(key, Instant::now()).unwrap();
+
+        assert_eq!(handle.shard(), ShardId::new(5), "the route carries its owner");
+        assert_eq!(table.resolve(handle), Some(key));
+
+        assert!(table.retire(handle, Instant::now()));
+        assert_eq!(table.resolve(handle), None, "a retired route resolves to nothing");
+        assert_eq!(table.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retiring_a_transport_route_twice_is_harmless() {
+        let mut table = TransportTable::new(ShardId::new(0));
+        let handle = table.install(participant(1), Instant::now()).unwrap();
+        assert!(table.retire(handle, Instant::now()));
+        assert!(
+            !table.retire(handle, Instant::now()),
+            "a redelivered teardown must not report success"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_epoch_cannot_reach_the_participant_that_replaced_it() {
+        let mut table = TransportTable::new(ShardId::new(0));
+        let first = table.install(participant(1), Instant::now()).unwrap();
+        assert!(table.retire(first, Instant::now()));
+
+        tokio::time::advance(ROUTE_QUARANTINE).await;
+        let second = table.install(participant(2), Instant::now()).unwrap();
+
+        assert_eq!(second.route, first.route, "the slot should come back");
+        assert_ne!(second.epoch, first.epoch, "but as a new incarnation");
+        assert_eq!(
+            table.resolve(first),
+            None,
+            "the old handle must not reach the new tenant"
+        );
+        assert_eq!(table.resolve(second), Some(participant(2)));
+    }
+
+    /// A retired slot is quarantined by its *slot* number. Storing the packed
+    /// route instead worked only on shard 0, where the shard bits are zero —
+    /// on any other shard the queue held a number far outside the table and
+    /// the slot never came back.
+    #[tokio::test(start_paused = true)]
+    async fn a_slot_returns_from_quarantine_on_a_shard_other_than_zero() {
+        for table_shard in [0usize, 1, 41] {
+            let mut table = RouteTable::new(ShardId::new(table_shard));
+            let now = Instant::now();
+            let (id, epoch) = table
+                .install(action(), names(), NtpTime::ZERO, now)
+                .unwrap();
+            assert!(table.retire(id, epoch, now));
+
+            tokio::time::advance(ROUTE_QUARANTINE).await;
+            let (reused, reused_epoch) = table
+                .install(action(), names(), NtpTime::ZERO, Instant::now())
+                .unwrap();
+
+            assert_eq!(reused, id, "shard {table_shard}: the slot must come back");
+            assert_ne!(
+                reused_epoch, epoch,
+                "shard {table_shard}: reuse must bump the epoch"
+            );
+            assert_eq!(
+                reused.shard(),
+                ShardId::new(table_shard),
+                "shard {table_shard}: a reused route still carries its owner"
+            );
+        }
+    }
+
+    /// The two families index different tables, so the same slot number is
+    /// two unrelated things. Nothing may leak between them.
+    #[tokio::test(start_paused = true)]
+    async fn the_two_namespaces_allocate_independently() {
+        let shard = ShardId::new(2);
+        let mut routes = RouteTable::new(shard);
+        let mut transports = TransportTable::new(shard);
+        let now = Instant::now();
+
+        let (endpoint, _) = routes
+            .install(action(), names(), NtpTime::ZERO, now)
+            .unwrap();
+        let transport = transports.install(participant(1), now).unwrap();
+
+        assert_eq!(
+            endpoint.slot(),
+            transport.route.slot(),
+            "both namespaces start at slot zero, which is the point"
+        );
+        assert_eq!(transports.resolve(transport), Some(participant(1)));
+        assert!(routes.get(endpoint).is_some());
     }
 }

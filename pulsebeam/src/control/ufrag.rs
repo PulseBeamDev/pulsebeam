@@ -1,4 +1,4 @@
-use crate::route::RouteId;
+use crate::route::{TransportHandle, TransportRoute};
 use str0m::IceCreds;
 
 /// Wire layout — 10 bytes → 16 Crockford base32 chars (80 bits / 5 = 16, exact):
@@ -29,16 +29,21 @@ use str0m::IceCreds;
 /// ufrag; there is no stable identity here for it to survive under.
 ///
 /// The ICE password is 15 random bytes → 24 Crockford chars (≥ RFC 8445 minimum of 22).
-const VERSION: u8 = 0;
-const RAW_LEN: usize = 10;
 const PASS_RAW_LEN: usize = 15;
 /// Exact length (in ASCII characters) of a v0 encoded ICE ufrag:
 /// 10 bytes × 8 bits / 5 bits-per-Crockford-char = 16 chars, no padding.
-pub const ENCODED_LEN: usize = 16;
+pub const ENCODED_LEN: usize = pulsebeam_routing::ufrag::ENCODED_LEN;
 
 /// Structured ICE ufrag that encodes all routing metadata needed to forward a
 /// STUN binding request to the correct shard and route — without any
 /// distributed lookup.
+///
+/// The wire encoding itself (the Crockford base32 codec and the byte layout)
+/// lives in `pulsebeam_routing::ufrag`, the shared no_std crate the Aya eBPF
+/// program and the simulator's steering adapter also parse against. This
+/// type is a thin conversion layer over that shared codec, translating
+/// between `pulsebeam_routing::TransportRoute` (a bare `u16` shard) and
+/// `pulsebeam`'s own [`TransportRoute`] (over [`crate::id::ShardId`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IceUfrag {
     /// Which cluster this node belongs to.  0 for single-cluster deployments.
@@ -46,8 +51,8 @@ pub struct IceUfrag {
     /// Which node within the cluster.  0 for single-node deployments.
     pub node_id: u16,
     /// The client's ICE association. Carries its own destination shard —
-    /// see [`RouteId`] — so nothing else here needs to.
-    pub route: RouteId,
+    /// see [`TransportRoute`] — so nothing else here needs to.
+    pub transport: TransportRoute,
     /// The route's incarnation, checked the same way every other arrival is.
     pub epoch: u16,
 }
@@ -56,7 +61,7 @@ impl IceUfrag {
     /// Exact encoded length in ASCII characters (Crockford base32, no padding).
     pub const ENCODED_LEN: usize = ENCODED_LEN;
 
-    pub fn new(cluster_id: u16, node_id: u16, route: RouteId, epoch: u16) -> Self {
+    pub fn new(cluster_id: u16, node_id: u16, transport: TransportRoute, epoch: u16) -> Self {
         debug_assert!(
             cluster_id < 4096,
             "cluster_id must fit in 12 bits (max 4095)"
@@ -64,46 +69,53 @@ impl IceUfrag {
         Self {
             cluster_id,
             node_id,
-            route,
+            transport,
             epoch,
+        }
+    }
+
+    /// The `(route, epoch)` pair the receiver validates against.
+    pub const fn handle(&self) -> TransportHandle {
+        TransportHandle::new(self.transport, self.epoch)
+    }
+
+    fn to_shared(self) -> pulsebeam_routing::ufrag::IceUfrag {
+        let route = pulsebeam_routing::TransportRoute::from_raw(self.transport.get());
+        debug_assert_eq!(
+            usize::from(route.shard()),
+            self.transport.shard().index(),
+            "shard must survive the pulsebeam <-> pulsebeam-routing TransportRoute conversion"
+        );
+        pulsebeam_routing::ufrag::IceUfrag::new(self.cluster_id, self.node_id, route, self.epoch)
+    }
+
+    fn from_shared(shared: pulsebeam_routing::ufrag::IceUfrag) -> Self {
+        let route = TransportRoute::from_raw(shared.transport.get());
+        debug_assert_eq!(
+            route.shard().index(),
+            usize::from(shared.transport.shard()),
+            "shard must survive the pulsebeam-routing <-> pulsebeam TransportRoute conversion"
+        );
+        Self {
+            cluster_id: shared.cluster_id,
+            node_id: shared.node_id,
+            transport: route,
+            epoch: shared.epoch,
         }
     }
 
     /// Encode to a 16-character Crockford base32 string for use as an ICE ufrag.
     /// All output characters are in [A-Z0-9], valid `ice-char` per RFC 8445.
     pub fn encode(&self) -> String {
-        let mut raw = [0u8; RAW_LEN];
-        raw[0] = (VERSION << 4) | ((self.cluster_id >> 8) as u8 & 0x0f);
-        raw[1] = (self.cluster_id & 0xff) as u8;
-        raw[2..4].copy_from_slice(&self.node_id.to_be_bytes());
-        raw[4..8].copy_from_slice(&self.route.get().to_be_bytes());
-        raw[8..10].copy_from_slice(&self.epoch.to_be_bytes());
-        base32::encode(base32::Alphabet::Crockford, &raw)
+        let ascii = self.to_shared().encode_ascii();
+        ascii.iter().map(|&b| b as char).collect()
     }
 
     /// Decode from a Crockford base32 string.  Returns `None` if the string is
     /// the wrong length, malformed, or carries an unknown version number.
     pub fn decode(s: &str) -> Option<Self> {
-        let raw = base32::decode(base32::Alphabet::Crockford, s)?;
-        if raw.len() != RAW_LEN {
-            return None;
-        }
-        let [c_hi, c_lo, n0, n1, r0, r1, r2, r3, e0, e1] = raw[..] else {
-            return None;
-        };
-        if c_hi >> 4 != VERSION {
-            return None;
-        }
-        let cluster_id = (u16::from(c_hi & 0x0f) << 8) | u16::from(c_lo);
-        let node_id = u16::from_be_bytes([n0, n1]);
-        let route = RouteId::from_raw(u32::from_be_bytes([r0, r1, r2, r3]));
-        let epoch = u16::from_be_bytes([e0, e1]);
-        Some(Self {
-            cluster_id,
-            node_id,
-            route,
-            epoch,
-        })
+        let shared = pulsebeam_routing::ufrag::IceUfrag::decode_ascii(s.as_bytes())?;
+        Some(Self::from_shared(shared))
     }
 
     /// Build complete `IceCreds` (encoded ufrag + random password) ready to
@@ -128,8 +140,8 @@ mod tests {
     use crate::id::ShardId;
     use pulsebeam_runtime::rand::os_rng;
 
-    fn route(shard: usize, slot: u32) -> RouteId {
-        RouteId::new(ShardId::new(shard), slot)
+    fn route(shard: usize, slot: u32) -> TransportRoute {
+        TransportRoute::new(ShardId::new(shard), slot)
     }
 
     #[test]
@@ -177,6 +189,14 @@ mod tests {
     fn the_route_s_own_shard_survives_the_round_trip() {
         let u = IceUfrag::new(0, 0, route(9, 1), 0);
         let decoded = IceUfrag::decode(&u.encode()).unwrap();
-        assert_eq!(decoded.route.shard(), ShardId::new(9));
+        assert_eq!(decoded.transport.shard(), ShardId::new(9));
+    }
+
+    #[test]
+    fn matches_shared_crate_encoding_for_the_same_fields() {
+        let u = IceUfrag::new(0xabc, 0x1234, route(7, 12345), 42);
+        let shared =
+            pulsebeam_routing::ufrag::IceUfrag::new(0xabc, 0x1234, pulsebeam_routing::TransportRoute::new(7, 12345), 42);
+        assert_eq!(u.encode().as_bytes(), shared.encode_ascii().as_slice());
     }
 }

@@ -11,7 +11,7 @@ use slotmap::SlotMap;
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::TrackId;
 use crate::id::ShardId;
-use crate::route::{RemoteRoute, ReverseRoute, RouteTable};
+use crate::route::{RemoteRoute, RouteHandle, RouteTable, TransportTable};
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::Topic;
 
@@ -124,7 +124,7 @@ impl DataStreamRoute {
 /// Where to send keyframe requests for a track published on another shard, and
 /// the encoding order needed to name one of its layers.
 pub(crate) struct TrackReverseTarget {
-    pub route: ReverseRoute,
+    pub route: RouteHandle,
     pub encodings: Vec<Option<str0m::media::Rid>>,
 }
 
@@ -161,7 +161,7 @@ pub(crate) struct TrackRoute {
     pub published: bool,
     /// This shard's own reverse route for the track, opened alongside
     /// `published` and retired with it.
-    pub reverse_route: Option<ReverseRoute>,
+    pub reverse_route: Option<RouteHandle>,
     /// Where *this* shard sends its own reverse traffic when it is a
     /// destination for a track published elsewhere — learned from the
     /// publish announcement or the late-join replay, whichever comes first.
@@ -338,10 +338,10 @@ pub(crate) struct ReliableStream {
     pub remote_routes: Vec<RemoteRoute>,
     /// This shard's own reverse route for the topic, opened alongside
     /// `published` and retired with it.
-    pub reverse_route: Option<ReverseRoute>,
+    pub reverse_route: Option<RouteHandle>,
     /// Where this shard sends acks when it is a destination for a topic
     /// published elsewhere — learned from the publish announcement.
-    pub reverse_target: Option<ReverseRoute>,
+    pub reverse_target: Option<RouteHandle>,
 }
 
 impl ReliableStream {
@@ -381,6 +381,10 @@ pub(crate) struct DataPlane {
     /// Routes this shard has installed as a *destination*, indexed by the id it
     /// handed out. Frames arriving from other shards resolve here.
     pub routes: RouteTable,
+    /// Client ICE associations this shard owns, indexed by the transport route
+    /// its ufrag carries. A separate namespace from `routes` — see
+    /// [`TransportTable`].
+    pub transports: TransportTable,
 }
 
 impl DataPlane {
@@ -391,6 +395,7 @@ impl DataPlane {
             data_streams: SlotMap::with_key(),
             reliable_streams: SlotMap::with_key(),
             routes: RouteTable::new(shard_id),
+            transports: TransportTable::new(shard_id),
         }
     }
 }

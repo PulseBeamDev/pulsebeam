@@ -9,7 +9,7 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
-use crate::route::{MediaEnvelope, ReverseRoute, RouteEnvelope, RouteId};
+use crate::route::{MediaEnvelope, RouteEnvelope, RouteHandle, RouteId, TransportHandle};
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -85,10 +85,26 @@ pub enum ShardCommand {
     /// only be minted by the shard that will own it, and the ufrag has to
     /// carry a real one. `None` means the route table is exhausted; nothing
     /// is left reserved in that case.
-    ReserveIngress {
+    /// Build the runtime binding a control-plane transaction has allocated a
+    /// transport route for.
+    ///
+    /// The shard decides nothing: the address arrives already chosen, and the
+    /// shard replies with the arena key it reserved on its own core. The route
+    /// does not resolve until the control plane publishes the view carrying
+    /// it. `None` means the shard could not reserve a key; nothing is left
+    /// behind in that case.
+    PrepareTransport {
         participant_id: ParticipantId,
-        room_id: RoomId,
-        reply: tokio::sync::oneshot::Sender<Option<(RouteId, u16)>>,
+        handle: TransportHandle,
+        reply: tokio::sync::oneshot::Sender<Option<crate::shard::participants::ParticipantKey>>,
+    },
+    /// The generation barrier. The shard replies with the generation it can
+    /// currently resolve against, which is at least `generation` because the
+    /// control plane published before sending this and the mailbox preserves
+    /// that order.
+    AckGeneration {
+        generation: u64,
+        reply: tokio::sync::oneshot::Sender<u64>,
     },
     /// Release a reservation that never reached `AddParticipant` — the
     /// negotiation that would have populated it failed after the route was
@@ -188,7 +204,7 @@ pub enum Topology {
         publisher: ParticipantId,
         topic: Topic,
         /// Where subscribers send this topic's application-level acks.
-        reverse: Option<ReverseRoute>,
+        reverse: Option<RouteHandle>,
     },
 }
 
@@ -200,11 +216,16 @@ pub enum Topology {
 /// both ends have that from the control plane — so a rid never travels.
 ///
 /// ```text
-/// RouteEnvelope(8) | tag(1) | body
-///   Keyframe  layer(1) kind(1)        -> 11 bytes
-///   Nack      layer(1) pid(2) blp(2)  -> 14 bytes
-///   DataAck   len(2) payload(len)     -> 11 + len
+/// Envelope(16) | tag(1) | body
+///   Keyframe  layer(1) kind(1)        -> 19 bytes
+///   Nack      layer(1) pid(2) blp(2)  -> 22 bytes
+///   DataAck   len(2) payload(len)     -> 19 + len
 /// ```
+///
+/// The header is the same 16 bytes every other payload family uses. A shorter
+/// reverse-only header would save eight bytes per request and cost a second
+/// route offset on the wire, which is the one thing the steering program
+/// cannot afford to have two of.
 #[derive(Debug, Clone)]
 pub enum Reverse {
     /// Ask for a keyframe on one encoding.
@@ -240,6 +261,10 @@ pub enum MediaPayload {
 /// Best-effort by construction. Cross-node this becomes a UDP datagram, so
 /// nothing that must not be dropped is representable here — topology travels
 /// the control plane ([`ShardCommand`] / [`ShardEvent`]) and never this way.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing MediaPayload would put a heap allocation on every forwarded media frame; the mesh moves these by value precisely to avoid that, and the ratio only became visible once ShardFrame::Ingress was deleted"
+)]
 pub enum ShardFrame {
     /// Forward payload, addressed by the destination's own route. Carries no
     /// semantic ids: everything needed to deliver it lives in the destination's
@@ -267,17 +292,6 @@ pub enum ShardFrame {
     Stats {
         env: RouteEnvelope,
         stats: crate::track::TrackStates,
-    },
-    /// A datagram batch that landed on the wrong shard's socket —
-    /// `SO_REUSEPORT` picks the receiving socket by 5-tuple hash, which has
-    /// nothing to do with which shard owns the route. Node-local with no
-    /// cross-node analogue, so it is addressed by the route the ufrag
-    /// carried, resolved by the receiving shard the same way every other
-    /// arrival is.
-    Ingress {
-        route: RouteId,
-        epoch: u16,
-        batch: RecvPacketBatch,
     },
 }
 
@@ -388,7 +402,7 @@ impl ShardWorker {
         clippy::disallowed_types,
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
-    pub fn new(
+    pub(crate) fn new(
         shard_id: ShardId,
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
@@ -399,8 +413,9 @@ impl ShardWorker {
         metrics: Arc<ShardMetrics>,
         rng: Rng,
         wall: WallAnchor,
+        view: crate::view::ShardViewReader,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall);
+        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall, view);
         let router = ChannelTransport {
             shard_id,
             frame_txs,
@@ -493,7 +508,7 @@ impl ShardWorker {
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
         let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
         for batch in self.recv_batch.drain(..) {
-            self.core.on_udp_batch(batch, &self.router);
+            self.core.on_udp_batch(batch);
         }
 
         self.core
@@ -564,7 +579,7 @@ mod reverse_tests {
     /// rather than in a datagram.
     #[test]
     fn reverse_bodies_stay_compact() {
-        const HEADER: usize = crate::route::ROUTE_ENVELOPE_LEN + 1; // envelope + tag
+        const HEADER: usize = crate::route::ENVELOPE_LEN + 1; // envelope + tag
 
         fn wire_len(body: &Reverse) -> usize {
             HEADER
@@ -580,8 +595,8 @@ mod reverse_tests {
                 layer: 0,
                 kind: KeyframeRequestKind::Pli,
             }),
-            11,
-            "a keyframe request must fit the documented 11 bytes"
+            19,
+            "a keyframe request must fit the documented 19 bytes"
         );
         assert_eq!(
             wire_len(&Reverse::Nack {
@@ -589,10 +604,10 @@ mod reverse_tests {
                 pid: 1,
                 blp: 0,
             }),
-            14,
-            "a NACK must fit the documented 14 bytes"
+            22,
+            "a NACK must fit the documented 22 bytes"
         );
-        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 19);
+        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 27);
     }
 
     /// An encoding is named by index, never by rid: the index is derivable from

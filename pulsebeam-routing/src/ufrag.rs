@@ -98,8 +98,8 @@ pub(crate) fn decode_ascii_detailed(s: &[u8]) -> Result<IceUfrag, UfragDecodeErr
     let v14 = crockford_value(c14).ok_or(UfragDecodeError::BadEncoding)?;
     let v15 = crockford_value(c15).ok_or(UfragDecodeError::BadEncoding)?;
 
-    let [b0, b1, b2, b3, b4] = decode_chunk(v0, v1, v2, v3, v4, v5, v6, v7);
-    let [b5, b6, b7, b8, b9] = decode_chunk(v8, v9, v10, v11, v12, v13, v14, v15);
+    let [b0, b1, b2, b3, b4] = decode_chunk([v0, v1, v2, v3, v4, v5, v6, v7]);
+    let [b5, b6, b7, b8, b9] = decode_chunk([v8, v9, v10, v11, v12, v13, v14, v15]);
     decode_raw_detailed(&[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9])
 }
 
@@ -188,7 +188,8 @@ fn encode_chunk(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8) -> [u8; 8] {
     ]
 }
 
-fn decode_chunk(v0: u8, v1: u8, v2: u8, v3: u8, v4: u8, v5: u8, v6: u8, v7: u8) -> [u8; 5] {
+fn decode_chunk(v: [u8; 8]) -> [u8; 5] {
+    let [v0, v1, v2, v3, v4, v5, v6, v7] = v;
     [
         (v0 << 3) | (v1 >> 2),
         (v1 << 6) | (v2 << 1) | (v3 >> 4),
@@ -280,7 +281,7 @@ mod tests {
         let mut state: u64 = 0x243F_6A88_85A3_08D3;
         for _ in 0..2000 {
             let mut raw = [0u8; RAW_LEN];
-            for byte in raw.iter_mut() {
+            for byte in &mut raw {
                 state = state
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);

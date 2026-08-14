@@ -11,7 +11,7 @@ use crate::{
     entity::ParticipantId,
     id::ShardId,
     participant::{ParticipantConfig, ParticipantCore},
-    route::RouteId,
+    route::{TransportHandle, TransportRoute},
     shard::demux::Demuxer,
 };
 
@@ -27,7 +27,7 @@ new_key_type! {
     /// carried `participant_id` for lookups that never needed a name —
     /// `resolve_mut` and friends check the key against the arena, not a
     /// cached copy of who used to be there.
-    pub(crate) struct ParticipantKey;
+    pub struct ParticipantKey;
 }
 
 pub(crate) struct ParticipantMeta {
@@ -37,7 +37,7 @@ pub(crate) struct ParticipantMeta {
     /// and free the demuxer's cache entries for it. Route and key share a
     /// lifetime by construction, but the route table and the demuxer are
     /// reached separately, so both need the value.
-    pub(super) ingress_route: RouteId,
+    pub(super) ingress_route: TransportRoute,
     pub(super) ingress_epoch: u16,
 }
 
@@ -70,7 +70,7 @@ pub(crate) struct ParticipantRegistry {
     /// built from the route has to exist before negotiation can produce the
     /// `ParticipantConfig` `populate` needs. Entries here never outlive a
     /// reservation: `populate` consumes one, `release_reserved` drops it.
-    pending_ingress: HashMap<ParticipantKey, (RouteId, u16)>,
+    pending_ingress: HashMap<ParticipantKey, TransportHandle>,
     demuxer: Demuxer,
     /// Addresses freed by a removal/unregister, waiting for the worker to
     /// actually close the sockets during the output phase.
@@ -108,12 +108,12 @@ impl ParticipantRegistry {
     /// Record the route `install_ingress_route` installed for a reserved
     /// key, so `populate` can carry it onto the finished `ParticipantMeta`
     /// once negotiation completes.
-    pub fn stash_ingress(&mut self, key: ParticipantKey, route: RouteId, epoch: u16) {
+    pub fn stash_ingress(&mut self, key: ParticipantKey, handle: TransportHandle) {
         debug_assert!(
             self.participants.get(key).is_some_and(Option::is_none),
             "stash_ingress called on a key that isn't a bare reservation"
         );
-        self.pending_ingress.insert(key, (route, epoch));
+        self.pending_ingress.insert(key, handle);
     }
 
     /// Fill in a slot `reserve` minted, once negotiation completes. Consumes
@@ -122,10 +122,11 @@ impl ParticipantRegistry {
     /// back to an unaddressable placeholder.
     pub fn populate(&mut self, key: ParticipantKey, cfg: ParticipantConfig, rng: &mut Rng) {
         let participant_id = cfg.participant_id;
-        let (ingress_route, ingress_epoch) = self
+        let handle = self
             .pending_ingress
             .remove(&key)
-            .unwrap_or((RouteId::from_raw(0), 0));
+            .unwrap_or(TransportHandle::new(TransportRoute::from_raw(0), 0));
+        let (ingress_route, ingress_epoch) = (handle.route, handle.epoch);
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -222,14 +223,14 @@ impl ParticipantRegistry {
         self.participants.get_mut(key)?.as_mut()
     }
 
-    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<(RouteId, u16)> {
+    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<TransportHandle> {
         self.demuxer.demux(batch)
     }
 
     /// The route `stash_ingress` recorded for a reservation that never
     /// reached `populate` — read (without consuming) by the cancellation
     /// path so it can retire the route before calling `release_reserved`.
-    pub fn pending_ingress_of(&self, key: ParticipantKey) -> Option<(RouteId, u16)> {
+    pub fn pending_ingress_of(&self, key: ParticipantKey) -> Option<TransportHandle> {
         self.pending_ingress.get(&key).copied()
     }
 
@@ -353,7 +354,7 @@ mod tests {
             "a bare reservation must not count as present"
         );
 
-        registry.stash_ingress(key, RouteId::from_raw(1), 3);
+        registry.stash_ingress(key, TransportHandle::new(TransportRoute::from_raw(1), 3));
         registry.populate(key, cfg(p, room_id("r6")), &mut rng);
         assert!(
             registry.resolve_mut(key).is_some(),

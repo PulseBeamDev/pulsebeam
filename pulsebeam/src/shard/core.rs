@@ -11,7 +11,7 @@ use super::events::{
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
-    entity::{AudioOrigin, ParticipantId, RoomId, TrackId, TrackKind},
+    entity::{AudioOrigin, ParticipantId, TrackId, TrackKind},
     id::ShardId,
     participant::{ParticipantConfig, batcher::GsoSendBatch},
     rtp::RtpPacket,
@@ -177,6 +177,9 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 
 pub(crate) struct ShardCore {
     pub(crate) shard_id: ShardId,
+    /// The only routing state this shard reads. Written by the control plane,
+    /// never by anything here.
+    view: crate::view::ShardViewReader,
     registry: ParticipantRegistry,
     pub(super) routing: ShardRoutingTable,
     timers: TimerWheel,
@@ -193,10 +196,17 @@ impl ShardCore {
         max_gso_segments: usize,
         rng: Rng,
         wall: WallAnchor,
+        view: crate::view::ShardViewReader,
     ) -> Self {
         let shard_id = shard_id.into();
+        debug_assert_eq!(
+            view.shard_id(),
+            shard_id,
+            "a shard may only read its own view"
+        );
         Self {
             shard_id,
+            view,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
             routing: ShardRoutingTable::new(shard_id),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
@@ -384,40 +394,37 @@ impl ShardCore {
         });
     }
 
-    pub(crate) fn on_udp_batch(
-        &mut self,
-        batch: pulsebeam_runtime::net::RecvPacketBatch,
-        router: &impl ShardTransport,
-    ) {
-        let Some((route, epoch)) = self.registry.demux(&batch) else {
+    pub(crate) fn on_udp_batch(&mut self, batch: pulsebeam_runtime::net::RecvPacketBatch) {
+        let Some(handle) = self.registry.demux(&batch) else {
             return;
         };
-        self.dispatch_ingress(route, epoch, batch, router);
+        self.dispatch_ingress(handle, batch);
     }
 
-    /// Everything downstream of here is index-addressed: `route.shard()` is
-    /// read once to decide forward-or-resolve, never hashed, and a route
-    /// this shard owns resolves straight to the participant key it was
-    /// installed for.
+    /// A route's encoded shard is its owner. Steering already picked this
+    /// socket from those bits, so a packet arriving here for another shard is
+    /// a misdelivery — dropped and counted, never put on a mailbox. There is
+    /// no forwarding path left to fall back to.
     fn dispatch_ingress(
         &mut self,
-        route: crate::route::RouteId,
-        epoch: u16,
+        handle: crate::route::TransportHandle,
         batch: pulsebeam_runtime::net::RecvPacketBatch,
-        router: &impl ShardTransport,
     ) {
-        if route.shard() != self.shard_id {
-            router.send_frame(
-                route.shard(),
-                ShardFrame::Ingress {
-                    route,
-                    epoch,
-                    batch,
-                },
+        if handle.shard() != self.shard_id {
+            debug_assert!(
+                false,
+                "shard {} received a batch for {}",
+                self.shard_id,
+                handle.shard()
             );
+            metrics::counter!("shard_wrong_owner_drop").increment(1);
             return;
         }
-        let Some(key) = self.routing.resolve_ingress(route, epoch) else {
+        let Some(key) = self
+            .view
+            .enter()
+            .and_then(|view| view.transports.resolve(handle))
+        else {
             return;
         };
         let Some(participant) = self.registry.resolve_mut(key) else {
@@ -711,7 +718,7 @@ impl ShardCore {
                                 router.send_frame(
                                     req.shard_id,
                                     ShardFrame::Reverse {
-                                        env: RouteEnvelope::new(target),
+                                        env: RouteEnvelope::feedback(target),
                                         body: Reverse::Keyframe {
                                             layer,
                                             kind: req.kind,
@@ -813,62 +820,77 @@ impl ShardCore {
             ShardCommand::AddTcpConnection { .. } => {
                 // Handled by the shard worker directly; no core action needed.
             }
-            ShardCommand::ReserveIngress {
+            ShardCommand::PrepareTransport {
                 participant_id,
-                room_id,
+                handle,
                 reply,
-            } => self.reserve_ingress(participant_id, room_id, now, reply),
+            } => self.prepare_transport(participant_id, handle, reply),
+            ShardCommand::AckGeneration { generation, reply } => {
+                self.ack_generation(generation, reply);
+            }
             ShardCommand::CancelReservation { participant_id } => {
-                self.cancel_reservation(&participant_id, now);
+                self.cancel_reservation(&participant_id);
             }
             cmd => self.on_control_command(cmd, now, router)?,
         }
         Some(())
     }
 
-    /// Bounded retries for a transient install failure — buggify's
-    /// exhaustion fault fires independently per call, so a few attempts
-    /// clear it almost certainly; a genuinely full table fails every attempt
-    /// just as fast, so the retry costs nothing in that case either.
-    const INGRESS_INSTALL_ATTEMPTS: u32 = 10;
-
-    /// Mint a participant slot and its ingress route in one step, so the
-    /// caller's ufrag always names a route that already resolves — a
-    /// reservation the route install failed for leaves nothing behind.
+    /// Reserve the arena slot the control plane's transport route will point
+    /// at, and report its key back.
     ///
-    /// Every other install failure in this codebase recovers by a later,
-    /// externally-triggered retry (the next subscribe, the next publish).
-    /// Connection setup has no such later trigger to lean on — a client
-    /// only gets this one attempt before it sees the join itself fail — so
-    /// the retry has to happen here instead.
-    fn reserve_ingress(
+    /// This is the whole of the shard's part in a transport lifecycle: it
+    /// does not allocate the address, does not decide whether the route is
+    /// legal, and does not make it resolvable — the route resolves when the
+    /// control plane publishes the view carrying this key.
+    ///
+    /// Idempotent, because a retry after a lost reply must not mint a second
+    /// participant: a key already reserved for this id is reported again.
+    fn prepare_transport(
         &mut self,
         participant_id: ParticipantId,
-        room_id: RoomId,
-        now: Instant,
-        reply: tokio::sync::oneshot::Sender<Option<(crate::route::RouteId, u16)>>,
+        handle: crate::route::TransportHandle,
+        reply: tokio::sync::oneshot::Sender<Option<ParticipantKey>>,
     ) {
-        let key = self.registry.reserve(participant_id);
-        for attempt in 1..=Self::INGRESS_INSTALL_ATTEMPTS {
-            if let Some((route, epoch)) =
-                self.routing
-                    .install_ingress_route(key, participant_id, room_id, now, &self.wall)
-            {
-                self.registry.stash_ingress(key, route, epoch);
-                let _ = reply.send(Some((route, epoch)));
-                return;
-            }
-            tracing::warn!(
-                %participant_id,
-                attempt,
-                "ingress route install failed, retrying"
-            );
+        debug_assert_eq!(
+            handle.shard(),
+            self.shard_id,
+            "only the owning shard prepares a transport binding"
+        );
+        if handle.shard() != self.shard_id {
+            let _ = reply.send(None);
+            return;
         }
-        self.registry.release_reserved(key);
-        let _ = reply.send(None);
+
+        if let Some(existing) = self.registry.key_of(&participant_id)
+            && self.registry.pending_ingress_of(existing).is_some()
+        {
+            let _ = reply.send(Some(existing));
+            return;
+        }
+
+        let key = self.registry.reserve(participant_id);
+        self.registry.stash_ingress(key, handle);
+        let _ = reply.send(Some(key));
     }
 
-    fn cancel_reservation(&mut self, participant_id: &ParticipantId, now: Instant) {
+    /// Report the generation this shard can currently resolve against.
+    ///
+    /// The control plane published before sending this command and the
+    /// mailbox preserves that order, so the answer is always at least the
+    /// generation being waited on — the assertion is what would catch that
+    /// stopping being true.
+    fn ack_generation(&mut self, generation: u64, reply: tokio::sync::oneshot::Sender<u64>) {
+        let observed = self.view.generation();
+        debug_assert!(
+            observed >= generation,
+            "shard {} sees generation {observed}, expected at least {generation}",
+            self.shard_id
+        );
+        let _ = reply.send(observed);
+    }
+
+    fn cancel_reservation(&mut self, participant_id: &ParticipantId) {
         let Some(key) = self.registry.key_of(participant_id) else {
             return;
         };
@@ -877,9 +899,6 @@ impl ShardCore {
         // itself refuses a populated slot only in debug builds.
         if self.registry.resolve_mut(key).is_some() {
             return;
-        }
-        if let Some((route, epoch)) = self.registry.pending_ingress_of(key) {
-            self.routing.retire_ingress_route(route, epoch, now);
         }
         self.registry.release_reserved(key);
     }
@@ -894,7 +913,8 @@ impl ShardCore {
             ShardCommand::AddParticipant(_)
             | ShardCommand::RemoveParticipant(_)
             | ShardCommand::AddTcpConnection { .. }
-            | ShardCommand::ReserveIngress { .. }
+            | ShardCommand::PrepareTransport { .. }
+            | ShardCommand::AckGeneration { .. }
             | ShardCommand::CancelReservation { .. } => pulsebeam_runtime::fatal!(
                 "a command handled by the outer match reached the inner one; the two have drifted apart"
             ),
@@ -1112,13 +1132,6 @@ impl ShardCore {
             ShardFrame::Media { env, payload } => {
                 self.on_media_frame(env, payload, now, router);
             }
-            ShardFrame::Ingress {
-                route,
-                epoch,
-                batch,
-            } => {
-                self.dispatch_ingress(route, epoch, batch, router);
-            }
             ShardFrame::Reverse { env, body } => {
                 self.on_reverse_frame(env, body, router);
             }
@@ -1273,8 +1286,10 @@ impl ShardCore {
         let key = self.registry.key_of(participant_id)?;
         self.timers.cancel(key);
         let meta = self.registry.remove(participant_id)?;
-        self.routing
-            .retire_ingress_route(meta.ingress_route, meta.ingress_epoch, now);
+        self.routing.retire_ingress_route(
+            crate::route::TransportHandle::new(meta.ingress_route, meta.ingress_epoch),
+            now,
+        );
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
             .remove_local_member(participant_id, key, meta.room_id, audio_ids, now);
@@ -1378,12 +1393,22 @@ mod test {
     }
 
     fn new_core() -> ShardCore {
-        ShardCore::new(
+        new_core_with_view().0
+    }
+
+    /// The writer is returned so a test that needs a route to resolve can
+    /// publish one — dropping it is fine, the last published view stays
+    /// readable.
+    fn new_core_with_view() -> (ShardCore, crate::view::ShardViewWriter) {
+        let (writer, reader) = crate::view::new_shard_view(ShardId::new(0));
+        let core = ShardCore::new(
             0,
             1,
             pulsebeam_runtime::rand::seeded_rng(42),
             WallAnchor::new(std::time::SystemTime::now(), Instant::now()),
-        )
+            reader,
+        );
+        (core, writer)
     }
 
     fn clear_dirty(core: &mut ShardCore) {
@@ -1600,7 +1625,7 @@ mod test {
 
         core.on_shard_frame(
             ShardFrame::Reverse {
-                env: RouteEnvelope::new(target),
+                env: RouteEnvelope::feedback(target),
                 body: Reverse::Keyframe {
                     layer: 0,
                     kind: str0m::media::KeyframeRequestKind::Pli,

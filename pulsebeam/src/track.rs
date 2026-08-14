@@ -392,7 +392,7 @@ pub struct Track {
     /// publisher's shard when it publishes, then carried to every other shard
     /// by the control plane: the compiled reverse plan, so the data plane never
     /// has to name the track to ask for anything.
-    pub reverse: Option<crate::route::ReverseRoute>,
+    pub reverse: Option<crate::route::RouteHandle>,
 }
 
 impl Track {

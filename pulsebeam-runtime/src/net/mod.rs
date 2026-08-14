@@ -121,9 +121,10 @@ pub async fn bind(
     addr: SocketAddr,
     transport: Transport,
     external_addr: Option<SocketAddr>,
+    shard_index: u16,
 ) -> io::Result<UnifiedSocket> {
     let sock = match transport {
-        Transport::Udp(mode) => bind_udp_socket(addr, mode, external_addr)
+        Transport::Udp(mode) => bind_udp_socket(addr, mode, external_addr, shard_index)
             .await?
             .into_unified_socket()?,
         Transport::Tcp => {

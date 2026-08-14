@@ -1,6 +1,7 @@
 use std::io;
 use std::time::Duration;
 
+use crate::control::state::ControlPlaneState;
 use crate::{
     control::{
         core::{ControllerCore, ControllerEvent, ControllerEventQueue, RoomPlacement},
@@ -10,7 +11,7 @@ use crate::{
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
-    route::RouteId,
+    route::TransportHandle,
     shard::{
         ShardContext,
         worker::{ShardCommand, ShardEventWrapper},
@@ -102,50 +103,31 @@ pub struct ControllerActor {
     /// use 0 for both; set via `NodeBuilder` when multi-node support lands.
     cluster_id: u16,
     node_id: u16,
+    /// The canonical lifecycle state. Only this actor mutates it, and no
+    /// shard ever reads it — a shard reads the view projected from it.
+    state: ControlPlaneState,
+    /// One writer per shard. Never shared, never locked, and never handed to
+    /// a shard: the one-publish-per-generation budget is only checkable
+    /// because there is exactly one caller.
+    views: Vec<crate::view::ShardViewWriter>,
 }
 
 impl ControllerActor {
-    pub fn new(
-        rng: pulsebeam_runtime::rand::Rng,
-        shard_contexts: Vec<ShardContext>,
-        candidates: Vec<Candidate>,
-        tcp_listener: pulsebeam_core::net::TcpListener,
-    ) -> Self {
-        Self::with_room_shard_slot(
-            rng,
-            shard_contexts,
-            candidates,
-            tcp_listener,
-            crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
-        )
-    }
-
-    pub fn with_room_shard_slot(
-        rng: pulsebeam_runtime::rand::Rng,
-        shard_contexts: Vec<ShardContext>,
-        candidates: Vec<Candidate>,
-        tcp_listener: pulsebeam_core::net::TcpListener,
-        room_shard_slot: usize,
-    ) -> Self {
-        Self::with_placement(
-            rng,
-            shard_contexts,
-            candidates,
-            tcp_listener,
-            room_shard_slot,
-            RoomPlacement::Hashed,
-        )
-    }
-
-    pub fn with_placement(
+    pub(crate) fn with_placement(
         mut rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<Candidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
         room_shard_slot: usize,
         placement: RoomPlacement,
+        views: Vec<crate::view::ShardViewWriter>,
     ) -> Self {
         let shard_count = shard_contexts.len();
+        debug_assert_eq!(
+            views.len(),
+            shard_count,
+            "one view writer per shard, held only here"
+        );
         let router = ShardRouter::new(shard_contexts, &mut rng);
 
         Self {
@@ -156,7 +138,13 @@ impl ControllerActor {
             tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
+            state: ControlPlaneState::new(shard_count),
+            views,
         }
+    }
+
+    fn view_mut(&mut self, shard_id: crate::id::ShardId) -> Option<&mut crate::view::ShardViewWriter> {
+        self.views.get_mut(shard_id.index())
     }
 
     pub async fn run(
@@ -171,7 +159,15 @@ impl ControllerActor {
         let Some(listener) = self.tcp_listener.take() else {
             pulsebeam_runtime::fatal!("ControllerActor::run called twice")
         };
-        let acceptor = TcpAcceptorHandle::spawn(listener, shutdown.child_token());
+        let acceptor = TcpAcceptorHandle::spawn(
+            listener,
+            crate::control::tcp_acceptor::TcpAcceptorConfig {
+                cluster_id: self.cluster_id,
+                node_id: self.node_id,
+                shard_count: self.router.shard_count(),
+            },
+            shutdown.child_token(),
+        );
         let mut pending_rx = acceptor.event_rx;
 
         let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
@@ -239,6 +235,7 @@ impl ControllerActor {
             ControllerCommand::DeleteParticipant(m) => {
                 self.core
                     .delete_participant(&m.participant_id, &mut self.eq);
+                self.retire_transport(&m.participant_id).await;
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
@@ -267,40 +264,24 @@ impl ControllerActor {
     ) -> Result<SdpAnswer, ControllerError> {
         self.core
             .delete_participant(&state.participant_id, &mut self.eq);
+        self.retire_transport(&state.participant_id).await;
         self.handle_create_participant(state, offer).await
     }
 
     /// Route an accepted TCP connection to the shard that owns its participant.
     ///
-    /// Routing priority:
-    /// 1. If the ufrag decodes to a valid `IceUfrag` **for this cluster and node**,
-    ///    use the encoded `shard_id` directly — O(1), no lookup.
-    /// 2. If the ufrag decodes but targets a *different* cluster or node, the
-    ///    connection was misrouted (load-balancer bug) or crafted by an attacker.
-    ///    Drop it immediately.
-    /// 3. If the ufrag cannot be decoded (old client format during a rolling
-    ///    upgrade), fall back to hash(peer_addr) routing.
-    /// 4. If no ufrag at all, fall back to hash(peer_addr) routing.
+    /// The acceptor has already decoded the ufrag and validated cluster,
+    /// node and shard bounds, so this is the handoff and nothing else: one
+    /// accepted stream, sent once to the shard its transport route names.
+    /// After this the shard owns the connection permanently — there is no
+    /// path back through here for a subsequent packet.
     fn route_tcp_connection(&mut self, conn: PendingTcpConn) {
-        let Some(ufrag) = conn.server_ufrag.and_then(|ufrag| IceUfrag::decode(&ufrag)) else {
-            tracing::warn!("invalid ufrag, disconnecting due to likely a malicous actor");
-            return;
-        };
-
-        if ufrag.cluster_id != self.cluster_id || ufrag.node_id != self.node_id {
-            tracing::warn!(
-                peer_addr = %conn.peer_addr,
-                ufrag_cluster = ufrag.cluster_id,
-                ufrag_node    = ufrag.node_id,
-                our_cluster   = self.cluster_id,
-                our_node      = self.node_id,
-                "TCP connection ufrag targets a different node, dropping"
-            );
-            return; // stream dropped here, OS socket closed
-        }
-
+        debug_assert!(
+            conn.handle.shard().index() < self.router.shard_count(),
+            "the acceptor must reject a shard outside the node before handing off"
+        );
         self.eq.send(
-            ufrag.route.shard(),
+            conn.handle.shard(),
             ShardCommand::AddTcpConnection {
                 stream: conn.stream,
                 peer_addr: conn.peer_addr,
@@ -308,33 +289,200 @@ impl ControllerActor {
         );
     }
 
-    /// Reserve a participant slot and its ingress route on `shard_id`,
-    /// awaiting the shard's reply — the only point in this actor's loop
-    /// that blocks on another actor, because nothing else can mint a route
-    /// in that shard's own table. `drain_core_events` runs first so a
-    /// `RemoveParticipant` queued by a preceding delete (a reconnect's
-    /// teardown-then-recreate) reaches the shard's mailbox before this does;
-    /// otherwise the reservation below could race the old entry under the
-    /// same id and trip the registry's duplicate-reservation assertion.
-    async fn reserve_ingress(
+    /// Stage a participant's transport route as one lifecycle generation.
+    ///
+    /// The control plane allocates the address, the owning shard prepares
+    /// only the runtime binding it must build on its own core, and the route
+    /// becomes resolvable when the view carrying it publishes. Nothing is
+    /// advertised until the shard acknowledges that generation, so the ufrag
+    /// this returns always names a route the owner can already resolve.
+    ///
+    /// `drain_core_events` runs first so a `RemoveParticipant` queued by a
+    /// preceding delete (a reconnect's teardown-then-recreate) reaches the
+    /// shard's mailbox before this does; otherwise the prepare below could
+    /// race the old entry under the same id and trip the registry's
+    /// duplicate-reservation assertion.
+    async fn stage_transport(
         &mut self,
         shard_id: crate::id::ShardId,
         participant_id: ParticipantId,
         room_id: RoomId,
-    ) -> Option<(RouteId, u16)> {
+    ) -> Option<TransportHandle> {
         self.drain_core_events().await;
+
+        let now = tokio::time::Instant::now();
+        if self.state.begin().is_err() {
+            debug_assert!(false, "lifecycle transactions serialise through this actor");
+            return None;
+        }
+
+        let handle = match self.state.reserve_transport(shard_id, now) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::warn!(?err, %participant_id, "transport route allocation failed");
+                self.state.abort(now);
+                return None;
+            }
+        };
+
+        let Some(participant_key) = self.prepare_transport(shard_id, participant_id, handle).await
+        else {
+            self.state.abort(now);
+            return None;
+        };
+
+        let staged = self
+            .state
+            .stage_participant(
+                participant_id,
+                crate::control::state::ParticipantRecord {
+                    shard_id,
+                    room_id,
+                    transport: handle,
+                    binding: None,
+                },
+            )
+            .and_then(|()| {
+                let Some(transaction) = self.state.pending().map(|tx| tx.id) else {
+                    return Err(crate::control::state::TransactionError::Idle);
+                };
+                self.state.record_binding(
+                    participant_id,
+                    crate::control::state::PreparedBinding {
+                        transaction,
+                        shard_id,
+                        participant: participant_key,
+                    },
+                )
+            });
+        if staged.is_err() {
+            self.state.abort(now);
+            return None;
+        }
+
+        let Some(generation) = self.publish_pending(shard_id, handle, participant_key) else {
+            self.state.abort(now);
+            return None;
+        };
+
+        if !self.await_generation(shard_id, generation).await {
+            self.state.abort(now);
+            return None;
+        }
+
+        if self.state.commit().is_err() {
+            self.state.abort(now);
+            return None;
+        }
+        Some(handle)
+    }
+
+    /// Ask the owning shard to build the runtime binding this route will
+    /// point at. The shard decides nothing here — it reserves a key on its
+    /// own core and reports it back.
+    async fn prepare_transport(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        participant_id: ParticipantId,
+        handle: TransportHandle,
+    ) -> Option<crate::shard::participants::ParticipantKey> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.router
             .send(
                 shard_id,
-                ShardCommand::ReserveIngress {
+                ShardCommand::PrepareTransport {
                     participant_id,
-                    room_id,
+                    handle,
                     reply: reply_tx,
                 },
             )
             .await;
         reply_rx.await.ok().flatten()
+    }
+
+    /// Compile and publish the staged generation. One publish, one shard.
+    fn publish_pending(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        handle: TransportHandle,
+        participant: crate::shard::participants::ParticipantKey,
+    ) -> Option<u64> {
+        let generation = self.state.pending().map(|tx| tx.generation)?;
+        let view = self.view_mut(shard_id)?;
+        view.stage(
+            generation,
+            crate::view::ViewOp::InstallTransport {
+                route: handle.route,
+                binding: crate::view::TransportBinding {
+                    epoch: handle.epoch,
+                    participant,
+                },
+            },
+        );
+        view.publish()
+    }
+
+    /// The generation barrier. The shard replies once it has observed a view
+    /// at least this new; until then nothing built in this generation is
+    /// externally visible.
+    async fn await_generation(&mut self, shard_id: crate::id::ShardId, generation: u64) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.router
+            .send(
+                shard_id,
+                ShardCommand::AckGeneration {
+                    generation,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+        let Ok(observed) = reply_rx.await else {
+            tracing::warn!(%shard_id, generation, "shard did not acknowledge its view generation");
+            return false;
+        };
+        if let Some(view) = self.view_mut(shard_id) {
+            view.observe_ack(observed);
+            return view.is_acknowledged(generation);
+        }
+        false
+    }
+
+    /// Retire a transport route as its own generation, so the route is gone
+    /// from the published view before the allocator may hand its slot out.
+    async fn retire_transport(&mut self, participant_id: &ParticipantId) {
+        let now = tokio::time::Instant::now();
+        let Some(record) = self.state.committed.participants.get(participant_id).copied() else {
+            return;
+        };
+        if self.state.begin().is_err() {
+            return;
+        }
+        let Ok(()) = self.state.forget_participant(*participant_id) else {
+            self.state.abort(now);
+            return;
+        };
+        let generation = self.state.pending().map(|tx| tx.generation);
+        let published = generation.and_then(|generation| {
+            let view = self.view_mut(record.shard_id)?;
+            view.stage(
+                generation,
+                crate::view::ViewOp::RetireTransport {
+                    handle: record.transport,
+                },
+            );
+            view.publish()
+        });
+        let Some(published) = published else {
+            self.state.abort(now);
+            return;
+        };
+        if !self.await_generation(record.shard_id, published).await {
+            self.state.abort(now);
+            return;
+        }
+        let _ = self.state.commit();
+        self.state
+            .release_transport(record.shard_id, record.transport.route.slot(), now);
     }
 
     pub async fn handle_create_participant(
@@ -356,27 +504,35 @@ impl ControllerActor {
             }
         };
 
-        // The route can only be minted by the shard that will own it, and
-        // the ufrag has to carry a real one before negotiation can produce
-        // an answer — so the reservation is the first thing that touches
-        // the shard, not the last.
-        let Some((route, epoch)) = self
-            .reserve_ingress(shard_id, state.participant_id, state.room_id)
+        // The transport route has to exist, be published and be acknowledged
+        // before the ufrag can carry it, so the whole lifecycle generation
+        // runs before negotiation rather than after.
+        let Some(handle) = self
+            .stage_transport(shard_id, state.participant_id, state.room_id)
             .await
         else {
             return Err(ControllerError::ServiceUnavailable);
         };
+        debug_assert_eq!(
+            handle.shard(),
+            shard_id,
+            "a route must carry the shard placement chose"
+        );
 
-        let ufrag = IceUfrag::new(self.cluster_id, self.node_id, route, epoch);
+        let ufrag = IceUfrag::new(self.cluster_id, self.node_id, handle.route, handle.epoch);
         let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
 
         let negotiated = self.negotiator.create_answer(offer, creds);
         let (rtc, answer) = match negotiated {
             Ok(negotiated) => negotiated,
             Err(err) => {
-                // The reservation already installed a route; nothing will
-                // ever populate it now, so it must be torn down explicitly
-                // rather than leaked.
+                // The route is published and acknowledged but nothing will
+                // ever populate it now. Retiring it is a generation of its
+                // own — the route must be absent from the published view
+                // before its slot can go back to the allocator — and the
+                // shard still holds the key it reserved, so both have to be
+                // unwound, not just one.
+                self.retire_transport(&state.participant_id).await;
                 self.router
                     .send(
                         shard_id,
@@ -419,7 +575,7 @@ mod tests {
     use super::*;
     use crate::id::ShardId;
     use crate::{
-        control::{tcp_acceptor::PendingTcpConn, ufrag::IceUfrag},
+        control::tcp_acceptor::PendingTcpConn,
         shard::{ShardContext, metrics::ShardMetrics},
     };
     use pulsebeam_core::net::TcpListener;
@@ -437,8 +593,8 @@ mod tests {
         pulsebeam_runtime::testing::test_host_ip("192.168.250.10")
     }
 
-    fn dummy_route(shard: usize) -> RouteId {
-        RouteId::new(ShardId::new(shard), 0)
+    fn dummy_route(shard: usize) -> crate::route::TransportRoute {
+        crate::route::TransportRoute::new(ShardId::new(shard), 0)
     }
 
     async fn make_actor(num_shards: usize) -> ControllerActor {
@@ -454,7 +610,18 @@ mod tests {
                 }
             })
             .collect();
-        ControllerActor::new(seeded_rng(42), shard_contexts, vec![], listener)
+        let views = (0..num_shards)
+            .map(|idx| crate::view::new_shard_view(ShardId::new(idx)).0)
+            .collect();
+        ControllerActor::with_placement(
+            seeded_rng(42),
+            shard_contexts,
+            vec![],
+            listener,
+            crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
+            RoomPlacement::Hashed,
+            views,
+        )
     }
 
     /// Accept one server-side TCP stream from a fresh loopback listener.
@@ -484,19 +651,21 @@ mod tests {
 
     // ── route_tcp_connection ─────────────────────────────────────────────────
 
+    /// Cluster, node and shard-bounds validation now happens in the acceptor,
+    /// which has its own tests for it. What is left to check here is that the
+    /// controller hands the connection to the shard the transport route names
+    /// and does nothing else with it.
     #[test]
-    fn test_route_valid_ufrag_routes_to_correct_shard() {
+    fn a_validated_connection_is_handed_to_the_shard_its_route_names() {
         run_local(async {
             let mut actor = make_actor(3).await;
             let (_client, stream) = make_buffered().await;
             let peer_addr = "1.2.3.4:5000".parse().unwrap();
 
-            // Encode for cluster=0, node=0 (actor defaults), shard=2
-            let ufrag = IceUfrag::new(0, 0, dummy_route(2), 0).encode();
             let conn = PendingTcpConn {
                 stream,
                 peer_addr,
-                server_ufrag: Some(ufrag),
+                handle: crate::route::TransportHandle::new(dummy_route(2), 0),
             };
             actor.route_tcp_connection(conn);
 
@@ -506,52 +675,15 @@ mod tests {
                     shard_id,
                     ShardCommand::AddTcpConnection { peer_addr: pa, .. },
                 ) => {
-                    assert_eq!(
-                        shard_id,
-                        ShardId::new(2),
-                        "must route to the shard encoded in the ufrag"
-                    );
+                    assert_eq!(shard_id, ShardId::new(2));
                     assert_eq!(pa, peer_addr);
                 }
                 _ => panic!("unexpected event: {event:?}"),
             }
-        });
-    }
 
-    #[test]
-    fn test_route_wrong_cluster_drops_connection() {
-        run_local(async {
-            let mut actor = make_actor(2).await;
-            // actor.cluster_id = 0, ufrag encodes cluster_id = 1
-            let (_client, stream) = make_buffered().await;
-            let conn = PendingTcpConn {
-                stream,
-                peer_addr: "1.2.3.4:5001".parse().unwrap(),
-                server_ufrag: Some(IceUfrag::new(1, 0, dummy_route(0), 0).encode()),
-            };
-            actor.route_tcp_connection(conn);
             assert!(
                 actor.eq.pop().is_none(),
-                "wrong-cluster connection must be silently dropped"
-            );
-        });
-    }
-
-    #[test]
-    fn test_route_wrong_node_drops_connection() {
-        run_local(async {
-            let mut actor = make_actor(2).await;
-            // actor.node_id = 0, ufrag encodes node_id = 7
-            let (_client, stream) = make_buffered().await;
-            let conn = PendingTcpConn {
-                stream,
-                peer_addr: "1.2.3.4:5002".parse().unwrap(),
-                server_ufrag: Some(IceUfrag::new(0, 7, dummy_route(0), 0).encode()),
-            };
-            actor.route_tcp_connection(conn);
-            assert!(
-                actor.eq.pop().is_none(),
-                "wrong-node connection must be silently dropped"
+                "a connection is handed off once, not repeatedly"
             );
         });
     }

@@ -376,6 +376,8 @@ impl NodeBuilder {
 
         let mut shard_contexts = Vec::new();
 
+        let mut view_writers = Vec::with_capacity(workers_count);
+
         for (shard_idx, (((udp_sock, tcp_sock), frame_rx), shard_rng)) in udp_sockets
             .into_iter()
             .zip(tcp_sockets.into_iter())
@@ -384,6 +386,8 @@ impl NodeBuilder {
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
+            let (view_writer, view_reader) = crate::view::new_shard_view(shard_id);
+            view_writers.push(view_writer);
             let (shard_command_tx, shard_command_rx) =
                 mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
             let shard_event_tx = shard_event_tx.clone();
@@ -411,6 +415,7 @@ impl NodeBuilder {
                     shard_occupancy,
                     shard_rng,
                     wall_anchor,
+                    view_reader,
                 );
                 join_set.spawn_local(ignore(shard.run()));
             } else {
@@ -466,6 +471,7 @@ impl NodeBuilder {
                                     shard_occupancy,
                                     shard_rng,
                                     wall_anchor,
+                                    view_reader,
                                 );
                                 tokio::task::unconstrained(shard.run()).await;
                             });
@@ -498,6 +504,7 @@ impl NodeBuilder {
             tcp_listener,
             self.room_shard_slot,
             self.room_placement,
+            view_writers,
         );
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
@@ -594,8 +601,10 @@ async fn bind_udp_sockets(
 ) -> Result<Vec<net::BoundUdpSocket>> {
     let mut sockets = Vec::with_capacity(workers);
 
-    for _ in 0..workers {
-        let socket = match net::bind_udp_socket(local_addr, mode, advertised_addr).await {
+    for shard_index in 0..workers {
+        let shard_index = u16::try_from(shard_index).unwrap_or(u16::MAX);
+        let socket = match net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await
+        {
             Ok(s) => s,
             Err(e) if sockets.is_empty() => {
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));

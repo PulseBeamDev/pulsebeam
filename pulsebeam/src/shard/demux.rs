@@ -1,6 +1,9 @@
 use pulsebeam_runtime::net;
 
-use crate::{control::ufrag::IceUfrag, route::RouteId};
+use crate::{
+    id::ShardId,
+    route::{TransportHandle, TransportRoute},
+};
 
 use ahash::{HashMap, HashMapExt};
 use std::net::SocketAddr;
@@ -15,26 +18,33 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 
 /// A UDP demuxer that maps packets to routes based on source address and STUN ufrag.
 ///
+/// This is a validation/cache layer on top of `pulsebeam-routing`'s shared,
+/// `no_std` classifier — the same classifier the Aya eBPF program and the
+/// simulator's steering adapter use. `Demuxer` never parses STUN or the ufrag
+/// itself; it calls `pulsebeam_routing::classify::classify_client` on the
+/// packet bytes and caches the result by source address so repeat packets
+/// skip the parse.
+///
 /// Resolving a route does not imply this shard owns it — see the note on
 /// cross-shard arrivals below.
 ///
 /// Routing uses two mechanisms:
-/// 1. A fast-path map from `SocketAddr` to `(RouteId, epoch)` (`addr_map`): efficient
+/// 1. A fast-path map from `SocketAddr` to a `TransportHandle` (`addr_map`): efficient
 ///    routing for known addresses (DTLS, RTP, RTCP).
-/// 2. For STUN packets from an unknown address, the ufrag in the USERNAME
-///    attribute is decoded via `IceUfrag::decode` to read `(route, epoch)`
-///    directly — no registration or lookup table is required, and no
-///    semantic id is ever hashed to get there.
+/// 2. For STUN packets from an unknown address, the shared classifier decodes
+///    the ufrag in the USERNAME attribute to read `(route, epoch)` directly —
+///    no registration or lookup table is required, and no semantic id is
+///    ever hashed to get there.
 ///
 /// Non-STUN packets from unknown addresses are rejected.
 ///
-/// A ufrag naming another shard is *not* rejected. `SO_REUSEPORT` picks the
-/// receiving socket by hashing the 4-tuple, which has nothing to do with which
-/// shard owns the route, so arriving on the wrong one is ordinary rather
-/// than suspicious; `ShardCore::on_udp_batch` forwards it to the owner by
-/// reading the route's own shard bits. Dropping it here instead makes a
-/// participant unreachable whenever the hash disagrees with placement, which
-/// is most of the time.
+/// A ufrag naming another shard is *not* rejected here. `SO_REUSEPORT` picks
+/// the receiving socket by hashing the 4-tuple, which has nothing to do with
+/// which shard owns the route, so arriving on the wrong one is ordinary
+/// rather than suspicious. Resolving the route and deciding whether this
+/// shard owns it are separate concerns: `demux` only resolves; the caller
+/// checks ownership (see [`Demuxer::owns`]) and decides whether to forward,
+/// process, or drop.
 ///
 /// # Security hardening
 ///
@@ -46,9 +56,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 ///   preventing one route from monopolising the budget.
 pub struct Demuxer {
     /// Fast-path cache: maps a known remote `SocketAddr` to a route.
-    addr_map: HashMap<SocketAddr, (RouteId, u16)>,
+    addr_map: HashMap<SocketAddr, TransportHandle>,
     /// Reverse: maps a route to all its known source addresses (for cleanup).
-    route_addrs: HashMap<RouteId, Vec<SocketAddr>>,
+    route_addrs: HashMap<TransportRoute, Vec<SocketAddr>>,
 }
 
 impl Demuxer {
@@ -61,7 +71,7 @@ impl Demuxer {
 
     /// Removes a route and all associated address-cache entries.
     /// Returns the previously-cached addresses (used to close TCP connections).
-    pub fn unregister(&mut self, route: RouteId) -> Vec<SocketAddr> {
+    pub fn unregister(&mut self, route: TransportRoute) -> Vec<SocketAddr> {
         if let Some(addrs) = self.route_addrs.remove(&route) {
             for addr in &addrs {
                 self.addr_map.remove(addr);
@@ -72,34 +82,32 @@ impl Demuxer {
         }
     }
 
-    /// Routes a packet to the route it addresses.
-    /// Returns `Some((route, epoch))` if routed, `None` if dropped.
-    pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<(RouteId, u16)> {
+    /// Routes a packet to the transport association it addresses.
+    /// Returns `None` if dropped.
+    ///
+    /// This resolves a route; it does not decide whether this shard owns it.
+    /// See [`Demuxer::owns`].
+    pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<TransportHandle> {
         let src = batch.src;
 
         if let Some(&addressed) = self.addr_map.get(&src) {
             return Some(addressed);
         }
 
-        // Slow path: STUN binding request — decode (route, epoch) directly from
-        // the ICE ufrag in the USERNAME attribute (no lookup table needed).
-        let ufrag_raw = ice::parse_stun_remote_ufrag_raw(batch.data())?;
-
-        // Reject anything whose raw byte length exceeds our fixed encoded length
-        // before touching UTF-8 conversion or base32 decode.  Any attacker who
-        // sends an oversized USERNAME is clearly not a legitimate peer.
-        if ufrag_raw.len() > IceUfrag::ENCODED_LEN {
-            return None;
-        }
-
-        let ufrag_str = std::str::from_utf8(ufrag_raw).ok()?;
-        let decoded = IceUfrag::decode(ufrag_str)?;
-        let addressed = (decoded.route, decoded.epoch);
+        // Slow path: classify the raw bytes through the shared no_std
+        // classifier — the same one the eBPF program and simulator use — and
+        // cache the resolved (route, epoch) by source address.
+        let handle = match pulsebeam_routing::classify::classify_client(batch.data()) {
+            pulsebeam_routing::classify::ClientVerdict::Bootstrap { handle, .. } => handle,
+            pulsebeam_routing::classify::ClientVerdict::Established
+            | pulsebeam_routing::classify::ClientVerdict::Drop(_) => return None,
+        };
+        let addressed = to_local_handle(handle);
 
         // Populate the fast-path cache only when within the safety bounds, to
         // prevent memory exhaustion from floods of distinct fabricated source IPs.
         if self.addr_map.len() < MAX_ADDR_ENTRIES {
-            let route_entry = self.route_addrs.entry(decoded.route).or_default();
+            let route_entry = self.route_addrs.entry(addressed.route).or_default();
             if route_entry.len() < MAX_ADDRS_PER_ROUTE {
                 route_entry.push(src);
                 self.addr_map.insert(src, addressed);
@@ -108,6 +116,36 @@ impl Demuxer {
 
         Some(addressed)
     }
+
+    /// Whether `shard_id` is the shard `handle`'s route belongs to.
+    ///
+    /// `demux` only resolves a packet to a route; it never decides
+    /// forwarding. The caller uses this to drop (and count) a packet that
+    /// resolved to a route owned by a different shard, rather than acting on
+    /// it directly.
+    pub fn owns(&self, handle: TransportHandle, shard_id: ShardId) -> bool {
+        handle.shard() == shard_id
+    }
+}
+
+impl Default for Demuxer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Converts a `pulsebeam-routing` transport handle — a bare `u16`-shard
+/// `TransportRoute` — into `pulsebeam`'s own `TransportRoute`, which is over
+/// `ShardId`. Both wrap the same `shard(12) | slot(20)` bit layout, so the
+/// conversion is a raw round trip through `get()`/`from_raw()`.
+fn to_local_handle(handle: pulsebeam_routing::TransportHandle) -> TransportHandle {
+    let route = TransportRoute::from_raw(handle.route.get());
+    debug_assert_eq!(
+        route.shard().index(),
+        usize::from(handle.route.shard()),
+        "shard must survive the pulsebeam-routing <-> pulsebeam TransportRoute conversion"
+    );
+    TransportHandle::new(route, handle.epoch)
 }
 
 /// Extract the server-side ICE ufrag (the first token before `:` in the STUN
@@ -116,633 +154,9 @@ impl Demuxer {
 /// Returns `None` if `data` does not look like a valid STUN message or does not
 /// carry a USERNAME attribute.
 pub(crate) fn extract_stun_server_ufrag(data: &[u8]) -> Option<String> {
-    ice::parse_stun_remote_ufrag_raw(data)
+    pulsebeam_routing::stun::server_ufrag(data)
         .and_then(|raw| std::str::from_utf8(raw).ok())
         .map(str::to_owned)
-}
-
-mod ice {
-
-    // --- Constants defined by RFC 5389 ---
-    const MIN_STUN_HEADER_SIZE: usize = 20;
-    const MAGIC_COOKIE: u32 = 0x2112A442;
-    // Pre-calculate byte representation for faster comparison
-    const MAGIC_COOKIE_BYTES: [u8; 4] = MAGIC_COOKIE.to_be_bytes();
-    const ATTRIBUTE_HEADER_SIZE: usize = 4; // Type (2 bytes) + Length (2 bytes)
-    const USERNAME_ATTRIBUTE_TYPE: u16 = 0x0006;
-
-    /// STUN parser focused *only* on extracting the USERNAME attribute value.
-    ///
-    /// It performs minimal validation necessary to safely find the attribute.
-    /// It returns a slice `&[u8]` referencing the username within the input `data`
-    /// buffer, achieving zero-copy.
-    ///
-    /// Returns `Some(&[u8])` if the USERNAME attribute is found, `None` otherwise
-    /// (due to parsing errors, malformed data, or the attribute not being present).
-    ///
-    /// # Arguments
-    ///
-    /// * `data`: A byte slice representing the potential STUN message.
-    ///
-    /// # Performance Considerations
-    ///
-    /// *   **Zero-Copy:** Returns `&[u8]`.
-    /// *   **Minimal Checks:** Skips validation of Transaction ID, other attributes, etc.
-    /// *   **No Allocations:** Does not allocate memory on the heap.
-    /// *   **Inline Hint:** Suggests inlining for potential performance gains in tight loops.
-    #[inline]
-    pub fn find_stun_username_slice(data: &[u8]) -> Option<&[u8]> {
-        // 1. Check minimum length for STUN header
-        if data.len() < MIN_STUN_HEADER_SIZE {
-            return None;
-        }
-
-        // Message type: the first two bits must be 00.
-        if data.first()? & 0b1100_0000 != 0 {
-            return None;
-        }
-
-        if data.get(4..8) != Some(MAGIC_COOKIE_BYTES.as_slice()) {
-            return None;
-        }
-
-        // Message length covers the attributes only.
-        let message_length = usize::from(u16::from_be_bytes([*data.get(2)?, *data.get(3)?]));
-
-        // The declared total must actually be present, and a message with no
-        // attributes cannot carry a username.
-        let expected_total_len = MIN_STUN_HEADER_SIZE.checked_add(message_length)?;
-        if data.len() < expected_total_len || message_length == 0 {
-            return None;
-        }
-
-        let mut current_pos = MIN_STUN_HEADER_SIZE;
-        // The attribute region is bounded by the declared length, which the
-        // check above proved is within the buffer.
-        let attributes_end = expected_total_len;
-
-        while current_pos < attributes_end {
-            if current_pos.checked_add(ATTRIBUTE_HEADER_SIZE)? > attributes_end {
-                return None;
-            }
-
-            let attr_type = u16::from_be_bytes([
-                *data.get(current_pos)?,
-                *data.get(current_pos.saturating_add(1))?,
-            ]);
-            let attr_value_len = usize::from(u16::from_be_bytes([
-                *data.get(current_pos.saturating_add(2))?,
-                *data.get(current_pos.saturating_add(3))?,
-            ]));
-
-            let value_pos = current_pos.saturating_add(ATTRIBUTE_HEADER_SIZE);
-
-            // An attribute may not claim more than the message length allows.
-            let end_of_value = value_pos.checked_add(attr_value_len)?;
-            if end_of_value > attributes_end {
-                return None;
-            }
-
-            if attr_type == USERNAME_ATTRIBUTE_TYPE {
-                return data.get(value_pos..end_of_value);
-            }
-
-            // Move to the next attribute.
-            // Value must be padded to a multiple of 4 bytes.
-            // Performance: Bitwise trick for padding calculation is fast.
-            let padded_len = attr_value_len.saturating_add(3) & !3;
-            // Check for overflow before updating current_pos
-            let next_pos = value_pos.checked_add(padded_len)?;
-
-            // This check is crucial: ensure moving to the next attribute position,
-            // considering padding, does not exceed the declared attribute boundary.
-            // If next_pos == attributes_end, the loop condition `while current_pos < attributes_end`
-            // will handle termination correctly on the next iteration.
-            // If next_pos > attributes_end, it means padding calculation resulted in exceeding
-            // the allowed space, indicating a malformed message.
-            if next_pos > attributes_end {
-                return None; // Padding pushed beyond declared message length
-            }
-            current_pos = next_pos;
-
-            // The loop condition `while current_pos < attributes_end` inherently checks
-            // if we have landed exactly on the boundary or gone past it.
-        }
-
-        // If the loop finishes, we either processed all attributes correctly
-        // without finding USERNAME, or the message was potentially malformed
-        // in a way that didn't trigger earlier checks but caused the loop
-        // to terminate (e.g., current_pos landing exactly on attributes_end after processing
-        // the last attribute).
-        // In either case, USERNAME was not found.
-        None
-    }
-
-    /// Convenience wrapper around `find_stun_username_slice` that attempts
-    /// to convert the resulting byte slice into a UTF-8 `&str`.
-    ///
-    /// Returns `Some(&str)` if the USERNAME attribute is found and contains valid
-    /// UTF-8 data, `None` otherwise.
-    #[inline]
-    pub fn parse_stun_remote_ufrag_raw(data: &[u8]) -> Option<&[u8]> {
-        find_stun_username_slice(data).and_then(|slice| first_token(slice, b':'))
-    }
-
-    #[inline]
-    fn first_token(input: &[u8], delimiter: u8) -> Option<&[u8]> {
-        let i = input.iter().position(|&b| b == delimiter)?;
-        input.get(..i)
-    }
-
-    // --- Robust Test Suite ---
-    #[cfg(test)]
-    mod tests {
-        // Convenience only: a test is not a shard, so nothing here is
-        // cross-core, and a fixture may read the host clock. Allowed at the
-        // module, never the file, so it cannot drift over production code
-        // sharing it. See docs/thread-per-core.md.
-        use super::*;
-
-        const BINDING_REQUEST: u16 = 0x0001;
-        const DUMMY_TX_ID: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        const MESSAGE_INTEGRITY_ATTRIBUTE_TYPE: u16 = 0x0008;
-        const PRIORITY_ATTRIBUTE_TYPE: u16 = 0x0024;
-
-        /// Helper to build a STUN message for testing.
-        fn build_stun_message(
-            msg_type: u16,
-            tx_id: [u8; 12],
-            attributes: &[(u16, &[u8])], // List of (Type, Value)
-        ) -> Vec<u8> {
-            let mut buf = Vec::with_capacity(128); // Pre-allocate some space
-
-            // Write header (placeholder length first)
-            buf.extend_from_slice(&msg_type.to_be_bytes());
-            buf.extend_from_slice(&[0u8; 2]); // Placeholder for length
-            buf.extend_from_slice(&MAGIC_COOKIE_BYTES);
-            buf.extend_from_slice(&tx_id);
-
-            assert_eq!(buf.len(), MIN_STUN_HEADER_SIZE);
-
-            // Add attributes and calculate total length
-            let mut total_attr_len: usize = 0;
-            for (attr_type, attr_value) in attributes {
-                let attr_value_len = attr_value.len();
-                // Check for unreasonable attribute length during test construction
-                assert!(
-                    attr_value_len <= u16::MAX as usize,
-                    "Test attribute too long"
-                );
-
-                buf.extend_from_slice(&attr_type.to_be_bytes());
-                buf.extend_from_slice(
-                    &u16::try_from(attr_value_len)
-                        .expect("fixture attr fits")
-                        .to_be_bytes(),
-                );
-                buf.extend_from_slice(attr_value);
-
-                // Add padding
-                let padded_len = attr_value_len.saturating_add(3) & !3;
-                let padding_len = padded_len.saturating_sub(attr_value_len);
-                buf.extend_from_slice(&vec![0u8; padding_len]);
-
-                total_attr_len =
-                    total_attr_len.saturating_add(ATTRIBUTE_HEADER_SIZE.saturating_add(padded_len));
-            }
-
-            // Check for unreasonable total length during test construction
-            assert!(
-                total_attr_len <= u16::MAX as usize,
-                "Total attribute length too long for test"
-            );
-
-            // Write the actual message length (attribute part only)
-            buf[2..4].copy_from_slice(
-                &u16::try_from(total_attr_len)
-                    .expect("fixture length fits")
-                    .to_be_bytes(),
-            );
-
-            buf
-        }
-
-        // --- Happy Path Tests ---
-
-        #[test]
-        fn test_valid_username_first() {
-            let username = b"user1";
-            let priority_val = 0x6e0001ff_u32.to_be_bytes();
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (USERNAME_ATTRIBUTE_TYPE, username),
-                    (PRIORITY_ATTRIBUTE_TYPE, &priority_val),
-                ],
-            );
-            assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        }
-
-        #[test]
-        fn test_valid_username_last() {
-            let username = b"user2";
-            let priority_val = 0x7f000000_u32.to_be_bytes();
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (PRIORITY_ATTRIBUTE_TYPE, &priority_val),
-                    (USERNAME_ATTRIBUTE_TYPE, username),
-                ],
-            );
-            assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        }
-
-        #[test]
-        fn test_valid_username_middle() {
-            let username = b"user3-middle"; // Length 12 (multiple of 4)
-            let priority_val = 0x12345678_u32.to_be_bytes();
-            let integrity_val = [0u8; 20]; // SHA1 HMAC size
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (PRIORITY_ATTRIBUTE_TYPE, &priority_val),
-                    (USERNAME_ATTRIBUTE_TYPE, username),
-                    (MESSAGE_INTEGRITY_ATTRIBUTE_TYPE, &integrity_val),
-                ],
-            );
-            assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        }
-
-        #[test]
-        fn test_valid_username_needs_padding() {
-            let username = b"user4pad"; // Length 8 (multiple of 4) - correct
-            let username_needs_pad = b"user5pad"; // Length 9 (needs 3 bytes padding)
-            let priority_val = 0xabcdef01_u32.to_be_bytes();
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (PRIORITY_ATTRIBUTE_TYPE, &priority_val),
-                    (USERNAME_ATTRIBUTE_TYPE, username_needs_pad), // This one needs padding
-                    (USERNAME_ATTRIBUTE_TYPE, username), // This one doesn't, testing search after padded one
-                ],
-            );
-            // Should find the *first* username attribute encountered
-            assert_eq!(
-                find_stun_username_slice(&msg),
-                Some(username_needs_pad as &[u8])
-            );
-        }
-
-        #[test]
-        fn test_valid_username_only_attribute() {
-            let username = b"only-user"; // 9 bytes -> pads to 12
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[(USERNAME_ATTRIBUTE_TYPE, username)],
-            );
-            assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        }
-
-        #[test]
-        fn test_zero_length_username() {
-            let username = b"";
-            let priority_val = 0x11223344_u32.to_be_bytes();
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (USERNAME_ATTRIBUTE_TYPE, username), // Zero length username
-                    (PRIORITY_ATTRIBUTE_TYPE, &priority_val),
-                ],
-            );
-            assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        }
-
-        // --- Missing/Absent Username Tests ---
-
-        #[test]
-        fn test_no_username_attribute() {
-            let priority_val = 0x1_u32.to_be_bytes();
-            let integrity_val = [1u8; 20];
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (PRIORITY_ATTRIBUTE_TYPE, &priority_val),
-                    (MESSAGE_INTEGRITY_ATTRIBUTE_TYPE, &integrity_val),
-                ],
-            );
-            assert_eq!(find_stun_username_slice(&msg), None);
-        }
-
-        #[test]
-        fn test_no_attributes_at_all() {
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[], // Empty attribute list
-            );
-            // Header should indicate length 0
-            assert_eq!(find_stun_username_slice(&msg), None);
-        }
-
-        // --- Malformed Header / Basic Checks Failures ---
-
-        #[test]
-        fn test_too_short_for_header() {
-            let data = &[0u8; MIN_STUN_HEADER_SIZE - 1];
-            assert_eq!(find_stun_username_slice(data), None);
-        }
-
-        #[test]
-        fn test_invalid_message_type_bits() {
-            let mut msg = build_stun_message(BINDING_REQUEST, DUMMY_TX_ID, &[]);
-            msg[0] = 0b0100_0000; // Set first bit
-            assert_eq!(find_stun_username_slice(&msg), None);
-            msg[0] = 0b1000_0000; // Set second bit
-            assert_eq!(find_stun_username_slice(&msg), None);
-            msg[0] = 0b1100_0000; // Set both bits
-            assert_eq!(find_stun_username_slice(&msg), None);
-        }
-
-        #[test]
-        fn test_invalid_magic_cookie() {
-            let mut msg = build_stun_message(BINDING_REQUEST, DUMMY_TX_ID, &[]);
-            msg[4] = 0xFF; // Corrupt first byte of cookie
-            assert_eq!(find_stun_username_slice(&msg), None);
-            msg[4] = MAGIC_COOKIE_BYTES[0]; // Restore
-            msg[7] = 0xEE; // Corrupt last byte of cookie
-            assert_eq!(find_stun_username_slice(&msg), None);
-        }
-
-        #[test]
-        fn test_message_length_exceeds_data_length() {
-            let username = b"test";
-            let mut msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[(USERNAME_ATTRIBUTE_TYPE, username)], // Length should be 4+4=8
-            );
-            // Manually set message length to something larger than actual data size
-            let declared_len: u16 =
-                u16::try_from(msg.len() - MIN_STUN_HEADER_SIZE + 1).expect("fixture length fits");
-            msg[2..4].copy_from_slice(&declared_len.to_be_bytes());
-
-            assert_eq!(find_stun_username_slice(&msg), None);
-        }
-
-        #[test]
-        fn test_message_length_zero_but_data_has_attrs() {
-            let username = b"test";
-            // Build correctly first
-            let mut msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[(USERNAME_ATTRIBUTE_TYPE, username)],
-            );
-            // Manually set message length to 0
-            msg[2..4].copy_from_slice(&0u16.to_be_bytes());
-            // Parser should exit early based on length field
-            assert_eq!(find_stun_username_slice(&msg), None);
-        }
-
-        // --- Malformed Attributes / Attribute Parsing Failures ---
-
-        #[test]
-        fn test_message_length_cuts_off_attr_header() {
-            // Goal: message_length allows the *first* attribute completely,
-            // but is too short to hold the *header* of the second attribute (USERNAME).
-
-            // Attribute 1: PRIORITY (non-target)
-            let priority_val = &[1, 2, 3, 4]; // Len 4, padded len 4. Total size 4+4=8.
-            // Attribute 2: USERNAME (target)
-            let username = b"test"; // Len 4, padded len 4. Total size 4+4=8.
-
-            // Total correct attr len = 8 + 8 = 16.
-            let mut msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (PRIORITY_ATTRIBUTE_TYPE, priority_val), // First attribute (processed)
-                    (USERNAME_ATTRIBUTE_TYPE, username),     // Second attribute (header cut off)
-                ],
-            );
-            // Sanity check length
-            assert_eq!(u16::from_be_bytes(msg[2..4].try_into().unwrap()), 16);
-            assert_eq!(msg.len(), MIN_STUN_HEADER_SIZE + 16); // 36 bytes total
-
-            // Set message length to cut off the *header* of the second attribute.
-            // First attribute (PRIORITY) occupies bytes 20..28 (Header 20..24, Value 24..28).
-            // It needs 8 bytes.
-            // The next attribute header would start at index 28 and needs 4 bytes (up to index 32).
-            // If message_length is set such that attributes_end is < 32, the check should fail
-            // when trying to read the second header.
-            // Let's set message_length to 10 (covers first attr [8 bytes] + 2 bytes).
-            // This means attributes_end = 20 + 10 = 30.
-            let bad_len: u16 = 10;
-            msg[2..4].copy_from_slice(&bad_len.to_be_bytes());
-
-            // --- Expected Trace ---
-            // 1. Parse PRIORITY attribute (current_pos=20). Fits (value ends at 28 <= 30). Not USERNAME.
-            // 2. Calculate next_pos = 28. Update current_pos = 28.
-            // 3. Loop again (current_pos=28). Check if enough space for next header:
-            //    current_pos(28) + ATTRIBUTE_HEADER_SIZE(4) = 32.
-            //    Is 32 > attributes_end(30)? YES. -> Return None.
-
-            // The assertion should now pass.
-            assert_eq!(
-                find_stun_username_slice(&msg),
-                None,
-                "Parser should return None because message_length cuts off the second attribute's header"
-            );
-
-            // Optional: Also test with truncated buffer (up to declared length)
-            assert_eq!(
-                find_stun_username_slice(&msg[..MIN_STUN_HEADER_SIZE + bad_len as usize]),
-                None,
-                "Parser should return None even when buffer is pre-truncated"
-            );
-        }
-
-        #[test]
-        fn test_attribute_length_exceeds_message_boundary() {
-            let username = b"user"; // Len 4, padded len 4. Attr size = 4+4=8
-            // Build correctly first
-            let mut msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[(USERNAME_ATTRIBUTE_TYPE, username)],
-            );
-            // Sanity check
-            assert_eq!(u16::from_be_bytes(msg[2..4].try_into().unwrap()), 8); // 4(type/len) + 4(value) = 8
-            assert_eq!(msg.len(), MIN_STUN_HEADER_SIZE + 8);
-
-            // Manually change the *attribute's* length field to claim more than allowed
-            // The message length is 8. Attribute region is bytes 20..28.
-            // Attribute header is at 20..24. Value starts at 24.
-            // If attr claims length 5, end_of_value = 24 + 5 = 29. attributes_end = 28.
-            // 29 > 28, so should fail.
-            msg[22..24].copy_from_slice(&5u16.to_be_bytes()); // Set attr length to 5
-
-            assert_eq!(find_stun_username_slice(&msg), None);
-        }
-
-        #[test]
-        fn test_attribute_value_plus_padding_exceeds_boundary() {
-            // Purpose: Test that the parser returns None when the calculated position
-            //          for the *next* attribute (after accounting for the current
-            //          attribute's value padding) exceeds the boundary set by the
-            //          message header's length field.
-
-            // To test this specific check, the USERNAME attribute cannot be found
-            // *before* the attribute whose padding causes the failure.
-            // Therefore, we use a placeholder attribute first.
-
-            // Attribute 1: Placeholder (e.g., SOFTWARE)
-            const SOFTWARE_ATTRIBUTE_TYPE: u16 = 0x8022; // Example placeholder type
-            let placeholder_val = b"NonUsernameData"; // Length 15, pads to 16. Total size = 4 + 16 = 20 bytes.
-
-            // Attribute 2: The one whose padding should cause failure (e.g., PRIORITY)
-            let priority_val = &[1u8, 2, 3]; // Length 3, pads to 4. Total size = 4 + 4 = 8 bytes.
-
-            // Build message with placeholder first, then priority.
-            // Correct total attribute length = 20 + 8 = 28 bytes.
-            let mut msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (SOFTWARE_ATTRIBUTE_TYPE, placeholder_val),
-                    (PRIORITY_ATTRIBUTE_TYPE, priority_val),
-                ],
-            );
-            // Sanity check that the message was built with the correct length initially
-            assert_eq!(
-                u16::from_be_bytes(msg[2..4].try_into().unwrap()),
-                28,
-                "Initial build length mismatch"
-            );
-            assert_eq!(
-                msg.len(),
-                MIN_STUN_HEADER_SIZE + 28,
-                "Initial buffer size mismatch"
-            ); // Total size 48
-
-            // --- Modify message length to trigger the failure condition ---
-            // Trace execution to determine required bad_len:
-            // attributes_start = 20.
-            // Process Placeholder: current=20. value_pos=24. end_of_value=24+15=39. Not USERNAME.
-            //   padded_len = 16. next_pos = 24 + 16 = 40. Set current_pos = 40.
-            // Process Priority: current=40. value_pos=44. end_of_value=44+3=47. Not USERNAME.
-            //   padded_len = 4. next_pos = 44 + 4 = 48.
-            // We need the padding check `if next_pos > attributes_end` to trigger for the PRIORITY attribute.
-            // So, we need `48 > attributes_end`. Let's set `attributes_end = 47`.
-            // `attributes_end = attributes_start + message_length`
-            // `47 = 20 + message_length` => `message_length` needs to be 27.
-            let bad_len: u16 = 27;
-            msg[2..4].copy_from_slice(&bad_len.to_be_bytes());
-            // Now attributes_end = 20 + 27 = 47.
-
-            // --- Execute and Assert ---
-            // Expected trace with attributes_end = 47:
-            // Process Placeholder: current=20. value_pos=24. end_of_value=39. (39<=47 OK). Not USERNAME.
-            //   padded_len=16. next_pos=40. (40<=47 OK). current_pos=40.
-            // Process Priority: current=40. value_pos=44. end_of_value=44+3=47. (47<=47 OK). Not USERNAME.
-            //   padded_len=4. next_pos=48.
-            //   Check padding boundary: if next_pos(48) > attributes_end(47) -> TRUE. Return None.
-            assert_eq!(
-                find_stun_username_slice(&msg),
-                None,
-                "Parser should return None because PRIORITY padding exceeds reduced message length (expected attributes_end=47)"
-            );
-
-            // Optional: Also test with the explicitly truncated buffer
-            assert_eq!(
-                find_stun_username_slice(&msg[..MIN_STUN_HEADER_SIZE + bad_len as usize]),
-                None,
-                "Parser should also return None on pre-truncated slice (expected attributes_end=47)"
-            );
-        }
-
-        #[test]
-        fn test_malformed_attribute_data_but_username_found_first() {
-            // Ensure that if the USERNAME is found, we don't parse further potentially
-            // malformed attributes.
-            let username = b"find-me-first";
-            let priority_val = &[1, 2, 3, 4, 5, 6, 7]; // Valid value for this test
-            // Build correctly initially
-            let mut msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[
-                    (USERNAME_ATTRIBUTE_TYPE, username), // Length 13 -> pads to 16. Size 4+16=20.
-                    (PRIORITY_ATTRIBUTE_TYPE, priority_val), // Length 7 -> pads to 8. Size 4+8=12.
-                ], // Total length = 20+12 = 32
-            );
-            // Sanity check
-            assert_eq!(u16::from_be_bytes(msg[2..4].try_into().unwrap()), 32);
-            assert_eq!(msg.len(), MIN_STUN_HEADER_SIZE + 32);
-
-            // Now, corrupt the *length* field of the second attribute (PRIORITY)
-            // First attr ends at 20 + 20 = 40. Second header starts at 40. Its length is at 42..44.
-            // Let's set its length to be huge, exceeding the message boundary.
-            msg[42..44].copy_from_slice(&1000u16.to_be_bytes());
-
-            // The parser should find the USERNAME attribute and return immediately,
-            // *without* hitting the error when parsing the second attribute.
-            assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        }
-
-        // --- UTF-8 Handling (`parse_stun_username_str`) ---
-
-        #[test]
-        fn test_valid_utf8_username_str() {
-            let username = "gültig€".as_bytes(); // Valid UTF-8 string
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[(USERNAME_ATTRIBUTE_TYPE, username)],
-            );
-            assert_eq!(find_stun_username_slice(&msg), Some(username)); // Slice check
-        }
-
-        #[test]
-        fn test_invalid_utf8_username_str() {
-            let invalid_utf8_bytes = &[0x80, 0xFF]; // Invalid UTF-8 sequence
-            let msg = build_stun_message(
-                BINDING_REQUEST,
-                DUMMY_TX_ID,
-                &[(USERNAME_ATTRIBUTE_TYPE, invalid_utf8_bytes)],
-            );
-            // The slice should still be found correctly
-            assert_eq!(
-                find_stun_username_slice(&msg),
-                Some(invalid_utf8_bytes as &[u8])
-            );
-        }
-
-        #[test]
-        fn test_ice_binding_from_raw() {
-            let packet_hex = "000100502112a4426943746c7a422f4d706e594800060009447172673a35504c4d000000c0570004000003e7802a0008e2e197300acfe8da00250000002400046e001eff00080014b610b03b8165bb4c317192054e00c73afb204dd480280004a953f217";
-            let packet_raw = hex::decode(packet_hex).unwrap();
-
-            assert_eq!(
-                find_stun_username_slice(&packet_raw),
-                Some(b"Dqrg:5PLM".as_slice())
-            );
-        }
-
-        #[test]
-        fn test_first_token() {
-            assert_eq!(first_token(b"asd", b':'), None);
-            assert_eq!(first_token(b"asd:", b':'), Some(b"asd".as_slice()));
-            assert_eq!(first_token(b"asd:bcd", b':'), Some(b"asd".as_slice()));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -809,10 +223,13 @@ mod demux_tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), port)
     }
 
-    fn ufrag(shard: usize, slot: u32) -> (IceUfrag, RouteId, u16) {
-        let route = RouteId::new(ShardId::new(shard), slot);
+    fn ufrag(shard: usize, slot: u32) -> (IceUfrag, TransportHandle) {
+        let route = TransportRoute::new(ShardId::new(shard), slot);
         let epoch = 7;
-        (IceUfrag::new(0, 0, route, epoch), route, epoch)
+        (
+            IceUfrag::new(0, 0, route, epoch),
+            TransportHandle::new(route, epoch),
+        )
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -820,30 +237,33 @@ mod demux_tests {
     #[test]
     fn valid_ufrag_matching_shard_routes_and_caches() {
         let mut d = Demuxer::new();
-        let (ice, route, epoch) = ufrag(3, 1);
+        let (ice, handle) = ufrag(3, 1);
         let encoded = ice.encode();
         let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
 
-        assert_eq!(d.demux(&batch), Some((route, epoch)));
+        assert_eq!(d.demux(&batch), Some(handle));
         // Fast-path entry created
         assert_eq!(d.addr_map.len(), 1);
         // Second packet uses fast path
-        assert_eq!(d.demux(&batch), Some((route, epoch)));
+        assert_eq!(d.demux(&batch), Some(handle));
         assert_eq!(d.addr_map.len(), 1); // no duplicate
     }
 
-    /// A ufrag for another shard resolves rather than being dropped: which
-    /// socket `SO_REUSEPORT` chose says nothing about which shard owns the
-    /// route, and the caller forwards it on by reading the route's own shard
-    /// bits. Rejecting it here made every participant whose hash disagreed
-    /// with its placement unreachable.
+    /// A ufrag for another shard resolves rather than being dropped:
+    /// resolving a route and deciding whether this shard owns it are
+    /// separate concerns now. Which socket `SO_REUSEPORT` chose says nothing
+    /// about which shard owns the route, so `demux` still decodes it; the
+    /// caller is the one that checks `owns` and decides whether to forward,
+    /// process, or drop.
     #[test]
-    fn a_ufrag_for_another_shard_still_resolves_so_it_can_be_forwarded() {
+    fn a_ufrag_for_another_shard_still_resolves_but_is_not_owned() {
         let mut d = Demuxer::new();
-        let (ice, route, epoch) = ufrag(4, 2);
+        let (ice, handle) = ufrag(4, 2);
         let batch = make_batch(src(1000), stun_with_ufrag(&ice.encode()));
 
-        assert_eq!(d.demux(&batch), Some((route, epoch)));
+        assert_eq!(d.demux(&batch), Some(handle));
+        assert!(!d.owns(handle, ShardId::new(0)));
+        assert!(d.owns(handle, ShardId::new(4)));
     }
 
     #[test]
@@ -874,34 +294,26 @@ mod demux_tests {
     #[test]
     fn per_route_addr_cap_limits_cache_growth() {
         let mut d = Demuxer::new();
-        let (ice, route, epoch) = ufrag(0, 0);
+        let (ice, handle) = ufrag(0, 0);
         let encoded = ice.encode();
 
         // Fill up to the cap
         for port in 0..u16::try_from(MAX_ADDRS_PER_ROUTE).expect("addr cap fits a u16") {
             let batch = make_batch(src(port), stun_with_ufrag(&encoded));
-            assert_eq!(
-                d.demux(&batch),
-                Some((route, epoch)),
-                "port {port} should route"
-            );
+            assert_eq!(d.demux(&batch), Some(handle), "port {port} should route");
         }
         assert_eq!(d.addr_map.len(), MAX_ADDRS_PER_ROUTE);
 
         // One more distinct source address: must still ROUTE but must NOT cache
         let extra = make_batch(src(9999), stun_with_ufrag(&encoded));
-        assert_eq!(
-            d.demux(&extra),
-            Some((route, epoch)),
-            "must still route after cap"
-        );
+        assert_eq!(d.demux(&extra), Some(handle), "must still route after cap");
         assert_eq!(d.addr_map.len(), MAX_ADDRS_PER_ROUTE, "cache must not grow");
     }
 
     #[test]
     fn unregister_clears_all_cached_addrs() {
         let mut d = Demuxer::new();
-        let (ice, route, _epoch) = ufrag(0, 0);
+        let (ice, handle) = ufrag(0, 0);
         let encoded = ice.encode();
 
         for port in 0..4u16 {
@@ -910,9 +322,50 @@ mod demux_tests {
         }
         assert_eq!(d.addr_map.len(), 4);
 
-        let freed = d.unregister(route);
+        let freed = d.unregister(handle.route);
         assert_eq!(freed.len(), 4);
         assert!(d.addr_map.is_empty());
         assert!(d.route_addrs.is_empty());
+    }
+
+    /// Phase-9 acceptance criterion: the shared classifier and this userspace
+    /// path must make the *same* decision for the same bytes — the kernel
+    /// parser is an optimization boundary, not a second security model.
+    #[test]
+    fn userspace_demux_agrees_with_the_shared_classifier() {
+        let (ice, handle) = ufrag(5, 42);
+        let bytes = stun_with_ufrag(&ice.encode());
+
+        let mut d = Demuxer::new();
+        let batch = make_batch(src(1000), bytes.clone());
+        let userspace_result = d.demux(&batch);
+
+        let shared_result = match pulsebeam_routing::classify::classify_client(&bytes) {
+            pulsebeam_routing::classify::ClientVerdict::Bootstrap { handle, .. } => {
+                Some(to_local_handle(handle))
+            }
+            _ => None,
+        };
+
+        assert_eq!(userspace_result, shared_result);
+        assert_eq!(userspace_result, Some(handle));
+    }
+
+    #[test]
+    fn userspace_demux_agrees_with_the_shared_classifier_on_drops() {
+        for bytes in [
+            b"RTP not STUN".to_vec(),
+            stun_with_ufrag("notavalidufrag!"),
+            stun_with_ufrag(&"A".repeat(IceUfrag::ENCODED_LEN + 1)),
+        ] {
+            let mut d = Demuxer::new();
+            let batch = make_batch(src(2000), bytes.clone());
+            assert_eq!(d.demux(&batch), None);
+            assert!(matches!(
+                pulsebeam_routing::classify::classify_client(&bytes),
+                pulsebeam_routing::classify::ClientVerdict::Drop(_)
+                    | pulsebeam_routing::classify::ClientVerdict::Established
+            ));
+        }
     }
 }

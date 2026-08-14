@@ -21,7 +21,7 @@ use tokio::time::Instant;
 
 use super::worker::{MediaPayload, Reverse, ShardEvent, ShardFrame, Topology};
 use crate::route::{
-    ImportEffect, MediaEnvelope, RemoteRoute, ReverseRoute, ReverseTarget, RouteAction,
+    ImportEffect, MediaEnvelope, RemoteRoute, RouteAction, RouteHandle, ReverseTarget, TransportHandle,
     RouteEnvelope, RouteId, RouteNames,
 };
 
@@ -602,7 +602,7 @@ impl ShardRoutingTable {
         track: &Track,
         now: Instant,
         wall: &WallAnchor,
-    ) -> Option<ReverseRoute> {
+    ) -> Option<RouteHandle> {
         let key = self.fanout_key(track.meta.id, track.meta.origin);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
@@ -636,7 +636,7 @@ impl ShardRoutingTable {
         topic: Topic,
         now: Instant,
         wall: &WallAnchor,
-    ) -> Option<ReverseRoute> {
+    ) -> Option<RouteHandle> {
         let key = DataStreamId::new(publisher, topic.clone());
         // Minted before the route install, alongside the reverse route it
         // will point at: `RouteAction::Reverse` never resolves to a key this
@@ -665,14 +665,14 @@ impl ShardRoutingTable {
         names: RouteNames,
         now: Instant,
         wall: &WallAnchor,
-    ) -> Option<ReverseRoute> {
+    ) -> Option<RouteHandle> {
         let (route, epoch) = self
             .data
             .routes
             .install(RouteAction::Reverse { target }, names, wall.ntp(), now)
             .inspect_err(|err| tracing::error!(?err, "reverse route install failed"))
             .ok()?;
-        Some(ReverseRoute { route, epoch })
+        Some(RouteHandle { route, epoch })
     }
 
     /// Install a client's ICE association. Route and key share a lifetime by
@@ -682,43 +682,24 @@ impl ShardRoutingTable {
     pub fn install_ingress_route(
         &mut self,
         participant: ParticipantKey,
-        origin: ParticipantId,
-        room_id: RoomId,
         now: Instant,
-        wall: &WallAnchor,
-    ) -> Option<(RouteId, u16)> {
+    ) -> Option<TransportHandle> {
         self.data
-            .routes
-            .install(
-                RouteAction::Ingress { participant },
-                RouteNames {
-                    room_id: Some(room_id),
-                    origin,
-                    track_id: None,
-                    topic: None,
-                },
-                wall.ntp(),
-                now,
-            )
+            .transports
+            .install(participant, now)
             .inspect_err(|err| tracing::error!(?err, "ingress route install failed"))
             .ok()
     }
 
-    /// Retire a client's ICE association route, e.g. on teardown or a failed
+    /// Retire a client's ICE association, e.g. on teardown or a failed
     /// connection setup that never gets past `AddParticipant`.
-    pub fn retire_ingress_route(&mut self, route: RouteId, epoch: u16, now: Instant) {
-        self.data.routes.retire(route, epoch, now);
+    pub fn retire_ingress_route(&mut self, handle: TransportHandle, now: Instant) {
+        self.data.transports.retire(handle, now);
     }
 
     /// Resolve an arriving client packet to the participant key it addresses.
-    pub fn resolve_ingress(&self, route: RouteId, epoch: u16) -> Option<ParticipantKey> {
-        match self.data.routes.resolve_action(route, epoch)? {
-            RouteAction::Ingress { participant } => Some(*participant),
-            other => {
-                debug_assert!(false, "an ingress frame arrived on a {other:?} route");
-                None
-            }
-        }
+    pub fn resolve_ingress(&self, handle: TransportHandle) -> Option<ParticipantKey> {
+        self.data.transports.resolve(handle)
     }
 
     /// Close a track's reverse path when its publisher goes away.
@@ -757,7 +738,7 @@ impl ShardRoutingTable {
         &self,
         publisher: ParticipantId,
         topic: &Topic,
-    ) -> Option<ReverseRoute> {
+    ) -> Option<RouteHandle> {
         let key = self.reliable_stream_key(&DataStreamId::new(publisher, topic.clone()))?;
         self.reliable_stream(key)?.reverse_route
     }
@@ -767,7 +748,7 @@ impl ShardRoutingTable {
         &mut self,
         publisher: ParticipantId,
         topic: &Topic,
-        reverse: Option<ReverseRoute>,
+        reverse: Option<RouteHandle>,
     ) {
         let key = DataStreamId::new(publisher, topic.clone());
         let Some(entry) = self.reliable_stream_mut(&key) else {
@@ -818,7 +799,7 @@ impl ShardRoutingTable {
         &self,
         track_id: &TrackId,
         rid: Option<Rid>,
-    ) -> Option<(ReverseRoute, u8)> {
+    ) -> Option<(RouteHandle, u8)> {
         let key = self.fanout_of(track_id)?;
         let target = self.data.tracks.get(key)?.reverse_target.as_ref()?;
         let layer = target.encodings.iter().position(|r| *r == rid)?;
@@ -871,10 +852,10 @@ impl ShardRoutingTable {
             .map(|remote| {
                 (
                     remote.shard_id,
-                    RouteEnvelope {
+                    RouteEnvelope::telemetry(RouteHandle {
                         route: remote.route,
                         epoch: remote.epoch,
-                    },
+                    }),
                 )
             })
             .collect()
@@ -2074,7 +2055,7 @@ impl ShardRoutingTable {
         topic: Topic,
         now: Instant,
         wall: &WallAnchor,
-    ) -> Option<ReverseRoute> {
+    ) -> Option<RouteHandle> {
         self.room(&room_id)?;
         let id = DataStreamId::new(publisher, topic.clone());
         let stream = self.reliable_stream_or_insert(room_id, id);
@@ -2230,7 +2211,7 @@ impl ShardRoutingTable {
         ctx.send_frame(
             target.route.shard(),
             ShardFrame::Reverse {
-                env: RouteEnvelope::new(target),
+                env: RouteEnvelope::feedback(target),
                 body: Reverse::DataAck(bytes.to_vec()),
             },
         );
