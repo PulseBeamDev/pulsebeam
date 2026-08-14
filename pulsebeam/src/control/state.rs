@@ -12,10 +12,8 @@
 //! a participant, room or track the owning shard has not built yet.
 #![deny(clippy::arithmetic_side_effects)]
 
-use ahash::{HashMap, HashMapExt};
 use tokio::time::Instant;
 
-use crate::entity::{ParticipantId, RoomId};
 use crate::id::ShardId;
 use crate::route::{
     PackedRoute, RouteError, RouteHandle, RouteId, SlotAllocator, TransportHandle, TransportRoute,
@@ -80,48 +78,6 @@ impl PerShardAllocator {
     }
 }
 
-/// What the control plane knows about one participant.
-///
-/// `binding` is opaque: it is the owning shard's own arena key, stored only
-/// long enough to compile into that shard's next view. The control plane
-/// never dereferences it and it is meaningless on any other shard.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ParticipantRecord {
-    pub shard_id: ShardId,
-    pub room_id: RoomId,
-    pub transport: TransportHandle,
-    pub binding: Option<ParticipantKey>,
-}
-
-/// The canonical mutable source for lifecycle facts. Never read by a packet
-/// handler.
-#[derive(Debug, Default)]
-pub(crate) struct ControlState {
-    pub participants: HashMap<ParticipantId, ParticipantRecord>,
-}
-
-impl ControlState {
-    pub fn new() -> Self {
-        Self {
-            participants: HashMap::new(),
-        }
-    }
-}
-
-/// How to undo one staged mutation.
-///
-/// The staged generation mutates `committed` in ordinary memory and records
-/// how to walk back, rather than cloning the whole state per transaction: a
-/// join would otherwise cost a copy of every participant on the node. Nothing
-/// staged is *visible* until the views publish and the barrier clears, which
-/// is where the plan's "leaves the previously committed views valid" actually
-/// lives.
-#[derive(Debug)]
-enum Undo {
-    RemoveParticipant(ParticipantId),
-    RestoreParticipant(ParticipantId, Box<ParticipantRecord>),
-}
-
 /// A route allocated but not yet committed. Held until the whole generation
 /// commits or aborts, so an abandoned transaction cannot leak an address.
 #[derive(Debug, Clone, Copy)]
@@ -142,7 +98,6 @@ pub(crate) struct PreparedBinding {
 pub(crate) struct LifecycleTransaction {
     pub id: TransactionId,
     pub generation: u64,
-    undo: Vec<Undo>,
     pub reservations: Vec<RouteReservation>,
     pub prepared: Vec<PreparedBinding>,
     affected: Vec<ShardId>,
@@ -153,7 +108,6 @@ impl LifecycleTransaction {
         Self {
             id,
             generation,
-            undo: Vec::new(),
             reservations: Vec::new(),
             prepared: Vec::new(),
             affected: Vec::new(),
@@ -188,7 +142,6 @@ pub(crate) enum TransactionError {
 /// looking at one function rather than trusting fifty call sites.
 #[derive(Debug)]
 pub(crate) struct ControlPlaneState {
-    pub committed: ControlState,
     pending: Option<LifecycleTransaction>,
     pub transport: PerShardAllocator,
     pub endpoint: PerShardAllocator,
@@ -199,7 +152,6 @@ pub(crate) struct ControlPlaneState {
 impl ControlPlaneState {
     pub fn new(shard_count: usize) -> Self {
         Self {
-            committed: ControlState::new(),
             pending: None,
             transport: PerShardAllocator::new(shard_count),
             endpoint: PerShardAllocator::new(shard_count),
@@ -284,70 +236,6 @@ impl ControlPlaneState {
         self.endpoint.retire(shard_id, slot, now);
     }
 
-    /// Stage a participant. Not visible to anything until the transaction
-    /// commits.
-    pub fn stage_participant(
-        &mut self,
-        participant_id: ParticipantId,
-        record: ParticipantRecord,
-    ) -> Result<(), TransactionError> {
-        let previous = self.committed.participants.insert(participant_id, record);
-        let tx = self.tx_mut()?;
-        tx.touch(record.shard_id);
-        tx.undo.push(match previous {
-            Some(old) => Undo::RestoreParticipant(participant_id, Box::new(old)),
-            None => Undo::RemoveParticipant(participant_id),
-        });
-        Ok(())
-    }
-
-    /// Record the binding key an owning shard reported. A duplicate report for
-    /// the same participant is idempotent — a retry after a lost
-    /// acknowledgement must not create a second endpoint.
-    pub fn record_binding(
-        &mut self,
-        participant_id: ParticipantId,
-        binding: PreparedBinding,
-    ) -> Result<(), TransactionError> {
-        let Some(record) = self.committed.participants.get_mut(&participant_id) else {
-            return Ok(());
-        };
-        debug_assert_eq!(
-            record.shard_id, binding.shard_id,
-            "only the owning shard prepares a participant's binding"
-        );
-        if let Some(existing) = record.binding {
-            debug_assert_eq!(
-                existing, binding.participant,
-                "a repeated prepare must report the same binding"
-            );
-            return Ok(());
-        }
-        record.binding = Some(binding.participant);
-        let tx = self.tx_mut()?;
-        debug_assert_eq!(
-            tx.id, binding.transaction,
-            "a binding prepared for an abandoned transaction must not be applied to this one"
-        );
-        tx.prepared.push(binding);
-        Ok(())
-    }
-
-    /// Stage a participant's removal.
-    pub fn forget_participant(
-        &mut self,
-        participant_id: ParticipantId,
-    ) -> Result<(), TransactionError> {
-        let previous = self.committed.participants.remove(&participant_id);
-        let tx = self.tx_mut()?;
-        if let Some(old) = previous {
-            tx.touch(old.shard_id);
-            tx.undo
-                .push(Undo::RestoreParticipant(participant_id, Box::new(old)));
-        }
-        Ok(())
-    }
-
     /// Return a transport slot to its allocator.
     ///
     /// Only after the route is absent from the published view and that
@@ -356,15 +244,6 @@ impl ControlPlaneState {
     /// to arrive.
     pub fn release_transport(&mut self, shard_id: ShardId, slot: u32, now: Instant) {
         self.transport.retire(shard_id, slot, now);
-    }
-
-    /// The room a participant was placed in, for authorization checks that
-    /// must not re-derive it from anything the data plane touched.
-    pub fn room_of(&self, participant_id: &ParticipantId) -> Option<RoomId> {
-        self.committed
-            .participants
-            .get(participant_id)
-            .map(|record| record.room_id)
     }
 
     /// Commit the staged generation. Callers must only reach here once every
@@ -383,17 +262,7 @@ impl ControlPlaneState {
     /// Abandon the staged generation, walking every staged mutation back and
     /// releasing every reservation it took.
     pub fn abort(&mut self, now: Instant) -> Option<LifecycleTransaction> {
-        let mut tx = self.pending.take()?;
-        while let Some(undo) = tx.undo.pop() {
-            match undo {
-                Undo::RemoveParticipant(id) => {
-                    self.committed.participants.remove(&id);
-                }
-                Undo::RestoreParticipant(id, record) => {
-                    self.committed.participants.insert(id, *record);
-                }
-            }
-        }
+        let tx = self.pending.take()?;
         for reservation in &tx.reservations {
             self.transport
                 .retire(reservation.shard_id, reservation.slot, now);
@@ -407,29 +276,6 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
-    use crate::entity::ExternalRoomId;
-    use slotmap::KeyData;
-
-    fn pid(seed: u8) -> ParticipantId {
-        ParticipantId::from_bytes([seed; 16])
-    }
-
-    fn room() -> RoomId {
-        RoomId::from_external(&ExternalRoomId::new("room1").unwrap())
-    }
-
-    fn participant_key(n: u32) -> ParticipantKey {
-        ParticipantKey::from(KeyData::from_ffi(u64::from(n) | (1 << 32)))
-    }
-
-    fn record(shard: ShardId, transport: TransportHandle) -> ParticipantRecord {
-        ParticipantRecord {
-            shard_id: shard,
-            room_id: room(),
-            transport,
-            binding: None,
-        }
-    }
 
     #[tokio::test(start_paused = true)]
     async fn a_reserved_route_carries_the_shard_placement_chose() {
@@ -454,42 +300,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_committed_transaction_advances_exactly_one_generation() {
-        let mut state = ControlPlaneState::new(2);
-        assert_eq!(state.committed_generation(), 0);
 
-        state.begin().unwrap();
-        let handle = state
-            .reserve_transport(ShardId::new(0), Instant::now())
-            .unwrap();
-        state
-            .stage_participant(pid(1), record(ShardId::new(0), handle))
-            .unwrap();
-        let tx = state.commit().unwrap();
-
-        assert_eq!(tx.generation, 1);
-        assert_eq!(state.committed_generation(), 1);
-        assert!(state.committed.participants.contains_key(&pid(1)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn aborting_leaves_no_participant_and_no_generation() {
-        let mut state = ControlPlaneState::new(2);
-        state.begin().unwrap();
-        let handle = state
-            .reserve_transport(ShardId::new(0), Instant::now())
-            .unwrap();
-        state
-            .stage_participant(pid(1), record(ShardId::new(0), handle))
-            .unwrap();
-
-        state.abort(Instant::now());
-
-        assert!(!state.committed.participants.contains_key(&pid(1)));
-        assert_eq!(state.committed_generation(), 0, "an aborted generation never lands");
-        assert!(state.pending().is_none());
-    }
 
     /// An abandoned transaction must not leak the address it took, or a
     /// reconnect storm would exhaust the namespace one failed join at a time.
@@ -510,52 +321,7 @@ mod tests {
         assert_ne!(second.epoch, first.epoch, "as a new incarnation");
     }
 
-    /// A retry after a lost acknowledgement must not create a second binding.
-    #[tokio::test(start_paused = true)]
-    async fn a_repeated_prepare_report_is_idempotent() {
-        let mut state = ControlPlaneState::new(2);
-        let shard = ShardId::new(0);
-        let id = state.begin().unwrap();
-        let handle = state.reserve_transport(shard, Instant::now()).unwrap();
-        state.stage_participant(pid(1), record(shard, handle)).unwrap();
 
-        let binding = PreparedBinding {
-            transaction: id,
-            shard_id: shard,
-            participant: participant_key(7),
-        };
-        state.record_binding(pid(1), binding).unwrap();
-        state.record_binding(pid(1), binding).unwrap();
-
-        assert_eq!(
-            state.committed.participants.get(&pid(1)).and_then(|r| r.binding),
-            Some(participant_key(7)),
-        );
-        assert_eq!(
-            state.pending().map(|tx| tx.prepared.len()),
-            Some(1),
-            "the second report must not add a second binding"
-        );
-    }
-
-    /// A binding report for a participant the transaction abandoned is a
-    /// no-op, not a resurrection.
-    #[tokio::test(start_paused = true)]
-    async fn a_late_binding_report_for_an_unknown_participant_is_harmless() {
-        let mut state = ControlPlaneState::new(2);
-        let id = state.begin().unwrap();
-        state
-            .record_binding(
-                pid(9),
-                PreparedBinding {
-                    transaction: id,
-                    shard_id: ShardId::new(0),
-                    participant: participant_key(1),
-                },
-            )
-            .unwrap();
-        assert!(state.committed.participants.is_empty());
-    }
 
     #[tokio::test(start_paused = true)]
     async fn only_one_transaction_stages_at_a_time() {

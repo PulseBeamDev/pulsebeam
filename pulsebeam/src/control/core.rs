@@ -88,7 +88,7 @@ pub enum RoomPlacement {
 }
 
 pub struct ControllerCore {
-    registry: RoomRegistry,
+    pub(crate) registry: RoomRegistry,
     room_shard_slot: usize,
     placement: RoomPlacement,
 }
@@ -202,13 +202,14 @@ impl ControllerCore {
         rtc: Rtc,
         state: ParticipantState,
         shard_id: ShardId,
+        transport: Option<crate::route::TransportHandle>,
     ) -> ParticipantConfig {
         let tracks = {
             let room = self.registry.get_or_create_room(state.room_id);
             room.tracks().cloned().collect()
         };
         self.registry
-            .add_participant(state.participant_id, state.room_id, shard_id);
+            .add_participant(state.participant_id, state.room_id, shard_id, transport);
         ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
@@ -371,11 +372,11 @@ mod tests {
         let subscriber_b = pid(12);
 
         core.registry
-            .add_participant(publisher, room, ShardId::new(0));
+            .add_participant(publisher, room, ShardId::new(0), None);
         core.registry
-            .add_participant(subscriber_a, room, ShardId::new(2));
+            .add_participant(subscriber_a, room, ShardId::new(2), None);
         core.registry
-            .add_participant(subscriber_b, room, ShardId::new(2));
+            .add_participant(subscriber_b, room, ShardId::new(2), None);
 
         let track = crate::track::Track {
             meta: TrackMeta {
@@ -416,11 +417,11 @@ mod tests {
         let subscriber_b = pid(42);
 
         core.registry
-            .add_participant(publisher, room, ShardId::new(0));
+            .add_participant(publisher, room, ShardId::new(0), None);
         core.registry
-            .add_participant(subscriber_a, room, ShardId::new(2));
+            .add_participant(subscriber_a, room, ShardId::new(2), None);
         core.registry
-            .add_participant(subscriber_b, room, ShardId::new(2));
+            .add_participant(subscriber_b, room, ShardId::new(2), None);
 
         let track_id = publisher.derive_track_id(TrackKind::Audio, "a");
         let track = crate::track::Track {
@@ -474,7 +475,7 @@ mod tests {
         let participant = pid(20);
 
         core.registry
-            .add_participant(participant, room, ShardId::new(6));
+            .add_participant(participant, room, ShardId::new(6), None);
         core.delete_participant(&participant, &mut eq);
 
         let Some(ControllerEvent::ShardCommandSent(
@@ -517,11 +518,11 @@ mod tests {
         let subscriber = pid(31);
 
         core.registry
-            .add_participant(publisher, room, ShardId::new(0));
+            .add_participant(publisher, room, ShardId::new(0), None);
         core.registry
-            .add_participant(subscriber, room, ShardId::new(1));
+            .add_participant(subscriber, room, ShardId::new(1), None);
         core.registry
-            .add_participant(subscriber, room, ShardId::new(2));
+            .add_participant(subscriber, room, ShardId::new(2), None);
 
         let track = crate::track::Track {
             meta: TrackMeta {

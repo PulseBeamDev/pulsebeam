@@ -65,6 +65,15 @@ pub(crate) struct ControlPlane {
     /// Separate from `data_imports`: the same (publisher, topic) can exist on
     /// both the realtime and reliable lanes and needs its own route.
     pub reliable_imports: ImportTable<DataStreamId>,
+    /// Where this shard last heard each remote participant was.
+    ///
+    /// Not a second lifecycle index — the control plane owns that (see
+    /// `RoomRegistry`). This is the receiver-side staleness guard for the
+    /// per-shard remote counts on `RoomFanout`: a participant that moves from
+    /// shard A to B produces an unregister for A that can arrive after the
+    /// register for B, and without the placement it was counted under there
+    /// is no way to tell that late unregister from a live one. Dropping it
+    /// would turn a local invariant into a distributed ordering assumption.
     pub participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
 }
 

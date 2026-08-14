@@ -237,7 +237,7 @@ impl ControllerActor {
             ControllerCommand::DeleteParticipant(m) => {
                 self.core
                     .delete_participant(&m.participant_id, &mut self.eq);
-                self.retire_transport(&m.participant_id).await;
+                self.retire_participant_transport(&m.participant_id).await;
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
@@ -266,7 +266,7 @@ impl ControllerActor {
     ) -> Result<SdpAnswer, ControllerError> {
         self.core
             .delete_participant(&state.participant_id, &mut self.eq);
-        self.retire_transport(&state.participant_id).await;
+        self.retire_participant_transport(&state.participant_id).await;
         self.handle_create_participant(state, offer).await
     }
 
@@ -432,8 +432,7 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         participant_id: ParticipantId,
-        room_id: RoomId,
-    ) -> Option<TransportHandle> {
+    ) -> Option<(TransportHandle, crate::shard::participants::ParticipantKey)> {
         self.drain_core_events().await;
 
         let now = tokio::time::Instant::now();
@@ -475,35 +474,6 @@ impl ControllerActor {
             return None;
         };
 
-        let staged = self
-            .state
-            .stage_participant(
-                participant_id,
-                crate::control::state::ParticipantRecord {
-                    shard_id,
-                    room_id,
-                    transport: handle,
-                    binding: None,
-                },
-            )
-            .and_then(|()| {
-                let Some(transaction) = self.state.pending().map(|tx| tx.id) else {
-                    return Err(crate::control::state::TransactionError::Idle);
-                };
-                self.state.record_binding(
-                    participant_id,
-                    crate::control::state::PreparedBinding {
-                        transaction,
-                        shard_id,
-                        participant: participant_key,
-                    },
-                )
-            });
-        if staged.is_err() {
-            self.state.abort(now);
-            return None;
-        }
-
         let Some(generation) = self.publish_pending(shard_id, handle, participant_key) else {
             self.state.abort(now);
             return None;
@@ -518,7 +488,7 @@ impl ControllerActor {
             self.state.abort(now);
             return None;
         }
-        Some(handle)
+        Some((handle, participant_key))
     }
 
     /// Ask the owning shard to build the runtime binding this route will
@@ -591,28 +561,28 @@ impl ControllerActor {
         false
     }
 
-    /// Retire a transport route as its own generation, so the route is gone
-    /// from the published view before the allocator may hand its slot out.
-    async fn retire_transport(&mut self, participant_id: &ParticipantId) {
-        let now = tokio::time::Instant::now();
-        let Some(record) = self.state.committed.participants.get(participant_id).copied() else {
+    /// Retire whatever transport route a participant holds, if the registry
+    /// still knows about one.
+    async fn retire_participant_transport(&mut self, participant_id: &ParticipantId) {
+        let Some((shard_id, handle)) = self.core.registry.transport_of(participant_id) else {
             return;
         };
+        self.retire_transport(shard_id, handle).await;
+    }
+
+    /// Retire a transport route as its own generation, so the route is gone
+    /// from the published view before the allocator may hand its slot out.
+    async fn retire_transport(&mut self, shard_id: crate::id::ShardId, handle: TransportHandle) {
+        let now = tokio::time::Instant::now();
         if self.state.begin().is_err() {
             return;
         }
-        let Ok(()) = self.state.forget_participant(*participant_id) else {
-            self.state.abort(now);
-            return;
-        };
         let generation = self.state.pending().map(|tx| tx.generation);
         let published = generation.and_then(|generation| {
-            let view = self.view_mut(record.shard_id)?;
+            let view = self.view_mut(shard_id)?;
             view.stage(
                 generation,
-                crate::view::ViewOp::RetireTransport {
-                    handle: record.transport,
-                },
+                crate::view::ViewOp::RetireTransport { handle },
             );
             view.publish()
         });
@@ -620,13 +590,13 @@ impl ControllerActor {
             self.state.abort(now);
             return;
         };
-        if !self.await_generation(record.shard_id, published).await {
+        if !self.await_generation(shard_id, published).await {
             self.state.abort(now);
             return;
         }
         let _ = self.state.commit();
         self.state
-            .release_transport(record.shard_id, record.transport.route.slot(), now);
+            .release_transport(shard_id, handle.route.slot(), now);
     }
 
     pub async fn handle_create_participant(
@@ -651,8 +621,8 @@ impl ControllerActor {
         // The transport route has to exist, be published and be acknowledged
         // before the ufrag can carry it, so the whole lifecycle generation
         // runs before negotiation rather than after.
-        let Some(handle) = self
-            .stage_transport(shard_id, state.participant_id, state.room_id)
+        let Some((handle, binding)) = self
+            .stage_transport(shard_id, state.participant_id)
             .await
         else {
             return Err(ControllerError::ServiceUnavailable);
@@ -676,7 +646,7 @@ impl ControllerActor {
                 // before its slot can go back to the allocator — and the
                 // shard still holds the key it reserved, so both have to be
                 // unwound, not just one.
-                self.retire_transport(&state.participant_id).await;
+                self.retire_transport(shard_id, handle).await;
                 self.router
                     .send(
                         shard_id,
@@ -688,7 +658,12 @@ impl ControllerActor {
                 return Err(err.into());
             }
         };
-        let cfg = self.core.create_participant(rtc, state, shard_id);
+        let cfg = self
+            .core
+            .create_participant(rtc, state, shard_id, Some(handle));
+        self.core
+            .registry
+            .bind_participant(&cfg.participant_id, binding);
 
         self.eq.broadcast(|| ShardCommand::RegisterParticipant {
             shard_id,
