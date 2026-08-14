@@ -17,7 +17,9 @@ use tokio::time::Instant;
 
 use crate::entity::{ParticipantId, RoomId};
 use crate::id::ShardId;
-use crate::route::{PackedRoute, RouteError, SlotAllocator, TransportHandle, TransportRoute};
+use crate::route::{
+    PackedRoute, RouteError, RouteHandle, RouteId, SlotAllocator, TransportHandle, TransportRoute,
+};
 use crate::shard::participants::ParticipantKey;
 
 /// Identifies one in-flight transaction, so a late acknowledgement for a
@@ -256,6 +258,30 @@ impl ControlPlaneState {
         tx.reservations.push(RouteReservation { shard_id, slot });
         tx.touch(shard_id);
         Ok(handle)
+    }
+
+    /// Reserve an endpoint route on the shard that asked for it. Placement is
+    /// not a decision here — the requesting shard is the destination.
+    pub fn reserve_endpoint(
+        &mut self,
+        shard_id: ShardId,
+        now: Instant,
+    ) -> Result<RouteHandle, TransactionError> {
+        let (slot, epoch) = self
+            .endpoint
+            .allocate(shard_id, now)
+            .map_err(TransactionError::Allocation)?;
+        let handle = RouteHandle::new(RouteId::new(shard_id, slot), epoch);
+        let tx = self.tx_mut()?;
+        tx.reservations.push(RouteReservation { shard_id, slot });
+        tx.touch(shard_id);
+        Ok(handle)
+    }
+
+    /// Return an endpoint slot to its allocator, once its route is absent from
+    /// the published view.
+    pub fn release_endpoint(&mut self, shard_id: ShardId, slot: u32, now: Instant) {
+        self.endpoint.retire(shard_id, slot, now);
     }
 
     /// Stage a participant. Not visible to anything until the transaction

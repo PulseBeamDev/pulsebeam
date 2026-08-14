@@ -9,7 +9,9 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use crate::clock::WallAnchor;
-use crate::route::{MediaEnvelope, RouteEnvelope, RouteHandle, RouteId, TransportHandle};
+use crate::route::{
+    MediaEnvelope, RouteAction, RouteEnvelope, RouteHandle, RouteId, TransportHandle,
+};
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -97,6 +99,13 @@ pub enum ShardCommand {
         participant_id: ParticipantId,
         handle: TransportHandle,
         reply: tokio::sync::oneshot::Sender<Option<crate::shard::participants::ParticipantKey>>,
+    },
+    /// The answer to a [`ShardEvent::RouteNeeded`]. `None` means the control
+    /// plane could not produce a usable route, and the shard must unwind
+    /// whatever it built expecting one.
+    RouteGranted {
+        request: RouteRequestId,
+        handle: Option<RouteHandle>,
     },
     /// The generation barrier. The shard replies with the generation it can
     /// currently resolve against, which is at least `generation` because the
@@ -316,7 +325,29 @@ pub enum ShardEvent {
     /// A topology change for the controller to relay, unchanged, to whichever
     /// shards it decides are concerned.
     Relay(Topology),
+    /// This shard needs an endpoint route for a destination it has just built.
+    ///
+    /// It does not allocate one: the address and the published view are the
+    /// control plane's, so the shard states the need and waits for a grant.
+    /// The action travels with it because that is what the control plane
+    /// compiles into the view — it is opaque to the controller, which never
+    /// looks inside a key that means something only on this shard.
+    RouteNeeded {
+        request: RouteRequestId,
+        action: RouteAction,
+    },
+    /// This shard no longer needs a route it was granted. The control plane
+    /// removes it from the published view and only then returns its slot.
+    RouteReleased { handle: RouteHandle },
 }
+
+/// Names one outstanding route request from one shard.
+///
+/// Scoped to the shard that minted it, so the control plane never needs it to
+/// be globally unique — it exists only to match a grant back to the work that
+/// asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RouteRequestId(pub u64);
 
 #[derive(Clone)]
 pub struct ShardContext {
@@ -454,6 +485,7 @@ impl ShardWorker {
                 .record_idle(busy_start.saturating_duration_since(loop_start));
 
             self.tick(busy_start);
+            self.core.flush_route_work();
             self.flush_shard_events()?;
 
             // TODO: record forwarding latency

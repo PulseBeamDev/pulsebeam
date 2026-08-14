@@ -19,7 +19,7 @@ use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::{Topic, Track, TrackMeta};
 use tokio::time::Instant;
 
-use super::worker::{MediaPayload, Reverse, ShardEvent, ShardFrame, Topology};
+use super::worker::{MediaPayload, Reverse, RouteRequestId, ShardEvent, ShardFrame, Topology};
 use crate::route::{
     ImportEffect, MediaEnvelope, RemoteRoute, RouteAction, RouteHandle, ReverseTarget, TransportHandle,
     RouteEnvelope, RouteId, RouteNames,
@@ -162,9 +162,280 @@ impl Origin {
 pub(crate) struct ShardRoutingTable {
     pub data: DataPlane,
     pub control: ControlPlane,
+    /// Routes this shard needs and has not been granted yet.
+    ///
+    /// The shard does not allocate: it builds the local object a route will
+    /// point at, states the need, and waits. The `ImportTable` states already
+    /// modelled this — `Installing` until `on_installed` — so what changes is
+    /// only who fills the gap.
+    pending_routes: ahash::HashMap<RouteRequestId, PendingRoute>,
+    pending_names: ahash::HashMap<RouteRequestId, RouteNames>,
+    outbound: std::collections::VecDeque<RouteWork>,
+    next_request: u64,
+    /// Stands in for the control plane's allocator in unit tests, so a test
+    /// can drive a subscribe to completion without a controller. Production
+    /// addresses always come from the control plane.
+    #[cfg(test)]
+    test_alloc: crate::route::SlotAllocator,
+}
+
+/// What the shard should finish once a route it asked for is granted.
+#[derive(Debug, Clone)]
+enum PendingRoute {
+    Video(TrackMeta),
+    Audio {
+        meta: TrackMeta,
+        room_id: RoomId,
+    },
+    /// The subscriber travels with the request so a refused grant can undo
+    /// its membership. `was_empty` is what decides whether a request is made
+    /// at all, so leaving a subscriber behind on a failure would make every
+    /// later one look like local churn and never ask again.
+    Data {
+        id: DataStreamId,
+        subscriber: Option<ParticipantKey>,
+    },
+    Reliable(DataStreamId),
+    /// The descriptor waits on its reverse route: a track is announced with
+    /// somewhere to send keyframe requests, or not announced at all.
+    ReverseTrack(Box<Track>),
+    ReverseTopic(DataStreamId),
+}
+
+/// Route lifecycle work for the control plane, drained by the shard each turn.
+#[derive(Debug, Clone)]
+pub(crate) enum RouteWork {
+    Need {
+        request: RouteRequestId,
+        action: RouteAction,
+    },
+    Release {
+        handle: RouteHandle,
+    },
 }
 
 impl ShardRoutingTable {
+    /// State a need and record what to do about the answer. Nothing resolves
+    /// until the control plane publishes the route into this shard's view.
+    fn request_route(
+        &mut self,
+        action: RouteAction,
+        names: RouteNames,
+        pending: PendingRoute,
+    ) -> RouteRequestId {
+        let request = RouteRequestId(self.next_request);
+        self.next_request = self.next_request.saturating_add(1);
+        self.pending_names.insert(request, names);
+        self.pending_routes.insert(request, pending);
+        self.outbound.push_back(RouteWork::Need { request, action });
+        request
+    }
+
+    /// Give up a route. It leaves the published view before its slot can be
+    /// reused, so the release goes through the control plane rather than
+    /// being applied here.
+    fn release_route(&mut self, handle: RouteHandle) {
+        self.data.routes.retire(handle);
+        self.outbound.push_back(RouteWork::Release { handle });
+    }
+
+    pub fn drain_route_work(&mut self) -> impl Iterator<Item = RouteWork> + '_ {
+        self.outbound.drain(..)
+    }
+
+    /// Run the control plane's half of every outstanding route request, in
+    /// one call. Only for unit tests: production grants arrive as commands
+    /// after a view publication and a generation barrier.
+    #[cfg(test)]
+    pub(crate) fn settle_routes(&mut self, now: Instant, wall: &WallAnchor) -> Vec<ShardEvent> {
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            let work: Vec<_> = self.outbound.drain(..).collect();
+            if work.is_empty() {
+                break;
+            }
+            for item in work {
+                match item {
+                    RouteWork::Need { request, .. } => {
+                        let granted = self.test_alloc.allocate(now).ok().map(|(slot, epoch)| {
+                            RouteHandle::new(RouteId::new(self.data.routes.shard_id(), slot), epoch)
+                        });
+                        if let Some(ev) = self.on_route_granted(request, granted, wall) {
+                            events.push(ev);
+                        }
+                    }
+                    RouteWork::Release { handle } => {
+                        self.test_alloc.retire(handle.route.slot(), now);
+                    }
+                }
+            }
+        }
+        events
+    }
+
+    /// The routes this shard currently has accounting for — what a test used
+    /// to read off the old route table.
+    #[cfg(test)]
+    pub(crate) fn live_routes(&self) -> usize {
+        self.data.routes.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_accounting(
+        &self,
+        handle: RouteHandle,
+    ) -> Option<&crate::route::RouteRuntimeEntry> {
+        self.data.routes.entry(handle)
+    }
+
+    /// Make every subsequent grant fail, standing in for a control plane that
+    /// has run out of address space.
+    #[cfg(test)]
+    pub(crate) fn starve_routes(&mut self) {
+        self.test_alloc = crate::route::SlotAllocator::with_max_slots(
+            self.data.routes.shard_id(),
+            0,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unstarve_routes(&mut self) {
+        self.test_alloc = crate::route::SlotAllocator::with_max_slots(
+            self.data.routes.shard_id(),
+            crate::route::PackedRoute::MAX_SLOT.saturating_add(1),
+        );
+    }
+
+    /// Apply a grant, completing whatever asked for it.
+    ///
+    /// A `None` handle means the control plane could not produce a route, so
+    /// the import is cancelled and whatever was built for it is released —
+    /// the same unwind the inline install used to do on an allocator error.
+    pub fn on_route_granted(
+        &mut self,
+        request: RouteRequestId,
+        granted: Option<RouteHandle>,
+        wall: &WallAnchor,
+    ) -> Option<ShardEvent> {
+        let pending = self.pending_routes.remove(&request)?;
+        let names = self.pending_names.remove(&request);
+        let Some(handle) = granted else {
+            self.cancel_pending(pending);
+            return None;
+        };
+        if let Some(names) = names {
+            self.data.routes.install(handle, names, wall.ntp());
+        }
+        self.complete_pending(pending, handle)
+    }
+
+    fn cancel_pending(&mut self, pending: PendingRoute) {
+        match pending {
+            PendingRoute::Video(meta) => {
+                self.control.imports.cancel_install(&meta.id);
+            }
+            PendingRoute::Audio { meta, .. } => {
+                self.control.imports.cancel_install(&meta.id);
+                self.release_fanout_if_idle(&meta.id);
+            }
+            PendingRoute::Data { id, subscriber } => {
+                self.control.data_imports.cancel_install(&id);
+                if let Some(subscriber) = subscriber {
+                    self.drop_data_subscriber(
+                        id.room_id,
+                        id.publisher_id,
+                        &id.topic,
+                        subscriber,
+                    );
+                }
+            }
+            PendingRoute::Reliable(id) => {
+                self.control.reliable_imports.cancel_install(&id);
+            }
+            PendingRoute::ReverseTrack { .. } | PendingRoute::ReverseTopic(_) => {}
+        }
+    }
+
+    fn complete_pending(
+        &mut self,
+        pending: PendingRoute,
+        handle: RouteHandle,
+    ) -> Option<ShardEvent> {
+        match pending {
+            PendingRoute::Video(track) => {
+                self.control
+                    .imports
+                    .on_installed(&track.id, handle.route, handle.epoch);
+                Some(ShardEvent::Relay(Topology::TrackSubscribed {
+                    track,
+                    route: handle.route,
+                    epoch: handle.epoch,
+                }))
+            }
+            PendingRoute::Audio { meta, room_id } => {
+                self.control
+                    .imports
+                    .on_installed(&meta.id, handle.route, handle.epoch);
+                if let Some(room) = self.room_mut(&room_id) {
+                    room.audio_imports.insert(meta.id);
+                }
+                Some(ShardEvent::Relay(Topology::TrackSubscribed {
+                    track: meta,
+                    route: handle.route,
+                    epoch: handle.epoch,
+                }))
+            }
+            PendingRoute::Data { id, .. } => {
+                self.control
+                    .data_imports
+                    .on_installed(&id, handle.route, handle.epoch);
+                Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
+                    room_id: id.room_id,
+                    topic: id.topic,
+                    publisher: Some(id.publisher_id),
+                    route: Some(handle.route),
+                    epoch: handle.epoch,
+                }))
+            }
+            PendingRoute::Reliable(id) => {
+                self.control
+                    .reliable_imports
+                    .on_installed(&id, handle.route, handle.epoch);
+                Some(ShardEvent::Relay(Topology::ReliableTopicSubscribed {
+                    room_id: id.room_id,
+                    topic: id.topic,
+                    publisher: Some(id.publisher_id),
+                    route: Some(handle.route),
+                    epoch: handle.epoch,
+                }))
+            }
+            PendingRoute::ReverseTrack(track) => {
+                let mut track = *track;
+                if let Some(key) = self.control.track_keys.get(&track.meta.id).copied()
+                    && let Some(entry) = self.data.tracks.get_mut(key)
+                {
+                    entry.published = true;
+                    entry.reverse_route = Some(handle);
+                }
+                track.reverse = Some(handle);
+                Some(ShardEvent::TrackPublished(track))
+            }
+            PendingRoute::ReverseTopic(id) => {
+                if let Some(key) = self.control.reliable_stream_keys.get(&id).copied()
+                    && let Some(entry) = self.data.reliable_streams.get_mut(key)
+                {
+                    entry.reverse_route = Some(handle);
+                }
+                Some(ShardEvent::Relay(Topology::ReliableTopicPublished {
+                    room_id: id.room_id,
+                    publisher: id.publisher_id,
+                    topic: id.topic,
+                    reverse: Some(handle),
+                }))
+            }
+        }
+    }
+
     /// The fanout for a track name, creating it if this shard has not seen the
     /// track before. Control path only.
     fn fanout_key(&mut self, track_id: TrackId, origin: ParticipantId) -> LocalTrackKey {
@@ -232,6 +503,15 @@ impl ShardRoutingTable {
         Self {
             data: DataPlane::new(shard_id),
             control: ControlPlane::new(),
+            pending_routes: ahash::HashMap::default(),
+            pending_names: ahash::HashMap::default(),
+            outbound: std::collections::VecDeque::new(),
+            next_request: 0,
+            #[cfg(test)]
+            test_alloc: crate::route::SlotAllocator::with_max_slots(
+                shard_id,
+                crate::route::PackedRoute::MAX_SLOT.saturating_add(1),
+            ),
         }
     }
 
@@ -266,7 +546,7 @@ impl ShardRoutingTable {
         room_id: RoomId,
         rng: &mut impl rand::RngCore,
     ) -> (RoomKey, &mut RoomFanout) {
-        let Self { data, control } = self;
+        let Self { data, control, .. } = self;
         let key = *control
             .room_keys
             .entry(room_id)
@@ -318,7 +598,7 @@ impl ShardRoutingTable {
     }
 
     fn data_stream_key_or_insert(&mut self, room_id: RoomId, id: DataStreamId) -> DataStreamKey {
-        let Self { data, control } = self;
+        let Self { data, control, .. } = self;
         let key = {
             let id_for_route = id.clone();
             *control
@@ -371,7 +651,7 @@ impl ShardRoutingTable {
         room_id: RoomId,
         id: DataStreamId,
     ) -> ReliableStreamKey {
-        let Self { data, control } = self;
+        let Self { data, control, .. } = self;
         // Every caller reaches here only after confirming the room exists
         // (`register_reliable_data_publisher`, `on_remote_reliable_publisher`,
         // and their callers all check first) — resolved once, here, so the
@@ -579,34 +859,26 @@ impl ShardRoutingTable {
     /// of the 32-bit space proportional to streams rather than streams x
     /// shards. The encoding list travels into the entry so a frame can name a
     /// layer by index instead of carrying a rid.
-    pub fn open_track_reverse_route(
-        &mut self,
-        track: &Track,
-        now: Instant,
-        wall: &WallAnchor,
-    ) -> Option<RouteHandle> {
+    /// Ask for the reverse path a published track needs, and hold the
+    /// descriptor until it exists. The announcement carries the handle, so a
+    /// subscriber never learns about a track it cannot ask for a keyframe on.
+    pub fn open_track_reverse_route(&mut self, track: Track) {
         let key = self.fanout_key(track.meta.id, track.meta.origin);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
         entry.encodings = track.layers.iter().map(|l| l.rid).collect();
-        let handle = self.open_reverse_route(
-            ReverseTarget::Track { track: key },
-            RouteNames {
-                room_id: None,
-                origin: track.meta.origin,
-                track_id: Some(track.meta.id),
-                topic: None,
-            },
-            now,
-            wall,
-        )?;
-        let Some(entry) = self.data.tracks.get_mut(key) else {
-            pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
+        let names = RouteNames {
+            room_id: None,
+            origin: track.meta.origin,
+            track_id: Some(track.meta.id),
+            topic: None,
         };
-        entry.published = true;
-        entry.reverse_route = Some(handle);
-        Some(handle)
+        self.request_reverse_route(
+            ReverseTarget::Track { track: key },
+            names,
+            PendingRoute::ReverseTrack(Box::new(track)),
+        );
     }
 
     /// The same, for a reliable data topic this shard publishes. Its reverse
@@ -616,15 +888,13 @@ impl ShardRoutingTable {
         room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
-        now: Instant,
-        wall: &WallAnchor,
-    ) -> Option<RouteHandle> {
+    ) {
         let key = DataStreamId::new(room_id, publisher, topic.clone());
-        // Minted before the route install, alongside the reverse route it
-        // will point at: `RouteAction::Reverse` never resolves to a key this
-        // shard hasn't already registered.
-        let stream = self.reliable_stream_key_or_insert(room_id, key);
-        let handle = self.open_reverse_route(
+        // Minted before the route is requested, alongside the reverse route
+        // it will point at: `RouteAction::Reverse` never resolves to a key
+        // this shard hasn't already registered.
+        let stream = self.reliable_stream_key_or_insert(room_id, key.clone());
+        self.request_reverse_route(
             ReverseTarget::Topic { stream },
             RouteNames {
                 room_id: Some(room_id),
@@ -632,29 +902,17 @@ impl ShardRoutingTable {
                 track_id: None,
                 topic: Some(topic),
             },
-            now,
-            wall,
-        )?;
-        if let Some(entry) = self.data.reliable_streams.get_mut(stream) {
-            entry.reverse_route = Some(handle);
-        }
-        Some(handle)
+            PendingRoute::ReverseTopic(key),
+        );
     }
 
-    fn open_reverse_route(
+    fn request_reverse_route(
         &mut self,
         target: ReverseTarget,
         names: RouteNames,
-        now: Instant,
-        wall: &WallAnchor,
-    ) -> Option<RouteHandle> {
-        let (route, epoch) = self
-            .data
-            .routes
-            .install(RouteAction::Reverse { target }, names, wall.ntp(), now)
-            .inspect_err(|err| tracing::error!(?err, "reverse route install failed"))
-            .ok()?;
-        Some(RouteHandle { route, epoch })
+        pending: PendingRoute,
+    ) {
+        self.request_route(RouteAction::Reverse { target }, names, pending);
     }
 
     /// Close a track's reverse path when its publisher goes away.
@@ -666,8 +924,9 @@ impl ShardRoutingTable {
             return;
         };
         entry.published = false;
-        if let Some(handle) = entry.reverse_route.take() {
-            self.data.routes.retire(handle.route, handle.epoch, now);
+        let reverse = entry.reverse_route.take();
+        if let Some(handle) = reverse {
+            self.release_route(handle);
         }
         self.release_fanout_if_idle(track_id);
     }
@@ -683,9 +942,17 @@ impl ShardRoutingTable {
         let Some(entry) = self.reliable_stream_mut(&key) else {
             return;
         };
-        if let Some(handle) = entry.reverse_route.take() {
-            self.data.routes.retire(handle.route, handle.epoch, now);
+        let reverse = entry.reverse_route.take();
+        if let Some(handle) = reverse {
+            self.release_route(handle);
         }
+    }
+
+    /// The reverse handle this shard opened for a track it publishes.
+    #[cfg(test)]
+    pub(crate) fn track_reverse_handle(&self, track_id: &TrackId) -> Option<RouteHandle> {
+        let key = self.control.track_keys.get(track_id).copied()?;
+        self.data.tracks.get(key)?.reverse_route
     }
 
     /// The reverse handle this shard opened for a topic it publishes, so a
@@ -721,19 +988,21 @@ impl ShardRoutingTable {
     ///
     /// The epoch check is what makes a recycled slot safe: a request in flight
     /// when a track was unpublished must not land on whatever took its place.
+    /// The action arrives already resolved: the caller reads it from the
+    /// published view under one guard, so this only turns a target into the
+    /// publisher it belongs to.
     pub fn resolve_reverse(
         &self,
-        route: RouteId,
-        epoch: u16,
-    ) -> Option<(ParticipantId, &ReverseTarget)> {
-        let target = match self.data.routes.resolve_action(route, epoch)? {
+        action: RouteAction,
+    ) -> Option<(ParticipantId, ReverseTarget)> {
+        let target = match action {
             RouteAction::Reverse { target } => target,
             other => {
                 debug_assert!(false, "a reverse frame arrived on a {other:?} route");
                 return None;
             }
         };
-        let origin = match *target {
+        let origin = match target {
             ReverseTarget::Track { track } => self.data.tracks.get(track).map(|r| r.origin),
             ReverseTarget::Topic { stream } => self
                 .data
@@ -952,7 +1221,7 @@ impl ShardRoutingTable {
         if self.control.imports.subscribe(track.id) != ImportEffect::Install {
             return None;
         }
-        let installed = self.data.routes.install(
+        self.request_route(
             RouteAction::Video { local_track: key },
             RouteNames {
                 room_id: None,
@@ -960,23 +1229,9 @@ impl ShardRoutingTable {
                 track_id: Some(track.id),
                 topic: None,
             },
-            wall.ntp(),
-            now,
+            PendingRoute::Video(track),
         );
-        let (route, epoch) = match installed {
-            Ok(installed) => installed,
-            Err(err) => {
-                tracing::error!(?err, track_id = %track.id, "video route install failed");
-                self.control.imports.cancel_install(&track.id);
-                return None;
-            }
-        };
-        self.control.imports.on_installed(&track.id, route, epoch);
-        Some(ShardEvent::Relay(Topology::TrackSubscribed {
-            track,
-            route,
-            epoch,
-        }))
+        None
     }
 
     /// Returns a `ShardEvent` iff this was the *last* local subscriber, so
@@ -1001,7 +1256,7 @@ impl ShardRoutingTable {
         // tell it apart from a resubscription that overtook it.
         let retired = match self.control.imports.unsubscribe(&track.id) {
             ImportEffect::Retire { route, epoch } => {
-                self.data.routes.retire(route, epoch, now);
+                self.release_route(RouteHandle::new(route, epoch));
                 self.control.imports.on_retired(&track.id);
                 Some((route, epoch))
             }
@@ -1093,24 +1348,11 @@ impl ShardRoutingTable {
                 if !was_empty {
                     return None;
                 }
-                // The local fanout entry exists before the route is installed.
-                let Some((route, epoch)) =
-                    self.install_data_route(room_id, publisher, &topic, now, wall)
-                else {
-                    // Undo the membership too. `was_empty` is what decides
-                    // whether an install is attempted, so leaving this
-                    // subscriber behind would make every later one look like
-                    // local churn and skip the retry.
-                    self.drop_data_subscriber(room_id, publisher, &topic, handle);
-                    return None;
-                };
-                Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
-                    room_id,
-                    topic,
-                    publisher: Some(publisher),
-                    route: Some(route),
-                    epoch,
-                }))
+                // The local fanout entry exists before the route is
+                // requested. The subscription is announced when the control
+                // plane grants the route.
+                self.install_data_route(room_id, publisher, &topic, Some(handle));
+                None
             }
             None => {
                 let was_empty = {
@@ -1455,7 +1697,7 @@ impl ShardRoutingTable {
             return;
         }
         if let ImportEffect::Retire { route, epoch } = self.control.imports.unsubscribe(&track_id) {
-            self.data.routes.retire(route, epoch, now);
+            self.release_route(RouteHandle::new(route, epoch));
             self.control.imports.on_retired(&track_id);
             self.release_fanout_if_idle(&track_id);
         }
@@ -1473,7 +1715,7 @@ impl ShardRoutingTable {
             if let ImportEffect::Retire { route, epoch } =
                 self.control.imports.unsubscribe(&track_id)
             {
-                self.data.routes.retire(route, epoch, now);
+                self.release_route(RouteHandle::new(route, epoch));
                 self.control.imports.on_retired(&track_id);
                 self.release_fanout_if_idle(&track_id);
             }
@@ -1531,26 +1773,27 @@ impl ShardRoutingTable {
 
     /// Install a destination route for a concrete data stream. Returns the
     /// handle to hand back to the publisher's shard.
+    /// Ask for the route an imported data stream needs. The announcement is
+    /// emitted when the grant lands, not here.
     fn install_data_route(
         &mut self,
         room_id: RoomId,
         publisher: ParticipantId,
         topic: &Topic,
-        now: Instant,
-        wall: &WallAnchor,
-    ) -> Option<(RouteId, u16)> {
+        subscriber: Option<ParticipantKey>,
+    ) {
         let key = DataStreamId::new(room_id, publisher, topic.clone());
         if self.control.data_imports.subscribe(key.clone()) != ImportEffect::Install {
-            return None;
+            return;
         }
-        // The local fanout entry exists before the route is installed, so an
-        // installed route always resolves to something.
+        // The local fanout entry exists before the route is requested, so a
+        // granted route always resolves to something.
         let Some(&stream) = self.control.data_stream_keys.get(&key) else {
-            debug_assert!(false, "installing a data route with no local fanout entry");
+            debug_assert!(false, "requesting a data route with no local fanout entry");
             self.control.data_imports.cancel_install(&key);
-            return None;
+            return;
         };
-        let installed = self.data.routes.install(
+        self.request_route(
             RouteAction::Data { stream },
             RouteNames {
                 room_id: Some(room_id),
@@ -1558,21 +1801,11 @@ impl ShardRoutingTable {
                 track_id: None,
                 topic: Some(topic.clone()),
             },
-            wall.ntp(),
-            now,
+            PendingRoute::Data {
+                id: key,
+                subscriber,
+            },
         );
-        let installed = match installed {
-            Ok(installed) => installed,
-            Err(err) => {
-                tracing::error!(?err, %topic, "data route install failed");
-                self.control.data_imports.cancel_install(&key);
-                return None;
-            }
-        };
-        self.control
-            .data_imports
-            .on_installed(&key, installed.0, installed.1);
-        Some(installed)
     }
 
     /// Remove a local data subscriber without touching the cluster route,
@@ -1601,7 +1834,7 @@ impl ShardRoutingTable {
     ) {
         let key = DataStreamId::new(room_id, publisher, topic.clone());
         if let ImportEffect::Retire { route, epoch } = self.control.data_imports.unsubscribe(&key) {
-            self.data.routes.retire(route, epoch, now);
+            self.release_route(RouteHandle::new(route, epoch));
             self.control.data_imports.on_retired(&key);
         }
     }
@@ -1636,32 +1869,19 @@ impl ShardRoutingTable {
             fanout.local_subscribers.insert_unique(subscriber);
         }
 
-        let (route, epoch) = self.install_data_route(room_id, publisher, topic, now, wall)?;
-        Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
-            room_id,
-            topic: topic.clone(),
-            publisher: Some(publisher),
-            route: Some(route),
-            epoch,
-        }))
+        self.install_data_route(room_id, publisher, topic, None);
+        None
     }
 
-    fn install_reliable_route(
-        &mut self,
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: &Topic,
-        now: Instant,
-        wall: &WallAnchor,
-    ) -> Option<(RouteId, u16)> {
+    fn install_reliable_route(&mut self, room_id: RoomId, publisher: ParticipantId, topic: &Topic) {
         let key = DataStreamId::new(room_id, publisher, topic.clone());
         if self.control.reliable_imports.subscribe(key.clone()) != ImportEffect::Install {
-            return None;
+            return;
         }
         // Minted before the route install, same rule as the reverse route:
         // an installed route always resolves to something that exists.
         let stream = self.reliable_stream_key_or_insert(room_id, key.clone());
-        let installed = self.data.routes.install(
+        self.request_route(
             RouteAction::Reliable { stream },
             RouteNames {
                 room_id: Some(room_id),
@@ -1669,21 +1889,8 @@ impl ShardRoutingTable {
                 track_id: None,
                 topic: Some(topic.clone()),
             },
-            wall.ntp(),
-            now,
+            PendingRoute::Reliable(key),
         );
-        let installed = match installed {
-            Ok(installed) => installed,
-            Err(err) => {
-                tracing::error!(?err, %topic, "reliable route install failed");
-                self.control.reliable_imports.cancel_install(&key);
-                return None;
-            }
-        };
-        self.control
-            .reliable_imports
-            .on_installed(&key, installed.0, installed.1);
-        Some(installed)
     }
 
     /// A reliable publisher was announced. A destination with local subscribers
@@ -1700,18 +1907,12 @@ impl ShardRoutingTable {
         if !room.reliable.has_local_subscribers(topic) {
             return None;
         }
-        let (route, epoch) = self.install_reliable_route(room_id, publisher, topic, now, wall)?;
+        self.install_reliable_route(room_id, publisher, topic);
         let id = DataStreamId::new(room_id, publisher, topic.clone());
         if let Some(stream) = self.reliable_stream_mut(&id) {
             stream.imported = true;
         }
-        Some(ShardEvent::Relay(Topology::ReliableTopicSubscribed {
-            room_id,
-            topic: topic.clone(),
-            publisher: Some(publisher),
-            route: Some(route),
-            epoch,
-        }))
+        None
     }
 
     /// Record a destination's handle for a reliable stream, or register its
@@ -1796,7 +1997,7 @@ impl ShardRoutingTable {
         // table, not this entry — so `retire_audio_route` releases it
         // directly rather than through the emptiness check video relies on.
         let track = self.fanout_key(meta.id, meta.origin);
-        let installed = self.data.routes.install(
+        self.request_route(
             RouteAction::Audio { room, track },
             RouteNames {
                 room_id: Some(room_id),
@@ -1804,27 +2005,9 @@ impl ShardRoutingTable {
                 track_id: Some(meta.id),
                 topic: None,
             },
-            wall.ntp(),
-            now,
+            PendingRoute::Audio { meta, room_id },
         );
-        let (route, epoch) = match installed {
-            Ok(installed) => installed,
-            Err(err) => {
-                tracing::error!(?err, track_id = %meta.id, "audio route install failed");
-                self.control.imports.cancel_install(&meta.id);
-                self.release_fanout_if_idle(&meta.id);
-                return None;
-            }
-        };
-        self.control.imports.on_installed(&meta.id, route, epoch);
-        if let Some(room) = self.room_mut(&room_id) {
-            room.audio_imports.insert(meta.id);
-        }
-        Some(ShardEvent::Relay(Topology::TrackSubscribed {
-            track: meta,
-            route,
-            epoch,
-        }))
+        None
     }
 
     pub fn unpublish_tracks(
@@ -2018,20 +2201,16 @@ impl ShardRoutingTable {
         room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
-        now: Instant,
-        wall: &WallAnchor,
-    ) -> (Option<RouteHandle>, Option<ReliableStreamKey>) {
-        if self.room(&room_id).is_none() {
-            return (None, None);
-        }
+    ) -> Option<ReliableStreamKey> {
+        self.room(&room_id)?;
         let id = DataStreamId::new(room_id, publisher, topic.clone());
         let key = self.reliable_stream_key_or_insert(room_id, id);
         if let Some(stream) = self.data.reliable_streams.get_mut(key) {
             debug_assert!(!stream.published);
             stream.published = true;
         }
-        let reverse = self.open_topic_reverse_route(room_id, publisher, topic, now, wall);
-        (reverse, Some(key))
+        self.open_topic_reverse_route(room_id, publisher, topic);
+        Some(key)
     }
 
     pub fn unregister_reliable_data_publisher(
@@ -2101,7 +2280,7 @@ impl ShardRoutingTable {
             if let ImportEffect::Retire { route, epoch } =
                 self.control.reliable_imports.unsubscribe(&id)
             {
-                self.data.routes.retire(route, epoch, now);
+                self.release_route(RouteHandle::new(route, epoch));
                 self.control.reliable_imports.on_retired(&id);
             }
         }
@@ -2424,6 +2603,14 @@ mod tests {
         }
     }
 
+    /// Run the control plane's half of any route the call just asked for and
+    /// return what the shard announces once it lands. Registration is a
+    /// request now, so a test that wants the announcement has to let the
+    /// grant happen.
+    fn settled(table: &mut ShardRoutingTable) -> Option<ShardEvent> {
+        table.settle_routes(now(), &wall()).into_iter().next()
+    }
+
     fn room_id(s: &str) -> RoomId {
         RoomId::from_external(&ExternalRoomId::new(s).unwrap())
     }
@@ -2545,14 +2732,18 @@ mod tests {
         let first_key = add_local_subscriber(&mut table, first);
         let second_key = add_local_subscriber(&mut table, second);
 
-        let ev = table.register_subscriber(first_key, track.clone(), now(), &wall());
+        table.register_subscriber(first_key, track.clone(), now(), &wall());
+        let ev = settled(&mut table);
         assert!(
             matches!(ev, Some(ShardEvent::Relay(Topology::TrackSubscribed { track: t, .. })) if t == track),
-            "the first subscriber installs a route and hands over the handle"
+            "the first subscriber asks for a route and hands over the handle once granted"
         );
 
-        let ev2 = table.register_subscriber(second_key, track, now(), &wall());
-        assert!(ev2.is_none(), "second subscriber must not re-notify");
+        table.register_subscriber(second_key, track, now(), &wall());
+        assert!(
+            settled(&mut table).is_none(),
+            "second subscriber must not re-notify"
+        );
     }
 
     /// A reconnect (same `ParticipantId`, a fresh `ParticipantKey`) must not
@@ -2576,11 +2767,8 @@ mod tests {
             origin: pid(),
         };
         let subscriber_key = add_local_subscriber(&mut table, subscriber);
-        assert!(
-            table
-                .register_subscriber(subscriber_key, track.clone(), now(), &wall())
-                .is_some()
-        );
+        table.register_subscriber(subscriber_key, track.clone(), now(), &wall());
+        assert!(settled(&mut table).is_some());
 
         assert!(
             table
@@ -2589,10 +2777,9 @@ mod tests {
             "the old connection must be torn down before the new one replaces it"
         );
         let replacement = replace_local_subscriber(&mut table, subscriber);
+        table.register_subscriber(replacement, track.clone(), now(), &wall());
         assert!(
-            table
-                .register_subscriber(replacement, track.clone(), now(), &wall())
-                .is_some(),
+            settled(&mut table).is_some(),
             "the new connection is a fresh subscriber, not a churn no-op"
         );
 
@@ -2630,10 +2817,11 @@ mod tests {
             ),
             "a topic-only subscription has no stream to route yet"
         );
-        assert_eq!(table.data.routes.len(), 0);
+        assert_eq!(table.live_routes(), 0);
 
         let publisher = pid();
-        let resolved = table.on_remote_reliable_publisher(room, publisher, &topic, now(), &wall());
+        table.on_remote_reliable_publisher(room, publisher, &topic, now(), &wall());
+        let resolved = settled(&mut table);
         assert!(
             matches!(
                 resolved,
@@ -2645,11 +2833,11 @@ mod tests {
             ),
             "the announcement resolves it into a concrete route"
         );
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
 
         assert!(table.unregister_reliable_data_subscriber(room, handle, &topic, now()));
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             0,
             "the last subscriber leaving retires the imported route"
         );
@@ -2891,7 +3079,7 @@ mod tests {
 
         let publisher = pid();
         let topic = Topic::for_test("chat");
-        let ev = table.register_data_subscriber(
+        table.register_data_subscriber(
             room,
             handle,
             topic.clone(),
@@ -2901,15 +3089,15 @@ mod tests {
         );
         assert!(
             matches!(
-                ev,
+                settled(&mut table),
                 Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     route: Some(_),
                     ..
                 }))
             ),
-            "the first subscriber installs a route and hands over the handle"
+            "the first subscriber asks for a route and hands over the handle once granted"
         );
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
 
         let h2 = new_participant_key();
         table.add_local_member(h2, room, &mut rng);
@@ -2919,7 +3107,7 @@ mod tests {
                 .is_none(),
             "local churn must not touch the cluster route"
         );
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
     }
 
     /// An install can fail — today only at the table's cap, cross-node whenever
@@ -2934,7 +3122,7 @@ mod tests {
     #[test]
     fn a_failed_install_leaves_the_stream_installable_again() {
         let mut table = ShardRoutingTable::new(ShardId::new(0));
-        table.data.routes = crate::route::RouteTable::with_max_slots(ShardId::new(0), 0);
+        table.starve_routes();
         let mut rng = rand::seeded_rng(23);
         let room = room_id("data-room");
         let handle = new_participant_key();
@@ -2942,35 +3130,28 @@ mod tests {
 
         let publisher = pid();
         let topic = Topic::for_test("chat");
+        table.register_data_subscriber(room, handle, topic.clone(), Some(publisher), now(), &wall());
         assert!(
-            table
-                .register_data_subscriber(
-                    room,
-                    handle,
-                    topic.clone(),
-                    Some(publisher),
-                    now(),
-                    &wall()
-                )
-                .is_none(),
-            "no route, so nothing to announce"
+            settled(&mut table).is_none(),
+            "the grant failed, so there is nothing to announce"
         );
-        assert_eq!(table.data.routes.len(), 0);
+        assert_eq!(table.live_routes(), 0);
 
-        table.data.routes = crate::route::RouteTable::new(ShardId::new(0));
+        table.unstarve_routes();
         let h2 = new_participant_key();
         table.add_local_member(h2, room, &mut rng);
+        table.register_data_subscriber(room, h2, topic, Some(publisher), now(), &wall());
         assert!(
             matches!(
-                table.register_data_subscriber(room, h2, topic, Some(publisher), now(), &wall()),
+                settled(&mut table),
                 Some(ShardEvent::Relay(Topology::DataTopicSubscribed {
                     route: Some(_),
                     ..
                 }))
             ),
-            "the next subscriber retries the install rather than joining a pending one"
+            "the next subscriber asks again rather than joining a pending request"
         );
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
     }
 
     /// A destination's measurements arrive whole, by message, and replace what
@@ -3079,11 +3260,10 @@ mod tests {
         };
         let track = video_track_with(&track_meta);
 
+        table.open_track_reverse_route(track);
         assert!(
-            table
-                .open_track_reverse_route(&track, now(), &wall())
-                .is_some(),
-            "publishing opens the reverse route"
+            !table.settle_routes(now(), &wall()).is_empty(),
+            "publishing opens the reverse route and announces the track"
         );
         let fanout_key = table
             .fanout_of(&track_meta.id)
@@ -3139,11 +3319,12 @@ mod tests {
         let handle = new_participant_key();
         table.add_local_member(handle, room, &mut rng);
 
+        table.register_reliable_data_publisher(room, publisher, topic.clone());
+        table.settle_routes(now(), &wall());
         let target = table
-            .register_reliable_data_publisher(room, publisher, topic.clone(), now(), &wall())
-            .0
+            .topic_reverse_handle(room, publisher, &topic)
             .expect("publishing a reliable topic opens its reverse route");
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
 
         let stream_id = DataStreamId::new(room, publisher, topic.clone());
         let stream_key = table
@@ -3154,9 +3335,11 @@ mod tests {
             .expect("publishing a reliable topic must mint its arena key");
         assert!(
             matches!(
-                table.resolve_reverse(target.route, target.epoch),
+                table.resolve_reverse(RouteAction::Reverse {
+                    target: ReverseTarget::Topic { stream: stream_key }
+                }),
                 Some((origin, ReverseTarget::Topic { stream }))
-                    if origin == publisher && *stream == stream_key
+                    if origin == publisher && stream == stream_key
             ),
             "an ack resolves to its publisher and topic through the route alone"
         );
@@ -3168,7 +3351,7 @@ mod tests {
 
         table.unregister_reliable_data_publisher(room, publisher, &topic, now());
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             0,
             "unpublishing must free the reverse route"
         );
@@ -3201,7 +3384,9 @@ mod tests {
         // The publishing shard stamps the descriptor, exactly as it does on
         // `ParticipantControlEvent::TrackPublished`.
         let mut track = video_track_with(&meta);
-        track.reverse = publisher_shard.open_track_reverse_route(&track, now(), &wall());
+        publisher_shard.open_track_reverse_route(track.clone());
+        publisher_shard.settle_routes(now(), &wall());
+        track.reverse = publisher_shard.track_reverse_handle(&track.meta.id);
         assert!(
             track.reverse.is_some(),
             "publishing must open a reverse route"
@@ -3240,10 +3425,12 @@ mod tests {
             origin: publisher,
         };
 
+        table.open_track_reverse_route(video_track_with(&track));
+        table.settle_routes(now(), &wall());
         let target = table
-            .open_track_reverse_route(&video_track_with(&track), now(), &wall())
+            .track_reverse_handle(&track.id)
             .expect("publishing opens the reverse route");
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
         assert_eq!(
             fanout(&table, &track.id).encodings,
             vec![None],
@@ -3258,22 +3445,24 @@ mod tests {
             let _ = shard;
             assert!(
                 matches!(
-                    table.resolve_reverse(target.route, target.epoch),
+                    table.resolve_reverse(RouteAction::Reverse {
+                        target: ReverseTarget::Track { track: fanout_key }
+                    }),
                     Some((origin, ReverseTarget::Track { track }))
-                        if origin == publisher && *track == fanout_key
+                        if origin == publisher && track == fanout_key
                 ),
                 "every subscriber resolves through the one route"
             );
         }
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             1,
             "subscriber count must not grow the reverse table"
         );
 
         table.close_track_reverse_route(&track.id, now());
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             0,
             "unpublishing must free the reverse route"
         );
@@ -3291,14 +3480,22 @@ mod tests {
             origin: publisher,
         };
 
+        table.open_track_reverse_route(video_track_with(&track));
+        table.settle_routes(now(), &wall());
         let stale = table
-            .open_track_reverse_route(&video_track_with(&track), now(), &wall())
-            .unwrap();
+            .track_reverse_handle(&track.id)
+            .expect("publishing opens the reverse route");
+
         table.close_track_reverse_route(&track.id, now());
 
         assert!(
-            table.resolve_reverse(stale.route, stale.epoch).is_none(),
-            "a reverse frame for an unpublished track must not resolve"
+            table.track_reverse_handle(&track.id).is_none(),
+            "an unpublished track keeps no reverse handle"
+        );
+        assert_eq!(
+            table.live_routes(),
+            0,
+            "and its accounting goes with it, so a frame for {stale} has nothing to land on"
         );
     }
 
@@ -3365,27 +3562,28 @@ mod tests {
                 now(),
                 &wall(),
             );
+            table.settle_routes(now(), &wall());
             handle
         };
 
         let a = subscribe(&mut table, &mut rng);
         let b = subscribe(&mut table, &mut rng);
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             1,
             "one route serves both subscribers"
         );
 
         table.unregister_data_subscriber(room, a, &topic, Some(publisher), now());
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             1,
             "churn with a subscriber remaining must not touch the cluster route"
         );
 
         table.unregister_data_subscriber(room, b, &topic, Some(publisher), now());
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             0,
             "the last unsubscribe must retire the route"
         );
@@ -3393,7 +3591,7 @@ mod tests {
         // And the slot must be usable again: resubscribing installs a new one.
         subscribe(&mut table, &mut rng);
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             1,
             "a later subscription must be able to install a fresh route"
         );
@@ -3422,10 +3620,11 @@ mod tests {
             ),
             "a wildcard subscription has no stream to install a route for yet"
         );
-        assert_eq!(table.data.routes.len(), 0);
+        assert_eq!(table.live_routes(), 0);
 
         let publisher = pid();
-        let resolved = table.on_remote_data_publisher(room, publisher, &topic, now(), &wall());
+        table.on_remote_data_publisher(room, publisher, &topic, now(), &wall());
+        let resolved = settled(&mut table);
         assert!(
             matches!(
                 resolved,
@@ -3437,7 +3636,7 @@ mod tests {
             ),
             "the announcement resolves the wildcard into a concrete route"
         );
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
     }
 
     /// Audio gets one route per (stream, destination). Membership in the room
@@ -3467,16 +3666,17 @@ mod tests {
         let mut ctx = RecordingCtx {
             ..Default::default()
         };
-        let ev = table.publish_track(track, room, None, now(), &wall(), &mut ctx);
+        table.publish_track(track, room, None, now(), &wall(), &mut ctx);
+        let ev = settled(&mut table);
         assert!(
             matches!(ev, Some(ShardEvent::Relay(Topology::TrackSubscribed { track: t, .. })) if t == audio),
-            "a remote audio publish installs a destination route"
+            "a remote audio publish gets a destination route"
         );
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
 
         table.remove_local_member(&local, handle, room, std::iter::empty(), now());
         assert_eq!(
-            table.data.routes.len(),
+            table.live_routes(),
             0,
             "no members left means nothing to deliver to"
         );
@@ -3544,7 +3744,7 @@ mod tests {
             &mut ctx,
         );
         assert!(ev.is_none(), "a local publisher needs no cluster route");
-        assert_eq!(table.data.routes.len(), 0);
+        assert_eq!(table.live_routes(), 0);
     }
 
     /// The destination allocates a route, the publisher receives the handle,
@@ -3561,27 +3761,27 @@ mod tests {
         let first_key = add_local_subscriber(&mut table, first);
         let second_key = add_local_subscriber(&mut table, second);
 
+        table.register_subscriber(first_key, track.clone(), now(), &wall());
         let Some(ShardEvent::Relay(Topology::TrackSubscribed { route, epoch, .. })) =
-            table.register_subscriber(first_key, track.clone(), now(), &wall())
+            settled(&mut table)
         else {
-            panic!("the first subscriber must install a route");
+            panic!("the first subscriber must get a route");
         };
-        assert_eq!(table.data.routes.len(), 1);
+        assert_eq!(table.live_routes(), 1);
 
+        table.register_subscriber(second_key, track.clone(), now(), &wall());
         assert!(
-            table
-                .register_subscriber(second_key, track.clone(), now(), &wall())
-                .is_none(),
+            settled(&mut table).is_none(),
             "local churn must not touch the cluster route"
         );
-        assert_eq!(table.data.routes.len(), 1, "exactly one route installation");
+        assert_eq!(table.live_routes(), 1, "exactly one route installation");
 
         assert!(
             table
                 .unregister_subscriber(first_key, track.clone(), now())
                 .is_none()
         );
-        assert_eq!(table.data.routes.len(), 1, "still one consumer left");
+        assert_eq!(table.live_routes(), 1, "still one consumer left");
 
         assert!(
             table
@@ -3589,16 +3789,15 @@ mod tests {
                 .is_some(),
             "the last subscriber leaving tells the publisher to stop"
         );
-        assert_eq!(table.data.routes.len(), 0, "the route is retired");
-
-        // A frame still in flight for the retired incarnation must not land.
-        let env = MediaEnvelope {
-            epoch,
-            route,
-            link_seq: 0,
-            playout_ntp32: 0,
-        };
-        assert!(table.data.routes.resolve(&env).is_err());
+        // A frame still in flight for the retired incarnation must not land:
+        // the accounting behind `(route, epoch)` is gone, and the published
+        // view no longer carries it either — see `view::tests`.
+        assert_eq!(table.live_routes(), 0, "the route is retired");
+        assert!(
+            table
+                .route_accounting(RouteHandle::new(route, epoch))
+                .is_none()
+        );
     }
 
     #[test]

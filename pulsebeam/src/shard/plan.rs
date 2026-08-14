@@ -12,7 +12,7 @@ use crate::audio_selector::TopNAudioSelector;
 use crate::entity::TrackId;
 use crate::id::ShardId;
 use super::keyset::KeySet;
-use crate::route::{RemoteRoute, RouteHandle, RouteTable};
+use crate::route::{RemoteRoute, RouteHandle, RouteRuntime};
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::Topic;
 
@@ -379,9 +379,10 @@ pub(crate) struct DataPlane {
     /// belongs to exactly one room.
     pub data_streams: SlotMap<DataStreamKey, DataStreamRoute>,
     pub reliable_streams: SlotMap<ReliableStreamKey, ReliableStream>,
-    /// Routes this shard has installed as a *destination*, indexed by the id it
-    /// handed out. Frames arriving from other shards resolve here.
-    pub routes: RouteTable,
+    /// Per-route accounting for the routes this shard is a destination for.
+    /// Resolution itself happens in the published view; this is only the
+    /// mutable processing state behind it.
+    pub routes: RouteRuntime,
 }
 
 impl DataPlane {
@@ -391,7 +392,7 @@ impl DataPlane {
             tracks: SlotMap::with_key(),
             data_streams: SlotMap::with_key(),
             reliable_streams: SlotMap::with_key(),
-            routes: RouteTable::new(shard_id),
+            routes: RouteRuntime::new(shard_id),
         }
     }
 }

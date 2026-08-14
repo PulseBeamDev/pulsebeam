@@ -11,10 +11,10 @@ use crate::{
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
-    route::TransportHandle,
+    route::{RouteHandle, TransportHandle},
     shard::{
         ShardContext,
-        worker::{ShardCommand, ShardEventWrapper},
+        worker::{ShardCommand, ShardEvent, ShardEventWrapper},
     },
 };
 use pulsebeam_runtime::mailbox;
@@ -184,7 +184,9 @@ impl ControllerActor {
                 biased;
 
                 Some(e) = shard_event_rx.recv() => {
-                    self.core.process_shard_event(e, &mut self.eq);
+                    if let Some(e) = self.handle_route_event(e).await {
+                        self.core.process_shard_event(e, &mut self.eq);
+                    }
                 }
 
                 _ = self.core.next_expired() => {}
@@ -289,6 +291,130 @@ impl ControllerActor {
         );
     }
 
+    /// Buggify's exhaustion fault fires independently per call, so a few
+    /// attempts clear a transient one almost certainly; a genuinely full
+    /// namespace fails every attempt just as fast, so the retry costs nothing
+    /// in that case either.
+    const TRANSPORT_ALLOCATION_ATTEMPTS: u32 = 10;
+
+    /// Route lifecycle, as its own generation.
+    ///
+    /// Returns the event untouched when it is not a route event, so the
+    /// ordinary topology projection still sees everything else. Routes are
+    /// separated out because a grant is only safe to hand back once the
+    /// owning shard has acknowledged the view that carries it, and that is a
+    /// barrier the synchronous projection cannot wait on.
+    async fn handle_route_event(&mut self, e: ShardEventWrapper) -> Option<ShardEventWrapper> {
+        let shard_id = e.from_shard_id;
+        match e.ev {
+            ShardEvent::RouteNeeded { request, action } => {
+                let handle = self.grant_route(shard_id, action).await;
+                self.router
+                    .send(shard_id, ShardCommand::RouteGranted { request, handle })
+                    .await;
+                None
+            }
+            ShardEvent::RouteReleased { handle } => {
+                self.release_route(shard_id, handle).await;
+                None
+            }
+            ev => Some(ShardEventWrapper {
+                from_shard_id: shard_id,
+                ev,
+            }),
+        }
+    }
+
+    /// Allocate, publish and confirm one endpoint route.
+    ///
+    /// The action is opaque here: it holds keys that mean something only on
+    /// the shard that asked, and the control plane's job is to give them an
+    /// address and put them in that shard's view — not to interpret them.
+    async fn grant_route(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        action: crate::route::RouteAction,
+    ) -> Option<RouteHandle> {
+        let now = tokio::time::Instant::now();
+        if self.state.begin().is_err() {
+            debug_assert!(false, "lifecycle transactions serialise through this actor");
+            return None;
+        }
+        let handle = match self.state.reserve_endpoint(shard_id, now) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::warn!(%shard_id, ?err, "endpoint route allocation failed");
+                self.state.abort(now);
+                return None;
+            }
+        };
+
+        let published = self.state.pending().map(|tx| tx.generation).and_then(|generation| {
+            let view = self.view_mut(shard_id)?;
+            view.stage(
+                generation,
+                crate::view::ViewOp::InstallRoute {
+                    route: handle.route,
+                    binding: crate::view::RouteBinding {
+                        epoch: handle.epoch,
+                        action,
+                    },
+                },
+            );
+            view.publish()
+        });
+        let Some(published) = published else {
+            self.state.abort(now);
+            return None;
+        };
+        if !self.await_generation(shard_id, published).await {
+            self.state.abort(now);
+            return None;
+        }
+        if self.state.commit().is_err() {
+            self.state.abort(now);
+            return None;
+        }
+        Some(handle)
+    }
+
+    /// Take a route out of the published view, then return its slot.
+    ///
+    /// The order is the whole point: a slot handed back before the route is
+    /// absent from the view could be granted again while a packet addressed
+    /// to its predecessor is still arriving.
+    async fn release_route(&mut self, shard_id: crate::id::ShardId, handle: RouteHandle) {
+        let now = tokio::time::Instant::now();
+        if self.state.begin().is_err() {
+            return;
+        }
+        let published = self.state.pending().map(|tx| tx.generation).and_then(|generation| {
+            let view = self.view_mut(shard_id)?;
+            view.stage(
+                generation,
+                crate::view::ViewOp::RetireRoute {
+                    route: handle.route,
+                    epoch: handle.epoch,
+                },
+            );
+            view.publish()
+        });
+        let Some(published) = published else {
+            self.state.abort(now);
+            return;
+        };
+        if !self.await_generation(shard_id, published).await {
+            self.state.abort(now);
+            return;
+        }
+        if self.state.commit().is_err() {
+            self.state.abort(now);
+            return;
+        }
+        self.state
+            .release_endpoint(shard_id, handle.route.slot(), now);
+    }
+
     /// Stage a participant's transport route as one lifecycle generation.
     ///
     /// The control plane allocates the address, the owning shard prepares
@@ -316,13 +442,31 @@ impl ControllerActor {
             return None;
         }
 
-        let handle = match self.state.reserve_transport(shard_id, now) {
-            Ok(handle) => handle,
-            Err(err) => {
-                tracing::warn!(?err, %participant_id, "transport route allocation failed");
-                self.state.abort(now);
-                return None;
+        // Bounded retries for a transient allocation failure. Every other
+        // install failure here recovers on a later externally-triggered retry
+        // (the next subscribe, the next publish); connection setup has no such
+        // later trigger — a client gets this one attempt before it sees the
+        // join itself fail — so the retry has to happen here.
+        let mut reserved = None;
+        for attempt in 1..=Self::TRANSPORT_ALLOCATION_ATTEMPTS {
+            match self.state.reserve_transport(shard_id, now) {
+                Ok(handle) => {
+                    reserved = Some(handle);
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        %participant_id,
+                        attempt,
+                        "transport route allocation failed, retrying"
+                    );
+                }
             }
+        }
+        let Some(handle) = reserved else {
+            self.state.abort(now);
+            return None;
         };
 
         let Some(participant_key) = self.prepare_transport(shard_id, participant_id, handle).await

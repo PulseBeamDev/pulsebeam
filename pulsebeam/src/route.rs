@@ -558,10 +558,17 @@ pub(crate) enum ReverseTarget {
     },
 }
 
+/// The shard-owned half of a route: the accounting a packet mutates as it
+/// arrives.
+///
+/// The other half — the epoch and the compiled [`RouteAction`] — lives in the
+/// published [`ShardView`](crate::view::ShardView), because that is what the
+/// control plane decides and the data plane only reads. What is left here is
+/// per-route processing state, which must be mutable on the owning core and
+/// therefore cannot live in an immutable image.
 #[derive(Debug)]
-pub(crate) struct RouteEntry {
+pub(crate) struct RouteRuntimeEntry {
     pub epoch: u16,
-    pub action: RouteAction,
     pub names: RouteNames,
     /// Expands the envelope's middle-32 against this route's own reference.
     pub expander: NtpExpander,
@@ -578,7 +585,7 @@ pub(crate) struct RouteStats {
     pub duplicated: u64,
 }
 
-impl RouteEntry {
+impl RouteRuntimeEntry {
     /// Fold a frame's `link_seq` into hop-local counters.
     ///
     /// Comparison is wrapping: `link_seq` is modulo 2^32, so "newer" means a
@@ -609,59 +616,6 @@ impl RouteEntry {
         }
     }
 }
-
-#[derive(Debug)]
-enum Slot {
-    Free,
-    Live(Box<RouteEntry>),
-}
-
-// `Free` carries nothing and `Live` is a `Box`, whose pointer is never null —
-// so the niche optimization makes this enum exactly the size of the pointer,
-// not the pointer plus a discriminant. That is what makes a working set of
-// slots cheap enough to preallocate; if this ever regresses (a new variant, a
-// wrapper type without the niche), preallocation silently gets `1 << 14`
-// times more expensive, so it is checked here rather than trusted.
-const _: () = assert!(size_of::<Slot>() == size_of::<usize>());
-
-/// Destination-owned table of installed routes.
-///
-/// # Id budget
-///
-/// [`RouteId`] is 32 bits and slots grow monotonically until a retired one
-/// clears [`ROUTE_QUARANTINE`], so the table's size is peak concurrent routes
-/// plus whatever churned in the last quarantine window. What matters is that
-/// every route family stays proportional to something bounded:
-///
-/// | family    | count per shard        |
-/// |-----------|------------------------|
-/// | video     | imported tracks        |
-/// | audio     | imported audio streams |
-/// | data      | imported (publisher, topic, lane) |
-/// | feedback  | *published* tracks     |
-///
-/// Feedback is the one that could easily have been `tracks x shards`: a route
-/// per subscribing shard is the obvious symmetry with the forward direction.
-/// It is deliberately not, because feedback is latest-wins and keeps no
-/// per-link accounting, so a per-sender route would buy nothing and would cost
-/// 32x on a 32-shard node.
-///
-/// There is no policy cap here — the families above are all bounded, so
-/// exhaustion means the address space itself ran out: [`RouteId`]'s slot
-/// field is 20 bits, `1 << ROUTE_SLOT_BITS` routes, full stop. Nothing to
-/// tune, and failing the install at that limit says what happened while
-/// there is still a process to say it in.
-#[derive(Debug)]
-pub(crate) struct RouteTable {
-    alloc: SlotAllocator,
-    slots: Vec<Slot>,
-}
-
-/// Working set preallocated up front so steady-state operation never
-/// allocates. A guess, not a bound — [`SlotAllocator::allocate`] grows past it
-/// with a `tracing::warn!` naming the shard and the new size, and only fails
-/// at the address space's own limit (`1 << ROUTE_SLOT_BITS`).
-const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
 
 /// Hands out `(slot, epoch)` pairs within one shard's slot namespace.
 ///
@@ -710,6 +664,15 @@ impl SlotAllocator {
     /// is fresh and the caller must push one entry; anything lower is a
     /// quarantined slot coming back, already bumped to a new epoch.
     pub(crate) fn allocate(&mut self, now: Instant) -> Result<(u32, u16), RouteError> {
+        // Exhaustion is the one failure every caller has written a rollback for and none has ever
+        // taken: a namespace only fills under a participant count no plan reaches. Injecting it is
+        // what puts those recovery paths under test at all. It lives here rather than at the table
+        // it used to serve because this is now the only place an address can fail to exist.
+        if pulsebeam_runtime::buggify!("route table exhausted") {
+            return Err(RouteError::Exhausted {
+                max_slots: self.max_slots,
+            });
+        }
         // FIFO from the oldest retirement, so a slot is only reused once no
         // datagram addressed to its previous incarnation could still arrive.
         if let Some(&(slot, retired_at)) = self.quarantine.front()
@@ -759,9 +722,26 @@ impl SlotAllocator {
     }
 }
 
+/// The shard's per-route accounting, addressed by slot.
+///
+/// Not a route *table*: it decides nothing and resolves nothing. Whether a
+/// route is live, and what it points at, is the published
+/// [`ShardView`](crate::view::ShardView)'s answer; this only holds the
+/// mutable processing state that must live on the owning core, and is
+/// created and dropped at the control plane's direction.
+#[derive(Debug)]
+pub(crate) struct RouteRuntime {
+    shard_id: ShardId,
+    slots: Vec<Option<Box<RouteRuntimeEntry>>>,
+}
+
+/// Working set preallocated up front so steady-state operation never
+/// allocates.
+const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
-    /// No slot is out of quarantine and the table is at its cap.
+    /// No slot is out of quarantine and the allocator is at its cap.
     Exhausted { max_slots: u32 },
     /// The envelope named a slot that is free, or an incarnation that is gone.
     Stale { route: RouteId, epoch: u16 },
@@ -769,132 +749,74 @@ pub(crate) enum RouteError {
     OutOfRange { route: RouteId },
 }
 
-impl RouteTable {
+impl RouteRuntime {
     pub fn new(shard_id: ShardId) -> Self {
-        Self::with_max_slots(shard_id, PackedRoute::MAX_SLOT.saturating_add(1))
-    }
-
-    pub fn with_max_slots(shard_id: ShardId, max_slots: u32) -> Self {
-        let alloc = SlotAllocator::with_max_slots(shard_id, max_slots);
-        let prealloc = alloc.epochs.capacity();
         Self {
-            alloc,
-            slots: Vec::with_capacity(prealloc),
+            shard_id,
+            slots: Vec::with_capacity(ROUTE_TABLE_PREALLOCATED_SLOTS),
         }
     }
 
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| matches!(s, Slot::Live(_)))
-            .count()
-    }
-
-    #[cfg(test)]
-    pub fn get(&self, id: RouteId) -> Option<&RouteEntry> {
-        match self.slots.get(id.index()) {
-            Some(Slot::Live(entry)) => Some(entry),
-            _ => None,
+    /// Build the accounting behind an address the control plane granted.
+    pub fn install(&mut self, handle: RouteHandle, names: RouteNames, ntp_ref: NtpTime) {
+        debug_assert_eq!(
+            handle.shard(),
+            self.shard_id,
+            "a route's accounting only exists at the shard that owns it"
+        );
+        let idx = handle.route.index();
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx.saturating_add(1), || None);
         }
-    }
-
-    /// Allocate and install in one step. The caller hands the resulting
-    /// `(RouteId, epoch)` to the sender, which may only then emit media.
-    pub fn install(
-        &mut self,
-        action: RouteAction,
-        names: RouteNames,
-        ntp_ref: NtpTime,
-        now: Instant,
-    ) -> Result<(RouteId, u16), RouteError> {
-        // Exhaustion is the one failure every caller here has written a rollback for and none has
-        // ever taken: the table only fills under a participant count no plan reaches. Injecting it
-        // is what puts those four recovery paths under test at all.
-        if pulsebeam_runtime::buggify!("route table exhausted") {
-            return Err(RouteError::Exhausted {
-                max_slots: self.alloc.max_slots,
-            });
-        }
-        let fresh = self.alloc.high_water();
-        let (slot_idx, epoch) = self.alloc.allocate(now)?;
-        let entry = Slot::Live(Box::new(RouteEntry {
-            epoch,
-            action,
+        let Some(slot) = self.slots.get_mut(idx) else {
+            debug_assert!(false, "the resize above guarantees this slot exists");
+            return;
+        };
+        *slot = Some(Box::new(RouteRuntimeEntry {
+            epoch: handle.epoch,
             names,
             expander: NtpExpander::new(ntp_ref),
             last_link_seq: None,
             stats: RouteStats::default(),
         }));
-        if slot_idx as usize == fresh {
-            self.slots.push(entry);
-        } else {
-            let Some(slot) = self.slots.get_mut(slot_idx as usize) else {
-                debug_assert!(false, "allocate() returned a slot outside the table");
-                return Err(RouteError::Exhausted {
-                    max_slots: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
-                });
-            };
-            debug_assert!(
-                matches!(slot, Slot::Free),
-                "a quarantined slot must still be free"
-            );
-            *slot = entry;
-        }
-        Ok((RouteId::new(self.alloc.shard_id(), slot_idx), epoch))
     }
 
-    /// Idempotent: retiring an already-free slot is a no-op, so a redelivered
-    /// teardown cannot desync the table.
-    ///
-    /// `epoch` must match the live incarnation. Every other operation on this
-    /// table checks it; retire was the one exception, and it is the one
-    /// operation here that destroys state — a teardown for a superseded
-    /// incarnation must not retire the one that replaced it.
-    pub fn retire(&mut self, id: RouteId, epoch: u16, now: Instant) -> bool {
-        debug_assert_eq!(
-            id.shard(),
-            self.alloc.shard_id(),
-            "a route is only retirable at the shard that owns it"
-        );
-        let Some(slot) = self.slots.get_mut(id.index()) else {
+    /// Idempotent, and epoch-checked: a redelivered teardown must not drop the
+    /// accounting of the incarnation that replaced the one it names.
+    pub fn retire(&mut self, handle: RouteHandle) -> bool {
+        let Some(slot) = self.slots.get_mut(handle.route.index()) else {
             return false;
         };
         match slot {
-            Slot::Live(entry) if entry.epoch == epoch => {}
+            Some(entry) if entry.epoch == handle.epoch => {}
             _ => return false,
         }
-        *slot = Slot::Free;
-        self.alloc.retire(id.slot(), now);
+        *slot = None;
         true
     }
 
-    pub fn resolve(&mut self, env: &MediaEnvelope) -> Result<&mut RouteEntry, RouteError> {
-        let idx = env.route.index();
-        let Some(slot) = self.slots.get_mut(idx) else {
-            return Err(RouteError::OutOfRange { route: env.route });
-        };
-        match slot {
-            Slot::Live(entry) if entry.epoch == env.epoch => Ok(entry),
-            _ => Err(RouteError::Stale {
-                route: env.route,
-                epoch: env.epoch,
-            }),
-        }
-    }
-
-    /// The compiled action behind a route, if that incarnation is still live.
-    ///
-    /// For frames that carry no [`MediaEnvelope`] — feedback has neither a timeline
-    /// nor per-link accounting to keep, so it addresses with `(route, epoch)`
-    /// alone.
-    pub fn resolve_action(&self, route: RouteId, epoch: u16) -> Option<&RouteAction> {
-        match self.slots.get(route.index()) {
-            Some(Slot::Live(entry)) if entry.epoch == epoch => Some(&entry.action),
+    pub fn entry_mut(&mut self, handle: RouteHandle) -> Option<&mut RouteRuntimeEntry> {
+        match self.slots.get_mut(handle.route.index()) {
+            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
             _ => None,
         }
     }
 
+    pub fn entry(&self, handle: RouteHandle) -> Option<&RouteRuntimeEntry> {
+        match self.slots.get(handle.route.index()) {
+            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
+            _ => None,
+        }
+    }
+
+    pub fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
 }
 
 /// Lifecycle of one imported stream on a destination shard.
@@ -1276,183 +1198,108 @@ mod tests {
         );
     }
 
-    /// A route this table installs must carry this table's own shard, not a
-    /// bare sequential index — that is what lets a misrouted packet be
-    /// forwarded by reading the id's high bits alone.
-    #[tokio::test(start_paused = true)]
-    async fn an_installed_route_carries_its_table_s_shard() {
-        let mut table = RouteTable::new(ShardId::new(41));
-        let (route, _epoch) = table
-            .install(action(), names(), NtpTime::ZERO, Instant::now())
-            .unwrap();
-        assert_eq!(route.shard(), ShardId::new(41));
+    // ── allocation, quarantine, and the accounting behind a route ────────
+
+    fn alloc(shard: usize) -> SlotAllocator {
+        SlotAllocator::with_max_slots(ShardId::new(shard), PackedRoute::MAX_SLOT.saturating_add(1))
     }
 
-    /// Growth is bounded, so a churn storm fails an install rather than
+    fn handle(shard: usize, slot: u32, epoch: u16) -> RouteHandle {
+        RouteHandle::new(RouteId::new(ShardId::new(shard), slot), epoch)
+    }
+
+    /// An address handed out for a shard must carry that shard, so a
+    /// misdelivered packet is recognised by reading its high bits alone.
+    #[tokio::test(start_paused = true)]
+    async fn an_allocated_route_carries_the_shard_it_was_allocated_for() {
+        let mut allocator = alloc(41);
+        let (slot, _) = allocator.allocate(Instant::now()).unwrap();
+        assert_eq!(
+            RouteId::new(ShardId::new(41), slot).shard(),
+            ShardId::new(41)
+        );
+    }
+
+    /// Growth is bounded, so a churn storm fails an allocation rather than
     /// consuming the node's memory until the allocator decides for us.
     #[tokio::test(start_paused = true)]
-    async fn a_table_at_its_cap_refuses_instead_of_growing() {
-        let mut table = RouteTable::with_max_slots(ShardId::new(0), 2);
+    async fn an_allocator_at_its_cap_refuses_instead_of_growing() {
+        let mut allocator = SlotAllocator::with_max_slots(ShardId::new(0), 2);
         let now = Instant::now();
 
         for _ in 0..2 {
-            table
-                .install(action(), names(), NtpTime::ZERO, now)
-                .expect("within the cap");
+            allocator.allocate(now).expect("within the cap");
         }
-
         assert_eq!(
-            table
-                .install(action(), names(), NtpTime::ZERO, now)
-                .unwrap_err(),
-            RouteError::Exhausted { max_slots: 2 },
+            allocator.allocate(now),
+            Err(RouteError::Exhausted { max_slots: 2 }),
+            "past the cap it must fail rather than grow"
         );
-
-        // Quarantine still returns slots, so the cap bounds concurrency rather
-        // than the total number of routes a shard may ever install.
-        table.retire(RouteId::from_raw(0), 0, now);
-        table
-            .install(action(), names(), NtpTime::ZERO, now + ROUTE_QUARANTINE)
-            .expect("a quarantined slot comes back");
     }
 
+    /// A slot only comes back once no datagram addressed to its previous
+    /// incarnation could still be in flight, and it comes back as a new
+    /// epoch so the old handle cannot reach the new tenant.
     #[tokio::test(start_paused = true)]
-    async fn a_stale_epoch_never_resolves_to_a_recycled_slot() {
-        let mut table = RouteTable::new(ShardId::new(0));
+    async fn a_recycled_slot_comes_back_under_a_new_epoch() {
+        let mut allocator = alloc(0);
         let now = Instant::now();
-        let (id, epoch) = table
-            .install(action(), names(), NtpTime::ZERO, now)
-            .unwrap();
+        let (slot, epoch) = allocator.allocate(now).unwrap();
+        allocator.retire(slot, now);
 
-        table.retire(id, epoch, now);
-        let later = now + ROUTE_QUARANTINE;
-        let (id2, epoch2) = table
-            .install(action(), names(), NtpTime::ZERO, later)
-            .unwrap();
+        tokio::time::advance(ROUTE_QUARANTINE).await;
+        let (reused, reused_epoch) = allocator.allocate(Instant::now()).unwrap();
 
-        assert_eq!(id2, id, "the slot should be reused after quarantine");
-        assert_ne!(epoch2, epoch, "reuse must bump the epoch");
-        assert_eq!(
-            table.resolve(&envelope(id, epoch)).err(),
-            Some(RouteError::Stale { route: id, epoch })
-        );
-        assert!(table.resolve(&envelope(id2, epoch2)).is_ok());
+        assert_eq!(reused, slot, "the slot should be reused after quarantine");
+        assert_ne!(reused_epoch, epoch, "but as a new incarnation");
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_slot_is_not_reused_inside_its_quarantine() {
-        let mut table = RouteTable::new(ShardId::new(0));
+        let mut allocator = alloc(0);
         let now = Instant::now();
-        let (id, epoch) = table
-            .install(action(), names(), NtpTime::ZERO, now)
-            .unwrap();
-        table.retire(id, epoch, now);
+        let (slot, _) = allocator.allocate(now).unwrap();
+        allocator.retire(slot, now);
 
-        let too_soon = now + ROUTE_QUARANTINE - Duration::from_millis(1);
-        let (id2, _) = table
-            .install(action(), names(), NtpTime::ZERO, too_soon)
-            .unwrap();
-        assert_ne!(id2, id, "must not reuse a slot still in quarantine");
+        let (next, _) = allocator.allocate(now).unwrap();
+        assert_ne!(next, slot, "must not reuse a slot still in quarantine");
     }
 
+    /// The accounting behind a route is epoch-checked the same way its
+    /// resolution is: a frame for a superseded incarnation must not fold into
+    /// the counters of the one that replaced it.
     #[tokio::test(start_paused = true)]
-    async fn resolve_rejects_free_and_out_of_range_slots() {
-        let mut table = RouteTable::new(ShardId::new(0));
-        let now = Instant::now();
-        let (id, epoch) = table
-            .install(action(), names(), NtpTime::ZERO, now)
-            .unwrap();
+    async fn accounting_is_scoped_to_one_incarnation() {
+        let mut runtime = RouteRuntime::new(ShardId::new(0));
+        runtime.install(handle(0, 0, 1), names(), NtpTime::ZERO);
 
-        let far = RouteId::from_raw(999);
-        assert_eq!(
-            table.resolve(&envelope(far, 0)).err(),
-            Some(RouteError::OutOfRange { route: far })
-        );
-
-        table.retire(id, epoch, now);
-        assert_eq!(
-            table.resolve(&envelope(id, epoch)).err(),
-            Some(RouteError::Stale { route: id, epoch })
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retire_is_idempotent() {
-        let mut table = RouteTable::new(ShardId::new(0));
-        let now = Instant::now();
-        let (id, epoch) = table
-            .install(action(), names(), NtpTime::ZERO, now)
-            .unwrap();
-        assert!(table.retire(id, epoch, now));
+        assert!(runtime.entry_mut(handle(0, 0, 1)).is_some());
         assert!(
-            !table.retire(id, epoch, now),
-            "a second retire must be a no-op"
-        );
-        assert_eq!(table.len(), 0);
-    }
-
-    /// A teardown in flight for a superseded incarnation must not retire the
-    /// one that replaced it — the epoch check is what makes `retire` safe to
-    /// call with a stale handle, the same way `resolve` already is.
-    #[tokio::test(start_paused = true)]
-    async fn retire_with_a_stale_epoch_does_not_touch_the_live_incarnation() {
-        let mut table = RouteTable::with_max_slots(ShardId::new(0), 1);
-        let now = Instant::now();
-        let (id, epoch) = table
-            .install(action(), names(), NtpTime::ZERO, now)
-            .unwrap();
-        table.retire(id, epoch, now);
-        let later = now + ROUTE_QUARANTINE;
-        let (id2, epoch2) = table
-            .install(action(), names(), NtpTime::ZERO, later)
-            .unwrap();
-        assert_eq!(id2, id, "single-slot table must reuse the same slot");
-        assert_ne!(epoch2, epoch);
-
-        assert!(
-            !table.retire(id, epoch, later),
-            "retiring the old incarnation's stale epoch must be a no-op"
+            runtime.entry_mut(handle(0, 0, 2)).is_none(),
+            "a different epoch is a different route"
         );
         assert!(
-            table.resolve(&envelope(id2, epoch2)).is_ok(),
-            "the live incarnation must survive a stale-epoch retire"
+            runtime.entry_mut(handle(0, 9, 1)).is_none(),
+            "a slot that was never installed has no accounting"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn link_seq_accounting_is_modulo_2_32() {
-        let mut table = RouteTable::new(ShardId::new(0));
-        let now = Instant::now();
-        let (id, epoch) = table
-            .install(
-                RouteAction::Video {
-                    local_track: LocalTrackKey::default(),
-                },
-                names(),
-                NtpTime::ZERO,
-                now,
-            )
-            .unwrap();
+    async fn retiring_accounting_is_idempotent_and_epoch_checked() {
+        let mut runtime = RouteRuntime::new(ShardId::new(0));
+        runtime.install(handle(0, 0, 4), names(), NtpTime::ZERO);
 
-        // Straddle the wrap: the successor of u32::MAX is 0, not a 4-billion gap.
-        let seqs = [u32::MAX - 2, u32::MAX - 1, u32::MAX, 0, 1];
-        for seq in seqs {
-            let mut env = envelope(id, epoch);
-            env.link_seq = seq;
-            let entry = table.resolve(&env).unwrap();
-            entry.observe(seq);
-        }
+        assert!(
+            !runtime.retire(handle(0, 0, 3)),
+            "a teardown for a superseded incarnation must not touch this one"
+        );
+        assert!(runtime.entry(handle(0, 0, 4)).is_some());
 
-        let stats = table.get(id).unwrap().stats;
-        assert_eq!(stats.received, seqs.len() as u64);
-        assert_eq!(stats.lost, 0, "contiguous across the wrap");
-        assert_eq!(stats.duplicated, 0);
-        assert_eq!(stats.reordered, 0);
+        assert!(runtime.retire(handle(0, 0, 4)));
+        assert!(!runtime.retire(handle(0, 0, 4)), "a redelivered teardown is a no-op");
+        assert_eq!(runtime.len(), 0);
     }
 
-    /// The churn sequence from the design: subscribe, another subscribe before
-    /// the ack, an unsubscribe before the ack, the ack, then retire. Exactly
-    /// one installation must occur.
     #[test]
     fn churn_before_the_install_ack_installs_exactly_once() {
         let mut imports = ImportTable::new();
@@ -1614,20 +1461,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn link_seq_detects_loss_duplication_and_reorder() {
-        let mut table = RouteTable::new(ShardId::new(0));
-        let now = Instant::now();
-        let (id, epoch) = table
-            .install(action(), names(), NtpTime::ZERO, now)
-            .unwrap();
+        let mut runtime = RouteRuntime::new(ShardId::new(0));
+        let route = handle(0, 0, 0);
+        runtime.install(route, names(), NtpTime::ZERO);
 
         for seq in [10u32, 11, 14, 14, 13] {
-            let mut env = envelope(id, epoch);
-            env.link_seq = seq;
-            let entry = table.resolve(&env).unwrap();
+            let entry = runtime.entry_mut(route).unwrap();
             entry.observe(seq);
         }
 
-        let stats = table.get(id).unwrap().stats;
+        let stats = runtime.entry(route).unwrap().stats;
         assert_eq!(stats.received, 5);
         assert_eq!(stats.duplicated, 1, "14 seen twice");
         assert_eq!(stats.reordered, 1, "13 arrived after 14");
@@ -1715,34 +1558,26 @@ mod tests {
 
     /// A retired slot is quarantined by its *slot* number. Storing the packed
     /// route instead worked only on shard 0, where the shard bits are zero —
-    /// on any other shard the queue held a number far outside the table and
-    /// the slot never came back.
+    /// on any other shard the queue held a number far outside the namespace
+    /// and the slot never came back.
     #[tokio::test(start_paused = true)]
     async fn a_slot_returns_from_quarantine_on_a_shard_other_than_zero() {
-        for table_shard in [0usize, 1, 41] {
-            let mut table = RouteTable::new(ShardId::new(table_shard));
+        for shard in [0usize, 1, 41] {
+            let mut allocator = alloc(shard);
             let now = Instant::now();
-            let (id, epoch) = table
-                .install(action(), names(), NtpTime::ZERO, now)
-                .unwrap();
-            assert!(table.retire(id, epoch, now));
+            let (slot, epoch) = allocator.allocate(now).unwrap();
+            allocator.retire(slot, now);
 
             tokio::time::advance(ROUTE_QUARANTINE).await;
-            let (reused, reused_epoch) = table
-                .install(action(), names(), NtpTime::ZERO, Instant::now())
-                .unwrap();
+            let (reused, reused_epoch) = allocator.allocate(Instant::now()).unwrap();
 
-            assert_eq!(reused, id, "shard {table_shard}: the slot must come back");
-            assert_ne!(
-                reused_epoch, epoch,
-                "shard {table_shard}: reuse must bump the epoch"
-            );
+            assert_eq!(reused, slot, "shard {shard}: the slot must come back");
+            assert_ne!(reused_epoch, epoch, "shard {shard}: reuse must bump the epoch");
             assert_eq!(
-                reused.shard(),
-                ShardId::new(table_shard),
-                "shard {table_shard}: a reused route still carries its owner"
+                RouteId::new(ShardId::new(shard), reused).shard(),
+                ShardId::new(shard),
+                "shard {shard}: a reused route still carries its owner"
             );
         }
     }
-
 }

@@ -123,6 +123,12 @@ impl ControllerCore {
 
     pub fn process_shard_event(&mut self, e: ShardEventWrapper, eq: &mut ControllerEventQueue) {
         match e.ev {
+            // Route lifecycle is a control-plane transaction, handled by the
+            // actor itself before this sees the event — it needs to await a
+            // publication barrier, which this synchronous projection cannot.
+            ShardEvent::RouteNeeded { .. } | ShardEvent::RouteReleased { .. } => {
+                debug_assert!(false, "route events are intercepted by the controller actor");
+            }
             ShardEvent::TrackPublished(track) => {
                 let Some((room_id, other_participants)) = self.registry.add_track(track.clone())
                 else {
