@@ -261,7 +261,11 @@ impl ShardRoutingTable {
 
     /// The fanout for a room name, creating it if this shard has not seen the
     /// room before. Control path only.
-    fn room_or_insert(&mut self, room_id: RoomId, rng: &mut impl rand::RngCore) -> &mut RoomFanout {
+    fn room_or_insert(
+        &mut self,
+        room_id: RoomId,
+        rng: &mut impl rand::RngCore,
+    ) -> (RoomKey, &mut RoomFanout) {
         let Self { data, control } = self;
         let key = *control
             .room_keys
@@ -270,7 +274,7 @@ impl ShardRoutingTable {
         let Some(room) = data.rooms.get_mut(key) else {
             pulsebeam_runtime::fatal!("room_keys and rooms are created together")
         };
-        room
+        (key, room)
     }
 
     fn remove_room(&mut self, room_id: &RoomId) {
@@ -306,6 +310,14 @@ impl ShardRoutingTable {
     /// registering it against `room_id`'s bookkeeping set) if this shard has
     /// not seen the stream before. Control path only.
     fn data_stream_or_insert(&mut self, room_id: RoomId, id: DataStreamId) -> &mut DataStreamRoute {
+        let key = self.data_stream_key_or_insert(room_id, id);
+        let Some(route) = self.data.data_streams.get_mut(key) else {
+            pulsebeam_runtime::fatal!("data_stream_keys and data_streams are created together")
+        };
+        route
+    }
+
+    fn data_stream_key_or_insert(&mut self, room_id: RoomId, id: DataStreamId) -> DataStreamKey {
         let Self { data, control } = self;
         let key = {
             let id_for_route = id.clone();
@@ -319,10 +331,7 @@ impl ShardRoutingTable {
         {
             room.data_stream_keys.insert(key);
         }
-        let Some(route) = data.data_streams.get_mut(key) else {
-            pulsebeam_runtime::fatal!("data_stream_keys and data_streams are created together")
-        };
-        route
+        key
     }
 
     fn remove_data_stream(&mut self, room_id: &RoomId, id: &DataStreamId) {
@@ -455,15 +464,18 @@ impl ShardRoutingTable {
 
     // -- local room membership -------------------------------------------
 
+    /// Returns the room's compiled key so the caller can hand it to the
+    /// participant. A participant that knows its own `RoomKey` never makes
+    /// the packet path hash a `RoomId` to find its room.
     pub fn add_local_member(
         &mut self,
         handle: ParticipantKey,
         room_id: RoomId,
         rng: &mut impl rand::RngCore,
-    ) {
-        self.room_or_insert(room_id, rng)
-            .members
-            .insert_unique(handle);
+    ) -> RoomKey {
+        let (key, room) = self.room_or_insert(room_id, rng);
+        room.members.insert_unique(handle);
+        key
     }
 
     /// Removes a local participant from its room and evicts its audio
@@ -810,17 +822,21 @@ impl ShardRoutingTable {
 
     /// A local participant published a track: register its measurement handles
     /// on the node so any shard that later subscribes can resolve them.
+    /// Returns the track's compiled fanout so the caller can bind it to the
+    /// publishing participant. RTP arrives at packet rate; resolving the
+    /// fanout by name there would be the single hottest hash on the node.
     pub fn publish_local_track(
         &mut self,
         track_id: TrackId,
         origin: ParticipantId,
         states: crate::track::TrackStates,
-    ) {
+    ) -> LocalTrackKey {
         let key = self.fanout_key(track_id, origin);
         let Some(entry) = self.data.tracks.get_mut(key) else {
             pulsebeam_runtime::fatal!("fanout_key returned a key the track table does not hold")
         };
         entry.layer_states = states;
+        key
     }
 
     pub fn unpublish_local_track(&mut self, track_id: &TrackId) {
@@ -858,7 +874,7 @@ impl ShardRoutingTable {
         }
 
         self.control.participant_shards.insert(participant_id, meta);
-        let room = self.room_or_insert(room_id, rng);
+        let (_, room) = self.room_or_insert(room_id, rng);
         room.insert_remote_shard(shard_id);
         room.increment_remote_participant_count(shard_id);
     }
@@ -1003,22 +1019,27 @@ impl ShardRoutingTable {
         }))
     }
 
+    /// Returns the compiled stream so the caller can bind it to the
+    /// publisher's channel — that is what keeps the packet path from
+    /// reassembling the stream's identity on every frame.
     pub fn register_data_publisher(
         &mut self,
         room_id: RoomId,
         publisher: ParticipantId,
         topic: Topic,
-    ) {
-        let Some(room) = self.room(&room_id) else {
-            return;
-        };
+    ) -> Option<DataStreamKey> {
+        let room = self.room(&room_id)?;
         let all_publisher_subscribers = room
             .all_publisher_subscriptions
             .local_by_topic
             .get(&topic)
             .cloned()
             .unwrap_or_default();
-        let route = self.data_stream_or_insert(room_id, DataStreamId::new(room_id, publisher, topic));
+        let id = DataStreamId::new(room_id, publisher, topic);
+        let key = self.data_stream_key_or_insert(room_id, id);
+        let Some(route) = self.data.data_streams.get_mut(key) else {
+            pulsebeam_runtime::fatal!("data_stream_key_or_insert returned an absent key")
+        };
         debug_assert!(!route.published);
         route.published = true;
         for subscriber in all_publisher_subscribers {
@@ -1026,6 +1047,7 @@ impl ShardRoutingTable {
         }
         // Remote wildcard subscribers are not attached here: a destination must
         // allocate its own route, so it is announced to and hands a handle back.
+        Some(key)
     }
 
     pub fn unregister_data_publisher(
@@ -1899,18 +1921,13 @@ impl ShardRoutingTable {
     #[inline]
     pub fn route_audio(
         &mut self,
-        room: RoomKey,
         track_key: LocalTrackKey,
         origin: Origin,
-        // The sender's own key, resolved once by the caller — not looked up
-        // here, so the room fan-out below can skip the sender by key instead
-        // of hashing `ev.origin` against every member's name on every
-        // packet. `None` whenever `origin` is remote, since a remote
-        // sender's key was never local to begin with.
-        origin_key: Option<ParticipantKey>,
         mut ev: AudioRtpEvent,
         ctx: &mut impl RoutingContext,
     ) {
+        let room = ev.room;
+        let origin_key = ev.origin_key;
         debug_assert!(
             origin.is_local() || origin_key.is_none(),
             "a remote origin must never carry a local key"
@@ -2003,13 +2020,18 @@ impl ShardRoutingTable {
         topic: Topic,
         now: Instant,
         wall: &WallAnchor,
-    ) -> Option<RouteHandle> {
-        self.room(&room_id)?;
+    ) -> (Option<RouteHandle>, Option<ReliableStreamKey>) {
+        if self.room(&room_id).is_none() {
+            return (None, None);
+        }
         let id = DataStreamId::new(room_id, publisher, topic.clone());
-        let stream = self.reliable_stream_or_insert(room_id, id);
-        debug_assert!(!stream.published);
-        stream.published = true;
-        self.open_topic_reverse_route(room_id, publisher, topic, now, wall)
+        let key = self.reliable_stream_key_or_insert(room_id, id);
+        if let Some(stream) = self.data.reliable_streams.get_mut(key) {
+            debug_assert!(!stream.published);
+            stream.published = true;
+        }
+        let reverse = self.open_topic_reverse_route(room_id, publisher, topic, now, wall);
+        (reverse, Some(key))
     }
 
     pub fn unregister_reliable_data_publisher(
@@ -3119,6 +3141,7 @@ mod tests {
 
         let target = table
             .register_reliable_data_publisher(room, publisher, topic.clone(), now(), &wall())
+            .0
             .expect("publishing a reliable topic opens its reverse route");
         assert_eq!(table.data.routes.len(), 1);
 

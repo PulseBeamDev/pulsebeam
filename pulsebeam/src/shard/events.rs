@@ -3,6 +3,8 @@ use str0m::media::KeyframeRequestKind;
 
 use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
+use crate::shard::participants::ParticipantKey;
+use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey, RoomKey};
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
 use crate::track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackLayer, TrackMeta};
@@ -10,16 +12,30 @@ use crate::track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackLayer, Tr
 pub struct AudioRtpEvent {
     pub stream_id: StreamId,
     pub pkt: RtpPacket,
-    pub room_id: RoomId,
+    /// Compiled, not named: the emitting participant already holds its room's
+    /// key, so audio dispatch never hashes a `RoomId` to find the fanout.
+    pub room: RoomKey,
+    /// The semantic origin, which subscribers need in order to attribute the
+    /// audio. Read once per delivery, never hashed.
     pub origin: ParticipantId,
+    /// The origin's compiled key, present only for a locally published
+    /// stream. It exists so the fanout can skip the publisher without
+    /// hashing its name back to a key; a remote origin has no key here and
+    /// no member of this room to skip.
+    pub origin_key: Option<ParticipantKey>,
+    /// The publisher's compiled fanout — see [`VideoRtpEvent::fanout`].
+    pub fanout: Option<LocalTrackKey>,
 }
 
 pub struct VideoRtpEvent {
     pub stream_id: StreamId,
     pub pkt: RtpPacket,
+    /// The publisher's compiled fanout, resolved once per SSRC rather than
+    /// hashed per packet. `None` only until the shard binds one.
+    pub fanout: Option<LocalTrackKey>,
 }
 
-pub struct SctpEvent {
+pub struct SctpEvent<K> {
     pub topic: Topic,
     pub pkt: Vec<u8>,
     pub origin: ParticipantId,
@@ -27,6 +43,24 @@ pub struct SctpEvent {
     /// and the emitting participant already knows its room, so the dispatch
     /// path never hashes a name back to one.
     pub room_id: RoomId,
+    /// The compiled stream, once the shard has bound it to this channel.
+    /// `None` only in the window between a topic being announced and the
+    /// shard minting its arena entry, where the caller falls back to a
+    /// room-scoped lookup.
+    pub stream: Option<K>,
+}
+
+/// The compiled identity of the participant emitting into the pipeline.
+///
+/// A sink is built per participant in the dirty loop, which already holds
+/// both the key and the name, so carrying both costs nothing and lets the
+/// hot events use keys while the lifecycle events keep using names.
+#[derive(Clone, Copy)]
+pub(crate) struct SinkIdentity {
+    pub id: ParticipantId,
+    pub key: ParticipantKey,
+    pub room_id: RoomId,
+    pub room_key: RoomKey,
 }
 
 pub enum ParticipantEvent {
@@ -120,8 +154,8 @@ pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
     audio_queue: VecDeque<AudioRtpEvent>,
     video_queue: VecDeque<VideoRtpEvent>,
-    data_queue: VecDeque<SctpEvent>,
-    reliable_data_queue: VecDeque<SctpEvent>,
+    data_queue: VecDeque<SctpEvent<DataStreamKey>>,
+    reliable_data_queue: VecDeque<SctpEvent<ReliableStreamKey>>,
     shard_events: VecDeque<ShardEvent>,
 }
 
@@ -137,10 +171,12 @@ impl EventPipeline {
         }
     }
 
-    pub fn participant_sink(&mut self, room_id: RoomId, id: ParticipantId) -> PipelineSinkRef<'_> {
+    pub fn participant_sink(&mut self, who: SinkIdentity) -> PipelineSinkRef<'_> {
         PipelineSinkRef {
-            id,
-            room_id,
+            id: who.id,
+            key: who.key,
+            room_id: who.room_id,
+            room_key: who.room_key,
             pipeline: self,
         }
     }
@@ -161,11 +197,11 @@ impl EventPipeline {
         self.shard_events.push_back(ev);
     }
 
-    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent> {
+    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent<DataStreamKey>> {
         self.data_queue.pop_front()
     }
 
-    pub fn pop_reliable_data_sctp(&mut self) -> Option<SctpEvent> {
+    pub fn pop_reliable_data_sctp(&mut self) -> Option<SctpEvent<ReliableStreamKey>> {
         self.reliable_data_queue.pop_front()
     }
 
@@ -180,7 +216,9 @@ impl EventPipeline {
 
 pub struct PipelineSinkRef<'a> {
     id: ParticipantId,
+    key: ParticipantKey,
     room_id: RoomId,
+    room_key: RoomKey,
     pipeline: &'a mut EventPipeline,
 }
 
@@ -318,29 +356,33 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket) {
+    fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<LocalTrackKey>, pkt: RtpPacket) {
         match stream_id.0.kind() {
             TrackKind::Audio => self.pipeline.audio_queue.push_back(AudioRtpEvent {
                 stream_id,
                 pkt,
-                room_id: self.room_id,
+                room: self.room_key,
                 origin: self.id,
+                origin_key: Some(self.key),
+                fanout,
             }),
-            TrackKind::Video => self
-                .pipeline
-                .video_queue
-                .push_back(VideoRtpEvent { stream_id, pkt }),
+            TrackKind::Video => self.pipeline.video_queue.push_back(VideoRtpEvent {
+                stream_id,
+                pkt,
+                fanout,
+            }),
             TrackKind::Data => {}
         }
     }
 
     #[inline]
-    fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>) {
+    fn publish_sctp(&mut self, topic: Topic, stream: Option<DataStreamKey>, pkt: Vec<u8>) {
         self.pipeline.data_queue.push_back(SctpEvent {
             topic,
             pkt,
             origin: self.id,
             room_id: self.room_id,
+            stream,
         });
     }
 
@@ -397,12 +439,18 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_reliable_sctp(&mut self, topic: Topic, frame: Vec<u8>) {
+    fn publish_reliable_sctp(
+        &mut self,
+        topic: Topic,
+        stream: Option<ReliableStreamKey>,
+        frame: Vec<u8>,
+    ) {
         self.pipeline.reliable_data_queue.push_back(SctpEvent {
             topic,
             pkt: frame,
             origin: self.id,
             room_id: self.room_id,
+            stream,
         });
     }
 

@@ -323,14 +323,13 @@ impl ShardCore {
                     debug_assert!(false, "an audio route's track key must resolve to a track");
                     return;
                 };
-                // `room_id` only fills a field the local-origin path still
-                // needs to carry; the lookup above resolves through `room`
-                // directly, never by hashing it back.
                 let ev = AudioRtpEvent {
                     stream_id: (track_id, None),
                     pkt,
-                    room_id,
+                    room,
                     origin,
+                    origin_key: None,
+                    fanout: Some(track),
                 };
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
@@ -339,7 +338,7 @@ impl ShardCore {
                     wall: &self.wall,
                 };
                 self.routing
-                    .route_audio(room, track, Origin::Remote, None, ev, &mut ctx);
+                    .route_audio(track, Origin::Remote, ev, &mut ctx);
             }
             (RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let mut ctx = DispatchCtx {
@@ -447,15 +446,12 @@ impl ShardCore {
             // fanout: the publishing participant does not hold the key yet.
             // Same race video already tolerates (TrackPublished may not have
             // drained yet) — a silent skip here self-heals on the next packet.
-            let Some(room) = self.routing.control.room_keys.get(&ev.room_id).copied() else {
+            // The fanout normally rides on the event; the fallback covers
+            // only the window before the shard bound one to the publisher.
+            let Some(track) = ev.fanout.or_else(|| self.routing.fanout_of(&ev.stream_id.0)) else {
                 continue;
             };
-            let Some(track) = self.routing.fanout_of(&ev.stream_id.0) else {
-                continue;
-            };
-            let origin_key = ctx.registry.key_of(&ev.origin);
-            self.routing
-                .route_audio(room, track, Origin::Local, origin_key, ev, &mut ctx);
+            self.routing.route_audio(track, Origin::Local, ev, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
@@ -463,23 +459,35 @@ impl ShardCore {
             // A locally published track still costs one lookup to reach its
             // fanout: the publishing participant does not hold the key yet.
             // Everything downstream of here is index-addressed.
-            let Some(fanout) = self.routing.fanout_of(&ev.stream_id.0) else {
+            let Some(fanout) = ev.fanout.or_else(|| self.routing.fanout_of(&ev.stream_id.0)) else {
                 continue;
             };
             self.routing.route_video(fanout, ev.pkt, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {
-            let id = crate::shard::control::DataStreamId::new(ev.room_id, ev.origin, ev.topic);
-            if let Some(stream) = self.routing.data_stream_key(&id) {
+            // The key normally rides on the event. The fallback covers only
+            // the window between a topic being announced and the shard
+            // binding its arena entry to the channel; dropping instead would
+            // silently lose whatever the publisher sent in it.
+            let stream = ev.stream.or_else(|| {
+                let id =
+                    crate::shard::control::DataStreamId::new(ev.room_id, ev.origin, ev.topic.clone());
+                self.routing.data_stream_key(&id)
+            });
+            if let Some(stream) = stream {
                 self.routing
                     .route_data(stream, Origin::Local, &ev.pkt, &mut ctx);
             }
         }
 
         while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
-            let id = crate::shard::control::DataStreamId::new(ev.room_id, ev.origin, ev.topic);
-            if let Some(stream) = self.routing.reliable_stream_key(&id) {
+            let stream = ev.stream.or_else(|| {
+                let id =
+                    crate::shard::control::DataStreamId::new(ev.room_id, ev.origin, ev.topic.clone());
+                self.routing.reliable_stream_key(&id)
+            });
+            if let Some(stream) = stream {
                 self.routing
                     .route_reliable_data(stream, Origin::Local, &ev.pkt, &mut ctx);
             }
@@ -521,8 +529,14 @@ impl ShardCore {
                             publisher,
                             topic,
                         } => {
-                            self.routing
-                                .register_data_publisher(room_id, publisher, topic.clone());
+                            if let Some(stream) = self.routing.register_data_publisher(
+                                room_id,
+                                publisher,
+                                topic.clone(),
+                            ) && let Some(p) = self.registry.get_mut(&publisher)
+                            {
+                                p.bind_published_data_stream(&topic, stream);
+                            }
                             self.pipeline.push_shard_event(ShardEvent::Relay(
                                 Topology::DataTopicPublished {
                                     room_id,
@@ -585,13 +599,18 @@ impl ShardCore {
                             publisher,
                             topic,
                         } => {
-                            let reverse = self.routing.register_reliable_data_publisher(
+                            let (reverse, stream) = self.routing.register_reliable_data_publisher(
                                 room_id,
                                 publisher,
                                 topic.clone(),
                                 now,
                                 &self.wall,
                             );
+                            if let Some(stream) = stream
+                                && let Some(p) = self.registry.get_mut(&publisher)
+                            {
+                                p.bind_published_reliable_stream(&topic, stream);
+                            }
                             self.pipeline.push_shard_event(ShardEvent::Relay(
                                 Topology::ReliableTopicPublished {
                                     room_id,
@@ -657,11 +676,14 @@ impl ShardCore {
                         ParticipantControlEvent::TrackPublished(mut track, states) => {
                             // Register the handles on the node; only the
                             // stateless descriptor continues to the controller.
-                            self.routing.publish_local_track(
+                            let fanout = self.routing.publish_local_track(
                                 track.meta.id,
                                 track.meta.origin,
                                 states,
                             );
+                            if let Some(p) = self.registry.get_mut(&track.meta.origin) {
+                                p.bind_published_track(track.meta.id, fanout);
+                            }
                             // Open the reverse path now and stamp it on the
                             // descriptor: by the time any shard can subscribe,
                             // it already knows where to ask for a keyframe.
@@ -772,9 +794,13 @@ impl ShardCore {
             };
             debug_assert!(participant.queued_dirty);
             participant.queued_dirty = false;
-            let room_id = participant.room_id;
-            let participant_id = participant.participant_id;
-            let mut sink = self.pipeline.participant_sink(room_id, participant_id);
+            let who = crate::shard::events::SinkIdentity {
+                id: participant.participant_id,
+                key: handle,
+                room_id: participant.room_id,
+                room_key: participant.room_key,
+            };
+            let mut sink = self.pipeline.participant_sink(who);
             let deadline = participant.poll(now, &mut sink);
             if let Some(deadline) = deadline {
                 self.timers.schedule(handle, deadline);
@@ -1260,7 +1286,8 @@ impl ShardCore {
             }
             None => self.registry.insert(cfg, &mut self.rng),
         };
-        self.routing.add_local_member(key, room_id, &mut self.rng);
+        let room_key = self.routing.add_local_member(key, room_id, &mut self.rng);
+        self.registry.join_room(key, room_key);
         let Some(participant) = self.registry.get_mut(&participant_id) else {
             pulsebeam_runtime::fatal!(
                 "registry accepted participant {participant_id} but cannot resolve it"
@@ -1439,6 +1466,29 @@ mod test {
         assert!(
             core2.dirty.contains(key),
             "newly added participant must be dirty"
+        );
+    }
+
+    /// A participant carries its room's compiled key from the moment it
+    /// joins. The packet path reads that key; if joining ever stopped
+    /// setting it, audio would resolve against the default key and every
+    /// packet would land in the wrong room's fanout, silently.
+    #[test]
+    fn joining_a_room_compiles_the_room_key_onto_the_participant() {
+        let router = TestRouter::new();
+        let mut core = new_core();
+        let p = pid();
+        let r = room_id("compiled-room");
+
+        add_participant(&mut core, &router, p, r);
+
+        let key = core.registry.key_of(&p).expect("participant is present");
+        let meta = core.registry.resolve_mut(key).expect("participant resolves");
+        let room_key = meta.room_key;
+        assert_eq!(
+            core.routing.room_id_of(room_key),
+            Some(r),
+            "the participant's compiled room key must resolve back to the room it joined"
         );
     }
 

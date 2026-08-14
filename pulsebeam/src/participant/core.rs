@@ -21,6 +21,7 @@ use tokio::time::Instant;
 
 use crate::entity::{self, TrackId};
 use crate::id::ShardId;
+use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey};
 #[cfg(debug_assertions)]
 use crate::log::plog_error;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
@@ -58,6 +59,11 @@ struct IncomingRtpRoute {
     rid: Option<Rid>,
     upstream_slot: usize,
     track_id: TrackId,
+    /// The track's compiled fanout, resolved once when this route is cached
+    /// rather than per packet. `None` until the shard has bound one — see
+    /// [`ParticipantCore::bind_published_track`], which patches the cache so
+    /// the miss does not become permanent.
+    fanout: Option<LocalTrackKey>,
 }
 
 pub struct TrackMapping {
@@ -181,6 +187,14 @@ pub struct ParticipantCore {
     track_availability: HashMap<TrackId, TrackAvailability>,
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
+    /// The compiled stream a published channel forwards into, recorded by the
+    /// shard once it has minted one. Keyed by channel so an arriving SCTP
+    /// frame reaches its fanout without hashing a room, a publisher or a
+    /// topic — the identity it would otherwise have to reassemble on every
+    /// packet.
+    published_track_fanouts: HashMap<TrackId, LocalTrackKey>,
+    data_pub_streams: HashMap<ChannelId, DataStreamKey>,
+    reliable_pub_streams: HashMap<ChannelId, ReliableStreamKey>,
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
     reliable_channels: ReliableChannels,
 
@@ -208,6 +222,41 @@ pub struct ParticipantCore {
 }
 
 impl ParticipantCore {
+    /// Record the fanout a published track forwards into.
+    ///
+    /// Patches the per-SSRC route cache as well as the index: a route cached
+    /// before the shard minted the fanout would otherwise keep reporting
+    /// `None` for the life of the stream, and the miss would never heal.
+    pub fn bind_published_track(&mut self, track_id: TrackId, fanout: LocalTrackKey) {
+        self.published_track_fanouts.insert(track_id, fanout);
+        for route in self.incoming_rtp_routes.values_mut() {
+            if route.track_id == track_id {
+                route.fanout = Some(fanout);
+            }
+        }
+    }
+
+    /// Record the stream a published data topic forwards into.
+    ///
+    /// Called by the shard once it has minted the arena entry, which happens
+    /// a step after the participant announced the topic. Until it lands, a
+    /// frame on that channel falls back to a room-scoped lookup; afterwards
+    /// the key rides on the event and nothing on the packet path hashes a
+    /// name.
+    pub fn bind_published_data_stream(&mut self, topic: &Topic, stream: DataStreamKey) {
+        let Some(&channel) = self.data_pub_channels.get(topic) else {
+            return;
+        };
+        self.data_pub_streams.insert(channel, stream);
+    }
+
+    pub fn bind_published_reliable_stream(&mut self, topic: &Topic, stream: ReliableStreamKey) {
+        let Some(channel) = self.reliable_channels.publisher_channel(topic) else {
+            return;
+        };
+        self.reliable_pub_streams.insert(channel, stream);
+    }
+
     pub fn new(
         cfg: ParticipantConfig,
         shard_id: ShardId,
@@ -255,6 +304,9 @@ impl ParticipantCore {
             published_tracks: HashMap::new(),
             track_availability: HashMap::new(),
             data_topic_channels: HashMap::new(),
+            published_track_fanouts: HashMap::new(),
+            data_pub_streams: HashMap::new(),
+            reliable_pub_streams: HashMap::new(),
             data_pub_channels: HashMap::new(),
             data_sub_channels: HashMap::new(),
             reliable_channels: ReliableChannels::new(),
@@ -1008,10 +1060,18 @@ impl ParticipantCore {
                 {
                     match (ch.lane, ch.direction) {
                         (DataLane::Realtime, DataTrackDirection::Publish) => {
-                            events.publish_sctp(ch.topic.clone(), data.data.to_vec());
+                            events.publish_sctp(
+                                ch.topic.clone(),
+                                self.data_pub_streams.get(&data.id).copied(),
+                                data.data.to_vec(),
+                            );
                         }
                         (DataLane::Reliable, DataTrackDirection::Publish) => {
-                            events.publish_reliable_sctp(ch.topic.clone(), data.data.to_vec());
+                            events.publish_reliable_sctp(
+                                ch.topic.clone(),
+                                self.reliable_pub_streams.get(&data.id).copied(),
+                                data.data.to_vec(),
+                            );
                         }
                         (DataLane::Reliable, DataTrackDirection::Subscribe) => {
                             debug_assert!(ch.scope.is_none());
@@ -1239,6 +1299,7 @@ impl ParticipantCore {
                 rid,
                 upstream_slot,
                 track_id,
+                fanout: self.published_track_fanouts.get(&track_id).copied(),
             };
             self.incoming_rtp_routes
                 .retain(|_, cached| cached.mid != mid || cached.rid != rid);
@@ -1262,7 +1323,7 @@ impl ParticipantCore {
             sr,
         ) {
             let stream_id: StreamId = (route.track_id, route.rid);
-            events.publish_rtp(stream_id, rtp);
+            events.publish_rtp(stream_id, route.fanout, rtp);
         } else {
             self.incoming_rtp_routes.remove(&ssrc);
         }

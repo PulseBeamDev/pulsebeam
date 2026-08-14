@@ -7,6 +7,7 @@ use pulsebeam_runtime::net::RecvPacketBatch;
 use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use slotmap::{SlotMap, new_key_type};
 
+use crate::shard::router::RoomKey;
 use crate::{
     entity::ParticipantId,
     id::ShardId,
@@ -39,6 +40,10 @@ pub(crate) struct ParticipantMeta {
     /// reached separately, so both need the value.
     pub(super) ingress_route: TransportRoute,
     pub(super) ingress_epoch: u16,
+    /// This participant's room, already compiled. Set when it joins, so
+    /// nothing on the packet path hashes a `RoomId` to find the fanout it
+    /// belongs to.
+    pub(super) room_key: RoomKey,
 }
 
 impl Deref for ParticipantMeta {
@@ -147,6 +152,9 @@ impl ParticipantRegistry {
             queued_dirty: false,
             ingress_route,
             ingress_epoch,
+            // Filled in by `join_room` once the room's arena entry exists,
+            // which is a step later than this one.
+            room_key: RoomKey::default(),
         });
         tracing::info!(%participant_id, "participant added to shard");
     }
@@ -158,6 +166,17 @@ impl ParticipantRegistry {
         let key = self.reserve(cfg.participant_id);
         self.populate(key, cfg, rng);
         key
+    }
+
+    /// Record the room this participant joined, already compiled. The room's
+    /// arena entry is created after `populate`, so this is a second step
+    /// rather than a constructor argument.
+    pub fn join_room(&mut self, key: ParticipantKey, room_key: RoomKey) {
+        let Some(Some(meta)) = self.participants.get_mut(key) else {
+            debug_assert!(false, "join_room called on a key with no participant");
+            return;
+        };
+        meta.room_key = room_key;
     }
 
     /// Free a reservation that never got to `populate` — negotiation failed,

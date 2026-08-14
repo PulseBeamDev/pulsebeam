@@ -1,5 +1,6 @@
 use crate::entity::{ParticipantId, TrackId};
 use crate::rtp::RtpPacket;
+use crate::shard::router::{DataStreamKey, LocalTrackKey, ReliableStreamKey};
 use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
 
 pub trait ParticipantSink {
@@ -28,14 +29,19 @@ pub trait ParticipantSink {
     fn request_keyframe(&mut self, layer: &TrackLayer);
     fn exit(&mut self);
 
-    fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket);
-    fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>);
+    fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<LocalTrackKey>, pkt: RtpPacket);
+    fn publish_sctp(&mut self, topic: Topic, stream: Option<DataStreamKey>, pkt: Vec<u8>);
 
     fn publish_reliable_data_topic(&mut self, topic: Topic);
     fn unpublish_reliable_data_topic(&mut self, topic: Topic);
     fn subscribe_reliable_data_topic(&mut self, topic: Topic);
     fn unsubscribe_reliable_data_topic(&mut self, topic: Topic);
-    fn publish_reliable_sctp(&mut self, topic: Topic, frame: Vec<u8>);
+    fn publish_reliable_sctp(
+        &mut self,
+        topic: Topic,
+        stream: Option<ReliableStreamKey>,
+        frame: Vec<u8>,
+    );
     fn forward_reliable_control(&mut self, publisher: ParticipantId, topic: Topic, bytes: Vec<u8>);
 }
 
@@ -128,11 +134,16 @@ pub mod test_utils {
             self.exit_count = self.exit_count.saturating_add(1);
         }
 
-        fn publish_rtp(&mut self, stream_id: StreamId, _pkt: RtpPacket) {
+        fn publish_rtp(
+            &mut self,
+            stream_id: StreamId,
+            _fanout: Option<LocalTrackKey>,
+            _pkt: RtpPacket,
+        ) {
             self.publish_rtp_calls.push(stream_id);
         }
 
-        fn publish_sctp(&mut self, topic: Topic, _pkt: Vec<u8>) {
+        fn publish_sctp(&mut self, topic: Topic, _stream: Option<DataStreamKey>, _pkt: Vec<u8>) {
             self.publish_sctp_calls.push(topic);
         }
 
@@ -140,7 +151,13 @@ pub mod test_utils {
         fn unpublish_reliable_data_topic(&mut self, _topic: Topic) {}
         fn subscribe_reliable_data_topic(&mut self, _topic: Topic) {}
         fn unsubscribe_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn publish_reliable_sctp(&mut self, _topic: Topic, _frame: Vec<u8>) {}
+        fn publish_reliable_sctp(
+            &mut self,
+            _topic: Topic,
+            _stream: Option<ReliableStreamKey>,
+            _frame: Vec<u8>,
+        ) {
+        }
         fn forward_reliable_control(
             &mut self,
             _publisher: ParticipantId,
