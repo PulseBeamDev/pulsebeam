@@ -1,4 +1,4 @@
-use crate::classify::{self, ClientVerdict, DropReason, NodeVerdict};
+use crate::classify::{self, DropReason, NodeVerdict};
 
 pub const MAX_SHARDS: u32 = 1024;
 pub const MAX_FLOWS: u32 = 131_072;
@@ -34,59 +34,72 @@ pub struct FlowKey {
     pub _pad: [u8; 3],
 }
 
-const _: () = assert!(core::mem::size_of::<FlowKey>() == 40);
+/// The wire length of a [`FlowKey`]. Named so the copy helper and the layout
+/// assertion cannot drift apart.
+pub const FLOW_KEY_LEN: usize = 40;
+
+const _: () = assert!(core::mem::size_of::<FlowKey>() == FLOW_KEY_LEN);
+
+impl FlowKey {
+    /// The key as the kernel map sees it.
+    ///
+    /// Written with checked slice ranges rather than indexing: this crate
+    /// compiles into a BPF program, where an out-of-range write is not a panic
+    /// but a verifier rejection at load time. The offsets are fixed and pinned
+    /// by `flow_key_layout_is_stable`; writing them this way means a slip is a
+    /// failed test rather than an unloadable program.
+    pub fn to_ne_bytes(self) -> [u8; FLOW_KEY_LEN] {
+        let mut bytes = [0u8; FLOW_KEY_LEN];
+        let mut write = |offset: usize, source: &[u8]| {
+            if let Some(target) = bytes.get_mut(offset..offset.saturating_add(source.len())) {
+                target.copy_from_slice(source);
+            } else {
+                debug_assert!(
+                    false,
+                    "FlowKey field at {offset} lies outside its own layout"
+                );
+            }
+        };
+        write(0, &self.src_addr);
+        write(16, &self.dst_addr);
+        write(32, &self.src_port.to_ne_bytes());
+        write(34, &self.dst_port.to_ne_bytes());
+        write(36, &[self.is_ipv6]);
+        bytes
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Verdict {
-    Pass { shard: u16 },
+    Select { shard: u16 },
+    Pass,
     Drop(DropReason),
 }
 
 pub trait SteerEnv {
     fn flow_lookup(&self, flow: FlowKey) -> Option<u16>;
-    fn flow_insert(&mut self, flow: FlowKey, shard: u16);
     fn bump(&mut self, counter: u32);
 }
 
 pub fn steer_client<E: SteerEnv>(
     env: &mut E,
-    payload: &[u8],
     flow: FlowKey,
-    cluster_id: u16,
-    node_id: u16,
     shard_count: u16,
     max_shards: u32,
 ) -> Verdict {
-    match classify::classify_client_for_node(payload, cluster_id, node_id, shard_count) {
-        ClientVerdict::Bootstrap { handle, .. } => {
-            let shard = handle.route.shard();
-            if u32::from(shard) >= max_shards {
-                env.bump(counters::INVALID_SHARD);
-                return Verdict::Drop(DropReason::InvalidShard);
-            }
-            env.flow_insert(flow, shard);
-            Verdict::Pass { shard }
-        }
-        ClientVerdict::Established => match env.flow_lookup(flow) {
-            Some(shard) if u32::from(shard) >= max_shards => {
-                env.bump(counters::INVALID_SHARD);
-                Verdict::Drop(DropReason::InvalidShard)
-            }
-            Some(shard) if shard >= shard_count => {
-                env.bump(counters::STALE_ROUTE);
-                Verdict::Drop(DropReason::StaleRoute)
-            }
-            Some(shard) => Verdict::Pass { shard },
-            None => {
-                env.bump(counters::UNKNOWN_FLOW);
-                Verdict::Drop(DropReason::UnknownFlow)
-            }
-        },
-        ClientVerdict::Drop(reason) => {
-            env.bump(drop_counter(reason));
-            Verdict::Drop(reason)
-        }
+    let Some(shard) = env.flow_lookup(flow) else {
+        env.bump(counters::UNKNOWN_FLOW);
+        return Verdict::Pass;
+    };
+    if u32::from(shard) >= max_shards {
+        env.bump(counters::INVALID_SHARD);
+        return Verdict::Pass;
     }
+    if shard >= shard_count {
+        env.bump(counters::STALE_ROUTE);
+        return Verdict::Pass;
+    }
+    Verdict::Select { shard }
 }
 
 pub fn steer_node<E: SteerEnv>(
@@ -96,7 +109,7 @@ pub fn steer_node<E: SteerEnv>(
     max_shards: u32,
 ) -> Verdict {
     match classify::classify_node(payload, shard_count) {
-        NodeVerdict::Steer { shard } if u32::from(shard) < max_shards => Verdict::Pass { shard },
+        NodeVerdict::Steer { shard } if u32::from(shard) < max_shards => Verdict::Select { shard },
         NodeVerdict::Steer { .. } => {
             env.bump(counters::INVALID_SHARD);
             Verdict::Drop(DropReason::InvalidShard)
@@ -128,11 +141,11 @@ pub const fn drop_counter(reason: DropReason) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{Envelope, EnvelopeType};
-    use crate::ufrag::IceUfrag;
-    use crate::{RouteId, TransportRoute};
+    use crate::{
+        RouteId,
+        envelope::{Envelope, EnvelopeType},
+    };
     use std::collections::HashMap;
-    use std::vec::Vec;
 
     #[derive(Default)]
     struct Env {
@@ -143,55 +156,6 @@ mod tests {
     impl SteerEnv for Env {
         fn flow_lookup(&self, flow: FlowKey) -> Option<u16> {
             self.flows.get(&flow).copied()
-        }
-
-        fn flow_insert(&mut self, flow: FlowKey, shard: u16) {
-            self.flows.insert(flow, shard);
-        }
-
-        fn bump(&mut self, counter: u32) {
-            let Some(value) = self.counters.get_mut(counter as usize) else {
-                panic!("counter index out of bounds");
-            };
-            *value += 1;
-        }
-    }
-
-    struct KernelAdapter(Env);
-
-    struct SimulatorAdapter {
-        flows: Vec<(FlowKey, u16)>,
-        counters: [u32; counters::COUNT as usize],
-    }
-
-    impl SteerEnv for KernelAdapter {
-        fn flow_lookup(&self, flow: FlowKey) -> Option<u16> {
-            self.0.flow_lookup(flow)
-        }
-
-        fn flow_insert(&mut self, flow: FlowKey, shard: u16) {
-            self.0.flow_insert(flow, shard);
-        }
-
-        fn bump(&mut self, counter: u32) {
-            self.0.bump(counter);
-        }
-    }
-
-    impl SteerEnv for SimulatorAdapter {
-        fn flow_lookup(&self, flow: FlowKey) -> Option<u16> {
-            self.flows
-                .iter()
-                .find_map(|(known, shard)| (*known == flow).then_some(*shard))
-        }
-
-        fn flow_insert(&mut self, flow: FlowKey, shard: u16) {
-            if let Some((_, known_shard)) = self.flows.iter_mut().find(|(known, _)| *known == flow)
-            {
-                *known_shard = shard;
-            } else {
-                self.flows.push((flow, shard));
-            }
         }
 
         fn bump(&mut self, counter: u32) {
@@ -213,48 +177,42 @@ mod tests {
         }
     }
 
-    fn stun_for(cluster: u16, node: u16, shard: u16) -> Vec<u8> {
-        let ufrag = IceUfrag::new(cluster, node, TransportRoute::new(shard, 9), 1);
-        let mut username = Vec::from(ufrag.encode_ascii());
-        username.extend_from_slice(b":peer");
-        let padded = (username.len() + 3) & !3;
-        let mut packet = Vec::with_capacity(20 + 4 + padded);
-        packet.extend_from_slice(&1u16.to_be_bytes());
-        packet.extend_from_slice(&u16::try_from(4 + padded).unwrap().to_be_bytes());
-        packet.extend_from_slice(&crate::stun::MAGIC_COOKIE.to_be_bytes());
-        packet.extend_from_slice(&[0; 12]);
-        packet.extend_from_slice(&6u16.to_be_bytes());
-        packet.extend_from_slice(&u16::try_from(username.len()).unwrap().to_be_bytes());
-        packet.extend_from_slice(&username);
-        packet.resize(20 + 4 + padded, 0);
-        packet
-    }
-
-    fn stun(shard: u16) -> Vec<u8> {
-        stun_for(3, 5, shard)
-    }
-
     #[test]
-    fn client_reclassifies_bootstrap_before_flow_lookup() {
+    fn client_miss_falls_through_without_selecting_or_dropping() {
         let mut env = Env::default();
-        let flow = flow(1);
         assert_eq!(
-            steer_client(&mut env, &stun(1), flow, 3, 5, 4, MAX_SHARDS),
-            Verdict::Pass { shard: 1 }
+            steer_client(&mut env, flow(1), 4, MAX_SHARDS),
+            Verdict::Pass
         );
-        assert_eq!(
-            steer_client(&mut env, &stun(3), flow, 3, 5, 4, MAX_SHARDS),
-            Verdict::Pass { shard: 3 }
-        );
-        assert_eq!(env.flow_lookup(flow), Some(3));
-    }
-
-    #[test]
-    fn established_unknown_flow_is_counted_and_dropped() {
-        let mut env = Env::default();
-        let verdict = steer_client(&mut env, b"media", flow(2), 3, 5, 4, MAX_SHARDS);
-        assert!(matches!(verdict, Verdict::Drop(_)));
         assert_eq!(env.counters[counters::UNKNOWN_FLOW as usize], 1);
+    }
+
+    #[test]
+    fn client_hit_selects_only_a_current_shard() {
+        let mut env = Env::default();
+        env.flows.insert(flow(1), 2);
+        assert_eq!(
+            steer_client(&mut env, flow(1), 4, MAX_SHARDS),
+            Verdict::Select { shard: 2 }
+        );
+    }
+
+    #[test]
+    fn stale_and_invalid_hits_also_fall_through() {
+        let mut env = Env::default();
+        env.flows.insert(flow(1), 4);
+        assert_eq!(
+            steer_client(&mut env, flow(1), 4, MAX_SHARDS),
+            Verdict::Pass
+        );
+        env.flows
+            .insert(flow(1), u16::try_from(MAX_SHARDS).unwrap());
+        assert_eq!(
+            steer_client(&mut env, flow(1), 4, MAX_SHARDS),
+            Verdict::Pass
+        );
+        assert_eq!(env.counters[counters::STALE_ROUTE as usize], 1);
+        assert_eq!(env.counters[counters::INVALID_SHARD as usize], 1);
     }
 
     #[test]
@@ -269,34 +227,8 @@ mod tests {
         .encode();
         assert_eq!(
             steer_node(&mut env, &envelope, 4, 3),
-            Verdict::Drop(crate::classify::DropReason::InvalidShard)
+            Verdict::Drop(DropReason::InvalidShard)
         );
         assert_eq!(env.counters[counters::INVALID_SHARD as usize], 1);
-    }
-
-    #[test]
-    fn kernel_and_simulator_adapters_make_identical_decisions() {
-        let mut kernel = KernelAdapter(Env::default());
-        let mut simulator = SimulatorAdapter {
-            flows: Vec::new(),
-            counters: [0; counters::COUNT as usize],
-        };
-        let sequence = [
-            (stun(1), flow(1)),
-            (b"media".to_vec(), flow(1)),
-            (stun_for(9, 5, 1), flow(2)),
-            (stun_for(3, 9, 1), flow(3)),
-            (stun(99), flow(4)),
-            (std::vec![0; 20], flow(5)),
-            (stun(2), flow(1)),
-            (b"media".to_vec(), flow(99)),
-        ];
-        for (payload, flow) in sequence {
-            let kernel_verdict = steer_client(&mut kernel, &payload, flow, 3, 5, 4, MAX_SHARDS);
-            let simulator_verdict =
-                steer_client(&mut simulator, &payload, flow, 3, 5, 4, MAX_SHARDS);
-            assert_eq!(kernel_verdict, simulator_verdict);
-            assert_eq!(kernel.0.counters, simulator.counters);
-        }
     }
 }

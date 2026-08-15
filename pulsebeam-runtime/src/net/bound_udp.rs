@@ -1,11 +1,21 @@
 use super::{UdpMode, UnifiedSocket, bind_scalar_socket, udp, udp_scalar};
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::SocketAddr,
+    os::fd::{AsFd, BorrowedFd},
+};
 
 pub struct BoundUdpSocket {
     socket: socket2::Socket,
     mode: UdpMode,
     external_addr: Option<SocketAddr>,
     local_addr: SocketAddr,
+}
+
+impl AsFd for BoundUdpSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
 }
 
 impl BoundUdpSocket {

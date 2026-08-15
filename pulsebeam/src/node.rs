@@ -224,6 +224,7 @@ impl NodeBuilder {
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let workers_count = self.workers;
+
         // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
         // both IPv6 and IPv4 peers.
         let local_addr = self
@@ -314,6 +315,9 @@ impl NodeBuilder {
         )
         .await?;
 
+        #[cfg(not(feature = "sim"))]
+        let steering = crate::ebpf::attach(&udp_sockets)?;
+
         let tcp_listener = bind_tcp_listener(local_addr)
             .await
             .context("binding tcp listener")?;
@@ -371,9 +375,6 @@ impl NodeBuilder {
         })?;
 
         let controller_rng = rand::Rng::seed_from_u64(rng.next_u64());
-        let shard_rngs: Vec<rand::Rng> = (0..udp_sockets.len())
-            .map(|_| rand::Rng::seed_from_u64(rng.next_u64()))
-            .collect();
 
         // One NTP<->Instant anchor for the whole node: read the wall clock once,
         // here, so every shard shares a timeline and nothing reads it again.
@@ -395,11 +396,10 @@ impl NodeBuilder {
 
         let mut view_writers = Vec::with_capacity(workers_count);
 
-        for (shard_idx, (((udp_sock, tcp_sock), frame_rx), shard_rng)) in udp_sockets
+        for (shard_idx, ((udp_sock, tcp_sock), frame_rx)) in udp_sockets
             .into_iter()
             .zip(tcp_sockets.into_iter())
             .zip(frame_rxs)
-            .zip(shard_rngs)
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
@@ -429,7 +429,6 @@ impl NodeBuilder {
                     frame_txs,
                     worker_occupancy,
                     shard_stats_tx,
-                    shard_rng,
                     wall_anchor,
                 );
                 join_set.spawn_local(ignore(shard.run()));
@@ -463,7 +462,12 @@ impl NodeBuilder {
                                         "shard {shard_id} cannot build its runtime: {err}"
                                     )
                                 });
-                            tune_current_data_thread(core_id);
+                            let realtime = tune_current_data_thread(core_id);
+                            metrics::gauge!(
+                                "shard_realtime",
+                                "shard" => shard_id.index().to_string()
+                            )
+                            .set(f64::from(realtime));
                             #[allow(
                                 clippy::disallowed_methods,
                                 reason = "the shard's dedicated OS thread enters its async runtime exactly once, here"
@@ -486,7 +490,6 @@ impl NodeBuilder {
                                     frame_txs,
                                     worker_occupancy,
                                     shard_stats_tx,
-                                    shard_rng,
                                     wall_anchor,
                                 );
                                 tokio::task::unconstrained(shard.run()).await;
@@ -530,6 +533,12 @@ impl NodeBuilder {
             self.room_placement,
             view_writers,
         );
+        #[cfg(not(feature = "sim"))]
+        let mut controller = controller;
+        #[cfg(not(feature = "sim"))]
+        if let Some(steering) = steering {
+            controller.set_steering(steering);
+        }
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);
@@ -722,7 +731,7 @@ pub fn tune_current_control_thread() {
     }
 }
 
-pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
+pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) -> bool {
     #[cfg(target_os = "linux")]
     {
         use rustix::thread::{current_timer_slack, set_current_timer_slack};
@@ -735,16 +744,18 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
         let current_thread_id = thread_native_id();
         let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
         let priority = ThreadPriority::from_posix(ScheduleParams { sched_priority: 50 });
-        if let Err(e) =
+        let realtime = if let Err(e) =
             thread_priority::set_thread_priority_and_policy(current_thread_id, priority, policy)
         {
             tracing::warn!(
                 "Failed to set Data Thread to SCHED_FIFO at priority 50 (requires CAP_SYS_NICE): {:?}",
                 e
             );
+            false
         } else {
             tracing::info!("Data thread successfully elevated to SCHED_FIFO (Priority 50)");
-        }
+            true
+        };
 
         // attempt to get closer to SCHED_FIFO without CAP_SYS_ADMIN
         let slack_value = NonZero::new(1);
@@ -764,6 +775,13 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
                 tracing::warn!(?core, "Failed to pin Data thread to CPU core");
             }
         }
+        realtime
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core_id;
+        false
     }
 }
 

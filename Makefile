@@ -55,7 +55,8 @@ test-sim-seed:
 
 # bpfel-unknown-none has no precompiled std, so it always needs nightly plus
 # `-Z build-std=core` — `rustup target add` cannot install it, tier-3 targets
-# ship no prebuilt sysroot.
+# ship no prebuilt sysroot. pulsebeam-ebpf/build.rs resolves and caches
+# bpf-linker, so no separate linker installation is needed.
 build-ebpf:
 	$(CARGO_CMD) +nightly build -Z build-std=core --target bpfel-unknown-none -p pulsebeam-ebpf --release
 

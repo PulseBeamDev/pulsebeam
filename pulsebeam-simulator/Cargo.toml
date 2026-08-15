@@ -16,6 +16,7 @@ workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 bytes = "1"
+fastrand.workspace = true
 ctor = "1.0.10"
 futures = "0.3.32"
 http = "1.4.1"

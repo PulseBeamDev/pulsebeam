@@ -1,16 +1,15 @@
 # PulseBeam server: Linux-only
 
-The server's UDP steering path is Aya/eBPF attached to a `SO_REUSEPORT`
-group (`BPF_PROG_TYPE_SK_REUSEPORT` selecting a socket via
-`SO_ATTACH_REUSEPORT_EBPF`). There is no non-Linux fallback, and none should
-be added — a "portable" code path here would silently stop doing the thing
-this crate exists to do.
+The server's preferred UDP steering path is Aya/eBPF attached to a
+`SO_REUSEPORT` group (`BPF_PROG_TYPE_SK_REUSEPORT` selecting a socket via
+`SO_ATTACH_REUSEPORT_EBPF`). Userspace forwarding remains the correctness
+fallback for bootstrap and for hosts where the object is absent.
 
-## Apply this compile-time gate
+## Compile-time gate
 
-This snippet needs to land in `pulsebeam/src/lib.rs`, near the top of the
-file (before any other item), by whoever owns that file — it is intentionally
-not applied here because `pulsebeam/src/**` is out of scope for this change.
+The gate is already present in `pulsebeam/src/lib.rs`, before the server
+modules. Portable protocol, core, and simulator crates remain buildable on
+other targets; the server crate fails immediately there.
 
 ```rust
 #[cfg(not(target_os = "linux"))]
@@ -60,9 +59,10 @@ rather than partway through name resolution.
   of this one program type that is easy to invalidate with an unrelated
   future BPF program. Do not grant `CAP_SYS_ADMIN` on a 5.8+ kernel — it is
   strictly broader than what the loader needs.
-- A missing or insufficient capability must fail the Linux server startup
-  path explicitly (a rejected `bpf()` syscall surfaced as a startup error),
-  not silently fall back to a non-eBPF steering path.
+- A missing eBPF object uses the userspace forwarding path. If an object is
+  present but a capability or verifier error prevents loading or attaching it,
+  startup fails explicitly rather than claiming that steering is active. The
+  attached state is exported as a metric.
 
 ## CI mapping
 
@@ -76,21 +76,30 @@ rather than partway through name resolution.
   a kernel/capability failure there can never mask or be masked by an
   ordinary compile/test failure.
 
-## Building `bpf-linker`
+## Building the eBPF program
 
-`cargo install bpf-linker --locked` against a stock LLVM does **not** work, and
-the failure is not a missing header or a permissions problem. bpf-linker 0.11.0
-links `LLVMParseIRInContext2`, which stock LLVM does not export — Aya carries a
-patched LLVM and ships prebuilt binaries for this reason, and the crate's own
-build script warns that `cargo install` is not the supported path.
+The eBPF package owns its Cargo configuration. From the repository root, both
+of these commands build the same `bpfel-unknown-none` release artifact:
 
-Verified here against LLVM 21.1.8: the build gets all the way to linking and
-fails with `rust-lld: error: undefined symbol: LLVMParseIRInContext2`. Setting
-`LLVM_SYS_211_PREFIX` does not help; it selects which LLVM is used, not which
-symbols it has.
+```sh
+make build-ebpf
+(cd pulsebeam-ebpf && cargo build --release)
+```
 
-So CI must install bpf-linker from Aya's prebuilt release rather than building
-it, and `make build-ebpf` cannot run on a machine that only has a distribution
-LLVM. `cargo check -p pulsebeam-ebpf` (host target) still compiles the program
-and its use of the shared classifier, which is the part worth gating on every
-change; it just does not run the BPF verifier.
+The package-local `rust-toolchain.toml` selects nightly with `rust-src`, and
+`.cargo/config.toml` selects the target and `build-std = ["core"]`. The package
+build script resolves `bpf-linker` automatically only for that BPF target:
+
+1. `BPF_LINKER`, when set;
+2. an executable `bpf-linker` already on `PATH`;
+3. Aya's pinned prebuilt `bpf-linker` 0.11.0 release for the host platform.
+
+Downloaded archives are SHA-256 checked and cached below Cargo's target
+directory, so subsequent builds need no network access. The automatic release
+path currently supports Linux x86_64/aarch64 and macOS x86_64/aarch64. Other
+hosts can use `BPF_LINKER=/path/to/bpf-linker`. A first download needs `curl`
+and a `tar` with zstd support.
+
+Host-target checks such as `cargo check -p pulsebeam-ebpf` do not resolve or
+download the linker; they compile the shared classifier without running the BPF
+verifier.

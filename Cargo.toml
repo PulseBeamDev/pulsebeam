@@ -28,6 +28,7 @@ aya = "0.14.0"
 aya-ebpf = "0.2.1"
 bytes = "1.11.1"
 derive_more = { version = "2.1.1", features = ["full"] }
+fastrand = "2.3.0"
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"
 rand = "0.10.1"

@@ -52,31 +52,19 @@ jobs:
     - name: Install nightly for eBPF build-std
       if: hashFiles('pulsebeam-ebpf/Cargo.toml') != ''
       run: rustup toolchain install nightly --component rust-src --profile minimal
-    - name: Cache bpf-linker
-      if: hashFiles('pulsebeam-ebpf/Cargo.toml') != ''
-      id: bpf-linker-cache
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/bpf-linker
-        key: bpf-linker-${{ runner.os }}-0.11.0
-    - name: Install bpf-linker
-      if: hashFiles('pulsebeam-ebpf/Cargo.toml') != '' && steps.bpf-linker-cache.outputs.cache-hit != 'true'
-      run: cargo install bpf-linker --locked --version 0.11.0
     - name: Build eBPF program
       if: hashFiles('pulsebeam-ebpf/Cargo.toml') != ''
       run: make build-ebpf
       env:
         CARGO_TERM_COLOR: always
 
-  # eBPF attach/load needs CAP_BPF/CAP_NET_ADMIN, which the normal `build` job
-  # does not have and should not gain — a runner with more privilege than the
-  # thing it's testing needs would hide a permissions bug the rest of CI can't
-  # see. Kept as its own job so a kernel/capability failure here never masks a
-  # semantic test failure in `build`, and vice versa.
+  # eBPF attach/load needs elevated kernel privileges, which the normal `build`
+  # job does not have and should not gain. Keep the behavioural smoke test in
+  # its own job so capability failures remain distinct from build failures.
   ebpf-smoke:
     runs-on: ubuntu-latest
     needs: build
-    if: hashFiles('pulsebeam-ebpf/Cargo.toml') != '' && hashFiles('pulsebeam-routing/Cargo.toml') != ''
+    if: hashFiles('pulsebeam-ebpf/Cargo.toml') != '' && hashFiles('pulsebeam/Cargo.toml') != ''
     continue-on-error: false
     steps:
     - uses: actions/checkout@v5
@@ -85,22 +73,11 @@ jobs:
       uses: mozilla-actions/sccache-action@v0.0.10
     - name: Install nightly for eBPF build-std
       run: rustup toolchain install nightly --component rust-src --profile minimal
-    - name: Cache bpf-linker
-      id: bpf-linker-cache
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/bpf-linker
-        key: bpf-linker-${{ runner.os }}-0.11.0
-    - name: Install bpf-linker
-      if: steps.bpf-linker-cache.outputs.cache-hit != 'true'
-      run: cargo install bpf-linker --locked --version 0.11.0
     - name: Build eBPF program
       run: make build-ebpf
-    # Kernel-privileged attach/load tests are expected to be marked #[ignore]
-    # so the unprivileged `build` job's normal `cargo test` run skips them;
-    # this job is the one place `--ignored` runs them, under sudo for
-    # CAP_BPF/CAP_NET_ADMIN.
+    # The test is ignored in ordinary builds because it needs a real kernel
+    # eBPF attach; this job is the privileged execution path.
     - name: Attach/load smoke test (privileged)
-      run: sudo -E env "PATH=$PATH" cargo test -p pulsebeam-routing --release -- --ignored --test-threads=1
+      run: sudo -E env "PATH=$PATH" cargo test -p pulsebeam --lib ebpf::tests::loader_attaches_to_a_reuseport_group --release -- --ignored --test-threads=1
       env:
         CARGO_TERM_COLOR: always

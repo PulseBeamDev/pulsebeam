@@ -5,7 +5,11 @@ use pulsebeam_routing::steer::{self, FlowKey, SteerEnv, Verdict};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
-use std::{io, net::SocketAddr};
+use std::sync::{Mutex, OnceLock};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+};
 
 pub struct BoundUdpSocket {
     socket: udp_scalar::UdpTransport,
@@ -45,6 +49,24 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "one-shot simulator control must cross turmoil host threads; it is not shard state"
+)]
+fn wrong_owner_injection_state() -> &'static Mutex<Option<IpAddr>> {
+    static STATE: OnceLock<Mutex<Option<IpAddr>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn wrong_owner_injection_state_enabled() -> Option<IpAddr> {
+    // A poisoned lock means a test thread panicked while holding it; that test
+    // is already failing, and steering must not take the process down with it.
+    match wrong_owner_injection_state().lock() {
+        Ok(state) => *state,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
 /// One member's queue of datagrams the group has already decided belong to it.
 #[derive(Default)]
 struct Inbox {
@@ -80,6 +102,7 @@ impl FlowTable {
     /// simply misses here and falls back through STUN bootstrap again — the
     /// old tuple's entry is left to age out rather than actively cleared,
     /// matching a kernel map that has no rebind signal either.
+    #[cfg(test)]
     fn insert(&mut self, tuple: FlowTuple, member: u16) {
         if self.members.insert(tuple, member).is_some() {
             self.arrival_order.retain(|known| *known != tuple);
@@ -108,8 +131,6 @@ impl FlowTable {
 /// delivery are pure bookkeeping over `(cluster_id, node_id)`, a bounded flow
 /// table, and one queue per shard.
 struct SimSteering {
-    cluster_id: u16,
-    node_id: u16,
     /// Indexed by shard index, not join order. A slot is `None` until that
     /// shard's socket has bound.
     inboxes: RefCell<Vec<Option<Inbox>>>,
@@ -124,9 +145,8 @@ struct SimSteering {
 
 impl SimSteering {
     fn new(cluster_id: u16, node_id: u16) -> Self {
+        let _ = (cluster_id, node_id);
         Self {
-            cluster_id,
-            node_id,
             inboxes: RefCell::new(Vec::new()),
             flow_table: RefCell::new(FlowTable::default()),
             counters: RefCell::new([0; steer::counters::COUNT as usize]),
@@ -164,30 +184,21 @@ impl SimSteering {
         }
     }
 
-    /// Resolve the member a datagram belongs to, without delivering it.
-    /// `None` means the packet is dropped: an unknown tuple with no valid
-    /// STUN bootstrap, exactly as an unrecognized flow with no matching
-    /// kernel map entry is dropped rather than guessed at.
-    fn classify(&self, tuple: FlowTuple, payload: &[u8], shard_count: u16) -> Option<usize> {
+    /// Resolve the member a datagram belongs to, without delivering it. A
+    /// known flow is selected from the map; a miss follows the socket group's
+    /// ordinary tuple hash so userspace can perform bootstrap classification.
+    fn classify(&self, tuple: FlowTuple, _payload: &[u8], shard_count: u16) -> Option<usize> {
         let mut env = SimSteerEnv {
             flow_table: &self.flow_table,
             counters: &self.counters,
         };
-        let verdict = steer::steer_client(
-            &mut env,
-            payload,
-            tuple,
-            self.cluster_id,
-            self.node_id,
-            shard_count,
-            steer::MAX_SHARDS,
-        );
+        let verdict = steer::steer_client(&mut env, tuple, shard_count, steer::MAX_SHARDS);
         match verdict {
-            Verdict::Pass { shard } => {
+            Verdict::Select { shard } => {
                 env.bump(steer::counters::SELECTED);
                 Some(usize::from(shard))
             }
-            Verdict::Drop(_) => None,
+            Verdict::Pass | Verdict::Drop(_) => Some(default_member(tuple, shard_count)),
         }
     }
 
@@ -198,11 +209,15 @@ impl SimSteering {
             counters: &self.counters,
         };
         match steer::steer_node(&mut env, payload, shard_count, steer::MAX_SHARDS) {
-            Verdict::Pass { shard } => {
+            Verdict::Select { shard } => {
                 env.bump(steer::counters::SELECTED);
                 Some(usize::from(shard))
             }
-            Verdict::Drop(_) => None,
+            // A node-lane datagram the program will not steer is not
+            // delivered here either: `Pass` means "no opinion", and there is no
+            // default hash to fall back to on this lane the way there is for
+            // clients.
+            Verdict::Pass | Verdict::Drop(_) => None,
         }
     }
 
@@ -230,11 +245,15 @@ impl SimSteering {
             return;
         };
 
-        if self.wrong_owner_injection.get()
-            && members > 1
-            && pulsebeam_routing::stun::is_stun(&payload)
+        if members > 1
+            && (self.wrong_owner_injection.get()
+                || wrong_owner_injection_state_enabled().is_some_and(|source| source == src.ip()))
         {
             self.wrong_owner_injection.set(false);
+            match wrong_owner_injection_state().lock() {
+                Ok(mut state) => *state = None,
+                Err(poisoned) => *poisoned.into_inner() = None,
+            }
             idx = idx.saturating_add(1).checked_rem(members).unwrap_or(0);
         }
 
@@ -255,12 +274,11 @@ impl SimSteering {
     }
 }
 
-pub fn set_wrong_owner_injection(enabled: bool) {
-    REUSEPORT_GROUPS.with(|groups| {
-        for group in groups.borrow().values().filter_map(Weak::upgrade) {
-            group.steering.set_wrong_owner_injection(enabled);
-        }
-    });
+pub fn set_wrong_owner_injection(source: IpAddr) {
+    match wrong_owner_injection_state().lock() {
+        Ok(mut state) => *state = Some(source),
+        Err(poisoned) => *poisoned.into_inner() = Some(source),
+    }
 }
 
 struct SimSteerEnv<'a> {
@@ -273,10 +291,6 @@ impl SteerEnv for SimSteerEnv<'_> {
         self.flow_table.borrow_mut().get(flow)
     }
 
-    fn flow_insert(&mut self, flow: FlowKey, shard: u16) {
-        self.flow_table.borrow_mut().insert(flow, shard);
-    }
-
     fn bump(&mut self, counter: u32) {
         let mut counters = self.counters.borrow_mut();
         let Some(value) = counters.get_mut(counter as usize) else {
@@ -285,6 +299,24 @@ impl SteerEnv for SimSteerEnv<'_> {
         };
         *value = value.saturating_add(1);
     }
+}
+
+fn default_member(flow: FlowKey, shard_count: u16) -> usize {
+    debug_assert!(shard_count > 0);
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in flow.src_addr.iter().chain(flow.dst_addr.iter()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= u64::from(flow.src_port);
+    hash = hash.wrapping_mul(0x100000001b3);
+    hash ^= u64::from(flow.dst_port);
+    hash = hash.wrapping_mul(0x100000001b3);
+    hash ^= u64::from(flow.is_ipv6);
+    // `shard_count` is the number of bound sockets, so it is never zero here;
+    // the guard keeps the modulo total rather than trusting that at a distance.
+    let members = u64::from(shard_count).max(1);
+    usize::try_from(hash.checked_rem(members).unwrap_or(0)).unwrap_or(0)
 }
 
 fn flow_key(src: SocketAddr, dst: SocketAddr) -> FlowKey {
@@ -482,8 +514,8 @@ pub async fn bind_udp_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsebeam_routing::TransportRoute;
-    use pulsebeam_routing::ufrag::IceUfrag;
+    use pulsebeam_routing::RouteId;
+    use pulsebeam_routing::envelope::{Envelope, EnvelopeType};
 
     fn addr(port: u16) -> SocketAddr {
         format!("192.168.1.10:{port}").parse().unwrap()
@@ -501,279 +533,43 @@ mod tests {
         steering
     }
 
-    const BINDING_REQUEST: u16 = 0x0001;
-    const MAGIC_COOKIE_BYTES: [u8; 4] = pulsebeam_routing::stun::MAGIC_COOKIE.to_be_bytes();
-    const USERNAME_ATTRIBUTE_TYPE: u16 = 0x0006;
-    const MIN_STUN_HEADER_SIZE: usize = 20;
-
-    fn build_stun_with_username(value: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(64);
-        buf.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-        buf.extend_from_slice(&[0u8; 2]);
-        buf.extend_from_slice(&MAGIC_COOKIE_BYTES);
-        buf.extend_from_slice(&[0u8; 12]);
-        assert_eq!(buf.len(), MIN_STUN_HEADER_SIZE);
-
-        let padded_len = (value.len() + 3) & !3;
-        let padding = padded_len - value.len();
-        buf.extend_from_slice(&USERNAME_ATTRIBUTE_TYPE.to_be_bytes());
-        buf.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
-        buf.extend_from_slice(value);
-        buf.extend_from_slice(&std::vec![0u8; padding]);
-
-        let total_attr_len = u16::try_from(4 + padded_len).unwrap();
-        buf[2..4].copy_from_slice(&total_attr_len.to_be_bytes());
-        buf
-    }
-
-    fn build_stun_with_ufrag(u: &IceUfrag) -> Vec<u8> {
-        let mut value = Vec::from(u.encode_ascii());
-        value.push(b':');
-        value.extend_from_slice(b"client");
-        build_stun_with_username(&value)
-    }
-
-    fn ufrag_for_shard(shard: u16) -> IceUfrag {
-        IceUfrag::new(
-            DEFAULT_SIM_CLUSTER_ID,
-            DEFAULT_SIM_NODE_ID,
-            TransportRoute::new(shard, 1),
-            7,
-        )
-    }
-
     #[test]
-    fn stun_bootstrap_selects_the_shard_named_by_the_ufrag() {
-        let steering = new_steering(4);
-        let u = ufrag_for_shard(2);
-        let msg = build_stun_with_ufrag(&u);
-        let tuple = flow_key(addr(1024), dst_addr());
-        assert_eq!(steering.classify(tuple, &msg, 4), Some(2));
-    }
-
-    #[test]
-    fn a_second_packet_on_the_same_tuple_reuses_the_member_without_reparsing_stun() {
-        let steering = new_steering(4);
-        let u = ufrag_for_shard(3);
-        let msg = build_stun_with_ufrag(&u);
-        let tuple = flow_key(addr(1024), dst_addr());
-        assert_eq!(steering.classify(tuple, &msg, 4), Some(3));
-
-        // Garbage this time — if this were reclassified it would be dropped.
-        let garbage = std::vec![0xAAu8; 32];
-        assert_eq!(steering.classify(tuple, &garbage, 4), Some(3));
-    }
-
-    #[test]
-    fn non_stun_packet_from_an_unknown_tuple_is_dropped() {
+    fn an_unknown_tuple_uses_default_hash_without_reading_payload() {
         let steering = new_steering(4);
         let tuple = flow_key(addr(1024), dst_addr());
-        let payload = std::vec![0xAAu8; 32];
-        assert_eq!(steering.classify(tuple, &payload, 4), None);
+        let first = steering.classify(tuple, b"not-stun", 4);
+        assert_eq!(first, steering.classify(tuple, b"garbage", 4));
+        assert_eq!(steering.counter(steer::counters::UNKNOWN_FLOW), 2);
     }
 
     #[test]
-    fn malformed_stun_packet_is_dropped() {
+    fn an_authenticated_flow_map_hit_selects_its_owner() {
         let steering = new_steering(4);
         let tuple = flow_key(addr(1024), dst_addr());
-        let mut msg = Vec::new();
-        msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-        msg.extend_from_slice(&0u16.to_be_bytes());
-        msg.extend_from_slice(&MAGIC_COOKIE_BYTES);
-        msg.extend_from_slice(&[0u8; 12]);
-        assert_eq!(steering.classify(tuple, &msg, 4), None);
+        steering.flow_table.borrow_mut().insert(tuple, 3);
+        assert_eq!(steering.classify(tuple, b"media", 4), Some(3));
+        assert_eq!(steering.counter(steer::counters::SELECTED), 1);
     }
 
     #[test]
-    fn garbage_packet_is_dropped() {
+    fn malformed_and_non_stun_bootstrap_payloads_still_fall_through() {
         let steering = new_steering(4);
         let tuple = flow_key(addr(1024), dst_addr());
-        let garbage = std::vec![0x00u8; 3];
-        assert_eq!(steering.classify(tuple, &garbage, 4), None);
+        let selected = steering.classify(tuple, &[0; 3], 4);
+        assert_eq!(selected, steering.classify(tuple, b"media", 4));
+        assert_eq!(steering.counter(steer::counters::MALFORMED_STUN), 0);
     }
 
     #[test]
-    fn rebound_tuple_requires_a_fresh_stun_bootstrap() {
+    fn stale_map_entries_fall_through_and_are_counted() {
         let steering = new_steering(4);
-        let u = ufrag_for_shard(1);
-        let msg = build_stun_with_ufrag(&u);
-        let old_tuple = flow_key(addr(1024), dst_addr());
-        assert_eq!(steering.classify(old_tuple, &msg, 4), Some(1));
-
-        let new_tuple = flow_key(addr(1025), dst_addr());
-        let non_stun = std::vec![0xAAu8; 32];
+        let tuple = flow_key(addr(1024), dst_addr());
+        steering.flow_table.borrow_mut().insert(tuple, 3);
         assert_eq!(
-            steering.classify(new_tuple, &non_stun, 4),
-            None,
-            "a rebound tuple has no flow entry yet, so non-STUN traffic on it must not be assigned"
-        );
-
-        let u2 = ufrag_for_shard(1);
-        let msg2 = build_stun_with_ufrag(&u2);
-        assert_eq!(steering.classify(new_tuple, &msg2, 4), Some(1));
-    }
-
-    #[test]
-    fn an_ice_restart_rebinds_a_known_tuple_before_flow_lookup() {
-        let steering = new_steering(4);
-        let tuple = flow_key(addr(1024), dst_addr());
-        assert_eq!(
-            steering.classify(tuple, &build_stun_with_ufrag(&ufrag_for_shard(1)), 4),
-            Some(1)
-        );
-        assert_eq!(
-            steering.classify(tuple, &build_stun_with_ufrag(&ufrag_for_shard(3)), 4),
-            Some(3)
-        );
-        assert_eq!(
-            steering.classify(tuple, &std::vec![0xAA; 32], 4),
-            Some(3),
-            "established media follows the restarted transport"
-        );
-    }
-
-    #[test]
-    fn client_drop_taxonomy_is_reachable_and_counted() {
-        let mut bad_encoding = vec![b'*'; pulsebeam_routing::ufrag::ENCODED_LEN];
-        bad_encoding.extend_from_slice(b":client");
-
-        let mut bad_version_username = Vec::from(ufrag_for_shard(1).encode_ascii());
-        bad_version_username[0] = b'4';
-        bad_version_username.extend_from_slice(b":client");
-
-        let cases = [
-            (
-                "no username",
-                {
-                    let mut msg = Vec::new();
-                    msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-                    msg.extend_from_slice(&0u16.to_be_bytes());
-                    msg.extend_from_slice(&MAGIC_COOKIE_BYTES);
-                    msg.extend_from_slice(&[0; 12]);
-                    msg
-                },
-                steer::counters::MALFORMED_STUN,
-            ),
-            (
-                "bad ufrag length",
-                build_stun_with_username(b"short:client"),
-                steer::counters::INVALID_UFRAG,
-            ),
-            (
-                "bad ufrag encoding",
-                build_stun_with_username(&bad_encoding),
-                steer::counters::INVALID_UFRAG,
-            ),
-            (
-                "bad ufrag version",
-                build_stun_with_username(&bad_version_username),
-                steer::counters::INVALID_VERSION,
-            ),
-        ];
-
-        for (name, payload, counter) in cases {
-            let steering = new_steering(4);
-            let tuple = flow_key(addr(1024), dst_addr());
-            assert_eq!(steering.classify(tuple, &payload, 4), None, "{name}");
-            assert_eq!(steering.counter(counter), 1, "{name}");
-        }
-
-        let wrong_cluster = IceUfrag::new(
-            DEFAULT_SIM_CLUSTER_ID.saturating_add(1),
-            DEFAULT_SIM_NODE_ID,
-            TransportRoute::new(1, 1),
-            7,
-        );
-        let wrong_node = IceUfrag::new(
-            DEFAULT_SIM_CLUSTER_ID,
-            DEFAULT_SIM_NODE_ID.saturating_add(1),
-            TransportRoute::new(1, 1),
-            7,
-        );
-        for (name, payload, counter) in [
-            (
-                "wrong cluster",
-                build_stun_with_ufrag(&wrong_cluster),
-                steer::counters::WRONG_CLUSTER,
-            ),
-            (
-                "wrong node",
-                build_stun_with_ufrag(&wrong_node),
-                steer::counters::WRONG_NODE,
-            ),
-            (
-                "invalid shard",
-                build_stun_with_ufrag(&ufrag_for_shard(4)),
-                steer::counters::INVALID_SHARD,
-            ),
-        ] {
-            let steering = new_steering(4);
-            let tuple = flow_key(addr(1024), dst_addr());
-            assert_eq!(steering.classify(tuple, &payload, 4), None, "{name}");
-            assert_eq!(steering.counter(counter), 1, "{name}");
-        }
-
-        let steering = new_steering(4);
-        let tuple = flow_key(addr(1024), dst_addr());
-        assert_eq!(
-            steering.classify(tuple, &build_stun_with_ufrag(&ufrag_for_shard(3)), 4),
-            Some(3)
-        );
-        assert_eq!(
-            steering.classify(tuple, &std::vec![0xAA; 32], 3),
-            None,
-            "a route outside the current shard count is stale"
+            steering.classify(tuple, b"media", 3),
+            Some(default_member(tuple, 3))
         );
         assert_eq!(steering.counter(steer::counters::STALE_ROUTE), 1);
-
-        let steering = new_steering(4);
-        assert_eq!(
-            steering.classify(flow_key(addr(1025), dst_addr()), &std::vec![0xAA; 32], 4),
-            None
-        );
-        assert_eq!(steering.counter(steer::counters::UNKNOWN_FLOW), 1);
-    }
-
-    #[test]
-    fn node_envelope_drop_taxonomy_is_reachable_and_counted() {
-        use pulsebeam_routing::RouteId;
-        use pulsebeam_routing::envelope::{Envelope, EnvelopeType};
-
-        let steering = new_steering(4);
-        assert_eq!(steering.classify_node(&[0; 3], 4), None);
-        assert_eq!(steering.counter(steer::counters::MALFORMED_ENVELOPE), 1);
-
-        let mut unsupported = Envelope {
-            ty: EnvelopeType::Media,
-            epoch: 1,
-            route: RouteId::new(1, 1),
-            extension: 0,
-        }
-        .encode();
-        unsupported[0] = 0xff;
-        assert_eq!(steering.classify_node(&unsupported, 4), None);
-        assert_eq!(steering.counter(steer::counters::INVALID_VERSION), 1);
-
-        let mut unknown_type = Envelope {
-            ty: EnvelopeType::Media,
-            epoch: 1,
-            route: RouteId::new(1, 1),
-            extension: 0,
-        }
-        .encode();
-        unknown_type[1] = 0xff;
-        assert_eq!(steering.classify_node(&unknown_type, 4), None);
-        assert_eq!(steering.counter(steer::counters::INVALID_TYPE), 1);
-
-        let invalid_shard = Envelope {
-            ty: EnvelopeType::Media,
-            epoch: 1,
-            route: RouteId::new(4, 1),
-            extension: 0,
-        }
-        .encode();
-        assert_eq!(steering.classify_node(&invalid_shard, 4), None);
-        assert_eq!(steering.counter(steer::counters::INVALID_SHARD), 1);
     }
 
     #[test]
@@ -786,77 +582,47 @@ mod tests {
         let hot_tuple = flow_key(addr(1024), dst_addr());
         let cold_tuple = flow_key(addr(1025), dst_addr());
         assert_eq!(table.get(hot_tuple), Some(0));
-
         let overflow_port = u16::try_from(1024 + steer::SIM_FLOW_CAPACITY).expect("fits a port");
-        let overflow_tuple = flow_key(addr(overflow_port), dst_addr());
-        table.insert(overflow_tuple, 0);
-        assert_eq!(
-            table.get(hot_tuple),
-            Some(0),
-            "an established flow touched before churn must remain resident"
-        );
-        assert_eq!(
-            table.get(cold_tuple),
-            None,
-            "the least-recently-used flow evicts"
-        );
-        assert_eq!(table.get(overflow_tuple), Some(0));
+        table.insert(flow_key(addr(overflow_port), dst_addr()), 0);
+        assert_eq!(table.get(hot_tuple), Some(0));
+        assert_eq!(table.get(cold_tuple), None);
         assert_eq!(table.members.len(), steer::SIM_FLOW_CAPACITY);
     }
 
     #[test]
-    fn wrong_owner_injection_delivers_to_a_different_member_than_classification_chose() {
+    fn wrong_owner_injection_exercises_userspace_forwarding() {
         let steering = new_steering(4);
         steering.set_wrong_owner_injection(true);
-
-        let u = ufrag_for_shard(2);
-        let msg = build_stun_with_ufrag(&u);
         let tuple = flow_key(addr(1024), dst_addr());
-        let selected = steering.classify(tuple, &msg, 4).unwrap();
-        assert_eq!(selected, 2);
-
-        steering.deliver(addr(1024), dst_addr(), msg);
-
+        let selected = default_member(tuple, 4);
+        steering.deliver(addr(1024), dst_addr(), vec![1, 2, 3]);
         let inboxes = steering.inboxes.borrow();
         let landed = inboxes
             .iter()
             .enumerate()
-            .find_map(|(i, inbox)| {
+            .find_map(|(index, inbox)| {
                 inbox
                     .as_ref()
                     .filter(|inbox| !inbox.queue.is_empty())
-                    .map(|_| i)
+                    .map(|_| index)
             })
             .expect("packet must land somewhere");
-        assert_ne!(
-            landed, selected,
-            "wrong-owner injection must not deliver to the classifier's chosen member"
-        );
+        assert_ne!(landed, selected);
     }
 
     #[test]
-    fn wrong_owner_injection_is_off_by_default() {
+    fn node_envelope_drop_taxonomy_remains_kernel_owned() {
         let steering = new_steering(4);
-        let u = ufrag_for_shard(2);
-        let msg = build_stun_with_ufrag(&u);
-        steering.deliver(addr(1024), dst_addr(), msg);
-
-        let inboxes = steering.inboxes.borrow();
-        assert!(!inboxes.get(2).unwrap().as_ref().unwrap().queue.is_empty());
-        assert_eq!(steering.counter(steer::counters::SELECTED), 1);
-    }
-
-    #[test]
-    fn bind_shard_out_of_order_still_indexes_by_shard_not_join_order() {
-        let steering = SimSteering::new(DEFAULT_SIM_CLUSTER_ID, DEFAULT_SIM_NODE_ID);
-        steering.bind_shard(2).unwrap();
-        steering.bind_shard(0).unwrap();
-        steering.bind_shard(1).unwrap();
-
-        let u = ufrag_for_shard(0);
-        let msg = build_stun_with_ufrag(&u);
-        let tuple = flow_key(addr(1024), dst_addr());
-        assert_eq!(steering.classify(tuple, &msg, 3), Some(0));
+        assert_eq!(steering.classify_node(&[0; 3], 4), None);
+        assert_eq!(steering.counter(steer::counters::MALFORMED_ENVELOPE), 1);
+        let envelope = Envelope {
+            ty: EnvelopeType::Media,
+            epoch: 1,
+            route: RouteId::new(1, 1),
+            extension: 0,
+        }
+        .encode();
+        assert_eq!(steering.classify_node(&envelope, 4), Some(1));
     }
 
     #[test]

@@ -18,11 +18,6 @@ use net::parse_udp;
 
 const SK_PASS: u32 = aya_ebpf::bindings::sk_action::SK_PASS;
 const SK_DROP: u32 = aya_ebpf::bindings::sk_action::SK_DROP;
-
-#[unsafe(no_mangle)]
-static CLUSTER_ID: u16 = 0;
-#[unsafe(no_mangle)]
-static NODE_ID: u16 = 0;
 #[unsafe(no_mangle)]
 static SHARD_COUNT: u16 = 0;
 
@@ -51,10 +46,6 @@ impl SteerEnv for BpfSteerEnv {
         u16::try_from(*shard).ok()
     }
 
-    fn flow_insert(&mut self, flow: FlowKey, shard: u16) {
-        let _ = FLOWS.insert(flow, u32::from(shard), 0);
-    }
-
     fn bump(&mut self, counter: u32) {
         bump(counter);
     }
@@ -63,7 +54,7 @@ impl SteerEnv for BpfSteerEnv {
 fn select_shard(ctx: &SkReuseportContext, shard: u16) -> u32 {
     if u32::from(shard) >= MAX_SHARDS {
         bump(counters::INVALID_SHARD);
-        return SK_DROP;
+        return SK_PASS;
     }
     match SOCKARRAY.select_reuseport(ctx, u32::from(shard)) {
         Ok(()) => {
@@ -72,38 +63,29 @@ fn select_shard(ctx: &SkReuseportContext, shard: u16) -> u32 {
         }
         Err(_) => {
             bump(counters::INVALID_SHARD);
-            SK_DROP
+            SK_PASS
         }
     }
 }
 
-/// Client bootstrap `SK_REUSEPORT`: first STUN of a transport carries the
-/// ufrag and steers by `TransportRoute.shard()`. An established (non-STUN)
-/// flow is steered by the `FLOWS` affinity map instead — no per-route lookup
-/// either way.
+/// Established-client `SK_REUSEPORT`: only an authenticated userspace flow
+/// entry may override the socket group's normal hash. A miss deliberately
+/// returns `SK_PASS`; userspace receives the bootstrap STUN and can forward it
+/// to the route owner without making the kernel a second classifier.
 #[sk_reuseport]
 pub fn pulsebeam_client(ctx: SkReuseportContext) -> u32 {
     let Some(udp) = parse_udp(&ctx) else {
-        bump(counters::MALFORMED_STUN);
-        return SK_DROP;
+        return SK_PASS;
     };
-
-    let cluster_id = unsafe { core::ptr::read_volatile(&raw const CLUSTER_ID) };
-    let node_id = unsafe { core::ptr::read_volatile(&raw const NODE_ID) };
-    let shard_count = unsafe { core::ptr::read_volatile(&raw const SHARD_COUNT) };
-
     let mut env = BpfSteerEnv;
     match steer::steer_client(
         &mut env,
-        udp.payload(),
         udp.flow,
-        cluster_id,
-        node_id,
-        shard_count,
+        u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX),
         MAX_SHARDS,
     ) {
-        Verdict::Pass { shard } => select_shard(&ctx, shard),
-        Verdict::Drop(_) => SK_DROP,
+        Verdict::Select { shard } => select_shard(&ctx, shard),
+        Verdict::Pass | Verdict::Drop(_) => SK_PASS,
     }
 }
 
@@ -121,8 +103,9 @@ pub fn pulsebeam_node(ctx: SkReuseportContext) -> u32 {
 
     let mut env = BpfSteerEnv;
     match steer::steer_node(&mut env, udp.payload(), shard_count, MAX_SHARDS) {
-        Verdict::Pass { shard } => select_shard(&ctx, shard),
+        Verdict::Select { shard } => select_shard(&ctx, shard),
         Verdict::Drop(_) => SK_DROP,
+        Verdict::Pass => SK_PASS,
     }
 }
 

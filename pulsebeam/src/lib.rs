@@ -35,6 +35,8 @@ pub mod audio_selector;
 mod bitrate;
 pub mod clock;
 pub mod control;
+#[cfg(not(feature = "sim"))]
+mod ebpf;
 pub mod entity;
 pub mod id;
 pub(crate) mod keys;
