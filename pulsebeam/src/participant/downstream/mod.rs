@@ -131,7 +131,15 @@ fn starvation_reset_target(
     // than a transient. The cheapest unfunded layer is the smallest step that
     // can restart feedback: if it fits, the estimator takes over from there; if
     // it does not, the link truly cannot carry it and pausing was right.
-    let target = unfunded.unwrap_or(desired).min(desired);
+    // Never below the current estimate. This exists to escape an estimate that
+    // is stuck too low; resetting downward would deepen exactly the condition
+    // it is meant to break. `unfunded` is a layer's cost, and another slot may
+    // already have spent most of the budget, so it is not bounded below by the
+    // estimate on its own.
+    let target = unfunded
+        .unwrap_or(desired)
+        .min(desired)
+        .max(estimate);
     *watch = Some(StarvationWatch {
         since: now,
         estimate: target,
@@ -670,6 +678,36 @@ mod tests {
             ),
             None,
             "an allocation that fit is a link in use, not one that has gone quiet"
+        );
+    }
+
+    /// The reset raises a stuck estimate; it must never lower one.
+    ///
+    /// `unfunded` is one layer's cost, not a floor — another slot may already
+    /// have spent most of the budget, so the cheapest thing that did not fit
+    /// can be cheaper than the estimate itself. Resetting to it would deepen
+    /// the stall this exists to break.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_never_lowers_the_estimate() {
+        let mut watch = None;
+        let now = Instant::now();
+        let desired = bps(4_000_000);
+        let estimate = bps(1_000_000);
+        let cheap = bps(120_000);
+
+        let _ = starvation_reset_target(&mut watch, now, desired, Some(cheap), bps(10_000), estimate);
+        let target = starvation_reset_target(
+            &mut watch,
+            now + STARVATION_TIMEOUT,
+            desired,
+            Some(cheap),
+            bps(10_000),
+            estimate,
+        );
+        assert_eq!(
+            target,
+            Some(estimate),
+            "a probe cheaper than the estimate must not drag the estimate down to it"
         );
     }
 

@@ -225,8 +225,8 @@ tests::bwe::screenshare_and_camera_over_wifi_test
 tests::bwe::screenshare_recovers_after_competing_camera_pause_test
   [PASS]
   camera: capacity unshaped | received 0 B | estimate: no allocation passes | qoe 0 fps=0.0 key=0 undecodable=0 torn=0 ttff=None freeze=0ns/0% | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 5          | media 0.0%
-  screen: capacity unshaped | received 0 B | estimate: no allocation passes | qoe 0 fps=0.0 key=0 undecodable=0 torn=0 ttff=None freeze=0ns/0% | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 4          | media 0.0%
-  viewer: capacity 3000000 bps | utilisation 8.6% (2901172 B / ~33750000 B) | estimate last 2759428 min 1767012 max 2759428 bps, worst drawdown 7.4%, 905 samples | demand last 2600000 min 2600000 max 3000000 bps | ends 8.0% off capacity | 80% at <s> | 90% at <s> | qoe 5084 fps=31.1 key=5 undecodable=0 torn=0 ttff=Some(<s>) freeze=160ms/0% | queue standing <ms> max <ms> | congestion loss 0.00% (0/4660) | link loss 5          | media 693.3%
+  screen: capacity unshaped | received 0 B | estimate: no allocation passes | qoe 0 fps=0.0 key=0 undecodable=0 torn=0 ttff=None freeze=0ns/0% | queue standing 0ns max 0ns | congestion loss 0.00% (0/0) | link loss 5          | media 0.0%
+  viewer: capacity 3000000 bps | utilisation 9.4% (3176986 B / ~33750000 B) | estimate last 2753451 min 2497679 max 2753451 bps, worst drawdown 0.0%, 902 samples | demand last 2800000 min 2400000 max 3000000 bps | ends 8.2% off capacity | 80% at 0ns | 90% at <s> | qoe 5136 fps=31.4 key=5 undecodable=0 torn=0 ttff=Some(<s>) freeze=195ms/0% | queue standing <ms> max <ms> | congestion loss 0.00% (0/4918) | link loss 2          | media 642.3%
 
 tests::bwe::screenshare_recovers_full_quality_after_going_still_test
   [PASS]
