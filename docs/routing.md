@@ -1,5 +1,33 @@
 # PulseBeam Routing Protocol Architecture
 
+> **Implementation status (2026-08):** client `SK_REUSEPORT` steering is
+> loaded at startup on Linux when the eBPF object is available. The attached
+> program is `pulsebeam_client`; the separately compiled `pulsebeam_node`
+> program is not attached by the current node startup path.
+>
+> The client program
+> performs only an authenticated-flow lookup in `FLOWS`; a miss falls through
+> to the socket group's tuple hash and never drops a packet. The control plane
+> installs `FLOWS` entries after str0m reports ICE authentication, and removes
+> no per-flow state on teardown because the bounded kernel map is self-healing.
+> Userspace remains authoritative: it decodes and validates the ufrag, caches
+> only authenticated source addresses, and forwards a resolved packet to the
+> owning shard when the reuseport hash selected another worker. Multi-worker
+> operation therefore remains correct while the object is absent, with eBPF
+> reducing steady-state mailbox forwarding once attached.
+>
+> The loader looks for `PULSEBEAM_EBPF_OBJECT`, then
+> `target/bpfel-unknown-none/release/pulsebeam-ebpf` relative to the process
+> working directory. A missing object is reported and uses the userspace
+> forwarding path; an object that exists but cannot load or attach fails node
+> startup. Build it with `make build-ebpf` before starting a production node.
+
+The sections below describe the wire format and the historical design
+constraints. Where they say that the kernel directly decodes a route or that
+client packets cannot cross the shard mailbox, the implementation-status block
+above is authoritative: client steering is now flow lookup plus userspace
+bootstrap forwarding.
+
 The current implementation follows the ownership and data-plane constraints
 in the routing and thread-per-core design documents. This document is the
 implementation guide for shard views, control-minted runtime keys, and
@@ -76,50 +104,50 @@ A shard is the unit of:
 - UDP socket ownership,
 - and established ICE-TCP connection ownership.
 
-The kernel steers packets to the owning shard before shard-local userspace
-state is consulted. Client UDP packets are not forwarded between shards
-through the in-process mailbox mesh.
-
-The route format encodes the `ShardId` directly so packet steering can identify the owning worker without a userspace lookup.
+The route format encodes the `ShardId` so userspace can identify the owning
+worker after ufrag validation. An attached kernel program handles only known
+5-tuples; the bootstrap packet and any tuple miss are resolved in userspace and
+may cross the in-process shard mailbox once.
 
 ---
 
 # 3. Why encode ShardId in the route
 
-The route must be usable by the network steering layer before shard-local userspace state is consulted.
+The route must be usable by the userspace demuxer before shard-local state is
+consulted. The kernel fast path has a smaller responsibility: retain affinity
+for an authenticated 5-tuple.
 
-For UDP, PulseBeam wants the kernel to steer a packet directly to the worker that owns the destination.
+For UDP, PulseBeam prefers the kernel to steer an authenticated flow directly
+to the worker that owns the destination. The fallback is deliberately part of
+the design, because a new ICE candidate has no flow-map entry yet.
 
-Instead of:
+For established flows:
 
 ```text
-RouteId
+5-tuple
    ↓
-BPF map:
-RouteId → ShardId
+FLOWS map: FlowKey → ShardId
    ↓
 socket
 ```
 
-PulseBeam uses:
+For bootstrap and map misses, PulseBeam uses:
 
 ```text
-RouteId
+raw UDP
    ↓
-extract ShardId
+userspace ufrag validation
    ↓
-reuseport socket
+owner-shard mailbox forwarding when needed
 ```
 
 The route therefore acts as a compact compiled execution address.
 
 This avoids maintaining a dynamic eBPF routing map for every individual route.
-
-It also removes the ingress ownership race. The control plane allocates and
-installs the transport route before returning ICE credentials. eBPF uses the
-encoded shard to deliver the first STUN packet directly to the owning socket;
-no receiving shard needs to discover the owner and enqueue the packet to a
-different shard.
+The control plane allocates the transport route before returning ICE
+credentials, then installs a tuple entry only after authentication. Before that
+point, the receiving shard resolves the ufrag and forwards the datagram if the
+route belongs elsewhere.
 
 ---
 
@@ -532,6 +560,12 @@ Crockford Base32
 
 # 16. Client UDP routing with eBPF
 
+> **Current implementation:** this section's historical STUN/ufrag eBPF
+> classifier is not attached. The production client program only looks up an
+> authenticated 5-tuple in `FLOWS`; userspace performs bootstrap classification
+> and forwards packets that land on the wrong shard. See the status block at
+> the top of this document.
+
 The eBPF routing model has two phases.
 
 ## Bootstrap traffic
@@ -827,6 +861,11 @@ No userspace route-table lookup is required merely to decide which shard socket 
 ---
 
 # 27. Inter-node UDP eBPF steering
+
+> **Current implementation:** inter-node steering is still a separate,
+> envelope-based path. The client-side flow-lookup program does not steer these
+> frames; the status block at the top of this document is authoritative for
+> what is attached in production.
 
 The inter-node path is particularly simple because PulseBeam controls the packet format.
 
@@ -1376,6 +1415,12 @@ The Envelope is already inside the cluster data plane and can therefore be small
 ---
 
 # 47. eBPF as part of the routing architecture
+
+> **Current implementation:** eBPF is attached only for client-side
+> authenticated-flow lookup when the object is available. The kernel does not
+> decode routes or ufrags, and a flow miss falls through to the normal socket
+> hash. The status block at the top of this document supersedes the historical
+> design language below.
 
 eBPF should be treated as a first-class design constraint, not merely a future optimization.
 
