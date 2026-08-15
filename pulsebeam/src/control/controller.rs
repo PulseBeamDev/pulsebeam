@@ -2206,11 +2206,12 @@ impl ControllerActor {
                 return;
             };
             let Some(handle) = self.install_video_route(shard_id, fanout, plan).await else {
+                // The fanout key stays. Only the route failed, and the shard is
+                // told which track a route carries by the route itself, so the
+                // retry re-stages this same key — dropping it here would mint a
+                // fresh one on every attempt and abandon the last in the arena.
                 self.subscriptions
                     .unsubscribe(shard_id, &track.id, &subscriber);
-                if let Some(binding) = self.track_bindings.get_mut(&track.id) {
-                    binding.fanouts.remove(&shard_id);
-                }
                 self.defer_subscribe(DeferredSubscribe {
                     shard_id,
                     subscriber,
