@@ -8,7 +8,6 @@
 //! would actually receive.
 
 use ahash::HashMap;
-use pulsebeam_runtime::rand::seeded_rng;
 use str0m::media::Rid;
 use tokio::time::Instant;
 
@@ -39,13 +38,12 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
-    pub fn new(seed: u64) -> Self {
-        let track =
-            ParticipantId::new(&mut seeded_rng(seed)).derive_track_id(TrackKind::Video, "sw");
+    pub fn new(_seed: u64) -> Self {
+        let track = ParticipantId::new().derive_track_id(TrackKind::Video, "sw");
         Self {
             track,
             cache: TrackStreamCache::new(),
-            switcher: Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(seed)),
+            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             out: Vec::new(),
             bursts: Vec::new(),
         }

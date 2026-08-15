@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use pulsebeam_runtime::rand::RngCore;
 use slotmap::SecondaryMap;
 use tokio::time::Instant;
 
@@ -67,8 +66,14 @@ pub struct TopNAudioSelector {
     owner_slots: SecondaryMap<TrackKey, AudioSelectorSlotId>,
 }
 
+impl Default for TopNAudioSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TopNAudioSelector {
-    pub fn new<R: RngCore>(rng: &mut R) -> Self {
+    pub fn new() -> Self {
         // immunity_expiry is set to Instant::now() at construction; any packet arriving
         // later will have now >= construction_time, so is_immune() returns false.
         let init_instant = Instant::now();
@@ -79,7 +84,7 @@ impl TopNAudioSelector {
                 immunity_expiry: init_instant,
                 last_power: 0.0,
                 slot_timeline: SlotTimeline {
-                    timeline: Timeline::new(AUDIO_FREQUENCY, rng),
+                    timeline: Timeline::new(AUDIO_FREQUENCY),
                     pending_marker: false,
                 },
             }),
@@ -254,16 +259,11 @@ mod tests {
     use tokio::time::Instant;
 
     use crate::rtp::RtpPacket;
-    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
 
     const TICK_MS: u64 = 20;
 
-    fn test_rng() -> impl RngCore {
-        seeded_rng(42)
-    }
-
     fn new_sel() -> TopNAudioSelector {
-        TopNAudioSelector::new(&mut test_rng())
+        TopNAudioSelector::new()
     }
 
     thread_local! {

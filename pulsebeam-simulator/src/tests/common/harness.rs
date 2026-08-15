@@ -1360,10 +1360,13 @@ fn step_name(step: &Step) -> &'static str {
     }
 }
 
+type PlanHandles = BTreeMap<&'static str, ParticipantHandle>;
+type PlanIps = BTreeMap<&'static str, IpAddr>;
+
 async fn execute_plan(
     plan: Vec<Step>,
-    handles: &mut HashMap<&'static str, ParticipantHandle>,
-    name_to_ip: &HashMap<&'static str, IpAddr>,
+    handles: &mut PlanHandles,
+    name_to_ip: &PlanIps,
     reports: &Mutex<HashMap<&'static str, LinkReport>>,
 ) -> anyhow::Result<()> {
     let total = plan.len();
@@ -1409,7 +1412,8 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let _ = get_handle(handles, participant, description)?;
-                pulsebeam_runtime::net::set_wrong_owner_injection(true);
+                let source = resolve(name_to_ip, participant, description)?;
+                pulsebeam_runtime::net::set_wrong_owner_injection(source);
                 handles
                     .get(participant)
                     .expect("participant was resolved above")
@@ -2415,18 +2419,14 @@ async fn execute_plan(
     Ok(())
 }
 
-fn resolve(
-    map: &HashMap<&'static str, IpAddr>,
-    name: &str,
-    step_desc: &str,
-) -> anyhow::Result<IpAddr> {
+fn resolve(map: &PlanIps, name: &str, step_desc: &str) -> anyhow::Result<IpAddr> {
     map.get(name).copied().ok_or_else(|| {
         anyhow::anyhow!("step \"{step_desc}\": unknown participant/endpoint name \"{name}\"")
     })
 }
 
 fn get_handle<'a>(
-    handles: &'a mut HashMap<&'static str, ParticipantHandle>,
+    handles: &'a mut PlanHandles,
     name: &str,
     step_desc: &str,
 ) -> anyhow::Result<&'a mut ParticipantHandle> {
@@ -2446,7 +2446,7 @@ fn get_handle<'a>(
 /// Deliberately only the *safety* half. "Everyone who should be known is known" is liveness and
 /// depends on discovery timing, which would make this flake; what it asserts is that nothing is
 /// known that should not be, and that whatever is known is described correctly.
-fn assert_room_state_consistent(handles: &HashMap<&'static str, ParticipantHandle>, after: &str) {
+fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
     // Every participant id the plan has ever created, and what it means now.
     #[derive(Clone, Copy)]
     enum Identity {
@@ -3126,7 +3126,7 @@ fn check_property(
     handle: &ParticipantHandle,
     ip: IpAddr,
     window: Duration,
-    handles: &HashMap<&'static str, ParticipantHandle>,
+    handles: &PlanHandles,
 ) -> Result<(), String> {
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
@@ -3705,6 +3705,7 @@ impl LocalNodeSim {
         // real clock is back in force before the runtime tears down.
         let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
         crate::sim_rand::set_thread_rng(self.rng_seed);
+        fastrand::seed(self.rng_seed);
         // Loss, reordering and duplication come from the shaper's own stream, not
         // from turmoil's RNG, so it has to be seeded too or a sweep replays one
         // impairment pattern under every seed.
@@ -3751,8 +3752,8 @@ impl LocalNodeSim {
                 .map_err(Into::into)
         });
 
-        let mut handles: HashMap<&'static str, ParticipantHandle> = HashMap::new();
-        let mut name_to_ip: HashMap<&'static str, IpAddr> = HashMap::new();
+        let mut handles = PlanHandles::new();
+        let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
 
         // Impairment is keyed by destination, so configuring the SFU's address is what degrades

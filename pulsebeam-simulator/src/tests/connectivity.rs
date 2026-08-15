@@ -161,7 +161,7 @@ fn controller_stall_keeps_established_media_alive() {
 
 #[test]
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
-fn wrong_owner_drops_once_and_media_continues() {
+fn wrong_owner_forwards_once_and_media_continues() {
     LocalNodeSim::new()
         .with_shards(2)
         .with_room(cross_shard_media_room())
@@ -175,8 +175,8 @@ fn wrong_owner_drops_once_and_media_continues() {
                 participant: "publisher",
             },
             Step::CheckRoutingCounter {
-                description: "the foreign datagram is dropped at the owner guard",
-                name: "shard_wrong_owner_drop",
+                description: "the foreign datagram is forwarded to its owner",
+                name: "shard_wrong_owner_forward",
                 exact: 1,
             },
             Step::CheckRxBytes {

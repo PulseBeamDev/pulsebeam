@@ -50,11 +50,11 @@ fn main() {
 fn route_lookup(iters: u32) {
     use ahash::{HashMap, HashMapExt};
 
-    let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
+    let _rng = pulsebeam_runtime::rand::seeded_rng(1);
     let mut map: HashMap<pulsebeam::entity::TrackId, u64> = HashMap::new();
     let mut ids = Vec::new();
     for _ in 0..64 {
-        let id = ParticipantId::new(&mut rng).derive_track_id(TrackKind::Video, "v");
+        let id = ParticipantId::new().derive_track_id(TrackKind::Video, "v");
         map.insert(id, 0);
         ids.push(id);
     }
