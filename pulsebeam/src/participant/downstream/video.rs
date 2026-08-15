@@ -64,10 +64,21 @@ pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 ///
 /// Deliberately above [`START_BANDWIDTH`]: the estimate this SFU starts its own
 /// allocator from is not the same number as the one it tells the transport to
-/// probe from. Lowering this to libwebrtc's 300 kbps is a defensible change but
-/// a behavioural one — it moves keyframe timing and first-frame latency across
-/// most plans — so it belongs in its own change with the scoreboard reviewed,
-/// not folded into a constant split.
+/// probe from.
+///
+/// **Lowering this to libwebrtc's 300 kbps trades one defect for another, and
+/// both were measured.** It fixes `a_rejoining_publisher_is_shown_to_an_existing_viewer`
+/// at every seed it currently fails: 2 Mbps overshoots a cellular link, and the
+/// burst at a slot switch overruns the client's 128-packet routing buffer, so
+/// media arrives and is discarded. It also costs `a_reordering_path_does_not_churn_keyframes`
+/// an extra layer reversal at the default seed, and
+/// `marker_only_publisher_streams_to_a_dd_subscriber` about 3% of its frames.
+///
+/// The reason it cannot simply be lowered is that libwebrtc pairs a 300 kbps
+/// start with probe clusters that reach a usable rate in a second or two. This
+/// SFU has no probing, so 300 kbps is a genuinely slower climb, and climbing
+/// through layers is what produces the extra reversal. Probing first, then this
+/// number.
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 pub struct VideoAllocator {
