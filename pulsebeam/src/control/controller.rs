@@ -50,6 +50,13 @@ struct TrackBinding {
     audio_routes: HashMap<crate::id::ShardId, RouteHandle>,
 }
 
+/// How many not-yet-published tracks one participant may have outstanding.
+///
+/// Generous against any real client — a subscription for a track that has not
+/// been announced yet is a race, not a workflow — and small enough that the
+/// list cannot be inflated by a client naming ids that will never exist.
+const MAX_PENDING_SUBSCRIPTIONS_PER_PARTICIPANT: usize = 64;
+
 struct PendingTrackSubscription {
     shard_id: crate::id::ShardId,
     subscriber: ParticipantId,
@@ -204,7 +211,8 @@ pub struct ControllerActor {
     track_bindings: HashMap<crate::entity::TrackId, TrackBinding>,
     data_bindings: HashMap<crate::shard::router::DataStreamId, StreamBinding>,
     reliable_bindings: HashMap<crate::shard::router::DataStreamId, StreamBinding>,
-    pending_track_subscriptions: Vec<PendingTrackSubscription>,
+    pending_track_subscriptions: HashMap<crate::entity::TrackId, Vec<PendingTrackSubscription>>,
+    pending_track_counts: HashMap<ParticipantId, usize>,
     data_pending: HashMap<
         crate::shard::router::DataStreamId,
         HashMap<
@@ -253,11 +261,13 @@ pub struct ControllerActor {
             ),
         >,
     >,
+    #[cfg(not(feature = "sim"))]
+    steering: Option<crate::ebpf::Steering>,
 }
 
 impl ControllerActor {
     pub(crate) fn with_placement(
-        mut rng: pulsebeam_runtime::rand::Rng,
+        _rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<Candidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
@@ -271,7 +281,7 @@ impl ControllerActor {
             shard_count,
             "one view writer per shard, held only here"
         );
-        let router = ShardRouter::new(shard_contexts, &mut rng);
+        let router = ShardRouter::new(shard_contexts);
 
         Self {
             router,
@@ -287,12 +297,21 @@ impl ControllerActor {
             track_bindings: HashMap::new(),
             data_bindings: HashMap::new(),
             reliable_bindings: HashMap::new(),
-            pending_track_subscriptions: Vec::new(),
+            pending_track_subscriptions: HashMap::new(),
+            pending_track_counts: HashMap::new(),
             data_pending: HashMap::new(),
             reliable_pending: HashMap::new(),
             data_wildcards: HashMap::new(),
             reliable_wildcards: HashMap::new(),
+            #[cfg(not(feature = "sim"))]
+            steering: None,
         }
+    }
+
+    #[cfg(not(feature = "sim"))]
+    pub(crate) fn set_steering(&mut self, steering: crate::ebpf::Steering) {
+        debug_assert!(self.steering.is_none());
+        self.steering = Some(steering);
     }
 
     /// Abandon the staged generation on both halves.
@@ -1219,6 +1238,26 @@ impl ControllerActor {
     async fn handle_route_event(&mut self, e: ShardEventMessage) -> Option<ShardEventMessage> {
         let (shard_id, event) = e;
         match event {
+            ShardEvent::TransportAuthenticated {
+                source: _authenticated_source,
+                destination: _authenticated_destination,
+                shard,
+            } => {
+                debug_assert_eq!(shard, shard_id);
+                #[cfg(not(feature = "sim"))]
+                if let Some(steering) = self.steering.as_mut() {
+                    let flow =
+                        crate::ebpf::flow_key(_authenticated_source, _authenticated_destination);
+                    let Ok(shard_index) = u16::try_from(shard.index()) else {
+                        debug_assert!(false, "a shard id must fit the eBPF map value");
+                        return None;
+                    };
+                    if let Err(error) = steering.install_flow(flow, shard_index) {
+                        tracing::warn!(%error, %shard, "failed to install authenticated eBPF flow");
+                    }
+                }
+                None
+            }
             ShardEvent::TrackSubscribed {
                 subscriber,
                 subscriber_key,
@@ -1226,7 +1265,22 @@ impl ControllerActor {
                 track,
             } => {
                 if !self.track_bindings.contains_key(&track.id) {
+                    // Track ids come from the client, so a subscription may
+                    // name something that does not exist and never will. Cap
+                    // how many a single participant can park here; the whole
+                    // list is dropped when it disconnects.
+                    let held = self
+                        .pending_track_counts
+                        .get(&subscriber)
+                        .copied()
+                        .unwrap_or_default();
+                    if held >= MAX_PENDING_SUBSCRIPTIONS_PER_PARTICIPANT {
+                        metrics::counter!("pending_subscription_rejected").increment(1);
+                        return None;
+                    }
                     self.pending_track_subscriptions
+                        .entry(track.id)
+                        .or_default()
                         .push(PendingTrackSubscription {
                             shard_id,
                             subscriber,
@@ -1234,6 +1288,8 @@ impl ControllerActor {
                             slot,
                             track,
                         });
+                    let held = self.pending_track_counts.entry(subscriber).or_default();
+                    *held = held.saturating_add(1);
                     return None;
                 }
                 self.on_track_subscribed(shard_id, subscriber, subscriber_key, slot, track)
@@ -1245,11 +1301,7 @@ impl ControllerActor {
                 slot,
                 track,
             } => {
-                self.pending_track_subscriptions.retain(|pending| {
-                    !(pending.subscriber == subscriber
-                        && pending.slot == slot
-                        && pending.track.id == track.id)
-                });
+                self.remove_pending_track_subscription(track.id, subscriber, slot);
                 self.on_track_unsubscribed(shard_id, subscriber, track)
                     .await;
                 None
@@ -1478,11 +1530,16 @@ impl ControllerActor {
     }
 
     async fn drain_pending_track_subscriptions(&mut self, track_id: crate::entity::TrackId) {
-        let pending = std::mem::take(&mut self.pending_track_subscriptions);
+        let pending = self
+            .pending_track_subscriptions
+            .remove(&track_id)
+            .unwrap_or_default();
         for subscription in pending {
-            if subscription.track.id != track_id {
-                self.pending_track_subscriptions.push(subscription);
-                continue;
+            if let Some(count) = self.pending_track_counts.get_mut(&subscription.subscriber) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_track_counts.remove(&subscription.subscriber);
+                }
             }
             self.on_track_subscribed(
                 subscription.shard_id,
@@ -1492,6 +1549,35 @@ impl ControllerActor {
                 subscription.track,
             )
             .await;
+        }
+    }
+
+    fn remove_pending_track_subscription(
+        &mut self,
+        track_id: crate::entity::TrackId,
+        subscriber: ParticipantId,
+        slot: crate::keys::DownstreamSlotKey,
+    ) {
+        let mut removed = false;
+        if let Some(pending) = self.pending_track_subscriptions.get_mut(&track_id) {
+            pending.retain(|entry| {
+                let matches = entry.subscriber == subscriber && entry.slot == slot;
+                removed |= matches;
+                !matches
+            });
+        }
+        if self
+            .pending_track_subscriptions
+            .get(&track_id)
+            .is_some_and(Vec::is_empty)
+        {
+            self.pending_track_subscriptions.remove(&track_id);
+        }
+        if removed && let Some(count) = self.pending_track_counts.get_mut(&subscriber) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_track_counts.remove(&subscriber);
+            }
         }
     }
 
@@ -1932,6 +2018,32 @@ impl ControllerActor {
         slot: crate::keys::DownstreamSlotKey,
         track: crate::track::TrackMeta,
     ) {
+        let Some(subscriber_room) = self
+            .core
+            .registry
+            .get_participant(&subscriber)
+            .map(|meta| meta.room_id)
+        else {
+            debug_assert!(false, "a subscription must come from a live participant");
+            return;
+        };
+        if subscriber_room != track.room_id {
+            metrics::counter!("track_subscription_room_rejected").increment(1);
+            return;
+        }
+        let Some(origin_room) = self
+            .core
+            .registry
+            .get_participant(&track.origin)
+            .map(|meta| meta.room_id)
+        else {
+            debug_assert!(false, "a published track must have a live origin");
+            return;
+        };
+        if origin_room != track.room_id {
+            debug_assert!(false, "track metadata room must match its origin");
+            return;
+        }
         let fanout = {
             let Some(binding) = self.track_bindings.get(&track.id) else {
                 debug_assert!(false, "a subscription must name a published track");
@@ -2595,6 +2707,18 @@ impl ControllerActor {
         for retired in self.subscriptions.remove_participant(participant_id) {
             self.release_route(retired.destination, retired.route).await;
         }
+        // A subscription naming a track that was never published waits here
+        // for a publish that may never come. Without this it outlives the
+        // subscriber: track ids are client-supplied, so a client could join,
+        // subscribe to invented ids, disconnect, and leave the entries behind
+        // for the life of the process — unbounded memory, and an O(pending)
+        // scan on every subsequent publish.
+        for pending in self.pending_track_subscriptions.values_mut() {
+            pending.retain(|entry| entry.subscriber != *participant_id);
+        }
+        self.pending_track_subscriptions
+            .retain(|_, entries| !entries.is_empty());
+        self.pending_track_counts.remove(participant_id);
     }
 
     /// Retire whatever transport route a participant holds, if the registry
@@ -2653,12 +2777,10 @@ impl ControllerActor {
         // Determine shard first so we can encode it into the ICE ufrag.
         let (slot, placement) = self.core.room_slot(&state.room_id);
         let shard_id = match placement {
-            RoomPlacement::Hashed => {
-                let routing_key = format!("{}-{}", state.room_id, slot);
-                self.router
-                    .try_route(&routing_key)
-                    .ok_or(ControllerError::ServiceUnavailable)?
-            }
+            RoomPlacement::Hashed => self
+                .router
+                .stable_route(&state.room_id)
+                .ok_or(ControllerError::ServiceUnavailable)?,
             RoomPlacement::RoundRobin => {
                 crate::id::ShardId::new(slot.checked_rem(self.router.shard_count()).unwrap_or(0))
             }
@@ -2677,7 +2799,7 @@ impl ControllerActor {
         );
 
         let ufrag = IceUfrag::new(self.cluster_id, self.node_id, handle.route, handle.epoch);
-        let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
+        let creds = ufrag.into_ice_creds();
 
         let negotiated = self.negotiator.create_answer(offer, creds);
         let (rtc, answer) = match negotiated {

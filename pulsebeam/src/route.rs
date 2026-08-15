@@ -509,6 +509,9 @@ pub(crate) struct SlotAllocator {
     epochs: Vec<u16>,
     /// Retired slots, oldest first, with the instant they were retired.
     quarantine: VecDeque<(u32, Instant)>,
+    /// Whether each slot is currently in `quarantine`, so a double retire is
+    /// an O(1) refusal rather than a scan of the queue.
+    quarantined: Vec<bool>,
     max_slots: u32,
 }
 
@@ -521,6 +524,7 @@ impl SlotAllocator {
             shard_id,
             epochs: Vec::with_capacity(prealloc),
             quarantine: VecDeque::new(),
+            quarantined: Vec::with_capacity(prealloc),
             max_slots,
         }
     }
@@ -544,6 +548,9 @@ impl SlotAllocator {
             && now.saturating_duration_since(retired_at) >= ROUTE_QUARANTINE
         {
             self.quarantine.pop_front();
+            if let Some(flag) = self.quarantined.get_mut(slot as usize) {
+                *flag = false;
+            }
             let Some(epoch) = self.epochs.get_mut(slot as usize) else {
                 debug_assert!(false, "a quarantined slot must be within the namespace");
                 return Err(RouteError::Exhausted {
@@ -572,6 +579,8 @@ impl SlotAllocator {
             );
         }
         self.epochs.push(0);
+        self.quarantined.push(false);
+        debug_assert_eq!(self.epochs.len(), self.quarantined.len());
         Ok((slot, 0))
     }
 
@@ -583,6 +592,24 @@ impl SlotAllocator {
             (slot as usize) < self.epochs.len(),
             "retired a slot that was never allocated"
         );
+        // A slot quarantined twice is handed out twice, at two different
+        // epochs. Both incarnations install into the same `RouteImage` index,
+        // so the second silently overwrites the first and the first
+        // participant's route stops resolving with no error anywhere — the one
+        // place in this model where a control-plane bug becomes silent media
+        // loss instead of a visible failure. Refuse the duplicate.
+        match self.quarantined.get_mut(slot as usize) {
+            Some(flag) if !*flag => *flag = true,
+            Some(_) => {
+                debug_assert!(false, "slot {slot} was retired while already quarantined");
+                metrics::counter!("route_double_retire").increment(1);
+                return;
+            }
+            None => {
+                debug_assert!(false, "retired a slot outside the namespace");
+                return;
+            }
+        }
         self.quarantine.push_back((slot, now));
     }
 }
@@ -716,6 +743,43 @@ impl RouteRuntime {
 
 #[cfg(test)]
 mod tests {
+
+    /// A slot quarantined twice would be handed out twice, at two different
+    /// epochs. Both install into the same `RouteImage` index, so the second
+    /// silently overwrites the first and the first participant's route stops
+    /// resolving with no error anywhere — a control-plane bug becoming silent
+    /// media loss. The allocator refuses the duplicate; in a build with
+    /// assertions on it aborts instead, because a caller doing this is broken.
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "already quarantined")]
+    async fn a_double_retire_is_refused() {
+        let mut alloc = SlotAllocator::with_max_slots(ShardId::new(0), 8);
+        let now = Instant::now();
+        let (slot, _) = alloc.allocate(now).unwrap();
+        alloc.retire(slot, now);
+        alloc.retire(slot, now);
+    }
+
+    /// The ordinary path the guard must not disturb: retire, wait out the
+    /// quarantine, and the slot comes back exactly once with a fresh epoch.
+    #[tokio::test(start_paused = true)]
+    async fn a_retired_slot_returns_once_with_a_new_epoch() {
+        let mut alloc = SlotAllocator::with_max_slots(ShardId::new(0), 8);
+        let (slot, first_epoch) = alloc.allocate(Instant::now()).unwrap();
+        alloc.retire(slot, Instant::now());
+
+        tokio::time::advance(ROUTE_QUARANTINE).await;
+        let (reused, second_epoch) = alloc.allocate(Instant::now()).unwrap();
+        assert_eq!(reused, slot);
+        assert_ne!(first_epoch, second_epoch);
+
+        // And it is not still queued: the next allocation is a fresh slot.
+        let (next, _) = alloc.allocate(Instant::now()).unwrap();
+        assert_ne!(next, slot, "a reused slot must leave the quarantine queue");
+
+        // Retiring it again is legal once it is live again.
+        alloc.retire(slot, Instant::now());
+    }
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;

@@ -7,7 +7,6 @@ use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indexmap::IndexSet;
-use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
 use std::time::Duration;
@@ -35,8 +34,40 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
-pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
+/// The lowest rate the bandwidth estimate may report.
+///
+/// Distinct from [`START_BANDWIDTH`] in meaning, and currently equal to it in
+/// value. Named separately because they are different decisions: this is the
+/// floor on what the estimator is *allowed to believe*, and that is where the
+/// estimate *begins*. Sharing one constant hid that.
+///
+/// **It should be lower.** libwebrtc's congestion controller floors its
+/// estimate far below its start bitrate, precisely so a link smaller than the
+/// start value can still be measured; at 300 kbps this SFU reports a 150 kbps
+/// link as 300 kbps and the allocator believes it has twice what it has.
+/// Lowering it currently fails `properties::sharding_does_not_change_who_is_served`
+/// — a single-shard viewer stops being served — which is a real defect this
+/// floor is masking rather than a reason to keep the floor. Diagnose that
+/// before moving this number.
+pub const MIN_ESTIMATE: Bitrate = START_BANDWIDTH;
+
+/// Where the estimate starts before any feedback has arrived.
+///
+/// libwebrtc's default start bitrate. Optimistic enough to reach a usable layer
+/// quickly, low enough that a constrained first link is not immediately
+/// overdriven.
+pub const START_BANDWIDTH: Bitrate = Bitrate::kbps(300);
+
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
+
+/// What the SFU announces to str0m as the starting estimate.
+///
+/// Deliberately above [`START_BANDWIDTH`]: the estimate this SFU starts its own
+/// allocator from is not the same number as the one it tells the transport to
+/// probe from. Lowering this to libwebrtc's 300 kbps is a defensible change but
+/// a behavioural one — it moves keyframe timing and first-frame latency across
+/// most plans — so it belongs in its own change with the scoreboard reviewed,
+/// not folded into a constant split.
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 pub struct VideoAllocator {
@@ -48,16 +79,15 @@ pub struct VideoAllocator {
     manual_sub: bool,
     tracks: Vec<Track>,
     layer_states: LayerStates,
-    rng: Rng,
     last_reconciled: HashSet<(TrackId, DownstreamSlotKey)>,
     desired_ctrl: BitrateController,
     current_allocation: Bitrate,
 }
 
 impl VideoAllocator {
-    pub(crate) fn new<R: RngCore>(ctx: LogCtx, manual_sub: bool, rng: &mut R) -> Self {
+    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         let desired_ctrl = BitrateControllerConfig {
-            min_bitrate: MIN_BANDWIDTH,
+            min_bitrate: START_BANDWIDTH,
             max_bitrate: MAX_BANDWIDTH,
             default_bitrate: INITIAL_BANDWIDTH,
             ..Default::default()
@@ -70,7 +100,6 @@ impl VideoAllocator {
             tracks: Vec::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
             routes: Vec::new(),
-            rng: Rng::seed_from_u64(rng.next_u64()),
             last_reconciled: HashSet::new(),
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
@@ -181,11 +210,15 @@ impl VideoAllocator {
             {
                 target
             } else {
-                track_state.lowest_healthy_quality(|l| {
+                let Some(layer) = track_state.lowest_healthy_quality(|l| {
                     layer_states
                         .get(&l.stream_id())
                         .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
-                })
+                }) else {
+                    slot.stop();
+                    return None;
+                };
+                layer
             };
 
             let layer = layer.clone();
@@ -241,7 +274,7 @@ impl VideoAllocator {
             plog_debug!(self.ctx, mid = %config.mid, "video slot already provisioned; skipping duplicate");
             return;
         }
-        let slot = Slot::new(self.ctx, config, &mut self.rng);
+        let slot = Slot::new(self.ctx, config);
         self.slots.insert(slot);
         self.rebalance();
     }
@@ -285,11 +318,13 @@ impl VideoAllocator {
         {
             if let Some(track_state) = pending_tracks.next() {
                 let states = &self.layer_states;
-                let layer = track_state.lowest_healthy_quality(|l| {
+                let Some(layer) = track_state.lowest_healthy_quality(|l| {
                     states
                         .get(&l.stream_id())
                         .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
-                });
+                }) else {
+                    continue;
+                };
                 slot.switch_to(layer, true);
                 staged = staged.saturating_add(1);
             } else {
@@ -310,8 +345,19 @@ impl VideoAllocator {
         );
     }
 
-    pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> (Bitrate, bool) {
-        let available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
+    /// Runs one allocation pass.
+    ///
+    /// Returns `(desired, assignments_changed, unfunded)`, where `unfunded` is
+    /// the cost of the cheapest layer the allocator was allowed to forward and
+    /// could not afford. `None` means everything it wanted fit.
+    ///
+    /// Only the allocator knows this; it cannot be recovered from a bitrate
+    /// afterwards, which is why it is reported rather than inferred.
+    pub fn update_allocations(
+        &mut self,
+        available_bandwidth: Bitrate,
+    ) -> (Bitrate, bool, Option<Bitrate>) {
+        let available_bandwidth = available_bandwidth.max(MIN_ESTIMATE).min(MAX_BANDWIDTH);
         // 1. Prepare the input views
         let mut views: Vec<SlotView> = self
             .slots
@@ -353,8 +399,8 @@ impl VideoAllocator {
         // out without the `sim` feature.
         #[cfg(feature = "sim")]
         if !views.is_empty() {
-            crate::sim_metrics::record_downstream_bwe(
-                &self.ctx.participant_id.to_string(),
+            crate::sim_metrics::record_downstream_bwe_for(
+                self.ctx.participant_id,
                 crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
                 crate::bitrate::saturating_bps(desired.as_f64()),
             );
@@ -366,12 +412,14 @@ impl VideoAllocator {
                     ) => Some(layer.quality as u8),
                     _ => None,
                 };
-                crate::sim_metrics::record_forwarded_quality(
-                    &view.track.meta.origin.to_string(),
-                    quality,
-                );
+                crate::sim_metrics::record_forwarded_quality_for(view.track.meta.origin, quality);
             }
         }
+
+        // What it would take to unblock the cheapest thing the allocator wanted
+        // and could not fund. `None` means everything it was allowed to forward
+        // fit.
+        let unfunded = engine.cheapest_unfunded(&views, &decisions);
 
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
@@ -400,7 +448,7 @@ impl VideoAllocator {
             log_allocation(self.ctx, available_bandwidth, desired, &decisions, &views);
         }
 
-        (desired, changed)
+        (desired, changed, unfunded)
     }
 
     pub fn current_allocation(&self) -> Bitrate {
@@ -687,7 +735,7 @@ struct Slot {
 }
 
 impl Slot {
-    fn new<R: RngCore>(ctx: LogCtx, cfg: SlotConfig, rng: &mut R) -> Self {
+    fn new(ctx: LogCtx, cfg: SlotConfig) -> Self {
         Self {
             ctx,
             mid: cfg.mid,
@@ -697,7 +745,7 @@ impl Slot {
 
             desired: None,
 
-            switcher: Switcher::new(rtp::VIDEO_FREQUENCY, rng),
+            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             // With no signaling, we assume users are viewing with 720p playback
             max_height: 720,
             min_height: 0,
@@ -1224,6 +1272,7 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
 
 impl AllocationEngine {
     const RESERVE_FRACTION: f64 = 0.10;
+    const UPGRADE_RESERVE_FRACTION: f64 = Self::RESERVE_FRACTION;
     // A slot keeps its layer until its cost exceeds ~1.33x the budget (1/0.75),
     // giving recoveries a hysteresis dead-band against churn.
     const DOWNGRADE_FACTOR: f64 = 0.75;
@@ -1244,9 +1293,7 @@ impl AllocationEngine {
             .iter()
             .map(|l| self.height(l))
             .min()
-            .unwrap_or_else(|| {
-                pulsebeam_runtime::fatal!("track reached height gating with no layers")
-            })
+            .unwrap_or_default()
     }
 
     /// Whether a layer is permitted by the client's spatial request.
@@ -1334,6 +1381,20 @@ impl AllocationEngine {
                 || target.is_some_and(|layer| self.snap(layer).healthy)
         );
         target
+    }
+
+    /// Whether this slot wanted a layer the viewer actually allows and could
+    /// not be given one.
+    ///
+    /// `pause_target` deliberately falls back past the eligibility filter so a
+    /// paused slot still names something to resume at, which means a `Pause`
+    /// alone does not distinguish "the budget refused it" from "the viewer
+    /// asked for it to be off". Only the first is starvation.
+    fn eligible_but_unfunded(&self, slot: &SlotView<'_>) -> bool {
+        slot.track
+            .layers
+            .iter()
+            .any(|layer| self.eligible(slot, layer))
     }
 
     /// The lowest eligible layer strictly above the selected layer.
@@ -1477,7 +1538,7 @@ impl AllocationEngine {
         // never drives the link to 100% (leaving room for probing/AIMD). Guaranteed
         // floors and retention may spend into it; climbing above the current layer
         // may not.
-        let reserve = bwe.as_f64() * Self::RESERVE_FRACTION;
+        let reserve = bwe.as_f64() * Self::UPGRADE_RESERVE_FRACTION;
         let mut budget = bwe.as_f64();
 
         let mut decisions = SecondaryMap::new();
@@ -1592,6 +1653,29 @@ impl AllocationEngine {
 
         decisions
     }
+
+    /// The cheapest layer the allocator was allowed to forward and could not
+    /// afford, if any. See [`Self::eligible_but_unfunded`].
+    ///
+    /// Both halves of the starvation signal in one value: `Some` means
+    /// something was unfundable, and the rate is what it would take to unblock
+    /// it. Resetting the estimate to *that* probes the one thing that could
+    /// restart feedback; resetting to full demand overshoots a small link and
+    /// costs the stream a layer reversal on the way back down.
+    pub fn cheapest_unfunded<'a>(
+        &self,
+        slots: &'a [SlotView<'a>],
+        decisions: &SecondaryMap<DownstreamSlotKey, AllocationDecision<'a>>,
+    ) -> Option<Bitrate> {
+        slots
+            .iter()
+            .filter(|slot| self.eligible_but_unfunded(slot))
+            .filter_map(|slot| match decisions.get(slot.key) {
+                Some(AllocationDecision::Pause(_, needed)) => Some(*needed),
+                _ => None,
+            })
+            .min_by(|a, b| a.as_f64().total_cmp(&b.as_f64()))
+    }
 }
 
 #[cfg(test)]
@@ -1664,15 +1748,9 @@ mod assignment_tests {
     use crate::participant::event::test_utils::MockParticipantSink;
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack};
-    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
+
     use str0m::bwe::Bitrate;
     use str0m::media::{Mid, SimulcastLayer};
-
-    fn test_rng() -> impl RngCore {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
 
     struct TestTracks {
         pub senders: Vec<UpstreamTrack>,
@@ -1683,16 +1761,16 @@ mod assignment_tests {
         use crate::entity::{ExternalRoomId, RoomId};
         LogCtx {
             room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
-            participant_id: ParticipantId::new(&mut test_rng()),
+            participant_id: ParticipantId::new(),
         }
     }
 
     fn setup_allocator() -> VideoAllocator {
-        VideoAllocator::new(test_ctx(), false, &mut test_rng())
+        VideoAllocator::new(test_ctx(), false)
     }
 
     fn add_tracks(allocator: &mut VideoAllocator, count: usize) -> TestTracks {
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
 
         let mut senders = Vec::new();
         let mut ids = Vec::new();
@@ -1726,7 +1804,7 @@ mod assignment_tests {
 
     #[test]
     fn allocation_snapshot_exposes_per_encoding_decode_target_count() {
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let (tx, built, mut states) = video_track_with_states(
             pid,
             Mid::from("v0"),
@@ -1832,8 +1910,8 @@ mod assignment_tests {
 
         allocator.rebalance();
 
-        let missing_track_id = ParticipantId::new(&mut test_rng())
-            .derive_track_id(TrackKind::Video, &Mid::from("missing"));
+        let missing_track_id =
+            ParticipantId::new().derive_track_id(TrackKind::Video, &Mid::from("missing"));
         let mut intents = HashMap::new();
         intents.insert(
             Mid::from("s0"),
@@ -1878,7 +1956,10 @@ mod assignment_tests {
         add_slots(&mut allocator, 1);
 
         let track = allocator.track(&tracks.ids[0]).unwrap();
-        let low = track.lowest_quality().clone();
+        let low = track
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
         let slot = allocator.slots.values_mut().next().unwrap();
         slot.set_roles_for_test(None, Some(&low));
         slot.paused = false;
@@ -1903,7 +1984,7 @@ mod assignment_tests {
 
     #[test]
     fn staging_preserves_old_route_until_switch_complete() {
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -1923,7 +2004,10 @@ mod assignment_tests {
         add_slots(&mut allocator, 1);
 
         let track = allocator.track(&track_id).unwrap();
-        let low = track.lowest_quality().clone();
+        let low = track
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
         let high = track.by_quality(LayerQuality::High).unwrap().clone();
 
         let slot = allocator.slots.values_mut().next().unwrap();
@@ -1959,7 +2043,10 @@ mod assignment_tests {
         add_slots(&mut allocator, 1);
 
         let track = allocator.track(&tracks.ids[0]).unwrap();
-        let old_stream_id = track.lowest_quality().stream_id();
+        let old_stream_id = track
+            .lowest_quality()
+            .expect("video track has a layer")
+            .stream_id();
         let slot_key = allocator.slots.keys().next().unwrap();
         allocator.set_route(old_stream_id.0, slot_key);
         allocator
@@ -1984,7 +2071,10 @@ mod assignment_tests {
         add_slots(&mut allocator, 2);
 
         let track = allocator.track(&tracks.ids[0]).unwrap();
-        let low = track.lowest_quality().clone();
+        let low = track
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
         let slot_keys: Vec<_> = allocator.slots.keys().collect();
         let correct_slot_key = slot_keys[0];
         let stale_slot_key = slot_keys[1];
@@ -2004,7 +2094,7 @@ mod assignment_tests {
 
     #[test]
     fn does_not_promote_staging_before_staging_packets() {
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -2070,7 +2160,7 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
 
-        let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000));
+        let (desired, _, _) = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
         assert!(allocator.current_allocation().as_f64() > 0.0);
         assert!(allocator.current_allocation() <= desired);
@@ -2083,7 +2173,12 @@ mod assignment_tests {
         add_slots(&mut allocator, 1);
 
         let track_id = tracks.ids[0];
-        let layer = allocator.track(&track_id).unwrap().lowest_quality().clone();
+        let layer = allocator
+            .track(&track_id)
+            .unwrap()
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
 
         let slot = allocator.slots.values_mut().next().unwrap();
         slot.set_roles_for_test(Some(&layer), None);
@@ -2097,7 +2192,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_accepts_ongoing_upgrade() {
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -2129,7 +2224,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_cancels_transition_when_target_reverts_to_active() {
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -2162,7 +2257,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_allows_downgrade_during_transition() {
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -2200,8 +2295,14 @@ mod assignment_tests {
 
         let t0 = allocator.track(&tracks.ids[0]).unwrap();
         let t1 = allocator.track(&tracks.ids[1]).unwrap();
-        let active = t0.lowest_quality().clone();
-        let new_target = t1.lowest_quality().clone();
+        let active = t0
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
+        let new_target = t1
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
 
         let slot = allocator.slots.values_mut().next().unwrap();
         slot.set_roles_for_test(Some(&active), None);
@@ -2281,7 +2382,7 @@ mod assignment_tests {
         }
 
         // Trigger rebalance with a new incoming track.
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let (tx, track, states) = video_track_with_states(pid, Mid::from("late"), vec![]);
         allocator.seed_layer_states(&states);
         allocator.add_track(Track {
@@ -2312,7 +2413,7 @@ mod assignment_tests {
         let mut tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
         allocator.remove_track(&tracks.ids[1]);
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let (tx, track, states) = video_track_with_states(pid, Mid::from("new_track"), vec![]);
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
@@ -2328,7 +2429,7 @@ mod assignment_tests {
     #[test]
     fn same_slot_switching_same_track_is_not_duplicate_assignment() {
         let mut allocator = setup_allocator();
-        let pid = ParticipantId::new(&mut test_rng());
+        let pid = ParticipantId::new();
         let (tx, track, states) = video_track_with_states(
             pid,
             Mid::from("t"),
@@ -2385,15 +2486,9 @@ mod allocation_tests {
     use crate::rtp::monitor::StreamQuality;
     use crate::track::LayerQuality;
     use proptest::prelude::*;
-    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
+
     use str0m::bwe::Bitrate;
     use str0m::media::Mid;
-
-    fn test_rng() -> impl RngCore {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
 
     fn next_slot_key() -> DownstreamSlotKey {
         use std::cell::RefCell;
@@ -2406,7 +2501,7 @@ mod allocation_tests {
     fn healthy_track() -> (Track, LayerStates) {
         use str0m::media::SimulcastLayer;
         let (tx, track, states) = video_track_with_states(
-            ParticipantId::new(&mut test_rng()),
+            ParticipantId::new(),
             Mid::from("t"),
             vec![
                 SimulcastLayer::new("q"),
@@ -3595,20 +3690,14 @@ mod slot_switch_tests {
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 
     use crate::track::{StreamWrite, StreamWriter};
-    use pulsebeam_runtime::rand::seeded_rng;
-    use str0m::media::SimulcastLayer;
 
-    fn test_rng() -> impl RngCore {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(9000);
-        seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
+    use str0m::media::SimulcastLayer;
 
     fn test_ctx() -> LogCtx {
         use crate::entity::{ExternalRoomId, RoomId};
         LogCtx {
             room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
-            participant_id: ParticipantId::new(&mut test_rng()),
+            participant_id: ParticipantId::new(),
         }
     }
 
@@ -3624,7 +3713,7 @@ mod slot_switch_tests {
 
     impl Fixture {
         fn new() -> Self {
-            let pid = ParticipantId::new(&mut test_rng());
+            let pid = ParticipantId::new();
             let (_, track, _states) = video_track_with_states(
                 pid,
                 Mid::from("v0"),
@@ -3637,7 +3726,7 @@ mod slot_switch_tests {
             let high = track.by_quality(LayerQuality::High).unwrap().clone();
             let low = track.by_quality(LayerQuality::Low).unwrap().clone();
 
-            let mut slot = Slot::new(test_ctx(), SlotConfig::default(), &mut test_rng());
+            let mut slot = Slot::new(test_ctx(), SlotConfig::default());
             slot.paused = false;
 
             Self {

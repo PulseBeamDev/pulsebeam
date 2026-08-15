@@ -14,7 +14,6 @@ use crate::route::Envelope;
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
-    rand::Rng,
 };
 use str0m::media::KeyframeRequestKind;
 use tokio::time::{Instant, Sleep};
@@ -67,6 +66,8 @@ pub(crate) const SHARD_VIEW_OP_BUDGET: usize = 256;
 pub(crate) const SHARD_VIEW_BACKLOG_OP_CAPACITY: usize = 16_384;
 pub(crate) const SHARD_PIPELINE_BUDGET: usize = 512;
 pub(crate) const SHARD_EVENT_BUDGET: usize = 1024;
+pub(crate) const SHARD_UDP_BATCH_BUDGET: usize = 256;
+pub(crate) const SHARD_PARTICIPANT_BUDGET: usize = 64;
 
 /// How often a shard hands its metrics to the control plane.
 ///
@@ -87,6 +88,7 @@ pub(crate) const STATS_CAPACITY: usize = 4;
 /// of a tick that is already long when the next tick will almost certainly be
 /// cheaper. [`STATS_DEADLINE_SLACK`] bounds how long that can go on.
 const STATS_BUSY_TICK: Duration = Duration::from_micros(200);
+const LONG_TICK: Duration = Duration::from_millis(10);
 
 /// How far past its due time a report may be deferred waiting for a cheap
 /// tick. A shard saturated for this long reports anyway: stale metrics from a
@@ -131,6 +133,10 @@ fn describe_shard_metrics() {
     metrics::describe_counter!(
         "shard_tick_budget_hit",
         "ticks that exhausted a bounded work phase before its queue drained"
+    );
+    metrics::describe_counter!(
+        "shard_long_tick",
+        "ticks longer than the realtime latency alarm threshold"
     );
     metrics::describe_counter!(
         "view_backlog_shed",
@@ -227,6 +233,11 @@ pub(crate) enum MediaPayload {
     reason = "the payload enum carries boxed RTP packets and owned SCTP bytes so cross-shard payloads remain core-local"
 )]
 pub(crate) enum ShardFrame {
+    Ingress {
+        batch: RecvPacketBatch,
+        handle: crate::route::TransportHandle,
+        source_shard: ShardId,
+    },
     /// Forward payload, addressed by the destination's own route. Carries no
     /// semantic ids: everything needed to deliver it lives in the destination's
     /// compiled route entry.
@@ -262,6 +273,11 @@ pub(crate) type ShardEventMessage = (ShardId, ShardEvent);
 /// canonical state and publishes the resulting execution image.
 #[derive(Debug)]
 pub(crate) enum ShardEvent {
+    TransportAuthenticated {
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        shard: ShardId,
+    },
     ParticipantClosed {
         participant: ParticipantId,
     },
@@ -429,10 +445,16 @@ impl ShardWorker {
         frame_txs: Vec<mailbox::Sender<ShardFrame>>,
         metrics: Arc<ShardMetrics>,
         stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
-        rng: Rng,
         wall: WallAnchor,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall, view_rx);
+        let shard_count = frame_txs.len();
+        let core = ShardCore::new(
+            shard_id,
+            udp_socket.max_gso_segments(),
+            shard_count,
+            wall,
+            view_rx,
+        );
         let router = ChannelTransport {
             shard_id,
             frame_txs,
@@ -520,6 +542,9 @@ impl ShardWorker {
         metrics::counter!("idle_us").absolute(idle_us);
         metrics::histogram!("tick_us")
             .record(u64::try_from(previous_busy.as_micros()).unwrap_or(u64::MAX) as f64);
+        if previous_busy >= LONG_TICK {
+            metrics::counter!("shard_long_tick").increment(1);
+        }
     }
 
     /// Hand this shard's cumulative metrics to the control plane.
@@ -617,12 +642,26 @@ impl ShardWorker {
 
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
         let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
-        for batch in self.recv_batch.drain(..) {
-            self.core.on_udp_batch(batch);
+        let received = self.recv_batch.len();
+        for batch in self
+            .recv_batch
+            .drain(..SHARD_UDP_BATCH_BUDGET.min(received))
+        {
+            self.core.on_udp_batch_routed(batch, &self.router);
+        }
+        if received >= SHARD_UDP_BATCH_BUDGET {
+            self.tick_budget_hit("udp");
         }
 
-        self.core
-            .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
+        if self.core.poll_and_flush_dirty(
+            now,
+            &mut self.udp_socket,
+            &mut self.tcp_socket,
+            SHARD_PARTICIPANT_BUDGET,
+        ) == SHARD_PARTICIPANT_BUDGET
+        {
+            self.tick_budget_hit("participants");
+        }
         if self
             .core
             .flush_stream_buffers(&self.router, SHARD_PIPELINE_BUDGET)
@@ -630,8 +669,15 @@ impl ShardWorker {
         {
             self.tick_budget_hit("pipeline");
         }
-        self.core
-            .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
+        if self.core.poll_and_flush_dirty(
+            now,
+            &mut self.udp_socket,
+            &mut self.tcp_socket,
+            SHARD_PARTICIPANT_BUDGET,
+        ) == SHARD_PARTICIPANT_BUDGET
+        {
+            self.tick_budget_hit("participants");
+        }
         if self
             .core
             .flush_participant_events(&self.router, SHARD_PIPELINE_BUDGET)
@@ -766,6 +812,7 @@ mod architecture_tests {
 
     fn event_variant(event: &ShardEvent) -> u8 {
         match event {
+            ShardEvent::TransportAuthenticated { .. } => 13,
             ShardEvent::ParticipantClosed { .. } => 0,
             ShardEvent::TrackSubscribed { .. } => 1,
             ShardEvent::TrackUnsubscribed { .. } => 2,

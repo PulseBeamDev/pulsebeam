@@ -52,9 +52,24 @@ impl DirtyTracker {
         Some(entry)
     }
 
+    pub fn exhausted(&self) -> bool {
+        self.cursor >= self.participants.len()
+    }
+
     pub fn finish_phase(&mut self) {
         debug_assert_eq!(self.cursor, self.participants.len());
         self.participants.clear();
+        self.cursor = 0;
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(self.active);
+            self.active = false;
+        }
+    }
+
+    pub fn finish_partial(&mut self) {
+        debug_assert!(self.cursor <= self.participants.len());
+        self.participants.drain(..self.cursor);
         self.cursor = 0;
         #[cfg(debug_assertions)]
         {

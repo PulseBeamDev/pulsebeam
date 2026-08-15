@@ -120,9 +120,14 @@ impl IceUfrag {
 
     /// Build complete `IceCreds` (encoded ufrag + random password) ready to
     /// pass to `rtc.direct_api().set_local_ice_credentials(...)`.
-    pub fn into_ice_creds(self, rng: &mut impl pulsebeam_runtime::rand::RngCore) -> IceCreds {
+    pub fn into_ice_creds(self) -> IceCreds {
+        // The ICE password is the only thing authenticating a peer against this
+        // route, so it comes from OS entropy directly. Under simulation the
+        // `getrandom(2)` override makes that reproducible without any seed
+        // being threaded here.
         let mut pass_raw = [0u8; PASS_RAW_LEN];
-        rng.fill_bytes(&mut pass_raw);
+        use pulsebeam_runtime::rand::RngCore;
+        pulsebeam_runtime::rand::os_rng().fill_bytes(&mut pass_raw);
         let pass = base32::encode(base32::Alphabet::Crockford, &pass_raw);
         IceCreds {
             ufrag: self.encode(),
@@ -138,7 +143,6 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::id::ShardId;
-    use pulsebeam_runtime::rand::os_rng;
 
     fn route(shard: usize, slot: u32) -> TransportRoute {
         TransportRoute::new(ShardId::new(shard), slot)
@@ -179,7 +183,7 @@ mod tests {
     #[test]
     fn ice_creds_ufrag_and_pass_lengths() {
         let u = IceUfrag::new(1, 2, route(3, 9), 5);
-        let creds = u.into_ice_creds(&mut os_rng());
+        let creds = u.into_ice_creds();
         assert_eq!(creds.ufrag.len(), 16);
         assert_eq!(creds.pass.len(), 24); // 15 bytes → 24 Crockford chars
         assert!(creds.pass.len() >= 22); // RFC 8445 minimum

@@ -1,4 +1,3 @@
-use pulsebeam_runtime::rand::Rng;
 use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
@@ -7,7 +6,7 @@ use std::collections::HashSet;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
-use crate::route::{Envelope, RouteHandle};
+use crate::route::{Envelope, RouteHandle, TransportHandle};
 use crate::shard::events::{
     AudioRtpEvent, ParticipantEvent, ParticipantLifecycleEvent, ParticipantSubscriptionEvent,
 };
@@ -167,7 +166,6 @@ pub(crate) struct ShardCore {
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
     pipeline: EventPipeline,
-    rng: Rng,
     wall: WallAnchor,
 }
 
@@ -175,12 +173,19 @@ impl ShardCore {
     pub(crate) fn new(
         shard_id: impl Into<crate::id::ShardId>,
         max_gso_segments: usize,
-        mut rng: Rng,
+        shard_count: usize,
         wall: WallAnchor,
         view_rx: mailbox::Receiver<Box<crate::view::ShardViewDelta>>,
     ) -> Self {
         let shard_id = shard_id.into();
-        let runtime = ShardRuntime::new(shard_id, &mut rng);
+        debug_assert!(shard_count > 0);
+        // A node cannot bind more sockets than `PackedRoute` can address, and
+        // the route's shard field is 12 bits — so this cannot overflow. Clamp
+        // rather than panic: a shard that mis-sizes its own steering table
+        // should drop packets it cannot own, not take the process down.
+        let shard_count = u16::try_from(shard_count).unwrap_or(u16::MAX);
+        debug_assert!(shard_count > 0, "a node always has at least one shard");
+        let runtime = ShardRuntime::new(shard_id);
         let view = crate::view::ShardView {
             shard: shard_id,
             ..Default::default()
@@ -191,13 +196,12 @@ impl ShardCore {
             view_rx,
             pending_view_delta: None,
             pending_view_offset: 0,
-            registry: ParticipantRegistry::new(shard_id, max_gso_segments),
+            registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             runtime,
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
             pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
-            rng,
             wall,
         }
     }
@@ -440,6 +444,7 @@ impl ShardCore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn on_udp_batch(&mut self, batch: net::RecvPacketBatch) {
         let Some(handle) = self.registry.demux(&batch) else {
             return;
@@ -454,6 +459,36 @@ impl ShardCore {
             crate::sim_metrics::record_routing_counter("shard_wrong_owner_drop");
             return;
         }
+        self.on_owned_udp_batch(batch, handle);
+    }
+
+    pub(crate) fn on_udp_batch_routed(
+        &mut self,
+        batch: net::RecvPacketBatch,
+        router: &impl ShardTransport,
+    ) {
+        let Some(handle) = self.registry.demux(&batch) else {
+            return;
+        };
+        if handle.shard() != self.shard_id {
+            router.send_frame(
+                handle.shard(),
+                ShardFrame::Ingress {
+                    batch,
+                    handle,
+                    source_shard: self.shard_id,
+                },
+            );
+            metrics::counter!("shard_wrong_owner_forward").increment(1);
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::record_routing_counter("shard_wrong_owner_forward");
+            return;
+        }
+        self.on_owned_udp_batch(batch, handle);
+    }
+
+    fn on_owned_udp_batch(&mut self, batch: net::RecvPacketBatch, handle: TransportHandle) {
+        debug_assert_eq!(handle.shard(), self.shard_id);
         let Some(key) = self.view.transports.resolve(handle) else {
             return;
         };
@@ -594,6 +629,31 @@ impl ShardCore {
                             track,
                         }),
                 },
+                ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Connected {
+                    participant_key,
+                    source,
+                    destination,
+                }) => {
+                    // Nothing to install: the demuxer cached this address when
+                    // it classified the flow's bootstrap, on whichever shard
+                    // that landed. All this does is tell control the flow is
+                    // real, so it can pin it in the steering map and retire the
+                    // cross-shard hop.
+                    if self
+                        .registry
+                        .authenticated_handle(participant_key)
+                        .is_none()
+                    {
+                        debug_assert!(false, "authenticated participant must still be registered");
+                        continue;
+                    }
+                    self.pipeline
+                        .push_shard_event(ShardEvent::TransportAuthenticated {
+                            source,
+                            destination,
+                            shard: self.shard_id,
+                        });
+                }
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
                     participant_id,
                     participant_key,
@@ -769,6 +829,25 @@ impl ShardCore {
         router: &impl ShardTransport,
     ) {
         match frame {
+            ShardFrame::Ingress {
+                batch,
+                handle,
+                source_shard,
+            } => {
+                // A datagram that reached the node on another shard's socket.
+                // Ordinary while a flow is bootstrapping — the steering map is
+                // a cache, and a miss lands on whatever the kernel's tuple hash
+                // picked. A rate that does not fall once flows are established
+                // means the map is not being populated.
+                debug_assert_ne!(
+                    source_shard, self.shard_id,
+                    "a shard cannot forward to itself"
+                );
+                metrics::counter!("shard_ingress_forwarded").increment(1);
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_counter("shard_ingress_forwarded");
+                self.on_owned_udp_batch(batch, handle);
+            }
             ShardFrame::Media { env, payload } => self.on_media_frame(env, payload, now, router),
             ShardFrame::Reverse { env, body } => self.on_reverse_frame(env, body, router),
             ShardFrame::Telemetry { env, stats } => {
@@ -836,7 +915,7 @@ impl ShardCore {
         cfg: ParticipantConfig,
     ) {
         debug_assert_eq!(transport.shard(), self.shard_id);
-        if !self.registry.insert(key, cfg, transport, &mut self.rng) {
+        if !self.registry.insert(key, cfg, transport) {
             return;
         }
         if let Some(participant) = self.registry.resolve_mut(key) {
@@ -874,10 +953,17 @@ impl ShardCore {
         now: Instant,
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
-    ) {
+        budget: usize,
+    ) -> usize {
+        debug_assert!(budget > 0);
         debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
-        while let Some(key) = self.dirty.next() {
+        let mut processed = 0;
+        while processed < budget {
+            let Some(key) = self.dirty.next() else {
+                break;
+            };
+            processed = processed.saturating_add(1);
             let Some(participant) = self.registry.resolve_mut(key) else {
                 continue;
             };
@@ -901,8 +987,13 @@ impl ShardCore {
             }
             participant.tcp_batcher.flush_tcp(tcp_socket);
         }
-        self.dirty.finish_phase();
+        if !self.dirty.exhausted() {
+            self.dirty.finish_partial();
+        } else {
+            self.dirty.finish_phase();
+        }
         self.udp_send_batch.flush(udp_socket);
+        processed
     }
 
     pub(crate) fn flush_close_peers(
@@ -949,22 +1040,17 @@ mod wrong_owner_tests {
         buf
     }
 
-    /// `SO_REUSEPORT` picks the receiving socket by hashing the 4-tuple, which
-    /// has nothing to do with which shard the ufrag names, so a datagram for
-    /// another shard arriving here is ordinary traffic. It must be dropped and
-    /// counted — never asserted on, and never re-enqueued.
-    ///
-    /// This was a `debug_assert_eq!`, which aborted under the sim and test
-    /// profiles and made the counted drop three lines below it unreachable.
-    /// Re-adding it makes this test abort rather than fail.
+    /// The compatibility entry point has no transport for forwarding, so a
+    /// foreign datagram is counted and discarded. Workers use
+    /// `on_udp_batch_routed`, which forwards the same datagram to its owner.
     #[tokio::test(start_paused = true)]
     async fn a_datagram_for_another_shard_is_dropped_not_asserted() {
         let shard = ShardId::new(0);
         let (_writer, view_rx) = crate::view::new_shard_view(shard);
         let mut core = ShardCore::new(
             shard,
-            1,
-            pulsebeam_runtime::rand::seeded_rng(1),
+            4,
+            4,
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
             view_rx,
         );
@@ -987,5 +1073,55 @@ mod wrong_owner_tests {
             0,
             "a foreign-shard datagram must not create or touch local state"
         );
+    }
+
+    struct CaptureTransport {
+        frames: std::cell::RefCell<Vec<(ShardId, ShardFrame)>>,
+    }
+
+    impl ShardTransport for CaptureTransport {
+        fn send_media(&self, _dst: ShardId, _env: Envelope, _payload: MediaPayload) {}
+
+        fn send_frame(&self, dst: ShardId, frame: ShardFrame) {
+            self.frames.borrow_mut().push((dst, frame));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_datagram_for_another_shard_is_forwarded_to_its_owner() {
+        let shard = ShardId::new(0);
+        let (_writer, view_rx) = crate::view::new_shard_view(shard);
+        let mut core = ShardCore::new(
+            shard,
+            4,
+            4,
+            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            view_rx,
+        );
+        let router = CaptureTransport {
+            frames: std::cell::RefCell::new(Vec::new()),
+        };
+        let foreign = TransportRoute::new(ShardId::new(3), 41);
+        let data = stun_binding_request(&IceUfrag::new(0, 0, foreign, 9).encode());
+        let len = data.len();
+
+        core.on_udp_batch_routed(
+            RecvPacketBatch {
+                src: "203.0.113.7:40000".parse().unwrap(),
+                dst: "198.51.100.1:3478".parse().unwrap(),
+                buf: data,
+                stride: len,
+                len,
+                transport: Transport::Udp(UdpMode::Scalar),
+                offset: 0,
+            },
+            &router,
+        );
+
+        let mut frames = router.frames.borrow_mut();
+        assert_eq!(frames.len(), 1);
+        let (dst, frame) = frames.pop().expect("wrong-owner ingress must be forwarded");
+        assert_eq!(dst, ShardId::new(3));
+        assert!(matches!(frame, ShardFrame::Ingress { source_shard, .. } if source_shard == shard));
     }
 }

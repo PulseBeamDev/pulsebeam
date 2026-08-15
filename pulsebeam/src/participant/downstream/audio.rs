@@ -225,14 +225,14 @@ mod tests {
         use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
         LogCtx {
             room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
-            participant_id: ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(1)),
+            participant_id: ParticipantId::new(),
         }
     }
 
     fn origin(seed: u64) -> AudioOrigin {
         use crate::entity::{ParticipantId, TrackKind};
-        let mut rng = pulsebeam_runtime::rand::seeded_rng(seed);
-        let participant = ParticipantId::new(&mut rng);
+        let _rng = pulsebeam_runtime::rand::seeded_rng(seed);
+        let participant = ParticipantId::new();
         AudioOrigin {
             track: participant.derive_track_id(TrackKind::Audio, "mic"),
             participant,

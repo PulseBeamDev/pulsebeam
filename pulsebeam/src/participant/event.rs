@@ -6,6 +6,7 @@ use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
 use str0m::channel::ChannelId;
 
 pub(crate) trait ParticipantSink {
+    fn connected(&mut self, source: std::net::SocketAddr, destination: std::net::SocketAddr);
     fn subscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey);
     fn unsubscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey);
     fn publish_track(&mut self, track: Track, states: crate::track::TrackStates);
@@ -89,6 +90,9 @@ pub mod test_utils {
     }
 
     impl ParticipantSink for MockParticipantSink {
+        fn connected(&mut self, _source: std::net::SocketAddr, _destination: std::net::SocketAddr) {
+        }
+
         fn subscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey) {
             self.subscribe_calls.push((track, slot));
         }

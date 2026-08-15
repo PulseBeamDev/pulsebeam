@@ -3,13 +3,12 @@ use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 
 use pulsebeam_runtime::net::RecvPacketBatch;
-use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use slotmap::SecondaryMap;
 
 use crate::{
     id::ShardId,
     participant::{ParticipantConfig, ParticipantCore},
-    route::{TransportHandle, TransportRoute},
+    route::TransportHandle,
     shard::demux::Demuxer,
 };
 
@@ -18,7 +17,7 @@ pub(crate) use crate::keys::ParticipantKey;
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
     pub(super) queued_dirty: bool,
-    pub(super) ingress_route: TransportRoute,
+    pub(super) ingress: TransportHandle,
 }
 
 impl Deref for ParticipantMeta {
@@ -48,12 +47,13 @@ impl ParticipantRegistry {
         self.participants.len()
     }
 
-    pub fn new(shard_id: ShardId, max_gso_segments: usize) -> Self {
+    pub fn new(shard_id: ShardId, max_gso_segments: usize, shard_count: u16) -> Self {
+        debug_assert!(shard_count > 0);
         Self {
             shard_id,
             max_gso_segments,
             participants: SecondaryMap::new(),
-            demuxer: Demuxer::new(),
+            demuxer: Demuxer::for_node(0, 0, shard_count),
             pending_close: VecDeque::new(),
         }
     }
@@ -63,18 +63,10 @@ impl ParticipantRegistry {
         key: ParticipantKey,
         cfg: ParticipantConfig,
         ingress: TransportHandle,
-        rng: &mut Rng,
     ) -> bool {
         debug_assert_eq!(ingress.shard(), self.shard_id);
         let participant_id = cfg.participant_id;
-        let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
-        let core = ParticipantCore::new(
-            cfg,
-            self.shard_id,
-            self.max_gso_segments,
-            1,
-            &mut participant_rng,
-        );
+        let core = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
         if self.participants.contains_key(key) {
             debug_assert!(false, "duplicate participant materialization");
             return false;
@@ -84,7 +76,7 @@ impl ParticipantRegistry {
             ParticipantMeta {
                 core,
                 queued_dirty: false,
-                ingress_route: ingress.route,
+                ingress,
             },
         );
         debug_assert!(previous.is_none());
@@ -94,7 +86,7 @@ impl ParticipantRegistry {
 
     pub fn remove_key(&mut self, key: ParticipantKey) -> Option<ParticipantMeta> {
         let meta = self.participants.remove(key)?;
-        let addrs = self.demuxer.unregister(meta.ingress_route);
+        let addrs = self.demuxer.unregister(meta.ingress.route);
         self.pending_close.extend(addrs);
         Some(meta)
     }
@@ -147,6 +139,20 @@ impl ParticipantRegistry {
 
     pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<TransportHandle> {
         self.demuxer.demux(batch)
+    }
+
+    /// The route a participant's authenticated address belongs to.
+    ///
+    /// The demuxer already cached this address when it classified the flow's
+    /// bootstrap, so there is nothing to install here — this only reports the
+    /// handle so the shard can tell control which flow to pin in the steering
+    /// map.
+    pub fn authenticated_handle(&self, key: ParticipantKey) -> Option<TransportHandle> {
+        let Some(meta) = self.participants.get(key) else {
+            debug_assert!(false, "authenticated participant must still be registered");
+            return None;
+        };
+        Some(meta.ingress)
     }
 
     pub fn drain_pending_close(&mut self) -> impl Iterator<Item = SocketAddr> + '_ {

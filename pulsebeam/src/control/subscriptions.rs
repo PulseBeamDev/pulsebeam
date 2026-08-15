@@ -14,7 +14,7 @@
 //! answer to a question.
 #![deny(clippy::arithmetic_side_effects)]
 
-use ahash::{HashMap, HashMapExt};
+use indexmap::IndexMap;
 
 use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
@@ -28,7 +28,7 @@ struct Interest {
     /// for somebody who never subscribed must not retire a live route, and a
     /// repeated subscribe must not inflate a count that then never returns to
     /// zero.
-    subscribers: ahash::HashMap<ParticipantId, (ParticipantKey, DownstreamSlotKey)>,
+    subscribers: IndexMap<ParticipantId, (ParticipantKey, DownstreamSlotKey)>,
     route: Option<RouteHandle>,
 }
 
@@ -51,13 +51,13 @@ pub(crate) enum InterestChange {
 /// to this across the node", which is what a nested shape would optimise for.
 #[derive(Debug)]
 pub(crate) struct Subscriptions<K> {
-    interest: HashMap<(ShardId, K), Interest>,
+    interest: IndexMap<(ShardId, K), Interest>,
 }
 
 impl<K: std::hash::Hash + Eq + Clone> Default for Subscriptions<K> {
     fn default() -> Self {
         Self {
-            interest: HashMap::new(),
+            interest: IndexMap::new(),
         }
     }
 }
@@ -112,7 +112,7 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
         let Some(interest) = self.interest.get_mut(&key) else {
             return InterestChange::None;
         };
-        if interest.subscribers.remove(subscriber).is_none() {
+        if interest.subscribers.shift_remove(subscriber).is_none() {
             return InterestChange::None;
         }
         if !interest.subscribers.is_empty() {
@@ -120,11 +120,11 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
         }
         match interest.route.take() {
             Some(route) => {
-                self.interest.remove(&key);
+                self.interest.shift_remove(&key);
                 InterestChange::Retire { route }
             }
             None => {
-                self.interest.remove(&key);
+                self.interest.shift_remove(&key);
                 InterestChange::None
             }
         }
@@ -175,7 +175,7 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
     pub fn remove_participant(&mut self, subscriber: &ParticipantId) -> Vec<Retired> {
         let mut retired = Vec::new();
         self.interest.retain(|(shard, _stream), interest| {
-            if interest.subscribers.remove(subscriber).is_none() {
+            if interest.subscribers.shift_remove(subscriber).is_none() {
                 return true;
             }
             if !interest.subscribers.is_empty() {

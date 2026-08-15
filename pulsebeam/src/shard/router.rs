@@ -117,12 +117,12 @@ pub(crate) struct ShardRuntime {
 }
 
 impl ShardRuntime {
-    pub fn new(shard_id: ShardId, rng: &mut impl pulsebeam_runtime::rand::RngCore) -> Self {
+    pub fn new(shard_id: ShardId) -> Self {
         Self {
             tracks: SecondaryMap::new(),
             data: SecondaryMap::new(),
             reliable: SecondaryMap::new(),
-            audio_selector: TopNAudioSelector::new(rng),
+            audio_selector: TopNAudioSelector::new(),
             routes: RouteRuntime::new(shard_id),
         }
     }
@@ -481,6 +481,9 @@ mod tests {
             states: Vec::new(),
             publication: Track {
                 meta: TrackMeta {
+                    room_id: crate::entity::RoomId::from_external(
+                        &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+                    ),
                     shard_id: ShardId::new(0),
                     id,
                     origin: ParticipantId::from_bytes([7; 16]),
@@ -494,8 +497,8 @@ mod tests {
 
     #[test]
     fn reinserting_a_live_track_runtime_replaces_its_encodings() {
-        let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
-        let mut runtime = ShardRuntime::new(ShardId::new(0), &mut rng);
+        let _rng = pulsebeam_runtime::rand::seeded_rng(1);
+        let mut runtime = ShardRuntime::new(ShardId::new(0));
         let mut track_keys = SlotMap::<TrackKey, ()>::with_key();
         let key = track_keys.insert(());
         let mut participant_keys = SlotMap::<ParticipantKey, ()>::with_key();

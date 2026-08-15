@@ -5,6 +5,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::{id::ShardId, shard::ShardContext, shard::worker::ShardCommand};
 
+#[cfg(test)]
 const MAX_LOAD: f64 = 0.8;
 
 pub struct ShardRouter {
@@ -16,7 +17,8 @@ pub struct ShardRouter {
 }
 
 impl ShardRouter {
-    pub fn new(shard_contexts: Vec<ShardContext>, rng: &mut impl RngCore) -> Self {
+    pub fn new(shard_contexts: Vec<ShardContext>) -> Self {
+        let mut rng = pulsebeam_runtime::rand::os_rng();
         let shard_count = shard_contexts.len();
         let shard_occupancy_snapshots = shard_contexts
             .iter()
@@ -93,6 +95,7 @@ impl ShardRouter {
         self.shard_loads.len()
     }
 
+    #[cfg(test)]
     pub fn try_route<K: Hash>(&self, key: &K) -> Option<ShardId> {
         let mut best_index = None;
         let mut max_hash = -1.0;
@@ -117,6 +120,26 @@ impl ShardRouter {
         }
 
         best_index
+    }
+
+    pub fn stable_route<K: Hash>(&self, key: &K) -> Option<ShardId> {
+        let mut best_index = None;
+        let mut best_hash = 0;
+        for index in 0..self.shard_loads.len() {
+            let hash = self.hash_for(key, index);
+            if best_index.is_none() || hash > best_hash {
+                best_hash = hash;
+                best_index = Some(ShardId::new(index));
+            }
+        }
+        best_index
+    }
+
+    fn hash_for<K: Hash>(&self, key: &K, index: usize) -> u64 {
+        let mut hasher = self.hasher_config.build_hasher();
+        key.hash(&mut hasher);
+        index.hash(&mut hasher);
+        hasher.finish()
     }
 
     pub fn try_send(
@@ -211,5 +234,14 @@ mod tests {
             router.try_route(&room_key).is_none(),
             "Router should signal busy state when no healthy cores remain"
         );
+    }
+
+    #[test]
+    fn stable_route_ignores_load() {
+        let mut router = setup_test_router(4);
+        let room_key = "room-stable";
+        let expected = router.stable_route(&room_key).unwrap();
+        router.shard_loads[expected.index()] = 1.0;
+        assert_eq!(router.stable_route(&room_key), Some(expected));
     }
 }

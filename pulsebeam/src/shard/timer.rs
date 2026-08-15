@@ -124,19 +124,18 @@ impl TimerWheel {
             return Some(self.last_now);
         }
 
-        let mut offset = 1;
-        while offset < SLOT_COUNT {
-            let tick = self.current_tick.saturating_add(offset as u64);
-            if self.slot_occupied(usize::from(slot_of(tick))) {
-                return Some(
-                    self.epoch
-                        .checked_add(Duration::from_millis(tick))
-                        .unwrap_or(self.epoch),
-                );
-            }
-            offset = offset.saturating_add(1);
-        }
-        None
+        // Scan the occupancy words, not the slots. The wheel is 256 slots in
+        // four `u64`s, so the next armed slot is found with at most four
+        // `trailing_zeros` instead of 255 bit tests — and this runs on every
+        // tick, for every shard, whether or not any timer is armed.
+        let start = usize::from(slot_of(self.current_tick.saturating_add(1)));
+        let offset = self.next_occupied_from(start)?;
+        let tick = self.current_tick.saturating_add(1).saturating_add(offset);
+        Some(
+            self.epoch
+                .checked_add(Duration::from_millis(tick))
+                .unwrap_or(self.epoch),
+        )
     }
 
     pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantKey)) {
@@ -296,10 +295,62 @@ impl TimerWheel {
         u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
 
+    #[cfg(test)]
     fn slot_occupied(&self, slot: usize) -> bool {
         self.occupied
             .get(slot / 64)
             .is_some_and(|word| word & (1 << (slot % 64)) != 0)
+    }
+
+    /// Slots from `start` (inclusive), wrapping, until one is occupied.
+    /// Returns the distance from `start`, or `None` if the wheel is empty.
+    ///
+    /// Walks whole words and uses `trailing_zeros`, so an empty wheel costs
+    /// four loads and an occupied one costs at most five.
+    fn next_occupied_from(&self, start: usize) -> Option<u64> {
+        debug_assert!(start < SLOT_COUNT);
+        // Rotate the bitmap so `start` sits at bit 0, then the first set bit
+        // is the answer. Done word by word to avoid materialising a 256-bit
+        // shift.
+        for step in 0..OCCUPANCY_WORDS.saturating_add(1) {
+            let base = start.saturating_add(step.saturating_mul(64));
+            let word = self.rotated_word(base);
+            if word != 0 {
+                let distance = step
+                    .saturating_mul(64)
+                    .saturating_add(word.trailing_zeros() as usize);
+                if distance < SLOT_COUNT {
+                    return Some(distance as u64);
+                }
+            }
+        }
+        None
+    }
+
+    /// The 64 slots beginning at `base` (wrapping), packed into a word with
+    /// `base` at bit 0.
+    fn rotated_word(&self, base: usize) -> u64 {
+        let base = base % SLOT_COUNT;
+        let word_idx = base / 64;
+        let bit = base % 64;
+        let lo = self.occupied.get(word_idx).copied().unwrap_or(0);
+        let hi = self
+            .occupied
+            .get(word_idx.saturating_add(1) % OCCUPANCY_WORDS)
+            .copied()
+            .unwrap_or(0);
+        if bit == 0 {
+            lo
+        } else {
+            // `bit` is `base % 64` and non-zero here, so the complement is in
+            // 1..=63 and neither shift can reach the width. Spelled with
+            // `saturating_sub` because this module denies bare arithmetic: a
+            // wrapped shift width here would silently mis-read the wheel
+            // rather than fail.
+            debug_assert!((1..64).contains(&bit));
+            let complement = 64usize.saturating_sub(bit);
+            (lo >> bit) | (hi << complement)
+        }
     }
 
     fn set_occupied(&mut self, slot: usize) {
@@ -317,6 +368,54 @@ impl TimerWheel {
 
 #[cfg(test)]
 mod tests {
+
+    /// `next_occupied_from` replaced a 255-iteration bit-by-bit scan that ran
+    /// on every tick. It is bit manipulation over a wrapping bitmap, so it is
+    /// checked against the obvious implementation at every start offset and
+    /// for every single-slot pattern, rather than at a few hand-picked ones.
+    #[test]
+    fn word_scanning_agrees_with_a_naive_slot_scan() {
+        fn naive(wheel: &TimerWheel, start: usize) -> Option<u64> {
+            (0..SLOT_COUNT).find_map(|d| {
+                wheel
+                    .slot_occupied((start + d) % SLOT_COUNT)
+                    .then_some(d as u64)
+            })
+        }
+
+        let mut wheel = TimerWheel::new(8);
+        for start in 0..SLOT_COUNT {
+            assert_eq!(
+                wheel.next_occupied_from(start),
+                naive(&wheel, start),
+                "empty wheel, start {start}"
+            );
+        }
+
+        for armed in 0..SLOT_COUNT {
+            wheel.set_occupied(armed);
+            for start in 0..SLOT_COUNT {
+                assert_eq!(
+                    wheel.next_occupied_from(start),
+                    naive(&wheel, start),
+                    "slot {armed} armed, start {start}"
+                );
+            }
+            wheel.clear_occupied(armed);
+        }
+
+        // A scattered pattern that straddles every word boundary.
+        for armed in [0, 1, 63, 64, 65, 127, 128, 191, 192, 255] {
+            wheel.set_occupied(armed);
+        }
+        for start in 0..SLOT_COUNT {
+            assert_eq!(
+                wheel.next_occupied_from(start),
+                naive(&wheel, start),
+                "scattered pattern, start {start}"
+            );
+        }
+    }
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;

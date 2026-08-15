@@ -98,6 +98,7 @@ impl StreamWriter {
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
+    pub room_id: crate::entity::RoomId,
     /// The shard ID that hosts this track's publisher.
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
@@ -396,25 +397,23 @@ pub struct Track {
 }
 
 impl Track {
-    pub fn lowest_quality(&self) -> &TrackLayer {
-        self.layers
-            .iter()
-            .min_by_key(|l| l.quality)
-            .unwrap_or_else(|| {
-                pulsebeam_runtime::fatal!("track {} was published with no layers", self.meta.id)
-            })
+    pub fn lowest_quality(&self) -> Option<&TrackLayer> {
+        self.layers.iter().min_by_key(|l| l.quality)
     }
 
     /// Lowest layer that is currently healthy, falling back to the absolute
     /// lowest when no layer is healthy yet. Prefer this over `lowest_quality`
     /// when staging an initial layer so the slot can actually receive a keyframe
     /// (an inactive layer never produces packets and the slot would stall).
-    pub fn lowest_healthy_quality(&self, is_healthy: impl Fn(&TrackLayer) -> bool) -> &TrackLayer {
+    pub fn lowest_healthy_quality(
+        &self,
+        is_healthy: impl Fn(&TrackLayer) -> bool,
+    ) -> Option<&TrackLayer> {
         self.layers
             .iter()
             .filter(|l| is_healthy(l))
             .min_by_key(|l| l.quality)
-            .unwrap_or_else(|| self.lowest_quality())
+            .or_else(|| self.lowest_quality())
     }
 
     pub fn by_quality(&self, quality: LayerQuality) -> Option<&TrackLayer> {
@@ -592,6 +591,9 @@ pub mod test_utils {
     ) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+            ),
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
@@ -602,6 +604,9 @@ pub mod test_utils {
     pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
         let meta = TrackMeta {
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+            ),
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
@@ -981,8 +986,8 @@ mod data_track {
 
         #[test]
         fn test_reliable_subscribe_rejects_publisher_scope() {
-            let mut rng = test_rng();
-            let publisher_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let publisher_id = ParticipantId::new();
             let label = format!("v1/rel/sub/chat/{}", publisher_id.as_str());
             let err = DataTrackIntent::try_from(&rel_cfg(&label)).unwrap_err();
             assert_eq!(
@@ -1021,8 +1026,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_subscribe_valid() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/sub/game-sync/{}", participant_id.as_str());
             let res = DataTrackIntent::try_from(&cfg(&label)).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
@@ -1036,8 +1041,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_publish_rejected() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/pub/game-sync/{}", participant_id.as_str());
             let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
             assert_eq!(err, DataTrackIntentError::ScopeNotAllowedForPublish);
@@ -1052,8 +1057,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_subscribe_trailing_garbage() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/sub/game-sync/{}/trailing", participant_id.as_str());
             let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
             assert!(matches!(err, DataTrackIntentError::InvalidScope(_)));
@@ -1374,7 +1379,7 @@ mod simulcast_pause_tests {
     /// A three-encoding video track and a starting instant.
     fn track() -> (UpstreamTrack, Instant) {
         let now = Instant::now();
-        let participant = ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(7));
+        let participant = ParticipantId::new();
         let (upstream, _) = test_utils::make_video_track(
             participant,
             Mid::from("v"),

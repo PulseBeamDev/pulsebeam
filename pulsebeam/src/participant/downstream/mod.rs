@@ -9,12 +9,11 @@ use crate::entity::TrackKind;
 use crate::id::AudioSelectorSlotId;
 use crate::log::LogCtx;
 use crate::participant::downstream::audio::AudioAllocator;
-use crate::participant::downstream::video::MIN_BANDWIDTH;
+use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamWriter, Track, TrackLayer};
-use pulsebeam_runtime::rand::RngCore;
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
 use str0m::rtp::{SeqNo, Ssrc};
@@ -47,22 +46,19 @@ impl Default for SlotConfig {
 /// watch a frozen stream for long.
 const STARVATION_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The share of the estimate that must be in use for the link to count as measured.
-///
-/// Below this the forwarded rate cannot characterise the path: feedback describes the traffic
-/// that was sent, so a trickle reports on a trickle whatever the link can really do. Deliberately
-/// far from 1.0 - an allocator may spend well under its estimate for perfectly good reasons, such
-/// as deliberately backgrounding a stream, and that must not read as starvation. Only a link that
-/// has gone genuinely quiet qualifies: the deadlock this catches sits at ~15% of its estimate,
-/// while a healthy allocator backgrounding a screen share sits at ~44%.
-const MEASURED_SHARE_OF_ESTIMATE: f64 = 0.25;
-
 /// How much the estimate must move for feedback to count as flowing.
 ///
 /// Small, because the question is whether the estimate is responding at all, not whether it is
 /// responding well. The filter drifts slightly on its own between updates, so exact equality
 /// would call a genuinely frozen estimate "moving".
 const ESTIMATE_MOVED_SHARE: f64 = 0.02;
+
+/// The share of the estimate that must be in use for the link to count as measured.
+///
+/// Paired with "something could not be placed" — see [`starvation_reset_target`]. Deliberately far
+/// from 1.0: an allocator may spend well under its estimate for good reasons, and that must not
+/// read as starvation on its own.
+const MEASURED_SHARE_OF_ESTIMATE: f64 = 0.25;
 
 /// A starvation episode being timed, and the estimate it started from.
 #[derive(Clone, Copy, Debug)]
@@ -81,11 +77,14 @@ struct StarvationWatch {
 ///
 /// Two conditions have to hold together, and getting either one alone wrong is expensive:
 ///
-/// - **The link is idle relative to the estimate.** Not merely "below desired", which is ordinary
-///   whenever the link is smaller than the application would like. This is the allocator failing
-///   to spend bandwidth it already believes it has, which happens when the stream that does not
-///   fit cannot be divided any smaller - a single-layer screen share has no lower rung, so it is
-///   dropped whole and the link goes quiet at a fraction of its capacity.
+/// - **Something could not be placed, *and* the link is idle relative to the estimate.** Both
+///   halves are needed and neither works alone. "Something could not be placed" on its own fires
+///   whenever an allocator backgrounds a stream on purpose. A rate threshold on its own cannot
+///   separate a real deadlock at 150 kbps of a 997 kbps estimate (15 %) from a healthy allocator
+///   underfilling at 473 kbps of 2.74 Mbps (17 %) — and an absolute floor is worse still, since a
+///   single minimum-rate layer sits exactly on it. Together they say the thing that matters: the
+///   allocator is holding headroom it cannot spend, because the cheapest rung of what it wants
+///   costs more than what it is told it has.
 /// - **The estimate is not moving.** A moving estimate means feedback is arriving and the loop is
 ///   closed, whatever the allocator is doing. Without this, ramp-up and priority reconfiguration
 ///   both look like starvation - and resetting there pins the estimate above what the link can
@@ -97,11 +96,13 @@ fn starvation_reset_target(
     watch: &mut Option<StarvationWatch>,
     now: Instant,
     desired: Bitrate,
+    unfunded: Option<Bitrate>,
     allocated: Bitrate,
     estimate: Bitrate,
 ) -> Option<Bitrate> {
+    // Headroom the allocator believes it has and is not using.
     let idle = allocated.as_f64() < estimate.as_f64() * MEASURED_SHARE_OF_ESTIMATE;
-    if desired == Bitrate::ZERO || desired <= estimate || !idle {
+    if desired == Bitrate::ZERO || desired <= estimate || unfunded.is_none() || !idle {
         *watch = None;
         return None;
     }
@@ -123,11 +124,19 @@ fn starvation_reset_target(
     if now.saturating_duration_since(started.since) < STARVATION_TIMEOUT {
         return None;
     }
+    // Probe at what would actually unblock, not at what the application wants.
+    // Resetting to full demand pins the estimate above what the link can carry,
+    // so the allocator overshoots and the stream reverses a layer coming back
+    // down — on a genuinely small link that is a permanent oscillation rather
+    // than a transient. The cheapest unfunded layer is the smallest step that
+    // can restart feedback: if it fits, the estimator takes over from there; if
+    // it does not, the link truly cannot carry it and pausing was right.
+    let target = unfunded.unwrap_or(desired).min(desired);
     *watch = Some(StarvationWatch {
         since: now,
-        estimate: desired,
+        estimate: target,
     });
-    Some(desired)
+    Some(target)
 }
 
 const BWE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
@@ -209,14 +218,14 @@ pub struct DownstreamAllocator {
 }
 
 impl DownstreamAllocator {
-    pub(crate) fn new(ctx: LogCtx, manual_sub: bool, rng: &mut impl RngCore) -> Self {
+    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         Self {
-            video: VideoAllocator::new(ctx, manual_sub, rng),
+            video: VideoAllocator::new(ctx, manual_sub),
             audio: AudioAllocator::new(ctx),
             dirty_allocation: false,
 
-            available_bandwidth: BweFilter::new(MIN_BANDWIDTH),
-            last_desired: video::MIN_BANDWIDTH,
+            available_bandwidth: BweFilter::new(START_BANDWIDTH),
+            last_desired: video::START_BANDWIDTH,
             starved_since: None,
             playout_delay: None,
             playout_delay_pending: false,
@@ -339,7 +348,7 @@ impl DownstreamAllocator {
     pub fn update_allocations(&mut self, now: Instant, bwe: &mut Bwe) -> bool {
         self.available_bandwidth.tick(now);
         self.dirty_allocation = false;
-        let (desired, assignments_changed) = self
+        let (desired, assignments_changed, unfunded) = self
             .video
             .update_allocations(self.available_bandwidth.current());
         let allocated = self.video.current_allocation();
@@ -348,7 +357,7 @@ impl DownstreamAllocator {
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;
         }
-        self.break_starvation_deadlock(now, desired, allocated, bwe);
+        self.break_starvation_deadlock(now, desired, unfunded, allocated, bwe);
         assignments_changed
     }
 
@@ -361,14 +370,19 @@ impl DownstreamAllocator {
         &mut self,
         now: Instant,
         desired: Bitrate,
+        unfunded: Option<Bitrate>,
         allocated: Bitrate,
         bwe: &mut Bwe,
     ) {
-        debug_assert!(allocated <= desired || desired == Bitrate::ZERO);
         let estimate = self.available_bandwidth.current();
-        let Some(target) =
-            starvation_reset_target(&mut self.starved_since, now, desired, allocated, estimate)
-        else {
+        let Some(target) = starvation_reset_target(
+            &mut self.starved_since,
+            now,
+            desired,
+            unfunded,
+            allocated,
+            estimate,
+        ) else {
             return;
         };
         bwe.reset(target);
@@ -487,10 +501,17 @@ mod tests {
     fn an_idle_link_with_a_frozen_estimate_is_a_deadlock() {
         let mut watch = None;
         let now = Instant::now();
-        let (desired, allocated, estimate) = (bps(3_000_000), bps(150_000), bps(997_190));
+        let (desired, estimate) = (bps(3_000_000), bps(997_190));
 
         assert_eq!(
-            starvation_reset_target(&mut watch, now, desired, allocated, estimate),
+            starvation_reset_target(
+                &mut watch,
+                now,
+                desired,
+                Some(desired),
+                bps(150_000),
+                estimate
+            ),
             None,
             "the deadlock must be held for {STARVATION_TIMEOUT:?} before it counts"
         );
@@ -499,7 +520,8 @@ mod tests {
                 &mut watch,
                 now + STARVATION_TIMEOUT,
                 desired,
-                allocated,
+                Some(desired),
+                bps(150_000),
                 estimate
             ),
             Some(desired),
@@ -513,12 +535,20 @@ mod tests {
         let mut watch = None;
         let now = Instant::now();
         let (desired, estimate) = (bps(3_000_000), bps(300_000));
-        let _ = starvation_reset_target(&mut watch, now, desired, Bitrate::ZERO, estimate);
+        let _ = starvation_reset_target(
+            &mut watch,
+            now,
+            desired,
+            Some(desired),
+            Bitrate::ZERO,
+            estimate,
+        );
         assert_eq!(
             starvation_reset_target(
                 &mut watch,
                 now + STARVATION_TIMEOUT,
                 desired,
+                Some(desired),
                 Bitrate::ZERO,
                 estimate
             ),
@@ -538,19 +568,57 @@ mod tests {
         let mut watch = None;
         let now = Instant::now();
         let desired = bps(4_600_000);
-        let allocated = bps(100_000);
 
-        let _ = starvation_reset_target(&mut watch, now, desired, allocated, bps(1_000_000));
+        let _ = starvation_reset_target(
+            &mut watch,
+            now,
+            desired,
+            Some(desired),
+            bps(100_000),
+            bps(1_000_000),
+        );
         assert_eq!(
             starvation_reset_target(
                 &mut watch,
                 now + STARVATION_TIMEOUT,
                 desired,
-                allocated,
-                bps(1_400_000),
+                Some(desired),
+                bps(100_000),
+                bps(1_400_000)
             ),
             None,
             "the estimate climbed 40%, so feedback is flowing and the loop is closed"
+        );
+    }
+
+    /// An allocator that is forwarding *something* is not deadlocked, however
+    /// little that is.
+    ///
+    /// This is the case no bitrate threshold can express. By rate it is
+    /// indistinguishable from the real deadlock above — 473 kbps of a 2.74 Mbps
+    /// estimate is 17 %, the deadlock is 150 kbps of 997 kbps, 15 % — and an
+    /// absolute floor fares no better, since one minimum-rate layer sits
+    /// exactly on it. The allocator afforded a layer, so it is spending by
+    /// choice and the loop is closed.
+    #[test]
+    fn an_underfilled_live_allocation_is_not_a_deadlock() {
+        let mut watch = None;
+        let now = Instant::now();
+        let desired = bps(4_600_000);
+        let estimate = bps(2_741_782);
+
+        let _ = starvation_reset_target(&mut watch, now, desired, None, bps(2_900_000), estimate);
+        assert_eq!(
+            starvation_reset_target(
+                &mut watch,
+                now + STARVATION_TIMEOUT,
+                desired,
+                None,
+                bps(2_900_000),
+                estimate
+            ),
+            None,
+            "an allocation that fit is not a deadlock, whatever share of the estimate it uses"
         );
     }
 
@@ -561,15 +629,15 @@ mod tests {
         let mut watch = None;
         let now = Instant::now();
         let (desired, estimate) = (bps(4_000_000), bps(3_000_000));
-        let allocated = bps(2_900_000);
 
-        let _ = starvation_reset_target(&mut watch, now, desired, allocated, estimate);
+        let _ = starvation_reset_target(&mut watch, now, desired, None, bps(2_900_000), estimate);
         assert_eq!(
             starvation_reset_target(
                 &mut watch,
                 now + STARVATION_TIMEOUT,
                 desired,
-                allocated,
+                None,
+                bps(2_900_000),
                 estimate
             ),
             None,
@@ -583,24 +651,25 @@ mod tests {
     /// runs at roughly 44% of its estimate with plenty of feedback flowing. Treating that as
     /// starvation resets the estimate above the link's real capacity, and the overshoot costs the
     /// backgrounded stream a layer reversal on the way back down - the exact churn that plan
-    /// forbids. Contrast the genuine deadlock, which sits at ~15%.
+    /// forbids.
     #[test]
     fn an_allocator_underspending_on_purpose_is_not_a_deadlock() {
         let mut watch = None;
         let now = Instant::now();
-        let (desired, estimate, allocated) = (bps(4_200_000), bps(2_838_598), bps(1_240_000));
+        let (desired, estimate) = (bps(4_200_000), bps(2_838_598));
 
-        let _ = starvation_reset_target(&mut watch, now, desired, allocated, estimate);
+        let _ = starvation_reset_target(&mut watch, now, desired, None, bps(2_900_000), estimate);
         assert_eq!(
             starvation_reset_target(
                 &mut watch,
                 now + STARVATION_TIMEOUT,
                 desired,
-                allocated,
+                None,
+                bps(2_900_000),
                 estimate
             ),
             None,
-            "44% of the estimate is a link in use, not one that has gone quiet"
+            "an allocation that fit is a link in use, not one that has gone quiet"
         );
     }
 
@@ -610,13 +679,21 @@ mod tests {
         let mut watch = None;
         let now = Instant::now();
         let (desired, estimate) = (bps(800_000), bps(3_000_000));
-        let _ = starvation_reset_target(&mut watch, now, desired, bps(100_000), estimate);
+        let _ = starvation_reset_target(
+            &mut watch,
+            now,
+            desired,
+            Some(desired),
+            bps(150_000),
+            estimate,
+        );
         assert_eq!(
             starvation_reset_target(
                 &mut watch,
                 now + STARVATION_TIMEOUT,
                 desired,
-                bps(100_000),
+                Some(desired),
+                bps(150_000),
                 estimate
             ),
             None

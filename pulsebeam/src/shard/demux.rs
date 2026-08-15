@@ -19,9 +19,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 /// This is a validation/cache layer on top of `pulsebeam-routing`'s shared,
 /// `no_std` classifier — the same classifier the Aya eBPF program and the
 /// simulator's steering adapter use. `Demuxer` never parses STUN or the ufrag
-/// itself; it calls `pulsebeam_routing::classify::classify_client` on the
-/// packet bytes and caches the result by source address so repeat packets
-/// skip the parse.
+/// itself; it calls `pulsebeam_routing::classify::classify_client_for_node` on
+/// packet bytes. A bootstrap result is returned to the caller but is not
+/// cached until str0m has authenticated the source address.
 ///
 /// Resolving a route does not imply this shard owns it — see the note on
 /// cross-shard arrivals below.
@@ -46,29 +46,110 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 ///
 /// # Security hardening
 ///
-/// * **Total cache cap** (`MAX_ADDR_ENTRIES`): the fast-path `addr_map` is bounded.
-///   Once full, packets are still decoded and forwarded but the source address is not
-///   cached, limiting memory under a flood of distinct source IPs.
-/// * **Per-route cap** (`MAX_ADDRS_PER_ROUTE`): limits how many source
-///   addresses a single route (real or fabricated) can occupy in the cache,
-///   preventing one route from monopolising the budget.
+/// The authenticated cache is bounded and **evicts rather than refuses**. A
+/// bootstrap packet never creates durable state, so a flood of fabricated
+/// ufrags can spend parser work but cannot poison a participant's address
+/// entry. Least-recently-used eviction means authenticated churn degrades into
+/// replacement while a live call — which touches its entry on every packet —
+/// keeps its place.
+///
+/// * **Total cache cap** (`MAX_ADDR_ENTRIES`): bounds the fast-path `addr_map`.
+/// * **Per-route cap** (`MAX_ADDRS_PER_ROUTE`): bounds how many source
+///   addresses one route (real or fabricated) can occupy, so no single route
+///   monopolises the budget.
 pub struct Demuxer {
     /// Fast-path cache: maps a known remote `SocketAddr` to a route.
-    addr_map: HashMap<SocketAddr, TransportHandle>,
+    addr_map: HashMap<SocketAddr, CachedRoute>,
     /// Reverse: maps a route to all its known source addresses (for cleanup).
     route_addrs: HashMap<TransportRoute, ArrayVec<SocketAddr, MAX_ADDRS_PER_ROUTE>>,
+    /// Monotonic stamp handed to each cache hit, so eviction can pick the
+    /// least recently used entry rather than refusing to admit a new one.
+    clock: u64,
+    cluster_id: u16,
+    node_id: u16,
+    shard_count: u16,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRoute {
+    handle: TransportHandle,
+    /// `clock` at the last hit. A flood's entries are touched once; a live
+    /// call's entry is touched continuously, which is what makes it survive.
+    used: u64,
 }
 
 impl Demuxer {
     pub fn new() -> Self {
+        Self::for_node(
+            0,
+            0,
+            u16::try_from(pulsebeam_routing::steer::MAX_SHARDS).unwrap_or(u16::MAX),
+        )
+    }
+
+    pub fn for_node(cluster_id: u16, node_id: u16, shard_count: u16) -> Self {
+        debug_assert!(shard_count > 0);
         Self {
             addr_map: HashMap::new(),
             route_addrs: HashMap::new(),
+            clock: 0,
+            cluster_id,
+            node_id,
+            shard_count,
         }
     }
 
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    /// Evict the least recently used entry belonging to `route`.
+    ///
+    /// Bounded by [`MAX_ADDRS_PER_ROUTE`], which is a `const` 16 — this is the
+    /// one scan in the packet path, and it runs only when a route's address
+    /// list is already full.
+    fn evict_lru_for_route(&mut self, route: TransportRoute) -> Option<SocketAddr> {
+        let addrs = self.route_addrs.get(&route)?;
+        let mut victim: Option<(SocketAddr, u64)> = None;
+        for addr in addrs {
+            let used = self.addr_map.get(addr).map_or(0, |entry| entry.used);
+            if victim.is_none_or(|(_, worst)| used < worst) {
+                victim = Some((*addr, used));
+            }
+        }
+        let (addr, _) = victim?;
+        self.addr_map.remove(&addr);
+        if let Some(addrs) = self.route_addrs.get_mut(&route) {
+            addrs.retain(|cached| *cached != addr);
+        }
+        Some(addr)
+    }
+
+    /// Evict the least recently used entry anywhere.
+    ///
+    /// Only reached when the global cache is full, which on a healthy node
+    /// never happens — it is the flood path, and the point is that a flood
+    /// degrades into churn instead of locking legitimate clients out.
+    fn evict_lru_global(&mut self) {
+        let mut victim: Option<(SocketAddr, TransportRoute, u64)> = None;
+        for (addr, entry) in &self.addr_map {
+            if victim.is_none_or(|(_, _, worst)| entry.used < worst) {
+                victim = Some((*addr, entry.handle.route, entry.used));
+            }
+        }
+        let Some((addr, route, _)) = victim else {
+            return;
+        };
+        self.addr_map.remove(&addr);
+        if let Some(addrs) = self.route_addrs.get_mut(&route) {
+            addrs.retain(|cached| *cached != addr);
+        }
+        metrics::counter!("demux_addr_cache_evicted").increment(1);
+    }
+
     /// Removes a route and all associated address-cache entries.
-    /// Returns the previously-cached addresses (used to close TCP connections).
+    /// Returns the previously-cached authenticated addresses.
     pub fn unregister(&mut self, route: TransportRoute) -> Vec<SocketAddr> {
         if let Some(addrs) = self.route_addrs.remove(&route) {
             for addr in &addrs {
@@ -88,32 +169,62 @@ impl Demuxer {
     pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<TransportHandle> {
         let src = batch.src;
 
-        if let Some(&addressed) = self.addr_map.get(&src) {
-            return Some(addressed);
+        let stamp = self.tick();
+        if let Some(entry) = self.addr_map.get_mut(&src) {
+            entry.used = stamp;
+            return Some(entry.handle);
         }
 
         // Slow path: classify the raw bytes through the shared no_std
-        // classifier — the same one the eBPF program and simulator use — and
-        // cache the resolved (route, epoch) by source address.
-        let handle = match pulsebeam_routing::classify::classify_client(batch.data()) {
+        // classifier — the same one the eBPF program and simulator use.
+        let handle = match pulsebeam_routing::classify::classify_client_for_node(
+            batch.data(),
+            self.cluster_id,
+            self.node_id,
+            self.shard_count,
+        ) {
             pulsebeam_routing::classify::ClientVerdict::Bootstrap { handle, .. } => handle,
             pulsebeam_routing::classify::ClientVerdict::Established
             | pulsebeam_routing::classify::ClientVerdict::Drop(_) => return None,
         };
         let addressed = to_local_handle(handle);
+        self.admit(src, addressed, stamp);
+        Some(addressed)
+    }
 
-        // Populate the fast-path cache only when within the safety bounds, to
-        // prevent memory exhaustion from floods of distinct fabricated source IPs.
-        if self.addr_map.len() < MAX_ADDR_ENTRIES {
-            let route_entry = self.route_addrs.entry(addressed.route).or_default();
-            if route_entry.len() < MAX_ADDRS_PER_ROUTE {
-                debug_assert!(route_entry.len() < MAX_ADDRS_PER_ROUTE);
-                route_entry.push(src);
-                self.addr_map.insert(src, addressed);
-            }
+    /// Cache `src -> handle`, evicting to make room rather than refusing.
+    ///
+    /// Admission is not conditional on this shard owning the route, and that is
+    /// the point: `SO_REUSEPORT` hashes the 4-tuple, so the shard that sees a
+    /// flow's STUN sees its DTLS and its media too. Caching here is what lets a
+    /// shard keep forwarding a flow it does not own — the rest of a handshake
+    /// carries no ufrag, so an uncached address is an undeliverable one.
+    fn admit(&mut self, src: SocketAddr, handle: TransportHandle, stamp: u64) {
+        if self.addr_map.len() >= MAX_ADDR_ENTRIES {
+            self.evict_lru_global();
+        }
+        if self
+            .route_addrs
+            .get(&handle.route)
+            .is_some_and(|addrs| addrs.len() >= MAX_ADDRS_PER_ROUTE)
+        {
+            self.evict_lru_for_route(handle.route);
+            metrics::counter!("demux_route_addrs_evicted").increment(1);
         }
 
-        Some(addressed)
+        let addrs = self.route_addrs.entry(handle.route).or_default();
+        if addrs.len() >= MAX_ADDRS_PER_ROUTE {
+            debug_assert!(false, "eviction must free a slot before admission");
+            return;
+        }
+        addrs.push(src);
+        self.addr_map.insert(
+            src,
+            CachedRoute {
+                handle,
+                used: stamp,
+            },
+        );
     }
 }
 
@@ -223,6 +334,139 @@ mod demux_tests {
 
     // ── Tests ─────────────────────────────────────────────────────────────────
 
+    /// A flood of fabricated ufrags naming one route must not lock the real
+    /// client out of that route.
+    ///
+    /// The caches bound memory, and a full table used to mean "stop caching".
+    /// That made filling it a denial of service: an uncached source address
+    /// has its non-STUN traffic dropped (`demux` returns `None` for
+    /// `Established`), so 16 spoofed packets naming a predictable route were
+    /// enough to sink a participant's media. Routes are enumerable — slots
+    /// issue sequentially from 0 and epochs start at 0 — so this needed no
+    /// knowledge of the victim at all.
+    ///
+    /// Eviction is the answer rather than gating admission on authentication:
+    /// gating starves the forwarding path, because a shard that does not own a
+    /// route never authenticates it and so could never route the DTLS that
+    /// follows the bootstrap.
+    #[test]
+    fn a_flood_on_one_route_cannot_lock_out_its_real_client() {
+        let mut d = Demuxer::new();
+        let (ice, handle) = ufrag(3, 1);
+        let encoded = ice.encode();
+
+        // The attacker fills every per-route address slot.
+        for port in 0..u16::try_from(MAX_ADDRS_PER_ROUTE).expect("cap fits a u16") {
+            let batch = make_batch(src(40000 + port), stun_with_ufrag(&encoded));
+            assert_eq!(d.demux(&batch), Some(handle));
+        }
+
+        // The legitimate client arrives afterwards and must still be admitted.
+        let victim = src(1000);
+        let batch = make_batch(victim, stun_with_ufrag(&encoded));
+        assert_eq!(d.demux(&batch), Some(handle));
+        assert!(
+            d.addr_map.contains_key(&victim),
+            "the real client must be cached; an uncached address has its media dropped"
+        );
+
+        // And its cache entry must survive continued attacker churn, because
+        // it is the one being used.
+        for port in 0..64u16 {
+            let noise = make_batch(src(50000 + port), stun_with_ufrag(&encoded));
+            let _ = d.demux(&noise);
+            let _ = d.demux(&make_batch(victim, stun_with_ufrag(&encoded)));
+        }
+        assert!(
+            d.addr_map.contains_key(&victim),
+            "an actively used entry must not be evicted by single-touch flood entries"
+        );
+    }
+
+    /// A shard that does not own a route must still be able to route the rest
+    /// of that flow's handshake.
+    ///
+    /// `SO_REUSEPORT` hashes the 4-tuple, so a flow's STUN and its DTLS land on
+    /// the same shard whether or not that shard owns the route. Caching on
+    /// classification is what makes the second one deliverable: DTLS carries no
+    /// ufrag, so an uncached address has nothing to classify and is dropped.
+    ///
+    /// This is why admission must not be gated on authentication. A forwarding
+    /// shard never authenticates the flow — the owner does — so a gate leaves
+    /// it permanently unable to forward anything but the bootstrap, and the
+    /// handshake stalls until some other message repairs it.
+    #[test]
+    fn a_shard_that_does_not_own_a_route_still_routes_the_rest_of_the_flow() {
+        let mut d = Demuxer::new();
+        let (ice, handle) = ufrag(3, 1);
+        let client = src(1234);
+
+        // Bootstrap: classifiable, and resolves to a route this shard does not
+        // own. Nothing here says "mine".
+        let bootstrap = make_batch(client, stun_with_ufrag(&ice.encode()));
+        assert_eq!(d.demux(&bootstrap), Some(handle));
+
+        // Everything after it carries no ufrag. It must still resolve, from the
+        // same shard, with no authentication and no cross-shard message.
+        let dtls = make_batch(
+            client,
+            std::vec![0x16, 0xfe, 0xfd, 0x00, 0x01, 0x02, 0x03, 0x04],
+        );
+        assert_eq!(
+            d.demux(&dtls),
+            Some(handle),
+            "a non-STUN packet on a known flow must resolve on the shard that saw its bootstrap"
+        );
+
+        let media = make_batch(
+            client,
+            std::vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(d.demux(&media), Some(handle));
+    }
+
+    /// The same attack aimed at the whole node rather than one route.
+    #[test]
+    fn a_global_flood_still_admits_a_new_client() {
+        let mut d = Demuxer::new();
+
+        // Saturate the global budget across many routes. The flood lives on
+        // 10.x.x.x so it cannot collide with the newcomer's address.
+        fn flood_src(n: usize) -> SocketAddr {
+            let n = u32::try_from(n).expect("flood index fits a u32");
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(0x0A00_0000u32.wrapping_add(n))),
+                4000,
+            )
+        }
+        let mut i = 0usize;
+        for slot in 0..u32::try_from(MAX_ADDR_ENTRIES / MAX_ADDRS_PER_ROUTE)
+            .expect("route count fits a u32")
+        {
+            let (ice, _) = ufrag(0, slot);
+            let encoded = ice.encode();
+            for _ in 0..MAX_ADDRS_PER_ROUTE {
+                let batch = make_batch(flood_src(i), stun_with_ufrag(&encoded));
+                let _ = d.demux(&batch);
+                i = i.wrapping_add(1);
+            }
+        }
+        assert_eq!(d.addr_map.len(), MAX_ADDR_ENTRIES);
+
+        let (ice, handle) = ufrag(1, 999);
+        let newcomer = src(65000);
+        let batch = make_batch(newcomer, stun_with_ufrag(&ice.encode()));
+        assert_eq!(d.demux(&batch), Some(handle));
+        assert!(
+            d.addr_map.contains_key(&newcomer),
+            "a saturated cache must evict, not refuse: refusing drops the new client's media"
+        );
+        assert!(
+            d.addr_map.len() <= MAX_ADDR_ENTRIES,
+            "eviction must keep the cache within its bound"
+        );
+    }
+
     #[test]
     fn valid_ufrag_matching_shard_routes_and_caches() {
         let mut d = Demuxer::new();
@@ -231,7 +475,6 @@ mod demux_tests {
         let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
 
         assert_eq!(d.demux(&batch), Some(handle));
-        // Fast-path entry created
         assert_eq!(d.addr_map.len(), 1);
         // Second packet uses fast path
         assert_eq!(d.demux(&batch), Some(handle));

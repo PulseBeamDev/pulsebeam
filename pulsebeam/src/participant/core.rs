@@ -5,7 +5,6 @@ use metrics::{counter, histogram};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::reliable::{RelControl, rel_control};
 use pulsebeam_runtime::net::{self, RecvPacketBatch, Transport};
-use pulsebeam_runtime::rand::RngCore;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
@@ -42,6 +41,11 @@ use crate::track::{
 use str0m::rtp::{RtpWrite, Ssrc};
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const POLL_WORK_BUDGET: usize = 256;
+const RTC_OUTPUT_BUDGET: usize = 128;
+const MAX_PENDING_INGRESS: usize = 256;
+const MAX_PENDING_FANOUT: usize = 256;
+const MAX_PENDING_RTC_MUTATIONS: usize = 256;
 
 #[derive(Clone, Copy)]
 struct IncomingRtpRoute {
@@ -223,6 +227,7 @@ pub struct ParticipantCore {
     pending_timeout: Option<Instant>,
     pending_fanout: VecDeque<PendingFanout>,
     pending_rtc_mutations: VecDeque<PendingRtcMutation>,
+    last_ingress: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     rtc_deadline: Option<Instant>,
     rtc_needs_drain: bool,
     exited: bool,
@@ -334,7 +339,6 @@ impl ParticipantCore {
         shard_id: ShardId,
         udp_gso_size: usize,
         tcp_gso_size: usize,
-        rng: &mut impl RngCore,
     ) -> Self {
         let rtc = cfg.rtc;
         let ctx = LogCtx {
@@ -350,6 +354,7 @@ impl ParticipantCore {
             pending_timeout: None,
             pending_fanout: VecDeque::new(),
             pending_rtc_mutations: VecDeque::new(),
+            last_ingress: None,
             rtc_deadline: None,
             rtc_needs_drain: true,
             exited: false,
@@ -367,7 +372,7 @@ impl ParticipantCore {
             udp_packets,
             tcp_batcher,
             upstream: UpstreamAllocator::new(ctx),
-            downstream: DownstreamAllocator::new(ctx, cfg.manual_sub, rng),
+            downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             incoming_rtp_routes: UpstreamRouteTable::default(),
             disconnect_reason: None,
             signaling,
@@ -398,6 +403,11 @@ impl ParticipantCore {
     }
 
     pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
+        self.last_ingress = Some((batch.src, batch.dst));
+        if self.pending_ingress.len() >= MAX_PENDING_INGRESS {
+            let _ = self.pending_ingress.pop_front();
+            metrics::counter!("participant_ingress_shed").increment(1);
+        }
         self.pending_ingress.push_back(batch);
     }
 
@@ -425,8 +435,8 @@ impl ParticipantCore {
         // to compare against what it received (i.e. how much of the link was video vs overhead).
         // Compiles out without the `sim` feature.
         #[cfg(feature = "sim")]
-        crate::sim_metrics::record_forwarded_media(
-            &self.participant_id.to_string(),
+        crate::sim_metrics::record_forwarded_media_for(
+            self.participant_id,
             pkt.payload.len() as u64,
         );
         let promoted =
@@ -453,25 +463,24 @@ impl ParticipantCore {
 
     #[inline]
     pub fn on_forward_sctp(&mut self, channel: ChannelId, pkt: &[u8]) {
-        self.pending_fanout.push_back(PendingFanout::Sctp {
+        self.enqueue_fanout(PendingFanout::Sctp {
             channel,
             pkt: pkt.to_vec(),
         });
     }
 
     pub fn on_forward_reliable_sctp(&mut self, channel: ChannelId, frame: &[u8]) {
-        self.pending_fanout.push_back(PendingFanout::ReliableSctp {
+        self.enqueue_fanout(PendingFanout::ReliableSctp {
             channel,
             frame: frame.to_vec(),
         });
     }
 
     pub fn on_deliver_reliable_control(&mut self, topic: &Topic, bytes: &[u8]) {
-        self.pending_fanout
-            .push_back(PendingFanout::ReliableControl {
-                topic: topic.clone(),
-                bytes: bytes.to_vec(),
-            });
+        self.enqueue_fanout(PendingFanout::ReliableControl {
+            topic: topic.clone(),
+            bytes: bytes.to_vec(),
+        });
     }
 
     pub fn on_tracks_published(&mut self, tracks: &[Track]) {
@@ -530,8 +539,15 @@ impl ParticipantCore {
         stream_id: StreamId,
         kind: KeyframeRequestKind,
     ) {
-        self.pending_fanout
-            .push_back(PendingFanout::Keyframe { stream_id, kind });
+        self.enqueue_fanout(PendingFanout::Keyframe { stream_id, kind });
+    }
+
+    fn enqueue_fanout(&mut self, work: PendingFanout) {
+        if self.pending_fanout.len() >= MAX_PENDING_FANOUT {
+            metrics::counter!("participant_fanout_shed").increment(1);
+            return;
+        }
+        self.pending_fanout.push_back(work);
     }
 
     fn handle_remote_keyframe_request_now(
@@ -602,23 +618,22 @@ impl ParticipantCore {
             return false;
         };
 
-        match work {
-            PendingFanout::Sctp { channel, pkt } => {
-                self.pending_rtc_mutations
-                    .push_back(PendingRtcMutation::Sctp { channel, pkt });
-            }
+        let mutation = match work {
+            PendingFanout::Sctp { channel, pkt } => PendingRtcMutation::Sctp { channel, pkt },
             PendingFanout::ReliableSctp { channel, frame } => {
-                self.pending_rtc_mutations
-                    .push_back(PendingRtcMutation::ReliableSctp { channel, frame });
+                PendingRtcMutation::ReliableSctp { channel, frame }
             }
             PendingFanout::ReliableControl { topic, bytes } => {
-                self.pending_rtc_mutations
-                    .push_back(PendingRtcMutation::ReliableControl { topic, bytes });
+                PendingRtcMutation::ReliableControl { topic, bytes }
             }
             PendingFanout::Keyframe { stream_id, kind } => {
-                self.pending_rtc_mutations
-                    .push_back(PendingRtcMutation::Keyframe { stream_id, kind });
+                PendingRtcMutation::Keyframe { stream_id, kind }
             }
+        };
+        if self.pending_rtc_mutations.len() >= MAX_PENDING_RTC_MUTATIONS {
+            metrics::counter!("participant_rtc_mutation_shed").increment(1);
+        } else {
+            self.pending_rtc_mutations.push_back(mutation);
         }
 
         true
@@ -792,8 +807,15 @@ impl ParticipantCore {
         #[cfg(feature = "sim")]
         let _sim_guard = sim_span.enter();
 
-        let mut budget = 3usize;
+        let mut timeout_budget = 3usize;
+        let mut work_budget = POLL_WORK_BUDGET;
         'drain: loop {
+            if work_budget == 0 {
+                metrics::counter!("participant_poll_budget_hit").increment(1);
+                let next = now.checked_add(Duration::from_micros(1)).unwrap_or(now);
+                return Some(next);
+            }
+            work_budget = work_budget.saturating_sub(1);
             if self.rtc_needs_drain {
                 let Some(rtc_deadline) = self.poll_rtc(now, events) else {
                     self.rtc_deadline = None;
@@ -896,8 +918,8 @@ impl ParticipantCore {
 
             // upper bounded to 3 ticks to defensively avoid spin loops from bugs or just to give fairness
             // to other participants
-            if deadline <= now && budget > 0 {
-                budget = budget.saturating_sub(1);
+            if deadline <= now && timeout_budget > 0 {
+                timeout_budget = timeout_budget.saturating_sub(1);
                 let _ = self.rtc.handle_input(Input::Timeout(now.into()));
                 self.rtc_needs_drain = true;
                 continue;
@@ -922,7 +944,12 @@ impl ParticipantCore {
         #[cfg(feature = "deep-metrics")]
         let mut errors = 0;
 
+        let mut outputs = 0usize;
         let result = loop {
+            if outputs >= RTC_OUTPUT_BUDGET {
+                metrics::counter!("participant_rtc_output_budget_hit").increment(1);
+                break Some(now);
+            }
             if !self.rtc.is_alive() {
                 break None;
             }
@@ -935,6 +962,7 @@ impl ParticipantCore {
                     break Some(deadline.into());
                 }
                 Ok(Output::Transmit(tx)) => {
+                    outputs = outputs.saturating_add(1);
                     #[cfg(feature = "deep-metrics")]
                     {
                         transmits += 1;
@@ -949,6 +977,7 @@ impl ParticipantCore {
                     }
                 }
                 Ok(Output::Event(event)) => {
+                    outputs = outputs.saturating_add(1);
                     #[cfg(feature = "deep-metrics")]
                     {
                         event_count += 1;
@@ -983,6 +1012,15 @@ impl ParticipantCore {
 
     fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {
         match e {
+            // `Connected` is DTLS; ICE reaching connected is what tells the
+            // shard the peer address is authenticated, and that is handled
+            // below. Falls through to the catch-all with every other event this
+            // participant does not act on.
+            Event::IceConnectionStateChange(state) if state.is_connected() => {
+                if let Some((source, destination)) = self.last_ingress {
+                    events.connected(source, destination);
+                }
+            }
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
             }
@@ -1226,6 +1264,7 @@ impl ParticipantCore {
                     .participant_id
                     .derive_track_id(media.kind.into(), &media.mid);
                 let track_meta = track::TrackMeta {
+                    room_id: self.room_id,
                     shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,

@@ -91,7 +91,11 @@ impl ControllerCore {
             } => {
                 self.delete_participant(&participant_id);
             }
-            ShardEvent::TrackSubscribed { .. }
+            // Facts the controller records elsewhere, or that only the shard
+            // acts on. Listed rather than wildcarded so a new event has to be
+            // considered here.
+            ShardEvent::TransportAuthenticated { .. }
+            | ShardEvent::TrackSubscribed { .. }
             | ShardEvent::TrackUnsubscribed { .. }
             | ShardEvent::DataTopicPublished { .. }
             | ShardEvent::DataTopicUnpublished { .. }
