@@ -846,6 +846,9 @@ impl ShardCore {
                 metrics::counter!("shard_ingress_forwarded").increment(1);
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("shard_ingress_forwarded");
+                if self.view.transports.resolve(handle).is_some() {
+                    self.registry.learn_addr(batch.src, handle);
+                }
                 self.on_owned_udp_batch(batch, handle);
             }
             ShardFrame::Media { env, payload } => self.on_media_frame(env, payload, now, router),

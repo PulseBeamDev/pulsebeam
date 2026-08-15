@@ -141,6 +141,17 @@ impl ParticipantRegistry {
         self.demuxer.demux(batch)
     }
 
+    /// Cache an address a sibling shard resolved on this shard's behalf.
+    ///
+    /// Steering is a cache, and populating it moves a flow from the shard the
+    /// tuple hash picked to the shard that owns the route — which has never
+    /// seen the flow's STUN and so cannot classify anything that follows it.
+    /// Learning the address while forwarding is still happening is what makes
+    /// that handover lossless.
+    pub fn learn_addr(&mut self, src: SocketAddr, handle: TransportHandle) {
+        self.demuxer.learn(src, handle);
+    }
+
     /// The route a participant's authenticated address belongs to.
     ///
     /// The demuxer already cached this address when it classified the flow's

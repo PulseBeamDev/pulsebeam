@@ -11,9 +11,9 @@ pub mod udp;
 #[path = "udp_fallback.rs"]
 pub mod udp;
 
-#[cfg(feature = "sim")]
-pub use bound_udp::set_wrong_owner_injection;
 pub use bound_udp::{BoundUdpSocket, bind_udp_socket};
+#[cfg(feature = "sim")]
+pub use bound_udp::{install_steering_flow, set_wrong_owner_injection};
 
 use std::{io, net::SocketAddr};
 

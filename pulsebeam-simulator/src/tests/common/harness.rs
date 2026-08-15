@@ -523,6 +523,22 @@ pub enum Step {
         name: &'static str,
         exact: u64,
     },
+    CheckRoutingCounterAtLeast {
+        description: &'static str,
+        name: &'static str,
+        min: u64,
+    },
+    /// Assert a routing counter stops climbing over `over`.
+    ///
+    /// Steering is a cache, so cross-shard forwarding is expected while a flow
+    /// bootstraps and expected to stop once the flow is pinned. A rate that
+    /// never reaches zero means the map is not being populated, which no
+    /// total-count assertion can distinguish from ordinary bootstrap traffic.
+    CheckRoutingCounterSettles {
+        description: &'static str,
+        name: &'static str,
+        over: Duration,
+    },
     /// Assert the participant has an active peer connection.
     CheckConnected {
         description: &'static str,
@@ -1330,6 +1346,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
         Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
+        Step::CheckRoutingCounterAtLeast { .. } => "CheckRoutingCounterAtLeast",
+        Step::CheckRoutingCounterSettles { .. } => "CheckRoutingCounterSettles",
         Step::CheckMediaRouted { .. } => "CheckMediaRouted",
         Step::CheckParticipantsKnown { .. } => "CheckParticipantsKnown",
         Step::CheckIdentityStable { .. } => "CheckIdentityStable",
@@ -2004,6 +2022,35 @@ async fn execute_plan(
                 assert_eq!(
                     actual, *exact,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     exactly {exact}\n  actual:       {actual}"
+                );
+            }
+
+            Step::CheckRoutingCounterAtLeast {
+                description,
+                name,
+                min,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name})");
+                let actual = pulsebeam::sim_metrics::routing_counter(name);
+                assert!(
+                    actual >= *min,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     at least {min}\n  actual:       {actual}"
+                );
+            }
+
+            Step::CheckRoutingCounterSettles {
+                description,
+                name,
+                over,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name}, {over:?})");
+                let before = pulsebeam::sim_metrics::routing_counter(name);
+                tokio::time::sleep(*over).await;
+                let after = pulsebeam::sim_metrics::routing_counter(name);
+                assert_eq!(
+                    before, after,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     no change over {over:?}\n  actual:       climbed by {}",
+                    after.saturating_sub(before)
                 );
             }
 

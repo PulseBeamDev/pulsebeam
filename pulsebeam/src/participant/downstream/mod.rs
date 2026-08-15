@@ -136,10 +136,7 @@ fn starvation_reset_target(
     // it is meant to break. `unfunded` is a layer's cost, and another slot may
     // already have spent most of the budget, so it is not bounded below by the
     // estimate on its own.
-    let target = unfunded
-        .unwrap_or(desired)
-        .min(desired)
-        .max(estimate);
+    let target = unfunded.unwrap_or(desired).min(desired).max(estimate);
     *watch = Some(StarvationWatch {
         since: now,
         estimate: target,
@@ -695,7 +692,8 @@ mod tests {
         let estimate = bps(1_000_000);
         let cheap = bps(120_000);
 
-        let _ = starvation_reset_target(&mut watch, now, desired, Some(cheap), bps(10_000), estimate);
+        let _ =
+            starvation_reset_target(&mut watch, now, desired, Some(cheap), bps(10_000), estimate);
         let target = starvation_reset_target(
             &mut watch,
             now + STARVATION_TIMEOUT,

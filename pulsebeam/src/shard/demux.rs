@@ -192,6 +192,35 @@ impl Demuxer {
         Some(addressed)
     }
 
+    /// Cache an address another shard classified, so this one can route the
+    /// flow directly once steering starts delivering it here.
+    pub fn learn(&mut self, src: SocketAddr, handle: TransportHandle) {
+        let stamp = self.tick();
+        match self.addr_map.get_mut(&src) {
+            Some(entry) if entry.handle.route == handle.route => {
+                entry.used = stamp;
+                entry.handle = handle;
+            }
+            // A rebind of the same address onto a different route has to leave
+            // the old route's address list, or unregistering that route later
+            // would evict an entry it no longer owns.
+            Some(_) => {
+                self.forget(src);
+                self.admit(src, handle, stamp);
+            }
+            None => self.admit(src, handle, stamp),
+        }
+    }
+
+    fn forget(&mut self, src: SocketAddr) {
+        let Some(entry) = self.addr_map.remove(&src) else {
+            return;
+        };
+        if let Some(addrs) = self.route_addrs.get_mut(&entry.handle.route) {
+            addrs.retain(|cached| *cached != src);
+        }
+    }
+
     /// Cache `src -> handle`, evicting to make room rather than refusing.
     ///
     /// Admission is not conditional on this shard owning the route, and that is
@@ -423,6 +452,65 @@ mod demux_tests {
             std::vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
         );
         assert_eq!(d.demux(&media), Some(handle));
+    }
+
+    /// The owner of a route must be able to route a flow it only ever saw
+    /// forwarded.
+    ///
+    /// Steering is a cache, and populating it hands a flow over from the shard
+    /// the tuple hash picked to the shard that owns the route. The owner has
+    /// never classified that flow — the bootstrap went to the other shard — so
+    /// without learning the address while forwarding is still happening, the
+    /// first datagram to arrive directly is unclassifiable and the handover
+    /// silently drops media until the next consent check repairs it.
+    #[test]
+    fn an_owner_routes_a_flow_it_only_saw_forwarded() {
+        let mut owner = Demuxer::new();
+        let (_, handle) = ufrag(3, 1);
+        let client = src(1234);
+
+        let media = make_batch(
+            client,
+            std::vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(
+            owner.demux(&media),
+            None,
+            "an address this shard has never seen resolves to nothing"
+        );
+
+        owner.learn(client, handle);
+
+        assert_eq!(
+            owner.demux(&media),
+            Some(handle),
+            "once steering delivers the flow here directly, it must resolve"
+        );
+    }
+
+    /// Learning the same address onto a different route must leave the old
+    /// route's address list, or tearing that route down would evict an entry
+    /// it no longer owns.
+    #[test]
+    fn relearning_an_address_moves_it_off_the_old_route() {
+        let mut d = Demuxer::new();
+        let (_, first) = ufrag(3, 1);
+        let (_, second) = ufrag(3, 2);
+        let client = src(1234);
+
+        d.learn(client, first);
+        d.learn(client, second);
+
+        d.unregister(first.route);
+        let media = make_batch(
+            client,
+            std::vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(
+            d.demux(&media),
+            Some(second),
+            "unregistering the abandoned route must not evict the live one"
+        );
     }
 
     /// The same attack aimed at the whole node rather than one route.

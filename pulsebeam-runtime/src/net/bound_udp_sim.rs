@@ -102,7 +102,6 @@ impl FlowTable {
     /// simply misses here and falls back through STUN bootstrap again — the
     /// old tuple's entry is left to age out rather than actively cleared,
     /// matching a kernel map that has no rebind signal either.
-    #[cfg(test)]
     fn insert(&mut self, tuple: FlowTuple, member: u16) {
         if self.members.insert(tuple, member).is_some() {
             self.arrival_order.retain(|known| *known != tuple);
@@ -154,6 +153,7 @@ impl SimSteering {
         }
     }
 
+    #[cfg(test)]
     fn set_wrong_owner_injection(&self, enabled: bool) {
         self.wrong_owner_injection.set(enabled);
     }
@@ -245,7 +245,16 @@ impl SimSteering {
             return;
         };
 
+        // Only a datagram that names its own route can be diverted to a shard
+        // that has never seen the flow. Steering delivers to the tuple hash or
+        // to the route's owner, and both of those have classified the flow
+        // already; a stranger shard has nothing to go on but the ufrag, so
+        // diverting media there would be testing a delivery production never
+        // performs. Naming the route is also what makes the diversion land
+        // somewhere that is definitely not the owner, rather than one shard
+        // over from whatever the hash happened to pick.
         if members > 1
+            && let Some(owner) = route_owner(&payload)
             && (self.wrong_owner_injection.get()
                 || wrong_owner_injection_state_enabled().is_some_and(|source| source == src.ip()))
         {
@@ -254,7 +263,15 @@ impl SimSteering {
                 Ok(mut state) => *state = None,
                 Err(poisoned) => *poisoned.into_inner() = None,
             }
-            idx = idx.saturating_add(1).checked_rem(members).unwrap_or(0);
+            idx = usize::from(owner)
+                .saturating_add(1)
+                .checked_rem(members)
+                .unwrap_or(0);
+            debug_assert_ne!(
+                idx,
+                usize::from(owner),
+                "the injected datagram must land on a shard that does not own its route"
+            );
         }
 
         debug_assert!(idx < members, "resolved member {idx} of {members}");
@@ -271,6 +288,49 @@ impl SimSteering {
         // RefCell as soon as it runs.
         drop(inboxes);
         ready.notify_one();
+    }
+}
+
+/// Pin an authenticated flow to the shard that owns its route, the way the
+/// controller pins one in the kernel's `FLOWS` map once str0m authenticates a
+/// source address.
+///
+/// Returns whether a reuseport group serving `destination` was found. Steering
+/// is a cache, so a miss is not an error: the flow keeps arriving wherever the
+/// tuple hash puts it and userspace keeps forwarding it.
+pub fn install_steering_flow(source: SocketAddr, destination: SocketAddr, shard: u16) -> bool {
+    REUSEPORT_GROUPS.with(|groups| {
+        for ((bind, advertised), group) in groups.borrow().iter() {
+            let serves = advertised.map_or(*bind == destination, |addr| addr == destination);
+            if !serves {
+                continue;
+            }
+            let Some(group) = group.upgrade() else {
+                continue;
+            };
+            // The receive pump keys arrivals on the socket's own local address,
+            // not on the candidate the client dialled. Installing under
+            // anything else produces an entry nothing will ever match.
+            let Ok(local) = group.socket.local_addr() else {
+                continue;
+            };
+            group
+                .steering
+                .flow_table
+                .borrow_mut()
+                .insert(flow_key(source, local), shard);
+            return true;
+        }
+        false
+    })
+}
+
+fn route_owner(payload: &[u8]) -> Option<u16> {
+    match pulsebeam_routing::classify::classify_client(payload) {
+        pulsebeam_routing::classify::ClientVerdict::Bootstrap { handle, .. } => {
+            Some(handle.route.shard())
+        }
+        _ => None,
     }
 }
 
@@ -525,6 +585,39 @@ mod tests {
         "192.168.1.99:3478".parse().unwrap()
     }
 
+    /// A STUN binding request whose USERNAME names `shard`'s route, which is
+    /// the only kind of datagram a shard can classify without prior state.
+    fn bootstrap_for(shard: u16, slot: u32) -> Vec<u8> {
+        let ufrag = pulsebeam_routing::ufrag::IceUfrag::new(
+            DEFAULT_SIM_CLUSTER_ID,
+            DEFAULT_SIM_NODE_ID,
+            pulsebeam_routing::TransportRoute::new(shard, slot),
+            0,
+        );
+        let mut username = ufrag.encode_ascii().to_vec();
+        username.extend_from_slice(b":client");
+        let padded = (username.len() + 3) & !3;
+
+        let mut buf = Vec::with_capacity(24 + padded);
+        buf.extend_from_slice(&0x0001u16.to_be_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(4 + padded)
+                .expect("fixture length fits")
+                .to_be_bytes(),
+        );
+        buf.extend_from_slice(&pulsebeam_routing::stun::MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 12]);
+        buf.extend_from_slice(&0x0006u16.to_be_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(username.len())
+                .expect("fixture username fits")
+                .to_be_bytes(),
+        );
+        buf.extend_from_slice(&username);
+        buf.resize(buf.len() + padded - username.len(), 0);
+        buf
+    }
+
     fn new_steering(shard_count: u16) -> SimSteering {
         let steering = SimSteering::new(DEFAULT_SIM_CLUSTER_ID, DEFAULT_SIM_NODE_ID);
         for shard in 0..shard_count {
@@ -589,13 +682,19 @@ mod tests {
         assert_eq!(table.members.len(), steer::SIM_FLOW_CAPACITY);
     }
 
+    /// A bootstrap datagram delivered to a shard that does not own its route.
+    ///
+    /// This is the one delivery userspace forwarding exists for, and the test
+    /// pins the property that makes it exercisable: the datagram lands
+    /// somewhere other than the shard the ufrag names, whatever the tuple hash
+    /// would have chosen.
     #[test]
-    fn wrong_owner_injection_exercises_userspace_forwarding() {
+    fn wrong_owner_injection_lands_on_a_shard_that_does_not_own_the_route() {
         let steering = new_steering(4);
         steering.set_wrong_owner_injection(true);
-        let tuple = flow_key(addr(1024), dst_addr());
-        let selected = default_member(tuple, 4);
-        steering.deliver(addr(1024), dst_addr(), vec![1, 2, 3]);
+        let owner = 2u16;
+        steering.deliver(addr(1024), dst_addr(), bootstrap_for(owner, 7));
+
         let inboxes = steering.inboxes.borrow();
         let landed = inboxes
             .iter()
@@ -607,7 +706,31 @@ mod tests {
                     .map(|_| index)
             })
             .expect("packet must land somewhere");
-        assert_ne!(landed, selected);
+        assert_ne!(landed, usize::from(owner));
+    }
+
+    /// A datagram that names no route cannot be diverted: a shard that has
+    /// never classified the flow has nothing to resolve it with, so production
+    /// never delivers one there.
+    #[test]
+    fn injection_does_not_divert_a_datagram_that_names_no_route() {
+        let steering = new_steering(4);
+        steering.set_wrong_owner_injection(true);
+        let tuple = flow_key(addr(1024), dst_addr());
+        steering.deliver(addr(1024), dst_addr(), b"media".to_vec());
+
+        let inboxes = steering.inboxes.borrow();
+        let landed = inboxes
+            .iter()
+            .enumerate()
+            .find_map(|(index, inbox)| {
+                inbox
+                    .as_ref()
+                    .filter(|inbox| !inbox.queue.is_empty())
+                    .map(|_| index)
+            })
+            .expect("packet must land somewhere");
+        assert_eq!(landed, default_member(tuple, 4));
     }
 
     #[test]

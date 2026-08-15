@@ -159,9 +159,12 @@ fn controller_stall_keeps_established_media_alive() {
         ]);
 }
 
-#[test]
+/// A datagram delivered to a shard that does not own its route reaches the
+/// owner instead of being dropped.
+///
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
-fn wrong_owner_forwards_once_and_media_continues() {
+#[test]
+fn wrong_owner_forwards_and_media_continues() {
     LocalNodeSim::new()
         .with_shards(2)
         .with_room(cross_shard_media_room())
@@ -170,17 +173,52 @@ fn wrong_owner_forwards_once_and_media_continues() {
                 description: "establish the media path",
                 duration: Duration::from_secs(5),
             },
+            Step::CheckRoutingCounterSettles {
+                description: "steering has pinned the flows, so forwarding has stopped",
+                name: "shard_wrong_owner_forward",
+                over: Duration::from_secs(2),
+            },
             Step::SendToWrongShard {
                 description: "inject one datagram into a foreign shard",
                 participant: "publisher",
             },
-            Step::CheckRoutingCounter {
+            Step::CheckRoutingCounterAtLeast {
                 description: "the foreign datagram is forwarded to its owner",
                 name: "shard_wrong_owner_forward",
-                exact: 1,
+                min: 1,
             },
             Step::CheckRxBytes {
                 description: "the participant's own media remains unaffected",
+                participant: "subscriber",
+                min_bytes: 1,
+            },
+        ]);
+}
+
+/// Cross-shard forwarding is a bootstrap cost, not a steady-state one.
+///
+/// Steering is a cache: a miss lands on whatever the kernel's tuple hash picked
+/// and userspace forwards it to the route's owner. Once the flow authenticates,
+/// control pins it and the forwarding stops. Nothing else notices if that
+/// pinning never happens — media still arrives, just across a core boundary on
+/// every packet — so the property worth holding is that the rate reaches zero.
+#[test]
+fn steering_stops_cross_shard_forwarding_once_flows_authenticate() {
+    LocalNodeSim::new()
+        .with_shards(4)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "let every flow authenticate",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckRoutingCounterSettles {
+                description: "no packet crosses a shard boundary at steady state",
+                name: "shard_wrong_owner_forward",
+                over: Duration::from_secs(3),
+            },
+            Step::CheckRxBytesInterval {
+                description: "and media is still flowing while it does not",
                 participant: "subscriber",
                 min_bytes: 1,
             },

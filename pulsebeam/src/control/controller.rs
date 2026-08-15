@@ -314,6 +314,39 @@ impl ControllerActor {
         self.steering = Some(steering);
     }
 
+    /// Pin an authenticated flow to the shard that owns its route, so the
+    /// kernel stops handing it to whichever shard the tuple hash picked and
+    /// userspace stops forwarding it across cores.
+    ///
+    /// A failure here costs throughput, not correctness: the flow keeps
+    /// arriving on the hashed shard, which resolves it from its own demux cache
+    /// and forwards it to the owner.
+    #[cfg(not(feature = "sim"))]
+    fn pin_flow_to_owner(
+        &mut self,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        shard: u16,
+    ) {
+        let Some(steering) = self.steering.as_mut() else {
+            return;
+        };
+        let flow = crate::ebpf::flow_key(source, destination);
+        if let Err(error) = steering.install_flow(flow, shard) {
+            tracing::warn!(%error, shard, "failed to install authenticated eBPF flow");
+        }
+    }
+
+    #[cfg(feature = "sim")]
+    fn pin_flow_to_owner(
+        &mut self,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        shard: u16,
+    ) {
+        pulsebeam_runtime::net::install_steering_flow(source, destination, shard);
+    }
+
     /// Abandon the staged generation on both halves.
     ///
     /// The view writer accumulates a generation's ops before publishing, so
@@ -1239,23 +1272,16 @@ impl ControllerActor {
         let (shard_id, event) = e;
         match event {
             ShardEvent::TransportAuthenticated {
-                source: _authenticated_source,
-                destination: _authenticated_destination,
+                source,
+                destination,
                 shard,
             } => {
                 debug_assert_eq!(shard, shard_id);
-                #[cfg(not(feature = "sim"))]
-                if let Some(steering) = self.steering.as_mut() {
-                    let flow =
-                        crate::ebpf::flow_key(_authenticated_source, _authenticated_destination);
-                    let Ok(shard_index) = u16::try_from(shard.index()) else {
-                        debug_assert!(false, "a shard id must fit the eBPF map value");
-                        return None;
-                    };
-                    if let Err(error) = steering.install_flow(flow, shard_index) {
-                        tracing::warn!(%error, %shard, "failed to install authenticated eBPF flow");
-                    }
-                }
+                let Ok(shard_index) = u16::try_from(shard.index()) else {
+                    debug_assert!(false, "a shard id must fit the steering map value");
+                    return None;
+                };
+                self.pin_flow_to_owner(source, destination, shard_index);
                 None
             }
             ShardEvent::TrackSubscribed {
