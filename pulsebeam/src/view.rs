@@ -1,4 +1,5 @@
 #![deny(clippy::arithmetic_side_effects)]
+#![deny(clippy::manual_find, clippy::manual_flatten)]
 
 use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
@@ -17,7 +18,7 @@ pub(crate) struct ShardView {
     pub routes: RouteImage,
     pub transports: TransportImage,
     pub tracks: TrackForwardingImage,
-    pub audio: TrackForwardingImage,
+    pub audio: AudioForwardingImage,
     pub data: DataForwardingImage,
     pub reliable: ReliableForwardingImage,
 }
@@ -38,10 +39,19 @@ pub(crate) struct TrackForwardingPlan {
     pub reverse_route: Option<RemoteRoutePlan>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudioForwardingPlan {
+    pub track_id: TrackId,
+    pub origin: ParticipantId,
+    pub local_subscribers: Vec<ParticipantKey>,
+    pub remote_routes: Vec<RemoteRoutePlan>,
+    pub reverse_route: Option<RemoteRoutePlan>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
     pub id: TrackId,
-    pub origin: ParticipantId,
+    pub origin_key: ParticipantKey,
     pub participant: Option<ParticipantKey>,
     pub encodings: Vec<Option<Rid>>,
     pub states: crate::track::TrackStates,
@@ -66,6 +76,25 @@ impl TrackForwardingImage {
     }
 
     fn upsert(&mut self, key: TrackKey, plan: TrackForwardingPlan) {
+        let _ = self.plans.insert(key, plan);
+    }
+
+    fn remove(&mut self, key: TrackKey) {
+        let _ = self.plans.remove(key);
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AudioForwardingImage {
+    plans: SecondaryMap<TrackKey, AudioForwardingPlan>,
+}
+
+impl AudioForwardingImage {
+    pub fn resolve(&self, key: TrackKey) -> Option<&AudioForwardingPlan> {
+        self.plans.get(key)
+    }
+
+    fn upsert(&mut self, key: TrackKey, plan: AudioForwardingPlan) {
         let _ = self.plans.insert(key, plan);
     }
 
@@ -177,23 +206,6 @@ impl TransportImage {
         }
     }
 
-    pub fn handle_for(&self, key: ParticipantKey, shard: ShardId) -> Option<TransportHandle> {
-        for (slot, binding) in self.slots.iter().enumerate() {
-            if binding.is_some_and(|binding| binding.participant == key) {
-                let Some(binding) = binding else {
-                    debug_assert!(false, "a matching transport binding must be present");
-                    continue;
-                };
-                let slot = u32::try_from(slot).ok()?;
-                return Some(TransportHandle::new(
-                    TransportRoute::new(shard, slot),
-                    binding.epoch,
-                ));
-            }
-        }
-        None
-    }
-
     fn install(&mut self, route: TransportRoute, binding: TransportBinding) {
         let idx = route.index();
         if idx >= self.slots.len() {
@@ -256,6 +268,7 @@ pub(crate) enum ViewOp {
     InsertDataRuntime {
         key: DataStreamKey,
         id: crate::shard::router::DataStreamId,
+        publisher: ParticipantKey,
     },
     RemoveDataRuntime {
         key: DataStreamKey,
@@ -263,6 +276,7 @@ pub(crate) enum ViewOp {
     InsertReliableRuntime {
         key: ReliableStreamKey,
         id: crate::shard::router::DataStreamId,
+        publisher: ParticipantKey,
     },
     RemoveReliableRuntime {
         key: ReliableStreamKey,
@@ -276,7 +290,7 @@ pub(crate) enum ViewOp {
     },
     SetAudioPlan {
         key: TrackKey,
-        plan: TrackForwardingPlan,
+        plan: AudioForwardingPlan,
     },
     RemoveAudioPlan {
         key: TrackKey,
@@ -353,7 +367,6 @@ pub(crate) struct ShardViewWriter {
     tx: mailbox::Sender<Box<ShardViewDelta>>,
     staged: Option<Box<ShardViewDelta>>,
     backlog: Option<Box<ShardViewDelta>>,
-    generation: u64,
 }
 
 impl ShardViewWriter {
@@ -378,7 +391,6 @@ impl ShardViewWriter {
             return None;
         }
         let generation = delta.generation;
-        self.generation = self.generation.max(generation);
         self.flush_backlog();
         if self.backlog.is_some() {
             self.coalesce(delta);
@@ -428,7 +440,6 @@ pub(crate) fn new_shard_view(
             tx,
             staged: None,
             backlog: None,
-            generation: 0,
         },
         rx,
     )

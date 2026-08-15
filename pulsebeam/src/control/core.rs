@@ -78,22 +78,29 @@ impl ControllerCore {
         )
     }
 
-    pub fn process_shard_event(&mut self, event: ShardEventMessage, eq: &mut ControllerEventQueue) {
+    pub fn process_shard_event(&mut self, event: ShardEventMessage) {
         match event.1 {
-            ShardEvent::TrackObserved { track, .. } => {
+            ShardEvent::TrackPublished { track, .. } => {
                 let _ = self.registry.add_track(*track);
             }
-            ShardEvent::TrackClosed { origin, track_id } => {
+            ShardEvent::TrackUnpublished { origin, track_id } => {
                 let _ = self.registry.remove_track(origin, track_id);
             }
             ShardEvent::ParticipantClosed {
                 participant: participant_id,
             } => {
-                self.delete_participant(&participant_id, eq);
+                self.delete_participant(&participant_id);
             }
-            ShardEvent::TrackStatsObserved { .. }
-            | ShardEvent::DataChannelObserved { .. }
-            | ShardEvent::SubscriptionIntent { .. } => {}
+            ShardEvent::TrackSubscribed { .. }
+            | ShardEvent::TrackUnsubscribed { .. }
+            | ShardEvent::DataTopicPublished { .. }
+            | ShardEvent::DataTopicUnpublished { .. }
+            | ShardEvent::DataTopicSubscribed { .. }
+            | ShardEvent::DataTopicUnsubscribed { .. }
+            | ShardEvent::ReliableDataTopicPublished { .. }
+            | ShardEvent::ReliableDataTopicUnpublished { .. }
+            | ShardEvent::ReliableDataTopicSubscribed { .. }
+            | ShardEvent::ReliableDataTopicUnsubscribed { .. } => {}
         }
     }
 
@@ -125,24 +132,10 @@ impl ControllerCore {
         }
     }
 
-    pub fn delete_participant(
-        &mut self,
-        participant_id: &ParticipantId,
-        eq: &mut ControllerEventQueue,
-    ) {
-        let Some(_shard_id) = self
-            .registry
-            .get_participant(participant_id)
-            .map(|meta| meta.shard_id)
-        else {
+    pub fn delete_participant(&mut self, participant_id: &ParticipantId) {
+        if self.registry.get_participant(participant_id).is_none() {
             return;
-        };
-        let binding = self
-            .registry
-            .get_participant(participant_id)
-            .and_then(|meta| meta.binding);
-        let _ = binding;
-        let _ = eq;
+        }
         let _ = self.registry.remove_participant(participant_id);
     }
 }

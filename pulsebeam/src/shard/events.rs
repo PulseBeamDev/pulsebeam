@@ -56,6 +56,7 @@ pub enum ParticipantEvent {
     Subscription(ParticipantSubscriptionEvent),
     Lifecycle(ParticipantLifecycleEvent),
     Control(ClientIntent),
+    Internal(ShardInternalEvent),
 }
 
 pub enum ParticipantSubscriptionEvent {
@@ -81,27 +82,7 @@ pub enum ParticipantLifecycleEvent {
 
 #[derive(Debug)]
 pub enum ClientIntent {
-    TrackSubscribed {
-        subscriber: ParticipantId,
-        subscriber_key: ParticipantKey,
-        slot: DownstreamSlotKey,
-        track: TrackMeta,
-    },
-    TrackUnsubscribed {
-        subscriber: ParticipantId,
-        slot: DownstreamSlotKey,
-        track: TrackMeta,
-    },
     TrackPublished(Track, crate::track::TrackStates),
-    /// A published track's latest measurements, refreshed on the slow poll.
-    ///
-    /// Within-shard: the participant that measures hands its own shard core a
-    /// value, which forwards it to the destinations holding a route. Nothing
-    /// reaches into a monitor from outside.
-    TrackStatsUpdated {
-        track_id: TrackId,
-        states: crate::track::TrackStates,
-    },
     TrackUnpublished {
         origin: ParticipantId,
         track_id: TrackId,
@@ -129,7 +110,6 @@ pub enum ClientIntent {
         topic: Topic,
         publisher: Option<ParticipantId>,
     },
-    KeyframeRequested(GlobalKeyframeRequest),
     ReliableDataTopicPublished {
         room_id: RoomId,
         publisher: ParticipantId,
@@ -150,6 +130,18 @@ pub enum ClientIntent {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: Topic,
+    },
+}
+
+pub enum ShardInternalEvent {
+    TrackStatsUpdated {
+        track_id: TrackId,
+        fanout: Option<TrackKey>,
+        states: crate::track::TrackStates,
+    },
+    KeyframeRequested {
+        request: GlobalKeyframeRequest,
+        fanout: Option<TrackKey>,
     },
     ReliableControlReceived {
         stream: Option<ReliableStreamKey>,
@@ -252,13 +244,21 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_track_stats(&mut self, track_id: TrackId, states: crate::track::TrackStates) {
+    fn publish_track_stats(
+        &mut self,
+        track_id: TrackId,
+        fanout: Option<TrackKey>,
+        states: crate::track::TrackStates,
+    ) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(ClientIntent::TrackStatsUpdated {
-                track_id,
-                states,
-            }));
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::TrackStatsUpdated {
+                    track_id,
+                    fanout,
+                    states,
+                },
+            ));
     }
 
     fn publish_track(&mut self, track: Track, states: crate::track::TrackStates) {
@@ -345,17 +345,20 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn request_keyframe(&mut self, layer: &TrackLayer) {
+    fn request_keyframe(&mut self, layer: &TrackLayer, fanout: Option<TrackKey>) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(ClientIntent::KeyframeRequested(
-                GlobalKeyframeRequest {
-                    shard_id: layer.meta.shard_id,
-                    origin: layer.meta.origin,
-                    stream_id: layer.stream_id(),
-                    kind: KeyframeRequestKind::Pli,
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::KeyframeRequested {
+                    request: GlobalKeyframeRequest {
+                        shard_id: layer.meta.shard_id,
+                        origin: layer.meta.origin,
+                        stream_id: layer.stream_id(),
+                        kind: KeyframeRequestKind::Pli,
+                    },
+                    fanout,
                 },
-            )));
+            ));
     }
 
     #[inline]
@@ -476,8 +479,8 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     ) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(
-                ClientIntent::ReliableControlReceived { stream, bytes },
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::ReliableControlReceived { stream, bytes },
             ));
     }
 }

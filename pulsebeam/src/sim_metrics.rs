@@ -82,6 +82,7 @@ struct Samples {
     /// is never desirable, and it is just as wrong during the cold-start ramp as it is in steady
     /// state, which is where a viewer notices it most.
     quality_reversals: HashMap<String, u64>,
+    routing_counters: HashMap<&'static str, u64>,
     /// Direction of each origin's last forwarded-layer change: `true` for an upgrade.
     last_quality_direction: HashMap<String, bool>,
     /// Every downstream estimate as `(elapsed, estimate_bps, desired_bps)`, keyed by the
@@ -140,6 +141,16 @@ pub fn record_cross_shard_media() {
 
 pub fn cross_shard_media_frames() -> u64 {
     SAMPLES.with_borrow(|s| s.cross_shard_media_frames)
+}
+
+pub fn record_routing_counter(name: &'static str) {
+    SAMPLES.with_borrow_mut(|s| {
+        *s.routing_counters.entry(name).or_default() += 1;
+    });
+}
+
+pub fn routing_counter(name: &'static str) -> u64 {
+    SAMPLES.with_borrow(|s| s.routing_counters.get(name).copied().unwrap_or(0))
 }
 
 /// Clear observations. The harness calls this at the start of each timed step so assertions

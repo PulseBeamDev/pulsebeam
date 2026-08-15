@@ -99,35 +99,6 @@ impl ParticipantRegistry {
         Some(meta)
     }
 
-    #[allow(
-        clippy::manual_find,
-        reason = "participant lookup is the shard-owned boundary before a keyed route is selected"
-    )]
-    pub fn get_mut(&mut self, id: &crate::entity::ParticipantId) -> Option<&mut ParticipantMeta> {
-        for (_, participant) in &mut self.participants {
-            if participant.participant_id == *id {
-                return Some(participant);
-            }
-        }
-        None
-    }
-
-    pub fn get_mut_with_key(
-        &mut self,
-        id: &crate::entity::ParticipantId,
-    ) -> Option<(ParticipantKey, &mut ParticipantMeta)> {
-        let mut key = None;
-        for (candidate, participant) in &mut self.participants {
-            if participant.participant_id == *id {
-                key = Some(candidate);
-                break;
-            }
-        }
-        let key = key?;
-        let participant = self.participants.get_mut(key)?;
-        Some((key, participant))
-    }
-
     pub fn resolve_mut(&mut self, key: ParticipantKey) -> Option<&mut ParticipantMeta> {
         self.participants.get_mut(key)
     }
@@ -141,6 +112,28 @@ impl ParticipantRegistry {
     pub fn unpublish_track(&mut self, track_id: &crate::entity::TrackId) {
         for (_, participant) in &mut self.participants {
             participant.on_tracks_unpublished(std::slice::from_ref(track_id));
+        }
+    }
+
+    pub fn bind_subscribed_track(
+        &mut self,
+        participant: ParticipantKey,
+        track_id: crate::entity::TrackId,
+        fanout: crate::shard::router::TrackKey,
+    ) {
+        if let Some(participant) = self.resolve_mut(participant) {
+            participant.bind_subscribed_track(track_id, fanout);
+        }
+    }
+
+    pub fn unbind_subscribed_track(
+        &mut self,
+        participant: ParticipantKey,
+        track_id: crate::entity::TrackId,
+        fanout: crate::shard::router::TrackKey,
+    ) {
+        if let Some(participant) = self.resolve_mut(participant) {
+            participant.unbind_subscribed_track(track_id, fanout);
         }
     }
 

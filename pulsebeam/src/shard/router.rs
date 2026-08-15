@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
 use str0m::media::Rid;
@@ -89,7 +90,7 @@ pub(crate) trait RoutingContext: ShardTransport {
 
 struct TrackRuntime {
     id: TrackId,
-    origin: ParticipantId,
+    origin_key: ParticipantKey,
     publication: crate::track::Track,
     encodings: Vec<Option<Rid>>,
     layer_states: crate::track::TrackStates,
@@ -103,6 +104,7 @@ struct StreamRuntime {
 
 pub(crate) struct ReliableRuntime {
     id: DataStreamId,
+    publisher: ParticipantKey,
     link_seq: u32,
 }
 
@@ -154,41 +156,62 @@ impl ShardRuntime {
                 );
             }
             crate::view::ViewOp::InsertTrackRuntime { key, descriptor } => {
-                if !self.tracks.contains_key(*key) {
-                    let _ = self.tracks.insert(
-                        *key,
-                        TrackRuntime {
-                            id: descriptor.id,
-                            origin: descriptor.origin,
-                            publication: descriptor.publication.clone(),
-                            encodings: descriptor.encodings.clone(),
-                            layer_states: descriptor.states.clone(),
-                            cache: None,
-                            link_seq: 0,
-                        },
+                let previous = self.tracks.insert(
+                    *key,
+                    TrackRuntime {
+                        id: descriptor.id,
+                        origin_key: descriptor.origin_key,
+                        publication: descriptor.publication.clone(),
+                        encodings: descriptor.encodings.clone(),
+                        layer_states: descriptor.states.clone(),
+                        cache: None,
+                        link_seq: 0,
+                    },
+                );
+                if let Some(previous) = previous {
+                    debug_assert_eq!(
+                        previous.id, descriptor.id,
+                        "a runtime key cannot change its logical track"
                     );
+                    if previous.id == descriptor.id {
+                        let Some(current) = self.tracks.get_mut(*key) else {
+                            debug_assert!(false, "inserted track runtime must remain addressable");
+                            return;
+                        };
+                        current.cache = previous.cache;
+                        current.link_seq = previous.link_seq;
+                    }
                 }
             }
             crate::view::ViewOp::RemoveTrackRuntime { key } => self.retire_track(*key),
             crate::view::ViewOp::InsertDataRuntime { key, .. } => {
-                if !self.data.contains_key(*key) {
-                    let _ = self.data.insert(*key, StreamRuntime { link_seq: 0 });
-                }
+                let _ = self.data.insert(*key, StreamRuntime { link_seq: 0 });
             }
             crate::view::ViewOp::RemoveDataRuntime { key } => self.retire_data_stream(*key),
-            crate::view::ViewOp::InsertReliableRuntime { key, id } => {
-                if !self.reliable.contains_key(*key) {
-                    let _ = self.reliable.insert(
-                        *key,
-                        ReliableRuntime {
-                            id: id.clone(),
-                            link_seq: 0,
-                        },
-                    );
-                }
+            crate::view::ViewOp::InsertReliableRuntime { key, id, publisher } => {
+                let _ = self.reliable.insert(
+                    *key,
+                    ReliableRuntime {
+                        id: id.clone(),
+                        publisher: *publisher,
+                        link_seq: 0,
+                    },
+                );
             }
             crate::view::ViewOp::RemoveReliableRuntime { key } => self.retire_reliable_stream(*key),
-            _ => {}
+            crate::view::ViewOp::InstallRoute { .. }
+            | crate::view::ViewOp::InstallTransport { .. }
+            | crate::view::ViewOp::RetireTransport { .. }
+            | crate::view::ViewOp::InsertParticipant { .. }
+            | crate::view::ViewOp::RemoveParticipant { .. }
+            | crate::view::ViewOp::SetTrackPlan { .. }
+            | crate::view::ViewOp::RemoveTrackPlan { .. }
+            | crate::view::ViewOp::SetAudioPlan { .. }
+            | crate::view::ViewOp::RemoveAudioPlan { .. }
+            | crate::view::ViewOp::SetDataPlan { .. }
+            | crate::view::ViewOp::RemoveDataPlan { .. }
+            | crate::view::ViewOp::SetReliablePlan { .. }
+            | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
         }
     }
 
@@ -198,17 +221,8 @@ impl ShardRuntime {
             .map(|track| (track.id, track.encodings.as_slice()))
     }
 
-    pub(crate) fn track_origin(&self, key: TrackKey) -> Option<ParticipantId> {
-        self.tracks.get(key).map(|track| track.origin)
-    }
-
-    pub(crate) fn track_key_for_id(&self, track_id: TrackId) -> Option<TrackKey> {
-        for (key, runtime) in &self.tracks {
-            if runtime.id == track_id {
-                return Some(key);
-            }
-        }
-        None
+    pub(crate) fn track_origin(&self, key: TrackKey) -> Option<ParticipantKey> {
+        self.tracks.get(key).map(|track| track.origin_key)
     }
 
     #[inline]
@@ -251,7 +265,7 @@ impl ShardRuntime {
             ctx.send_media(
                 remote.shard_id,
                 env,
-                MediaPayload::Video(packet.to_transit()),
+                MediaPayload::Video(Box::new(packet.to_transit())),
             );
         }
     }
@@ -261,7 +275,7 @@ impl ShardRuntime {
         track: TrackKey,
         origin: Origin,
         mut event: AudioRtpEvent,
-        plan: &crate::view::TrackForwardingPlan,
+        plan: &crate::view::AudioForwardingPlan,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert_eq!(plan.track_id, event.stream_id.0);
@@ -272,7 +286,7 @@ impl ShardRuntime {
         else {
             return;
         };
-        for &(subscriber, _) in &plan.local_subscribers {
+        for &subscriber in &plan.local_subscribers {
             if Some(subscriber) == event.origin_key {
                 continue;
             }
@@ -302,7 +316,7 @@ impl ShardRuntime {
                 ctx.send_media(
                     remote.shard_id,
                     env,
-                    MediaPayload::Audio(event.pkt.to_transit()),
+                    MediaPayload::Audio(Box::new(event.pkt.to_transit())),
                 );
             }
         }
@@ -312,7 +326,7 @@ impl ShardRuntime {
         &mut self,
         stream: DataStreamKey,
         origin: Origin,
-        packet: Vec<u8>,
+        packet: Bytes,
         plan: &crate::view::StreamForwardingPlan,
         ctx: &mut impl RoutingContext,
     ) {
@@ -341,7 +355,7 @@ impl ShardRuntime {
         &mut self,
         stream: ReliableStreamKey,
         origin: Origin,
-        frame: Vec<u8>,
+        frame: Bytes,
         plan: &crate::view::StreamForwardingPlan,
         ctx: &mut impl RoutingContext,
     ) {
@@ -373,7 +387,7 @@ impl ShardRuntime {
 
     pub fn route_reliable_control(
         &self,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         plan: &crate::view::StreamForwardingPlan,
         ctx: &mut impl RoutingContext,
     ) {
@@ -426,18 +440,75 @@ impl ShardRuntime {
     pub fn resolve_reverse(
         &self,
         action: RouteAction,
-    ) -> Option<(ParticipantId, crate::route::ReverseTarget)> {
+    ) -> Option<(ParticipantKey, crate::route::ReverseTarget)> {
         let RouteAction::Reverse { target } = action else {
             debug_assert!(false, "reverse frame resolved a non-reverse route");
             return None;
         };
         let origin = match target {
             crate::route::ReverseTarget::Track { track } => self.track_origin(track),
-            crate::route::ReverseTarget::Topic { stream } => self
-                .reliable
-                .get(stream)
-                .map(|runtime| runtime.id.publisher_id),
+            crate::route::ReverseTarget::Topic { stream } => {
+                self.reliable.get(stream).map(|runtime| runtime.publisher)
+            }
         }?;
         Some((origin, target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{ParticipantId, TrackKind};
+    use crate::id::ShardId;
+    use crate::track::{Track, TrackMeta};
+    use slotmap::SlotMap;
+
+    fn descriptor(
+        id: TrackId,
+        origin_key: ParticipantKey,
+        rid: &'static str,
+    ) -> crate::view::TrackDescriptor {
+        crate::view::TrackDescriptor {
+            id,
+            origin_key,
+            participant: None,
+            encodings: vec![Some(Rid::from(rid))],
+            states: Vec::new(),
+            publication: Track {
+                meta: TrackMeta {
+                    shard_id: ShardId::new(0),
+                    id,
+                    origin: ParticipantId::from_bytes([7; 16]),
+                },
+                layers: Vec::new(),
+                reverse: None,
+            },
+        }
+    }
+
+    #[test]
+    fn reinserting_a_live_track_runtime_replaces_its_encodings() {
+        let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
+        let mut runtime = ShardRuntime::new(ShardId::new(0), &mut rng);
+        let mut track_keys = SlotMap::<TrackKey, ()>::with_key();
+        let key = track_keys.insert(());
+        let mut participant_keys = SlotMap::<ParticipantKey, ()>::with_key();
+        let origin_key = participant_keys.insert(());
+        let track_id =
+            ParticipantId::from_bytes([7; 16]).derive_track_id(TrackKind::Video, "track");
+
+        runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
+            key,
+            descriptor: descriptor(track_id, origin_key, "q"),
+        });
+        runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
+            key,
+            descriptor: descriptor(track_id, origin_key, "f"),
+        });
+
+        assert_eq!(
+            runtime.track_descriptor(key).unwrap().1,
+            &[Some(Rid::from("f"))]
+        );
     }
 }

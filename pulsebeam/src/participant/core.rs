@@ -70,30 +70,43 @@ impl Default for UpstreamRouteTable {
 }
 
 impl UpstreamRouteTable {
-    fn index(ssrc: Ssrc) -> usize {
-        usize::try_from(*ssrc).unwrap_or(0) % MAX_UPSTREAM_ENCODED_STREAMS
-    }
-
+    /// Scanned rather than indexed. The array is bounded by the same constant
+    /// that bounds how many encoded streams a participant may have, so this is
+    /// output-proportional over one or two cache lines. Hashing the SSRC into
+    /// the array instead makes it direct-mapped with no chaining, and since a
+    /// client picks its SSRCs at random, streams collide and evict each other
+    /// far more often than not.
     fn get(&self, ssrc: Ssrc) -> Option<IncomingRtpRoute> {
         self.entries
-            .get(Self::index(ssrc))
-            .copied()
+            .iter()
             .flatten()
-            .filter(|route| route.ssrc == ssrc)
+            .copied()
+            .find(|route| route.ssrc == ssrc)
     }
 
     fn insert(&mut self, route: IncomingRtpRoute) {
-        let index = Self::index(route.ssrc);
-        debug_assert!(index < self.entries.len());
-        if let Some(entry) = self.entries.get_mut(index) {
-            *entry = Some(route);
-        }
+        let slot = self
+            .entries
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.ssrc == route.ssrc))
+            .or_else(|| self.entries.iter().position(Option::is_none))
+            .and_then(|index| self.entries.get_mut(index));
+        let Some(slot) = slot else {
+            debug_assert!(
+                false,
+                "more encoded streams than MAX_UPSTREAM_ENCODED_STREAMS allows"
+            );
+            metrics::counter!("upstream_route_table_full").increment(1);
+            return;
+        };
+        *slot = Some(route);
     }
 
     fn remove(&mut self, ssrc: Ssrc) {
-        let index = Self::index(ssrc);
-        if let Some(entry) = self.entries.get_mut(index)
-            && entry.is_some_and(|route| route.ssrc == ssrc)
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|route| route.ssrc == ssrc))
         {
             *entry = None;
         }
@@ -229,6 +242,7 @@ pub struct ParticipantCore {
     /// topic — the identity it would otherwise have to reassemble on every
     /// packet.
     published_track_fanouts: HashMap<TrackId, TrackKey>,
+    subscribed_track_fanouts: HashMap<TrackId, TrackKey>,
     data_pub_streams: HashMap<ChannelId, DataStreamKey>,
     reliable_pub_streams: HashMap<ChannelId, ReliableStreamKey>,
     reliable_sub_streams: HashMap<ChannelId, ReliableStreamKey>,
@@ -271,6 +285,23 @@ impl ParticipantCore {
                 route.fanout = Some(fanout);
             }
         }
+    }
+
+    pub(crate) fn bind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
+        self.subscribed_track_fanouts.insert(track_id, fanout);
+    }
+
+    pub(crate) fn unbind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
+        if self.subscribed_track_fanouts.get(&track_id) == Some(&fanout) {
+            self.subscribed_track_fanouts.remove(&track_id);
+        }
+    }
+
+    fn track_fanout(&self, track_id: TrackId) -> Option<TrackKey> {
+        self.published_track_fanouts
+            .get(&track_id)
+            .or_else(|| self.subscribed_track_fanouts.get(&track_id))
+            .copied()
     }
 
     /// Record the stream a published data topic forwards into.
@@ -344,6 +375,7 @@ impl ParticipantCore {
             last_keyframe_request: HashMap::new(),
             data_topic_channels: HashMap::new(),
             published_track_fanouts: HashMap::new(),
+            subscribed_track_fanouts: HashMap::new(),
             data_pub_streams: HashMap::new(),
             reliable_pub_streams: HashMap::new(),
             reliable_sub_streams: HashMap::new(),
@@ -538,7 +570,11 @@ impl ParticipantCore {
     /// flips activity and health per packet and the allocator acts on those.
     fn publish_changed_stats(&mut self, events: &mut impl ParticipantSink) {
         for (track_id, states) in self.upstream.take_changed_stats() {
-            events.publish_track_stats(track_id, states);
+            events.publish_track_stats(
+                track_id,
+                self.published_track_fanouts.get(&track_id).copied(),
+                states,
+            );
         }
     }
 
@@ -547,7 +583,12 @@ impl ParticipantCore {
         // and running the allocator first would decide against last tick's.
         self.upstream.poll_slow(now);
         self.publish_changed_stats(events);
-        let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
+        let assignments_changed = self.downstream.poll_slow(
+            now,
+            &mut self.rtc.bwe(),
+            events,
+            &self.subscribed_track_fanouts,
+        );
         if assignments_changed {
             self.signaling.mark_assignments_dirty();
         }
@@ -836,7 +877,8 @@ impl ParticipantCore {
                 if assignments_changed {
                     self.signaling.mark_assignments_dirty();
                 }
-                self.downstream.reconcile_routes(now, events);
+                self.downstream
+                    .reconcile_routes(now, events, &self.subscribed_track_fanouts);
                 self.rtc_needs_drain = true;
                 continue;
             }
@@ -952,7 +994,9 @@ impl ParticipantCore {
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => {
                 if let Some(layer) = self.downstream.handle_keyframe_request(req) {
-                    events.request_keyframe(layer);
+                    let stream_id = layer.stream_id();
+                    let layer = layer.clone();
+                    events.request_keyframe(&layer, self.track_fanout(stream_id.0));
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
@@ -1289,6 +1333,11 @@ impl ParticipantCore {
         let route = if let Some(route) = self.incoming_rtp_routes.get(ssrc) {
             route
         } else {
+            // Once per stream in a healthy participant. A rate proportional to
+            // the packet rate means the table is evicting live routes.
+            metrics::counter!("upstream_route_miss").increment(1);
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::record_routing_counter("upstream_route_miss");
             let mut api = self.rtc.direct_api();
             let Some(stream) = api.stream_rx(&ssrc) else {
                 return;
@@ -1380,5 +1429,128 @@ impl ParticipantCore {
         self.disconnect_reason = Some(reason);
         self.rtc.disconnect();
         self.rtc_needs_drain = true;
+    }
+}
+
+#[cfg(test)]
+mod upstream_route_table_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    use super::*;
+    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
+
+    fn track_id(label: &str) -> TrackId {
+        entity::ParticipantId::from_bytes([7u8; 16])
+            .derive_track_id(entity::TrackKind::Video, label)
+    }
+
+    fn route(ssrc: u32) -> IncomingRtpRoute {
+        IncomingRtpRoute {
+            ssrc: Ssrc::from(ssrc),
+            mid: Mid::from("0"),
+            rid: None,
+            upstream_slot: 0,
+            track_id: track_id("t"),
+            fanout: None,
+        }
+    }
+
+    /// The table used to be direct-mapped on `ssrc % MAX_UPSTREAM_ENCODED_STREAMS`,
+    /// so any two SSRCs congruent modulo that constant evicted each other and
+    /// every packet from both took the expensive `direct_api()` miss path. A
+    /// client picks its SSRCs at random, so this is the common case, not a
+    /// corner: among six streams the collision probability is over 90%.
+    #[test]
+    fn ssrcs_congruent_modulo_the_capacity_do_not_evict_each_other() {
+        let mut table = UpstreamRouteTable::default();
+        let ssrcs: Vec<u32> = (0..MAX_UPSTREAM_ENCODED_STREAMS)
+            .map(|k| {
+                0x1000_0000
+                    + u32::try_from(k).unwrap()
+                        * u32::try_from(MAX_UPSTREAM_ENCODED_STREAMS).unwrap()
+            })
+            .collect();
+
+        for ssrc in &ssrcs {
+            table.insert(route(*ssrc));
+        }
+
+        for ssrc in &ssrcs {
+            assert_eq!(
+                table.get(Ssrc::from(*ssrc)).map(|route| route.ssrc),
+                Some(Ssrc::from(*ssrc)),
+                "every inserted route must remain retrievable"
+            );
+        }
+    }
+
+    /// The property that outlives any particular table implementation: a route
+    /// that fits is a route that resolves, whatever the SSRCs happen to be.
+    #[test]
+    fn every_route_that_fits_is_retrievable() {
+        let mut rng = seeded_rng(0xB0A7);
+        for _ in 0..256 {
+            let mut table = UpstreamRouteTable::default();
+            let mut ssrcs = Vec::with_capacity(MAX_UPSTREAM_ENCODED_STREAMS);
+            while ssrcs.len() < MAX_UPSTREAM_ENCODED_STREAMS {
+                let candidate = rng.next_u32();
+                if !ssrcs.contains(&candidate) {
+                    ssrcs.push(candidate);
+                }
+            }
+
+            for ssrc in &ssrcs {
+                table.insert(route(*ssrc));
+            }
+            for ssrc in &ssrcs {
+                assert!(
+                    table.get(Ssrc::from(*ssrc)).is_some(),
+                    "ssrc {ssrc:#x} was evicted by a route that should have had its own slot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reinserting_an_ssrc_updates_in_place_rather_than_consuming_a_slot() {
+        let mut table = UpstreamRouteTable::default();
+        for k in 0..MAX_UPSTREAM_ENCODED_STREAMS {
+            table.insert(route(1000 + u32::try_from(k).unwrap()));
+        }
+        let mut updated = route(1000);
+        updated.upstream_slot = 5;
+        table.insert(updated);
+
+        assert_eq!(
+            table.get(Ssrc::from(1000u32)).map(|r| r.upstream_slot),
+            Some(5)
+        );
+        for k in 1..MAX_UPSTREAM_ENCODED_STREAMS {
+            assert!(
+                table
+                    .get(Ssrc::from(1000 + u32::try_from(k).unwrap()))
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn removing_one_route_leaves_the_others() {
+        let mut table = UpstreamRouteTable::default();
+        for k in 0..MAX_UPSTREAM_ENCODED_STREAMS {
+            table.insert(route(2000 + u32::try_from(k).unwrap()));
+        }
+        table.remove(Ssrc::from(2003u32));
+
+        assert!(table.get(Ssrc::from(2003u32)).is_none());
+        for k in 0..MAX_UPSTREAM_ENCODED_STREAMS {
+            if k != 3 {
+                assert!(
+                    table
+                        .get(Ssrc::from(2000 + u32::try_from(k).unwrap()))
+                        .is_some()
+                );
+            }
+        }
     }
 }

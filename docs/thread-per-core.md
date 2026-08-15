@@ -89,9 +89,9 @@ Now:
 - `StreamMonitor` keeps its measurements as **plain fields** and produces a
   `StreamStats` **value** on demand. It is `Copy`; there is nothing to share.
 - On the slow poll a publishing participant hands its own shard a snapshot per
-  track (`ParticipantControlEvent::TrackStatsUpdated`). Within one shard, so
-  still no sharing.
-- The shard applies it locally and sends `ShardFrame::Stats` to every
+  track (`ShardInternalEvent::TrackStatsUpdated`). Within one shard, so still
+  no sharing.
+- The shard applies it locally and sends `ShardFrame::Telemetry` to every
   destination holding a route for that track — route-addressed, best-effort,
   latest-wins. Losing one costs a slightly stale allocation and nothing else.
 - A destination replaces its `layer_states` wholesale. **One message is one

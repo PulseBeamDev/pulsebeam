@@ -375,9 +375,14 @@ impl DownstreamAllocator {
         self.available_bandwidth = BweFilter::new(target);
     }
 
-    pub(crate) fn reconcile_routes(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+    pub(crate) fn reconcile_routes(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+        fanouts: &ahash::HashMap<TrackId, crate::shard::router::TrackKey>,
+    ) {
         self.video
-            .poll_slow(now, self.available_bandwidth.current(), events);
+            .poll_slow(now, self.available_bandwidth.current(), events, fanouts);
     }
 
     pub(crate) fn poll_slow(
@@ -385,10 +390,11 @@ impl DownstreamAllocator {
         now: Instant,
         bwe: &mut Bwe,
         events: &mut impl ParticipantSink,
+        fanouts: &ahash::HashMap<TrackId, crate::shard::router::TrackKey>,
     ) -> bool {
         let assignments_changed = self.update_allocations(now, bwe);
         self.video
-            .poll_slow(now, self.available_bandwidth.current(), events);
+            .poll_slow(now, self.available_bandwidth.current(), events, fanouts);
         assignments_changed
     }
 

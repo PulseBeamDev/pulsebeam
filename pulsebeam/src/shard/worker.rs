@@ -10,6 +10,7 @@ use std::{marker::PhantomData, pin::Pin, rc::Rc, sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
 use crate::route::Envelope;
+use bytes::Bytes;
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -35,21 +36,18 @@ use super::core::{ShardCore, ShardTransport};
 ///
 /// Deliberately large and preallocated. Every entry is one topology change
 /// (publish, subscribe, teardown, participant lifecycle) — control-rate events,
-/// not per-packet — so a healthy node never comes close. It is sized this way
-/// so that filling it is unambiguous evidence of a stalled controller rather
-/// than a burst, which is what lets [`ShardWorker::flush_shard_events`] treat
-/// it as fatal instead of blocking.
+/// not per-packet — so a healthy node never comes close. A full queue sheds the
+/// event and increments `shard_event_shed`; the next event or view update can
+/// restore the derived state without blocking the shard.
 pub(crate) const SHARD_EVENT_CAPACITY: usize = 65_536;
 
 /// Depth of the controller -> shard command queue.
 ///
-/// The shard *can* block on this one, so it does not need the headroom its
-/// reverse does; sizing them alike would make an ordinary burst look like the
-/// stalled controller [`SHARD_EVENT_CAPACITY`]'s overflow exists to diagnose.
+/// Both directions are non-blocking; the controller requeues a full command
+/// mailbox and retries on a later tick.
 ///
-/// Both directions must read this from here. Restating the depth at the call
-/// site would let the two drift apart, and the ratio below would then be
-/// asserted about a number nothing uses.
+/// Both directions read these capacities from here so the queue bounds do not
+/// drift apart at their call sites.
 pub(crate) const SHARD_COMMAND_CAPACITY: usize = 1024;
 
 /// Depth of the shard -> shard media queue, one per receiving shard.
@@ -88,11 +86,6 @@ const STATS_BUSY_TICK: Duration = Duration::from_micros(200);
 /// tick. A shard saturated for this long reports anyway: stale metrics from a
 /// struggling shard are exactly the ones worth having.
 const STATS_DEADLINE_SLACK: Duration = STATS_REPORT_INTERVAL;
-
-const _: () = assert!(
-    SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
-    "the queue a shard cannot block on must have far more headroom than the one it can"
-);
 
 /// Registered once per shard so `/metrics` carries `# HELP` for what every
 /// shard always reports. Repeating these per tick would be harmless but
@@ -133,6 +126,7 @@ pub(crate) enum ShardError {
 pub(crate) enum ShardCommand {
     MaterializeParticipant {
         key: crate::shard::participants::ParticipantKey,
+        transport: crate::route::TransportHandle,
         config: Box<ParticipantConfig>,
     },
     AdoptTcpConnection {
@@ -175,18 +169,18 @@ pub(crate) enum Reverse {
     /// the subscriber telling the publisher what it is missing. Opaque here —
     /// the SFU relays it without interpreting it, which is what keeps
     /// end-to-end reliability an endpoint concern rather than a hop guarantee.
-    DataAck(Vec<u8>),
+    DataAck(Bytes),
 }
 
 /// Payload carried under an [`Envelope`]. Still typed this pass; byte
 /// serialization arrives with the UDP transport.
 pub(crate) enum MediaPayload {
-    Video(RtpPacket),
-    Audio(RtpPacket),
+    Video(Box<RtpPacket>),
+    Audio(Box<RtpPacket>),
     /// SCTP bytes for a client data channel. Which lane the client asked for is
     /// in the destination's route entry, not here — the destination already
     /// knows it, and it describes the client's channel, not this hop.
-    Data(Vec<u8>),
+    Data(Bytes),
 }
 
 /// Everything one shard sends another: the data plane.
@@ -196,7 +190,7 @@ pub(crate) enum MediaPayload {
 /// the control plane ([`ShardCommand`] / [`ShardEvent`]) and never this way.
 #[allow(
     clippy::large_enum_variant,
-    reason = "boxing MediaPayload would put a heap allocation on every forwarded media frame; the mesh moves these by value precisely to avoid that, and the ratio only became visible once the client-packet variant was deleted"
+    reason = "the payload enum carries one shared Bytes handle for SCTP and boxed RTP packets so its routing envelope stays compact"
 )]
 pub(crate) enum ShardFrame {
     /// Forward payload, addressed by the destination's own route. Carries no
@@ -234,26 +228,71 @@ pub(crate) type ShardEventMessage = (ShardId, ShardEvent);
 /// canonical state and publishes the resulting execution image.
 #[derive(Debug)]
 pub(crate) enum ShardEvent {
-    TrackObserved {
-        track: Box<Track>,
-        states: crate::track::TrackStates,
-    },
-    TrackClosed {
-        origin: ParticipantId,
-        track_id: TrackId,
-    },
     ParticipantClosed {
         participant: ParticipantId,
     },
-    DataChannelObserved {
-        intent: crate::shard::events::ClientIntent,
+    TrackSubscribed {
+        subscriber: ParticipantId,
+        subscriber_key: crate::shard::participants::ParticipantKey,
+        slot: crate::keys::DownstreamSlotKey,
+        track: crate::track::TrackMeta,
     },
-    SubscriptionIntent {
-        intent: crate::shard::events::ClientIntent,
+    TrackUnsubscribed {
+        subscriber: ParticipantId,
+        slot: crate::keys::DownstreamSlotKey,
+        track: crate::track::TrackMeta,
     },
-    TrackStatsObserved {
-        track_id: TrackId,
+    TrackPublished {
+        track: Box<Track>,
         states: crate::track::TrackStates,
+    },
+    TrackUnpublished {
+        origin: ParticipantId,
+        track_id: TrackId,
+    },
+    DataTopicPublished {
+        room_id: crate::entity::RoomId,
+        publisher: ParticipantId,
+        topic: crate::track::Topic,
+    },
+    DataTopicUnpublished {
+        room_id: crate::entity::RoomId,
+        publisher: ParticipantId,
+        topic: crate::track::Topic,
+    },
+    DataTopicSubscribed {
+        room_id: crate::entity::RoomId,
+        subscriber: ParticipantId,
+        topic: crate::track::Topic,
+        publisher: Option<ParticipantId>,
+        channel: str0m::channel::ChannelId,
+    },
+    DataTopicUnsubscribed {
+        room_id: crate::entity::RoomId,
+        subscriber: ParticipantId,
+        topic: crate::track::Topic,
+        publisher: Option<ParticipantId>,
+    },
+    ReliableDataTopicPublished {
+        room_id: crate::entity::RoomId,
+        publisher: ParticipantId,
+        topic: crate::track::Topic,
+    },
+    ReliableDataTopicUnpublished {
+        room_id: crate::entity::RoomId,
+        publisher: ParticipantId,
+        topic: crate::track::Topic,
+    },
+    ReliableDataTopicSubscribed {
+        room_id: crate::entity::RoomId,
+        subscriber: ParticipantId,
+        topic: crate::track::Topic,
+        channel: str0m::channel::ChannelId,
+    },
+    ReliableDataTopicUnsubscribed {
+        room_id: crate::entity::RoomId,
+        subscriber: ParticipantId,
+        topic: crate::track::Topic,
     },
 }
 
@@ -543,18 +582,9 @@ impl ShardWorker {
 
     /// Hand this tick's topology events to the controller.
     ///
-    /// **Never await here.** The controller awaits when it sends a shard a
-    /// command, so a shard that awaits sending an event closes a cycle: with
-    /// both channels full, the controller blocks on a shard that is blocked on
-    /// the controller and neither ever drains. The shard side is the one that
-    /// must not block, because a shard that never blocks is what makes the
-    /// controller's await safe — its commands are always drained.
-    ///
-    /// So this is `try_send`, and a full queue is fatal rather than handled:
-    /// [`SHARD_EVENT_CAPACITY`] is sized far above any rate real topology churn
-    /// can produce, so reaching it means the controller has stopped consuming
-    /// and the cluster's view of the topology is already wrong. Continuing from
-    /// there would silently drop subscriptions and teardowns.
+    /// Events never wait on the controller. `try_send` keeps the shard's media
+    /// loop independent; a full queue sheds this recoverable topology hint and
+    /// records it for diagnosis.
     fn flush_shard_events(&mut self) -> Result<(), ShardError> {
         while let Some(event) = self.core.pop_shard_event() {
             match self.event_tx.try_send((self.router.shard_id, event)) {
@@ -565,6 +595,8 @@ impl ShardWorker {
                 }
                 Err(mailbox::TrySendError::Full(_ev)) => {
                     metrics::counter!("shard_event_shed").increment(1);
+                    #[cfg(feature = "sim")]
+                    crate::sim_metrics::record_routing_counter("shard_event_shed");
                     tracing::error!(
                         shard = %self.router.shard_id,
                         "shard event queue is full; shedding a recoverable control event"
@@ -618,7 +650,32 @@ mod reverse_tests {
             22,
             "a NACK must fit the documented 22 bytes"
         );
-        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 27);
+        assert_eq!(
+            wire_len(&Reverse::DataAck(Bytes::from_static(&[0u8; 8]))),
+            27
+        );
+    }
+
+    #[test]
+    fn media_payload_keeps_shared_data_bytes_compact() {
+        const _: () = assert!(std::mem::size_of::<MediaPayload>() <= 64);
+        let bytes = Bytes::from_static(b"payload");
+        let payload = MediaPayload::Data(bytes.clone());
+        let MediaPayload::Data(shared) = payload else {
+            unreachable!();
+        };
+        assert_eq!(shared.as_ptr(), bytes.as_ptr());
+        assert_eq!(shared.len(), bytes.len());
+    }
+
+    #[test]
+    fn reverse_data_ack_keeps_shared_bytes() {
+        let bytes = Bytes::from_static(b"ack");
+        let Reverse::DataAck(shared) = Reverse::DataAck(bytes.clone()) else {
+            unreachable!();
+        };
+        assert_eq!(shared.as_ptr(), bytes.as_ptr());
+        assert_eq!(shared.len(), bytes.len());
     }
 
     /// An encoding is named by index, never by rid: the index is derivable from
@@ -638,5 +695,45 @@ mod reverse_tests {
             1,
             "an encoding selector must be one byte"
         );
+    }
+}
+
+#[cfg(test)]
+mod architecture_tests {
+    use super::*;
+
+    const SHARD_EVENT_VARIANT_COUNT: usize = 13;
+    const SHARD_COMMAND_VARIANT_COUNT: usize = 2;
+
+    fn event_variant(event: &ShardEvent) -> u8 {
+        match event {
+            ShardEvent::ParticipantClosed { .. } => 0,
+            ShardEvent::TrackSubscribed { .. } => 1,
+            ShardEvent::TrackUnsubscribed { .. } => 2,
+            ShardEvent::TrackPublished { .. } => 3,
+            ShardEvent::TrackUnpublished { .. } => 4,
+            ShardEvent::DataTopicPublished { .. } => 5,
+            ShardEvent::DataTopicUnpublished { .. } => 6,
+            ShardEvent::DataTopicSubscribed { .. } => 7,
+            ShardEvent::DataTopicUnsubscribed { .. } => 8,
+            ShardEvent::ReliableDataTopicPublished { .. } => 9,
+            ShardEvent::ReliableDataTopicUnpublished { .. } => 10,
+            ShardEvent::ReliableDataTopicSubscribed { .. } => 11,
+            ShardEvent::ReliableDataTopicUnsubscribed { .. } => 12,
+        }
+    }
+
+    fn command_variant(command: &ShardCommand) -> u8 {
+        match command {
+            ShardCommand::MaterializeParticipant { .. } => 0,
+            ShardCommand::AdoptTcpConnection { .. } => 1,
+        }
+    }
+
+    #[test]
+    fn event_and_command_surfaces_have_exhaustive_guards() {
+        assert_eq!(SHARD_EVENT_VARIANT_COUNT, 13);
+        assert_eq!(SHARD_COMMAND_VARIANT_COUNT, 2);
+        let _ = (event_variant, command_variant);
     }
 }

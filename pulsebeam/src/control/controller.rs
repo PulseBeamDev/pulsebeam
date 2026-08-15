@@ -60,6 +60,7 @@ struct PendingTrackSubscription {
 
 struct StreamBinding {
     publisher_shard: crate::id::ShardId,
+    publisher: crate::shard::participants::ParticipantKey,
     key: Option<crate::shard::router::RuntimeStreamKey>,
     reverse_route: Option<RouteHandle>,
     subscribers: HashMap<
@@ -83,9 +84,13 @@ enum StreamLane {
 }
 
 impl StreamBinding {
-    fn new(publisher_shard: crate::id::ShardId) -> Self {
+    fn new(
+        publisher_shard: crate::id::ShardId,
+        publisher: crate::shard::participants::ParticipantKey,
+    ) -> Self {
         Self {
             publisher_shard,
+            publisher,
             key: None,
             reverse_route: None,
             subscribers: HashMap::new(),
@@ -348,7 +353,7 @@ impl ControllerActor {
 
                 Some(e) = shard_event_rx.recv() => {
                     if let Some(e) = self.handle_route_event(e).await {
-                        self.core.process_shard_event(e, &mut self.eq);
+                        self.core.process_shard_event(e);
                     }
                 }
 
@@ -406,8 +411,7 @@ impl ControllerActor {
                 self.retire_participant_subscriptions(&m.participant_id)
                     .await;
                 self.retire_participant_transport(&m.participant_id).await;
-                self.core
-                    .delete_participant(&m.participant_id, &mut self.eq);
+                self.core.delete_participant(&m.participant_id);
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
@@ -452,8 +456,7 @@ impl ControllerActor {
             .await;
         self.retire_participant_transport(&state.participant_id)
             .await;
-        self.core
-            .delete_participant(&state.participant_id, &mut self.eq);
+        self.core.delete_participant(&state.participant_id);
         self.handle_create_participant(state, offer).await
     }
 
@@ -572,7 +575,7 @@ impl ControllerActor {
         }
     }
 
-    async fn prepare_stream_key(
+    fn prepare_stream_key(
         &mut self,
         destination: crate::id::ShardId,
         id: &crate::shard::router::DataStreamId,
@@ -590,7 +593,7 @@ impl ControllerActor {
         }
     }
 
-    async fn retire_stream_runtime(
+    fn retire_stream_runtime(
         &mut self,
         destination: crate::id::ShardId,
         key: crate::shard::router::RuntimeStreamKey,
@@ -618,10 +621,19 @@ impl ControllerActor {
             crate::shard::router::RuntimeStreamKey::Reliable(_) => StreamLane::Reliable,
         };
         let pending = self.stream_pending_mut(lane).remove(&id);
+        let Some(publisher) = self
+            .core
+            .registry
+            .get_participant(&id.publisher_id)
+            .and_then(|meta| meta.binding)
+        else {
+            debug_assert!(false, "a stream publisher must have a participant key");
+            return;
+        };
         let binding = self
             .stream_bindings_mut(lane)
             .entry(id.clone())
-            .or_insert_with(|| StreamBinding::new(shard_id));
+            .or_insert_with(|| StreamBinding::new(shard_id, publisher));
         debug_assert_eq!(binding.publisher_shard, shard_id);
         binding.key = Some(key);
         if let Some(pending) = pending {
@@ -960,10 +972,10 @@ impl ControllerActor {
                 .release_endpoint(*destination, route.route.slot(), now);
         }
         if let Some(key) = source_key {
-            self.retire_stream_runtime(publisher_shard, key, lane).await;
+            self.retire_stream_runtime(publisher_shard, key, lane);
         }
         for (destination, key) in destination_keys {
-            self.retire_stream_runtime(destination, key, lane).await;
+            self.retire_stream_runtime(destination, key, lane);
         }
         self.stream_bindings_mut(lane).remove(&id);
         true
@@ -1033,7 +1045,7 @@ impl ControllerActor {
             {
                 continue;
             }
-            let Some(key) = self.prepare_stream_key(destination, &id, lane).await else {
+            let Some(key) = self.prepare_stream_key(destination, &id, lane) else {
                 continue;
             };
             let Some(action) = Self::stream_action(lane, key) else {
@@ -1070,6 +1082,7 @@ impl ControllerActor {
         let Some(binding) = self.stream_bindings(lane).get(&id) else {
             return;
         };
+        let publisher_key = binding.publisher;
         let binding_data = (
             binding.publisher_shard,
             binding.key,
@@ -1119,6 +1132,7 @@ impl ControllerActor {
                         crate::view::ViewOp::InsertDataRuntime {
                             key,
                             id: id.clone(),
+                            publisher: publisher_key,
                         },
                     );
                     view.stage(
@@ -1147,6 +1161,7 @@ impl ControllerActor {
                         crate::view::ViewOp::InsertReliableRuntime {
                             key,
                             id: id.clone(),
+                            publisher: publisher_key,
                         },
                     );
                     view.stage(
@@ -1196,21 +1211,17 @@ impl ControllerActor {
     /// Route lifecycle, as its own generation.
     ///
     /// Returns the event untouched when it is not a route event, so the
-    /// ordinary topology projection still sees everything else. Routes are
-    /// separated out because a grant is only safe to hand back once the
-    /// owning shard has acknowledged the view that carries it, and that is a
-    /// barrier the synchronous projection cannot wait on.
+    /// ordinary topology projection still sees everything else. Route work is
+    /// separated because it updates the canonical bindings and view deltas
+    /// before the ordinary registry projection observes the resulting fact.
     async fn handle_route_event(&mut self, e: ShardEventMessage) -> Option<ShardEventMessage> {
         let (shard_id, event) = e;
         match event {
-            ShardEvent::SubscriptionIntent {
-                intent:
-                    crate::shard::events::ClientIntent::TrackSubscribed {
-                        subscriber,
-                        subscriber_key,
-                        slot,
-                        track,
-                    },
+            ShardEvent::TrackSubscribed {
+                subscriber,
+                subscriber_key,
+                slot,
+                track,
             } => {
                 if !self.track_bindings.contains_key(&track.id) {
                     self.pending_track_subscriptions
@@ -1227,14 +1238,10 @@ impl ControllerActor {
                     .await;
                 None
             }
-            ShardEvent::SubscriptionIntent {
-                intent:
-                    crate::shard::events::ClientIntent::TrackUnsubscribed {
-                        subscriber,
-                        slot,
-                        track,
-                        ..
-                    },
+            ShardEvent::TrackUnsubscribed {
+                subscriber,
+                slot,
+                track,
             } => {
                 self.pending_track_subscriptions.retain(|pending| {
                     !(pending.subscriber == subscriber
@@ -1245,13 +1252,10 @@ impl ControllerActor {
                     .await;
                 None
             }
-            ShardEvent::DataChannelObserved {
-                intent:
-                    crate::shard::events::ClientIntent::DataTopicPublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    },
+            ShardEvent::DataTopicPublished {
+                room_id,
+                publisher,
+                topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
                 let key = self.state.mint_data(shard_id, id.clone())?;
@@ -1263,13 +1267,10 @@ impl ControllerActor {
                 .await;
                 None
             }
-            ShardEvent::DataChannelObserved {
-                intent:
-                    crate::shard::events::ClientIntent::ReliableDataTopicPublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    },
+            ShardEvent::ReliableDataTopicPublished {
+                room_id,
+                publisher,
+                topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
                 let key = self.state.mint_reliable(shard_id, id.clone())?;
@@ -1281,123 +1282,116 @@ impl ControllerActor {
                 .await;
                 None
             }
-            ShardEvent::SubscriptionIntent { intent: ev } => match ev {
-                crate::shard::events::ClientIntent::DataTopicSubscribed {
+            ShardEvent::DataTopicSubscribed {
+                room_id,
+                subscriber,
+                topic,
+                publisher,
+                channel,
+            } => {
+                let Some(subscriber_key) = self
+                    .core
+                    .registry
+                    .get_participant(&subscriber)
+                    .and_then(|meta| meta.binding)
+                else {
+                    debug_assert!(false, "a data subscription must name a participant key");
+                    return None;
+                };
+                self.on_stream_subscription(
+                    shard_id,
                     room_id,
                     subscriber,
+                    subscriber_key,
                     topic,
                     publisher,
                     channel,
-                } => {
-                    let Some(subscriber_key) = self
-                        .core
-                        .registry
-                        .get_participant(&subscriber)
-                        .and_then(|meta| meta.binding)
-                    else {
-                        debug_assert!(false, "a data subscription must name a participant key");
-                        return None;
-                    };
-                    self.on_stream_subscription(
-                        shard_id,
-                        room_id,
-                        subscriber,
-                        subscriber_key,
-                        topic,
-                        publisher,
-                        channel,
-                        StreamLane::Data,
-                    )
-                    .await;
-                    None
-                }
-                crate::shard::events::ClientIntent::ReliableDataTopicSubscribed {
+                    StreamLane::Data,
+                )
+                .await;
+                None
+            }
+            ShardEvent::ReliableDataTopicSubscribed {
+                room_id,
+                subscriber,
+                topic,
+                channel,
+            } => {
+                let Some(subscriber_key) = self
+                    .core
+                    .registry
+                    .get_participant(&subscriber)
+                    .and_then(|meta| meta.binding)
+                else {
+                    debug_assert!(false, "a reliable subscription must name a participant key");
+                    return None;
+                };
+                self.on_stream_subscription(
+                    shard_id,
                     room_id,
                     subscriber,
+                    subscriber_key,
                     topic,
+                    None,
                     channel,
-                } => {
-                    let Some(subscriber_key) = self
-                        .core
-                        .registry
-                        .get_participant(&subscriber)
-                        .and_then(|meta| meta.binding)
-                    else {
-                        debug_assert!(false, "a reliable subscription must name a participant key");
-                        return None;
-                    };
-                    self.on_stream_subscription(
-                        shard_id,
-                        room_id,
-                        subscriber,
-                        subscriber_key,
-                        topic,
-                        None,
-                        channel,
-                        StreamLane::Reliable,
-                    )
-                    .await;
-                    None
-                }
-                crate::shard::events::ClientIntent::DataTopicUnsubscribed {
+                    StreamLane::Reliable,
+                )
+                .await;
+                None
+            }
+            ShardEvent::DataTopicUnsubscribed {
+                room_id,
+                subscriber,
+                topic,
+                publisher,
+            } => {
+                self.on_stream_unsubscription(
                     room_id,
                     subscriber,
                     topic,
                     publisher,
-                    ..
-                } => {
-                    self.on_stream_unsubscription(
-                        room_id,
-                        subscriber,
-                        topic,
-                        publisher,
-                        StreamLane::Data,
-                    )
-                    .await;
-                    None
-                }
-                crate::shard::events::ClientIntent::ReliableDataTopicUnsubscribed {
+                    StreamLane::Data,
+                )
+                .await;
+                None
+            }
+            ShardEvent::ReliableDataTopicUnsubscribed {
+                room_id,
+                subscriber,
+                topic,
+            } => {
+                self.on_stream_unsubscription(
                     room_id,
                     subscriber,
                     topic,
-                    ..
-                } => {
-                    self.on_stream_unsubscription(
-                        room_id,
-                        subscriber,
-                        topic,
-                        None,
-                        StreamLane::Reliable,
-                    )
-                    .await;
-                    None
+                    None,
+                    StreamLane::Reliable,
+                )
+                .await;
+                None
+            }
+            ShardEvent::DataTopicUnpublished {
+                room_id,
+                publisher,
+                topic,
+            } => {
+                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                if !self.retire_stream_binding(id, StreamLane::Data).await {
+                    debug_assert!(false, "data stream retirement must complete");
                 }
-                crate::shard::events::ClientIntent::DataTopicPublished { .. }
-                | crate::shard::events::ClientIntent::ReliableDataTopicPublished { .. } => None,
-                crate::shard::events::ClientIntent::DataTopicUnpublished {
-                    room_id,
-                    publisher,
-                    topic,
-                } => {
-                    let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                    if !self.retire_stream_binding(id, StreamLane::Data).await {
-                        debug_assert!(false, "data stream retirement must complete");
-                    }
-                    None
+                None
+            }
+            ShardEvent::ReliableDataTopicUnpublished {
+                room_id,
+                publisher,
+                topic,
+            } => {
+                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                if !self.retire_stream_binding(id, StreamLane::Reliable).await {
+                    debug_assert!(false, "reliable stream retirement must complete");
                 }
-                crate::shard::events::ClientIntent::ReliableDataTopicUnpublished {
-                    room_id,
-                    publisher,
-                    topic,
-                } => {
-                    let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                    if !self.retire_stream_binding(id, StreamLane::Reliable).await {
-                        debug_assert!(false, "reliable stream retirement must complete");
-                    }
-                    None
-                }
-                ev => Some((shard_id, ShardEvent::SubscriptionIntent { intent: ev })),
-            },
+                None
+            }
             ShardEvent::ParticipantClosed {
                 participant: participant_id,
             } => {
@@ -1412,17 +1406,15 @@ impl ControllerActor {
                     },
                 ))
             }
-            ShardEvent::TrackClosed { origin, track_id } => {
+            ShardEvent::TrackUnpublished { origin, track_id } => {
                 if !self.retire_track_binding(track_id).await {
                     debug_assert!(false, "track route retirement must complete");
                 }
-                Some((shard_id, ShardEvent::TrackClosed { origin, track_id }))
+                Some((shard_id, ShardEvent::TrackUnpublished { origin, track_id }))
             }
-            ShardEvent::TrackObserved { track, states } => {
+            ShardEvent::TrackPublished { track, states } => {
                 let track_id = track.meta.id;
-                let fanout = self
-                    .prepare_track_key(shard_id, track_id, track.meta.origin)
-                    .await?;
+                let fanout = self.prepare_track_key(shard_id, track_id, track.meta.origin)?;
                 let track_id = track.meta.id;
                 self.track_bindings.insert(
                     track_id,
@@ -1464,19 +1456,12 @@ impl ControllerActor {
                 announced.map(|track| {
                     (
                         shard_id,
-                        ShardEvent::TrackObserved {
+                        ShardEvent::TrackPublished {
                             track: Box::new(track),
                             states: Vec::new(),
                         },
                     )
                 })
-            }
-            ShardEvent::TrackStatsObserved { track_id, states } => Some((
-                shard_id,
-                ShardEvent::TrackStatsObserved { track_id, states },
-            )),
-            ShardEvent::DataChannelObserved { intent } => {
-                Some((shard_id, ShardEvent::DataChannelObserved { intent }))
             }
         }
     }
@@ -1531,7 +1516,7 @@ impl ControllerActor {
             {
                 continue;
             }
-            let Some(key) = self.prepare_track_key(destination, track_id, origin).await else {
+            let Some(key) = self.prepare_track_key(destination, track_id, origin) else {
                 debug_assert!(false, "a subscriber shard must accept a track runtime");
                 continue;
             };
@@ -1714,7 +1699,7 @@ impl ControllerActor {
         Some(track)
     }
 
-    async fn prepare_track_key(
+    fn prepare_track_key(
         &mut self,
         shard_id: crate::id::ShardId,
         track_id: crate::entity::TrackId,
@@ -1740,19 +1725,13 @@ impl ControllerActor {
         };
         let mut local_subscribers: HashMap<
             crate::id::ShardId,
-            Vec<(
-                crate::shard::participants::ParticipantKey,
-                crate::keys::DownstreamSlotKey,
-            )>,
+            Vec<crate::shard::participants::ParticipantKey>,
         > = HashMap::new();
         for (participant, shard, key) in self.core.registry.participants_in_room(&room_id) {
             if participant != origin
                 && let Some(key) = key
             {
-                local_subscribers
-                    .entry(shard)
-                    .or_default()
-                    .push((key, crate::keys::DownstreamSlotKey::default()));
+                local_subscribers.entry(shard).or_default().push(key);
             }
         }
         let destinations: Vec<_> = local_subscribers.keys().copied().collect();
@@ -1767,10 +1746,10 @@ impl ControllerActor {
             {
                 continue;
             }
-            let Some(key) = self.prepare_track_key(destination, track_id, origin).await else {
+            let Some(key) = self.prepare_track_key(destination, track_id, origin) else {
                 continue;
             };
-            let plan = crate::view::TrackForwardingPlan {
+            let plan = crate::view::AudioForwardingPlan {
                 track_id,
                 origin,
                 local_subscribers: local_subscribers
@@ -1811,7 +1790,7 @@ impl ControllerActor {
                 epoch: route.epoch,
             })
             .collect();
-        let source_plan = crate::view::TrackForwardingPlan {
+        let source_plan = crate::view::AudioForwardingPlan {
             track_id,
             origin,
             local_subscribers: local_subscribers
@@ -1835,7 +1814,7 @@ impl ControllerActor {
             targets.push((
                 *destination,
                 *key,
-                crate::view::TrackForwardingPlan {
+                crate::view::AudioForwardingPlan {
                     track_id,
                     origin,
                     local_subscribers: local_subscribers
@@ -1856,7 +1835,7 @@ impl ControllerActor {
         targets: Vec<(
             crate::id::ShardId,
             crate::shard::router::TrackKey,
-            crate::view::TrackForwardingPlan,
+            crate::view::AudioForwardingPlan,
             Option<RouteHandle>,
         )>,
     ) {
@@ -1873,9 +1852,10 @@ impl ControllerActor {
                 self.abort_transaction(shard, now);
                 return;
             };
+            let publisher_fanout = binding.publisher_fanout;
             let descriptor = crate::view::TrackDescriptor {
                 id: binding.meta.id,
-                origin: binding.meta.origin,
+                origin_key: binding.publisher_participant,
                 participant: (shard == binding.publisher_shard)
                     .then_some(binding.publisher_participant),
                 encodings: binding.encodings.clone(),
@@ -1886,10 +1866,12 @@ impl ControllerActor {
                 self.abort_transaction(shard, now);
                 return;
             };
-            view.stage(
-                generation,
-                crate::view::ViewOp::InsertTrackRuntime { key, descriptor },
-            );
+            if key != publisher_fanout {
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::InsertTrackRuntime { key, descriptor },
+                );
+            }
             view.stage(
                 generation,
                 crate::view::ViewOp::SetAudioPlan {
@@ -1948,10 +1930,7 @@ impl ControllerActor {
             } else if let Some(&fanout) = binding.fanouts.get(&shard_id) {
                 fanout
             } else {
-                let Some(fanout) = self
-                    .prepare_track_key(shard_id, track.id, track.origin)
-                    .await
-                else {
+                let Some(fanout) = self.prepare_track_key(shard_id, track.id, track.origin) else {
                     debug_assert!(false, "a subscriber shard must accept a track runtime");
                     return;
                 };
@@ -2101,7 +2080,7 @@ impl ControllerActor {
             };
             let descriptor = crate::view::TrackDescriptor {
                 id: binding.meta.id,
-                origin: binding.meta.origin,
+                origin_key: binding.publisher_participant,
                 participant: (shard_id == binding.publisher_shard)
                     .then_some(binding.publisher_participant),
                 encodings: binding.encodings.clone(),
@@ -2288,7 +2267,7 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
         action: crate::route::RouteAction,
         video_plan: Option<crate::view::TrackForwardingPlan>,
-        audio_plan: Option<crate::view::TrackForwardingPlan>,
+        audio_plan: Option<crate::view::AudioForwardingPlan>,
         data_plan: Option<crate::view::StreamForwardingPlan>,
         reliable_plan: Option<crate::view::StreamForwardingPlan>,
     ) -> Option<RouteHandle> {
@@ -2407,9 +2386,9 @@ impl ControllerActor {
     ///
     /// The control plane allocates the address, the owning shard prepares
     /// only the runtime binding it must build on its own core, and the route
-    /// becomes resolvable when the view carrying it publishes. Nothing is
-    /// advertised until the shard acknowledges that generation, so the ufrag
-    /// this returns always names a route the owner can already resolve.
+    /// becomes resolvable when the view carrying it is applied on the owning
+    /// shard. The caller advertises the route after queuing the delta; a first
+    /// packet racing that apply is a counted, recoverable drop.
     ///
     /// `drain_core_events` runs first so a `RemoveParticipant` queued by a
     /// preceding delete (a reconnect's teardown-then-recreate) reaches the
@@ -2482,11 +2461,11 @@ impl ControllerActor {
     async fn prepare_transport(
         &mut self,
         shard_id: crate::id::ShardId,
-        _participant_id: ParticipantId,
+        participant_id: ParticipantId,
         handle: TransportHandle,
     ) -> Option<crate::shard::participants::ParticipantKey> {
         debug_assert_eq!(handle.shard(), shard_id);
-        self.state.mint_participant(shard_id)
+        self.state.mint_participant(shard_id, participant_id)
     }
 
     /// Compile and publish the staged generation. One publish, one shard.
@@ -2649,9 +2628,8 @@ impl ControllerActor {
             }
         };
 
-        // The transport route has to exist, be published and be acknowledged
-        // before the ufrag can carry it, so the whole lifecycle generation
-        // runs before negotiation rather than after.
+        // The transport route is allocated and its view delta is queued before
+        // negotiation. The shard applies it independently on its next tick.
         let Some((handle, binding)) = self.stage_transport(shard_id, state.participant_id).await
         else {
             return Err(ControllerError::ServiceUnavailable);
@@ -2669,7 +2647,7 @@ impl ControllerActor {
         let (rtc, answer) = match negotiated {
             Ok(negotiated) => negotiated,
             Err(err) => {
-                // The route is published and acknowledged but nothing will
+                // The route is published but nothing will
                 // ever populate it now. Retiring it is a generation of its
                 // own — the route must be absent from the published view
                 // before its slot can go back to the allocator — and the
@@ -2693,6 +2671,7 @@ impl ControllerActor {
             shard_id,
             ShardCommand::MaterializeParticipant {
                 key: binding,
+                transport: handle,
                 config: Box::new(cfg),
             },
         );

@@ -20,6 +20,7 @@ use crate::entity::TrackId;
 use crate::keys::DownstreamSlotKey;
 use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
 use crate::rtp::monitor::StreamStats;
+use crate::shard::router::TrackKey;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Maximum number of video slots per participant.
@@ -39,7 +40,6 @@ pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 pub struct VideoAllocator {
-    // Hot
     routes: Vec<(TrackId, DownstreamSlotKey)>,
     slots: SlotMap<DownstreamSlotKey, Slot>,
 
@@ -471,14 +471,20 @@ impl VideoAllocator {
         now: Instant,
         _bandwidth: Bitrate,
         events: &mut impl ParticipantSink,
+        fanouts: &HashMap<TrackId, TrackKey>,
     ) {
         self.reconcile_routes(events);
-        self.retry_keyframe_requests(now, events);
+        self.retry_keyframe_requests(now, events, fanouts);
     }
 
-    fn retry_keyframe_requests(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+    fn retry_keyframe_requests(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+        fanouts: &HashMap<TrackId, TrackKey>,
+    ) {
         for (_, slot) in &mut self.slots {
-            slot.pli_retry(now, events);
+            slot.pli_retry(now, events, fanouts);
         }
     }
 
@@ -727,7 +733,12 @@ impl Slot {
         self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
     }
 
-    fn pli_retry(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+    fn pli_retry(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+        fanouts: &HashMap<TrackId, TrackKey>,
+    ) {
         if self.paused {
             return;
         }
@@ -767,7 +778,7 @@ impl Slot {
             );
         }
 
-        events.request_keyframe(staging);
+        events.request_keyframe(staging, fanouts.get(&staging.stream_id().0).copied());
     }
 
     fn switch_to(&mut self, new_layer: &TrackLayer, force: bool) -> bool {
@@ -1882,7 +1893,7 @@ mod assignment_tests {
         );
 
         let mut queue = MockParticipantSink::new();
-        allocator.retry_keyframe_requests(now, &mut queue);
+        allocator.retry_keyframe_requests(now, &mut queue, &HashMap::new());
         assert_eq!(
             queue.request_keyframe_calls.len(),
             1,
@@ -3752,7 +3763,8 @@ mod slot_switch_tests {
 
         // PLI is what unblocks the switch.
         let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
-        fx.slot.pli_retry(Instant::now(), &mut sink);
+        fx.slot
+            .pli_retry(Instant::now(), &mut sink, &HashMap::new());
         assert_eq!(
             sink.request_keyframe_calls.first().map(|c| c.0),
             Some(low.stream_id()),

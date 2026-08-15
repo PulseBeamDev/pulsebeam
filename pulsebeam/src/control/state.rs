@@ -4,12 +4,11 @@
 //! reads its own [`ShardView`](crate::view::ShardView), which is *derived*
 //! from here, not a second independently maintained model.
 //!
-//! The unit of change is a [`LifecycleTransaction`]: stage, allocate, ask the
-//! owning shards to prepare their runtime bindings, compile one view delta per
-//! affected shard, publish each once, wait for the generation barrier, then
-//! commit and advertise. Nothing is externally visible before the barrier
-//! clears, which is what stops a sender ever holding a route that resolves to
-//! a participant, room or track the owning shard has not built yet.
+//! The unit of change is a [`LifecycleTransaction`]: stage allocator and arena
+//! mutations, compile one view delta per affected shard, publish each once,
+//! then commit. Shards apply queued deltas on their next tick; a packet that
+//! arrives in that small window is dropped and counted rather than blocking a
+//! media loop on control-plane progress.
 #![deny(clippy::arithmetic_side_effects)]
 
 use slotmap::SlotMap;
@@ -76,13 +75,20 @@ pub(crate) struct RouteReservation {
 }
 
 #[derive(Debug)]
-pub(crate) struct ParticipantRecord;
+pub(crate) struct ParticipantRecord {
+    pub id: crate::entity::ParticipantId,
+}
 
 #[derive(Debug)]
-pub(crate) struct TrackRecord;
+pub(crate) struct TrackRecord {
+    pub id: crate::entity::TrackId,
+    pub origin: crate::entity::ParticipantId,
+}
 
 #[derive(Debug)]
-pub(crate) struct StreamRecord;
+pub(crate) struct StreamRecord {
+    pub id: crate::shard::router::DataStreamId,
+}
 
 #[derive(Debug)]
 pub(crate) struct ShardArenas {
@@ -113,6 +119,10 @@ pub(crate) enum RouteFamily {
 pub(crate) struct LifecycleTransaction {
     pub generation: u64,
     pub reservations: Vec<RouteReservation>,
+    pub participants: Vec<(ShardId, crate::keys::ParticipantKey)>,
+    pub tracks: Vec<(ShardId, crate::keys::TrackKey)>,
+    pub data: Vec<(ShardId, crate::keys::DataStreamKey)>,
+    pub reliable: Vec<(ShardId, crate::keys::ReliableStreamKey)>,
 }
 
 impl LifecycleTransaction {
@@ -120,6 +130,10 @@ impl LifecycleTransaction {
         Self {
             generation,
             reservations: Vec::new(),
+            participants: Vec::new(),
+            tracks: Vec::new(),
+            data: Vec::new(),
+            reliable: Vec::new(),
         }
     }
 }
@@ -142,6 +156,10 @@ pub(crate) enum TransactionError {
 #[derive(Debug)]
 pub(crate) struct ControlPlaneState {
     pending: Option<LifecycleTransaction>,
+    detached_participants: Vec<(ShardId, crate::keys::ParticipantKey)>,
+    detached_tracks: Vec<(ShardId, crate::keys::TrackKey)>,
+    detached_data: Vec<(ShardId, crate::keys::DataStreamKey)>,
+    detached_reliable: Vec<(ShardId, crate::keys::ReliableStreamKey)>,
     pub arenas: Vec<ShardArenas>,
     pub transport: PerShardAllocator,
     pub endpoint: PerShardAllocator,
@@ -152,6 +170,10 @@ impl ControlPlaneState {
     pub fn new(shard_count: usize) -> Self {
         Self {
             pending: None,
+            detached_participants: Vec::new(),
+            detached_tracks: Vec::new(),
+            detached_data: Vec::new(),
+            detached_reliable: Vec::new(),
             arenas: (0..shard_count).map(|_| ShardArenas::new()).collect(),
             transport: PerShardAllocator::new(shard_count),
             endpoint: PerShardAllocator::new(shard_count),
@@ -159,69 +181,114 @@ impl ControlPlaneState {
         }
     }
 
-    pub fn mint_participant(&mut self, shard: ShardId) -> Option<crate::keys::ParticipantKey> {
-        self.arenas
+    pub fn mint_participant(
+        &mut self,
+        shard: ShardId,
+        id: crate::entity::ParticipantId,
+    ) -> Option<crate::keys::ParticipantKey> {
+        let key = self
+            .arenas
             .get_mut(shard.index())
-            .map(|arena| arena.participants.insert(ParticipantRecord))
+            .map(|arena| arena.participants.insert(ParticipantRecord { id }))?;
+        if let Some(tx) = self.pending.as_mut() {
+            tx.participants.push((shard, key));
+        } else {
+            self.detached_participants.push((shard, key));
+        }
+        Some(key)
     }
 
     pub fn mint_track(
         &mut self,
         shard: ShardId,
-        _id: crate::entity::TrackId,
-        _origin: crate::entity::ParticipantId,
+        id: crate::entity::TrackId,
+        origin: crate::entity::ParticipantId,
     ) -> Option<crate::keys::TrackKey> {
-        self.arenas
+        let key = self
+            .arenas
             .get_mut(shard.index())
-            .map(|arena| arena.tracks.insert(TrackRecord))
+            .map(|arena| arena.tracks.insert(TrackRecord { id, origin }))?;
+        if let Some(tx) = self.pending.as_mut() {
+            tx.tracks.push((shard, key));
+        } else {
+            self.detached_tracks.push((shard, key));
+        }
+        Some(key)
     }
 
     pub fn mint_data(
         &mut self,
         shard: ShardId,
-        _id: crate::shard::router::DataStreamId,
+        id: crate::shard::router::DataStreamId,
     ) -> Option<crate::keys::DataStreamKey> {
-        self.arenas
+        let key = self
+            .arenas
             .get_mut(shard.index())
-            .map(|arena| arena.data.insert(StreamRecord))
+            .map(|arena| arena.data.insert(StreamRecord { id }))?;
+        if let Some(tx) = self.pending.as_mut() {
+            tx.data.push((shard, key));
+        } else {
+            self.detached_data.push((shard, key));
+        }
+        Some(key)
     }
 
     pub fn mint_reliable(
         &mut self,
         shard: ShardId,
-        _id: crate::shard::router::DataStreamId,
+        id: crate::shard::router::DataStreamId,
     ) -> Option<crate::keys::ReliableStreamKey> {
-        self.arenas
+        let key = self
+            .arenas
             .get_mut(shard.index())
-            .map(|arena| arena.reliable.insert(StreamRecord))
+            .map(|arena| arena.reliable.insert(StreamRecord { id }))?;
+        if let Some(tx) = self.pending.as_mut() {
+            tx.reliable.push((shard, key));
+        } else {
+            self.detached_reliable.push((shard, key));
+        }
+        Some(key)
     }
 
     pub fn remove_participant(&mut self, shard: ShardId, key: crate::keys::ParticipantKey) {
-        let _ = self
+        let record = self
             .arenas
             .get_mut(shard.index())
             .and_then(|arena| arena.participants.remove(key));
+        if let Some(record) = record {
+            debug_assert!(!record.id.as_str().is_empty());
+        }
     }
 
     pub fn remove_track(&mut self, shard: ShardId, key: crate::keys::TrackKey) {
-        let _ = self
+        let record = self
             .arenas
             .get_mut(shard.index())
             .and_then(|arena| arena.tracks.remove(key));
+        if let Some(record) = record {
+            debug_assert!(!record.id.as_str().is_empty());
+            debug_assert!(!record.origin.as_str().is_empty());
+        }
     }
 
     pub fn remove_data(&mut self, shard: ShardId, key: crate::keys::DataStreamKey) {
-        let _ = self
+        let record = self
             .arenas
             .get_mut(shard.index())
             .and_then(|arena| arena.data.remove(key));
+        if let Some(record) = record {
+            debug_assert!(!record.id.topic.as_ref().is_empty());
+        }
     }
 
     pub fn remove_reliable(&mut self, shard: ShardId, key: crate::keys::ReliableStreamKey) {
-        let _ = self
+        let record = self
             .arenas
             .get_mut(shard.index())
             .and_then(|arena| arena.reliable.remove(key));
+        if let Some(record) = record {
+            debug_assert!(!record.id.topic.as_ref().is_empty());
+        }
     }
 
     pub fn pending(&self) -> Option<&LifecycleTransaction> {
@@ -236,7 +303,12 @@ impl ControlPlaneState {
             return Err(TransactionError::Busy);
         }
         let generation = self.generation.saturating_add(1);
-        self.pending = Some(LifecycleTransaction::new(generation));
+        let mut tx = LifecycleTransaction::new(generation);
+        tx.participants.append(&mut self.detached_participants);
+        tx.tracks.append(&mut self.detached_tracks);
+        tx.data.append(&mut self.detached_data);
+        tx.reliable.append(&mut self.detached_reliable);
+        self.pending = Some(tx);
         Ok(())
     }
 
@@ -302,16 +374,14 @@ impl ControlPlaneState {
 
     /// Return a transport slot to its allocator.
     ///
-    /// Only after the route is absent from the published view and that
-    /// generation is acknowledged — the allocator's own quarantine then keeps
-    /// the slot out of circulation for as long as a stale datagram could take
-    /// to arrive.
+    /// Only after the route is absent from the staged view; the allocator's
+    /// quarantine then keeps the slot out of circulation for as long as a
+    /// stale datagram could take to arrive.
     pub fn release_transport(&mut self, shard_id: ShardId, slot: u32, now: Instant) {
         self.transport.retire(shard_id, slot, now);
     }
 
-    /// Commit the staged generation. Callers must only reach here once every
-    /// affected shard has acknowledged the published generation.
+    /// Commit the staged generation after its deltas have been queued.
     pub fn commit(&mut self) -> Result<LifecycleTransaction, TransactionError> {
         let tx = self.pending.take().ok_or(TransactionError::Idle)?;
         debug_assert_eq!(
@@ -338,6 +408,18 @@ impl ControlPlaneState {
                         .retire(reservation.shard_id, reservation.slot, now);
                 }
             }
+        }
+        for &(shard, key) in &tx.participants {
+            self.remove_participant(shard, key);
+        }
+        for &(shard, key) in &tx.tracks {
+            self.remove_track(shard, key);
+        }
+        for &(shard, key) in &tx.data {
+            self.remove_data(shard, key);
+        }
+        for &(shard, key) in &tx.reliable {
+            self.remove_reliable(shard, key);
         }
         Some(tx)
     }
@@ -396,5 +478,35 @@ mod tests {
         let mut state = ControlPlaneState::new(2);
         state.begin().unwrap();
         assert_eq!(state.begin(), Err(TransactionError::Busy));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abort_removes_every_minted_runtime_key() {
+        let mut state = ControlPlaneState::new(1);
+        let shard = ShardId::new(0);
+        state.begin().unwrap();
+        let participant_id = crate::entity::ParticipantId::from_bytes([1; 16]);
+        let participant = state.mint_participant(shard, participant_id).unwrap();
+        let track = state
+            .mint_track(
+                shard,
+                participant_id.derive_track_id(crate::entity::TrackKind::Video, "track"),
+                participant_id,
+            )
+            .unwrap();
+        let stream = crate::shard::router::DataStreamId::new(
+            crate::entity::RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("room").unwrap(),
+            ),
+            participant_id,
+            crate::track::Topic::for_test("topic"),
+        );
+        let data = state.mint_data(shard, stream.clone()).unwrap();
+        let reliable = state.mint_reliable(shard, stream).unwrap();
+        state.abort(Instant::now());
+        assert!(state.arenas[0].participants.get(participant).is_none());
+        assert!(state.arenas[0].tracks.get(track).is_none());
+        assert!(state.arenas[0].data.get(data).is_none());
+        assert!(state.arenas[0].reliable.get(reliable).is_none());
     }
 }

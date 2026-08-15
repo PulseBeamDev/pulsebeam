@@ -40,9 +40,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 /// the receiving socket by hashing the 4-tuple, which has nothing to do with
 /// which shard owns the route, so arriving on the wrong one is ordinary
 /// rather than suspicious. Resolving the route and deciding whether this
-/// shard owns it are separate concerns: `demux` only resolves; the caller
-/// checks ownership (see [`Demuxer::owns`]) and decides whether to forward,
-/// process, or drop.
+/// shard owns it are separate concerns: `demux` only resolves, and the caller
+/// compares `TransportHandle::shard` against its own before doing anything
+/// with the result.
 ///
 /// # Security hardening
 ///
@@ -84,7 +84,7 @@ impl Demuxer {
     /// Returns `None` if dropped.
     ///
     /// This resolves a route; it does not decide whether this shard owns it.
-    /// See [`Demuxer::owns`].
+    /// The caller compares the returned shard against its own.
     pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<TransportHandle> {
         let src = batch.src;
 

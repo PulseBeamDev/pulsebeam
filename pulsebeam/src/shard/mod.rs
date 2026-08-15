@@ -1,3 +1,5 @@
+#![deny(clippy::manual_find, clippy::manual_flatten)]
+
 pub(crate) mod core;
 pub(crate) mod demux;
 mod dirty;

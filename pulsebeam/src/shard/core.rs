@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use pulsebeam_runtime::rand::Rng;
 use pulsebeam_runtime::{
     mailbox,
@@ -12,7 +13,7 @@ use crate::shard::events::{
     ParticipantSubscriptionEvent,
 };
 use crate::{
-    entity::{ParticipantId, TrackId, TrackKind},
+    entity::{TrackId, TrackKind},
     id::AudioSelectorSlotId,
     keys::{DownstreamSlotKey, ParticipantKey},
     participant::{ParticipantConfig, batcher::GsoSendBatch},
@@ -52,26 +53,26 @@ impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
 impl<'a, R: ShardTransport> DispatchCtx<'a, R> {
     fn notify_keyframe_request(
         &mut self,
-        participant_id: ParticipantId,
+        participant: ParticipantKey,
         track_id: TrackId,
         rid: Option<Rid>,
         kind: str0m::media::KeyframeRequestKind,
     ) {
-        if let Some((key, participant)) = self.registry.get_mut_with_key(&participant_id) {
-            participant.handle_remote_keyframe_request((track_id, rid), kind);
-            self.dirty.mark(key, participant);
+        if let Some(meta) = self.registry.resolve_mut(participant) {
+            meta.handle_remote_keyframe_request((track_id, rid), kind);
+            self.dirty.mark(participant, meta);
         }
     }
 
     fn deliver_reliable_control(
         &mut self,
-        publisher: ParticipantId,
+        publisher: ParticipantKey,
         topic: &crate::track::Topic,
         bytes: &[u8],
     ) {
-        if let Some((key, participant)) = self.registry.get_mut_with_key(&publisher) {
-            participant.on_deliver_reliable_control(topic, bytes);
-            self.dirty.mark(key, participant);
+        if let Some(meta) = self.registry.resolve_mut(publisher) {
+            meta.on_deliver_reliable_control(topic, bytes);
+            self.dirty.mark(publisher, meta);
         }
     }
 }
@@ -205,17 +206,57 @@ impl ShardCore {
                             meta.bind_published_track(descriptor.id, *key);
                         }
                     }
-                    crate::view::ViewOp::InsertDataRuntime { id, key } => {
-                        if let Some(meta) = self.registry.get_mut(&id.publisher_id) {
+                    crate::view::ViewOp::InsertDataRuntime { publisher, key, id } => {
+                        if let Some(meta) = self.registry.resolve_mut(*publisher) {
                             meta.bind_published_data_stream(&id.topic, *key);
                         }
                     }
-                    crate::view::ViewOp::InsertReliableRuntime { id, key } => {
-                        if let Some(meta) = self.registry.get_mut(&id.publisher_id) {
+                    crate::view::ViewOp::InsertReliableRuntime { publisher, key, id } => {
+                        if let Some(meta) = self.registry.resolve_mut(*publisher) {
                             meta.bind_published_reliable_stream(&id.topic, *key);
                         }
                     }
-                    _ => {}
+                    crate::view::ViewOp::SetTrackPlan { key, plan } => {
+                        if let Some(previous) = self.view.tracks.resolve(*key) {
+                            for &(participant, _) in &previous.local_subscribers {
+                                self.registry.unbind_subscribed_track(
+                                    participant,
+                                    previous.track_id,
+                                    *key,
+                                );
+                            }
+                        }
+                        for &(participant, _) in &plan.local_subscribers {
+                            self.registry
+                                .bind_subscribed_track(participant, plan.track_id, *key);
+                        }
+                    }
+                    crate::view::ViewOp::RemoveTrackPlan { key } => {
+                        if let Some(previous) = self.view.tracks.resolve(*key) {
+                            for &(participant, _) in &previous.local_subscribers {
+                                self.registry.unbind_subscribed_track(
+                                    participant,
+                                    previous.track_id,
+                                    *key,
+                                );
+                            }
+                        }
+                    }
+                    crate::view::ViewOp::InstallRoute { .. }
+                    | crate::view::ViewOp::RetireRoute { .. }
+                    | crate::view::ViewOp::InstallTransport { .. }
+                    | crate::view::ViewOp::RetireTransport { .. }
+                    | crate::view::ViewOp::InsertParticipant { .. }
+                    | crate::view::ViewOp::RemoveParticipant { .. }
+                    | crate::view::ViewOp::RemoveTrackRuntime { .. }
+                    | crate::view::ViewOp::RemoveDataRuntime { .. }
+                    | crate::view::ViewOp::RemoveReliableRuntime { .. }
+                    | crate::view::ViewOp::RemoveAudioPlan { .. }
+                    | crate::view::ViewOp::SetAudioPlan { .. }
+                    | crate::view::ViewOp::SetDataPlan { .. }
+                    | crate::view::ViewOp::RemoveDataPlan { .. }
+                    | crate::view::ViewOp::SetReliablePlan { .. }
+                    | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
                 }
                 if let crate::view::ViewOp::RemoveParticipant { key } = op {
                     self.timers.cancel(*key);
@@ -261,6 +302,8 @@ impl ShardCore {
             (crate::route::RouteAction::Video { local_track }, MediaPayload::Video(mut pkt)) => {
                 let Some(plan) = view.tracks.resolve(local_track) else {
                     metrics::counter!("remote_video_before_plan").increment(1);
+                    #[cfg(feature = "sim")]
+                    crate::sim_metrics::record_routing_counter("remote_video_before_plan");
                     return;
                 };
                 pkt.playout_time = self.wall.to_instant(playout);
@@ -273,11 +316,13 @@ impl ShardCore {
                     wall: &self.wall,
                 };
                 self.runtime
-                    .route_video_with_plan(local_track, pkt, plan, &mut ctx);
+                    .route_video_with_plan(local_track, *pkt, plan, &mut ctx);
             }
             (crate::route::RouteAction::Audio { track }, MediaPayload::Audio(mut pkt)) => {
                 let Some(plan) = view.audio.resolve(track) else {
                     metrics::counter!("remote_audio_before_plan").increment(1);
+                    #[cfg(feature = "sim")]
+                    crate::sim_metrics::record_routing_counter("remote_audio_before_plan");
                     return;
                 };
                 pkt.playout_time = self.wall.to_instant(playout);
@@ -294,7 +339,7 @@ impl ShardCore {
                     Origin::Remote,
                     AudioRtpEvent {
                         stream_id: (plan.track_id, None),
-                        pkt,
+                        pkt: *pkt,
                         origin: plan.origin,
                         origin_key: None,
                         fanout: Some(track),
@@ -306,6 +351,8 @@ impl ShardCore {
             (crate::route::RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = view.data.resolve(stream) else {
                     metrics::counter!("remote_data_before_plan").increment(1);
+                    #[cfg(feature = "sim")]
+                    crate::sim_metrics::record_routing_counter("remote_data_before_plan");
                     return;
                 };
                 let mut ctx = DispatchCtx {
@@ -320,6 +367,8 @@ impl ShardCore {
             (crate::route::RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = view.reliable.resolve(stream) else {
                     metrics::counter!("remote_reliable_before_plan").increment(1);
+                    #[cfg(feature = "sim")]
+                    crate::sim_metrics::record_routing_counter("remote_reliable_before_plan");
                     return;
                 };
                 let mut ctx = DispatchCtx {
@@ -344,9 +393,14 @@ impl ShardCore {
         let Some(handle) = self.registry.demux(&batch) else {
             return;
         };
-        debug_assert_eq!(handle.shard(), self.shard_id);
+        // Not an error: SO_REUSEPORT picks the receiving socket by hashing the
+        // 4-tuple, which has nothing to do with which shard owns the route, so
+        // a datagram for another shard arriving here is ordinary. Resolving a
+        // route is not a claim to own it.
         if handle.shard() != self.shard_id {
             metrics::counter!("shard_wrong_owner_drop").increment(1);
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::record_routing_counter("shard_wrong_owner_drop");
             return;
         }
         let Some(key) = self.view.transports.resolve(handle) else {
@@ -376,6 +430,8 @@ impl ShardCore {
             let view = &self.view;
             let Some(plan) = view.audio.resolve(track) else {
                 metrics::counter!("audio_before_plan").increment(1);
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_counter("audio_before_plan");
                 continue;
             };
             self.runtime
@@ -390,6 +446,8 @@ impl ShardCore {
             let view = &self.view;
             let Some(plan) = view.tracks.resolve(fanout) else {
                 metrics::counter!("video_before_plan").increment(1);
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_counter("video_before_plan");
                 continue;
             };
             self.runtime
@@ -403,10 +461,17 @@ impl ShardCore {
             let view = &self.view;
             let Some(plan) = view.data.resolve(stream) else {
                 metrics::counter!("data_before_plan").increment(1);
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_counter("data_before_plan");
                 continue;
             };
-            self.runtime
-                .route_data_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
+            self.runtime.route_data_with_plan(
+                stream,
+                Origin::Local,
+                Bytes::from(ev.pkt),
+                plan,
+                &mut ctx,
+            );
         }
         while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
             let Some(stream) = ev.stream else {
@@ -416,12 +481,14 @@ impl ShardCore {
             let view = &self.view;
             let Some(plan) = view.reliable.resolve(stream) else {
                 metrics::counter!("reliable_before_plan").increment(1);
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_counter("reliable_before_plan");
                 continue;
             };
             self.runtime.route_reliable_data_with_plan(
                 stream,
                 Origin::Local,
-                ev.pkt,
+                Bytes::from(ev.pkt),
                 plan,
                 &mut ctx,
             );
@@ -437,16 +504,12 @@ impl ShardCore {
                         subscriber,
                         subscriber_key,
                         slot,
-                    } => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::SubscriptionIntent {
-                            intent: ClientIntent::TrackSubscribed {
-                                subscriber,
-                                subscriber_key,
-                                slot,
-                                track,
-                            },
-                        }),
+                    } => self.pipeline.push_shard_event(ShardEvent::TrackSubscribed {
+                        subscriber,
+                        subscriber_key,
+                        slot,
+                        track,
+                    }),
                     ParticipantSubscriptionEvent::Unsubscribed {
                         track,
                         subscriber,
@@ -454,12 +517,10 @@ impl ShardCore {
                         ..
                     } => self
                         .pipeline
-                        .push_shard_event(ShardEvent::SubscriptionIntent {
-                            intent: ClientIntent::TrackUnsubscribed {
-                                subscriber,
-                                slot,
-                                track,
-                            },
+                        .push_shard_event(ShardEvent::TrackUnsubscribed {
+                            subscriber,
+                            slot,
+                            track,
                         }),
                 },
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
@@ -475,14 +536,14 @@ impl ShardCore {
                 ParticipantEvent::Control(ev) => match ev {
                     ClientIntent::TrackPublished(mut track, states) => {
                         track.reverse = None;
-                        self.pipeline.push_shard_event(ShardEvent::TrackObserved {
+                        self.pipeline.push_shard_event(ShardEvent::TrackPublished {
                             track: Box::new(track),
                             states,
                         });
                     }
                     ClientIntent::TrackUnpublished { origin, track_id } => {
                         self.pipeline
-                            .push_shard_event(ShardEvent::TrackClosed { origin, track_id });
+                            .push_shard_event(ShardEvent::TrackUnpublished { origin, track_id });
                     }
                     ClientIntent::DataTopicPublished {
                         room_id,
@@ -490,40 +551,118 @@ impl ShardCore {
                         topic,
                     } => {
                         self.pipeline
-                            .push_shard_event(ShardEvent::DataChannelObserved {
-                                intent: ClientIntent::DataTopicPublished {
-                                    room_id,
-                                    publisher,
-                                    topic,
-                                },
+                            .push_shard_event(ShardEvent::DataTopicPublished {
+                                room_id,
+                                publisher,
+                                topic,
                             });
                     }
+                    ClientIntent::DataTopicUnpublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => self
+                        .pipeline
+                        .push_shard_event(ShardEvent::DataTopicUnpublished {
+                            room_id,
+                            publisher,
+                            topic,
+                        }),
+                    ClientIntent::DataTopicSubscribed {
+                        room_id,
+                        subscriber,
+                        topic,
+                        publisher,
+                        channel,
+                    } => self
+                        .pipeline
+                        .push_shard_event(ShardEvent::DataTopicSubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                            publisher,
+                            channel,
+                        }),
+                    ClientIntent::DataTopicUnsubscribed {
+                        room_id,
+                        subscriber,
+                        topic,
+                        publisher,
+                    } => self
+                        .pipeline
+                        .push_shard_event(ShardEvent::DataTopicUnsubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                            publisher,
+                        }),
                     ClientIntent::ReliableDataTopicPublished {
                         room_id,
                         publisher,
                         topic,
                     } => {
                         self.pipeline
-                            .push_shard_event(ShardEvent::DataChannelObserved {
-                                intent: ClientIntent::ReliableDataTopicPublished {
-                                    room_id,
-                                    publisher,
-                                    topic,
-                                },
+                            .push_shard_event(ShardEvent::ReliableDataTopicPublished {
+                                room_id,
+                                publisher,
+                                topic,
                             });
                     }
-                    ClientIntent::TrackStatsUpdated { track_id, states } => {
+                    ClientIntent::ReliableDataTopicUnpublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => self
+                        .pipeline
+                        .push_shard_event(ShardEvent::ReliableDataTopicUnpublished {
+                            room_id,
+                            publisher,
+                            topic,
+                        }),
+                    ClientIntent::ReliableDataTopicSubscribed {
+                        room_id,
+                        subscriber,
+                        topic,
+                        channel,
+                    } => self
+                        .pipeline
+                        .push_shard_event(ShardEvent::ReliableDataTopicSubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                            channel,
+                        }),
+                    ClientIntent::ReliableDataTopicUnsubscribed {
+                        room_id,
+                        subscriber,
+                        topic,
+                    } => {
                         self.pipeline
-                            .push_shard_event(ShardEvent::TrackStatsObserved {
-                                track_id,
-                                states: states.clone(),
+                            .push_shard_event(ShardEvent::ReliableDataTopicUnsubscribed {
+                                room_id,
+                                subscriber,
+                                topic,
                             });
-                        self.apply_local_track_stats(track_id, states, router);
                     }
-                    ClientIntent::KeyframeRequested(req) => {
-                        self.send_keyframe_request(req, router);
+                },
+                ParticipantEvent::Internal(ev) => match ev {
+                    crate::shard::events::ShardInternalEvent::TrackStatsUpdated {
+                        track_id,
+                        fanout,
+                        states,
+                    } => {
+                        self.apply_local_track_stats(fanout, track_id, states, router);
                     }
-                    ClientIntent::ReliableControlReceived { stream, bytes } => {
+                    crate::shard::events::ShardInternalEvent::KeyframeRequested {
+                        request,
+                        fanout,
+                    } => {
+                        self.send_keyframe_request(fanout, request, router);
+                    }
+                    crate::shard::events::ShardInternalEvent::ReliableControlReceived {
+                        stream,
+                        bytes,
+                    } => {
                         let Some(stream) = stream else {
                             debug_assert!(false, "reliable control has no compiled stream key");
                             continue;
@@ -539,11 +678,9 @@ impl ShardCore {
                             router,
                             wall: &self.wall,
                         };
-                        self.runtime.route_reliable_control(bytes, plan, &mut ctx);
+                        self.runtime
+                            .route_reliable_control(Bytes::from(bytes), plan, &mut ctx);
                     }
-                    ev => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::SubscriptionIntent { intent: ev }),
                 },
             }
         }
@@ -555,14 +692,20 @@ impl ShardCore {
 
     fn apply_local_track_stats(
         &mut self,
+        fanout: Option<crate::shard::router::TrackKey>,
         track_id: crate::entity::TrackId,
         states: crate::track::TrackStates,
         router: &impl ShardTransport,
     ) {
-        let Some(fanout) = self.runtime.track_key_for_id(track_id) else {
+        let Some(fanout) = fanout else {
             metrics::counter!("track_stats_before_runtime").increment(1);
             return;
         };
+        let Some((runtime_track_id, _)) = self.runtime.track_descriptor(fanout) else {
+            metrics::counter!("track_stats_before_runtime").increment(1);
+            return;
+        };
+        debug_assert_eq!(runtime_track_id, track_id);
         let Some(plan) = self.view.tracks.resolve(fanout) else {
             metrics::counter!("track_stats_before_plan").increment(1);
             return;
@@ -578,10 +721,11 @@ impl ShardCore {
 
     fn send_keyframe_request(
         &mut self,
+        fanout: Option<crate::shard::router::TrackKey>,
         req: crate::track::GlobalKeyframeRequest,
         router: &impl ShardTransport,
     ) {
-        let Some(fanout) = self.runtime.track_key_for_id(req.stream_id.0) else {
+        let Some(fanout) = fanout else {
             metrics::counter!("keyframe_before_runtime").increment(1);
             return;
         };
@@ -630,8 +774,12 @@ impl ShardCore {
         router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
-            ShardCommand::MaterializeParticipant { key, config } => {
-                self.add_participant(key, *config);
+            ShardCommand::MaterializeParticipant {
+                key,
+                transport,
+                config,
+            } => {
+                self.add_participant(key, transport, *config);
             }
             ShardCommand::AdoptTcpConnection { .. } => {
                 debug_assert!(false, "TCP handoff is consumed by the worker");
@@ -708,15 +856,14 @@ impl ShardCore {
         }
     }
 
-    fn add_participant(&mut self, key: ParticipantKey, cfg: ParticipantConfig) {
-        let Some(handle) = self.view.transports.handle_for(key, self.shard_id) else {
-            debug_assert!(
-                false,
-                "participant materialization requires an installed transport"
-            );
-            return;
-        };
-        if !self.registry.insert(key, cfg, handle, &mut self.rng) {
+    fn add_participant(
+        &mut self,
+        key: ParticipantKey,
+        transport: crate::route::TransportHandle,
+        cfg: ParticipantConfig,
+    ) {
+        debug_assert_eq!(transport.shard(), self.shard_id);
+        if !self.registry.insert(key, cfg, transport, &mut self.rng) {
             return;
         }
         if let Some(participant) = self.registry.resolve_mut(key) {
@@ -794,5 +941,78 @@ impl ShardCore {
             udp_socket.close_peer(&addr);
             tcp_socket.close_peer(&addr);
         }
+    }
+}
+
+#[cfg(test)]
+mod wrong_owner_tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    use super::*;
+    use crate::control::ufrag::IceUfrag;
+    use crate::id::ShardId;
+    use crate::route::TransportRoute;
+    use pulsebeam_runtime::net::{RecvPacketBatch, Transport, UdpMode};
+
+    const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+    const BINDING_REQUEST: [u8; 2] = [0x00, 0x01];
+    const USERNAME_TYPE: [u8; 2] = [0x00, 0x06];
+
+    fn stun_binding_request(server_ufrag: &str) -> Vec<u8> {
+        let username = format!("{server_ufrag}:client");
+        let value = username.as_bytes();
+        let padded = value.len().next_multiple_of(4);
+        let attr_total = 4 + padded;
+
+        let mut buf = Vec::with_capacity(20 + attr_total);
+        buf.extend_from_slice(&BINDING_REQUEST);
+        buf.extend_from_slice(&u16::try_from(attr_total).unwrap().to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE);
+        buf.extend_from_slice(&[0u8; 12]);
+        buf.extend_from_slice(&USERNAME_TYPE);
+        buf.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
+        buf.extend_from_slice(value);
+        buf.resize(buf.len() + (padded - value.len()), 0);
+        buf
+    }
+
+    /// `SO_REUSEPORT` picks the receiving socket by hashing the 4-tuple, which
+    /// has nothing to do with which shard the ufrag names, so a datagram for
+    /// another shard arriving here is ordinary traffic. It must be dropped and
+    /// counted — never asserted on, and never re-enqueued.
+    ///
+    /// This was a `debug_assert_eq!`, which aborted under the sim and test
+    /// profiles and made the counted drop three lines below it unreachable.
+    /// Re-adding it makes this test abort rather than fail.
+    #[tokio::test(start_paused = true)]
+    async fn a_datagram_for_another_shard_is_dropped_not_asserted() {
+        let shard = ShardId::new(0);
+        let (_writer, view_rx) = crate::view::new_shard_view(shard);
+        let mut core = ShardCore::new(
+            shard,
+            1,
+            pulsebeam_runtime::rand::seeded_rng(1),
+            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            view_rx,
+        );
+
+        let foreign = TransportRoute::new(ShardId::new(3), 41);
+        let data = stun_binding_request(&IceUfrag::new(0, 0, foreign, 9).encode());
+        let len = data.len();
+        core.on_udp_batch(RecvPacketBatch {
+            src: "203.0.113.7:40000".parse().unwrap(),
+            dst: "198.51.100.1:3478".parse().unwrap(),
+            buf: data,
+            stride: len,
+            len,
+            transport: Transport::Udp(UdpMode::Scalar),
+            offset: 0,
+        });
+
+        assert_eq!(
+            core.participant_count(),
+            0,
+            "a foreign-shard datagram must not create or touch local state"
+        );
     }
 }

@@ -13,6 +13,7 @@ pub(crate) trait ParticipantSink {
     fn publish_track_stats(
         &mut self,
         track_id: crate::entity::TrackId,
+        fanout: Option<TrackKey>,
         states: crate::track::TrackStates,
     );
     fn unpublish_track(&mut self, track_id: TrackId);
@@ -30,7 +31,7 @@ pub(crate) trait ParticipantSink {
     );
     fn publish_data_topic(&mut self, topic: Topic);
     fn unpublish_data_topic(&mut self, topic: Topic);
-    fn request_keyframe(&mut self, layer: &TrackLayer);
+    fn request_keyframe(&mut self, layer: &TrackLayer, fanout: Option<TrackKey>);
     fn exit(&mut self);
 
     fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<TrackKey>, pkt: RtpPacket);
@@ -99,6 +100,7 @@ pub mod test_utils {
         fn publish_track_stats(
             &mut self,
             _track_id: crate::entity::TrackId,
+            _fanout: Option<TrackKey>,
             _states: crate::track::TrackStates,
         ) {
         }
@@ -137,7 +139,7 @@ pub mod test_utils {
             self.unpublish_data_topic_calls.push(topic);
         }
 
-        fn request_keyframe(&mut self, layer: &TrackLayer) {
+        fn request_keyframe(&mut self, layer: &TrackLayer, _fanout: Option<TrackKey>) {
             self.request_keyframe_calls
                 .push((layer.stream_id(), layer.meta.origin));
         }

@@ -701,6 +701,13 @@ Instead, the Envelope has a first-class `type`.
 
 # 22. Fixed inter-node Envelope
 
+The envelope is the data-plane wire contract. Lifecycle state is maintained
+separately by the controller and delivered to each shard as a `ShardViewDelta`;
+the current same-node implementation carries `ShardFrame` values through the
+shard mesh, while the fixed envelope remains the boundary for node-to-node
+transport. No lifecycle command, reply channel, or generation acknowledgement
+is encoded in this envelope.
+
 The common Envelope header is exactly 16 bytes.
 
 Wire layout:
@@ -878,7 +885,9 @@ RouteId
 ShardId + Slot
 ```
 
-The shard already knows the route belongs to it.
+The shard checks the encoded owner before dispatching. A packet that reaches a
+different reuseport socket is a normal wrong-owner arrival: it is counted and
+dropped, never forwarded back through the shard mesh.
 
 Therefore the hot-path lookup becomes approximately:
 
@@ -916,13 +925,10 @@ shard 3
 endpoint_slots[17]
 ```
 
-The exact storage implementation can be:
-
-- a dense generational table,
-- a custom externally addressed slot table,
-- or another shard-local layout.
-
-The wire protocol does not depend on the specific Rust container.
+The current storage uses shard-owned `SecondaryMap`s keyed by control-minted
+`TrackKey`, `DataStreamKey`, and `ReliableStreamKey`; stable participant and
+publisher identities are carried alongside the compiled view entries. The
+wire protocol does not depend on the Rust container.
 
 ---
 
@@ -956,9 +962,9 @@ RouteHandle {
 ```
 
 The control plane is the route allocator. It chooses the destination shard,
-allocates a slot and epoch in that shard's namespace, and asks the owning
-shard to install the compiled endpoint. The route handle is not published to
-a sender until installation is acknowledged.
+allocates a slot and epoch in that shard's namespace, and publishes a delta
+that installs the compiled endpoint. The route handle is advertised after the
+delta is queued; the owning shard applies it on its next tick.
 
 The owning shard remains the authority for live endpoint state and validates
 the route epoch on receipt. Allocation authority and endpoint state ownership
@@ -968,14 +974,18 @@ are separate:
 control plane:
     choose shard
     allocate (route, epoch)
-    request installation
-    publish only after acknowledgement
+    compile and queue a ShardViewDelta
+    commit the lifecycle generation
 
 owning shard:
-    install endpoint at slot
+    apply the queued delta
     process packets
     retire endpoint on command
 ```
+
+A packet racing the delta can be dropped before the view is applied. These
+transitions are deliberately non-blocking; the drop is observable through the
+corresponding `*_before_plan`/`*_before_runtime` counters.
 
 Transport routes and distributed endpoint routes use separate allocator
 namespaces even though they share the packed representation.
@@ -1177,7 +1187,9 @@ Envelope {
 + SCTP/data-channel payload
 ```
 
-The route may point to participant-level SCTP state rather than a media stream slot.
+The route points to the compiled data or reliable stream runtime. The payload
+uses reference-counted `Bytes`, so forwarding to several remote shards does
+not clone the application's byte buffer.
 
 The common packed route layout still applies.
 
@@ -1198,7 +1210,7 @@ select shard socket
    ↓
 shard receives datagram
    ↓
-parse 16-byte Envelope
+parse 16-byte Envelope (at the node boundary)
    ↓
 validate version
    ↓
@@ -1206,7 +1218,7 @@ validate epoch
    ↓
 extract slot
    ↓
-lookup endpoint
+lookup the shard-local compiled endpoint
    ↓
 dispatch by Envelope.type
 ```
