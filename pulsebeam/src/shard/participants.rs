@@ -103,15 +103,23 @@ impl ParticipantRegistry {
         self.participants.get_mut(key)
     }
 
-    pub fn publish_track(&mut self, track: &crate::track::Track) {
-        for (_, participant) in &mut self.participants {
-            participant.on_tracks_published(std::slice::from_ref(track));
+    pub fn publish_track_to(&mut self, track: &crate::track::Track, audience: &[ParticipantKey]) {
+        for &key in audience {
+            if let Some(participant) = self.participants.get_mut(key) {
+                participant.on_tracks_published(std::slice::from_ref(track));
+            }
         }
     }
 
-    pub fn unpublish_track(&mut self, track_id: &crate::entity::TrackId) {
-        for (_, participant) in &mut self.participants {
-            participant.on_tracks_unpublished(std::slice::from_ref(track_id));
+    pub fn unpublish_track_to(
+        &mut self,
+        track_id: &crate::entity::TrackId,
+        audience: &[ParticipantKey],
+    ) {
+        for &key in audience {
+            if let Some(participant) = self.participants.get_mut(key) {
+                participant.on_tracks_unpublished(std::slice::from_ref(track_id));
+            }
         }
     }
 

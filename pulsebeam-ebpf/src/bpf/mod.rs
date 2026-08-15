@@ -11,13 +11,10 @@ use aya_ebpf::{
     maps::{LruHashMap, PerCpuArray, ReusePortSockArray},
     programs::SkReuseportContext,
 };
-use pulsebeam_routing::{
-    classify::{ClientVerdict, DropReason, NodeVerdict, classify_client_for_node, classify_node},
-    envelope::peek_shard,
-};
+use pulsebeam_routing::steer::{self, FlowKey, SteerEnv, Verdict};
 
 use crate::common::{MAX_FLOWS, MAX_SHARDS, counters};
-use net::{FlowKey, parse_udp};
+use net::parse_udp;
 
 const SK_PASS: u32 = aya_ebpf::bindings::sk_action::SK_PASS;
 const SK_DROP: u32 = aya_ebpf::bindings::sk_action::SK_DROP;
@@ -46,6 +43,23 @@ fn bump(index: u32) {
     }
 }
 
+struct BpfSteerEnv;
+
+impl SteerEnv for BpfSteerEnv {
+    fn flow_lookup(&self, flow: FlowKey) -> Option<u16> {
+        let shard = unsafe { FLOWS.get(flow) }?;
+        u16::try_from(*shard).ok()
+    }
+
+    fn flow_insert(&mut self, flow: FlowKey, shard: u16) {
+        let _ = FLOWS.insert(flow, u32::from(shard), 0);
+    }
+
+    fn bump(&mut self, counter: u32) {
+        bump(counter);
+    }
+}
+
 fn select_shard(ctx: &SkReuseportContext, shard: u16) -> u32 {
     if u32::from(shard) >= MAX_SHARDS {
         bump(counters::INVALID_SHARD);
@@ -60,21 +74,6 @@ fn select_shard(ctx: &SkReuseportContext, shard: u16) -> u32 {
             bump(counters::INVALID_SHARD);
             SK_DROP
         }
-    }
-}
-
-fn drop_reason_counter(reason: DropReason) -> u32 {
-    match reason {
-        DropReason::NotStun | DropReason::MalformedStun | DropReason::NoUsername => {
-            counters::MALFORMED_STUN
-        }
-        DropReason::BadUfragLen | DropReason::BadUfragEncoding => counters::INVALID_UFRAG,
-        DropReason::BadVersion => counters::INVALID_VERSION,
-        DropReason::WrongCluster => counters::WRONG_CLUSTER,
-        DropReason::WrongNode => counters::WRONG_NODE,
-        DropReason::MalformedEnvelope => counters::MALFORMED_ENVELOPE,
-        DropReason::UnknownEnvelopeType => counters::INVALID_TYPE,
-        DropReason::InvalidShard => counters::INVALID_SHARD,
     }
 }
 
@@ -93,33 +92,18 @@ pub fn pulsebeam_client(ctx: SkReuseportContext) -> u32 {
     let node_id = unsafe { core::ptr::read_volatile(&raw const NODE_ID) };
     let shard_count = unsafe { core::ptr::read_volatile(&raw const SHARD_COUNT) };
 
-    match classify_client_for_node(udp.payload(), cluster_id, node_id, shard_count) {
-        ClientVerdict::Bootstrap { handle, .. } => {
-            let shard = handle.route.shard();
-            let selected = select_shard(&ctx, shard);
-            if selected == SK_PASS {
-                let _ = FLOWS.insert(udp.flow, u32::from(shard), 0);
-            }
-            selected
-        }
-        ClientVerdict::Established => match unsafe { FLOWS.get(udp.flow) } {
-            Some(&shard) => {
-                if shard >= u32::from(shard_count) {
-                    bump(counters::STALE_ROUTE);
-                    SK_DROP
-                } else {
-                    select_shard(&ctx, shard as u16)
-                }
-            }
-            None => {
-                bump(counters::UNKNOWN_FLOW);
-                SK_DROP
-            }
-        },
-        ClientVerdict::Drop(reason) => {
-            bump(drop_reason_counter(reason));
-            SK_DROP
-        }
+    let mut env = BpfSteerEnv;
+    match steer::steer_client(
+        &mut env,
+        udp.payload(),
+        udp.flow,
+        cluster_id,
+        node_id,
+        shard_count,
+        MAX_SHARDS,
+    ) {
+        Verdict::Pass { shard } => select_shard(&ctx, shard),
+        Verdict::Drop(_) => SK_DROP,
     }
 }
 
@@ -135,25 +119,10 @@ pub fn pulsebeam_node(ctx: SkReuseportContext) -> u32 {
 
     let shard_count = unsafe { core::ptr::read_volatile(&raw const SHARD_COUNT) };
 
-    let Some(shard) = peek_shard(udp.payload()) else {
-        bump(counters::MALFORMED_ENVELOPE);
-        return SK_DROP;
-    };
-
-    match classify_node(udp.payload(), shard_count) {
-        NodeVerdict::Steer {
-            shard: verdict_shard,
-        } => {
-            debug_assert_eq!(
-                shard, verdict_shard,
-                "peek_shard must agree with classify_node"
-            );
-            select_shard(&ctx, verdict_shard)
-        }
-        NodeVerdict::Drop(reason) => {
-            bump(drop_reason_counter(reason));
-            SK_DROP
-        }
+    let mut env = BpfSteerEnv;
+    match steer::steer_node(&mut env, udp.payload(), shard_count, MAX_SHARDS) {
+        Verdict::Pass { shard } => select_shard(&ctx, shard),
+        Verdict::Drop(_) => SK_DROP,
     }
 }
 

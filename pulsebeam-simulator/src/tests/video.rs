@@ -1,6 +1,70 @@
 use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
 
+fn cross_shard_video_room() -> super::common::Room {
+    super::common::Room::new("cross-shard-video")
+        .with_participant(super::common::Participant::single_publisher("publisher"))
+        .with_participant(super::common::Participant::subscriber("subscriber"))
+}
+
+#[test]
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+fn cross_shard_stats_reach_the_subscriber_allocator() {
+    super::common::LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(cross_shard_video_room())
+        .run(vec![
+            super::common::Step::Run {
+                description: "converge publisher telemetry across the shard boundary",
+                duration: Duration::from_secs(12),
+            },
+            super::common::Step::CheckForwardedQualityReached {
+                description: "subscriber quality responds to publisher stats",
+                origin: "publisher",
+                min_quality: 1,
+            },
+        ]);
+}
+
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+#[test]
+fn cross_shard_keyframe_reaches_the_publisher() {
+    super::common::LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            super::common::Room::new("cross-shard-keyframe")
+                .with_participant(super::common::Participant::publisher(
+                    "publisher",
+                    &["q", "h", "f"],
+                ))
+                .with_participant(super::common::Participant::subscriber("subscriber")),
+        )
+        .run(vec![
+            super::common::Step::Run {
+                description: "establish a cross-shard simulcast stream",
+                duration: Duration::from_secs(8),
+            },
+            super::common::Step::SetBandwidth {
+                description: "force a layer change that needs a fresh keyframe",
+                participant: "subscriber",
+                bits_per_sec: 250_000,
+            },
+            super::common::Step::Run {
+                description: "allow the reverse feedback route to carry the request",
+                duration: Duration::from_secs(8),
+            },
+            super::common::Step::CheckCrossShardMedia {
+                description: "the request belongs to a genuinely cross-shard stream",
+                min_frames: 100,
+            },
+            super::common::Step::CheckKeyframeRequestsAtLeast {
+                description: "the publisher receives the cross-shard keyframe request",
+                participant: "publisher",
+                min: 1,
+            },
+        ]);
+}
+
 /// A publisher that attaches a synthetic L1T3 Dependency Descriptor to every
 /// frame flows end-to-end and the subscriber decodes it — exercising the agent's
 /// DD emission and the SFU's DD-aware forwarder (parse + Full-target forward)

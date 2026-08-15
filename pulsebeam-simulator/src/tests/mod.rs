@@ -4,7 +4,6 @@ pub mod common;
 pub mod connectivity;
 pub mod data_channel;
 pub mod properties;
-pub mod routing_v5;
 pub mod subscriptions;
 pub mod video;
 

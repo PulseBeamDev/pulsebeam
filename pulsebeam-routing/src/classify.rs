@@ -20,6 +20,8 @@ pub enum DropReason {
     MalformedEnvelope,
     UnknownEnvelopeType,
     InvalidShard,
+    UnknownFlow,
+    StaleRoute,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

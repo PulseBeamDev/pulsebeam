@@ -7,6 +7,7 @@
 //! parsing.
 
 use aya_ebpf::programs::SkReuseportContext;
+use pulsebeam_routing::steer::FlowKey;
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
@@ -21,18 +22,6 @@ const UDP_HEADER_LEN: usize = 8;
 /// bootstrap messages and the fixed Envelope both fit comfortably inside
 /// this; anything past it is truncated, not read out of bounds.
 pub const MAX_PAYLOAD: usize = 512;
-
-#[derive(Clone, Copy)]
-pub struct FlowKey {
-    pub src_addr: [u8; 16],
-    pub dst_addr: [u8; 16],
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub is_ipv6: u8,
-    pub _pad: [u8; 3],
-}
-
-const _: () = assert!(core::mem::size_of::<FlowKey>() == 36);
 
 pub struct UdpPacket {
     pub flow: FlowKey,

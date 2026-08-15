@@ -82,7 +82,7 @@ struct Samples {
     /// is never desirable, and it is just as wrong during the cold-start ramp as it is in steady
     /// state, which is where a viewer notices it most.
     quality_reversals: HashMap<String, u64>,
-    routing_counters: HashMap<&'static str, u64>,
+    routing_counters: HashMap<String, u64>,
     /// Direction of each origin's last forwarded-layer change: `true` for an upgrade.
     last_quality_direction: HashMap<String, bool>,
     /// Every downstream estimate as `(elapsed, estimate_bps, desired_bps)`, keyed by the
@@ -108,6 +108,30 @@ struct Samples {
 
 thread_local! {
     static SAMPLES: RefCell<Samples> = RefCell::new(Samples::default());
+    static CONTROLLER_STALL_UNTIL: RefCell<Option<Instant>> = const { RefCell::new(None) };
+    static FAIL_NEXT_MATERIALIZATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn fail_next_materialization() {
+    FAIL_NEXT_MATERIALIZATION.with(|fail| fail.set(true));
+}
+
+pub fn take_materialization_failure() -> bool {
+    FAIL_NEXT_MATERIALIZATION.with(std::cell::Cell::take)
+}
+
+pub fn request_controller_stall(duration: Duration) {
+    let until = Instant::now()
+        .checked_add(duration)
+        .unwrap_or_else(Instant::now);
+    CONTROLLER_STALL_UNTIL.with_borrow_mut(|deadline| *deadline = Some(until));
+}
+
+pub async fn wait_controller_stall() {
+    let deadline = CONTROLLER_STALL_UNTIL.with_borrow_mut(Option::take);
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    }
 }
 
 /// Record one downstream allocation pass. Called from the allocator's reporting path.
@@ -145,12 +169,24 @@ pub fn cross_shard_media_frames() -> u64 {
 
 pub fn record_routing_counter(name: &'static str) {
     SAMPLES.with_borrow_mut(|s| {
-        *s.routing_counters.entry(name).or_default() += 1;
+        *s.routing_counters.entry(name.to_owned()).or_default() += 1;
+    });
+}
+
+pub fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) {
+    SAMPLES.with_borrow_mut(|s| {
+        let key = format!("routing_drop:{lane}:{stage}:{origin}");
+        *s.routing_counters.entry(key).or_default() += 1;
     });
 }
 
 pub fn routing_counter(name: &'static str) -> u64 {
     SAMPLES.with_borrow(|s| s.routing_counters.get(name).copied().unwrap_or(0))
+}
+
+pub fn routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) -> u64 {
+    let key = format!("routing_drop:{lane}:{stage}:{origin}");
+    SAMPLES.with_borrow(|s| s.routing_counters.get(&key).copied().unwrap_or(0))
 }
 
 /// Clear observations. The harness calls this at the start of each timed step so assertions

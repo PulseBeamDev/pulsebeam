@@ -34,6 +34,7 @@ allow-print-in-tests = true
 # The point of the deny is not that these are forbidden. It is that reaching for
 # one has to be a decision somebody wrote down.
 disallowed-types = [
+    { path = "bytes::Bytes", reason = "refcounted payload shared across shard boundaries. Cross-shard data is copied deliberately so allocation and release stay core-local; use Vec<u8> unless an explicit, reviewed exception is required." },
     { path = "std::sync::Arc", reason = "cross-core refcount. Fine when the count is bounded and touched at startup (one per shard); wrong on any path that runs per packet. Prefer Rc, or an owned value the shard holds outright." },
     { path = "std::sync::Mutex", reason = "a shard must never block on another shard. Use a message." },
     { path = "std::sync::RwLock", reason = "as Mutex. A reader still takes a cache line other cores want." },

@@ -1,6 +1,7 @@
 #![cfg_attr(target_arch = "bpf", no_std)]
 #![cfg_attr(target_arch = "bpf", no_main)]
 
+#[cfg(target_arch = "bpf")]
 mod common;
 
 #[cfg(target_arch = "bpf")]
@@ -49,7 +50,7 @@ mod host_tests {
 
     #[test]
     fn counter_index_table_is_dense_and_in_bounds() {
-        use crate::common::counters;
+        use pulsebeam_routing::steer::counters;
         let indices = [
             counters::MALFORMED_STUN,
             counters::MALFORMED_ENVELOPE,
@@ -74,6 +75,6 @@ mod host_tests {
     #[test]
     fn transport_route_shard_stays_within_sockarray_capacity() {
         let route = TransportRoute::new(1, 0);
-        assert!(u32::from(route.shard()) < crate::common::MAX_SHARDS);
+        assert!(u32::from(route.shard()) < pulsebeam_routing::steer::MAX_SHARDS);
     }
 }

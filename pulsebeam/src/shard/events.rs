@@ -55,7 +55,7 @@ pub(crate) struct SinkIdentity {
 pub enum ParticipantEvent {
     Subscription(ParticipantSubscriptionEvent),
     Lifecycle(ParticipantLifecycleEvent),
-    Control(ClientIntent),
+    Control(ShardEvent),
     Internal(ShardInternalEvent),
 }
 
@@ -77,59 +77,6 @@ pub enum ParticipantLifecycleEvent {
     Exited {
         participant_id: ParticipantId,
         participant_key: ParticipantKey,
-    },
-}
-
-#[derive(Debug)]
-pub enum ClientIntent {
-    TrackPublished(Track, crate::track::TrackStates),
-    TrackUnpublished {
-        origin: ParticipantId,
-        track_id: TrackId,
-    },
-    DataTopicPublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-    },
-    DataTopicUnpublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-    },
-    DataTopicSubscribed {
-        room_id: RoomId,
-        subscriber: ParticipantId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-        channel: ChannelId,
-    },
-    DataTopicUnsubscribed {
-        room_id: RoomId,
-        subscriber: ParticipantId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-    },
-    ReliableDataTopicPublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-    },
-    ReliableDataTopicUnpublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-    },
-    ReliableDataTopicSubscribed {
-        room_id: RoomId,
-        subscriber: ParticipantId,
-        topic: Topic,
-        channel: ChannelId,
-    },
-    ReliableDataTopicUnsubscribed {
-        room_id: RoomId,
-        subscriber: ParticipantId,
-        topic: Topic,
     },
 }
 
@@ -206,6 +153,15 @@ impl EventPipeline {
     pub fn pop_shard_event(&mut self) -> Option<ShardEvent> {
         self.shard_events.pop_front()
     }
+
+    pub fn has_pending(&self) -> bool {
+        !self.participant_events.is_empty()
+            || !self.audio_queue.is_empty()
+            || !self.video_queue.is_empty()
+            || !self.data_queue.is_empty()
+            || !self.reliable_data_queue.is_empty()
+            || !self.shard_events.is_empty()
+    }
 }
 
 pub struct PipelineSinkRef<'a> {
@@ -262,18 +218,21 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     fn publish_track(&mut self, track: Track, states: crate::track::TrackStates) {
+        let mut track = track;
+        track.reverse = None;
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(ClientIntent::TrackPublished(
-                track, states,
-            )));
+            .push_back(ParticipantEvent::Control(ShardEvent::TrackPublished {
+                track: Box::new(track),
+                states,
+            }));
     }
 
     #[inline]
     fn unpublish_track(&mut self, track_id: TrackId) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(ClientIntent::TrackUnpublished {
+            .push_back(ParticipantEvent::Control(ShardEvent::TrackUnpublished {
                 origin: self.id,
                 track_id,
             }));
@@ -288,15 +247,13 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     ) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(
-                ClientIntent::DataTopicSubscribed {
-                    room_id: self.room_id,
-                    subscriber: self.id,
-                    topic,
-                    publisher,
-                    channel,
-                },
-            ));
+            .push_back(ParticipantEvent::Control(ShardEvent::DataTopicSubscribed {
+                room_id: self.room_id,
+                subscriber: self.id,
+                topic,
+                publisher,
+                channel,
+            }));
     }
 
     #[inline]
@@ -309,7 +266,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ClientIntent::DataTopicUnsubscribed {
+                ShardEvent::DataTopicUnsubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
@@ -322,13 +279,11 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     fn publish_data_topic(&mut self, topic: Topic) {
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(
-                ClientIntent::DataTopicPublished {
-                    room_id: self.room_id,
-                    publisher: self.id,
-                    topic,
-                },
-            ));
+            .push_back(ParticipantEvent::Control(ShardEvent::DataTopicPublished {
+                room_id: self.room_id,
+                publisher: self.id,
+                topic,
+            }));
     }
 
     #[inline]
@@ -336,7 +291,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ClientIntent::DataTopicUnpublished {
+                ShardEvent::DataTopicUnpublished {
                     room_id: self.room_id,
                     publisher: self.id,
                     topic,
@@ -404,7 +359,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ClientIntent::ReliableDataTopicPublished {
+                ShardEvent::ReliableDataTopicPublished {
                     room_id: self.room_id,
                     publisher: self.id,
                     topic,
@@ -417,7 +372,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ClientIntent::ReliableDataTopicUnpublished {
+                ShardEvent::ReliableDataTopicUnpublished {
                     room_id: self.room_id,
                     publisher: self.id,
                     topic,
@@ -430,7 +385,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ClientIntent::ReliableDataTopicSubscribed {
+                ShardEvent::ReliableDataTopicSubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
@@ -444,7 +399,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
-                ClientIntent::ReliableDataTopicUnsubscribed {
+                ShardEvent::ReliableDataTopicUnsubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,

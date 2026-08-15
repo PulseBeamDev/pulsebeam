@@ -56,6 +56,7 @@ pub(crate) struct TrackDescriptor {
     pub encodings: Vec<Option<Rid>>,
     pub states: crate::track::TrackStates,
     pub publication: crate::track::Track,
+    pub audience: Vec<ParticipantKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,7 +400,7 @@ impl ShardViewWriter {
         match self.tx.try_send(delta) {
             Ok(()) => Some(generation),
             Err(mailbox::TrySendError::Full(delta)) => {
-                self.backlog = Some(delta);
+                self.backlog = Some(Self::bound_backlog(delta));
                 Some(generation)
             }
             Err(mailbox::TrySendError::Closed(_)) => None,
@@ -411,9 +412,30 @@ impl ShardViewWriter {
             debug_assert_eq!(backlog.shard, self.shard);
             backlog.ops.extend(delta.ops);
             backlog.generation = delta.generation;
+            Self::trim_backlog(backlog);
         } else {
-            self.backlog = Some(delta);
+            self.backlog = Some(Self::bound_backlog(delta));
         }
+    }
+
+    fn bound_backlog(mut delta: Box<ShardViewDelta>) -> Box<ShardViewDelta> {
+        Self::trim_backlog(&mut delta);
+        delta
+    }
+
+    fn trim_backlog(delta: &mut ShardViewDelta) {
+        let excess = delta
+            .ops
+            .len()
+            .saturating_sub(crate::shard::worker::SHARD_VIEW_BACKLOG_OP_CAPACITY);
+        if excess == 0 {
+            return;
+        }
+        delta.ops.drain(..excess);
+        metrics::counter!("view_backlog_shed").increment(excess as u64);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_counter("view_backlog_shed");
+        debug_assert!(delta.ops.len() <= crate::shard::worker::SHARD_VIEW_BACKLOG_OP_CAPACITY);
     }
 
     pub fn flush_backlog(&mut self) -> bool {
@@ -462,5 +484,32 @@ mod tests {
         let shard = ShardId::new(0);
         let (mut writer, _rx) = new_shard_view(shard);
         assert_eq!(writer.publish(), None);
+    }
+
+    #[test]
+    fn stale_route_epoch_is_rejected_after_slot_reuse() {
+        let route = RouteId::new(ShardId::new(0), 7);
+        let mut track_keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
+        let key = track_keys.insert(());
+        let mut image = RouteImage::default();
+        image.install(
+            route,
+            RouteBinding {
+                epoch: 3,
+                action: RouteAction::Video { local_track: key },
+            },
+        );
+        image.install(
+            route,
+            RouteBinding {
+                epoch: 4,
+                action: RouteAction::Video { local_track: key },
+            },
+        );
+
+        assert!(image.resolve(route, 3).is_none());
+        assert!(image.resolve(route, 4).is_some());
+        image.retire(route, 3);
+        assert!(image.resolve(route, 4).is_some());
     }
 }

@@ -131,6 +131,136 @@ fn tcp_simulation_test() {
         ]);
 }
 
+fn cross_shard_media_room() -> Room {
+    Room::new("cross-shard-media")
+        .with_participant(Participant::single_publisher("publisher"))
+        .with_participant(Participant::subscriber("subscriber"))
+}
+
+#[test]
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+fn controller_stall_keeps_established_media_alive() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "establish media before the controller stall",
+                duration: Duration::from_secs(5),
+            },
+            Step::StallController {
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckRxBytesInterval {
+                description: "media continues while control is stalled",
+                participant: "subscriber",
+                min_bytes: 1,
+            },
+        ]);
+}
+
+#[test]
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+fn wrong_owner_drops_once_and_media_continues() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "establish the media path",
+                duration: Duration::from_secs(5),
+            },
+            Step::SendToWrongShard {
+                description: "inject one datagram into a foreign shard",
+                participant: "publisher",
+            },
+            Step::CheckRoutingCounter {
+                description: "the foreign datagram is dropped at the owner guard",
+                name: "shard_wrong_owner_drop",
+                exact: 1,
+            },
+            Step::CheckRxBytes {
+                description: "the participant's own media remains unaffected",
+                participant: "subscriber",
+                min_bytes: 1,
+            },
+        ]);
+}
+
+#[test]
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+fn failed_materialization_does_not_connect_the_participant() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("materialization-failure")
+                .with_participant(Participant::single_publisher("publisher"))
+                .with_participant(Participant::subscriber("subscriber").starts_disconnected()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "establish the publisher before the injected failure",
+                duration: Duration::from_secs(5),
+            },
+            Step::FailNextMaterialization {
+                description: "fail the next participant materialization",
+            },
+            Step::Join {
+                description: "attempt the failed materialization",
+                participant: "subscriber",
+            },
+            Step::Run {
+                description: "allow the failed command to drain",
+                duration: Duration::from_secs(2),
+            },
+            Step::CheckRoutingCounter {
+                description: "the injected failure was consumed",
+                name: "materialization_failed",
+                exact: 1,
+            },
+            Step::CheckRoutingCounter {
+                description: "failed materialization leaves no participant key behind",
+                name: "materialization_orphan",
+                exact: 0,
+            },
+        ]);
+}
+
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+#[test]
+fn track_observation_is_not_forwarded_before_plan() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "settle observation, publication, and plan in order",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckMediaRouted {
+                description: "steady-state forwarding uses a compiled plan",
+                participant: "subscriber",
+            },
+        ]);
+
+    for (lane, stage, origin) in [
+        ("video", "plan", "local"),
+        ("video", "plan", "remote"),
+        ("audio", "plan", "local"),
+        ("audio", "plan", "remote"),
+        ("data", "plan", "local"),
+        ("data", "plan", "remote"),
+        ("reliable", "plan", "local"),
+        ("reliable", "plan", "remote"),
+    ] {
+        assert_eq!(
+            pulsebeam::sim_metrics::routing_drop(lane, stage, origin),
+            0,
+            "steady-state routing must not observe {lane} before the {stage}"
+        );
+    }
+}
+
 /// Reproduces the Chrome-with-UDP-disabled failure: with two shards the hash of
 /// a client's `peer_addr` and the hash of `room_id` can land on different shards,
 /// causing TCP egress to be silently dropped.

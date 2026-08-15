@@ -2817,7 +2817,6 @@ dependencies = [
  "axum",
  "axum-extra",
  "base32",
- "bytes",
  "clap",
  "core_affinity",
  "ctor",

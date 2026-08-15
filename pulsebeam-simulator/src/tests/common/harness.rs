@@ -328,6 +328,16 @@ pub enum Step {
         description: &'static str,
         duration: Duration,
     },
+    StallController {
+        duration: Duration,
+    },
+    SendToWrongShard {
+        description: &'static str,
+        participant: &'static str,
+    },
+    FailNextMaterialization {
+        description: &'static str,
+    },
 
     // ── Network ───────────────────────────────────────────────────────────
     Partition {
@@ -501,6 +511,17 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         max: u64,
+    },
+    /// Assert the publisher received at least `min` keyframe requests.
+    CheckKeyframeRequestsAtLeast {
+        description: &'static str,
+        participant: &'static str,
+        min: u64,
+    },
+    CheckRoutingCounter {
+        description: &'static str,
+        name: &'static str,
+        exact: u64,
     },
     /// Assert the participant has an active peer connection.
     CheckConnected {
@@ -1283,6 +1304,9 @@ async fn run_participant(
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Run { .. } => "Run",
+        Step::StallController { .. } => "StallController",
+        Step::SendToWrongShard { .. } => "SendToWrongShard",
+        Step::FailNextMaterialization { .. } => "FailNextMaterialization",
         Step::Partition { .. } => "Partition",
         Step::Repair { .. } => "Repair",
         Step::Hold { .. } => "Hold",
@@ -1304,6 +1328,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
+        Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
+        Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
         Step::CheckMediaRouted { .. } => "CheckMediaRouted",
         Step::CheckParticipantsKnown { .. } => "CheckParticipantsKnown",
         Step::CheckIdentityStable { .. } => "CheckIdentityStable",
@@ -1369,6 +1395,31 @@ async fn execute_plan(
                 if *duration >= ROOM_SETTLE_FLOOR {
                     assert_room_state_consistent(handles, description);
                 }
+            }
+
+            Step::StallController { duration } => {
+                tracing::info!("[step {n}/{total}: {kind}] controller stalled for {duration:?}");
+                pulsebeam::sim_metrics::request_controller_stall(*duration);
+                tokio::time::sleep(*duration).await;
+            }
+
+            Step::SendToWrongShard {
+                description,
+                participant,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let _ = get_handle(handles, participant, description)?;
+                pulsebeam_runtime::net::set_wrong_owner_injection(true);
+                handles
+                    .get(participant)
+                    .expect("participant was resolved above")
+                    .send_command(ParticipantCmd::Reconnect);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            Step::FailNextMaterialization { description } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\"");
+                pulsebeam::sim_metrics::fail_next_materialization();
             }
 
             Step::Report {
@@ -1920,6 +1971,35 @@ async fn execute_plan(
                 assert!(
                     actual <= *max,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {max} keyframe (PLI) requests\n  actual:       {actual} (a climbing count means downstream cannot decode — PLI storm)"
+                );
+            }
+
+            Step::CheckKeyframeRequestsAtLeast {
+                description,
+                participant,
+                min,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, min {min})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let actual = handle.keyframe_requests();
+                assert!(
+                    actual >= *min,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {min} keyframe (PLI) requests\n  actual:       {actual}"
+                );
+            }
+
+            Step::CheckRoutingCounter {
+                description,
+                name,
+                exact,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name})");
+                let actual = pulsebeam::sim_metrics::routing_counter(name);
+                assert_eq!(
+                    actual, *exact,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     exactly {exact}\n  actual:       {actual}"
                 );
             }
 

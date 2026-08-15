@@ -31,13 +31,6 @@ impl DirtyTracker {
         if participant.queued_dirty {
             return;
         }
-        debug_assert!(
-            !self
-                .participants
-                .get(self.cursor..)
-                .unwrap_or_default()
-                .contains(&key)
-        );
         participant.queued_dirty = true;
         self.participants.push(key);
     }

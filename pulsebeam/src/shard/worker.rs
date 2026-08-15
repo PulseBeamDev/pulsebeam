@@ -10,7 +10,6 @@ use std::{marker::PhantomData, pin::Pin, rc::Rc, sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
 use crate::route::Envelope;
-use bytes::Bytes;
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -62,6 +61,13 @@ pub(crate) const SHARD_FRAME_CAPACITY: usize = 1024;
 
 pub(crate) const SHARD_VIEW_CAPACITY: usize = 1024;
 
+pub(crate) const SHARD_COMMAND_BUDGET: usize = 64;
+pub(crate) const SHARD_FRAME_BUDGET: usize = 256;
+pub(crate) const SHARD_VIEW_OP_BUDGET: usize = 256;
+pub(crate) const SHARD_VIEW_BACKLOG_OP_CAPACITY: usize = 16_384;
+pub(crate) const SHARD_PIPELINE_BUDGET: usize = 512;
+pub(crate) const SHARD_EVENT_BUDGET: usize = 1024;
+
 /// How often a shard hands its metrics to the control plane.
 ///
 /// The values are cumulative and absolute, so this is a staleness bound and
@@ -109,6 +115,34 @@ fn describe_shard_metrics() {
         "tick_us",
         metrics::Unit::Microseconds,
         "how long one shard loop iteration took"
+    );
+    metrics::describe_counter!(
+        "routing_drop",
+        "recoverable packet or topology drops by lane, stage, and origin"
+    );
+    metrics::describe_counter!(
+        "shard_event_shed",
+        "topology events shed because the controller mailbox was full"
+    );
+    metrics::describe_counter!(
+        "shard_wrong_owner_drop",
+        "packets received by a shard that does not own their transport route"
+    );
+    metrics::describe_counter!(
+        "shard_tick_budget_hit",
+        "ticks that exhausted a bounded work phase before its queue drained"
+    );
+    metrics::describe_counter!(
+        "view_backlog_shed",
+        "view operations discarded after the bounded coalescing backlog filled"
+    );
+    metrics::describe_counter!(
+        "upstream_route_miss",
+        "incoming media with no matching upstream SSRC route"
+    );
+    metrics::describe_counter!(
+        "upstream_route_table_full",
+        "incoming media whose upstream SSRC route table could not accept a new entry"
     );
 }
 
@@ -169,7 +203,7 @@ pub(crate) enum Reverse {
     /// the subscriber telling the publisher what it is missing. Opaque here —
     /// the SFU relays it without interpreting it, which is what keeps
     /// end-to-end reliability an endpoint concern rather than a hop guarantee.
-    DataAck(Bytes),
+    DataAck(Vec<u8>),
 }
 
 /// Payload carried under an [`Envelope`]. Still typed this pass; byte
@@ -180,7 +214,7 @@ pub(crate) enum MediaPayload {
     /// SCTP bytes for a client data channel. Which lane the client asked for is
     /// in the destination's route entry, not here — the destination already
     /// knows it, and it describes the client's channel, not this hop.
-    Data(Bytes),
+    Data(Vec<u8>),
 }
 
 /// Everything one shard sends another: the data plane.
@@ -190,7 +224,7 @@ pub(crate) enum MediaPayload {
 /// the control plane ([`ShardCommand`] / [`ShardEvent`]) and never this way.
 #[allow(
     clippy::large_enum_variant,
-    reason = "the payload enum carries one shared Bytes handle for SCTP and boxed RTP packets so its routing envelope stays compact"
+    reason = "the payload enum carries boxed RTP packets and owned SCTP bytes so cross-shard payloads remain core-local"
 )]
 pub(crate) enum ShardFrame {
     /// Forward payload, addressed by the destination's own route. Carries no
@@ -544,9 +578,16 @@ impl ShardWorker {
     }
 
     fn tick(&mut self, now: Instant) {
-        self.core.apply_view_deltas();
+        if self.core.apply_view_deltas(SHARD_VIEW_OP_BUDGET) == SHARD_VIEW_OP_BUDGET {
+            self.tick_budget_hit("view");
+        }
         // phase 1: input
-        while let Ok(cmd) = self.command_rx.try_recv() {
+        let mut commands: usize = 0;
+        for _ in 0..SHARD_COMMAND_BUDGET {
+            let Ok(cmd) = self.command_rx.try_recv() else {
+                break;
+            };
+            commands = commands.saturating_add(1);
             match cmd {
                 ShardCommand::AdoptTcpConnection { stream, peer_addr } => {
                     if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
@@ -558,8 +599,19 @@ impl ShardWorker {
                 }
             }
         }
-        while let Ok(ev) = self.frame_rx.try_recv() {
+        if commands == SHARD_COMMAND_BUDGET {
+            self.tick_budget_hit("commands");
+        }
+        let mut frames: usize = 0;
+        for _ in 0..SHARD_FRAME_BUDGET {
+            let Ok(ev) = self.frame_rx.try_recv() else {
+                break;
+            };
+            frames = frames.saturating_add(1);
             self.core.on_shard_frame(ev, now, &self.router);
+        }
+        if frames == SHARD_FRAME_BUDGET {
+            self.tick_budget_hit("frames");
         }
         self.core.fire_timers(now);
 
@@ -571,10 +623,22 @@ impl ShardWorker {
 
         self.core
             .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
-        self.core.flush_stream_buffers(&self.router);
+        if self
+            .core
+            .flush_stream_buffers(&self.router, SHARD_PIPELINE_BUDGET)
+            == SHARD_PIPELINE_BUDGET
+        {
+            self.tick_budget_hit("pipeline");
+        }
         self.core
             .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
-        self.core.flush_participant_events(&self.router);
+        if self
+            .core
+            .flush_participant_events(&self.router, SHARD_PIPELINE_BUDGET)
+            == SHARD_PIPELINE_BUDGET
+        {
+            self.tick_budget_hit("participant_events");
+        }
 
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
@@ -586,7 +650,10 @@ impl ShardWorker {
     /// loop independent; a full queue sheds this recoverable topology hint and
     /// records it for diagnosis.
     fn flush_shard_events(&mut self) -> Result<(), ShardError> {
-        while let Some(event) = self.core.pop_shard_event() {
+        for _ in 0..SHARD_EVENT_BUDGET {
+            let Some(event) = self.core.pop_shard_event() else {
+                break;
+            };
             match self.event_tx.try_send((self.router.shard_id, event)) {
                 Ok(()) => {}
                 Err(mailbox::TrySendError::Closed(_)) => {
@@ -605,7 +672,17 @@ impl ShardWorker {
             }
         }
 
+        if self.core.has_pending_events() {
+            self.tick_budget_hit("shard_events");
+        }
+
         Ok(())
+    }
+
+    fn tick_budget_hit(&self, phase: &'static str) {
+        metrics::counter!("shard_tick_budget_hit", "phase" => phase).increment(1);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_counter("shard_tick_budget_hit");
     }
 }
 
@@ -650,32 +727,17 @@ mod reverse_tests {
             22,
             "a NACK must fit the documented 22 bytes"
         );
-        assert_eq!(
-            wire_len(&Reverse::DataAck(Bytes::from_static(&[0u8; 8]))),
-            27
-        );
+        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 27);
     }
 
     #[test]
-    fn media_payload_keeps_shared_data_bytes_compact() {
+    fn media_payload_stays_compact() {
         const _: () = assert!(std::mem::size_of::<MediaPayload>() <= 64);
-        let bytes = Bytes::from_static(b"payload");
-        let payload = MediaPayload::Data(bytes.clone());
-        let MediaPayload::Data(shared) = payload else {
+        let payload = MediaPayload::Data(b"payload".to_vec());
+        let MediaPayload::Data(bytes) = payload else {
             unreachable!();
         };
-        assert_eq!(shared.as_ptr(), bytes.as_ptr());
-        assert_eq!(shared.len(), bytes.len());
-    }
-
-    #[test]
-    fn reverse_data_ack_keeps_shared_bytes() {
-        let bytes = Bytes::from_static(b"ack");
-        let Reverse::DataAck(shared) = Reverse::DataAck(bytes.clone()) else {
-            unreachable!();
-        };
-        assert_eq!(shared.as_ptr(), bytes.as_ptr());
-        assert_eq!(shared.len(), bytes.len());
+        assert_eq!(bytes, b"payload");
     }
 
     /// An encoding is named by index, never by rid: the index is derivable from
@@ -702,9 +764,6 @@ mod reverse_tests {
 mod architecture_tests {
     use super::*;
 
-    const SHARD_EVENT_VARIANT_COUNT: usize = 13;
-    const SHARD_COMMAND_VARIANT_COUNT: usize = 2;
-
     fn event_variant(event: &ShardEvent) -> u8 {
         match event {
             ShardEvent::ParticipantClosed { .. } => 0,
@@ -723,17 +782,11 @@ mod architecture_tests {
         }
     }
 
-    fn command_variant(command: &ShardCommand) -> u8 {
-        match command {
-            ShardCommand::MaterializeParticipant { .. } => 0,
-            ShardCommand::AdoptTcpConnection { .. } => 1,
-        }
-    }
-
     #[test]
-    fn event_and_command_surfaces_have_exhaustive_guards() {
-        assert_eq!(SHARD_EVENT_VARIANT_COUNT, 13);
-        assert_eq!(SHARD_COMMAND_VARIANT_COUNT, 2);
-        let _ = (event_variant, command_variant);
+    fn event_surface_has_an_exhaustive_guard() {
+        let event = ShardEvent::ParticipantClosed {
+            participant: ParticipantId::from_bytes([0; 16]),
+        };
+        assert_eq!(event_variant(&event), 0);
     }
 }

@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
 use str0m::media::Rid;
@@ -96,6 +95,7 @@ struct TrackRuntime {
     layer_states: crate::track::TrackStates,
     cache: Option<TrackStreamCache>,
     link_seq: u32,
+    audience: Vec<ParticipantKey>,
 }
 
 struct StreamRuntime {
@@ -135,6 +135,10 @@ impl ShardRuntime {
         self.tracks.get(key).map(|track| &track.publication)
     }
 
+    pub(crate) fn track_audience(&self, key: TrackKey) -> Option<&[ParticipantKey]> {
+        self.tracks.get(key).map(|track| track.audience.as_slice())
+    }
+
     pub(crate) fn retire_data_stream(&mut self, key: DataStreamKey) {
         let _ = self.data.remove(key);
     }
@@ -166,6 +170,7 @@ impl ShardRuntime {
                         layer_states: descriptor.states.clone(),
                         cache: None,
                         link_seq: 0,
+                        audience: descriptor.audience.clone(),
                     },
                 );
                 if let Some(previous) = previous {
@@ -326,7 +331,7 @@ impl ShardRuntime {
         &mut self,
         stream: DataStreamKey,
         origin: Origin,
-        packet: Bytes,
+        packet: Vec<u8>,
         plan: &crate::view::StreamForwardingPlan,
         ctx: &mut impl RoutingContext,
     ) {
@@ -355,7 +360,7 @@ impl ShardRuntime {
         &mut self,
         stream: ReliableStreamKey,
         origin: Origin,
-        frame: Bytes,
+        frame: Vec<u8>,
         plan: &crate::view::StreamForwardingPlan,
         ctx: &mut impl RoutingContext,
     ) {
@@ -387,7 +392,7 @@ impl ShardRuntime {
 
     pub fn route_reliable_control(
         &self,
-        bytes: Bytes,
+        bytes: Vec<u8>,
         plan: &crate::view::StreamForwardingPlan,
         ctx: &mut impl RoutingContext,
     ) {
@@ -483,6 +488,7 @@ mod tests {
                 layers: Vec::new(),
                 reverse: None,
             },
+            audience: Vec::new(),
         }
     }
 

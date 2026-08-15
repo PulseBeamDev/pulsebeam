@@ -301,7 +301,7 @@ impl ControllerActor {
     /// dropping the control-plane transaction without dropping them would
     /// leave the abandoned ops staged — and the next generation would publish
     /// them as if they had been part of it.
-    fn abort_transaction(&mut self, _shard_id: crate::id::ShardId, now: tokio::time::Instant) {
+    fn abort_transaction(&mut self, now: tokio::time::Instant) {
         for view in &mut self.views {
             view.abort();
         }
@@ -347,6 +347,8 @@ impl ControllerActor {
         let cooldown_duration = std::time::Duration::from_secs(0);
 
         loop {
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::wait_controller_stall().await;
             tokio::select! {
                 // let command to backpressure to signal clients to slow down.
                 biased;
@@ -836,7 +838,7 @@ impl ControllerActor {
         for (destination, key, route) in stale {
             let Some(view) = self.view_mut(*destination) else {
                 debug_assert!(false, "a stream route must name a local view");
-                self.abort_transaction(*destination, now);
+                self.abort_transaction(now);
                 return false;
             };
             view.stage(
@@ -851,7 +853,7 @@ impl ControllerActor {
         if let Some((key, plan)) = source_key.zip(source_plan) {
             let Some(view) = self.view_mut(publisher_shard) else {
                 debug_assert!(false, "a stream publisher must name a local view");
-                self.abort_transaction(publisher_shard, now);
+                self.abort_transaction(now);
                 return false;
             };
             match (lane, key) {
@@ -880,7 +882,7 @@ impl ControllerActor {
         }
         if self.state.commit().is_err() {
             debug_assert!(false, "a published stream retirement must commit");
-            self.abort_transaction(publisher_shard, now);
+            self.abort_transaction(now);
             return false;
         }
 
@@ -932,7 +934,7 @@ impl ControllerActor {
         for (destination, key, route) in &routes {
             let Some(view) = self.view_mut(*destination) else {
                 debug_assert!(false, "a stream route must name a local view");
-                self.abort_transaction(*destination, now);
+                self.abort_transaction(now);
                 return false;
             };
             view.stage(
@@ -947,7 +949,7 @@ impl ControllerActor {
         if let Some(key) = source_key {
             let Some(view) = self.view_mut(publisher_shard) else {
                 debug_assert!(false, "a stream publisher must name a local view");
-                self.abort_transaction(publisher_shard, now);
+                self.abort_transaction(now);
                 return false;
             };
             Self::stage_remove_stream_plan(view, generation, lane, key);
@@ -964,7 +966,7 @@ impl ControllerActor {
         }
         if self.state.commit().is_err() {
             debug_assert!(false, "a published stream retirement must commit");
-            self.abort_transaction(publisher_shard, now);
+            self.abort_transaction(now);
             return false;
         }
         for (destination, _, route) in &routes {
@@ -1122,7 +1124,7 @@ impl ControllerActor {
         };
         for (shard, key, plan, route) in targets {
             let Some(view) = self.view_mut(shard) else {
-                self.abort_transaction(shard, now);
+                self.abort_transaction(now);
                 return;
             };
             match (lane, key) {
@@ -1198,7 +1200,7 @@ impl ControllerActor {
             }
         }
         if self.state.commit().is_err() {
-            self.abort_transaction(crate::id::ShardId::new(0), now);
+            self.abort_transaction(now);
         }
     }
 
@@ -1399,6 +1401,15 @@ impl ControllerActor {
                 self.retire_participant_streams(&participant_id).await;
                 self.retire_participant_subscriptions(&participant_id).await;
                 self.retire_participant_transport(&participant_id).await;
+                #[cfg(feature = "sim")]
+                if self.state.arenas.iter().any(|arena| {
+                    arena
+                        .participants
+                        .values()
+                        .any(|record| record.id == participant_id)
+                }) {
+                    crate::sim_metrics::record_routing_counter("materialization_orphan");
+                }
                 Some((
                     shard_id,
                     ShardEvent::ParticipantClosed {
@@ -1557,7 +1568,7 @@ impl ControllerActor {
         for retired in &video_routes {
             let Some(view) = self.view_mut(retired.destination) else {
                 debug_assert!(false, "a video route must name a local view");
-                self.abort_transaction(retired.destination, now);
+                self.abort_transaction(now);
                 return false;
             };
             view.stage(
@@ -1576,7 +1587,7 @@ impl ControllerActor {
         for (destination, route) in &audio_routes {
             let Some(view) = self.view_mut(*destination) else {
                 debug_assert!(false, "an audio route must name a local view");
-                self.abort_transaction(*destination, now);
+                self.abort_transaction(now);
                 return false;
             };
             view.stage(
@@ -1595,7 +1606,7 @@ impl ControllerActor {
         if let Some(route) = reverse_route {
             let Some(view) = self.view_mut(publisher_shard) else {
                 debug_assert!(false, "a reverse route must name a local view");
-                self.abort_transaction(publisher_shard, now);
+                self.abort_transaction(now);
                 return false;
             };
             view.stage(
@@ -1610,7 +1621,7 @@ impl ControllerActor {
 
         let Some(view) = self.view_mut(publisher_shard) else {
             debug_assert!(false, "a track publisher must name a local view");
-            self.abort_transaction(publisher_shard, now);
+            self.abort_transaction(now);
             return false;
         };
         view.stage(
@@ -1658,7 +1669,7 @@ impl ControllerActor {
         }
         if self.state.commit().is_err() {
             debug_assert!(false, "a published track retirement must commit");
-            self.abort_transaction(publisher_shard, now);
+            self.abort_transaction(now);
             return false;
         }
         for (shard, route) in endpoint_releases {
@@ -1849,7 +1860,7 @@ impl ControllerActor {
         };
         for (shard, key, plan, route) in targets {
             let Some(binding) = self.track_bindings.get(&plan.track_id) else {
-                self.abort_transaction(shard, now);
+                self.abort_transaction(now);
                 return;
             };
             let publisher_fanout = binding.publisher_fanout;
@@ -1861,9 +1872,10 @@ impl ControllerActor {
                 encodings: binding.encodings.clone(),
                 states: binding.states.clone(),
                 publication: binding.publication.clone(),
+                audience: self.track_audience_on_shard(binding.meta.origin, shard),
             };
             let Some(view) = self.view_mut(shard) else {
-                self.abort_transaction(shard, now);
+                self.abort_transaction(now);
                 return;
             };
             if key != publisher_fanout {
@@ -1903,7 +1915,7 @@ impl ControllerActor {
             }
         }
         if self.state.commit().is_err() {
-            self.abort_transaction(crate::id::ShardId::new(0), now);
+            self.abort_transaction(now);
         }
     }
 
@@ -2047,6 +2059,29 @@ impl ControllerActor {
         ))
     }
 
+    fn track_audience_on_shard(
+        &self,
+        origin: ParticipantId,
+        shard: crate::id::ShardId,
+    ) -> Vec<crate::shard::participants::ParticipantKey> {
+        let Some(room_id) = self
+            .core
+            .registry
+            .get_participant(&origin)
+            .map(|meta| meta.room_id)
+        else {
+            debug_assert!(false, "a published track must have a room");
+            return Vec::new();
+        };
+        self.core
+            .registry
+            .participants_in_room(&room_id)
+            .into_iter()
+            .filter(|(_, owner, key)| *owner == shard && key.is_some())
+            .filter_map(|(_, _, key)| key)
+            .collect()
+    }
+
     async fn publish_track_plans(&mut self, track_id: crate::entity::TrackId) -> bool {
         let Some(binding) = self.track_bindings.get(&track_id) else {
             return false;
@@ -2075,7 +2110,7 @@ impl ControllerActor {
         };
         for (shard_id, (fanout, plan)) in plans {
             let Some(binding) = self.track_bindings.get(&track_id) else {
-                self.abort_transaction(shard_id, now);
+                self.abort_transaction(now);
                 return false;
             };
             let descriptor = crate::view::TrackDescriptor {
@@ -2086,9 +2121,10 @@ impl ControllerActor {
                 encodings: binding.encodings.clone(),
                 states: binding.states.clone(),
                 publication: binding.publication.clone(),
+                audience: self.track_audience_on_shard(binding.meta.origin, shard_id),
             };
             let Some(view) = self.view_mut(shard_id) else {
-                self.abort_transaction(shard_id, now);
+                self.abort_transaction(now);
                 return false;
             };
             view.stage(
@@ -2113,7 +2149,7 @@ impl ControllerActor {
             }
         }
         if self.state.commit().is_err() {
-            self.abort_transaction(crate::id::ShardId::new(0), now);
+            self.abort_transaction(now);
             return false;
         }
         true
@@ -2131,12 +2167,12 @@ impl ControllerActor {
             return None;
         }
         let Ok(handle) = self.state.reserve_endpoint(shard_id, now) else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         };
         let generation = self.state.pending()?.generation;
         let Some(view) = self.view_mut(shard_id) else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         };
         view.stage(
@@ -2165,7 +2201,7 @@ impl ControllerActor {
             }
         }
         if self.state.commit().is_err() {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         }
         Some(handle)
@@ -2280,7 +2316,7 @@ impl ControllerActor {
             Ok(handle) => handle,
             Err(err) => {
                 tracing::warn!(%shard_id, ?err, "endpoint route allocation failed");
-                self.abort_transaction(shard_id, now);
+                self.abort_transaction(now);
                 return None;
             }
         };
@@ -2335,11 +2371,11 @@ impl ControllerActor {
                 view.publish()
             });
         let Some(_) = published else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         };
         if self.state.commit().is_err() {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         }
         Some(handle)
@@ -2371,11 +2407,11 @@ impl ControllerActor {
                 view.publish()
             });
         let Some(_) = published else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return;
         };
         if self.state.commit().is_err() {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return;
         }
         self.state
@@ -2431,7 +2467,7 @@ impl ControllerActor {
             }
         }
         let Some(handle) = reserved else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         };
 
@@ -2439,17 +2475,17 @@ impl ControllerActor {
             .prepare_transport(shard_id, participant_id, handle)
             .await
         else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         };
 
         let Some(_) = self.publish_pending(shard_id, handle, participant_key) else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         };
 
         if self.state.commit().is_err() {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return None;
         }
         Some((handle, participant_key))
@@ -2600,7 +2636,7 @@ impl ControllerActor {
             view.publish()
         });
         let Some(_) = published else {
-            self.abort_transaction(shard_id, now);
+            self.abort_transaction(now);
             return;
         };
         let _ = self.state.commit();

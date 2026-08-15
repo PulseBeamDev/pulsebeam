@@ -22,7 +22,7 @@ fn rust_files(root: &Path, files: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn deleted_routing_v4_types_stay_deleted() {
+fn deleted_types_stay_deleted() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

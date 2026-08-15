@@ -1,16 +1,15 @@
-use bytes::Bytes;
 use pulsebeam_runtime::rand::Rng;
 use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
 };
+use std::collections::HashSet;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
 use crate::route::{Envelope, RouteHandle};
 use crate::shard::events::{
-    AudioRtpEvent, ClientIntent, ParticipantEvent, ParticipantLifecycleEvent,
-    ParticipantSubscriptionEvent,
+    AudioRtpEvent, ParticipantEvent, ParticipantLifecycleEvent, ParticipantSubscriptionEvent,
 };
 use crate::{
     entity::{TrackId, TrackKind},
@@ -32,6 +31,18 @@ pub(crate) use super::router::ShardTransport;
 use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame};
 
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
+
+fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) {
+    metrics::counter!(
+        "routing_drop",
+        "lane" => lane,
+        "stage" => stage,
+        "origin" => origin
+    )
+    .increment(1);
+    #[cfg(feature = "sim")]
+    crate::sim_metrics::record_routing_drop(lane, stage, origin);
+}
 
 struct DispatchCtx<'a, R: ShardTransport> {
     registry: &'a mut ParticipantRegistry,
@@ -148,6 +159,8 @@ pub(crate) struct ShardCore {
     pub(crate) shard_id: crate::id::ShardId,
     view: crate::view::ShardView,
     view_rx: mailbox::Receiver<Box<crate::view::ShardViewDelta>>,
+    pending_view_delta: Option<Box<crate::view::ShardViewDelta>>,
+    pending_view_offset: usize,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
     timers: TimerWheel,
@@ -176,6 +189,8 @@ impl ShardCore {
             shard_id,
             view,
             view_rx,
+            pending_view_delta: None,
+            pending_view_offset: 0,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
             runtime,
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
@@ -187,19 +202,41 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn apply_view_deltas(&mut self) {
-        while let Ok(delta) = self.view_rx.try_recv() {
+    pub(crate) fn apply_view_deltas(&mut self, budget: usize) -> usize {
+        debug_assert!(budget > 0);
+        let mut applied = 0;
+        while applied < budget {
+            if self.pending_view_delta.is_none() {
+                let Ok(delta) = self.view_rx.try_recv() else {
+                    break;
+                };
+                self.pending_view_delta = Some(delta);
+            }
+            let Some(delta) = self.pending_view_delta.take() else {
+                debug_assert!(false, "a readable view delta must be retained");
+                break;
+            };
             debug_assert_eq!(delta.shard, self.shard_id);
-            for op in &delta.ops {
+            let start = self.pending_view_offset;
+            let count = budget
+                .saturating_sub(applied)
+                .min(delta.ops.len().saturating_sub(start));
+            let end = start.saturating_add(count);
+            for op in delta.ops.get(start..end).unwrap_or_default() {
                 if let crate::view::ViewOp::RemoveTrackRuntime { key } = op
-                    && let Some(track) = self.runtime.track_publication(*key)
+                    && let Some(track_id) = self
+                        .runtime
+                        .track_publication(*key)
+                        .map(|track| track.meta.id)
+                    && let Some(audience) = self.runtime.track_audience(*key).map(ToOwned::to_owned)
                 {
-                    self.registry.unpublish_track(&track.meta.id);
+                    self.registry.unpublish_track_to(&track_id, &audience);
                 }
                 self.runtime.apply_view_op(op);
                 match op {
                     crate::view::ViewOp::InsertTrackRuntime { key, descriptor } => {
-                        self.registry.publish_track(&descriptor.publication);
+                        self.registry
+                            .publish_track_to(&descriptor.publication, &descriptor.audience);
                         if let Some(participant) = descriptor.participant
                             && let Some(meta) = self.registry.resolve_mut(participant)
                         {
@@ -217,18 +254,31 @@ impl ShardCore {
                         }
                     }
                     crate::view::ViewOp::SetTrackPlan { key, plan } => {
+                        let mut previous_participants = HashSet::new();
                         if let Some(previous) = self.view.tracks.resolve(*key) {
                             for &(participant, _) in &previous.local_subscribers {
-                                self.registry.unbind_subscribed_track(
-                                    participant,
-                                    previous.track_id,
-                                    *key,
-                                );
+                                previous_participants.insert(participant);
+                                if !plan
+                                    .local_subscribers
+                                    .iter()
+                                    .any(|&(current, _)| current == participant)
+                                {
+                                    self.registry.unbind_subscribed_track(
+                                        participant,
+                                        previous.track_id,
+                                        *key,
+                                    );
+                                }
                             }
                         }
                         for &(participant, _) in &plan.local_subscribers {
-                            self.registry
-                                .bind_subscribed_track(participant, plan.track_id, *key);
+                            if !previous_participants.contains(&participant) {
+                                self.registry.bind_subscribed_track(
+                                    participant,
+                                    plan.track_id,
+                                    *key,
+                                );
+                            }
                         }
                     }
                     crate::view::ViewOp::RemoveTrackPlan { key } => {
@@ -263,8 +313,17 @@ impl ShardCore {
                     let _ = self.registry.remove_key(*key);
                 }
             }
-            delta.apply(&mut self.view);
+            applied = applied.saturating_add(count);
+            self.pending_view_offset = end;
+            if end == delta.ops.len() {
+                delta.apply(&mut self.view);
+                self.pending_view_offset = 0;
+            } else {
+                self.pending_view_delta = Some(delta);
+                break;
+            }
         }
+        applied
     }
 
     pub(crate) async fn view_readable(&mut self) -> Option<()> {
@@ -301,9 +360,7 @@ impl ShardCore {
         match (action, payload) {
             (crate::route::RouteAction::Video { local_track }, MediaPayload::Video(mut pkt)) => {
                 let Some(plan) = view.tracks.resolve(local_track) else {
-                    metrics::counter!("remote_video_before_plan").increment(1);
-                    #[cfg(feature = "sim")]
-                    crate::sim_metrics::record_routing_counter("remote_video_before_plan");
+                    record_routing_drop("video", "plan", "remote");
                     return;
                 };
                 pkt.playout_time = self.wall.to_instant(playout);
@@ -320,9 +377,7 @@ impl ShardCore {
             }
             (crate::route::RouteAction::Audio { track }, MediaPayload::Audio(mut pkt)) => {
                 let Some(plan) = view.audio.resolve(track) else {
-                    metrics::counter!("remote_audio_before_plan").increment(1);
-                    #[cfg(feature = "sim")]
-                    crate::sim_metrics::record_routing_counter("remote_audio_before_plan");
+                    record_routing_drop("audio", "plan", "remote");
                     return;
                 };
                 pkt.playout_time = self.wall.to_instant(playout);
@@ -350,9 +405,7 @@ impl ShardCore {
             }
             (crate::route::RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = view.data.resolve(stream) else {
-                    metrics::counter!("remote_data_before_plan").increment(1);
-                    #[cfg(feature = "sim")]
-                    crate::sim_metrics::record_routing_counter("remote_data_before_plan");
+                    record_routing_drop("data", "plan", "remote");
                     return;
                 };
                 let mut ctx = DispatchCtx {
@@ -366,9 +419,7 @@ impl ShardCore {
             }
             (crate::route::RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = view.reliable.resolve(stream) else {
-                    metrics::counter!("remote_reliable_before_plan").increment(1);
-                    #[cfg(feature = "sim")]
-                    crate::sim_metrics::record_routing_counter("remote_reliable_before_plan");
+                    record_routing_drop("reliable", "plan", "remote");
                     return;
                 };
                 let mut ctx = DispatchCtx {
@@ -407,96 +458,116 @@ impl ShardCore {
             return;
         };
         let Some(participant) = self.registry.resolve_mut(key) else {
-            debug_assert!(false, "transport view points at no participant");
+            record_routing_drop("transport", "runtime", "local");
             return;
         };
         participant.on_ingress(batch);
         self.dirty.mark(key, participant);
     }
 
-    pub(crate) fn flush_stream_buffers(&mut self, router: &impl ShardTransport) {
+    pub(crate) fn flush_stream_buffers(
+        &mut self,
+        router: &impl ShardTransport,
+        budget: usize,
+    ) -> usize {
+        debug_assert!(budget > 0);
+        let mut processed = 0;
         let mut ctx = DispatchCtx {
             registry: &mut self.registry,
             dirty: &mut self.dirty,
             router,
             wall: &self.wall,
         };
-        while let Some(ev) = self.pipeline.pop_audio_rtp() {
+        while processed < budget {
+            let Some(ev) = self.pipeline.pop_audio_rtp() else {
+                break;
+            };
+            processed = processed.saturating_add(1);
             debug_assert_eq!(ev.stream_id.0.kind(), TrackKind::Audio);
             let Some(track) = ev.fanout else {
-                metrics::counter!("audio_before_runtime").increment(1);
+                record_routing_drop("audio", "runtime", "local");
                 continue;
             };
             let view = &self.view;
             let Some(plan) = view.audio.resolve(track) else {
-                metrics::counter!("audio_before_plan").increment(1);
-                #[cfg(feature = "sim")]
-                crate::sim_metrics::record_routing_counter("audio_before_plan");
+                record_routing_drop("audio", "plan", "local");
                 continue;
             };
             self.runtime
                 .route_audio_with_plan(track, Origin::Local, ev, plan, &mut ctx);
         }
-        while let Some(ev) = self.pipeline.pop_video_rtp() {
+        while processed < budget {
+            let Some(ev) = self.pipeline.pop_video_rtp() else {
+                break;
+            };
+            processed = processed.saturating_add(1);
             debug_assert_eq!(ev.stream_id.0.kind(), TrackKind::Video);
             let Some(fanout) = ev.fanout else {
-                metrics::counter!("video_before_runtime").increment(1);
+                record_routing_drop("video", "runtime", "local");
                 continue;
             };
             let view = &self.view;
             let Some(plan) = view.tracks.resolve(fanout) else {
-                metrics::counter!("video_before_plan").increment(1);
-                #[cfg(feature = "sim")]
-                crate::sim_metrics::record_routing_counter("video_before_plan");
+                record_routing_drop("video", "plan", "local");
                 continue;
             };
             self.runtime
                 .route_video_with_plan(fanout, ev.pkt, plan, &mut ctx);
         }
-        while let Some(ev) = self.pipeline.pop_data_sctp() {
+        while processed < budget {
+            let Some(ev) = self.pipeline.pop_data_sctp() else {
+                break;
+            };
+            processed = processed.saturating_add(1);
             let Some(stream) = ev.stream else {
-                metrics::counter!("data_before_runtime").increment(1);
+                record_routing_drop("data", "runtime", "local");
                 continue;
             };
             let view = &self.view;
             let Some(plan) = view.data.resolve(stream) else {
-                metrics::counter!("data_before_plan").increment(1);
-                #[cfg(feature = "sim")]
-                crate::sim_metrics::record_routing_counter("data_before_plan");
+                record_routing_drop("data", "plan", "local");
                 continue;
             };
-            self.runtime.route_data_with_plan(
-                stream,
-                Origin::Local,
-                Bytes::from(ev.pkt),
-                plan,
-                &mut ctx,
-            );
+            self.runtime
+                .route_data_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
         }
-        while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
+        while processed < budget {
+            let Some(ev) = self.pipeline.pop_reliable_data_sctp() else {
+                break;
+            };
+            processed = processed.saturating_add(1);
             let Some(stream) = ev.stream else {
-                metrics::counter!("reliable_before_runtime").increment(1);
+                record_routing_drop("reliable", "runtime", "local");
                 continue;
             };
             let view = &self.view;
             let Some(plan) = view.reliable.resolve(stream) else {
-                metrics::counter!("reliable_before_plan").increment(1);
-                #[cfg(feature = "sim")]
-                crate::sim_metrics::record_routing_counter("reliable_before_plan");
+                record_routing_drop("reliable", "plan", "local");
                 continue;
             };
             self.runtime.route_reliable_data_with_plan(
                 stream,
                 Origin::Local,
-                Bytes::from(ev.pkt),
+                ev.pkt,
                 plan,
                 &mut ctx,
             );
         }
+        processed
     }
 
-    pub(crate) fn flush_participant_events(&mut self, router: &impl ShardTransport) {
-        while let Some(event) = self.pipeline.pop_participant_event() {
+    pub(crate) fn flush_participant_events(
+        &mut self,
+        router: &impl ShardTransport,
+        budget: usize,
+    ) -> usize {
+        debug_assert!(budget > 0);
+        let mut processed = 0;
+        while processed < budget {
+            let Some(event) = self.pipeline.pop_participant_event() else {
+                break;
+            };
+            processed = processed.saturating_add(1);
             match event {
                 ParticipantEvent::Subscription(ev) => match ev {
                     ParticipantSubscriptionEvent::Subscribed {
@@ -533,118 +604,7 @@ impl ShardCore {
                             participant: participant_id,
                         });
                 }
-                ParticipantEvent::Control(ev) => match ev {
-                    ClientIntent::TrackPublished(mut track, states) => {
-                        track.reverse = None;
-                        self.pipeline.push_shard_event(ShardEvent::TrackPublished {
-                            track: Box::new(track),
-                            states,
-                        });
-                    }
-                    ClientIntent::TrackUnpublished { origin, track_id } => {
-                        self.pipeline
-                            .push_shard_event(ShardEvent::TrackUnpublished { origin, track_id });
-                    }
-                    ClientIntent::DataTopicPublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => {
-                        self.pipeline
-                            .push_shard_event(ShardEvent::DataTopicPublished {
-                                room_id,
-                                publisher,
-                                topic,
-                            });
-                    }
-                    ClientIntent::DataTopicUnpublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::DataTopicUnpublished {
-                            room_id,
-                            publisher,
-                            topic,
-                        }),
-                    ClientIntent::DataTopicSubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                        publisher,
-                        channel,
-                    } => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::DataTopicSubscribed {
-                            room_id,
-                            subscriber,
-                            topic,
-                            publisher,
-                            channel,
-                        }),
-                    ClientIntent::DataTopicUnsubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                        publisher,
-                    } => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::DataTopicUnsubscribed {
-                            room_id,
-                            subscriber,
-                            topic,
-                            publisher,
-                        }),
-                    ClientIntent::ReliableDataTopicPublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => {
-                        self.pipeline
-                            .push_shard_event(ShardEvent::ReliableDataTopicPublished {
-                                room_id,
-                                publisher,
-                                topic,
-                            });
-                    }
-                    ClientIntent::ReliableDataTopicUnpublished {
-                        room_id,
-                        publisher,
-                        topic,
-                    } => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::ReliableDataTopicUnpublished {
-                            room_id,
-                            publisher,
-                            topic,
-                        }),
-                    ClientIntent::ReliableDataTopicSubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                        channel,
-                    } => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::ReliableDataTopicSubscribed {
-                            room_id,
-                            subscriber,
-                            topic,
-                            channel,
-                        }),
-                    ClientIntent::ReliableDataTopicUnsubscribed {
-                        room_id,
-                        subscriber,
-                        topic,
-                    } => {
-                        self.pipeline
-                            .push_shard_event(ShardEvent::ReliableDataTopicUnsubscribed {
-                                room_id,
-                                subscriber,
-                                topic,
-                            });
-                    }
-                },
+                ParticipantEvent::Control(ev) => self.pipeline.push_shard_event(ev),
                 ParticipantEvent::Internal(ev) => match ev {
                     crate::shard::events::ShardInternalEvent::TrackStatsUpdated {
                         track_id,
@@ -678,12 +638,16 @@ impl ShardCore {
                             router,
                             wall: &self.wall,
                         };
-                        self.runtime
-                            .route_reliable_control(Bytes::from(bytes), plan, &mut ctx);
+                        self.runtime.route_reliable_control(bytes, plan, &mut ctx);
                     }
                 },
             }
         }
+        processed
+    }
+
+    pub(crate) fn has_pending_events(&self) -> bool {
+        self.pipeline.has_pending()
     }
 
     pub(crate) fn pop_shard_event(&mut self) -> Option<ShardEvent> {
@@ -698,16 +662,16 @@ impl ShardCore {
         router: &impl ShardTransport,
     ) {
         let Some(fanout) = fanout else {
-            metrics::counter!("track_stats_before_runtime").increment(1);
+            record_routing_drop("stats", "runtime", "local");
             return;
         };
         let Some((runtime_track_id, _)) = self.runtime.track_descriptor(fanout) else {
-            metrics::counter!("track_stats_before_runtime").increment(1);
+            record_routing_drop("stats", "descriptor", "local");
             return;
         };
         debug_assert_eq!(runtime_track_id, track_id);
         let Some(plan) = self.view.tracks.resolve(fanout) else {
-            metrics::counter!("track_stats_before_plan").increment(1);
+            record_routing_drop("stats", "plan", "local");
             return;
         };
         let mut ctx = DispatchCtx {
@@ -726,19 +690,19 @@ impl ShardCore {
         router: &impl ShardTransport,
     ) {
         let Some(fanout) = fanout else {
-            metrics::counter!("keyframe_before_runtime").increment(1);
+            record_routing_drop("keyframe", "runtime", "local");
             return;
         };
         let Some(plan) = self.view.tracks.resolve(fanout) else {
-            metrics::counter!("keyframe_before_plan").increment(1);
+            record_routing_drop("keyframe", "plan", "local");
             return;
         };
         let Some(reverse) = plan.reverse_route else {
-            metrics::counter!("keyframe_before_reverse_route").increment(1);
+            record_routing_drop("keyframe", "reverse", "local");
             return;
         };
         let Some((_, encodings)) = self.runtime.track_descriptor(fanout) else {
-            metrics::counter!("keyframe_before_descriptor").increment(1);
+            record_routing_drop("keyframe", "descriptor", "local");
             return;
         };
         let mut layer = None;
@@ -749,11 +713,11 @@ impl ShardCore {
             }
         }
         let Some(layer) = layer else {
-            metrics::counter!("keyframe_unknown_rid").increment(1);
+            record_routing_drop("keyframe", "encoding", "local");
             return;
         };
         let Ok(layer) = u8::try_from(layer) else {
-            metrics::counter!("keyframe_encoding_overflow").increment(1);
+            record_routing_drop("keyframe", "encoding", "local");
             return;
         };
         router.send_frame(
@@ -779,6 +743,15 @@ impl ShardCore {
                 transport,
                 config,
             } => {
+                #[cfg(feature = "sim")]
+                if crate::sim_metrics::take_materialization_failure() {
+                    crate::sim_metrics::record_routing_counter("materialization_failed");
+                    self.pipeline
+                        .push_shard_event(ShardEvent::ParticipantClosed {
+                            participant: config.participant_id,
+                        });
+                    return Some(());
+                }
                 self.add_participant(key, transport, *config);
             }
             ShardCommand::AdoptTcpConnection { .. } => {
@@ -806,7 +779,7 @@ impl ShardCore {
                     return;
                 };
                 let Some(plan) = view.tracks.resolve(local_track) else {
-                    metrics::counter!("stats_before_plan").increment(1);
+                    record_routing_drop("stats", "plan", "remote");
                     return;
                 };
                 let mut ctx = DispatchCtx {
@@ -837,11 +810,11 @@ impl ShardCore {
         match (target, body) {
             (crate::route::ReverseTarget::Track { track }, Reverse::Keyframe { layer, kind }) => {
                 let Some((track_id, encodings)) = self.runtime.track_descriptor(track) else {
-                    metrics::counter!("reverse_before_runtime").increment(1);
+                    record_routing_drop("reverse", "runtime", "remote");
                     return;
                 };
                 let Some(rid) = encodings.get(usize::from(layer)).copied() else {
-                    metrics::counter!("reverse_unknown_layer").increment(1);
+                    record_routing_drop("reverse", "encoding", "remote");
                     return;
                 };
                 ctx.notify_keyframe_request(origin, track_id, rid, kind);

@@ -17,6 +17,7 @@ extern crate std;
 
 pub mod classify;
 pub mod envelope;
+pub mod steer;
 pub mod stun;
 pub mod ufrag;
 

@@ -509,4 +509,23 @@ mod tests {
         assert!(state.arenas[0].data.get(data).is_none());
         assert!(state.arenas[0].reliable.get(reliable).is_none());
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn removed_track_key_does_not_resolve_after_reissue() {
+        let mut state = ControlPlaneState::new(1);
+        let shard = ShardId::new(0);
+        let origin = crate::entity::ParticipantId::from_bytes([2; 16]);
+        let track_id = origin.derive_track_id(crate::entity::TrackKind::Video, "track");
+
+        state.begin().unwrap();
+        let old_key = state.mint_track(shard, track_id, origin).unwrap();
+        state.commit().unwrap();
+        state.remove_track(shard, old_key);
+
+        state.begin().unwrap();
+        let new_key = state.mint_track(shard, track_id, origin).unwrap();
+        assert!(state.arenas[0].tracks.get(old_key).is_none());
+        assert!(state.arenas[0].tracks.get(new_key).is_some());
+        assert_ne!(old_key, new_key);
+    }
 }
