@@ -645,6 +645,11 @@ fn video_survives_failing_route_installs_test() {
                 .with_participant(Participant::single_publisher("joiner").starts_disconnected()),
         )
         .run(vec![
+            Step::ForceFailure {
+                description: "The very first route a publisher needs cannot be allocated",
+                site: "route table exhausted",
+                count: 1,
+            },
             Step::Run {
                 description: "Establish the stable pair",
                 duration: Duration::from_secs(10),
@@ -672,9 +677,10 @@ fn video_survives_failing_route_installs_test() {
             },
         ]);
 
-    // Without this the plan passes hardest when it injects nothing. At 80 per thousand and a
-    // handful of install calls it injected nothing at all on the first seed tried, and looked
-    // exactly like a pass.
+    // Buggify decides where the rest of the failures land, but not whether any
+    // do. At this rate and a handful of allocations, several seeds injected
+    // nothing at all and the plan degraded into asserting the happy path —
+    // which is why the first failure is forced rather than drawn.
     let (_, fired) = pulsebeam_runtime::buggify::coverage();
     assert!(
         !fired.is_empty(),

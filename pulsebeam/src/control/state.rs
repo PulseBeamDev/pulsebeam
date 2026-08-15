@@ -115,6 +115,12 @@ pub(crate) enum RouteFamily {
     Endpoint,
 }
 
+/// What one staged generation would undo.
+///
+/// Every arena key here was minted *while this transaction was open*, which is
+/// what makes removing them on abort an undo. A key minted with no transaction
+/// staged is already live and belongs to nothing: adopting it into whichever
+/// transaction opens next would let an unrelated abort destroy it.
 #[derive(Debug)]
 pub(crate) struct LifecycleTransaction {
     pub generation: u64,
@@ -156,10 +162,6 @@ pub(crate) enum TransactionError {
 #[derive(Debug)]
 pub(crate) struct ControlPlaneState {
     pending: Option<LifecycleTransaction>,
-    detached_participants: Vec<(ShardId, crate::keys::ParticipantKey)>,
-    detached_tracks: Vec<(ShardId, crate::keys::TrackKey)>,
-    detached_data: Vec<(ShardId, crate::keys::DataStreamKey)>,
-    detached_reliable: Vec<(ShardId, crate::keys::ReliableStreamKey)>,
     pub arenas: Vec<ShardArenas>,
     pub transport: PerShardAllocator,
     pub endpoint: PerShardAllocator,
@@ -170,10 +172,6 @@ impl ControlPlaneState {
     pub fn new(shard_count: usize) -> Self {
         Self {
             pending: None,
-            detached_participants: Vec::new(),
-            detached_tracks: Vec::new(),
-            detached_data: Vec::new(),
-            detached_reliable: Vec::new(),
             arenas: (0..shard_count).map(|_| ShardArenas::new()).collect(),
             transport: PerShardAllocator::new(shard_count),
             endpoint: PerShardAllocator::new(shard_count),
@@ -192,8 +190,6 @@ impl ControlPlaneState {
             .map(|arena| arena.participants.insert(ParticipantRecord { id }))?;
         if let Some(tx) = self.pending.as_mut() {
             tx.participants.push((shard, key));
-        } else {
-            self.detached_participants.push((shard, key));
         }
         Some(key)
     }
@@ -210,8 +206,6 @@ impl ControlPlaneState {
             .map(|arena| arena.tracks.insert(TrackRecord { id, origin }))?;
         if let Some(tx) = self.pending.as_mut() {
             tx.tracks.push((shard, key));
-        } else {
-            self.detached_tracks.push((shard, key));
         }
         Some(key)
     }
@@ -227,8 +221,6 @@ impl ControlPlaneState {
             .map(|arena| arena.data.insert(StreamRecord { id }))?;
         if let Some(tx) = self.pending.as_mut() {
             tx.data.push((shard, key));
-        } else {
-            self.detached_data.push((shard, key));
         }
         Some(key)
     }
@@ -244,8 +236,6 @@ impl ControlPlaneState {
             .map(|arena| arena.reliable.insert(StreamRecord { id }))?;
         if let Some(tx) = self.pending.as_mut() {
             tx.reliable.push((shard, key));
-        } else {
-            self.detached_reliable.push((shard, key));
         }
         Some(key)
     }
@@ -303,12 +293,7 @@ impl ControlPlaneState {
             return Err(TransactionError::Busy);
         }
         let generation = self.generation.saturating_add(1);
-        let mut tx = LifecycleTransaction::new(generation);
-        tx.participants.append(&mut self.detached_participants);
-        tx.tracks.append(&mut self.detached_tracks);
-        tx.data.append(&mut self.detached_data);
-        tx.reliable.append(&mut self.detached_reliable);
-        self.pending = Some(tx);
+        self.pending = Some(LifecycleTransaction::new(generation));
         Ok(())
     }
 
@@ -508,6 +493,49 @@ mod tests {
         assert!(state.arenas[0].tracks.get(track).is_none());
         assert!(state.arenas[0].data.get(data).is_none());
         assert!(state.arenas[0].reliable.get(reliable).is_none());
+    }
+
+    /// A key minted with no transaction staged is live, and an unrelated
+    /// transaction aborting must not destroy it.
+    ///
+    /// Minting outside a transaction is ordinary: a shard's fanout key is
+    /// prepared before control opens the transaction that installs its route.
+    /// Adopting those keys into the next transaction made every abort a
+    /// collateral teardown — one failed route allocation on one shard removed
+    /// arena entries belonging to participants that had nothing to do with it,
+    /// and their media stopped for good.
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_does_not_destroy_keys_minted_before_it() {
+        let mut state = ControlPlaneState::new(1);
+        let shard = ShardId::new(0);
+        let origin = crate::entity::ParticipantId::from_bytes([3; 16]);
+
+        let live = state
+            .mint_track(
+                shard,
+                origin.derive_track_id(crate::entity::TrackKind::Video, "live"),
+                origin,
+            )
+            .unwrap();
+
+        state.begin().unwrap();
+        let doomed = state
+            .mint_track(
+                shard,
+                origin.derive_track_id(crate::entity::TrackKind::Video, "doomed"),
+                origin,
+            )
+            .unwrap();
+        state.abort(Instant::now());
+
+        assert!(
+            state.arenas[0].tracks.get(doomed).is_none(),
+            "a key minted inside the transaction is undone by aborting it"
+        );
+        assert!(
+            state.arenas[0].tracks.get(live).is_some(),
+            "a key minted before it was never part of it"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -263,6 +263,22 @@ pub struct ControllerActor {
     >,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
+    /// Subscriptions whose route could not be allocated, waiting for a retry.
+    ///
+    /// A subscribe carries its own retry trigger only if something later
+    /// re-emits it, and nothing does: the subscriber's shard already believes
+    /// it subscribed. Without this the first failed allocation leaves that
+    /// participant with no video for the rest of its session.
+    deferred_subscribes: std::collections::VecDeque<DeferredSubscribe>,
+}
+
+#[derive(Debug, Clone)]
+struct DeferredSubscribe {
+    shard_id: crate::id::ShardId,
+    subscriber: ParticipantId,
+    subscriber_key: crate::shard::participants::ParticipantKey,
+    slot: crate::keys::DownstreamSlotKey,
+    track: crate::track::TrackMeta,
 }
 
 impl ControllerActor {
@@ -305,6 +321,7 @@ impl ControllerActor {
             reliable_wildcards: HashMap::new(),
             #[cfg(not(feature = "sim"))]
             steering: None,
+            deferred_subscribes: std::collections::VecDeque::new(),
         }
     }
 
@@ -415,6 +432,7 @@ impl ControllerActor {
 
                 _ = poll_interval.tick() => {
                     self.router.poll_loads();
+                    self.retry_deferred_subscribes().await;
                 }
 
                 Some(ev) = pending_rx.recv() => {
@@ -1260,7 +1278,82 @@ impl ControllerActor {
     /// attempts clear a transient one almost certainly; a genuinely full
     /// namespace fails every attempt just as fast, so the retry costs nothing
     /// in that case either.
-    const TRANSPORT_ALLOCATION_ATTEMPTS: u32 = 10;
+    const ROUTE_ALLOCATION_ATTEMPTS: u32 = 10;
+
+    /// Bounded so a node that is genuinely out of routes sheds the backlog
+    /// instead of growing one. A subscriber dropped here is no worse off than
+    /// it was before the queue existed.
+    const MAX_DEFERRED_SUBSCRIBES: usize = 1024;
+
+    /// Reserve an endpoint route, retrying a transient shortage.
+    ///
+    /// Exhaustion is either momentary — a slot is in quarantine, or fault
+    /// injection fired — or total, and the two need opposite responses. A
+    /// bounded retry gets the first right at no cost to the second: a
+    /// genuinely full namespace fails every attempt without blocking.
+    fn reserve_endpoint_retrying(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        now: tokio::time::Instant,
+        family: &'static str,
+    ) -> Option<RouteHandle> {
+        for attempt in 1..=Self::ROUTE_ALLOCATION_ATTEMPTS {
+            match self.state.reserve_endpoint(shard_id, now) {
+                Ok(handle) => return Some(handle),
+                Err(err) => {
+                    tracing::warn!(
+                        %shard_id,
+                        ?err,
+                        attempt,
+                        family,
+                        "endpoint route allocation failed, retrying"
+                    );
+                }
+            }
+        }
+        metrics::counter!("route_allocation_failed", "family" => family).increment(1);
+        None
+    }
+
+    fn defer_subscribe(&mut self, deferred: DeferredSubscribe) {
+        metrics::counter!("subscribe_deferred").increment(1);
+        if self.deferred_subscribes.len() >= Self::MAX_DEFERRED_SUBSCRIBES {
+            metrics::counter!("subscribe_deferred_dropped").increment(1);
+            self.deferred_subscribes.pop_front();
+        }
+        self.deferred_subscribes.push_back(deferred);
+    }
+
+    /// Retry every deferred subscription once.
+    ///
+    /// One pass, not a loop until success: a retry that fails is re-deferred
+    /// by the same path that deferred it originally, so the next tick picks it
+    /// up. Draining the queue into a local first is what keeps that from
+    /// spinning within one tick.
+    async fn retry_deferred_subscribes(&mut self) {
+        if self.deferred_subscribes.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.deferred_subscribes);
+        for deferred in pending {
+            let DeferredSubscribe {
+                shard_id,
+                subscriber,
+                subscriber_key,
+                slot,
+                track,
+            } = deferred;
+            // A participant that left, or a track that was retired, takes its
+            // deferred work with it rather than being resurrected here.
+            if self.core.registry.get_participant(&subscriber).is_none()
+                || !self.track_bindings.contains_key(&track.id)
+            {
+                continue;
+            }
+            self.on_track_subscribed(shard_id, subscriber, subscriber_key, slot, track)
+                .await;
+        }
+    }
 
     /// Route lifecycle, as its own generation.
     ///
@@ -2118,6 +2211,13 @@ impl ControllerActor {
                 if let Some(binding) = self.track_bindings.get_mut(&track.id) {
                     binding.fanouts.remove(&shard_id);
                 }
+                self.defer_subscribe(DeferredSubscribe {
+                    shard_id,
+                    subscriber,
+                    subscriber_key,
+                    slot,
+                    track,
+                });
                 return;
             };
             self.subscriptions.installed(shard_id, track.id, handle);
@@ -2304,7 +2404,7 @@ impl ControllerActor {
             debug_assert!(false, "lifecycle transactions serialise through this actor");
             return None;
         }
-        let Ok(handle) = self.state.reserve_endpoint(shard_id, now) else {
+        let Some(handle) = self.reserve_endpoint_retrying(shard_id, now, "video") else {
             self.abort_transaction(now);
             return None;
         };
@@ -2450,13 +2550,13 @@ impl ControllerActor {
             debug_assert!(false, "lifecycle transactions serialise through this actor");
             return None;
         }
-        let handle = match self.state.reserve_endpoint(shard_id, now) {
-            Ok(handle) => handle,
-            Err(err) => {
-                tracing::warn!(%shard_id, ?err, "endpoint route allocation failed");
-                self.abort_transaction(now);
-                return None;
-            }
+        // A stream granted here — a track's reverse route, an audio fanout, a
+        // data lane — is announced once and never re-offered. Losing the
+        // allocation loses the stream for the rest of the session, so this
+        // retries for the same reason connection setup does.
+        let Some(handle) = self.reserve_endpoint_retrying(shard_id, now, "endpoint") else {
+            self.abort_transaction(now);
+            return None;
         };
 
         let published = self
@@ -2588,7 +2688,7 @@ impl ControllerActor {
         // later trigger — a client gets this one attempt before it sees the
         // join itself fail — so the retry has to happen here.
         let mut reserved = None;
-        for attempt in 1..=Self::TRANSPORT_ALLOCATION_ATTEMPTS {
+        for attempt in 1..=Self::ROUTE_ALLOCATION_ATTEMPTS {
             match self.state.reserve_transport(shard_id, now) {
                 Ok(handle) => {
                     reserved = Some(handle);

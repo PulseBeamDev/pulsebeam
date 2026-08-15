@@ -335,6 +335,15 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
     },
+    /// Force the next `count` reaches of a buggify site to fire.
+    ///
+    /// The probability decides where failures land, not whether any do; this
+    /// guarantees the plan exercises the recovery path at every seed.
+    ForceFailure {
+        description: &'static str,
+        site: &'static str,
+        count: u32,
+    },
     FailNextMaterialization {
         description: &'static str,
     },
@@ -1323,6 +1332,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::StallController { .. } => "StallController",
         Step::SendToWrongShard { .. } => "SendToWrongShard",
         Step::FailNextMaterialization { .. } => "FailNextMaterialization",
+        Step::ForceFailure { .. } => "ForceFailure",
         Step::Partition { .. } => "Partition",
         Step::Repair { .. } => "Repair",
         Step::Hold { .. } => "Hold",
@@ -1437,6 +1447,15 @@ async fn execute_plan(
                     .expect("participant was resolved above")
                     .send_command(ParticipantCmd::Reconnect);
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            Step::ForceFailure {
+                description,
+                site,
+                count,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({site} x{count})");
+                pulsebeam_runtime::buggify::force(site, *count);
             }
 
             Step::FailNextMaterialization { description } => {
