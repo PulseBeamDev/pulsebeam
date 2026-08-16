@@ -24,6 +24,7 @@ use crate::{
         timer::TimerWheel,
     },
 };
+use slotmap::Key;
 use str0m::media::Rid;
 
 pub(crate) use super::router::ShardTransport;
@@ -951,6 +952,23 @@ impl ShardCore {
         });
     }
 
+    pub(crate) fn on_tx_timestamps(
+        &mut self,
+        timestamps: impl IntoIterator<Item = net::TxTimestamp>,
+    ) {
+        for timestamp in timestamps {
+            let key = ParticipantKey::from(slotmap::KeyData::from_ffi(timestamp.tag.owner));
+            let Some(participant) = self.registry.resolve_mut(key) else {
+                continue;
+            };
+            let Some(at) = timestamp.at else {
+                metrics::counter!("udp_tx_timestamp_missing").increment(1);
+                continue;
+            };
+            participant.on_send_timestamp(str0m::net::SendId(timestamp.tag.id), at);
+        }
+    }
+
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
         now: Instant,
@@ -982,7 +1000,7 @@ impl ShardCore {
             }
             while self
                 .udp_send_batch
-                .append_from(&mut participant.udp_packets)
+                .append_from(&mut participant.udp_packets, key.data().as_ffi())
             {
                 if self.udp_send_batch.is_full() {
                     self.udp_send_batch.flush(udp_socket);

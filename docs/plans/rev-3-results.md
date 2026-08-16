@@ -16,3 +16,12 @@ artifact:
 - `a_fixed_link_does_not_collapse_the_estimate`
 
 The exact-filter run took 15.09 seconds at 100 us.
+
+## Wire send timestamps
+
+After the two-phase str0m registration and asynchronous simulator completion
+path landed, `a_fixed_link_does_not_collapse_the_estimate` changed from red to
+green. Its exact-filter replay passed in 28.88 seconds. The Linux loopback GSO
+test also confirmed that `OPT_ID` advances per `sendmsg`: one kernel timestamp
+was correlated to the GSO message and assigned to each of its three tagged
+segments.

@@ -31,6 +31,7 @@
 //! bytes". The latter silently encodes link rate, codec, fixture length and current behaviour all
 //! at once, and stops meaning anything the moment any of them changes.
 
+use crate::net::{SendTag, TxTimestamp};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
@@ -337,6 +338,12 @@ pub fn record_gro_batch(ip: IpAddr, datagrams: usize) {
     });
 }
 
+pub fn record_missing_tx_timestamp(ip: IpAddr) {
+    record(ip, |stats| {
+        stats.missing_tx_timestamps = stats.missing_tx_timestamps.saturating_add(1);
+    });
+}
+
 impl Stats {
     /// The standing queue: what a packet typically waits behind, rather than the worst moment.
     ///
@@ -491,6 +498,7 @@ struct Queued {
     release_at: Instant,
     dst: SocketAddr,
     buf: Vec<u8>,
+    tag: Option<SendTag>,
 }
 
 /// Egress bottleneck state for one socket.
@@ -524,6 +532,7 @@ struct ShaperState {
     loss_counter: u64,
     /// Gilbert-Elliott position per destination: true while in the bad state.
     in_bad_state: HashMap<IpAddr, bool>,
+    completions: VecDeque<TxTimestamp>,
 }
 
 impl Default for ShaperState {
@@ -533,6 +542,7 @@ impl Default for ShaperState {
             queue: VecDeque::new(),
             loss_counter: IMPAIRMENT_SEED.load(std::sync::atomic::Ordering::Relaxed),
             in_bad_state: HashMap::new(),
+            completions: VecDeque::new(),
         }
     }
 }
@@ -553,6 +563,16 @@ impl Shaper {
 
     /// Offer a packet to the bottleneck.
     pub fn offer(&mut self, now: Instant, dst: SocketAddr, buf: &[u8]) -> Shaped {
+        self.offer_tracked(now, dst, buf, None)
+    }
+
+    pub fn offer_tracked(
+        &mut self,
+        now: Instant,
+        dst: SocketAddr,
+        buf: &[u8],
+        tag: Option<SendTag>,
+    ) -> Shaped {
         let Some(bits_per_sec) = capacity_at(dst.ip(), now) else {
             // No capacity to model, but reordering is a property of the path rather than of its
             // rate: an uncapped link still delivers out of order. Hold the sampled packet in the
@@ -567,6 +587,7 @@ impl Shaper {
                         release_at: now + reorder.delay,
                         dst,
                         buf: buf.to_vec(),
+                        tag,
                     });
                     st.queue
                         .make_contiguous()
@@ -583,7 +604,7 @@ impl Shaper {
             .map(|l| l.max_backlog)
             .unwrap_or(DEFAULT_MAX_BACKLOG);
         let reorder = reorder_for(&dst.ip());
-        self.with(|st| st.offer(now, dst, buf, bits_per_sec, max_backlog, reorder))
+        self.with(|st| st.offer(now, dst, buf, tag, bits_per_sec, max_backlog, reorder))
     }
 
     /// Take every packet whose turn on the wire has come.
@@ -594,6 +615,20 @@ impl Shaper {
     /// carries.
     pub fn drain_due(&mut self, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         self.with(|st| st.drain_due(now))
+    }
+
+    pub fn complete(&mut self, tag: Option<SendTag>, at: Option<Instant>) {
+        if let Some(tag) = tag {
+            self.with(|state| state.completions.push_back(TxTimestamp { tag, at }));
+        }
+    }
+
+    pub fn drain_completions(&mut self, out: &mut Vec<TxTimestamp>) -> usize {
+        self.with(|state| {
+            let start = out.len();
+            out.extend(state.completions.drain(..));
+            out.len().saturating_sub(start)
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -672,6 +707,7 @@ impl ShaperState {
         now: Instant,
         dst: SocketAddr,
         buf: &[u8],
+        tag: Option<SendTag>,
         bits_per_sec: u64,
         max_backlog: Duration,
         reorder: Reorder,
@@ -688,6 +724,12 @@ impl ShaperState {
         if backlog > max_backlog {
             // Buffer full. Tail drop, exactly as a bottleneck queue does.
             record(dst.ip(), |s| s.dropped_overflow += 1);
+            if tag.is_some() {
+                record_missing_tx_timestamp(dst.ip());
+            }
+            if let Some(tag) = tag {
+                self.completions.push_back(TxTimestamp { tag, at: None });
+            }
             return Shaped::Absorbed;
         }
 
@@ -711,6 +753,7 @@ impl ShaperState {
             release_at,
             dst,
             buf: buf.to_vec(),
+            tag,
         });
         // `drain_due` releases from the front while the front is due, so the queue has to stay
         // ordered by release time for a delayed packet to be overtaken rather than to hold up
@@ -728,6 +771,12 @@ impl ShaperState {
                 break;
             }
             let q = self.queue.pop_front().expect("front just checked");
+            if let Some(tag) = q.tag {
+                self.completions.push_back(TxTimestamp {
+                    tag,
+                    at: Some(q.release_at),
+                });
+            }
             out.push((q.dst, q.buf));
         }
         out
@@ -930,5 +979,30 @@ mod tests {
         assert!(s.delivered > 0, "some packets should be queued");
         assert!(s.dropped_overflow > 0, "the buffer should have overflowed");
         assert_eq!(s.dropped_loss, 0, "no loss model was configured");
+    }
+
+    #[test]
+    fn transmit_completions_follow_wire_departure_and_report_overflow() {
+        let ip: IpAddr = "5.6.7.9".parse().unwrap();
+        let dst = SocketAddr::new(ip, 1234);
+        set_downlink_with_backlog(ip, 80_000, Duration::from_millis(100));
+        let mut shaper = Shaper::default();
+        let now = Instant::now();
+        shaper.offer(now, dst, &[0u8; 1_000]);
+        shaper.offer_tracked(now, dst, &[0u8; 1_000], Some(SendTag { owner: 1, id: 1 }));
+        shaper.offer_tracked(now, dst, &[0u8; 1_000], Some(SendTag { owner: 1, id: 2 }));
+
+        let mut completions = Vec::new();
+        assert_eq!(shaper.drain_completions(&mut completions), 1);
+        assert_eq!(completions[0].tag.id, 2);
+        assert!(completions[0].at.is_none());
+
+        shaper.drain_due(now);
+        assert_eq!(shaper.drain_completions(&mut completions), 0);
+        shaper.drain_due(now + Duration::from_millis(101));
+        assert_eq!(shaper.drain_completions(&mut completions), 1);
+        assert_eq!(completions[1].tag.id, 1);
+        assert_eq!(completions[1].at, Some(now + Duration::from_millis(100)));
+        assert_eq!(stats(ip).missing_tx_timestamps, 1);
     }
 }

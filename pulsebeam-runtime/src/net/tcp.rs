@@ -768,6 +768,7 @@ mod tests {
                 dst: peer_addr,
                 buf: payload,
                 segment_size: 8,
+                tx_tags: &[],
             }];
             let batch = SendPacketBatch { packets: &packets };
             sock.try_send_batch(&batch).unwrap();
@@ -884,6 +885,7 @@ mod tests {
                     dst: peer_addr,
                     buf: &payload,
                     segment_size: MAX_FRAME_SIZE,
+                    tx_tags: &[],
                 }];
                 let batch = SendPacketBatch { packets: &packets };
                 assert_eq!(

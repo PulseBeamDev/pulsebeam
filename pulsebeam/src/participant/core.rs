@@ -961,6 +961,12 @@ impl ParticipantCore {
         }
     }
 
+    pub(crate) fn on_send_timestamp(&mut self, id: str0m::net::SendId, at: Instant) {
+        let _ = self
+            .rtc
+            .handle_input(Input::SendTimestamp { id, at: at.into() });
+    }
+
     fn advance_rtc_clock(&mut self, candidate: Instant) {
         let previous = self.rtc_clock;
         self.rtc_clock = self.rtc_clock.max(candidate);
@@ -1020,9 +1026,11 @@ impl ParticipantCore {
                         work_items += 1;
                     }
                     match tx.proto {
-                        Protocol::Udp => self
-                            .udp_packets
-                            .push_back(tx.destination, tx.contents.into()),
+                        Protocol::Udp => self.udp_packets.push_tracked(
+                            tx.destination,
+                            tx.contents.into(),
+                            tx.send_id,
+                        ),
                         Protocol::Tcp => self.tcp_batcher.push_back(tx.destination, &tx.contents),
                         _ => {}
                     }

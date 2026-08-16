@@ -20,7 +20,7 @@ use crate::sync::Arc;
 
 use super::{
     BATCH_SIZE, MAX_UDP_GSO_PAYLOAD_SIZE, MAX_UDP_PAYLOAD_SIZE, RecvPacketBatch, SendPacket,
-    SendPacketBatch, UDP_MAX_GSO_SEGMENTS, fmt_bytes,
+    SendPacketBatch, SendTag, TxTimestamp, UDP_MAX_GSO_SEGMENTS, fmt_bytes,
 };
 
 use nix::{
@@ -28,10 +28,11 @@ use nix::{
     errno::Errno,
     sys::socket::{
         ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage,
-        TimestampingFlag, recvmmsg, sendmmsg, setsockopt, sockopt,
+        TimestampingFlag, recvmmsg, recvmsg, sendmmsg, setsockopt, sockopt,
     },
 };
 use std::{
+    collections::VecDeque,
     io::{self, ErrorKind, IoSlice, IoSliceMut},
     net::{IpAddr, SocketAddr},
     os::fd::AsRawFd,
@@ -44,6 +45,7 @@ const INVALID_GRO_SEGMENT_SIZE: i32 = 0;
 const SINGLE_SEGMENT: usize = 1;
 const DROP_LOG_INTERVAL: usize = 100;
 const CLOCK_STEP_THRESHOLD: Duration = Duration::from_millis(50);
+const TX_TIMESTAMP_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub const MODE: UdpMode = UdpMode::Batch;
 
@@ -203,6 +205,10 @@ impl UdpTransport {
         self.writer.try_send_batch(batch)
     }
 
+    pub fn try_recv_tx_timestamps(&mut self, out: &mut Vec<TxTimestamp>) -> io::Result<usize> {
+        self.writer.try_recv_tx_timestamps(out)
+    }
+
     pub fn close_peer(&mut self, _peer_addr: &SocketAddr) {
         // UDP has no per-peer connection state to close.
     }
@@ -240,11 +246,16 @@ pub fn from_socket(
 
     let gro_enabled = setsockopt(&socket2_sock, sockopt::UdpGroSegment, &true).is_ok();
     let timestamping = TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE
-        | TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE;
+        | TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
+        | TimestampingFlag::SOF_TIMESTAMPING_TX_SOFTWARE
+        | TimestampingFlag::SOF_TIMESTAMPING_OPT_ID
+        | TimestampingFlag::SOF_TIMESTAMPING_OPT_TSONLY;
     setsockopt(&socket2_sock, sockopt::Timestamping, &timestamping).map_err(|error| {
         io::Error::new(
             ErrorKind::Unsupported,
-            format!("SO_TIMESTAMPING with RX software timestamps is required: {error}"),
+            format!(
+                "SO_TIMESTAMPING with RX/TX software timestamps and OPT_ID is required: {error}"
+            ),
         )
     })?;
 
@@ -287,6 +298,10 @@ pub fn from_socket(
         gso_capable,
         drop_count: 0,
         send_batch_limit: send_buf_size / 2,
+        next_kernel_send_id: 0,
+        pending_timestamps: VecDeque::new(),
+        timestamp_completions: VecDeque::new(),
+        timestamp_domain: TimestampDomain::default(),
     };
 
     tracing::info!(
@@ -444,22 +459,19 @@ pub struct UdpTransportWriter {
     gso_capable: bool,
     drop_count: usize,
     send_batch_limit: usize,
+    next_kernel_send_id: u32,
+    pending_timestamps: VecDeque<PendingTimestamp>,
+    timestamp_completions: VecDeque<TxTimestamp>,
+    timestamp_domain: TimestampDomain,
+}
+
+struct PendingTimestamp {
+    kernel_id: u32,
+    tags: Vec<SendTag>,
+    accepted_at: tokio::time::Instant,
 }
 
 impl UdpTransportWriter {
-    /// Builds another independent writer handle over the same underlying
-    /// socket. Each write creates its syscall scratch locally, so this can be
-    /// used by another task without sharing mutable header state.
-    pub fn fork(&self) -> Self {
-        Self {
-            sock: self.sock.clone(),
-            local_addr: self.local_addr,
-            gso_capable: self.gso_capable,
-            drop_count: 0,
-            send_batch_limit: self.send_batch_limit,
-        }
-    }
-
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -476,6 +488,77 @@ impl UdpTransportWriter {
     pub async fn writable(&self) -> io::Result<()> {
         self.sock.ready(tokio::io::Interest::WRITABLE).await?;
         Ok(())
+    }
+
+    pub fn try_recv_tx_timestamps(&mut self, out: &mut Vec<TxTimestamp>) -> io::Result<usize> {
+        let start = out.len();
+        let anchor = self.timestamp_domain.capture();
+        for _ in 0..BATCH_SIZE {
+            let mut byte = [0u8; 1];
+            let mut iov = [IoSliceMut::new(&mut byte)];
+            let mut cmsg_buffer = cmsg_space!([u8; 256]);
+            let message = match recvmsg::<SockaddrStorage>(
+                self.sock.as_raw_fd(),
+                &mut iov,
+                Some(&mut cmsg_buffer),
+                MsgFlags::MSG_ERRQUEUE | MsgFlags::MSG_DONTWAIT,
+            ) {
+                Ok(message) => message,
+                Err(Errno::EWOULDBLOCK) => break,
+                Err(error) => return Err(io::Error::from(error)),
+            };
+            let mut kernel_id = None;
+            let mut sent_at = None;
+            if let Ok(cmsgs) = message.cmsgs() {
+                for cmsg in cmsgs {
+                    match cmsg {
+                        ControlMessageOwned::ScmTimestampsns(timestamps) => {
+                            sent_at = TimestampDomain::convert(anchor, timestamps.system);
+                        }
+                        ControlMessageOwned::Ipv4RecvErr(error, _)
+                        | ControlMessageOwned::Ipv6RecvErr(error, _)
+                            if error.ee_origin == nix::libc::SO_EE_ORIGIN_TIMESTAMPING =>
+                        {
+                            kernel_id = Some(error.ee_data);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let Some(kernel_id) = kernel_id else {
+                continue;
+            };
+            let Some(position) = self
+                .pending_timestamps
+                .iter()
+                .position(|pending| pending.kernel_id == kernel_id)
+            else {
+                continue;
+            };
+            let Some(pending) = self.pending_timestamps.remove(position) else {
+                debug_assert!(false, "located TX timestamp must remain pending");
+                continue;
+            };
+            for tag in pending.tags {
+                self.timestamp_completions
+                    .push_back(TxTimestamp { tag, at: sent_at });
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        while self.pending_timestamps.front().is_some_and(|pending| {
+            now.saturating_duration_since(pending.accepted_at) >= TX_TIMESTAMP_TIMEOUT
+        }) {
+            let Some(pending) = self.pending_timestamps.pop_front() else {
+                break;
+            };
+            for tag in pending.tags {
+                self.timestamp_completions
+                    .push_back(TxTimestamp { tag, at: None });
+            }
+        }
+        out.extend(self.timestamp_completions.drain(..));
+        Ok(out.len().saturating_sub(start))
     }
 
     /// Sends every packet in `batch`. GSO's segment-size cmsg applies to an
@@ -539,6 +622,8 @@ impl UdpTransportWriter {
             debug_assert_ne!(p.segment_size, 0);
             debug_assert!(p.segment_size <= p.buf.len());
             debug_assert!(p.buf.len() <= MAX_UDP_GSO_PAYLOAD_SIZE);
+            let segment_count = p.buf.len().div_ceil(p.segment_size);
+            debug_assert!(p.tx_tags.is_empty() || p.tx_tags.len() == segment_count);
             debug_assert!(
                 p.segment_size >= p.buf.len()
                     || p.buf.len().div_ceil(p.segment_size) <= UDP_MAX_GSO_SEGMENTS
@@ -554,6 +639,7 @@ impl UdpTransportWriter {
                 || p.segment_size > p.buf.len()
                 || p.segment_size > u16::MAX as usize
                 || p.buf.len() > MAX_UDP_GSO_PAYLOAD_SIZE
+                || (!p.tx_tags.is_empty() && p.tx_tags.len() != segment_count)
                 || (p.segment_size < p.buf.len()
                     && p.buf.len().div_ceil(p.segment_size) > UDP_MAX_GSO_SEGMENTS)
             {
@@ -607,15 +693,37 @@ impl UdpTransportWriter {
 
         match result {
             Ok(count) => {
+                let accepted_at = tokio::time::Instant::now();
+                for packet in group.get(..count).unwrap_or_default() {
+                    let kernel_id = self.next_kernel_send_id;
+                    self.next_kernel_send_id = self.next_kernel_send_id.wrapping_add(1);
+                    let tags: Vec<_> = packet.tx_tags.iter().flatten().copied().collect();
+                    if !tags.is_empty() {
+                        self.pending_timestamps.push_back(PendingTimestamp {
+                            kernel_id,
+                            tags,
+                            accepted_at,
+                        });
+                    }
+                }
+                for packet in group.get(count..).unwrap_or_default() {
+                    self.complete_missing(packet);
+                }
                 self.record_drop(group.len().saturating_sub(count));
                 Ok(count)
             }
             // Lossy: kernel buffer full — drop this group rather than queue it.
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                for packet in group {
+                    self.complete_missing(packet);
+                }
                 self.record_drop(group.len());
                 Ok(group.len())
             }
             Err(err) => {
+                for packet in group {
+                    self.complete_missing(packet);
+                }
                 tracing::trace!("try_send_batch failed with {err}");
                 Err(err)
             }
@@ -630,6 +738,13 @@ impl UdpTransportWriter {
             tracing::warn!(dropped = count, "udp dropped packets during sendmmsg");
         }
         self.drop_count = self.drop_count.saturating_add(count);
+    }
+
+    fn complete_missing(&mut self, packet: &SendPacket<'_>) {
+        for tag in packet.tx_tags.iter().flatten().copied() {
+            self.timestamp_completions
+                .push_back(TxTimestamp { tag, at: None });
+        }
     }
 }
 
@@ -722,6 +837,7 @@ mod tests {
             dst: recv_addr,
             buf: &payload,
             segment_size: 500,
+            tx_tags: &[],
         }];
         let batch = SendPacketBatch { packets: &packets };
 
@@ -760,11 +876,13 @@ mod tests {
                 dst: r1.local_addr().unwrap(),
                 buf: &p1,
                 segment_size: p1.len(),
+                tx_tags: &[],
             },
             SendPacket {
                 dst: r2.local_addr().unwrap(),
                 buf: &p2,
                 segment_size: p2.len(),
+                tx_tags: &[],
             },
         ];
         let batch = SendPacketBatch { packets: &packets };
@@ -788,6 +906,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gso_send_reports_every_tag_once() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut sender = bind(addr, None).await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let segment_size = 500;
+        let payload = vec![7u8; segment_size * 3];
+        let tags = [
+            Some(SendTag { owner: 9, id: 1 }),
+            Some(SendTag { owner: 9, id: 2 }),
+            Some(SendTag { owner: 9, id: 3 }),
+        ];
+        let packets = [SendPacket {
+            dst: receiver.local_addr().unwrap(),
+            buf: &payload,
+            segment_size,
+            tx_tags: &tags,
+        }];
+
+        sender.writable().await.unwrap();
+        assert_eq!(
+            sender
+                .try_send_batch(&SendPacketBatch { packets: &packets })
+                .unwrap(),
+            1
+        );
+
+        let mut completions = Vec::new();
+        for _ in 0..1_000 {
+            sender.try_recv_tx_timestamps(&mut completions).unwrap();
+            if completions.len() == tags.len() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(completions.len(), tags.len());
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| completion.tag.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(completions.iter().all(|completion| completion.at.is_some()));
+        assert!(completions.windows(2).all(|pair| pair[0].at <= pair[1].at));
+    }
+
+    #[tokio::test]
     async fn gso_gro_preserves_a_full_segment_batch() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut sender = bind(addr, None).await.unwrap();
@@ -808,6 +974,7 @@ mod tests {
             dst: receiver.local_addr(),
             buf: &payload,
             segment_size,
+            tx_tags: &[],
         }];
 
         sender.writable().await.unwrap();

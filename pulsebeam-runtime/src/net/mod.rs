@@ -27,6 +27,18 @@ pub const MAX_UDP_PAYLOAD_SIZE: usize = 1500;
 pub const MAX_UDP_GSO_PAYLOAD_SIZE: usize = u16::MAX as usize;
 pub const UDP_MAX_GSO_SEGMENTS: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SendTag {
+    pub owner: u64,
+    pub id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxTimestamp {
+    pub tag: SendTag,
+    pub at: Option<tokio::time::Instant>,
+}
+
 #[cfg(not(feature = "sim"))]
 fn bind_scalar_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
     let socket = socket2::Socket::new(
@@ -107,6 +119,7 @@ pub struct SendPacket<'a> {
     /// If `segment_size == buf.len()` (or `buf` is empty), no GSO is applied
     /// and this is a single ordinary datagram.
     pub segment_size: usize,
+    pub tx_tags: &'a [Option<SendTag>],
 }
 
 /// A multi-packet, multi-destination batch for sendmmsg.
@@ -195,6 +208,14 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::UdpScalar(inner) => inner.try_send_batch(batch),
+        }
+    }
+
+    #[inline]
+    pub fn try_recv_tx_timestamps(&mut self, out: &mut Vec<TxTimestamp>) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(inner) => inner.try_recv_tx_timestamps(out),
+            Self::UdpScalar(inner) => inner.try_recv_tx_timestamps(out),
         }
     }
 

@@ -498,6 +498,7 @@ impl ShardTransport for ChannelTransport {
 pub(crate) struct ShardWorker {
     core: ShardCore,
     recv_batch: Vec<RecvPacketBatch>,
+    tx_timestamps: Vec<net::TxTimestamp>,
     udp_socket: UnifiedSocket,
     tcp_socket: net::tcp::TcpTransport,
     command_rx: mailbox::Receiver<ShardCommand>,
@@ -560,6 +561,7 @@ impl ShardWorker {
         Self {
             core,
             recv_batch: Vec::with_capacity(net::BATCH_SIZE),
+            tx_timestamps: Vec::with_capacity(net::BATCH_SIZE),
             udp_socket,
             tcp_socket,
             command_rx,
@@ -766,6 +768,11 @@ impl ShardWorker {
             self.tick_budget_hit("frames");
         }
         self.core.fire_timers(now);
+
+        let _ = self
+            .udp_socket
+            .try_recv_tx_timestamps(&mut self.tx_timestamps);
+        self.core.on_tx_timestamps(self.tx_timestamps.drain(..));
 
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
         let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);

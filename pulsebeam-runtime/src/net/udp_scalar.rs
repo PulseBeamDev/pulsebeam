@@ -1,4 +1,7 @@
-use crate::{net::SendPacket, sync::Arc};
+use crate::{
+    net::{SendPacket, TxTimestamp},
+    sync::Arc,
+};
 use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
@@ -40,6 +43,10 @@ impl UdpTransport {
     #[inline]
     pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<usize> {
         self.writer.try_send_batch(batch)
+    }
+
+    pub fn try_recv_tx_timestamps(&mut self, out: &mut Vec<TxTimestamp>) -> io::Result<usize> {
+        self.writer.try_recv_tx_timestamps(out)
     }
 
     pub fn close_peer(&mut self, _peer_addr: &SocketAddr) {
@@ -300,6 +307,16 @@ impl UdpTransportWriter {
         Ok(())
     }
 
+    pub fn try_recv_tx_timestamps(&mut self, out: &mut Vec<TxTimestamp>) -> io::Result<usize> {
+        #[cfg(feature = "sim")]
+        return Ok(self.shaper.drain_completions(out));
+        #[cfg(not(feature = "sim"))]
+        {
+            let _ = out;
+            Ok(0)
+        }
+    }
+
     #[inline]
     pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<usize> {
         for group in batch.packets {
@@ -316,10 +333,12 @@ impl UdpTransportWriter {
             debug_assert!(batch.segment_size <= batch.buf.len());
             let segment_count = batch.buf.len().div_ceil(batch.segment_size);
             debug_assert!(segment_count <= crate::net::UDP_MAX_GSO_SEGMENTS);
+            debug_assert!(batch.tx_tags.is_empty() || batch.tx_tags.len() == segment_count);
             if batch.buf.is_empty()
                 || batch.segment_size == 0
                 || batch.segment_size > batch.buf.len()
                 || segment_count > crate::net::UDP_MAX_GSO_SEGMENTS
+                || (!batch.tx_tags.is_empty() && batch.tx_tags.len() != segment_count)
             {
                 return Err(io::Error::new(
                     ErrorKind::InvalidInput,
@@ -330,8 +349,9 @@ impl UdpTransportWriter {
                 crate::net::shaper::record_gso_batch(batch.dst.ip(), segment_count);
             }
             let now = tokio::time::Instant::now();
-            for segment in batch.buf.chunks(batch.segment_size) {
-                self.try_send_datagram(now, batch.dst, segment)?;
+            for (index, segment) in batch.buf.chunks(batch.segment_size).enumerate() {
+                let tag = batch.tx_tags.get(index).copied().flatten();
+                self.try_send_datagram(now, batch.dst, segment, tag)?;
             }
             return Ok(true);
         }
@@ -365,22 +385,30 @@ impl UdpTransportWriter {
         now: tokio::time::Instant,
         dst: SocketAddr,
         buf: &[u8],
+        tag: Option<crate::net::SendTag>,
     ) -> io::Result<()> {
         use crate::net::shaper::Shaped;
 
         debug_assert!(!buf.is_empty());
-        if let Shaped::Absorbed = self.shaper.offer(now, dst, buf) {
+        if let Shaped::Absorbed = self.shaper.offer_tracked(now, dst, buf, tag) {
             return Ok(());
         }
         if self.shaper.should_drop_packet(dst.ip()) {
+            self.shaper.complete(tag, Some(now));
             return Ok(());
         }
-        if self.shaper.should_duplicate_packet(dst.ip()) {
-            let _ = self.sock.try_send_to(buf, dst);
-        }
+        let duplicate_sent = self.shaper.should_duplicate_packet(dst.ip())
+            && self.sock.try_send_to(buf, dst).is_ok();
         match self.sock.try_send_to(buf, dst) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.shaper.complete(tag, Some(now));
+                Ok(())
+            }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if tag.is_some() && !duplicate_sent {
+                    crate::net::shaper::record_missing_tx_timestamp(dst.ip());
+                }
+                self.shaper.complete(tag, duplicate_sent.then_some(now));
                 if self.drop_count.is_multiple_of(100) {
                     tracing::warn!("udp_scalar dropped a packet due to full socket");
                 }
@@ -388,6 +416,13 @@ impl UdpTransportWriter {
                 Ok(())
             }
             Err(err) => {
+                #[cfg(feature = "sim")]
+                {
+                    if tag.is_some() {
+                        crate::net::shaper::record_missing_tx_timestamp(dst.ip());
+                    }
+                    self.shaper.complete(tag, None);
+                }
                 tracing::warn!("try_send_batch failed with {err}");
                 Err(err)
             }

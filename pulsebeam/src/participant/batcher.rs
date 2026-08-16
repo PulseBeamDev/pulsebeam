@@ -22,6 +22,7 @@ pub struct OwnedPacketQueue {
 struct OwnedPacket {
     dst: SocketAddr,
     contents: Vec<u8>,
+    send_id: Option<str0m::net::SendId>,
 }
 
 impl OwnedPacketQueue {
@@ -34,12 +35,25 @@ impl OwnedPacketQueue {
     }
 
     pub fn push_back(&mut self, dst: SocketAddr, contents: Vec<u8>) {
+        self.push_tracked(dst, contents, None);
+    }
+
+    pub fn push_tracked(
+        &mut self,
+        dst: SocketAddr,
+        contents: Vec<u8>,
+        send_id: Option<str0m::net::SendId>,
+    ) {
         debug_assert!(!contents.is_empty(), "Pushed content must not be empty");
         debug_assert!(
             contents.len() <= net::MAX_UDP_PAYLOAD_SIZE,
             "Packet exceeds maximum supported MTU"
         );
-        self.packets.push_back(OwnedPacket { dst, contents });
+        self.packets.push_back(OwnedPacket {
+            dst,
+            contents,
+            send_id,
+        });
     }
 }
 
@@ -49,11 +63,14 @@ struct GsoPacketMeta {
     segment_size: usize,
     start: usize,
     end: usize,
+    tag_start: usize,
+    tag_end: usize,
 }
 
 pub struct GsoSendBatch {
     arena: Vec<u8>,
     packets: ArrayVec<GsoPacketMeta, { net::BATCH_SIZE }>,
+    tx_tags: Vec<Option<net::SendTag>>,
 }
 
 impl GsoSendBatch {
@@ -61,6 +78,7 @@ impl GsoSendBatch {
         Self {
             arena: Vec::with_capacity(net::BATCH_SIZE * net::MAX_UDP_GSO_PAYLOAD_SIZE),
             packets: ArrayVec::new(),
+            tx_tags: Vec::with_capacity(net::BATCH_SIZE * net::UDP_MAX_GSO_SEGMENTS),
         }
     }
 
@@ -72,7 +90,7 @@ impl GsoSendBatch {
         self.packets.is_empty()
     }
 
-    pub fn append_from(&mut self, queue: &mut OwnedPacketQueue) -> bool {
+    pub fn append_from(&mut self, queue: &mut OwnedPacketQueue, owner: u64) -> bool {
         debug_assert!(!self.is_full());
         let Some(first) = queue.packets.front() else {
             return false;
@@ -83,6 +101,7 @@ impl GsoSendBatch {
         let dst = first.dst;
         let segment_size = first.contents.len();
         let start = self.arena.len();
+        let tag_start = self.tx_tags.len();
         let mut segment_count = 0;
 
         while let Some(packet) = queue.packets.front() {
@@ -106,6 +125,8 @@ impl GsoSendBatch {
 
             let is_tail = packet.contents.len() < segment_size;
             self.arena.extend_from_slice(&packet.contents);
+            self.tx_tags
+                .push(packet.send_id.map(|id| net::SendTag { owner, id: id.0 }));
             segment_count = segment_count.saturating_add(1);
             queue.packets.pop_front();
             if is_tail {
@@ -114,14 +135,18 @@ impl GsoSendBatch {
         }
 
         let end = self.arena.len();
+        let tag_end = self.tx_tags.len();
         debug_assert_ne!(segment_count, 0);
         debug_assert!(end > start);
         debug_assert!(end.saturating_sub(start) <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        debug_assert_eq!(tag_end.saturating_sub(tag_start), segment_count);
         self.packets.push(GsoPacketMeta {
             dst,
             segment_size,
             start,
             end,
+            tag_start,
+            tag_end,
         });
         true
     }
@@ -140,10 +165,15 @@ impl GsoSendBatch {
                 debug_assert!(false, "queued packet escapes the arena");
                 continue;
             };
+            let Some(tx_tags) = self.tx_tags.get(packet.tag_start..packet.tag_end) else {
+                debug_assert!(false, "queued timestamp tags escape the arena");
+                continue;
+            };
             packets.push(net::SendPacket {
                 dst: packet.dst,
                 buf,
                 segment_size: packet.segment_size,
+                tx_tags,
             });
         }
         let batch = net::SendPacketBatch { packets: &packets };
@@ -153,6 +183,7 @@ impl GsoSendBatch {
         drop(packets);
         self.packets.clear();
         self.arena.clear();
+        self.tx_tags.clear();
         debug_assert!(self.arena.capacity() >= net::BATCH_SIZE * net::MAX_UDP_GSO_PAYLOAD_SIZE);
     }
 }
@@ -238,6 +269,7 @@ impl Batcher {
             dst: state.dst,
             buf: &state.buf,
             segment_size: state.segment_size,
+            tx_tags: &[],
         })
     }
 
@@ -265,6 +297,7 @@ impl Batcher {
                 dst: state.dst,
                 buf: &state.buf,
                 segment_size: state.segment_size,
+                tx_tags: &[],
             }];
             if let Err(err) = socket.try_send_batch(&net::SendPacketBatch { packets: &packet }) {
                 tracing::trace!("error on writing to TCP socket: {:?}", err);
@@ -511,11 +544,31 @@ mod tests {
         packets.push_back(addr, vec![3; 500]);
         let mut output = GsoSendBatch::preallocated();
 
-        assert!(output.append_from(&mut packets));
+        assert!(output.append_from(&mut packets, 0));
         assert_eq!(output.packets[0].dst, addr);
         assert_eq!(output.packets[0].segment_size, 1000);
         assert_eq!(output.packets[0].end - output.packets[0].start, 2500);
-        assert!(!output.append_from(&mut packets));
+        assert!(!output.append_from(&mut packets, 0));
+    }
+
+    #[test]
+    fn send_batch_preserves_timestamp_identity_per_segment() {
+        let addr = create_test_addr();
+        let mut packets = OwnedPacketQueue::with_capacity(4);
+        packets.push_tracked(addr, vec![1; 500], Some(str0m::net::SendId(4)));
+        packets.push_back(addr, vec![2; 500]);
+        packets.push_tracked(addr, vec![3; 400], Some(str0m::net::SendId(5)));
+        let mut batch = GsoSendBatch::preallocated();
+
+        assert!(batch.append_from(&mut packets, 77));
+        assert_eq!(
+            batch.tx_tags,
+            vec![
+                Some(net::SendTag { owner: 77, id: 4 }),
+                None,
+                Some(net::SendTag { owner: 77, id: 5 }),
+            ]
+        );
     }
 
     #[test]
@@ -529,8 +582,8 @@ mod tests {
         let mut batch = GsoSendBatch::preallocated();
         let capacity = batch.arena.capacity();
 
-        assert!(batch.append_from(&mut packets));
-        assert!(batch.append_from(&mut packets));
+        assert!(batch.append_from(&mut packets, 0));
+        assert!(batch.append_from(&mut packets, 0));
 
         assert_eq!(batch.packets.len(), 2);
         assert_eq!(batch.packets[0].start, 0);
@@ -550,9 +603,9 @@ mod tests {
         packets.push_back(other, vec![3; 600]);
 
         let mut batch = GsoSendBatch::preallocated();
-        assert!(batch.append_from(&mut packets));
-        assert!(batch.append_from(&mut packets));
-        assert!(batch.append_from(&mut packets));
+        assert!(batch.append_from(&mut packets, 0));
+        assert!(batch.append_from(&mut packets, 0));
+        assert!(batch.append_from(&mut packets, 0));
 
         assert_eq!(&batch.arena[0..500], &[1; 500]);
         assert_eq!(&batch.arena[500..1100], &[2; 600]);
