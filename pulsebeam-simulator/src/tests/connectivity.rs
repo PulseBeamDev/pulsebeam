@@ -696,12 +696,21 @@ fn video_survives_failing_route_installs_test() {
 /// quietly stopped doing anything.
 #[test]
 fn every_declared_failure_point_is_reachable_test() {
+    // Enough participants that the room allocates routes tens of times, not
+    // twice. At 50% per site and a handful of reaches, "none fired" is a coin
+    // toss the plan loses often enough to look like flakiness — and it reads as
+    // the injector being broken, which is the one thing this exists to detect.
+    // The count is what makes the claim true at every seed rather than most.
     LocalNodeSim::new()
         .with_buggify(500)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
-                .with_participant(Participant::subscriber("bob")),
+                .with_participant(Participant::single_publisher("carol"))
+                .with_participant(Participant::single_publisher("dave"))
+                .with_participant(Participant::single_publisher("erin"))
+                .with_participant(Participant::subscriber("bob"))
+                .with_participant(Participant::subscriber("frank")),
         )
         .run(vec![Step::Run {
             description: "Enough traffic to reach the route table",
