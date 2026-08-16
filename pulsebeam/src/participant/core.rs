@@ -47,6 +47,13 @@ const MAX_PENDING_INGRESS: usize = 256;
 const MAX_PENDING_FANOUT: usize = 256;
 const MAX_PENDING_RTC_MUTATIONS: usize = 256;
 
+fn inline_rtc_timeout(deadline: Instant, wall_now: Instant) -> Option<Instant> {
+    let latest = wall_now
+        .checked_add(pulsebeam_runtime::SHARD_TIMER_QUANTUM)
+        .unwrap_or(wall_now);
+    (deadline <= latest).then_some(deadline.max(wall_now))
+}
+
 #[derive(Clone, Copy)]
 struct IncomingRtpRoute {
     ssrc: Ssrc,
@@ -242,6 +249,7 @@ pub struct ParticipantCore {
     pending_rtc_mutations: VecDeque<PendingRtcMutation>,
     last_ingress: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     rtc_deadline: Option<Instant>,
+    rtc_clock: Instant,
     rtc_needs_drain: bool,
     exited: bool,
     #[cfg(debug_assertions)]
@@ -358,6 +366,7 @@ impl ParticipantCore {
         let udp_packets = OwnedPacketQueue::with_capacity(udp_gso_size);
         let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
+        let now = Instant::now();
         let mut p = Self {
             pending_ingress: VecDeque::new(),
             pending_timeout: None,
@@ -365,6 +374,7 @@ impl ParticipantCore {
             pending_rtc_mutations: VecDeque::new(),
             last_ingress: None,
             rtc_deadline: None,
+            rtc_clock: now,
             rtc_needs_drain: true,
             exited: false,
             #[cfg(debug_assertions)]
@@ -385,7 +395,7 @@ impl ParticipantCore {
             incoming_rtp_routes: UpstreamRouteTable::default(),
             disconnect_reason: None,
             signaling,
-            last_slow_poll: Instant::now(),
+            last_slow_poll: now,
             last_keyframe_request: HashMap::new(),
             data_topic_channels: HashMap::new(),
             published_track_fanouts: HashMap::new(),
@@ -816,7 +826,7 @@ impl ParticipantCore {
         #[cfg(feature = "sim")]
         let _sim_guard = sim_span.enter();
 
-        let mut timeout_budget = 3usize;
+        self.advance_rtc_clock(now, now);
         let mut work_budget = POLL_WORK_BUDGET;
         'drain: loop {
             if work_budget == 0 {
@@ -840,8 +850,8 @@ impl ParticipantCore {
             debug_assert!(self.rtc_deadline.is_some());
 
             if let Some(deadline) = self.pending_timeout.take() {
-                let now = deadline.max(now);
-                let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+                self.advance_rtc_clock(deadline.max(now), now);
+                let _ = self.rtc.handle_input(Input::Timeout(self.rtc_clock.into()));
                 self.rtc_needs_drain = true;
                 continue;
             }
@@ -861,6 +871,8 @@ impl ParticipantCore {
             }
 
             let ctx = self.log_ctx();
+            self.advance_rtc_clock(now, now);
+            let receive_at = self.rtc_clock;
             while let Some(batch) = self.pending_ingress.front_mut() {
                 let transport = match batch.transport {
                     Transport::Udp(_) => str0m::net::Protocol::Udp,
@@ -887,7 +899,9 @@ impl ParticipantCore {
                     destination: dst,
                     contents,
                 };
-                let _ = self.rtc.handle_input(Input::Receive(now.into(), recv));
+                let _ = self
+                    .rtc
+                    .handle_input(Input::Receive(receive_at.into(), recv));
                 self.rtc_needs_drain = true;
                 continue 'drain;
             }
@@ -925,17 +939,31 @@ impl ParticipantCore {
                 .unwrap_or(next_slow_poll)
                 .min(next_slow_poll);
 
-            // upper bounded to 3 ticks to defensively avoid spin loops from bugs or just to give fairness
-            // to other participants
-            if deadline <= now && timeout_budget > 0 {
-                timeout_budget = timeout_budget.saturating_sub(1);
-                let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+            if let Some(rtc_now) = inline_rtc_timeout(deadline, now) {
+                self.advance_rtc_clock(rtc_now, now);
+                let _ = self.rtc.handle_input(Input::Timeout(self.rtc_clock.into()));
                 self.rtc_needs_drain = true;
                 continue;
             }
 
             return Some(deadline);
         }
+    }
+
+    fn advance_rtc_clock(&mut self, candidate: Instant, wall_now: Instant) {
+        let previous = self.rtc_clock;
+        self.rtc_clock = self.rtc_clock.max(candidate).max(wall_now);
+        debug_assert!(
+            self.rtc_clock >= previous,
+            "participant RTC clock moved backwards"
+        );
+        debug_assert!(
+            self.rtc_clock
+                <= wall_now
+                    .checked_add(pulsebeam_runtime::SHARD_TIMER_QUANTUM)
+                    .unwrap_or(wall_now),
+            "participant RTC clock advanced beyond one wheel quantum"
+        );
     }
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
@@ -1477,6 +1505,29 @@ impl ParticipantCore {
         self.disconnect_reason = Some(reason);
         self.rtc.disconnect();
         self.rtc_needs_drain = true;
+    }
+}
+
+#[cfg(test)]
+mod rtc_clock_tests {
+    use super::*;
+
+    #[test]
+    fn sub_quantum_deadlines_do_not_accumulate_clock_lag() {
+        let start = Instant::now();
+        let mut wall = start;
+        let mut rtc = start;
+
+        for _ in 0..1_000 {
+            wall += pulsebeam_runtime::SHARD_TIMER_QUANTUM;
+            let deadline = rtc + Duration::from_micros(30);
+            let candidate = inline_rtc_timeout(deadline, wall).expect("deadline is inline");
+            rtc = rtc.max(candidate).max(wall);
+            assert!(rtc >= wall);
+            assert!(rtc <= wall + pulsebeam_runtime::SHARD_TIMER_QUANTUM);
+        }
+
+        assert_eq!(rtc, wall);
     }
 }
 
