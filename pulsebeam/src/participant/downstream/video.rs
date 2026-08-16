@@ -51,22 +51,8 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
-/// The lowest rate the bandwidth estimate may report.
-///
-/// Distinct from [`START_BANDWIDTH`] in meaning, and currently equal to it in
-/// value. Named separately because they are different decisions: this is the
-/// floor on what the estimator is *allowed to believe*, and that is where the
-/// estimate *begins*. Sharing one constant hid that.
-///
-/// **It should be lower.** libwebrtc's congestion controller floors its
-/// estimate far below its start bitrate, precisely so a link smaller than the
-/// start value can still be measured; at 300 kbps this SFU reports a 150 kbps
-/// link as 300 kbps and the allocator believes it has twice what it has.
-/// Lowering it currently fails `properties::sharding_does_not_change_who_is_served`
-/// — a single-shard viewer stops being served — which is a real defect this
-/// floor is masking rather than a reason to keep the floor. Diagnose that
-/// before moving this number.
-pub const MIN_ESTIMATE: Bitrate = START_BANDWIDTH;
+/// Match str0m's congestion-controller floor without adding a second SFU floor.
+pub const MIN_ESTIMATE: Bitrate = Bitrate::kbps(40);
 
 /// Where the estimate starts before any feedback has arrived.
 ///
