@@ -37,7 +37,20 @@ impl DerefMut for ParticipantMeta {
 pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
-    participants: SecondaryMap<ParticipantKey, ParticipantMeta>,
+    /// Boxed, and that is the point.
+    ///
+    /// `SecondaryMap` is a dense `Vec` indexed by the key, so its element size
+    /// is its stride. `ParticipantMeta` is ~10.9KB — three quarters of it
+    /// str0m's `Rtc` — and growing the map `Vec::extend`s, which reallocates
+    /// and memcpies every participant already in it. On a shard filling to 500
+    /// that is ~2.7MB copied in one go, on a `SCHED_FIFO` thread, while media
+    /// is flowing. A pointer costs 16 bytes of stride instead of 10,904, so the
+    /// same growth moves 8KB.
+    ///
+    /// The indirection is free where it matters: resolving a participant always
+    /// missed on a 10.9KB object anyway, and the pointer array it now goes
+    /// through is dense enough to stay resident (500 participants = 8KB).
+    participants: SecondaryMap<ParticipantKey, Box<ParticipantMeta>>,
     demuxer: Demuxer,
     pending_close: VecDeque<SocketAddr>,
 }
@@ -73,18 +86,18 @@ impl ParticipantRegistry {
         }
         let previous = self.participants.insert(
             key,
-            ParticipantMeta {
+            Box::new(ParticipantMeta {
                 core,
                 queued_dirty: false,
                 ingress,
-            },
+            }),
         );
         debug_assert!(previous.is_none());
         tracing::info!(%participant_id, "participant added to shard");
         true
     }
 
-    pub fn remove_key(&mut self, key: ParticipantKey) -> Option<ParticipantMeta> {
+    pub fn remove_key(&mut self, key: ParticipantKey) -> Option<Box<ParticipantMeta>> {
         let meta = self.participants.remove(key)?;
         let addrs = self.demuxer.unregister(meta.ingress.route);
         self.pending_close.extend(addrs);
@@ -92,7 +105,7 @@ impl ParticipantRegistry {
     }
 
     pub fn resolve_mut(&mut self, key: ParticipantKey) -> Option<&mut ParticipantMeta> {
-        self.participants.get_mut(key)
+        self.participants.get_mut(key).map(Box::as_mut)
     }
 
     pub fn publish_track_to(&mut self, track: &crate::track::Track, audience: &[ParticipantKey]) {
@@ -168,5 +181,40 @@ impl ParticipantRegistry {
 
     pub fn drain_pending_close(&mut self) -> impl Iterator<Item = SocketAddr> + '_ {
         self.pending_close.drain(..)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    use super::*;
+
+    fn value_size<K: slotmap::Key, V>(_: &SecondaryMap<K, V>) -> usize {
+        std::mem::size_of::<V>()
+    }
+
+    /// The registry's element stride is a pointer, not a participant.
+    ///
+    /// `SecondaryMap` is a dense `Vec` indexed by the key, so whatever it holds
+    /// is what gets memcpied every time the map grows — on the shard's
+    /// `SCHED_FIFO` thread, with media flowing. Storing the participant inline
+    /// made that ~2.7MB in one go at 500 participants; a pointer makes it 8KB.
+    ///
+    /// This is a stride check rather than a style check: if `ParticipantMeta`
+    /// ever shrinks to something a `Vec` can carry, the indirection can go and
+    /// this assertion is the place to reconsider it.
+    #[test]
+    fn the_registry_holds_participants_behind_a_pointer() {
+        let registry = ParticipantRegistry::new(ShardId::new(0), 1, 1);
+        assert_eq!(
+            value_size(&registry.participants),
+            std::mem::size_of::<usize>(),
+            "the participant registry must store a pointer per slot"
+        );
+        assert!(
+            std::mem::size_of::<ParticipantMeta>() > 4096,
+            "a participant is small enough to inline now; revisit the Box and this test"
+        );
     }
 }

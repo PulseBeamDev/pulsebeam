@@ -61,67 +61,80 @@ struct IncomingRtpRoute {
     fanout: Option<TrackKey>,
 }
 
+/// Upstream stream routing, stored as parallel arrays.
+///
+/// Every received RTP packet searches this by SSRC, and the search reads only
+/// the key. Holding the keys apart from the payload means a participant with
+/// `n` upstream streams costs `n/16` cache lines to search rather than
+/// `n * size_of::<IncomingRtpRoute>() / 64` — and each stream added after that
+/// costs four bytes of scan, not fifty-odd. That ratio is the point: the number
+/// of upstream streams is expected to grow, and this stays cheap while it does.
+///
+/// Both arrays are dense and index-aligned: `ssrcs[i]` describes `routes[i]`.
+/// Removal is a `swap_remove` on both, so there are no holes to skip and no
+/// tombstones to test.
+#[derive(Default)]
 struct UpstreamRouteTable {
-    entries: [Option<IncomingRtpRoute>; MAX_UPSTREAM_ENCODED_STREAMS],
+    ssrcs: Vec<Ssrc>,
+    routes: Vec<IncomingRtpRoute>,
 }
 
-impl Default for UpstreamRouteTable {
-    fn default() -> Self {
-        Self {
-            entries: std::array::from_fn(|_| None),
-        }
-    }
-}
+/// The packing claim above is only true while an SSRC is four bytes.
+const _: () = assert!(std::mem::size_of::<Ssrc>() == 4);
 
 impl UpstreamRouteTable {
-    /// Scanned rather than indexed. The array is bounded by the same constant
-    /// that bounds how many encoded streams a participant may have, so this is
-    /// output-proportional over one or two cache lines. Hashing the SSRC into
-    /// the array instead makes it direct-mapped with no chaining, and since a
-    /// client picks its SSRCs at random, streams collide and evict each other
-    /// far more often than not.
+    fn index_of(&self, ssrc: Ssrc) -> Option<usize> {
+        self.ssrcs.iter().position(|&known| known == ssrc)
+    }
+
     fn get(&self, ssrc: Ssrc) -> Option<IncomingRtpRoute> {
-        self.entries
-            .iter()
-            .flatten()
-            .copied()
-            .find(|route| route.ssrc == ssrc)
+        self.routes.get(self.index_of(ssrc)?).copied()
     }
 
     fn insert(&mut self, route: IncomingRtpRoute) {
-        let slot = self
-            .entries
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.ssrc == route.ssrc))
-            .or_else(|| self.entries.iter().position(Option::is_none))
-            .and_then(|index| self.entries.get_mut(index));
-        let Some(slot) = slot else {
+        debug_assert_eq!(self.ssrcs.len(), self.routes.len());
+        if let Some(index) = self.index_of(route.ssrc) {
+            if let Some(slot) = self.routes.get_mut(index) {
+                *slot = route;
+            }
+            return;
+        }
+        if self.routes.len() >= MAX_UPSTREAM_ENCODED_STREAMS {
             debug_assert!(
                 false,
                 "more encoded streams than MAX_UPSTREAM_ENCODED_STREAMS allows"
             );
             metrics::counter!("upstream_route_table_full").increment(1);
             return;
-        };
-        *slot = Some(route);
+        }
+        self.ssrcs.push(route.ssrc);
+        self.routes.push(route);
     }
 
     fn remove(&mut self, ssrc: Ssrc) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.is_some_and(|route| route.ssrc == ssrc))
-        {
-            *entry = None;
-        }
+        debug_assert_eq!(self.ssrcs.len(), self.routes.len());
+        let Some(index) = self.index_of(ssrc) else {
+            return;
+        };
+        self.ssrcs.swap_remove(index);
+        self.routes.swap_remove(index);
     }
 
     fn clear(&mut self) {
-        self.entries.fill(None);
+        self.ssrcs.clear();
+        self.routes.clear();
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut IncomingRtpRoute> {
-        self.entries.iter_mut().filter_map(Option::as_mut)
+    /// Fill in the fanout for every stream of `track_id`.
+    ///
+    /// A method rather than an `iter_mut`, so the SSRC a route is filed under
+    /// cannot be edited out from under the key array.
+    fn bind_fanout(&mut self, track_id: TrackId, fanout: TrackKey) {
+        for route in &mut self.routes {
+            if route.track_id == track_id {
+                route.fanout = Some(fanout);
+            }
+        }
     }
 }
 
@@ -285,11 +298,7 @@ impl ParticipantCore {
     /// `None` for the life of the stream, and the miss would never heal.
     pub(crate) fn bind_published_track(&mut self, track_id: TrackId, fanout: TrackKey) {
         self.published_track_fanouts.insert(track_id, fanout);
-        for route in self.incoming_rtp_routes.iter_mut() {
-            if route.track_id == track_id {
-                route.fanout = Some(fanout);
-            }
-        }
+        self.incoming_rtp_routes.bind_fanout(track_id, fanout);
     }
 
     pub(crate) fn bind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
@@ -1521,6 +1530,50 @@ mod upstream_route_table_tests {
                 "every inserted route must remain retrievable"
             );
         }
+    }
+
+    /// The key array and the payload array must describe the same streams.
+    ///
+    /// They are separate allocations kept aligned by index, which is what makes
+    /// the search read four bytes per stream instead of the whole route. A
+    /// removal that reorders one and not the other silently starts routing a
+    /// stream's packets to another stream's track — no panic, no metric, just
+    /// media arriving on the wrong slot. `swap_remove` on both is what keeps
+    /// them aligned, and reordering is exactly what it does.
+    #[test]
+    fn removal_keeps_the_key_and_payload_arrays_describing_the_same_streams() {
+        let mut table = UpstreamRouteTable::default();
+        let ssrcs: Vec<u32> = (0..MAX_UPSTREAM_ENCODED_STREAMS)
+            .map(|k| 0x2000_0000 + u32::try_from(k).unwrap())
+            .collect();
+        for ssrc in &ssrcs {
+            table.insert(route(*ssrc));
+        }
+
+        // Remove from the front, which is where swap_remove reorders most.
+        for removed in 0..ssrcs.len() {
+            table.remove(Ssrc::from(ssrcs[removed]));
+            assert_eq!(
+                table.ssrcs.len(),
+                table.routes.len(),
+                "the arrays must stay the same length"
+            );
+            for (index, key) in table.ssrcs.iter().enumerate() {
+                assert_eq!(
+                    table.routes[index].ssrc,
+                    *key,
+                    "routes[{index}] must be the route for ssrcs[{index}]"
+                );
+            }
+            for surviving in ssrcs.iter().skip(removed.saturating_add(1)) {
+                assert_eq!(
+                    table.get(Ssrc::from(*surviving)).map(|r| r.ssrc),
+                    Some(Ssrc::from(*surviving)),
+                    "removing one stream must not lose another"
+                );
+            }
+        }
+        assert!(table.ssrcs.is_empty() && table.routes.is_empty());
     }
 
     /// The property that outlives any particular table implementation: a route

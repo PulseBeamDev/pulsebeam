@@ -22,7 +22,11 @@ use crate::rtp::monitor::StreamStats;
 use crate::shard::router::TrackKey;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
-/// Maximum number of video slots per participant.
+/// Video slots preallocated per participant.
+///
+/// A starting capacity, not a bound. Nothing here may assume a participant has
+/// few slots: the negotiated limit is expected to rise, so anything that walks
+/// slots has to stay cheap as it does.
 const VIDEO_MAX_SLOTS: usize = 25;
 
 /// How long to wait before the *first* PLI retry while a slot is transitioning.
