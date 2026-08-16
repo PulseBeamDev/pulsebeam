@@ -3670,7 +3670,7 @@ impl LocalNodeSim {
     pub fn new() -> Self {
         Self {
             rooms: Vec::new(),
-            tick_duration: Duration::from_millis(1),
+            tick_duration: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
             rng_seed: super::sim_seed(),
             subnet: None,
             tcp_only: false,
