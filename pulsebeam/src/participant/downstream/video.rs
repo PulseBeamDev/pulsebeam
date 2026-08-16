@@ -80,24 +80,23 @@ pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
 /// What the SFU announces to str0m as the starting estimate.
 ///
-/// Deliberately above [`START_BANDWIDTH`]: the estimate this SFU starts its own
-/// allocator from is not the same number as the one it tells the transport to
-/// probe from.
+/// libwebrtc's `kDefaultStartBitrateBps`. A start bitrate is a prior, not a
+/// measurement, and the allocator spends against it before a single packet has
+/// been acknowledged — so it has to be a number a link is not embarrassed by.
 ///
-/// **Lowering this to libwebrtc's 300 kbps trades one defect for another, and
-/// both were measured.** It fixes `a_rejoining_publisher_is_shown_to_an_existing_viewer`
-/// at every seed it currently fails: 2 Mbps overshoots a cellular link, and the
-/// burst at a slot switch overruns the client's 128-packet routing buffer, so
-/// media arrives and is discarded. It also costs `a_reordering_path_does_not_churn_keyframes`
-/// an extra layer reversal at the default seed, and
-/// `marker_only_publisher_streams_to_a_dd_subscriber` about 3% of its frames.
+/// This was 2 Mbps, which is what you need when probing cannot ramp you.
+/// Probing can: `set_desired_bitrate` drives probe clusters, and the pacer
+/// sends each recommendation as one burst, fills it with padding large enough
+/// to measure against jitter, and paces at the committed rate rather than the
+/// estimate. From 300 kbps that reaches 80% of a 3 Mbps link in 3.3s and 90% in
+/// 3.5s, first frame at 361ms.
 ///
-/// The reason it cannot simply be lowered is that libwebrtc pairs a 300 kbps
-/// start with probe clusters that reach a usable rate in a second or two. This
-/// SFU has no probing, so 300 kbps is a genuinely slower climb, and climbing
-/// through layers is what produces the extra reversal. Probing first, then this
-/// number.
-pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
+/// The 2 Mbps was leftover compensation, and it was expensive. On a fixed
+/// 400 kbps cellular link the allocator funded ~1.3 Mbps against it: the queue
+/// reached 65ms, the link dropped 37 packets and the viewer froze for 5.07s —
+/// 51% of the run — before the estimate walked down to 345 kbps. Six BWE plans
+/// failed on it at seeds 16, 17 and 19.
+pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 
 pub struct VideoAllocator {
     routes: Vec<(TrackId, DownstreamSlotKey)>,
