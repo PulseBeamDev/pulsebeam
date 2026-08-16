@@ -38,7 +38,7 @@ use std::time::Duration;
 use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
-use str0m::media::{Direction, MediaAdded, MediaKind, Mid, Rid};
+use str0m::media::{Direction, KeyframeRequestKind, MediaAdded, MediaKind, Mid, Rid};
 use str0m::rtp::{RtpWrite, Ssrc};
 use str0m::{
     Event, Input, Output, Rtc,
@@ -286,6 +286,19 @@ struct MediaSubsystem {
     /// are the keyframe the stream opens with, and dropping them costs the viewer the picture
     /// until the next one, which on a settled stream can be seconds away.
     unrouted: VecDeque<(Mid, Option<Instant>, RtpPacket)>,
+    /// Slots that lost held media before their assignment arrived.
+    ///
+    /// A dropped packet is usually part of the keyframe the stream opens with,
+    /// and losing any of it costs the whole frame. The SFU will not send
+    /// another unprompted: it requested one when it switched the slot, saw it
+    /// answered, and from its side the switch is complete — so waiting is
+    /// waiting for the publisher's next periodic keyframe, which on a settled
+    /// stream is seconds away or never.
+    ///
+    /// Asking once, when the assignment finally lands, is the recovery that
+    /// does not depend on media and signalling beating each other across a
+    /// boundary that does not order them.
+    lost_before_routing: HashMap<Mid, Option<Rid>>,
     /// Cache of which (mid, rid) each incoming SSRC belongs to. `Event::RtpPacket`
     /// carries only the SSRC, so the mapping is resolved once via the DirectApi and
     /// reused. Mirrors the SFU's `incoming_rtp_routes`.
@@ -431,6 +444,7 @@ impl AgentDriver {
                 pending_media_subscriptions: HashMap::new(),
                 pending_media_targets: HashMap::new(),
                 unrouted: VecDeque::new(),
+                lost_before_routing: HashMap::new(),
                 audio_sink: None,
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
@@ -1017,7 +1031,13 @@ impl AgentDriver {
                                     let deadline = self.now.checked_add(UNROUTED_MAX_WAIT);
                                     self.media.unrouted.push_back((mid, deadline, packet));
                                     while self.media.unrouted.len() > UNROUTED_CAPACITY {
-                                        self.media.unrouted.pop_front();
+                                        if let Some((lost, _, packet)) =
+                                            self.media.unrouted.pop_front()
+                                        {
+                                            self.media
+                                                .lost_before_routing
+                                                .insert(lost, packet.rid);
+                                        }
                                         self.stats.unroutable_media_dropped =
                                             self.stats.unroutable_media_dropped.wrapping_add(1);
                                     }
@@ -1222,6 +1242,7 @@ impl AgentDriver {
         let mut still_waiting = VecDeque::with_capacity(self.media.unrouted.len());
         while let Some((mid, deadline, packet)) = self.media.unrouted.pop_front() {
             if deadline.is_none_or(|deadline| now > deadline) {
+                self.media.lost_before_routing.insert(mid, packet.rid);
                 self.stats.unroutable_media_dropped =
                     self.stats.unroutable_media_dropped.wrapping_add(1);
                 continue;
@@ -1236,6 +1257,34 @@ impl AgentDriver {
             }
         }
         self.media.unrouted = still_waiting;
+        self.recover_lost_keyframes();
+    }
+
+    /// Ask the SFU for a keyframe on every routable slot that lost held media.
+    ///
+    /// Once, per loss: the request travels to the publisher and comes back as a
+    /// keyframe, and asking again before that round trip completes only costs
+    /// bandwidth. If this one is lost too the slot goes on receiving
+    /// undecodable frames, which is the same place it was — but it is no longer
+    /// the only outcome.
+    fn recover_lost_keyframes(&mut self) {
+        if self.media.lost_before_routing.is_empty() {
+            return;
+        }
+        let mut api = self.rtc.direct_api();
+        self.media.lost_before_routing.retain(|mid, rid| {
+            if !self.media.media_targets.contains_key(mid) {
+                // Still unassigned. Hold the request until it can be answered
+                // by a stream this client can actually route.
+                return true;
+            }
+            let Some(stream) = api.stream_rx_by_mid(*mid, *rid) else {
+                return false;
+            };
+            stream.request_keyframe(KeyframeRequestKind::Pli);
+            tracing::debug!(?mid, ?rid, "requesting a keyframe after losing held media");
+            false
+        });
     }
 
     fn emit(&mut self, event: AgentEvent) {

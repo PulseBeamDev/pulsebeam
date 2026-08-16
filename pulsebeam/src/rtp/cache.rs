@@ -137,7 +137,11 @@ impl StreamCache {
         }
 
         let frame_ts = pkt.rtp_ts.numer();
-        let is_keyframe = pkt.is_keyframe;
+        // Anchoring needs the keyframe's *first* packet, not any packet of it.
+        // A Dependency Descriptor carries the template structure on every packet
+        // of a keyframe, so `is_keyframe` is true across the whole frame, and
+        // under reordering the one that arrives first is routinely not the head.
+        let opens_segment = pkt.is_keyframe && pkt.is_frame_start;
 
         // Placing the packet naturally evicts whatever occupied its slot
         // `CAPACITY` positions ago — no eviction loop needed.
@@ -149,7 +153,14 @@ impl StreamCache {
         }
         self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
 
-        if is_keyframe && self.segment_ts != Some(frame_ts) {
+        // Re-anchor when the head of the same keyframe turns up late: a segment
+        // opened on a later packet would replay a frame the receiver cannot
+        // start assembling, and it discards the whole thing — including the
+        // template structure, which only keyframes carry.
+        if opens_segment
+            && (self.segment_ts != Some(frame_ts)
+                || self.segment_start_seq.is_none_or(|start| seq < start))
+        {
             self.open_segment(seq, frame_ts);
         }
 
@@ -218,6 +229,14 @@ impl StreamCache {
         }
 
         if !segment.iter().any(|p| p.is_keyframe) {
+            return None;
+        }
+
+        // The burst has to begin where a receiver can begin. Handing over a
+        // frame with no start costs more than the frame: the receiver discards
+        // it, and with it the template structure that only keyframes carry, so
+        // every later frame in the stream fails to parse too.
+        if !segment.first().is_some_and(|p| p.is_frame_start) {
             return None;
         }
 
@@ -446,6 +465,66 @@ mod test {
 
     fn builder(style: ParameterSetStyle) -> H264StreamBuilder {
         H264StreamBuilder::new(1, 1000, 90_000, Instant::now()).with_parameter_sets(style)
+    }
+
+    /// A Dependency Descriptor carries the template structure on *every* packet
+    /// of a keyframe, so every one of them reports `is_keyframe`. The packet
+    /// that arrives first is not the one a receiver can start assembling from,
+    /// and under reordering it routinely is not the head.
+    ///
+    /// Replaying from the wrong one costs far more than the frame. The receiver
+    /// discards a frame it never saw the start of, and the structure rides only
+    /// on keyframes, so every later frame in the stream fails to parse — the
+    /// picture never appears and nothing reports an error.
+    #[test]
+    fn a_reordered_keyframe_still_replays_from_the_head_of_its_frame() {
+        let mut b = builder(ParameterSetStyle::AggregatedWithIdr);
+        let mut frame = b.keyframe(4);
+        assert!(frame.len() >= 3, "need a multi-packet keyframe");
+
+        // The shape a DD stream produces: keyframe on all, frame start on one.
+        for (index, pkt) in frame.iter_mut().enumerate() {
+            pkt.is_keyframe = true;
+            pkt.is_frame_start = index == 0;
+        }
+        let head_seq = frame[0].seq_no;
+
+        // The head arrives after the packet that follows it.
+        let mut cache = StreamCache::new();
+        cache.push(frame[1].clone());
+        cache.push(frame[0].clone());
+        for pkt in frame.iter().skip(2) {
+            cache.push(pkt.clone());
+        }
+
+        let replay = cache.replay().expect("a complete keyframe must be replayable");
+        assert_eq!(
+            replay.first().map(|p| p.seq_no),
+            Some(head_seq),
+            "the burst must begin where the receiver can begin"
+        );
+    }
+
+    /// And if the head never arrives, refuse rather than replay a frame with no
+    /// beginning — the PLI retry asks for a fresh keyframe, which is recoverable.
+    #[test]
+    fn a_keyframe_missing_its_head_is_not_replayed() {
+        let mut b = builder(ParameterSetStyle::AggregatedWithIdr);
+        let mut frame = b.keyframe(4);
+        for (index, pkt) in frame.iter_mut().enumerate() {
+            pkt.is_keyframe = true;
+            pkt.is_frame_start = index == 0;
+        }
+
+        let mut cache = StreamCache::new();
+        for pkt in frame.iter().skip(1) {
+            cache.push(pkt.clone());
+        }
+
+        assert!(
+            cache.replay().is_none(),
+            "a keyframe whose first packet was lost is not a switch target"
+        );
     }
 
     #[test]
