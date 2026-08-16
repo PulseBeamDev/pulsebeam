@@ -393,6 +393,10 @@ impl VideoSubscriber {
         self
     }
 
+    /// Refuse spatial layers shorter than `height`; pause the video when none can be funded.
+    ///
+    /// This is a quality floor, not a bandwidth guarantee or priority. If the publisher offers
+    /// no layer this tall, its tallest available layer remains eligible.
     pub fn minimum_height(mut self, height: u32) -> Self {
         self.min_height = height;
         self
