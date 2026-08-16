@@ -357,7 +357,6 @@ impl DownstreamAllocator {
             .video
             .update_allocations(self.available_bandwidth.current());
         let allocated = self.video.current_allocation();
-        bwe.set_current_bitrate(allocated);
         if self.last_desired != desired {
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;

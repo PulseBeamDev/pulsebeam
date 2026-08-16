@@ -417,8 +417,7 @@ impl AgentDriver {
     pub(crate) fn new(init: DriverInit) -> Self {
         let (outgoing_tx, outgoing_rx) = mailbox::bounded(256);
         let now = Instant::now();
-        let mut rtc = init.rtc;
-        rtc.bwe().set_current_bitrate(Bitrate::ZERO);
+        let rtc = init.rtc;
 
         let mut driver = Self {
             rtc,
