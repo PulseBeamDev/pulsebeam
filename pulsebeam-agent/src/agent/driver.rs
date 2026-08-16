@@ -23,11 +23,18 @@ const UNROUTED_CAPACITY: usize = 128;
 
 /// How long a packet may wait to be routed before it is stale.
 ///
-/// The assignment travels over the data channel, so the wait is a round trip at worst. Anything
-/// older belongs to a stream that has gone, and handing it over late is worse than dropping it:
-/// the receiver has moved on, and a packet from behind its sequence frontier reads as a gap it
-/// must wait out.
-const UNROUTED_MAX_WAIT: Duration = Duration::from_millis(500);
+/// Not a round trip. The assignment rides the data channel, whose lane is the last to come up —
+/// SCTP on top of DTLS — and on a lossy link its first messages are retransmitted like anything
+/// else; measured at 1.5-2s from first media to first assignment on a cellular profile. Sized for
+/// a round trip, this dropped the opening of every stream on exactly the links least able to
+/// spare it.
+///
+/// The objection to holding longer — that a late packet reads as a gap the receiver must wait out
+/// — applies to a stream that has moved on. A slot with no target has delivered nothing, so there
+/// is no frontier to arrive behind, and this only ever holds slots in that state. Memory is
+/// bounded by [`UNROUTED_CAPACITY`], which is the real limit; this is the backstop for a slot that
+/// never becomes routable at all.
+const UNROUTED_MAX_WAIT: Duration = Duration::from_secs(3);
 
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};

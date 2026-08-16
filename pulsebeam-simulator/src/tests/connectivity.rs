@@ -742,7 +742,12 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
             Step::CheckVideoQuality {
                 description: "The viewer can see her",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50),
+                // One unrecovered gap is what a cellular link does: 1% loss over
+                // this many packets outruns retransmission occasionally. Zero is
+                // the right budget for `fiber()`, not for this one. A botched
+                // switch is still caught — it produces gaps by the handful, and
+                // a timestamp regression with them.
+                quality: VideoQuality::min_frames(50).allow_gaps(1),
             },
             Step::Disconnect {
                 description: "Alice drops out",

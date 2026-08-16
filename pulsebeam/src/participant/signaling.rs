@@ -82,14 +82,6 @@ pub struct Signaling {
     previous_assignments: HashMap<String, PreviousAssignment>,
     previous_audio_assignments: HashMap<String, PreviousAudioAssignment>,
     last_client_intents: Option<HashMap<Mid, Intent>>,
-    /// Whether an assignment has ever reached the client.
-    ///
-    /// Media and the assignment naming its slot travel separately, and the
-    /// assignment's lane is the last to come up: it needs the data channel,
-    /// which needs SCTP, while RTP only needs DTLS. Forwarding before this is
-    /// forwarding what the client provably cannot route — it holds those
-    /// packets briefly and then drops them.
-    announced: bool,
 }
 
 impl Signaling {
@@ -106,7 +98,6 @@ impl Signaling {
             previous_assignments: HashMap::new(),
             previous_audio_assignments: HashMap::new(),
             last_client_intents: None,
-            announced: false,
 
             slot_count: 0,
         }
@@ -216,10 +207,6 @@ impl Signaling {
         self.dirty_assignments = true;
     }
 
-    /// Whether the client has been told what its slots carry.
-    pub fn has_announced(&self) -> bool {
-        self.announced
-    }
 
     pub fn request_full_sync(&mut self) {
         self.pending_snapshot_request = true;
@@ -402,7 +389,6 @@ impl Signaling {
         self.dirty_tracks = false;
         self.dirty_assignments = false;
         self.pending_snapshot_request = false;
-        self.announced = true;
         true
     }
 }
