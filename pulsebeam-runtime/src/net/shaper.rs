@@ -251,6 +251,49 @@ fn gro_windows() -> &'static Mutex<HashMap<IpAddr, Duration>> {
     GRO_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TxFaults {
+    pub completion_delay: Duration,
+    pub completion_reorder_probability: f64,
+    pub completion_reorder_delay: Duration,
+    pub error_queue_overflow_probability: f64,
+    pub enobufs_probability: f64,
+    pub partial_gso_probability: f64,
+}
+
+fn tx_faults() -> &'static Mutex<HashMap<IpAddr, TxFaults>> {
+    static TX_FAULTS: std::sync::OnceLock<Mutex<HashMap<IpAddr, TxFaults>>> =
+        std::sync::OnceLock::new();
+    TX_FAULTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_tx_faults(ip: IpAddr, faults: TxFaults) {
+    for probability in [
+        faults.completion_reorder_probability,
+        faults.error_queue_overflow_probability,
+        faults.enobufs_probability,
+        faults.partial_gso_probability,
+    ] {
+        assert!(
+            (0.0..=1.0).contains(&probability),
+            "TX fault probability must be between 0 and 1"
+        );
+    }
+    tx_faults()
+        .lock()
+        .expect("shaper TX faults poisoned")
+        .insert(ip, faults);
+}
+
+fn tx_faults_for(ip: &IpAddr) -> TxFaults {
+    tx_faults()
+        .lock()
+        .expect("shaper TX faults poisoned")
+        .get(ip)
+        .copied()
+        .unwrap_or_default()
+}
+
 pub fn set_gro_window(ip: IpAddr, window: Duration) {
     gro_windows()
         .lock()
@@ -259,11 +302,16 @@ pub fn set_gro_window(ip: IpAddr, window: Duration) {
 }
 
 pub fn gro_enabled(ip: IpAddr) -> bool {
+    !gro_window(ip).is_zero()
+}
+
+pub fn gro_window(ip: IpAddr) -> Duration {
     gro_windows()
         .lock()
         .expect("shaper GRO windows poisoned")
         .get(&ip)
-        .is_some_and(|window| !window.is_zero())
+        .copied()
+        .unwrap_or_default()
 }
 
 pub fn set_duplicate(ip: IpAddr, probability: f64) {
@@ -300,6 +348,8 @@ pub struct Stats {
     pub gro_batches: u64,
     pub gro_datagrams: u64,
     pub missing_tx_timestamps: u64,
+    pub dropped_enobufs: u64,
+    pub partial_gso_sends: u64,
     /// Dropped because the bottleneck buffer was full. Distinct from configured loss: this is
     /// congestion, and a controller that causes a lot of it is overusing the link.
     pub dropped_overflow: u64,
@@ -449,7 +499,10 @@ pub fn clear() {
         .lock()
         .expect("shaper GRO windows poisoned")
         .clear();
-    reorders().lock().expect("shaper reorders poisoned").clear();
+    tx_faults()
+        .lock()
+        .expect("shaper TX faults poisoned")
+        .clear();
     stats_map().lock().expect("shaper stats poisoned").clear();
 }
 
@@ -501,6 +554,18 @@ struct Queued {
     tag: Option<SendTag>,
 }
 
+#[derive(Clone, Copy)]
+struct OfferLimit {
+    bits_per_sec: u64,
+    max_backlog: Duration,
+    reorder: Reorder,
+}
+
+struct PendingCompletion {
+    ready_at: Instant,
+    completion: TxTimestamp,
+}
+
 /// Egress bottleneck state for one socket.
 ///
 /// Shared behind a handle rather than copied: `UdpTransportWriter` is `Clone`, and a bottleneck
@@ -532,7 +597,7 @@ struct ShaperState {
     loss_counter: u64,
     /// Gilbert-Elliott position per destination: true while in the bad state.
     in_bad_state: HashMap<IpAddr, bool>,
-    completions: VecDeque<TxTimestamp>,
+    completions: VecDeque<PendingCompletion>,
 }
 
 impl Default for ShaperState {
@@ -604,7 +669,19 @@ impl Shaper {
             .map(|l| l.max_backlog)
             .unwrap_or(DEFAULT_MAX_BACKLOG);
         let reorder = reorder_for(&dst.ip());
-        self.with(|st| st.offer(now, dst, buf, tag, bits_per_sec, max_backlog, reorder))
+        self.with(|st| {
+            st.offer(
+                now,
+                dst,
+                buf,
+                tag,
+                OfferLimit {
+                    bits_per_sec,
+                    max_backlog,
+                    reorder,
+                },
+            )
+        })
     }
 
     /// Take every packet whose turn on the wire has come.
@@ -617,17 +694,63 @@ impl Shaper {
         self.with(|st| st.drain_due(now))
     }
 
-    pub fn complete(&mut self, tag: Option<SendTag>, at: Option<Instant>) {
+    pub fn complete(
+        &mut self,
+        now: Instant,
+        ip: IpAddr,
+        tag: Option<SendTag>,
+        at: Option<Instant>,
+    ) {
         if let Some(tag) = tag {
-            self.with(|state| state.completions.push_back(TxTimestamp { tag, at }));
+            self.with(|state| state.enqueue_completion(now, ip, tag, at));
         }
     }
 
     pub fn drain_completions(&mut self, out: &mut Vec<TxTimestamp>) -> usize {
+        self.drain_completions_at(Instant::now(), out)
+    }
+
+    fn drain_completions_at(&mut self, now: Instant, out: &mut Vec<TxTimestamp>) -> usize {
         self.with(|state| {
             let start = out.len();
-            out.extend(state.completions.drain(..));
+            while state
+                .completions
+                .front()
+                .is_some_and(|completion| completion.ready_at <= now)
+            {
+                let Some(completion) = state.completions.pop_front() else {
+                    debug_assert!(false, "ready completion must remain queued");
+                    break;
+                };
+                out.push(completion.completion);
+            }
             out.len().saturating_sub(start)
+        })
+    }
+
+    pub fn accepted_segments(&mut self, ip: IpAddr, segment_count: usize) -> usize {
+        debug_assert_ne!(segment_count, 0);
+        self.with(|state| {
+            let faults = tx_faults_for(&ip);
+            if state.sample(faults.enobufs_probability) {
+                record(ip, |stats| {
+                    stats.dropped_enobufs = stats
+                        .dropped_enobufs
+                        .saturating_add(u64::try_from(segment_count).unwrap_or(u64::MAX));
+                });
+                return 0;
+            }
+            if segment_count > 1 && state.sample(faults.partial_gso_probability) {
+                record(ip, |stats| {
+                    stats.partial_gso_sends = stats.partial_gso_sends.saturating_add(1);
+                });
+                let choices = u64::try_from(segment_count.saturating_sub(1)).unwrap_or(u64::MAX);
+                let offset = usize::try_from(state.loss_counter % choices).unwrap_or_default();
+                let accepted = 1usize.saturating_add(offset);
+                debug_assert!((1..segment_count).contains(&accepted));
+                return accepted.min(segment_count.saturating_sub(1));
+            }
+            segment_count
         })
     }
 
@@ -674,6 +797,32 @@ fn record(ip: IpAddr, f: impl FnOnce(&mut Stats)) {
 }
 
 impl ShaperState {
+    fn sample(&mut self, probability: f64) -> bool {
+        probability > 0.0 && next_uniform(&mut self.loss_counter) < probability
+    }
+
+    fn enqueue_completion(&mut self, now: Instant, ip: IpAddr, tag: SendTag, at: Option<Instant>) {
+        let faults = tx_faults_for(&ip);
+        let overflowed = self.sample(faults.error_queue_overflow_probability);
+        if overflowed || at.is_none() {
+            record_missing_tx_timestamp(ip);
+        }
+        let mut ready_at = now + faults.completion_delay;
+        if self.sample(faults.completion_reorder_probability) {
+            ready_at += faults.completion_reorder_delay;
+        }
+        self.completions.push_back(PendingCompletion {
+            ready_at,
+            completion: TxTimestamp {
+                tag,
+                at: (!overflowed).then_some(at).flatten(),
+            },
+        });
+        self.completions
+            .make_contiguous()
+            .sort_by_key(|completion| completion.ready_at);
+    }
+
     fn sample_loss(&mut self, ip: IpAddr, loss: Loss) -> bool {
         match loss {
             Loss::Independent(rate) => {
@@ -708,27 +857,22 @@ impl ShaperState {
         dst: SocketAddr,
         buf: &[u8],
         tag: Option<SendTag>,
-        bits_per_sec: u64,
-        max_backlog: Duration,
-        reorder: Reorder,
+        limit: OfferLimit,
     ) -> Shaped {
         // Serialisation delay: how long this packet occupies the link.
         let on_wire =
-            Duration::from_secs_f64((buf.len() as f64 * 8.0) / bits_per_sec.max(1) as f64);
+            Duration::from_secs_f64((buf.len() as f64 * 8.0) / limit.bits_per_sec.max(1) as f64);
 
         let idle_at = self.next_free.entry(dst.ip()).or_insert(now);
         // A link idle in the past is idle now; it does not accrue credit.
         let release_at = (*idle_at).max(now);
         let backlog = release_at.saturating_duration_since(now);
 
-        if backlog > max_backlog {
+        if backlog > limit.max_backlog {
             // Buffer full. Tail drop, exactly as a bottleneck queue does.
             record(dst.ip(), |s| s.dropped_overflow += 1);
-            if tag.is_some() {
-                record_missing_tx_timestamp(dst.ip());
-            }
             if let Some(tag) = tag {
-                self.completions.push_back(TxTimestamp { tag, at: None });
+                self.enqueue_completion(now, dst.ip(), tag, None);
             }
             return Shaped::Absorbed;
         }
@@ -744,8 +888,10 @@ impl ShaperState {
         // genuinely leaves after ones offered behind it. Delaying it in place would only add
         // jitter; the queue is re-sorted below so departure order actually changes.
         let mut release_at = release_at;
-        if reorder.probability > 0.0 && next_uniform(&mut self.loss_counter) < reorder.probability {
-            release_at += reorder.delay;
+        if limit.reorder.probability > 0.0
+            && next_uniform(&mut self.loss_counter) < limit.reorder.probability
+        {
+            release_at += limit.reorder.delay;
             record(dst.ip(), |s| s.reordered += 1);
         }
 
@@ -772,10 +918,7 @@ impl ShaperState {
             }
             let q = self.queue.pop_front().expect("front just checked");
             if let Some(tag) = q.tag {
-                self.completions.push_back(TxTimestamp {
-                    tag,
-                    at: Some(q.release_at),
-                });
+                self.enqueue_completion(now, q.dst.ip(), tag, Some(q.release_at));
             }
             out.push((q.dst, q.buf));
         }
@@ -1000,9 +1143,58 @@ mod tests {
         shaper.drain_due(now);
         assert_eq!(shaper.drain_completions(&mut completions), 0);
         shaper.drain_due(now + Duration::from_millis(101));
-        assert_eq!(shaper.drain_completions(&mut completions), 1);
+        assert_eq!(
+            shaper.drain_completions_at(now + Duration::from_millis(101), &mut completions),
+            1
+        );
         assert_eq!(completions[1].tag.id, 1);
         assert_eq!(completions[1].at, Some(now + Duration::from_millis(100)));
         assert_eq!(stats(ip).missing_tx_timestamps, 1);
+    }
+
+    #[test]
+    fn tx_faults_are_seeded_asynchronous_and_observable() {
+        let ip: IpAddr = "5.6.7.10".parse().unwrap();
+        let now = Instant::now();
+        set_tx_faults(
+            ip,
+            TxFaults {
+                completion_delay: Duration::from_millis(2),
+                completion_reorder_probability: 1.0,
+                completion_reorder_delay: Duration::from_millis(3),
+                error_queue_overflow_probability: 1.0,
+                enobufs_probability: 1.0,
+                partial_gso_probability: 1.0,
+            },
+        );
+        let mut shaper = Shaper::default();
+
+        assert_eq!(shaper.accepted_segments(ip, 4), 0);
+        shaper.complete(now, ip, Some(SendTag { owner: 3, id: 7 }), Some(now));
+
+        let mut completions = Vec::new();
+        assert_eq!(
+            shaper.drain_completions_at(now + Duration::from_millis(4), &mut completions),
+            0
+        );
+        assert_eq!(
+            shaper.drain_completions_at(now + Duration::from_millis(5), &mut completions),
+            1
+        );
+        assert_eq!(completions[0].tag.id, 7);
+        assert!(completions[0].at.is_none());
+        let observed = stats(ip);
+        assert_eq!(observed.dropped_enobufs, 4);
+        assert_eq!(observed.missing_tx_timestamps, 1);
+
+        set_tx_faults(
+            ip,
+            TxFaults {
+                partial_gso_probability: 1.0,
+                ..TxFaults::default()
+            },
+        );
+        assert!((1..4).contains(&shaper.accepted_segments(ip, 4)));
+        assert_eq!(stats(ip).partial_gso_sends, 1);
     }
 }

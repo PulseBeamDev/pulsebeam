@@ -191,6 +191,7 @@ impl UdpTransportReader {
         debug_assert_eq!(self.arena.len(), CHUNK_SIZE);
         let start = out.len();
         let gro_enabled = self.gro_segments() > 1;
+        let received_at = tokio::time::Instant::now();
         #[cfg(feature = "sim")]
         if let Some(member) = &self.member {
             for index in 0..crate::net::BATCH_SIZE {
@@ -200,7 +201,14 @@ impl UdpTransportReader {
                             buf.len() <= CHUNK_SIZE,
                             "reuseport datagram exceeds the chunk size"
                         );
-                        Self::append_datagram(out, self.local_addr, src, buf, gro_enabled);
+                        Self::append_datagram(
+                            out,
+                            self.local_addr,
+                            src,
+                            buf,
+                            gro_enabled,
+                            received_at,
+                        );
                     }
                     Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
                     Err(err) => return Err(err),
@@ -219,7 +227,14 @@ impl UdpTransportReader {
                     );
                     debug_assert!(n <= self.arena.len());
                     let buf = self.arena.get(..n).unwrap_or_default().to_vec();
-                    Self::append_datagram(out, self.local_addr, source, buf, gro_enabled);
+                    Self::append_datagram(
+                        out,
+                        self.local_addr,
+                        source,
+                        buf,
+                        gro_enabled,
+                        received_at,
+                    );
                 }
                 Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
                 Err(err) => return Err(err),
@@ -235,21 +250,28 @@ impl UdpTransportReader {
         src: SocketAddr,
         buf: Vec<u8>,
         gro_enabled: bool,
+        received_at: tokio::time::Instant,
     ) {
         let len = buf.len();
         debug_assert_ne!(len, 0);
-        if gro_enabled {
-            if let Some(previous) = out.last_mut() {
-                let datagrams = previous.len.div_ceil(previous.stride);
-                if previous.src == src
-                    && previous.stride == len
-                    && datagrams < crate::net::UDP_MAX_GSO_SEGMENTS
-                {
-                    previous.buf.extend_from_slice(&buf);
-                    previous.len = previous.len.saturating_add(len);
-                    debug_assert_eq!(previous.buf.len(), previous.len);
-                    return;
-                }
+        if gro_enabled && let Some(previous) = out.last_mut() {
+            let datagrams = previous.len.div_ceil(previous.stride);
+            #[cfg(feature = "sim")]
+            let within_gro_window = previous.received_at.is_some_and(|previous_at| {
+                received_at.saturating_duration_since(previous_at)
+                    <= crate::net::shaper::gro_window(dst.ip())
+            });
+            #[cfg(not(feature = "sim"))]
+            let within_gro_window = false;
+            if previous.src == src
+                && previous.stride == len
+                && within_gro_window
+                && datagrams < crate::net::UDP_MAX_GSO_SEGMENTS
+            {
+                previous.buf.extend_from_slice(&buf);
+                previous.len = previous.len.saturating_add(len);
+                debug_assert_eq!(previous.buf.len(), previous.len);
+                return;
             }
         }
         out.push(RecvPacketBatch {
@@ -259,7 +281,7 @@ impl UdpTransportReader {
             buf,
             stride: len,
             len,
-            received_at: Some(tokio::time::Instant::now()),
+            received_at: Some(received_at),
             offset: 0,
         });
     }
@@ -349,11 +371,16 @@ impl UdpTransportWriter {
                 crate::net::shaper::record_gso_batch(batch.dst.ip(), segment_count);
             }
             let now = tokio::time::Instant::now();
+            let accepted_segments = self.shaper.accepted_segments(batch.dst.ip(), segment_count);
             for (index, segment) in batch.buf.chunks(batch.segment_size).enumerate() {
                 let tag = batch.tx_tags.get(index).copied().flatten();
-                self.try_send_datagram(now, batch.dst, segment, tag)?;
+                if index < accepted_segments {
+                    self.try_send_datagram(now, batch.dst, segment, tag)?;
+                } else {
+                    self.shaper.complete(now, batch.dst.ip(), tag, None);
+                }
             }
-            return Ok(true);
+            Ok(true)
         }
 
         #[cfg(not(feature = "sim"))]
@@ -394,21 +421,19 @@ impl UdpTransportWriter {
             return Ok(());
         }
         if self.shaper.should_drop_packet(dst.ip()) {
-            self.shaper.complete(tag, Some(now));
+            self.shaper.complete(now, dst.ip(), tag, Some(now));
             return Ok(());
         }
         let duplicate_sent = self.shaper.should_duplicate_packet(dst.ip())
             && self.sock.try_send_to(buf, dst).is_ok();
         match self.sock.try_send_to(buf, dst) {
             Ok(_) => {
-                self.shaper.complete(tag, Some(now));
+                self.shaper.complete(now, dst.ip(), tag, Some(now));
                 Ok(())
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                if tag.is_some() && !duplicate_sent {
-                    crate::net::shaper::record_missing_tx_timestamp(dst.ip());
-                }
-                self.shaper.complete(tag, duplicate_sent.then_some(now));
+                self.shaper
+                    .complete(now, dst.ip(), tag, duplicate_sent.then_some(now));
                 if self.drop_count.is_multiple_of(100) {
                     tracing::warn!("udp_scalar dropped a packet due to full socket");
                 }
@@ -418,14 +443,102 @@ impl UdpTransportWriter {
             Err(err) => {
                 #[cfg(feature = "sim")]
                 {
-                    if tag.is_some() {
-                        crate::net::shaper::record_missing_tx_timestamp(dst.ip());
-                    }
-                    self.shaper.complete(tag, None);
+                    self.shaper.complete(now, dst.ip(), tag, None);
                 }
                 tracing::warn!("try_send_batch failed with {err}");
                 Err(err)
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod tests {
+    use super::*;
+    use crate::net::shaper::{self, TxFaults};
+    use crate::net::{SendPacket, SendPacketBatch, SendTag};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    #[test]
+    fn simulated_udp_matches_the_transport_contract() {
+        let host_ip = IpAddr::V4(Ipv4Addr::new(10, 88, 0, 1));
+        let mut sim = turmoil::Builder::new()
+            .tick_duration(Duration::from_micros(100))
+            .min_message_latency(Duration::from_millis(1))
+            .max_message_latency(Duration::from_millis(1))
+            .build();
+        sim.host(host_ip, move || async move {
+            shaper::set_gro_window(host_ip, Duration::from_millis(1));
+            let mut sender = bind(SocketAddr::new(host_ip, 0), None).await.unwrap();
+            let mut receiver = bind(SocketAddr::new(host_ip, 0), None).await.unwrap();
+            let segment_size = 500;
+            let segment_count = 3;
+            let expected = (0..segment_count)
+                .map(|index| vec![u8::try_from(index).unwrap(); segment_size])
+                .collect::<Vec<_>>();
+            let payload = expected.concat();
+            let tags = (0..segment_count)
+                .map(|index| {
+                    Some(SendTag {
+                        owner: 11,
+                        id: u64::try_from(index).unwrap(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let packets = [SendPacket {
+                dst: receiver.local_addr(),
+                buf: &payload,
+                segment_size,
+                tx_tags: &tags,
+            }];
+
+            sender
+                .try_send_batch(&SendPacketBatch { packets: &packets })
+                .unwrap();
+            receiver.readable().await.unwrap();
+            let mut batches = Vec::new();
+            receiver.try_recv_batch(&mut batches).unwrap();
+            let mut completions = Vec::new();
+            assert_eq!(
+                sender.try_recv_tx_timestamps(&mut completions).unwrap(),
+                segment_count
+            );
+            crate::net::assert_udp_conformance(&expected, &mut batches, &completions, 11);
+
+            let observed = shaper::stats(host_ip);
+            assert!(observed.gso_batches > 0);
+            assert!(observed.gso_segments >= u64::try_from(segment_count).unwrap());
+            assert!(observed.gro_batches > 0);
+            assert!(observed.gro_datagrams >= u64::try_from(segment_count).unwrap());
+
+            shaper::set_tx_faults(
+                host_ip,
+                TxFaults {
+                    error_queue_overflow_probability: 1.0,
+                    ..TxFaults::default()
+                },
+            );
+            let fault_tag = [Some(SendTag { owner: 11, id: 3 })];
+            let fault_payload = [9u8; 10];
+            let fault_packets = [SendPacket {
+                dst: receiver.local_addr(),
+                buf: &fault_payload,
+                segment_size: fault_payload.len(),
+                tx_tags: &fault_tag,
+            }];
+            sender
+                .try_send_batch(&SendPacketBatch {
+                    packets: &fault_packets,
+                })
+                .unwrap();
+            let mut missing = Vec::new();
+            assert_eq!(sender.try_recv_tx_timestamps(&mut missing).unwrap(), 1);
+            assert_eq!(missing[0].tag.id, 3);
+            assert!(missing[0].at.is_none());
+            assert!(shaper::stats(host_ip).missing_tx_timestamps > 0);
+            Ok(())
+        });
+        sim.run().unwrap();
     }
 }

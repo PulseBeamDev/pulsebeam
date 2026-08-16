@@ -176,6 +176,28 @@ pub struct UdpTransport {
     writer: UdpTransportWriter,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UdpIoStats {
+    pub gso_batches: u64,
+    pub gso_segments: u64,
+    pub gro_batches: u64,
+    pub gro_datagrams: u64,
+    pub missing_tx_timestamps: u64,
+}
+
+#[derive(Default)]
+struct UdpRecvStats {
+    gro_batches: u64,
+    gro_datagrams: u64,
+}
+
+#[derive(Default)]
+struct UdpSendStats {
+    gso_batches: u64,
+    gso_segments: u64,
+    missing_tx_timestamps: u64,
+}
+
 impl UdpTransport {
     pub fn local_addr(&self) -> SocketAddr {
         self.reader.local_addr()
@@ -207,6 +229,16 @@ impl UdpTransport {
 
     pub fn try_recv_tx_timestamps(&mut self, out: &mut Vec<TxTimestamp>) -> io::Result<usize> {
         self.writer.try_recv_tx_timestamps(out)
+    }
+
+    pub fn io_stats(&self) -> UdpIoStats {
+        UdpIoStats {
+            gso_batches: self.writer.stats.gso_batches,
+            gso_segments: self.writer.stats.gso_segments,
+            gro_batches: self.reader.stats.gro_batches,
+            gro_datagrams: self.reader.stats.gro_datagrams,
+            missing_tx_timestamps: self.writer.stats.missing_tx_timestamps,
+        }
     }
 
     pub fn close_peer(&mut self, _peer_addr: &SocketAddr) {
@@ -290,6 +322,7 @@ pub fn from_socket(
         gro_enabled,
         arena: UdpRecvArena::preallocated(),
         timestamp_domain: TimestampDomain::default(),
+        stats: UdpRecvStats::default(),
     };
 
     let writer = UdpTransportWriter {
@@ -302,6 +335,7 @@ pub fn from_socket(
         pending_timestamps: VecDeque::new(),
         timestamp_completions: VecDeque::new(),
         timestamp_domain: TimestampDomain::default(),
+        stats: UdpSendStats::default(),
     };
 
     tracing::info!(
@@ -327,6 +361,7 @@ pub struct UdpTransportReader {
 
     arena: UdpRecvArena,
     timestamp_domain: TimestampDomain,
+    stats: UdpRecvStats,
 }
 
 impl UdpTransportReader {
@@ -352,6 +387,7 @@ impl UdpTransportReader {
             gro_enabled,
             arena,
             timestamp_domain,
+            stats,
         } = self;
         let local_addr = *local_addr;
         let gro_enabled = *gro_enabled;
@@ -426,6 +462,13 @@ impl UdpTransportReader {
                         }
                         debug_assert_ne!(stride, 0);
                         debug_assert!(stride <= total_len);
+                        let datagrams = total_len.div_ceil(stride);
+                        if datagrams > 1 {
+                            stats.gro_batches = stats.gro_batches.saturating_add(1);
+                            stats.gro_datagrams = stats
+                                .gro_datagrams
+                                .saturating_add(u64::try_from(datagrams).unwrap_or(u64::MAX));
+                        }
                     }
                 }
                 Err(Errno::EWOULDBLOCK) => return Err(io::Error::from(ErrorKind::WouldBlock)),
@@ -463,6 +506,7 @@ pub struct UdpTransportWriter {
     pending_timestamps: VecDeque<PendingTimestamp>,
     timestamp_completions: VecDeque<TxTimestamp>,
     timestamp_domain: TimestampDomain,
+    stats: UdpSendStats,
 }
 
 struct PendingTimestamp {
@@ -539,6 +583,12 @@ impl UdpTransportWriter {
                 debug_assert!(false, "located TX timestamp must remain pending");
                 continue;
             };
+            if sent_at.is_none() {
+                self.stats.missing_tx_timestamps = self
+                    .stats
+                    .missing_tx_timestamps
+                    .saturating_add(u64::try_from(pending.tags.len()).unwrap_or(u64::MAX));
+            }
             for tag in pending.tags {
                 self.timestamp_completions
                     .push_back(TxTimestamp { tag, at: sent_at });
@@ -552,6 +602,10 @@ impl UdpTransportWriter {
             let Some(pending) = self.pending_timestamps.pop_front() else {
                 break;
             };
+            self.stats.missing_tx_timestamps = self
+                .stats
+                .missing_tx_timestamps
+                .saturating_add(u64::try_from(pending.tags.len()).unwrap_or(u64::MAX));
             for tag in pending.tags {
                 self.timestamp_completions
                     .push_back(TxTimestamp { tag, at: None });
@@ -695,6 +749,14 @@ impl UdpTransportWriter {
             Ok(count) => {
                 let accepted_at = tokio::time::Instant::now();
                 for packet in group.get(..count).unwrap_or_default() {
+                    let segment_count = packet.buf.len().div_ceil(packet.segment_size);
+                    if segment_count > 1 {
+                        self.stats.gso_batches = self.stats.gso_batches.saturating_add(1);
+                        self.stats.gso_segments = self
+                            .stats
+                            .gso_segments
+                            .saturating_add(u64::try_from(segment_count).unwrap_or(u64::MAX));
+                    }
                     let kernel_id = self.next_kernel_send_id;
                     self.next_kernel_send_id = self.next_kernel_send_id.wrapping_add(1);
                     let tags: Vec<_> = packet.tx_tags.iter().flatten().copied().collect();
@@ -741,6 +803,9 @@ impl UdpTransportWriter {
     }
 
     fn complete_missing(&mut self, packet: &SendPacket<'_>) {
+        self.stats.missing_tx_timestamps = self.stats.missing_tx_timestamps.saturating_add(
+            u64::try_from(packet.tx_tags.iter().flatten().count()).unwrap_or(u64::MAX),
+        );
         for tag in packet.tx_tags.iter().flatten().copied() {
             self.timestamp_completions
                 .push_back(TxTimestamp { tag, at: None });
@@ -970,11 +1035,19 @@ mod tests {
         for (index, segment) in payload.chunks_exact_mut(segment_size).enumerate() {
             segment.fill(u8::try_from(index % 256).expect("masked to a byte"));
         }
+        let tags = (0..segment_count)
+            .map(|index| {
+                Some(SendTag {
+                    owner: 10,
+                    id: u64::try_from(index).expect("segment count fits u64"),
+                })
+            })
+            .collect::<Vec<_>>();
         let packets = [SendPacket {
             dst: receiver.local_addr(),
             buf: &payload,
             segment_size,
-            tx_tags: &[],
+            tx_tags: &tags,
         }];
 
         sender.writable().await.unwrap();
@@ -988,20 +1061,26 @@ mod tests {
         receiver.readable().await.unwrap();
         let mut batches = Vec::new();
         receiver.try_recv_batch(&mut batches).unwrap();
-        let mut received = Vec::new();
-        for batch in &mut batches {
-            while let Some(packet) = batch.next_packet() {
-                received.push(packet.to_vec());
+        let mut completions = Vec::new();
+        for _ in 0..1_000 {
+            sender.try_recv_tx_timestamps(&mut completions).unwrap();
+            if completions.len() == segment_count {
+                break;
             }
+            tokio::task::yield_now().await;
         }
 
-        assert_eq!(received.len(), segment_count);
-        for (index, packet) in received.iter().enumerate() {
-            assert_eq!(
-                packet,
-                &vec![u8::try_from(index % 256).expect("masked to a byte"); segment_size]
-            );
-        }
+        let expected = (0..segment_count)
+            .map(|index| vec![u8::try_from(index % 256).expect("masked to a byte"); segment_size])
+            .collect::<Vec<_>>();
+        crate::net::assert_udp_conformance(&expected, &mut batches, &completions, 10);
+        let send_stats = sender.io_stats();
+        let receive_stats = receiver.io_stats();
+        assert!(send_stats.gso_batches > 0);
+        assert!(send_stats.gso_segments >= u64::try_from(segment_count).unwrap());
+        assert_eq!(send_stats.missing_tx_timestamps, 0);
+        assert!(receive_stats.gro_batches > 0);
+        assert!(receive_stats.gro_datagrams >= u64::try_from(segment_count).unwrap());
     }
 
     #[tokio::test]

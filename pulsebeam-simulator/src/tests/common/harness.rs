@@ -4,7 +4,7 @@ use crate::tests::common::client::{
 use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
-pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
+pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder, TxFaults};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -3563,6 +3563,7 @@ pub struct LinkProfile {
     /// the forward direction.
     pub feedback: Option<FeedbackProfile>,
     pub gro_window: Duration,
+    pub tx_faults: TxFaults,
 }
 
 /// Impairment on the path carrying transport feedback back to the SFU.
@@ -3603,6 +3604,7 @@ impl LinkProfile {
             duplicate: 0.0,
             feedback: None,
             gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
+            tx_faults: TxFaults::default(),
         }
     }
 
@@ -3618,6 +3620,7 @@ impl LinkProfile {
             duplicate: 0.0005,
             feedback: Some(FeedbackProfile::wifi()),
             gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
+            tx_faults: TxFaults::default(),
         }
     }
 
@@ -3634,6 +3637,7 @@ impl LinkProfile {
             duplicate: 0.001,
             feedback: Some(FeedbackProfile::cellular()),
             gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
+            tx_faults: TxFaults::default(),
         }
     }
 }
@@ -3826,6 +3830,7 @@ impl LocalNodeSim {
         let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
         pulsebeam_runtime::net::shaper::set_gro_window(server_ip, self.link.gro_window);
+        pulsebeam_runtime::net::shaper::set_tx_faults(server_ip, self.link.tx_faults);
 
         // Impairment is keyed by destination, so configuring the SFU's address is what degrades
         // the client-to-SFU direction - the one carrying transport feedback. Leaving it clean
@@ -3845,6 +3850,7 @@ impl LocalNodeSim {
 
                 name_to_ip.insert(participant.name, ip);
                 pulsebeam_runtime::net::shaper::set_gro_window(ip, self.link.gro_window);
+                pulsebeam_runtime::net::shaper::set_tx_faults(ip, self.link.tx_faults);
                 // The runtime shaper sits on the SFU's egress socket, so this models loss and
                 // bandwidth on the path to the participant. Client UDP sockets bypass it; do not
                 // configure a misleading "server" destination here.

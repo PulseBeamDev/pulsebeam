@@ -248,6 +248,39 @@ fn fmt_bytes(b: usize) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_udp_conformance(
+    expected: &[Vec<u8>],
+    batches: &mut [RecvPacketBatch],
+    completions: &[TxTimestamp],
+    expected_owner: u64,
+) {
+    let received = batches
+        .iter_mut()
+        .flat_map(|batch| std::iter::from_fn(|| batch.next_packet().map(<[u8]>::to_vec)))
+        .collect::<Vec<_>>();
+    assert_eq!(received, expected);
+    assert_eq!(completions.len(), expected.len());
+    assert!(
+        completions
+            .iter()
+            .all(|completion| completion.tag.owner == expected_owner)
+    );
+    assert!(
+        completions
+            .windows(2)
+            .all(|pair| pair[0].tag.id < pair[1].tag.id)
+    );
+    assert!(
+        completions
+            .windows(2)
+            .all(|pair| match (pair[0].at, pair[1].at) {
+                (Some(first), Some(second)) => first <= second,
+                _ => true,
+            })
+    );
+}
+
+#[cfg(test)]
 mod tests {
     // Tests assert by panicking; the process ending is the mechanism.
     use super::*;
