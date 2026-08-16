@@ -1141,7 +1141,14 @@ impl AllocationEngine {
     /// back to the seed its quality implies, which is what the publisher
     /// advertised before its first packet.
     pub fn new(slots: &[SlotView<'_>], states: &LayerStates) -> Self {
-        let snaps = slots
+        // Sized up front. The map is rebuilt on every allocation pass, for every
+        // participant, and letting it grow from empty rehashes the whole thing
+        // two or three times on the way — work proportional to the layer count,
+        // repeated 10 times a second per participant, for nothing.
+        let layer_count = slots.iter().map(|s| s.track.layers.len()).sum();
+        let mut snaps = HashMap::with_capacity_and_hasher(layer_count, Default::default());
+        snaps.extend(
+            slots
             .iter()
             .flat_map(|s| s.track.layers.iter())
             .map(|l| {
@@ -1174,8 +1181,11 @@ impl AllocationEngine {
                     },
                 };
                 (stream_id, snap)
-            })
-            .collect();
+            }),
+        );
+        // An upper bound, not an exact count: two slots may view the same
+        // track, and those layers collapse to one entry.
+        debug_assert!(snaps.len() <= layer_count);
         Self { snaps }
     }
 
@@ -1577,7 +1587,8 @@ impl AllocationEngine {
         let reserve = bwe.as_f64() * Self::UPGRADE_RESERVE_FRACTION;
         let mut budget = bwe.as_f64();
 
-        let mut decisions = SecondaryMap::new();
+        // One entry per slot, known before the waterfall starts.
+        let mut decisions = SecondaryMap::with_capacity(slots.len());
 
         // Strict-priority waterfall. Serve each stream fully — its `min_height`
         // floor, then its climb toward `target_height` — before touching the next

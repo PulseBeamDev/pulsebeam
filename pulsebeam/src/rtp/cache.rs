@@ -9,6 +9,15 @@ use crate::rtp::RtpPacket;
 use str0m::media::{MediaTime, Rid};
 use str0m::rtp::SeqNo;
 
+/// No packet in this slot.
+///
+/// A sentinel rather than an `Option<u64>`, which would double the probe array
+/// for a bit that the value already encodes. Extended sequence numbers count up
+/// from zero and a stream would have to run for longer than the universe to
+/// reach this one; if it somehow did, the slot reads as empty and costs a
+/// retransmission, not a wrong packet.
+const EMPTY_SLOT: u64 = u64::MAX;
+
 /// Ring capacity. Must be a power of two so `seq & CACHE_MASK` indexes a slot.
 const STREAM_CACHE_CAPACITY: usize = 512;
 const CACHE_MASK: u64 = (STREAM_CACHE_CAPACITY - 1) as u64;
@@ -61,8 +70,19 @@ const MAX_REPLAY_SPAN_MS: u64 = 400;
 /// on more than one packet without starting a new frame.
 #[derive(Debug)]
 pub struct StreamCache {
+    /// What each ring slot currently holds, or [`EMPTY_SLOT`] for none.
+    ///
+    /// Split out from `ring` because every probe reads this and nothing else.
+    /// A packet is 280 bytes — five cache lines — and answering "is sequence
+    /// number `n` still here" by reading one is what made a NACK walk stream
+    /// the whole 143KB ring to find a handful of packets. Eight bytes per slot
+    /// makes the same walk 4KB, sequential, and prefetchable.
+    ///
+    /// Index-aligned with `ring`: `seqs[i] != EMPTY_SLOT` exactly when
+    /// `ring[i].is_some()`, and then it is that packet's sequence number.
+    seqs: Box<[u64]>,
     /// Direct-mapped ring indexed by `seq & CACHE_MASK`. Two sequence numbers
-    /// `CAPACITY` apart share a slot; a read verifies `slot.seq_no == wanted`, so
+    /// `CAPACITY` apart share a slot; a read verifies `seqs[slot] == wanted`, so
     /// an evicted entry (overwritten by a newer packet at the same slot) reads as
     /// absent.
     ring: Box<[Option<RtpPacket>]>,
@@ -90,6 +110,7 @@ impl Default for StreamCache {
 impl StreamCache {
     pub fn new() -> Self {
         Self {
+            seqs: vec![EMPTY_SLOT; STREAM_CACHE_CAPACITY].into_boxed_slice(),
             ring: std::iter::repeat_with(|| None)
                 .take(STREAM_CACHE_CAPACITY)
                 .collect(),
@@ -104,10 +125,16 @@ impl StreamCache {
     /// The packet occupying `seq`'s slot, if that slot actually holds `seq`.
     #[inline]
     fn slot(&self, seq: u64) -> Option<&RtpPacket> {
-        self.ring
-            .get((seq & CACHE_MASK) as usize)
-            .and_then(Option::as_ref)
-            .filter(|p| *p.seq_no == seq)
+        let index = (seq & CACHE_MASK) as usize;
+        if self.seqs.get(index).copied() != Some(seq) {
+            return None;
+        }
+        let stored = self.ring.get(index).and_then(Option::as_ref);
+        debug_assert!(
+            stored.is_some_and(|p| *p.seq_no == seq),
+            "the sequence index and the ring disagree about slot {index}"
+        );
+        stored
     }
 
     /// Take ownership of a packet, handing it back only when it was too old to
@@ -145,8 +172,12 @@ impl StreamCache {
 
         // Placing the packet naturally evicts whatever occupied its slot
         // `CAPACITY` positions ago — no eviction loop needed.
-        if let Some(slot) = self.ring.get_mut((seq & CACHE_MASK) as usize) {
+        let index = (seq & CACHE_MASK) as usize;
+        if let (Some(slot), Some(stored_seq)) =
+            (self.ring.get_mut(index), self.seqs.get_mut(index))
+        {
             *slot = Some(pkt);
+            *stored_seq = seq;
         } else {
             debug_assert!(false, "CACHE_MASK produced an index outside the ring");
             return None;
@@ -391,6 +422,7 @@ impl StreamCache {
         for slot in &mut self.ring {
             *slot = None;
         }
+        self.seqs.fill(EMPTY_SLOT);
         self.newest_seq = None;
         self.segment_start_seq = None;
         self.segment_ts = None;
@@ -525,6 +557,60 @@ mod test {
             cache.replay().is_none(),
             "a keyframe whose first packet was lost is not a switch target"
         );
+    }
+
+    /// The probe index and the ring must agree about every slot.
+    ///
+    /// They are separate allocations, and the index is what a lookup trusts —
+    /// so an index that says "sequence 40 is here" while the ring holds
+    /// something else hands back the wrong packet, or a packet that is gone.
+    /// Wrapping overwrites slots and `clear` empties them; both have to move
+    /// the index with the ring.
+    #[test]
+    fn the_probe_index_and_the_ring_agree_after_wrapping_and_clearing() {
+        let mut b = builder(ParameterSetStyle::AggregatedWithIdr);
+        let mut cache = StreamCache::new();
+
+        // Push well past capacity so every slot is overwritten at least twice.
+        let mut pushed = Vec::new();
+        for _ in 0..(STREAM_CACHE_CAPACITY * 2 / 3) {
+            for p in b.delta_frame(3) {
+                pushed.push(*p.seq_no);
+                cache.push(p);
+            }
+        }
+
+        for (index, &stored) in cache.seqs.iter().enumerate() {
+            match cache.ring.get(index).and_then(Option::as_ref) {
+                Some(packet) => assert_eq!(
+                    stored,
+                    *packet.seq_no,
+                    "slot {index} is indexed under a sequence number it does not hold"
+                ),
+                None => assert_eq!(stored, EMPTY_SLOT, "slot {index} indexes a packet it lost"),
+            }
+        }
+
+        // Everything still inside the window resolves; everything evicted does
+        // not, and neither reads as some other packet.
+        let newest = *pushed.last().expect("pushed something");
+        for &seq in &pushed {
+            let resolved = cache.get(SeqNo::from(seq)).map(|p| *p.seq_no);
+            if newest.saturating_sub(seq) < STREAM_CACHE_CAPACITY as u64 {
+                assert_eq!(resolved, Some(seq), "sequence {seq} is still in the window");
+            } else {
+                assert_eq!(resolved, None, "sequence {seq} slid out and must read absent");
+            }
+        }
+
+        cache.clear();
+        for &seq in &pushed {
+            assert!(
+                cache.get(SeqNo::from(seq)).is_none(),
+                "clearing must empty the index too, or a probe trusts a stale slot"
+            );
+        }
+        assert!(cache.seqs.iter().all(|&stored| stored == EMPTY_SLOT));
     }
 
     #[test]
