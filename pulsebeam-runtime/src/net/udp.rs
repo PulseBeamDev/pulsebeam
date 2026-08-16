@@ -27,14 +27,15 @@ use nix::{
     cmsg_space,
     errno::Errno,
     sys::socket::{
-        ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg,
-        sendmmsg, setsockopt, sockopt,
+        ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage,
+        TimestampingFlag, recvmmsg, sendmmsg, setsockopt, sockopt,
     },
 };
 use std::{
     io::{self, ErrorKind, IoSlice, IoSliceMut},
     net::{IpAddr, SocketAddr},
     os::fd::AsRawFd,
+    time::{Duration, SystemTime},
 };
 const MEBIBYTE: usize = 1024 * 1024;
 const GSO_PROBE_SEGMENT_SIZE: i32 = 1200;
@@ -42,6 +43,7 @@ const DISABLE_GSO_SEGMENT_SIZE: i32 = 0;
 const INVALID_GRO_SEGMENT_SIZE: i32 = 0;
 const SINGLE_SEGMENT: usize = 1;
 const DROP_LOG_INTERVAL: usize = 100;
+const CLOCK_STEP_THRESHOLD: Duration = Duration::from_millis(50);
 
 pub const MODE: UdpMode = UdpMode::Batch;
 
@@ -53,6 +55,73 @@ const RECV_ARENA_SIZE: usize = BATCH_SIZE * GRO_SLOT_SIZE;
 
 struct UdpRecvArena {
     bytes: Box<[u8]>,
+}
+
+#[derive(Clone, Copy)]
+struct TimestampAnchor {
+    monotonic: tokio::time::Instant,
+    realtime: SystemTime,
+    valid: bool,
+}
+
+#[derive(Default)]
+struct TimestampDomain {
+    previous: Option<(tokio::time::Instant, SystemTime)>,
+}
+
+impl TimestampDomain {
+    fn capture(&mut self) -> TimestampAnchor {
+        let monotonic = tokio::time::Instant::now();
+        let realtime = SystemTime::now();
+        self.capture_at(monotonic, realtime)
+    }
+
+    fn capture_at(
+        &mut self,
+        monotonic: tokio::time::Instant,
+        realtime: SystemTime,
+    ) -> TimestampAnchor {
+        let valid = self.previous.is_none_or(|(previous_mono, previous_real)| {
+            let mono_elapsed = monotonic.saturating_duration_since(previous_mono);
+            realtime
+                .duration_since(previous_real)
+                .ok()
+                .is_some_and(|real_elapsed| {
+                    real_elapsed.abs_diff(mono_elapsed) <= CLOCK_STEP_THRESHOLD
+                })
+        });
+        self.previous = Some((monotonic, realtime));
+        TimestampAnchor {
+            monotonic,
+            realtime,
+            valid,
+        }
+    }
+
+    fn convert(
+        anchor: TimestampAnchor,
+        timestamp: nix::sys::time::TimeSpec,
+    ) -> Option<tokio::time::Instant> {
+        if !anchor.valid
+            || timestamp.tv_sec() < 0
+            || !(0..1_000_000_000).contains(&timestamp.tv_nsec())
+        {
+            return None;
+        }
+        let realtime = SystemTime::UNIX_EPOCH.checked_add(Duration::new(
+            u64::try_from(timestamp.tv_sec()).ok()?,
+            u32::try_from(timestamp.tv_nsec()).ok()?,
+        ))?;
+        if realtime <= anchor.realtime {
+            anchor
+                .monotonic
+                .checked_sub(anchor.realtime.duration_since(realtime).ok()?)
+        } else {
+            anchor
+                .monotonic
+                .checked_add(realtime.duration_since(anchor.realtime).ok()?)
+        }
+    }
 }
 
 impl UdpRecvArena {
@@ -170,6 +239,14 @@ pub fn from_socket(
     let recv_buf_size = socket2_sock.recv_buffer_size()?;
 
     let gro_enabled = setsockopt(&socket2_sock, sockopt::UdpGroSegment, &true).is_ok();
+    let timestamping = TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE
+        | TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE;
+    setsockopt(&socket2_sock, sockopt::Timestamping, &timestamping).map_err(|error| {
+        io::Error::new(
+            ErrorKind::Unsupported,
+            format!("SO_TIMESTAMPING with RX software timestamps is required: {error}"),
+        )
+    })?;
 
     let gso_capable = if setsockopt(
         &socket2_sock,
@@ -201,6 +278,7 @@ pub fn from_socket(
         local_addr,
         gro_enabled,
         arena: UdpRecvArena::preallocated(),
+        timestamp_domain: TimestampDomain::default(),
     };
 
     let writer = UdpTransportWriter {
@@ -233,6 +311,7 @@ pub struct UdpTransportReader {
     gro_enabled: bool,
 
     arena: UdpRecvArena,
+    timestamp_domain: TimestampDomain,
 }
 
 impl UdpTransportReader {
@@ -257,11 +336,13 @@ impl UdpTransportReader {
             local_addr,
             gro_enabled,
             arena,
+            timestamp_domain,
         } = self;
         let local_addr = *local_addr;
         let gro_enabled = *gro_enabled;
 
         sock.try_io(tokio::io::Interest::READABLE, || {
+            let timestamp_anchor = timestamp_domain.capture();
             let mut slot_iter = arena.slots_mut();
             let mut iovs: [[IoSliceMut; 1]; BATCH_SIZE] = std::array::from_fn(|_| {
                 // The arena is built with exactly BATCH_SIZE slots; an empty
@@ -272,7 +353,10 @@ impl UdpTransportReader {
             drop(slot_iter);
 
             let fd = sock.as_raw_fd();
-            let mut headers = MultiHeaders::preallocate(BATCH_SIZE, Some(cmsg_space!(i32)));
+            let mut headers = MultiHeaders::preallocate(
+                BATCH_SIZE,
+                Some(cmsg_space!(i32, nix::sys::socket::Timestamps)),
+            );
 
             let mut received = [None; BATCH_SIZE];
             match recvmmsg(fd, &mut headers, iovs.iter_mut(), MsgFlags::empty(), None) {
@@ -300,19 +384,28 @@ impl UdpTransportReader {
                         // coalesced several same-size datagrams into it, the
                         // kernel tells us via the UdpGroSegments cmsg.
                         let mut stride = total_len;
-                        if gro_enabled && let Ok(cmsgs) = item.cmsgs() {
+                        let mut received_at = None;
+                        if let Ok(cmsgs) = item.cmsgs() {
                             for cmsg in cmsgs {
-                                if let ControlMessageOwned::UdpGroSegments(seg) = cmsg {
-                                    if seg > INVALID_GRO_SEGMENT_SIZE {
+                                match cmsg {
+                                    ControlMessageOwned::UdpGroSegments(seg)
+                                        if gro_enabled && seg > INVALID_GRO_SEGMENT_SIZE =>
+                                    {
                                         stride = (seg as usize).min(total_len);
                                     }
-                                    break;
+                                    ControlMessageOwned::ScmTimestampsns(timestamps) => {
+                                        received_at = TimestampDomain::convert(
+                                            timestamp_anchor,
+                                            timestamps.system,
+                                        );
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
 
                         if let Some(slot) = received.get_mut(slot_idx) {
-                            *slot = Some((src, stride, total_len));
+                            *slot = Some((src, stride, total_len, received_at));
                         } else {
                             debug_assert!(false, "recvmmsg reported slot {slot_idx} out of range");
                         }
@@ -325,7 +418,7 @@ impl UdpTransportReader {
             }
             let prev_len = out.len();
             for (slot_idx, entry) in received.into_iter().enumerate() {
-                let Some((src, stride, total_len)) = entry else {
+                let Some((src, stride, total_len, received_at)) = entry else {
                     continue;
                 };
                 let buf = arena.packet(slot_idx, total_len).to_vec();
@@ -336,6 +429,7 @@ impl UdpTransportReader {
                     stride,
                     len: total_len,
                     transport: Transport::Udp(UdpMode::Batch),
+                    received_at,
                     offset: 0,
                 });
             }
@@ -584,6 +678,32 @@ mod tests {
         assert_eq!(out[0].data(), b"test-udp-payload");
         assert_eq!(out[0].src, sender.local_addr().unwrap());
         assert_eq!(out[0].dst, local_addr);
+        assert!(out[0].received_at.is_some());
+    }
+
+    #[test]
+    fn timestamp_conversion_preserves_spacing_and_rejects_clock_steps() {
+        let monotonic = tokio::time::Instant::now();
+        let realtime = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut domain = TimestampDomain::default();
+        let anchor = domain.capture_at(monotonic, realtime);
+        let first =
+            TimestampDomain::convert(anchor, nix::sys::time::TimeSpec::new(99, 900_000_000))
+                .expect("valid first timestamp");
+        let second =
+            TimestampDomain::convert(anchor, nix::sys::time::TimeSpec::new(99, 950_000_000))
+                .expect("valid second timestamp");
+        assert_eq!(
+            second.saturating_duration_since(first),
+            Duration::from_millis(50)
+        );
+
+        let stepped = domain.capture_at(
+            monotonic + Duration::from_secs(1),
+            realtime + Duration::from_secs(2),
+        );
+        assert!(!stepped.valid);
+        assert!(TimestampDomain::convert(stepped, nix::sys::time::TimeSpec::new(102, 0)).is_none());
     }
 
     #[tokio::test]

@@ -469,6 +469,7 @@ impl TcpTransport {
                     stride: len,
                     len,
                     transport: Transport::Tcp,
+                    received_at: None,
                     offset: 0,
                 });
             }

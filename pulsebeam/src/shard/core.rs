@@ -1068,6 +1068,7 @@ mod wrong_owner_tests {
             stride: len,
             len,
             transport: Transport::Udp(UdpMode::Scalar),
+            received_at: None,
             offset: 0,
         });
 
@@ -1116,6 +1117,7 @@ mod wrong_owner_tests {
                 stride: len,
                 len,
                 transport: Transport::Udp(UdpMode::Scalar),
+                received_at: None,
                 offset: 0,
             },
             &router,

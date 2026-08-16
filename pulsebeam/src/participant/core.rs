@@ -826,7 +826,6 @@ impl ParticipantCore {
         #[cfg(feature = "sim")]
         let _sim_guard = sim_span.enter();
 
-        self.advance_rtc_clock(now, now);
         let mut work_budget = POLL_WORK_BUDGET;
         'drain: loop {
             if work_budget == 0 {
@@ -850,7 +849,8 @@ impl ParticipantCore {
             debug_assert!(self.rtc_deadline.is_some());
 
             if let Some(deadline) = self.pending_timeout.take() {
-                self.advance_rtc_clock(deadline.max(now), now);
+                self.advance_rtc_clock(deadline.max(now));
+                self.assert_rtc_actuation_bound(now);
                 let _ = self.rtc.handle_input(Input::Timeout(self.rtc_clock.into()));
                 self.rtc_needs_drain = true;
                 continue;
@@ -871,7 +871,17 @@ impl ParticipantCore {
             }
 
             let ctx = self.log_ctx();
-            self.advance_rtc_clock(now, now);
+            let received_at = self
+                .pending_ingress
+                .front()
+                .and_then(|batch| batch.received_at)
+                .unwrap_or(now);
+            if self.pending_ingress.front().is_some_and(|batch| {
+                matches!(batch.transport, Transport::Udp(_)) && batch.received_at.is_none()
+            }) {
+                metrics::counter!("udp_rx_timestamp_missing").increment(1);
+            }
+            self.advance_rtc_clock(received_at);
             let receive_at = self.rtc_clock;
             while let Some(batch) = self.pending_ingress.front_mut() {
                 let transport = match batch.transport {
@@ -940,7 +950,8 @@ impl ParticipantCore {
                 .min(next_slow_poll);
 
             if let Some(rtc_now) = inline_rtc_timeout(deadline, now) {
-                self.advance_rtc_clock(rtc_now, now);
+                self.advance_rtc_clock(rtc_now);
+                self.assert_rtc_actuation_bound(now);
                 let _ = self.rtc.handle_input(Input::Timeout(self.rtc_clock.into()));
                 self.rtc_needs_drain = true;
                 continue;
@@ -950,13 +961,16 @@ impl ParticipantCore {
         }
     }
 
-    fn advance_rtc_clock(&mut self, candidate: Instant, wall_now: Instant) {
+    fn advance_rtc_clock(&mut self, candidate: Instant) {
         let previous = self.rtc_clock;
-        self.rtc_clock = self.rtc_clock.max(candidate).max(wall_now);
+        self.rtc_clock = self.rtc_clock.max(candidate);
         debug_assert!(
             self.rtc_clock >= previous,
             "participant RTC clock moved backwards"
         );
+    }
+
+    fn assert_rtc_actuation_bound(&self, wall_now: Instant) {
         debug_assert!(
             self.rtc_clock
                 <= wall_now
@@ -1611,8 +1625,7 @@ mod upstream_route_table_tests {
             );
             for (index, key) in table.ssrcs.iter().enumerate() {
                 assert_eq!(
-                    table.routes[index].ssrc,
-                    *key,
+                    table.routes[index].ssrc, *key,
                     "routes[{index}] must be the route for ssrcs[{index}]"
                 );
             }

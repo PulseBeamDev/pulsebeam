@@ -252,6 +252,7 @@ impl UdpTransportReader {
             buf,
             stride: len,
             len,
+            received_at: Some(tokio::time::Instant::now()),
             offset: 0,
         });
     }

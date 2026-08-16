@@ -344,6 +344,7 @@ mod demux_tests {
             stride: len,
             len,
             transport: Transport::Udp(pulsebeam_runtime::net::UdpMode::Scalar),
+            received_at: None,
             offset: 0,
         }
     }

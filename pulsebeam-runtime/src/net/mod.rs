@@ -64,6 +64,7 @@ pub struct RecvPacketBatch {
     pub stride: usize,
     pub len: usize,
     pub transport: Transport,
+    pub received_at: Option<tokio::time::Instant>,
 
     pub offset: usize,
 }
@@ -244,6 +245,7 @@ mod tests {
             stride: 6,
             len: 20,
             transport: Transport::Udp(UdpMode::Scalar),
+            received_at: None,
             offset: 0,
         };
 
@@ -263,6 +265,7 @@ mod tests {
             stride: 6,
             len: 18,
             transport: Transport::Udp(UdpMode::Scalar),
+            received_at: None,
             offset: 0,
         };
 
@@ -281,6 +284,7 @@ mod tests {
             stride: 2,
             len: 2,
             transport: Transport::Udp(UdpMode::Batch),
+            received_at: None,
             offset: 0,
         };
 
