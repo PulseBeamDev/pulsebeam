@@ -162,7 +162,11 @@ impl UdpTransportReader {
     }
 
     pub fn gro_segments(&self) -> usize {
-        1
+        if cfg!(feature = "sim") && crate::net::shaper::gro_enabled(self.local_addr.ip()) {
+            crate::net::UDP_MAX_GSO_SEGMENTS
+        } else {
+            1
+        }
     }
 
     #[inline]
@@ -178,45 +182,88 @@ impl UdpTransportReader {
     #[inline]
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
         debug_assert_eq!(self.arena.len(), CHUNK_SIZE);
+        let start = out.len();
+        let gro_enabled = self.gro_segments() > 1;
         #[cfg(feature = "sim")]
         if let Some(member) = &self.member {
-            let (buf, src) = member.try_recv()?;
-            let n = buf.len();
-            debug_assert!(n <= CHUNK_SIZE, "reuseport datagram exceeds the chunk size");
-            out.push(RecvPacketBatch {
-                transport: Transport::Udp(UdpMode::Scalar),
-                src,
-                dst: self.local_addr,
-                buf,
-                stride: n,
-                len: n,
-                offset: 0,
-            });
-            return Ok(1);
-        }
-        match self.sock.try_recv_from(&mut self.arena) {
-            Ok((n, source)) => {
-                debug_assert!(
-                    n <= CHUNK_SIZE,
-                    "scalar recv length exceeds maximum UDP chunk size"
-                );
-                debug_assert!(n <= self.arena.len());
-                out.push(RecvPacketBatch {
-                    transport: Transport::Udp(UdpMode::Scalar),
-                    src: source,
-                    dst: self.local_addr,
-                    buf: self.arena.get(..n).unwrap_or_default().to_vec(),
-                    stride: n,
-                    len: n,
-                    offset: 0,
-                });
+            for index in 0..crate::net::BATCH_SIZE {
+                match member.try_recv() {
+                    Ok((buf, src)) => {
+                        debug_assert!(
+                            buf.len() <= CHUNK_SIZE,
+                            "reuseport datagram exceeds the chunk size"
+                        );
+                        Self::append_datagram(out, self.local_addr, src, buf, gro_enabled);
+                    }
+                    Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) => return Err(err),
+                }
             }
-            Err(err) => {
-                return Err(err);
-            }
+            self.record_gro(out, start);
+            return Ok(out.len().saturating_sub(start));
         }
 
-        Ok(1)
+        for index in 0..crate::net::BATCH_SIZE {
+            match self.sock.try_recv_from(&mut self.arena) {
+                Ok((n, source)) => {
+                    debug_assert!(
+                        n <= CHUNK_SIZE,
+                        "scalar recv length exceeds maximum UDP chunk size"
+                    );
+                    debug_assert!(n <= self.arena.len());
+                    let buf = self.arena.get(..n).unwrap_or_default().to_vec();
+                    Self::append_datagram(out, self.local_addr, source, buf, gro_enabled);
+                }
+                Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+        self.record_gro(out, start);
+        Ok(out.len().saturating_sub(start))
+    }
+
+    fn append_datagram(
+        out: &mut Vec<RecvPacketBatch>,
+        dst: SocketAddr,
+        src: SocketAddr,
+        buf: Vec<u8>,
+        gro_enabled: bool,
+    ) {
+        let len = buf.len();
+        debug_assert_ne!(len, 0);
+        if gro_enabled {
+            if let Some(previous) = out.last_mut() {
+                let datagrams = previous.len.div_ceil(previous.stride);
+                if previous.src == src
+                    && previous.stride == len
+                    && datagrams < crate::net::UDP_MAX_GSO_SEGMENTS
+                {
+                    previous.buf.extend_from_slice(&buf);
+                    previous.len = previous.len.saturating_add(len);
+                    debug_assert_eq!(previous.buf.len(), previous.len);
+                    return;
+                }
+            }
+        }
+        out.push(RecvPacketBatch {
+            transport: Transport::Udp(UdpMode::Scalar),
+            src,
+            dst,
+            buf,
+            stride: len,
+            len,
+            offset: 0,
+        });
+    }
+
+    fn record_gro(&self, out: &[RecvPacketBatch], start: usize) {
+        for batch in out.get(start..).unwrap_or_default() {
+            debug_assert_ne!(batch.stride, 0);
+            let datagrams = batch.len.div_ceil(batch.stride);
+            if datagrams > 1 {
+                crate::net::shaper::record_gro_batch(self.local_addr.ip(), datagrams);
+            }
+        }
     }
 }
 
@@ -236,7 +283,11 @@ impl UdpTransportWriter {
     }
 
     pub fn max_gso_segments(&self) -> usize {
-        1
+        if cfg!(feature = "sim") {
+            crate::net::UDP_MAX_GSO_SEGMENTS
+        } else {
+            1
+        }
     }
 
     #[inline]
@@ -256,33 +307,81 @@ impl UdpTransportWriter {
     pub fn try_send_group(&mut self, batch: &SendPacket) -> std::io::Result<bool> {
         #[cfg(feature = "sim")]
         {
-            use crate::net::shaper::Shaped;
+            debug_assert!(!batch.buf.is_empty());
+            debug_assert_ne!(batch.segment_size, 0);
+            debug_assert!(batch.segment_size <= batch.buf.len());
+            let segment_count = batch.buf.len().div_ceil(batch.segment_size);
+            debug_assert!(segment_count <= crate::net::UDP_MAX_GSO_SEGMENTS);
+            if batch.buf.is_empty()
+                || batch.segment_size == 0
+                || batch.segment_size > batch.buf.len()
+                || segment_count > crate::net::UDP_MAX_GSO_SEGMENTS
+            {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "invalid simulated UDP packet segment size",
+                ));
+            }
+            if segment_count > 1 {
+                crate::net::shaper::record_gso_batch(batch.dst.ip(), segment_count);
+            }
             let now = tokio::time::Instant::now();
-            // Offer only. Release is the release task's job, so a packet's departure time is set
-            // by the link rather than by when this happens to be called next.
-            if let Shaped::Absorbed = self.shaper.offer(now, batch.dst, batch.buf) {
-                return Ok(true);
+            for segment in batch.buf.chunks(batch.segment_size) {
+                self.try_send_datagram(now, batch.dst, segment)?;
             }
-            if self.shaper.should_drop_packet(batch.dst.ip()) {
-                return Ok(true);
-            }
-            if self.shaper.should_duplicate_packet(batch.dst.ip()) {
-                let _ = self.sock.try_send_to(batch.buf, batch.dst);
-            }
+            return Ok(true);
         }
 
-        let res = self.sock.try_send_to(batch.buf, batch.dst);
+        #[cfg(not(feature = "sim"))]
+        {
+            let res = self.sock.try_send_to(batch.buf, batch.dst);
 
-        match res {
-            Ok(_) => Ok(true),
-            // Lossy: kernel buffer full — drop this batch rather than queue it.
+            match res {
+                Ok(_) => Ok(true),
+                // Lossy: kernel buffer full — drop this batch rather than queue it.
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    // metrics::counter!("udp_egress_packets_dropped_total").increment(1);
+                    if self.drop_count.is_multiple_of(100) {
+                        tracing::warn!("udp_scalar dropped a packet due to full socket");
+                    }
+                    self.drop_count = self.drop_count.saturating_add(1);
+                    Ok(true)
+                }
+                Err(err) => {
+                    tracing::warn!("try_send_batch failed with {err}");
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sim")]
+    fn try_send_datagram(
+        &mut self,
+        now: tokio::time::Instant,
+        dst: SocketAddr,
+        buf: &[u8],
+    ) -> io::Result<()> {
+        use crate::net::shaper::Shaped;
+
+        debug_assert!(!buf.is_empty());
+        if let Shaped::Absorbed = self.shaper.offer(now, dst, buf) {
+            return Ok(());
+        }
+        if self.shaper.should_drop_packet(dst.ip()) {
+            return Ok(());
+        }
+        if self.shaper.should_duplicate_packet(dst.ip()) {
+            let _ = self.sock.try_send_to(buf, dst);
+        }
+        match self.sock.try_send_to(buf, dst) {
+            Ok(_) => Ok(()),
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                // metrics::counter!("udp_egress_packets_dropped_total").increment(1);
                 if self.drop_count.is_multiple_of(100) {
                     tracing::warn!("udp_scalar dropped a packet due to full socket");
                 }
                 self.drop_count = self.drop_count.saturating_add(1);
-                Ok(true)
+                Ok(())
             }
             Err(err) => {
                 tracing::warn!("try_send_batch failed with {err}");

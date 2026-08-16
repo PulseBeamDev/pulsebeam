@@ -3562,6 +3562,7 @@ pub struct LinkProfile {
     /// return path clean, which is the right choice only when a plan is deliberately isolating
     /// the forward direction.
     pub feedback: Option<FeedbackProfile>,
+    pub gro_window: Duration,
 }
 
 /// Impairment on the path carrying transport feedback back to the SFU.
@@ -3601,6 +3602,7 @@ impl LinkProfile {
             reorder: Reorder::NONE,
             duplicate: 0.0,
             feedback: None,
+            gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
         }
     }
 
@@ -3615,6 +3617,7 @@ impl LinkProfile {
             reorder: Reorder::occasional(),
             duplicate: 0.0005,
             feedback: Some(FeedbackProfile::wifi()),
+            gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
         }
     }
 
@@ -3630,6 +3633,7 @@ impl LinkProfile {
             reorder: Reorder::occasional(),
             duplicate: 0.001,
             feedback: Some(FeedbackProfile::cellular()),
+            gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
         }
     }
 }
@@ -3821,6 +3825,7 @@ impl LocalNodeSim {
         let mut handles = PlanHandles::new();
         let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
+        pulsebeam_runtime::net::shaper::set_gro_window(server_ip, self.link.gro_window);
 
         // Impairment is keyed by destination, so configuring the SFU's address is what degrades
         // the client-to-SFU direction - the one carrying transport feedback. Leaving it clean
@@ -3839,6 +3844,7 @@ impl LocalNodeSim {
                 ip_counter += 1;
 
                 name_to_ip.insert(participant.name, ip);
+                pulsebeam_runtime::net::shaper::set_gro_window(ip, self.link.gro_window);
                 // The runtime shaper sits on the SFU's egress socket, so this models loss and
                 // bandwidth on the path to the participant. Client UDP sockets bypass it; do not
                 // configure a misleading "server" destination here.

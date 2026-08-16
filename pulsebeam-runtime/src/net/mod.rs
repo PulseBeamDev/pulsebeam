@@ -25,6 +25,7 @@ pub const BATCH_SIZE: usize = 32;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 1500;
 pub const MAX_UDP_GSO_PAYLOAD_SIZE: usize = u16::MAX as usize;
+pub const UDP_MAX_GSO_SEGMENTS: usize = 64;
 
 #[cfg(not(feature = "sim"))]
 fn bind_scalar_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
