@@ -692,6 +692,16 @@ impl ParticipantCore {
     }
 
     fn apply_stream_write(&mut self, write: StreamWrite, now: Instant) {
+        // A slot's media is undeliverable until the client has been told what
+        // that slot carries, and the assignment's lane comes up last: it needs
+        // the data channel, which needs SCTP, while RTP needs only DTLS. For the
+        // second or so in between, everything sent is held by the client and
+        // then dropped — bandwidth spent on a constrained link to produce
+        // nothing, on exactly the link where the estimate is still ramping.
+        if !self.signaling.has_announced() {
+            metrics::counter!("egress_withheld_before_announce").increment(1);
+            return;
+        }
         let (pkt, mid, rid, ssrc, pt, kind) = match write {
             StreamWrite::Video {
                 pkt,
