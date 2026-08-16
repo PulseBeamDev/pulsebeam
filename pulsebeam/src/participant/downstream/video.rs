@@ -25,7 +25,21 @@ use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, Trac
 /// Maximum number of video slots per participant.
 const VIDEO_MAX_SLOTS: usize = 25;
 
-/// How long to wait between PLI retries while a slot is in a transition state.
+/// How long to wait before the *first* PLI retry while a slot is transitioning.
+///
+/// A slot's opening request is routinely lost: it is made the moment the slot
+/// is staged, which is often before the reverse route carrying it upstream
+/// exists. Waiting a full second to find that out is a second of black screen
+/// on every subscribe, and it is the largest single term in time-to-first-frame.
+///
+/// A faster retry cannot flood the publisher — [`KEYFRAME_DEBOUNCE`] is a
+/// leading-edge 500ms on the way upstream, so the extra attempts are absorbed
+/// there rather than turning into keyframes.
+///
+/// [`KEYFRAME_DEBOUNCE`]: crate::track::KEYFRAME_DEBOUNCE
+const KEYFRAME_FIRST_RETRY: Duration = Duration::from_millis(250);
+
+/// The interval those retries back off to, and hold at until keep-alive.
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// After repeated retries, continue to probe the stream with lower-frequency keep-alives.
@@ -766,7 +780,7 @@ impl Slot {
 
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
-            staging_keyframe_interval: KEYFRAME_RETRY_INTERVAL,
+            staging_keyframe_interval: KEYFRAME_FIRST_RETRY,
         }
     }
 
@@ -789,7 +803,7 @@ impl Slot {
     fn pli_reset(&mut self) {
         self.staging_keyframe_retries = 0;
         self.staging_keyframe_last_at = None;
-        self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
+        self.staging_keyframe_interval = KEYFRAME_FIRST_RETRY;
     }
 
     fn pli_retry(
@@ -825,6 +839,13 @@ impl Slot {
             self.staging_keyframe_retries = self.staging_keyframe_retries.saturating_add(1);
         }
         self.staging_keyframe_last_at = Some(now);
+
+        if !keepalive_mode && !reached_keepalive {
+            self.staging_keyframe_interval = self
+                .staging_keyframe_interval
+                .saturating_mul(2)
+                .min(KEYFRAME_RETRY_INTERVAL);
+        }
 
         if reached_keepalive {
             self.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
