@@ -4,29 +4,35 @@ use tokio::time::Instant;
 
 use super::participants::ParticipantKey;
 
-const SLOT_COUNT: usize = 256;
+const SLOT_COUNT: usize = 1024;
 const OCCUPANCY_WORDS: usize = SLOT_COUNT / u64::BITS as usize;
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "SLOT_COUNT is 256, asserted below"
+    reason = "SLOT_COUNT is 1024 and fits in u16, asserted below"
 )]
 const DUE_LOCATION: u16 = SLOT_COUNT as u16;
-const _: () = assert!(SLOT_COUNT == 256, "slot_of() relies on a 256-slot wheel");
+const _: () = assert!(SLOT_COUNT == 1024, "slot_of() relies on a 1024-slot wheel");
 const DISARMED_LOCATION: u16 = DUE_LOCATION + 1;
-const MAX_DEADLINE_TICKS: u64 = 101;
+const MAX_DEADLINE_TICKS: u64 = 1001;
 
 /// The wheel slot a tick falls in.
 ///
 /// The wheel has exactly `SLOT_COUNT` slots, so this is the tick modulo the
 /// wheel size. The wrap is the addressing scheme, not a lost value.
-fn slot_of(tick: u64) -> u8 {
+fn slot_of(tick: u64) -> u16 {
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "SLOT_COUNT is 256, so the low byte is the slot index"
+        reason = "the 1024-slot mask fits in u16"
     )]
     {
-        tick as u8
+        (tick & 1023) as u16
     }
+}
+
+fn duration_for_ticks(ticks: u64) -> Duration {
+    let quantum_nanos =
+        u64::try_from(pulsebeam_runtime::SHARD_TIMER_QUANTUM.as_nanos()).unwrap_or(u64::MAX);
+    Duration::from_nanos(ticks.saturating_mul(quantum_nanos))
 }
 
 #[derive(Clone, Copy)]
@@ -90,7 +96,7 @@ impl TimerWheel {
                 self.current_tick
                     .saturating_add((SLOT_COUNT as u64).saturating_sub(1)),
             );
-            (u16::from(slot_of(deadline_tick)), deadline_tick)
+            (slot_of(deadline_tick), deadline_tick)
         };
 
         if let Some(node) = self.nodes.get(key) {
@@ -124,16 +130,12 @@ impl TimerWheel {
             return Some(self.last_now);
         }
 
-        // Scan the occupancy words, not the slots. The wheel is 256 slots in
-        // four `u64`s, so the next armed slot is found with at most four
-        // `trailing_zeros` instead of 255 bit tests — and this runs on every
-        // tick, for every shard, whether or not any timer is armed.
         let start = usize::from(slot_of(self.current_tick.saturating_add(1)));
         let offset = self.next_occupied_from(start)?;
         let tick = self.current_tick.saturating_add(1).saturating_add(offset);
         Some(
             self.epoch
-                .checked_add(Duration::from_millis(tick))
+                .checked_add(duration_for_ticks(tick))
                 .unwrap_or(self.epoch),
         )
     }
@@ -151,7 +153,7 @@ impl TimerWheel {
         } else {
             while self.current_tick < target_tick {
                 self.current_tick = self.current_tick.saturating_add(1);
-                self.drain_location(u16::from(slot_of(self.current_tick)), &mut f);
+                self.drain_location(slot_of(self.current_tick), &mut f);
             }
         }
         debug_assert_eq!(self.current_tick, target_tick);
@@ -284,15 +286,17 @@ impl TimerWheel {
 
     fn deadline_tick(&self, deadline: Instant) -> u64 {
         let elapsed = deadline.saturating_duration_since(self.epoch);
-        let millis = elapsed.as_millis();
-        let rounded = millis.saturating_add(u128::from(
-            !elapsed.subsec_nanos().is_multiple_of(1_000_000),
-        ));
+        let quantum = pulsebeam_runtime::SHARD_TIMER_QUANTUM.as_nanos();
+        debug_assert_ne!(quantum, 0);
+        let rounded = elapsed.as_nanos().div_ceil(quantum);
         u64::try_from(rounded).unwrap_or(u64::MAX)
     }
 
     fn elapsed_ticks(&self, now: Instant) -> u64 {
-        u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
+        let quantum = pulsebeam_runtime::SHARD_TIMER_QUANTUM.as_nanos();
+        debug_assert_ne!(quantum, 0);
+        u64::try_from(now.saturating_duration_since(self.epoch).as_nanos() / quantum)
+            .unwrap_or(u64::MAX)
     }
 
     #[cfg(test)]
@@ -302,16 +306,8 @@ impl TimerWheel {
             .is_some_and(|word| word & (1 << (slot % 64)) != 0)
     }
 
-    /// Slots from `start` (inclusive), wrapping, until one is occupied.
-    /// Returns the distance from `start`, or `None` if the wheel is empty.
-    ///
-    /// Walks whole words and uses `trailing_zeros`, so an empty wheel costs
-    /// four loads and an occupied one costs at most five.
     fn next_occupied_from(&self, start: usize) -> Option<u64> {
         debug_assert!(start < SLOT_COUNT);
-        // Rotate the bitmap so `start` sits at bit 0, then the first set bit
-        // is the answer. Done word by word to avoid materialising a 256-bit
-        // shift.
         for step in 0..OCCUPANCY_WORDS.saturating_add(1) {
             let base = start.saturating_add(step.saturating_mul(64));
             let word = self.rotated_word(base);
@@ -369,10 +365,6 @@ impl TimerWheel {
 #[cfg(test)]
 mod tests {
 
-    /// `next_occupied_from` replaced a 255-iteration bit-by-bit scan that ran
-    /// on every tick. It is bit manipulation over a wrapping bitmap, so it is
-    /// checked against the obvious implementation at every start offset and
-    /// for every single-slot pattern, rather than at a few hand-picked ones.
     #[test]
     fn word_scanning_agrees_with_a_naive_slot_scan() {
         fn naive(wheel: &TimerWheel, start: usize) -> Option<u64> {
@@ -392,9 +384,10 @@ mod tests {
             );
         }
 
+        let starts = [0, 1, 63, 64, 65, 255, 256, 511, 512, 767, 768, 1023];
         for armed in 0..SLOT_COUNT {
             wheel.set_occupied(armed);
-            for start in 0..SLOT_COUNT {
+            for start in starts {
                 assert_eq!(
                     wheel.next_occupied_from(start),
                     naive(&wheel, start),
@@ -405,7 +398,9 @@ mod tests {
         }
 
         // A scattered pattern that straddles every word boundary.
-        for armed in [0, 1, 63, 64, 65, 127, 128, 191, 192, 255] {
+        for armed in [
+            0, 1, 63, 64, 65, 127, 128, 191, 192, 255, 256, 511, 512, 767, 768, 1023,
+        ] {
             wheel.set_occupied(armed);
         }
         for start in 0..SLOT_COUNT {
@@ -432,14 +427,14 @@ mod tests {
         let mut wheel = TimerWheel::new(16);
         let key = keys(1)[0];
         let start = wheel.epoch;
-        wheel.schedule(key, start + Duration::from_micros(1_001));
+        wheel.schedule(key, start + Duration::from_micros(101));
 
         let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_micros(1_999), |entry| {
+        wheel.drain_expired(start + Duration::from_micros(199), |entry| {
             expired.push(entry);
         });
         assert!(expired.is_empty());
-        wheel.drain_expired(start + Duration::from_millis(2), |entry| {
+        wheel.drain_expired(start + Duration::from_micros(200), |entry| {
             expired.push(entry);
         });
         assert_eq!(expired, vec![key]);

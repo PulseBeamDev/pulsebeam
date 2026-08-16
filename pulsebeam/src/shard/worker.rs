@@ -2,11 +2,15 @@
 //! startup and never again. Carries the sanctioned exception in
 //! `shard::metrics`; nothing else here may share.
 
+#[cfg(not(feature = "sim"))]
+use std::cell::Cell;
+#[cfg(feature = "sim")]
+use std::pin::Pin;
 #[allow(
     clippy::disallowed_types,
     reason = "Arc<ShardMetrics>, one per shard, see module note"
 )]
-use std::{marker::PhantomData, pin::Pin, rc::Rc, sync::Arc, time::Duration};
+use std::{marker::PhantomData, rc::Rc, sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
 use crate::route::Envelope;
@@ -16,7 +20,95 @@ use pulsebeam_runtime::{
     net::{self, RecvPacketBatch, UnifiedSocket},
 };
 use str0m::media::KeyframeRequestKind;
-use tokio::time::{Instant, Sleep};
+use tokio::time::Instant;
+#[cfg(feature = "sim")]
+use tokio::time::Sleep;
+
+#[cfg(not(feature = "sim"))]
+struct ShardTimer {
+    fd: tokio::io::unix::AsyncFd<rustix::fd::OwnedFd>,
+    armed_for: Cell<Option<Instant>>,
+}
+
+#[cfg(not(feature = "sim"))]
+impl ShardTimer {
+    fn new() -> std::io::Result<Self> {
+        use rustix::time::{TimerfdClockId, TimerfdFlags, timerfd_create};
+
+        let fd = timerfd_create(
+            TimerfdClockId::Monotonic,
+            TimerfdFlags::NONBLOCK | TimerfdFlags::CLOEXEC,
+        )?;
+        Ok(Self {
+            fd: tokio::io::unix::AsyncFd::new(fd)?,
+            armed_for: Cell::new(None),
+        })
+    }
+
+    fn arm(&self, deadline: Option<Instant>) -> std::io::Result<bool> {
+        use rustix::time::Timespec;
+        use rustix::time::{
+            ClockId, Itimerspec, TimerfdTimerFlags, clock_gettime, timerfd_settime,
+        };
+
+        let mut bytes = [0u8; size_of::<u64>()];
+        match rustix::io::read(self.fd.get_ref(), &mut bytes) {
+            Ok(count) => debug_assert_eq!(count, bytes.len()),
+            Err(rustix::io::Errno::AGAIN) => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        let Some(deadline) = deadline else {
+            let disarmed = Itimerspec {
+                it_interval: Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            };
+            let _ = timerfd_settime(self.fd.get_ref(), TimerfdTimerFlags::empty(), &disarmed)?;
+            self.armed_for.set(None);
+            return Ok(false);
+        };
+
+        let delay = deadline.saturating_duration_since(Instant::now());
+        let absolute = clock_gettime(ClockId::Monotonic)
+            .checked_add(Timespec::try_from(delay).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("timerfd deadline overflow"))?;
+        let timer = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: absolute,
+        };
+        let _ = timerfd_settime(self.fd.get_ref(), TimerfdTimerFlags::ABSTIME, &timer)?;
+        self.armed_for.set(Some(deadline));
+        Ok(true)
+    }
+
+    async fn wait(&self) -> std::io::Result<()> {
+        let mut ready = self.fd.readable().await?;
+        ready.clear_ready();
+        let mut bytes = [0u8; size_of::<u64>()];
+        let count = rustix::io::read(self.fd.get_ref(), &mut bytes)?;
+        debug_assert_eq!(count, bytes.len());
+        if let Some(deadline) = self.armed_for.take() {
+            metrics::histogram!("timerfd_wakeup_late_us").record(
+                u64::try_from(
+                    Instant::now()
+                        .saturating_duration_since(deadline)
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX) as f64,
+            );
+        }
+        Ok(())
+    }
+}
 
 use crate::{
     entity::{ParticipantId, TrackId},
@@ -141,6 +233,11 @@ fn describe_shard_metrics() {
     metrics::describe_counter!(
         "view_backlog_shed",
         "view operations discarded after the bounded coalescing backlog filled"
+    );
+    metrics::describe_histogram!(
+        "timerfd_wakeup_late_us",
+        metrics::Unit::Microseconds,
+        "production timerfd wakeup delay beyond the requested deadline"
     );
     metrics::describe_counter!(
         "upstream_route_miss",
@@ -491,12 +588,19 @@ impl ShardWorker {
     }
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
+        #[cfg(feature = "sim")]
         let sleep = tokio::time::sleep(tokio::time::Duration::MAX);
+        #[cfg(feature = "sim")]
         tokio::pin!(sleep);
+        #[cfg(not(feature = "sim"))]
+        let mut timer = ShardTimer::new()?;
 
         let mut loop_start = Instant::now();
         loop {
+            #[cfg(feature = "sim")]
             self.wait_for_inputs(sleep.as_mut()).await?;
+            #[cfg(not(feature = "sim"))]
+            self.wait_for_inputs(&mut timer).await?;
 
             let busy_start = Instant::now();
             self.metrics
@@ -572,14 +676,19 @@ impl ShardWorker {
         self.stats_due = now.checked_add(STATS_REPORT_INTERVAL).unwrap_or(now);
     }
 
-    async fn wait_for_inputs(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), ShardError> {
+    fn next_wait_deadline(&mut self) -> Option<Instant> {
         // A quiet shard must still wake to report, or its metrics would freeze
         // at whatever it last had traffic for.
         let stats_deadline = self.stats_tx.as_ref().map(|_| self.stats_due);
-        let deadline = match (self.core.next_timer_deadline(), stats_deadline) {
+        match (self.core.next_timer_deadline(), stats_deadline) {
             (Some(timer), Some(stats)) => Some(timer.min(stats)),
             (timer, stats) => timer.or(stats),
-        };
+        }
+    }
+
+    #[cfg(feature = "sim")]
+    async fn wait_for_inputs(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), ShardError> {
+        let deadline = self.next_wait_deadline();
         let has_timer = if let Some(d) = deadline {
             sleep.as_mut().reset(d);
             true
@@ -596,6 +705,24 @@ impl ShardWorker {
             Ok(_) = self.tcp_socket.readable() => {}
             Some(_) = self.command_rx.readable() => {}
             _ = sleep.as_mut(), if has_timer => {}
+            else => return Err(ShardError::ManagerDisconnected),
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "sim"))]
+    async fn wait_for_inputs(&mut self, timer: &mut ShardTimer) -> Result<(), ShardError> {
+        let has_timer = timer.arm(self.next_wait_deadline())?;
+
+        tokio::select! {
+            biased;
+            Some(_) = self.core.view_readable() => {}
+            Ok(_) = self.udp_socket.readable() => {}
+            Some(_) = self.frame_rx.readable() => {}
+            Ok(_) = self.tcp_socket.readable() => {}
+            Some(_) = self.command_rx.readable() => {}
+            _ = timer.wait(), if has_timer => {}
             else => return Err(ShardError::ManagerDisconnected),
         }
 
@@ -729,6 +856,20 @@ impl ShardWorker {
         metrics::counter!("shard_tick_budget_hit", "phase" => phase).increment(1);
         #[cfg(feature = "sim")]
         crate::sim_metrics::record_routing_counter("shard_tick_budget_hit");
+    }
+}
+
+#[cfg(all(test, not(feature = "sim")))]
+mod timerfd_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timerfd_does_not_wake_before_its_deadline() {
+        let timer = ShardTimer::new().expect("create timerfd");
+        let deadline = Instant::now() + Duration::from_millis(2);
+        assert!(timer.arm(Some(deadline)).expect("arm timerfd"));
+        timer.wait().await.expect("wait for timerfd");
+        assert!(Instant::now() >= deadline);
     }
 }
 

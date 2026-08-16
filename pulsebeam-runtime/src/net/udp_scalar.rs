@@ -162,11 +162,11 @@ impl UdpTransportReader {
     }
 
     pub fn gro_segments(&self) -> usize {
-        if cfg!(feature = "sim") && crate::net::shaper::gro_enabled(self.local_addr.ip()) {
-            crate::net::UDP_MAX_GSO_SEGMENTS
-        } else {
-            1
+        #[cfg(feature = "sim")]
+        if crate::net::shaper::gro_enabled(self.local_addr.ip()) {
+            return crate::net::UDP_MAX_GSO_SEGMENTS;
         }
+        1
     }
 
     #[inline]
@@ -257,6 +257,9 @@ impl UdpTransportReader {
     }
 
     fn record_gro(&self, out: &[RecvPacketBatch], start: usize) {
+        #[cfg(not(feature = "sim"))]
+        let _ = (out, start);
+        #[cfg(feature = "sim")]
         for batch in out.get(start..).unwrap_or_default() {
             debug_assert_ne!(batch.stride, 0);
             let datagrams = batch.len.div_ceil(batch.stride);
