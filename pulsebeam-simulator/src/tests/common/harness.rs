@@ -2661,6 +2661,8 @@ fn assert_video_quality(
 pub enum Property {
     /// Video frames decoded during the last run after a complete, parameterized keyframe.
     VideoDecodes,
+    /// UDP GSO and asynchronous TX completions both carried media in this plan.
+    UdpGsoAndTimestampsExercised,
     /// Delivered throughput was at least this percent of the link's capacity.
     ///
     /// Only meaningful when demand meets or exceeds capacity; a plan whose sources cannot fill
@@ -3241,6 +3243,23 @@ fn check_property(
                 return Err(format!(
                     "{} decoded keyframes were missing parameter sets",
                     total.missing_parameter_sets
+                ));
+            }
+        }
+        Property::UdpGsoAndTimestampsExercised => {
+            if stats.gso_batches == 0 || stats.gso_segments <= stats.gso_batches {
+                return Err(format!(
+                    "no segmented UDP send was observed ({} batches, {} segments)",
+                    stats.gso_batches, stats.gso_segments
+                ));
+            }
+            if stats.tx_timestamps == 0 {
+                return Err("no UDP send timestamp completion was observed".to_string());
+            }
+            if stats.missing_tx_timestamps != 0 {
+                return Err(format!(
+                    "{} UDP send timestamps were missing",
+                    stats.missing_tx_timestamps
                 ));
             }
         }

@@ -19,6 +19,37 @@ use std::time::Duration;
 /// of the implementation rather than of a lucky schedule.
 const QOS_SEEDS: [u64; 4] = [0xDEAD_BEEF, 0x1234_5678, 0x0BAD_F00D, 0xFEED_FACE];
 
+#[test]
+fn udp_gso_and_timestamp_completions_are_exercised_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the media path",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeAll {
+                description: "Viewer requests the full camera ladder",
+                participant: "viewer",
+                heights: &[720],
+            },
+            Step::Run {
+                description: "Carry enough media to aggregate UDP datagrams",
+                duration: Duration::from_secs(10),
+            },
+            Step::Expect {
+                description: "The simulated data plane uses GSO and TX completions",
+                participant: "viewer",
+                property: Property::UdpGsoAndTimestampsExercised,
+            },
+        ]);
+}
+
 /// Upgrading after a long stretch at low quality must not break the stream.
 ///
 /// This is an end-to-end anchor for the transition from a long low-quality period to an explicit

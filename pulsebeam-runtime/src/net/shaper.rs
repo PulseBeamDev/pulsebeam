@@ -347,6 +347,7 @@ pub struct Stats {
     pub gso_segments: u64,
     pub gro_batches: u64,
     pub gro_datagrams: u64,
+    pub tx_timestamps: u64,
     pub missing_tx_timestamps: u64,
     pub dropped_enobufs: u64,
     pub partial_gso_sends: u64,
@@ -806,6 +807,10 @@ impl ShaperState {
         let overflowed = self.sample(faults.error_queue_overflow_probability);
         if overflowed || at.is_none() {
             record_missing_tx_timestamp(ip);
+        } else {
+            record(ip, |stats| {
+                stats.tx_timestamps = stats.tx_timestamps.saturating_add(1);
+            });
         }
         let mut ready_at = now + faults.completion_delay;
         if self.sample(faults.completion_reorder_probability) {
@@ -1149,7 +1154,9 @@ mod tests {
         );
         assert_eq!(completions[1].tag.id, 1);
         assert_eq!(completions[1].at, Some(now + Duration::from_millis(100)));
-        assert_eq!(stats(ip).missing_tx_timestamps, 1);
+        let observed = stats(ip);
+        assert_eq!(observed.tx_timestamps, 1);
+        assert_eq!(observed.missing_tx_timestamps, 1);
     }
 
     #[test]
