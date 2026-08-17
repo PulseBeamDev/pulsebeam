@@ -224,6 +224,7 @@ impl NodeBuilder {
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let workers_count = self.workers;
+
         // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
         // both IPv6 and IPv4 peers.
         let local_addr = self
@@ -276,18 +277,23 @@ impl NodeBuilder {
         let primary_external_addr = advertised_addrs.first().copied();
 
         let mut join_set = JoinSet::new();
-        if let Some(source) = self.internal_metrics {
-            let listener = match source {
-                ListenerSource::Bind(addr) => bind_tcp_listener(addr)
-                    .await
-                    .context("binding internal metrics")?,
-                ListenerSource::PreBound(l) => l,
-            };
-
-            let ctx = internal::InternalContext::init(listener)
-                .context("failed to spawn internal server")?;
-            join_set.spawn(ignore(ctx.serve_internal_http(shutdown.child_token())));
-        }
+        // Initialised here so the global recorder is in place before anything
+        // runs, but served after the shards exist — it needs their metrics lane.
+        let internal_ctx = match self.internal_metrics {
+            Some(source) => {
+                let listener = match source {
+                    ListenerSource::Bind(addr) => bind_tcp_listener(addr)
+                        .await
+                        .context("binding internal metrics")?,
+                    ListenerSource::PreBound(l) => l,
+                };
+                Some(
+                    internal::InternalContext::init(listener)
+                        .context("failed to spawn internal server")?,
+                )
+            }
+            None => None,
+        };
 
         let cpu_cores = get_core_ids().unwrap_or_default();
         if cpu_cores.is_empty() {
@@ -308,6 +314,9 @@ impl NodeBuilder {
             self.udp_mode,
         )
         .await?;
+
+        #[cfg(not(feature = "sim"))]
+        let steering = crate::ebpf::attach(&udp_sockets)?;
 
         let tcp_listener = bind_tcp_listener(local_addr)
             .await
@@ -366,9 +375,6 @@ impl NodeBuilder {
         })?;
 
         let controller_rng = rand::Rng::seed_from_u64(rng.next_u64());
-        let shard_rngs: Vec<rand::Rng> = (0..udp_sockets.len())
-            .map(|_| rand::Rng::seed_from_u64(rng.next_u64()))
-            .collect();
 
         // One NTP<->Instant anchor for the whole node: read the wall clock once,
         // here, so every shard shares a timeline and nothing reads it again.
@@ -376,14 +382,29 @@ impl NodeBuilder {
 
         let mut shard_contexts = Vec::new();
 
-        for (shard_idx, (((udp_sock, tcp_sock), frame_rx), shard_rng)) in udp_sockets
+        // Only built when something will scrape it, so a node without the
+        // internal server never pays for a snapshot it would throw away.
+        let stats_lane = internal_ctx.is_some().then(|| {
+            mailbox::new::<Box<crate::shard::recorder::ShardStatsReport>>(
+                crate::shard::worker::STATS_CAPACITY.saturating_mul(workers_count.max(1)),
+            )
+        });
+        let (stats_tx, stats_rx) = match stats_lane {
+            Some((tx, rx)) => (Some(tx), Some(rx)),
+            None => (None, None),
+        };
+
+        let mut view_writers = Vec::with_capacity(workers_count);
+
+        for (shard_idx, ((udp_sock, tcp_sock), frame_rx)) in udp_sockets
             .into_iter()
             .zip(tcp_sockets.into_iter())
             .zip(frame_rxs)
-            .zip(shard_rngs)
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
+            let (view_writer, view_reader) = crate::view::new_shard_view(shard_id);
+            view_writers.push(view_writer);
             let (shard_command_tx, shard_command_rx) =
                 mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
             let shard_event_tx = shard_event_tx.clone();
@@ -393,11 +414,8 @@ impl NodeBuilder {
                 reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
             )]
             let occupancy = Arc::new(ShardMetrics::new());
-            #[allow(
-                clippy::disallowed_types,
-                reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
-            )]
-            let shard_occupancy = Arc::new(ShardMetrics::new());
+            let worker_occupancy = occupancy.clone();
+            let shard_stats_tx = stats_tx.clone();
 
             if use_shared_runtime {
                 let shard = ShardWorker::new(
@@ -405,11 +423,12 @@ impl NodeBuilder {
                     udp_sock.into_unified_socket()?,
                     tcp_sock,
                     shard_command_rx,
+                    view_reader,
                     shard_event_tx,
                     frame_rx,
                     frame_txs,
-                    shard_occupancy,
-                    shard_rng,
+                    worker_occupancy,
+                    shard_stats_tx,
                     wall_anchor,
                 );
                 join_set.spawn_local(ignore(shard.run()));
@@ -443,7 +462,12 @@ impl NodeBuilder {
                                         "shard {shard_id} cannot build its runtime: {err}"
                                     )
                                 });
-                            tune_current_data_thread(core_id);
+                            let realtime = tune_current_data_thread(core_id);
+                            metrics::gauge!(
+                                "shard_realtime",
+                                "shard" => shard_id.index().to_string()
+                            )
+                            .set(f64::from(realtime));
                             #[allow(
                                 clippy::disallowed_methods,
                                 reason = "the shard's dedicated OS thread enters its async runtime exactly once, here"
@@ -460,11 +484,12 @@ impl NodeBuilder {
                                     udp_sock,
                                     tcp_sock,
                                     shard_command_rx,
+                                    view_reader,
                                     shard_event_tx,
                                     frame_rx,
                                     frame_txs,
-                                    shard_occupancy,
-                                    shard_rng,
+                                    worker_occupancy,
+                                    shard_stats_tx,
                                     wall_anchor,
                                 );
                                 tokio::task::unconstrained(shard.run()).await;
@@ -485,6 +510,14 @@ impl NodeBuilder {
             });
         }
 
+        if let (Some(ctx), Some(stats_rx)) = (internal_ctx, stats_rx) {
+            join_set.spawn(ignore(ctx.serve_internal_http(
+                workers_count,
+                stats_rx,
+                shutdown.child_token(),
+            )));
+        }
+
         // set current thread to lower priority after spawning worker threads so
         // we don't lower the worker threads' priorities
         if matches!(self.worker_execution, WorkerExecution::ThreadPerWorker) {
@@ -498,7 +531,14 @@ impl NodeBuilder {
             tcp_listener,
             self.room_shard_slot,
             self.room_placement,
+            view_writers,
         );
+        #[cfg(not(feature = "sim"))]
+        let mut controller = controller;
+        #[cfg(not(feature = "sim"))]
+        if let Some(steering) = steering {
+            controller.set_steering(steering);
+        }
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);
@@ -594,24 +634,26 @@ async fn bind_udp_sockets(
 ) -> Result<Vec<net::BoundUdpSocket>> {
     let mut sockets = Vec::with_capacity(workers);
 
-    for _ in 0..workers {
-        let socket = match net::bind_udp_socket(local_addr, mode, advertised_addr).await {
-            Ok(s) => s,
-            Err(e) if sockets.is_empty() => {
-                return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
-            }
-            Err(e) => {
-                // Shedding workers here is not a capacity trade-off: a
-                // single-shard node never executes a cross-shard path at all.
-                tracing::warn!(
-                    requested = workers,
-                    running = sockets.len(),
-                    "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
+    for shard_index in 0..workers {
+        let shard_index = u16::try_from(shard_index).unwrap_or(u16::MAX);
+        let socket =
+            match net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await {
+                Ok(s) => s,
+                Err(e) if sockets.is_empty() => {
+                    return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
+                }
+                Err(e) => {
+                    // Shedding workers here is not a capacity trade-off: a
+                    // single-shard node never executes a cross-shard path at all.
+                    tracing::warn!(
+                        requested = workers,
+                        running = sockets.len(),
+                        "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
                      workers than requested: {e}"
-                );
-                break;
-            }
-        };
+                    );
+                    break;
+                }
+            };
         sockets.push(socket);
     }
     Ok(sockets)
@@ -689,7 +731,7 @@ pub fn tune_current_control_thread() {
     }
 }
 
-pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
+pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) -> bool {
     #[cfg(target_os = "linux")]
     {
         use rustix::thread::{current_timer_slack, set_current_timer_slack};
@@ -702,16 +744,18 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
         let current_thread_id = thread_native_id();
         let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
         let priority = ThreadPriority::from_posix(ScheduleParams { sched_priority: 50 });
-        if let Err(e) =
+        let realtime = if let Err(e) =
             thread_priority::set_thread_priority_and_policy(current_thread_id, priority, policy)
         {
             tracing::warn!(
                 "Failed to set Data Thread to SCHED_FIFO at priority 50 (requires CAP_SYS_NICE): {:?}",
                 e
             );
+            false
         } else {
             tracing::info!("Data thread successfully elevated to SCHED_FIFO (Priority 50)");
-        }
+            true
+        };
 
         // attempt to get closer to SCHED_FIFO without CAP_SYS_ADMIN
         let slack_value = NonZero::new(1);
@@ -731,6 +775,13 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
                 tracing::warn!(?core, "Failed to pin Data thread to CPU core");
             }
         }
+        realtime
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core_id;
+        false
     }
 }
 
@@ -753,6 +804,7 @@ mod internal {
     use pprof::protos::Message;
     use serde::Deserialize;
     use tokio::runtime::Handle;
+    use tokio::sync::oneshot;
 
     #[derive(Deserialize)]
     pub struct ProfileParams {
@@ -783,6 +835,10 @@ mod internal {
 
     impl InternalContext {
         pub fn init(listener: TcpListener) -> anyhow::Result<Self> {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the one global recorder in the process, for control-plane, HTTP and runtime metrics. Shards never write to it — they install their own per tick and report by message. See clippy.toml."
+            )]
             let prometheus = PrometheusBuilder::new()
                 .set_buckets_for_metric(
                     Matcher::Suffix("_delay_us".to_string()),
@@ -797,7 +853,12 @@ mod internal {
             })
         }
 
-        pub async fn serve_internal_http(self, shutdown: CancellationToken) -> Result<()> {
+        pub async fn serve_internal_http(
+            self,
+            shard_count: usize,
+            stats_rx: mailbox::Receiver<Box<crate::shard::recorder::ShardStatsReport>>,
+            shutdown: CancellationToken,
+        ) -> Result<()> {
             const INDEX_HTML: &str = r#"
 <ul>
   <li><a href="/healthz">Healthcheck</a></li>
@@ -809,6 +870,16 @@ mod internal {
 </ul>
 "#;
 
+            // One scrape at a time is plenty; a queue here would only serve
+            // several callers the same numbers a moment apart.
+            let (scrape_tx, scrape_rx) = mailbox::new(1);
+            let aggregator_join = tokio::spawn(crate::control::stats_aggregator::run(
+                shard_count,
+                stats_rx,
+                scrape_rx,
+                shutdown.child_token(),
+            ));
+
             let router = {
                 let prometheus = self.prometheus.clone();
                 Router::new()
@@ -816,7 +887,16 @@ mod internal {
                     // .route("/debug/pprof/allocs", get(heap_profile))
                     .route("/healthz", get(healthcheck))
                     .route("/", get(async move || Html(INDEX_HTML)))
-                    .route("/metrics", get(async move || prometheus.render()))
+                    .route(
+                        "/metrics",
+                        get(async move || {
+                            // The exporter still owns control-plane, HTTP and
+                            // runtime metrics; the shards' own numbers arrive
+                            // as values and are rendered separately.
+                            let shards = scrape_shards(&scrape_tx).await;
+                            format!("{}{shards}", prometheus.render())
+                        }),
+                    )
             };
             let rt_monitor_join = tokio::spawn(rt_background_monitor(self.prometheus));
 
@@ -831,6 +911,7 @@ mod internal {
                         tracing::error!("internal http server error: {e}");
                     }
                 }
+                _ = aggregator_join => {}
                 _ = rt_monitor_join => {}
                 _ = shutdown.cancelled() => {
                     tracing::info!("internal http server shutting down");
@@ -839,6 +920,19 @@ mod internal {
 
             Ok(())
         }
+    }
+
+    /// Ask the aggregator for the shards' exposition.
+    ///
+    /// A scrape must never be able to stall the node, so a wedged or departed
+    /// aggregator yields an empty block: the exporter's own metrics still get
+    /// served, and the missing shard series say plainly that something is wrong.
+    async fn scrape_shards(scrape_tx: &mailbox::Sender<oneshot::Sender<String>>) -> String {
+        let (tx, rx) = oneshot::channel();
+        if scrape_tx.try_send(tx).is_err() {
+            return String::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     async fn rt_background_monitor(prometheus: PrometheusHandle) {

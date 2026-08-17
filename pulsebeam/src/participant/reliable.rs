@@ -21,10 +21,6 @@ impl ReliableChannels {
         self.publishers.get(topic).copied()
     }
 
-    pub(super) fn subscriber_channel(&self, topic: &Topic) -> Option<ChannelId> {
-        self.subscribers.get(topic).copied()
-    }
-
     pub(super) fn open(
         &mut self,
         channel_id: ChannelId,
@@ -47,7 +43,7 @@ impl ReliableChannels {
                     return Err(());
                 }
                 self.subscribers.insert(channel.topic.clone(), channel_id);
-                events.subscribe_reliable_data_topic(channel.topic.clone());
+                events.subscribe_reliable_data_topic(channel.topic.clone(), channel_id);
             }
         }
         Ok(())
@@ -66,7 +62,14 @@ impl ReliableChannels {
                 debug_assert!(channel.scope.is_none());
                 let removed = self.subscribers.remove(&channel.topic);
                 debug_assert!(removed.is_some());
-                events.unsubscribe_reliable_data_topic(channel.topic);
+                let Some(channel_id) = removed else {
+                    debug_assert!(
+                        false,
+                        "reliable subscriber channel must exist while closing"
+                    );
+                    return;
+                };
+                events.unsubscribe_reliable_data_topic(channel.topic, channel_id);
             }
         }
     }
