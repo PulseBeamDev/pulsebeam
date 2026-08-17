@@ -9,6 +9,7 @@ use crate::{
         core::{ControllerCore, ControllerEvent, ControllerEventQueue, RoomPlacement},
         lanes::{Lanes, StreamLane, Subscriber, WildcardSubscriber},
         negotiator::{Negotiator, NegotiatorError},
+        pending::{PendingSubscription, PendingSubscriptions},
         router::ShardRouter,
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
         ufrag::IceUfrag,
@@ -54,21 +55,6 @@ struct TrackBinding {
     fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
     audio_fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
     audio_routes: HashMap<crate::id::ShardId, RouteHandle>,
-}
-
-/// How many not-yet-published tracks one participant may have outstanding.
-///
-/// Generous against any real client — a subscription for a track that has not
-/// been announced yet is a race, not a workflow — and small enough that the
-/// list cannot be inflated by a client naming ids that will never exist.
-const MAX_PENDING_SUBSCRIPTIONS_PER_PARTICIPANT: usize = 64;
-
-struct PendingTrackSubscription {
-    shard_id: crate::id::ShardId,
-    subscriber: ParticipantId,
-    subscriber_key: crate::shard::participants::ParticipantKey,
-    slot: crate::keys::DownstreamSlotKey,
-    track: crate::track::TrackMeta,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -154,26 +140,9 @@ pub struct ControllerActor {
     /// Data and reliable stream routing. One type per lane rather than three
     /// fields duplicated per lane, so the two cannot drift.
     lanes: Lanes,
-    pending_track_subscriptions: HashMap<crate::entity::TrackId, Vec<PendingTrackSubscription>>,
-    pending_track_counts: HashMap<ParticipantId, usize>,
+    pending: PendingSubscriptions,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
-    /// Subscriptions whose route could not be allocated, waiting for a retry.
-    ///
-    /// A subscribe carries its own retry trigger only if something later
-    /// re-emits it, and nothing does: the subscriber's shard already believes
-    /// it subscribed. Without this the first failed allocation leaves that
-    /// participant with no video for the rest of its session.
-    deferred_subscribes: std::collections::VecDeque<DeferredSubscribe>,
-}
-
-#[derive(Debug, Clone)]
-struct DeferredSubscribe {
-    shard_id: crate::id::ShardId,
-    subscriber: ParticipantId,
-    subscriber_key: crate::shard::participants::ParticipantKey,
-    slot: crate::keys::DownstreamSlotKey,
-    track: crate::track::TrackMeta,
 }
 
 impl ControllerActor {
@@ -207,11 +176,9 @@ impl ControllerActor {
             views,
             track_bindings: HashMap::new(),
             lanes: Lanes::new(),
-            pending_track_subscriptions: HashMap::new(),
-            pending_track_counts: HashMap::new(),
+            pending: PendingSubscriptions::default(),
             #[cfg(not(feature = "sim"))]
             steering: None,
-            deferred_subscribes: std::collections::VecDeque::new(),
         }
     }
 
@@ -449,11 +416,6 @@ impl ControllerActor {
     /// in that case either.
     const ROUTE_ALLOCATION_ATTEMPTS: u32 = 10;
 
-    /// Bounded so a node that is genuinely out of routes sheds the backlog
-    /// instead of growing one. A subscriber dropped here is no worse off than
-    /// it was before the queue existed.
-    const MAX_DEFERRED_SUBSCRIBES: usize = 1024;
-
     /// Reserve an endpoint route, retrying a transient shortage.
     ///
     /// Exhaustion is either momentary — a slot is in quarantine, or fault
@@ -484,13 +446,11 @@ impl ControllerActor {
         None
     }
 
-    fn defer_subscribe(&mut self, deferred: DeferredSubscribe) {
+    fn defer_subscribe(&mut self, deferred: PendingSubscription) {
         metrics::counter!("subscribe_deferred").increment(1);
-        if self.deferred_subscribes.len() >= Self::MAX_DEFERRED_SUBSCRIBES {
+        if !self.pending.hold_route(deferred) {
             metrics::counter!("subscribe_deferred_dropped").increment(1);
-            self.deferred_subscribes.pop_front();
         }
-        self.deferred_subscribes.push_back(deferred);
     }
 
     /// Retry every deferred subscription once.
@@ -500,17 +460,15 @@ impl ControllerActor {
     /// up. Draining the queue into a local first is what keeps that from
     /// spinning within one tick.
     async fn retry_deferred_subscribes(&mut self) {
-        if self.deferred_subscribes.is_empty() {
-            return;
-        }
-        let pending = std::mem::take(&mut self.deferred_subscribes);
+        let pending = self.pending.take_route_retries();
         for deferred in pending {
-            let DeferredSubscribe {
+            let PendingSubscription {
                 shard_id,
                 subscriber,
                 subscriber_key,
                 slot,
                 track,
+                ..
             } = deferred;
             // A participant that left, or a track that was retired, takes its
             // deferred work with it rather than being resurrected here.
@@ -557,27 +515,12 @@ impl ControllerActor {
                     // name something that does not exist and never will. Cap
                     // how many a single participant can park here; the whole
                     // list is dropped when it disconnects.
-                    let held = self
-                        .pending_track_counts
-                        .get(&subscriber)
-                        .copied()
-                        .unwrap_or_default();
-                    if held >= MAX_PENDING_SUBSCRIPTIONS_PER_PARTICIPANT {
+                    let pending =
+                        PendingSubscription::new(shard_id, subscriber, subscriber_key, slot, track);
+                    if !self.pending.hold_publication(pending) {
                         metrics::counter!("pending_subscription_rejected").increment(1);
                         return None;
                     }
-                    self.pending_track_subscriptions
-                        .entry(track.id)
-                        .or_default()
-                        .push(PendingTrackSubscription {
-                            shard_id,
-                            subscriber,
-                            subscriber_key,
-                            slot,
-                            track,
-                        });
-                    let held = self.pending_track_counts.entry(subscriber).or_default();
-                    *held = held.saturating_add(1);
                     return None;
                 }
                 self.on_track_subscribed(shard_id, subscriber, subscriber_key, slot, track)

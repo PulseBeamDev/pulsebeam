@@ -12,17 +12,8 @@ impl ControllerActor {
         &mut self,
         track_id: crate::entity::TrackId,
     ) {
-        let pending = self
-            .pending_track_subscriptions
-            .remove(&track_id)
-            .unwrap_or_default();
+        let pending = self.pending.take_published(track_id);
         for subscription in pending {
-            if let Some(count) = self.pending_track_counts.get_mut(&subscription.subscriber) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.pending_track_counts.remove(&subscription.subscriber);
-                }
-            }
             self.on_track_subscribed(
                 subscription.shard_id,
                 subscription.subscriber,
@@ -40,27 +31,7 @@ impl ControllerActor {
         subscriber: ParticipantId,
         slot: crate::keys::DownstreamSlotKey,
     ) {
-        let mut removed = false;
-        if let Some(pending) = self.pending_track_subscriptions.get_mut(&track_id) {
-            pending.retain(|entry| {
-                let matches = entry.subscriber == subscriber && entry.slot == slot;
-                removed |= matches;
-                !matches
-            });
-        }
-        if self
-            .pending_track_subscriptions
-            .get(&track_id)
-            .is_some_and(Vec::is_empty)
-        {
-            self.pending_track_subscriptions.remove(&track_id);
-        }
-        if removed && let Some(count) = self.pending_track_counts.get_mut(&subscriber) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.pending_track_counts.remove(&subscriber);
-            }
-        }
+        self.pending.remove(track_id, subscriber, slot);
     }
 
     pub(super) async fn install_video_runtimes(&mut self, track_id: crate::entity::TrackId) {
@@ -575,13 +546,13 @@ impl ControllerActor {
                 // fresh one on every attempt and abandon the last in the arena.
                 self.subscriptions
                     .unsubscribe(shard_id, &track.id, &subscriber);
-                self.defer_subscribe(DeferredSubscribe {
+                self.defer_subscribe(crate::control::pending::PendingSubscription::new(
                     shard_id,
                     subscriber,
                     subscriber_key,
                     slot,
                     track,
-                });
+                ));
                 return;
             };
             self.subscriptions.installed(shard_id, track.id, handle);
