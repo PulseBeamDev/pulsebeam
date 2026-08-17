@@ -550,6 +550,7 @@ fn next_uniform(counter: &mut u64) -> f64 {
 
 struct Queued {
     release_at: Instant,
+    sent_at: Instant,
     dst: SocketAddr,
     buf: Vec<u8>,
     tag: Option<SendTag>,
@@ -651,6 +652,7 @@ impl Shaper {
                 self.with(|st| {
                     st.queue.push_back(Queued {
                         release_at: now + reorder.delay,
+                        sent_at: now,
                         dst,
                         buf: buf.to_vec(),
                         tag,
@@ -892,6 +894,7 @@ impl ShaperState {
         // Reordering is applied to the release time, not by shuffling the queue, so the packet
         // genuinely leaves after ones offered behind it. Delaying it in place would only add
         // jitter; the queue is re-sorted below so departure order actually changes.
+        let sent_at = release_at;
         let mut release_at = release_at;
         if limit.reorder.probability > 0.0
             && next_uniform(&mut self.loss_counter) < limit.reorder.probability
@@ -902,6 +905,7 @@ impl ShaperState {
 
         self.queue.push_back(Queued {
             release_at,
+            sent_at,
             dst,
             buf: buf.to_vec(),
             tag,
@@ -922,8 +926,9 @@ impl ShaperState {
                 break;
             }
             let q = self.queue.pop_front().expect("front just checked");
+            debug_assert!(q.sent_at <= q.release_at);
             if let Some(tag) = q.tag {
-                self.enqueue_completion(now, q.dst.ip(), tag, Some(q.release_at));
+                self.enqueue_completion(now, q.dst.ip(), tag, Some(q.sent_at));
             }
             out.push((q.dst, q.buf));
         }
@@ -1044,7 +1049,12 @@ mod tests {
         let mut shaper = Shaper::default();
         let start = Instant::now();
         // First packet is reordered; the rest are offered far enough behind that they overtake it.
-        shaper.offer(start, dst, &[0u8; 200]);
+        shaper.offer_tracked(
+            start,
+            dst,
+            &[0u8; 200],
+            Some(SendTag { owner: 1, id: 9 }),
+        );
         set_reorder(ip, Reorder::NONE);
         for _ in 0..3 {
             shaper.offer(start + Duration::from_millis(10), dst, &[0u8; 200]);
@@ -1063,6 +1073,12 @@ mod tests {
 
         let late = shaper.drain_due(start + Duration::from_millis(60));
         assert_eq!(late.len(), 1, "the delayed packet should arrive afterwards");
+        let mut completions = Vec::new();
+        assert_eq!(
+            shaper.drain_completions_at(start + Duration::from_millis(60), &mut completions),
+            1
+        );
+        assert_eq!(completions[0].at, Some(start));
         assert_eq!(stats(ip).reordered, 1);
     }
 
