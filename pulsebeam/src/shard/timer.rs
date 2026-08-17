@@ -295,8 +295,12 @@ impl TimerWheel {
     fn elapsed_ticks(&self, now: Instant) -> u64 {
         let quantum = pulsebeam_runtime::SHARD_TIMER_QUANTUM.as_nanos();
         debug_assert_ne!(quantum, 0);
-        u64::try_from(now.saturating_duration_since(self.epoch).as_nanos() / quantum)
-            .unwrap_or(u64::MAX)
+        let ticks = now
+            .saturating_duration_since(self.epoch)
+            .as_nanos()
+            .checked_div(quantum)
+            .unwrap_or(u128::MAX);
+        u64::try_from(ticks).unwrap_or(u64::MAX)
     }
 
     #[cfg(test)]

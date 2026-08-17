@@ -388,7 +388,8 @@ impl VideoAllocator {
             for plan in &self.allocation.plans {
                 let quality = plan
                     .chosen
-                    .map(|chosen| self.allocation.rung(plan, chosen).quality as u8);
+                    .and_then(|chosen| self.allocation.rung(plan, chosen))
+                    .map(|rung| rung.quality as u8);
                 crate::sim_metrics::record_forwarded_quality_for(plan.origin, quality);
             }
         }
@@ -972,8 +973,8 @@ fn log_allocation(ctx: LogCtx, hold: Bitrate, desired: Bitrate, allocation: &All
     let mut total_used_bps = 0u64;
 
     for plan in &allocation.plans {
-        let entry = if let Some(chosen) = plan.chosen {
-            let rung = allocation.rung(plan, chosen);
+        let entry = if let Some(rung) = plan.chosen.and_then(|chosen| allocation.rung(plan, chosen))
+        {
             total_used_bps = total_used_bps.saturating_add(u64::from(rung.send_bps));
             let quality = match rung.quality {
                 LayerQuality::High => "H",
@@ -1111,7 +1112,9 @@ impl Allocation {
                 });
             let held = active_layer.and_then(|layer| {
                 let target = slot.decode_target();
-                self.rungs[first..]
+                self.rungs
+                    .get(first..)
+                    .unwrap_or_default()
                     .iter()
                     .position(|rung| rung.layer == layer && rung.target == target)
                     .and_then(|index| u8::try_from(index).ok())
@@ -1151,8 +1154,16 @@ impl Allocation {
     fn build_rungs(&mut self, slot: &Slot, track: &Track, states: &LayerStates) {
         let mut snapshots = [StreamStats::default(); MAX_ENCODINGS_PER_SLOT];
         let mut heights = [0u32; MAX_ENCODINGS_PER_SLOT];
+        let layer_count = track.layers.len().min(MAX_ENCODINGS_PER_SLOT);
+        debug_assert!(!track.layers.is_empty());
+        debug_assert_eq!(layer_count, track.layers.len());
+        let layers = track.layers.get(..layer_count).unwrap_or_default();
 
-        for (index, layer) in track.layers.iter().enumerate() {
+        for ((layer, snapshot_slot), height_slot) in layers
+            .iter()
+            .zip(snapshots.iter_mut())
+            .zip(heights.iter_mut())
+        {
             let snapshot = states.get(&layer.stream_id()).copied().unwrap_or_else(|| {
                 StreamStats::new(
                     true,
@@ -1160,30 +1171,27 @@ impl Allocation {
                     layer.quality.fallback_height(),
                 )
             });
-            snapshots[index] = snapshot;
-            heights[index] = if snapshot.height == 0 {
+            *snapshot_slot = snapshot;
+            *height_slot = if snapshot.height == 0 {
                 layer.quality.fallback_height()
             } else {
                 snapshot.height
             };
-            debug_assert_ne!(heights[index], 0);
+            debug_assert_ne!(*height_slot, 0);
             debug_assert!(snapshot.stable_bitrate_bps >= snapshot.bitrate_bps);
         }
 
-        let layer_count = track.layers.len();
-        let min_track_height = heights[..layer_count]
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or_default();
+        let snapshots = snapshots.get(..layer_count).unwrap_or_default();
+        let heights = heights.get(..layer_count).unwrap_or_default();
+        let min_track_height = heights.iter().copied().min().unwrap_or_default();
         let request = slot.max_height.max(min_track_height);
-        let ceiling = heights[..layer_count]
+        let ceiling = heights
             .iter()
             .copied()
             .filter(|height| *height >= request)
             .min()
             .unwrap_or(request);
-        let tallest_allowed = heights[..layer_count]
+        let tallest_allowed = heights
             .iter()
             .copied()
             .filter(|height| *height <= ceiling)
@@ -1192,33 +1200,49 @@ impl Allocation {
         let effective_min = slot.min_height.min(tallest_allowed);
 
         let mut selected = [false; MAX_ENCODINGS_PER_SLOT];
-        for index in 0..layer_count {
-            let snapshot = snapshots[index];
-            selected[index] = heights[index] <= ceiling
-                && heights[index] >= effective_min
+        let selected = selected.get_mut(..layer_count).unwrap_or_default();
+        for ((selected, snapshot), height) in selected
+            .iter_mut()
+            .zip(snapshots.iter())
+            .zip(heights.iter())
+        {
+            *selected = *height <= ceiling
+                && *height >= effective_min
                 && snapshot.healthy
                 && snapshot.bitrate_bps > 0;
         }
 
-        if !selected[..layer_count].iter().any(|selected| *selected) {
-            let cheapest_healthy = (0..layer_count)
-                .filter(|index| snapshots[*index].healthy && snapshots[*index].bitrate_bps > 0)
-                .min_by_key(|index| snapshots[*index].stable_bitrate_bps);
+        if !selected.iter().any(|selected| *selected) {
+            let cheapest_healthy = snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, snapshot)| snapshot.healthy && snapshot.bitrate_bps > 0)
+                .min_by_key(|(_, snapshot)| snapshot.stable_bitrate_bps)
+                .map(|(index, _)| index);
             if let Some(index) = cheapest_healthy {
-                selected[index] = true;
+                let Some(selected) = selected.get_mut(index) else {
+                    debug_assert!(false, "healthy layer index must resolve");
+                    return;
+                };
+                *selected = true;
             } else {
-                for index in 0..layer_count {
-                    selected[index] = heights[index] <= ceiling;
+                for (selected, height) in selected.iter_mut().zip(heights.iter()) {
+                    *selected = *height <= ceiling;
                 }
             }
         }
 
         let first = self.rungs.len();
-        for (layer_index, layer) in track.layers.iter().enumerate() {
-            if !selected[layer_index] {
+        for (layer_index, (((layer, selected), snapshot), height)) in layers
+            .iter()
+            .zip(selected.iter())
+            .zip(snapshots.iter())
+            .zip(heights.iter())
+            .enumerate()
+        {
+            if !*selected {
                 continue;
             }
-            let snapshot = snapshots[layer_index];
             let count = usize::from(snapshot.decode_targets.max(1))
                 .min(crate::rtp::monitor::MAX_LADDER_TARGETS);
             let full_send = snapshot.bitrate_bps;
@@ -1230,7 +1254,12 @@ impl Allocation {
                 if fps < slot.min_fps {
                     continue;
                 }
-                let declared = snapshot.decode_target_kbps[decode_target].saturating_mul(1_000);
+                let declared = snapshot
+                    .decode_target_kbps
+                    .get(decode_target)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_mul(1_000);
                 let send_bps = if declared > 0 {
                     declared
                 } else {
@@ -1244,7 +1273,7 @@ impl Allocation {
                     target: DecodeTargetSelection::Target(decode_target),
                     price_bps,
                     send_bps,
-                    height: heights[layer_index],
+                    height: *height,
                     fps,
                     quality: layer.quality,
                 });
@@ -1256,40 +1285,62 @@ impl Allocation {
                     target: DecodeTargetSelection::Full,
                     price_bps: full_price,
                     send_bps: full_send,
-                    height: heights[layer_index],
+                    height: *height,
                     fps: snapshot.full_fps,
                     quality: layer.quality,
                 });
             }
         }
 
-        self.rungs[first..].sort_by(|a, b| {
+        let Some(new_rungs) = self.rungs.get_mut(first..) else {
+            debug_assert!(false, "new rung span must resolve");
+            return;
+        };
+        new_rungs.sort_by(|a, b| {
             a.price_bps
                 .cmp(&b.price_bps)
                 .then_with(|| b.height.cmp(&a.height))
         });
 
         let mut write = first;
-        for read in first..self.rungs.len() {
-            let candidate = self.rungs[read];
-            let dominated = self.rungs[first..write].iter().any(|kept| {
-                kept.price_bps <= candidate.price_bps
-                    && kept.height >= candidate.height
-                    && kept.fps >= candidate.fps
-                    && (kept.price_bps < candidate.price_bps
-                        || kept.height > candidate.height
-                        || kept.fps > candidate.fps)
-            });
+        let end = self.rungs.len();
+        for read in first..end {
+            let Some(candidate) = self.rungs.get(read).copied() else {
+                debug_assert!(false, "candidate rung index must resolve");
+                break;
+            };
+            let dominated = self
+                .rungs
+                .get(first..write)
+                .unwrap_or_default()
+                .iter()
+                .any(|kept| {
+                    kept.price_bps <= candidate.price_bps
+                        && kept.height >= candidate.height
+                        && kept.fps >= candidate.fps
+                        && (kept.price_bps < candidate.price_bps
+                            || kept.height > candidate.height
+                            || kept.fps > candidate.fps)
+                });
             if !dominated {
-                self.rungs[write] = candidate;
+                let Some(destination) = self.rungs.get_mut(write) else {
+                    debug_assert!(false, "destination rung index must resolve");
+                    break;
+                };
+                *destination = candidate;
                 write = write.saturating_add(1);
             }
         }
         self.rungs.truncate(write);
         debug_assert!(
-            self.rungs[first..]
+            self.rungs
+                .get(first..)
+                .unwrap_or_default()
                 .windows(2)
-                .all(|pair| pair[0].price_bps <= pair[1].price_bps)
+                .all(|pair| pair
+                    .first()
+                    .zip(pair.get(1))
+                    .is_some_and(|(a, b)| { a.price_bps <= b.price_bps }))
         );
         debug_assert!(self.rungs.len().saturating_sub(first) <= MAX_RUNGS_PER_SLOT);
     }
@@ -1312,7 +1363,11 @@ impl Allocation {
             let first = usize::try_from(plan.first).unwrap_or(usize::MAX);
             debug_assert!(first.saturating_add(usize::from(plan.len)) <= rungs.len());
             for index in 0..usize::from(plan.len) {
-                let rung = rungs[first + index];
+                let offset = first.saturating_add(index);
+                let Some(rung) = rungs.get(offset).copied() else {
+                    debug_assert!(false, "allocation rung index must resolve");
+                    break;
+                };
                 let retaining = plan.held.is_some_and(|held| index <= usize::from(held));
                 if !retaining && plan.switch_pending && plan.active_layer != Some(rung.layer) {
                     break;
@@ -1329,8 +1384,12 @@ impl Allocation {
                 plan.chosen = Some(u8::try_from(index).unwrap_or(u8::MAX));
             }
             if let Some(chosen) = plan.chosen {
-                spent =
-                    spent.saturating_add(u64::from(rungs[first + usize::from(chosen)].price_bps));
+                let offset = first.saturating_add(usize::from(chosen));
+                let Some(rung) = rungs.get(offset) else {
+                    debug_assert!(false, "chosen rung index must resolve");
+                    continue;
+                };
+                spent = spent.saturating_add(u64::from(rung.price_bps));
             }
             force_minimum = false;
         }
@@ -1342,9 +1401,9 @@ impl Allocation {
             .plans
             .iter()
             .filter(|plan| plan.len > 0)
-            .map(|plan| {
+            .filter_map(|plan| {
                 let last = plan.len.saturating_sub(1);
-                u64::from(self.rung(plan, last).price_bps)
+                self.rung(plan, last).map(|rung| u64::from(rung.price_bps))
             })
             .fold(0u64, u64::saturating_add);
         Bitrate::from(crate::bitrate::saturating_bps(
@@ -1356,7 +1415,8 @@ impl Allocation {
         let total = self
             .plans
             .iter()
-            .filter_map(|plan| plan.held.map(|held| self.rung(plan, held).send_bps))
+            .filter_map(|plan| plan.held.and_then(|held| self.rung(plan, held)))
+            .map(|rung| rung.send_bps)
             .map(u64::from)
             .fold(0u64, u64::saturating_add);
         Bitrate::bps(total)
@@ -1370,7 +1430,10 @@ impl Allocation {
                     return None;
                 }
                 let next = plan.chosen.map_or(0, |chosen| chosen.saturating_add(1));
-                (next < plan.len).then(|| Bitrate::bps(u64::from(self.rung(plan, next).price_bps)))
+                (next < plan.len)
+                    .then(|| self.rung(plan, next))
+                    .flatten()
+                    .map(|rung| Bitrate::bps(u64::from(rung.price_bps)))
             })
             .min_by(|a, b| a.as_f64().total_cmp(&b.as_f64()))
     }
@@ -1387,7 +1450,7 @@ impl Allocation {
                 continue;
             };
             debug_assert_eq!(track.meta.origin, plan.origin);
-            let rung = plan.chosen.map(|chosen| self.rung(plan, chosen));
+            let rung = plan.chosen.and_then(|chosen| self.rung(plan, chosen));
             let layer_index = rung.map_or(plan.pause_layer, |rung| rung.layer);
             let Some(layer) = track.layers.get(usize::from(layer_index)) else {
                 debug_assert!(false, "allocation layer index must resolve");
@@ -1404,12 +1467,12 @@ impl Allocation {
         changed
     }
 
-    fn rung(&self, plan: &SlotPlan, index: u8) -> Rung {
+    fn rung(&self, plan: &SlotPlan, index: u8) -> Option<Rung> {
         debug_assert!(index < plan.len);
         let first = usize::try_from(plan.first).unwrap_or(usize::MAX);
         let offset = first.saturating_add(usize::from(index));
         debug_assert!(offset < self.rungs.len());
-        self.rungs[offset]
+        self.rungs.get(offset).copied()
     }
 }
 
@@ -1426,7 +1489,8 @@ fn decode_target_fps(full_fps: u32, count: usize, target: usize) -> u32 {
 fn saturating_u32(value: f64) -> u32 {
     debug_assert!(value.is_finite());
     debug_assert!(value >= 0.0);
-    value.clamp(0.0, f64::from(u32::MAX)).ceil() as u32
+    let rounded = crate::bitrate::saturating_bps(value.ceil()).min(u64::from(u32::MAX));
+    u32::try_from(rounded).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -2458,7 +2522,9 @@ mod allocation_tests {
         allocation.run(Bitrate::mbps(10), Bitrate::mbps(10));
 
         let plan = allocation.plans[0];
-        let chosen = allocation.rung(&plan, plan.chosen.unwrap());
+        let chosen = allocation
+            .rung(&plan, plan.chosen.unwrap())
+            .expect("chosen rung must resolve");
         assert_eq!(chosen.layer, plan.active_layer.unwrap());
     }
 
