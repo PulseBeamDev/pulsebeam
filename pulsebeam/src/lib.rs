@@ -24,14 +24,22 @@
 //! Read `docs/thread-per-core.md` before adding one. Those rules are not style
 //! preferences; they are what keeps the design able to span more than one node.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "pulsebeam server requires Linux: its UDP steering path is Aya/eBPF \
+     (BPF_PROG_TYPE_SK_REUSEPORT). Portable crates (protocol, core, \
+     simulator) build elsewhere; the server binary does not."
+);
+
 pub mod audio_selector;
 mod bitrate;
 pub mod clock;
 pub mod control;
+#[cfg(not(feature = "sim"))]
+mod ebpf;
 pub mod entity;
-pub(crate) mod view;
-pub(crate) mod keys;
 pub mod id;
+pub(crate) mod keys;
 pub(crate) mod log;
 pub mod message;
 pub mod node;
@@ -42,6 +50,7 @@ pub mod shard;
 #[cfg(feature = "sim")]
 pub mod sim_metrics;
 pub mod track;
+pub(crate) mod view;
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]
