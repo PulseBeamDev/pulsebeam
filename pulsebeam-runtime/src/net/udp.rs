@@ -20,7 +20,7 @@ use crate::sync::Arc;
 
 use super::{
     BATCH_SIZE, MAX_UDP_GSO_PAYLOAD_SIZE, MAX_UDP_PAYLOAD_SIZE, RecvPacketBatch, SendPacket,
-    SendPacketBatch, fmt_bytes,
+    SendPacketBatch, UDP_MAX_GSO_SEGMENTS, fmt_bytes,
 };
 
 use nix::{
@@ -48,7 +48,6 @@ pub const MODE: UdpMode = UdpMode::Batch;
 pub const SOCKET_SEND_SIZE: usize = 2 * MEBIBYTE;
 pub const SOCKET_RECV_SIZE: usize = 4 * MEBIBYTE;
 
-const UDP_MAX_GSO_SEGMENTS: usize = 64;
 const GRO_SLOT_SIZE: usize = UDP_MAX_GSO_SEGMENTS * MAX_UDP_PAYLOAD_SIZE;
 const RECV_ARENA_SIZE: usize = BATCH_SIZE * GRO_SLOT_SIZE;
 

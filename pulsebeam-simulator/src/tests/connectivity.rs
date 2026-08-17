@@ -131,6 +131,174 @@ fn tcp_simulation_test() {
         ]);
 }
 
+fn cross_shard_media_room() -> Room {
+    Room::new("cross-shard-media")
+        .with_participant(Participant::single_publisher("publisher"))
+        .with_participant(Participant::subscriber("subscriber"))
+}
+
+#[test]
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+fn controller_stall_keeps_established_media_alive() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "establish media before the controller stall",
+                duration: Duration::from_secs(5),
+            },
+            Step::StallController {
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckRxBytesInterval {
+                description: "media continues while control is stalled",
+                participant: "subscriber",
+                min_bytes: 1,
+            },
+        ]);
+}
+
+/// A datagram delivered to a shard that does not own its route reaches the
+/// owner instead of being dropped.
+///
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+#[test]
+fn wrong_owner_forwards_and_media_continues() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "establish the media path",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckRoutingCounterSettles {
+                description: "steering has pinned the flows, so forwarding has stopped",
+                name: "shard_wrong_owner_forward",
+                over: Duration::from_secs(2),
+            },
+            Step::SendToWrongShard {
+                description: "inject one datagram into a foreign shard",
+                participant: "publisher",
+            },
+            Step::CheckRoutingCounterAtLeast {
+                description: "the foreign datagram is forwarded to its owner",
+                name: "shard_wrong_owner_forward",
+                min: 1,
+            },
+            Step::CheckRxBytes {
+                description: "the participant's own media remains unaffected",
+                participant: "subscriber",
+                min_bytes: 1,
+            },
+        ]);
+}
+
+/// Cross-shard forwarding is a bootstrap cost, not a steady-state one.
+///
+/// Steering is a cache: a miss lands on whatever the kernel's tuple hash picked
+/// and userspace forwards it to the route's owner. Once the flow authenticates,
+/// control pins it and the forwarding stops. Nothing else notices if that
+/// pinning never happens — media still arrives, just across a core boundary on
+/// every packet — so the property worth holding is that the rate reaches zero.
+#[test]
+fn steering_stops_cross_shard_forwarding_once_flows_authenticate() {
+    LocalNodeSim::new()
+        .with_shards(4)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "let every flow authenticate",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckRoutingCounterSettles {
+                description: "no packet crosses a shard boundary at steady state",
+                name: "shard_wrong_owner_forward",
+                over: Duration::from_secs(3),
+            },
+            Step::CheckRxBytesInterval {
+                description: "and media is still flowing while it does not",
+                participant: "subscriber",
+                min_bytes: 1,
+            },
+        ]);
+}
+
+#[test]
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+fn failed_materialization_does_not_connect_the_participant() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("materialization-failure")
+                .with_participant(Participant::single_publisher("publisher"))
+                .with_participant(Participant::subscriber("subscriber").starts_disconnected()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "establish the publisher before the injected failure",
+                duration: Duration::from_secs(5),
+            },
+            Step::FailNextMaterialization {
+                description: "fail the next participant materialization",
+            },
+            Step::Join {
+                description: "attempt the failed materialization",
+                participant: "subscriber",
+            },
+            Step::Run {
+                description: "allow the failed command to drain",
+                duration: Duration::from_secs(2),
+            },
+            Step::CheckRoutingCounter {
+                description: "the injected failure was consumed",
+                name: "materialization_failed",
+                exact: 1,
+            },
+            Step::CheckRoutingCounter {
+                description: "failed materialization leaves no participant key behind",
+                name: "materialization_orphan",
+                exact: 0,
+            },
+        ]);
+}
+
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+#[test]
+fn track_observation_is_not_forwarded_before_plan() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(cross_shard_media_room())
+        .run(vec![
+            Step::Run {
+                description: "settle observation, publication, and plan in order",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckMediaRouted {
+                description: "steady-state forwarding uses a compiled plan",
+                participant: "subscriber",
+            },
+        ]);
+
+    for (lane, stage, origin) in [
+        ("video", "plan", "local"),
+        ("video", "plan", "remote"),
+        ("audio", "plan", "local"),
+        ("audio", "plan", "remote"),
+        ("data", "plan", "local"),
+        ("data", "plan", "remote"),
+        ("reliable", "plan", "local"),
+        ("reliable", "plan", "remote"),
+    ] {
+        assert_eq!(
+            pulsebeam::sim_metrics::routing_drop(lane, stage, origin),
+            0,
+            "steady-state routing must not observe {lane} before the {stage}"
+        );
+    }
+}
+
 /// Reproduces the Chrome-with-UDP-disabled failure: with two shards the hash of
 /// a client's `peer_addr` and the hash of `room_id` can land on different shards,
 /// causing TCP egress to be silently dropped.
@@ -477,6 +645,11 @@ fn video_survives_failing_route_installs_test() {
                 .with_participant(Participant::single_publisher("joiner").starts_disconnected()),
         )
         .run(vec![
+            Step::ForceFailure {
+                description: "The very first route a publisher needs cannot be allocated",
+                site: "route table exhausted",
+                count: 1,
+            },
             Step::Run {
                 description: "Establish the stable pair",
                 duration: Duration::from_secs(10),
@@ -504,9 +677,10 @@ fn video_survives_failing_route_installs_test() {
             },
         ]);
 
-    // Without this the plan passes hardest when it injects nothing. At 80 per thousand and a
-    // handful of install calls it injected nothing at all on the first seed tried, and looked
-    // exactly like a pass.
+    // Buggify decides where the rest of the failures land, but not whether any
+    // do. At this rate and a handful of allocations, several seeds injected
+    // nothing at all and the plan degraded into asserting the happy path —
+    // which is why the first failure is forced rather than drawn.
     let (_, fired) = pulsebeam_runtime::buggify::coverage();
     assert!(
         !fired.is_empty(),
@@ -522,12 +696,21 @@ fn video_survives_failing_route_installs_test() {
 /// quietly stopped doing anything.
 #[test]
 fn every_declared_failure_point_is_reachable_test() {
+    // Enough participants that the room allocates routes tens of times, not
+    // twice. At 50% per site and a handful of reaches, "none fired" is a coin
+    // toss the plan loses often enough to look like flakiness — and it reads as
+    // the injector being broken, which is the one thing this exists to detect.
+    // The count is what makes the claim true at every seed rather than most.
     LocalNodeSim::new()
         .with_buggify(500)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
-                .with_participant(Participant::subscriber("bob")),
+                .with_participant(Participant::single_publisher("carol"))
+                .with_participant(Participant::single_publisher("dave"))
+                .with_participant(Participant::single_publisher("erin"))
+                .with_participant(Participant::subscriber("bob"))
+                .with_participant(Participant::subscriber("frank")),
         )
         .run(vec![Step::Run {
             description: "Enough traffic to reach the route table",
@@ -568,7 +751,12 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
             Step::CheckVideoQuality {
                 description: "The viewer can see her",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50),
+                // One unrecovered gap is what a cellular link does: 1% loss over
+                // this many packets outruns retransmission occasionally. Zero is
+                // the right budget for `fiber()`, not for this one. A botched
+                // switch is still caught — it produces gaps by the handful, and
+                // a timestamp regression with them.
+                quality: VideoQuality::min_frames(50).allow_gaps(1),
             },
             Step::Disconnect {
                 description: "Alice drops out",
