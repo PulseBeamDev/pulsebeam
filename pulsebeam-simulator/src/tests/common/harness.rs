@@ -3563,8 +3563,17 @@ pub struct LinkProfile {
     /// return path clean, which is the right choice only when a plan is deliberately isolating
     /// the forward direction.
     pub feedback: Option<FeedbackProfile>,
+    /// How long the receiver may coalesce same-source datagrams into one GRO
+    /// batch.
+    ///
+    /// A NAPI poll interval, so it belongs to the NIC rather than to the shard
+    /// scheduler — pinning it to the timer quantum only looked right while the
+    /// two happened to share a value.
     pub gro_window: Duration,
 }
+
+/// See [`LinkProfile::gro_window`].
+pub const GRO_WINDOW: Duration = Duration::from_micros(100);
 
 /// Impairment on the path carrying transport feedback back to the SFU.
 #[derive(Clone, Copy, Debug, Default)]
@@ -3603,7 +3612,7 @@ impl LinkProfile {
             reorder: Reorder::NONE,
             duplicate: 0.0,
             feedback: None,
-            gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
+            gro_window: GRO_WINDOW,
         }
     }
 
@@ -3618,7 +3627,7 @@ impl LinkProfile {
             reorder: Reorder::occasional(),
             duplicate: 0.0005,
             feedback: Some(FeedbackProfile::wifi()),
-            gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
+            gro_window: GRO_WINDOW,
         }
     }
 
@@ -3634,7 +3643,7 @@ impl LinkProfile {
             reorder: Reorder::occasional(),
             duplicate: 0.001,
             feedback: Some(FeedbackProfile::cellular()),
-            gro_window: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
+            gro_window: GRO_WINDOW,
         }
     }
 }

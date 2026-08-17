@@ -4,16 +4,16 @@ use tokio::time::Instant;
 
 use super::participants::ParticipantKey;
 
-const SLOT_COUNT: usize = 1024;
+const SLOT_COUNT: usize = 256;
 const OCCUPANCY_WORDS: usize = SLOT_COUNT / u64::BITS as usize;
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "SLOT_COUNT is 1024 and fits in u16, asserted below"
+    reason = "SLOT_COUNT is 256, asserted below"
 )]
 const DUE_LOCATION: u16 = SLOT_COUNT as u16;
-const _: () = assert!(SLOT_COUNT == 1024, "slot_of() relies on a 1024-slot wheel");
+const _: () = assert!(SLOT_COUNT == 256, "slot_of() relies on a 256-slot wheel");
 const DISARMED_LOCATION: u16 = DUE_LOCATION + 1;
-const MAX_DEADLINE_TICKS: u64 = 1001;
+const MAX_DEADLINE_TICKS: u64 = 101;
 
 /// The wheel slot a tick falls in.
 ///
@@ -22,10 +22,10 @@ const MAX_DEADLINE_TICKS: u64 = 1001;
 fn slot_of(tick: u64) -> u16 {
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "the 1024-slot mask fits in u16"
+        reason = "the 256-slot mask fits in u16"
     )]
     {
-        (tick & 1023) as u16
+        (tick & 255) as u16
     }
 }
 
@@ -369,6 +369,22 @@ impl TimerWheel {
 #[cfg(test)]
 mod tests {
 
+    /// Word boundaries and their neighbours, plus the wrap point: the slots
+    /// where scanning a word at a time can disagree with scanning a slot at a
+    /// time. Derived from `SLOT_COUNT` rather than written out, so resizing the
+    /// wheel cannot leave this pointing at slots that no longer exist.
+    fn boundary_slots() -> Vec<usize> {
+        let mut slots = vec![0, 1];
+        for word_start in (64..SLOT_COUNT).step_by(64) {
+            slots.extend([word_start - 1, word_start, word_start + 1]);
+        }
+        slots.push(SLOT_COUNT - 1);
+        slots.retain(|slot| *slot < SLOT_COUNT);
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
     #[test]
     fn word_scanning_agrees_with_a_naive_slot_scan() {
         fn naive(wheel: &TimerWheel, start: usize) -> Option<u64> {
@@ -388,10 +404,9 @@ mod tests {
             );
         }
 
-        let starts = [0, 1, 63, 64, 65, 255, 256, 511, 512, 767, 768, 1023];
         for armed in 0..SLOT_COUNT {
             wheel.set_occupied(armed);
-            for start in starts {
+            for start in boundary_slots() {
                 assert_eq!(
                     wheel.next_occupied_from(start),
                     naive(&wheel, start),
@@ -402,9 +417,7 @@ mod tests {
         }
 
         // A scattered pattern that straddles every word boundary.
-        for armed in [
-            0, 1, 63, 64, 65, 127, 128, 191, 192, 255, 256, 511, 512, 767, 768, 1023,
-        ] {
+        for armed in boundary_slots() {
             wheel.set_occupied(armed);
         }
         for start in 0..SLOT_COUNT {
@@ -431,14 +444,14 @@ mod tests {
         let mut wheel = TimerWheel::new(16);
         let key = keys(1)[0];
         let start = wheel.epoch;
-        wheel.schedule(key, start + Duration::from_micros(101));
+        wheel.schedule(key, start + Duration::from_micros(1_001));
 
         let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_micros(199), |entry| {
+        wheel.drain_expired(start + Duration::from_micros(1_999), |entry| {
             expired.push(entry);
         });
         assert!(expired.is_empty());
-        wheel.drain_expired(start + Duration::from_micros(200), |entry| {
+        wheel.drain_expired(start + Duration::from_millis(2), |entry| {
             expired.push(entry);
         });
         assert_eq!(expired, vec![key]);

@@ -33,4 +33,4 @@ pub mod sync;
 pub mod system;
 pub mod testing;
 
-pub const SHARD_TIMER_QUANTUM: std::time::Duration = std::time::Duration::from_micros(100);
+pub const SHARD_TIMER_QUANTUM: std::time::Duration = std::time::Duration::from_millis(1);
