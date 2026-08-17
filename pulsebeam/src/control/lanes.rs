@@ -124,11 +124,54 @@ impl<C> StreamBinding<C> {
 /// stream, then by the subscriber's shard.
 type PendingSubscribers<C> = HashMap<ShardId, HashMap<ParticipantId, Subscriber<C>>>;
 
+/// Which publishers are live on each topic.
+///
+/// A wildcard subscription has to name every stream on its topic, and without
+/// this that means walking every stream on the node. Kept beside the bindings
+/// rather than derived from them, so it is one lookup instead of one scan.
+#[derive(Default)]
+struct TopicIndex {
+    publishers: HashMap<(RoomId, Topic), Vec<ParticipantId>>,
+}
+
+impl TopicIndex {
+    fn insert(&mut self, id: &DataStreamId) {
+        let publishers = self
+            .publishers
+            .entry((id.room_id, id.topic.clone()))
+            .or_default();
+        if !publishers.contains(&id.publisher_id) {
+            publishers.push(id.publisher_id);
+        }
+    }
+
+    fn remove(&mut self, id: &DataStreamId) {
+        let key = (id.room_id, id.topic.clone());
+        let Some(publishers) = self.publishers.get_mut(&key) else {
+            return;
+        };
+        publishers.retain(|publisher| *publisher != id.publisher_id);
+        if publishers.is_empty() {
+            self.publishers.remove(&key);
+        }
+    }
+
+    fn streams(&self, room: &RoomId, topic: &Topic) -> Vec<DataStreamId> {
+        self.publishers
+            .get(&(*room, topic.clone()))
+            .into_iter()
+            .flatten()
+            .map(|publisher| DataStreamId::new(*room, *publisher, topic.clone()))
+            .collect()
+    }
+}
+
 pub(crate) struct LaneRegistry<C = DefaultChannel> {
     lane: StreamLane,
     bindings: HashMap<DataStreamId, StreamBinding<C>>,
     pending: HashMap<DataStreamId, PendingSubscribers<C>>,
     wildcards: HashMap<(RoomId, Topic), HashMap<ParticipantId, WildcardSubscriber<C>>>,
+    by_topic: TopicIndex,
 }
 
 impl<C: Copy> LaneRegistry<C> {
@@ -138,6 +181,7 @@ impl<C: Copy> LaneRegistry<C> {
             bindings: HashMap::new(),
             pending: HashMap::new(),
             wildcards: HashMap::new(),
+            by_topic: TopicIndex::default(),
         }
     }
 
@@ -150,17 +194,14 @@ impl<C: Copy> LaneRegistry<C> {
     }
 
     pub(crate) fn remove(&mut self, id: &DataStreamId) -> Option<StreamBinding<C>> {
+        self.by_topic.remove(id);
         self.bindings.remove(id)
     }
 
     /// Every live stream carrying `topic` in `room`. The set a wildcard
     /// subscription resolves to at the moment it is made.
     pub(crate) fn ids_on_topic(&self, room: &RoomId, topic: &Topic) -> Vec<DataStreamId> {
-        self.bindings
-            .keys()
-            .filter(|id| id.room_id == *room && id.topic == *topic)
-            .cloned()
-            .collect()
+        self.by_topic.streams(room, topic)
     }
 
     /// Publish `id`, draining anyone who subscribed before it existed.
@@ -177,6 +218,7 @@ impl<C: Copy> LaneRegistry<C> {
             "runtime key does not belong to this lane"
         );
         let pending = self.pending.remove(&id);
+        self.by_topic.insert(&id);
         let binding = self
             .bindings
             .entry(id)

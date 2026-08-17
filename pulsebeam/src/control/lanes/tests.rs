@@ -261,7 +261,11 @@ fn subscribers_on_different_shards_are_filed_separately() {
     reg.subscribe(id.clone(), shard(1), participant(9), subscriber(9));
 
     let binding = reg.get(&id).expect("binding");
-    assert_eq!(binding.subscribers.len(), 2, "one entry per subscriber shard");
+    assert_eq!(
+        binding.subscribers.len(),
+        2,
+        "one entry per subscriber shard"
+    );
     assert!(binding.subscribers[&shard(0)].contains_key(&participant(8)));
     assert!(binding.subscribers[&shard(1)].contains_key(&participant(9)));
 }
@@ -294,12 +298,74 @@ fn ids_on_topic_is_scoped_to_the_room() {
     let here = stream(participant(1), "chat");
     ready(&mut reg, &here, shard(0));
 
-    let elsewhere = DataStreamId::new(
-        room_named("other"),
-        participant(2),
-        topic("chat"),
-    );
+    let elsewhere = DataStreamId::new(room_named("other"), participant(2), topic("chat"));
     ready(&mut reg, &elsewhere, shard(0));
 
     assert_eq!(reg.ids_on_topic(&room(), &topic("chat")), vec![here]);
+}
+
+/// The topic index exists so a wildcard is a lookup instead of a scan. It is
+/// only safe while it agrees with the bindings it summarises, so every test
+/// that mutates the registry checks it.
+fn assert_index_agrees(reg: &Registry) {
+    let mut indexed: Vec<_> = reg
+        .by_topic
+        .publishers
+        .iter()
+        .flat_map(|((room, topic), publishers)| {
+            publishers
+                .iter()
+                .map(|publisher| DataStreamId::new(*room, *publisher, topic.clone()))
+        })
+        .collect();
+    let mut bound: Vec<_> = reg.bindings.keys().cloned().collect();
+    let sort_key = |id: &DataStreamId| (id.publisher_id, id.topic.as_ref().to_owned());
+    indexed.sort_by_key(sort_key);
+    bound.sort_by_key(sort_key);
+    assert_eq!(indexed, bound, "topic index disagrees with the bindings");
+}
+
+#[test]
+fn the_topic_index_tracks_every_declare_and_remove() {
+    let mut reg = Registry::new(StreamLane::Data);
+    assert_index_agrees(&reg);
+
+    let first = stream(participant(1), "chat");
+    let second = stream(participant(2), "chat");
+    let other = stream(participant(3), "telemetry");
+    for id in [&first, &second, &other] {
+        ready(&mut reg, id, shard(0));
+        assert_index_agrees(&reg);
+    }
+
+    assert_eq!(reg.ids_on_topic(&room(), &topic("chat")).len(), 2);
+
+    reg.remove(&first);
+    assert_index_agrees(&reg);
+    assert_eq!(
+        reg.ids_on_topic(&room(), &topic("chat")),
+        vec![second.clone()],
+        "removing one publisher must leave the others on the topic"
+    );
+
+    reg.remove(&second);
+    reg.remove(&other);
+    assert_index_agrees(&reg);
+    assert!(reg.ids_on_topic(&room(), &topic("chat")).is_empty());
+}
+
+#[test]
+fn declaring_the_same_stream_twice_does_not_duplicate_it_on_its_topic() {
+    let mut reg = Registry::new(StreamLane::Data);
+    let id = stream(participant(1), "chat");
+
+    ready(&mut reg, &id, shard(0));
+    ready(&mut reg, &id, shard(0));
+
+    assert_eq!(
+        reg.ids_on_topic(&room(), &topic("chat")),
+        vec![id],
+        "a re-declared stream must appear on its topic exactly once"
+    );
+    assert_index_agrees(&reg);
 }
