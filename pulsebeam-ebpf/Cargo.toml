@@ -1,0 +1,32 @@
+[package]
+name = "pulsebeam-ebpf"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pulsebeam-ebpf"
+path = "src/main.rs"
+
+# `aya-ebpf` is itself `#![no_std]` and happens to compile fine on a hosted
+# target too (its bpf-only bits, like `feature(asm_experimental_arch)`, are
+# behind `cfg(target_arch = "bpf")` internally), but there is no reason to
+# pull it into the host build graph at all: nothing outside `mod bpf` in
+# `src/main.rs` names it, and that module is itself `cfg(target_arch =
+# "bpf")`-gated.
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = { workspace = true }
+
+[dependencies]
+pulsebeam-routing = { path = "../pulsebeam-routing" }
+
+[build-dependencies]
+sha2 = "0.10"
