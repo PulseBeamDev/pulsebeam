@@ -21,7 +21,14 @@ use crate::id::ShardId;
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::route::RouteHandle;
 
-/// One destination shard's interest in one stream.
+/// One destination shard's interest in one stream: who wants it there, and
+/// the route serving them.
+///
+/// The destination-local forwarding key is deliberately *not* here. It
+/// outlives the interest — video keeps its fanout key across an unsubscribe so
+/// a resubscribe does not mint a second one and abandon the first in the
+/// arena — so tying it to a record that dies with the last subscriber would
+/// leak arena slots.
 #[derive(Debug)]
 struct Interest<S> {
     subscribers: IndexMap<ParticipantId, S>,
