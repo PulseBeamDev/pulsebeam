@@ -1611,7 +1611,10 @@ impl AllocationEngine {
             // floor; else leave paused.
             if let Some(floor) = self.floor_layer(slot) {
                 let cost = self.stable_cost(floor);
-                let threshold = if slot.forwarding && slot.current_quality >= floor.quality {
+                let resuming = !slot.forwarding;
+                let threshold = if resuming {
+                    cost + reserve
+                } else if slot.current_quality >= floor.quality {
                     cost * Self::DOWNGRADE_FACTOR
                 } else {
                     cost
