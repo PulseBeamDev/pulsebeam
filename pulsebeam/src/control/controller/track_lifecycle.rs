@@ -522,8 +522,7 @@ impl ControllerActor {
             shard_id,
             track.id,
             subscriber,
-            subscriber_key,
-            slot,
+            (subscriber_key, slot),
             track.shard_id,
         );
         {
