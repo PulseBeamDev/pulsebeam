@@ -1,6 +1,7 @@
 pub mod api;
 pub mod controller;
 pub(crate) mod core;
+pub(crate) mod lanes;
 mod negotiator;
 mod registry;
 mod room;
