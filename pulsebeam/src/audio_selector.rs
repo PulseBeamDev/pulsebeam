@@ -1,16 +1,22 @@
 use std::time::Duration;
 
-use pulsebeam_runtime::rand::RngCore;
+use slotmap::SecondaryMap;
 use tokio::time::Instant;
 
 use crate::{
     control::MAX_SEND_AUDIO_SLOTS,
     id::AudioSelectorSlotId,
     rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline},
-    track::StreamId,
+    shard::router::TrackKey,
 };
+use str0m::media::Rid;
 
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
+
+/// A stream's identity for slot ownership, addressed by the shard's own
+/// fanout key rather than the track's name — resolving a `TrackId` here
+/// measured the same cost the rest of the forwarding path stopped paying.
+pub(crate) type AudioStreamKey = (TrackKey, Option<Rid>);
 
 /// Slot is considered dead if no packet has arrived within this window.
 const DEAD_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -27,7 +33,7 @@ struct SlotTimeline {
 }
 
 struct SlotState {
-    owner: Option<StreamId>,
+    owner: Option<AudioStreamKey>,
     /// Wall-clock time of the most recent packet. `None` means the
     /// slot has never been used.
     last_arrival_ts: Option<Instant>,
@@ -57,10 +63,17 @@ impl SlotState {
 
 pub struct TopNAudioSelector {
     slots: [SlotState; SELECTOR_SLOTS],
+    owner_slots: SecondaryMap<TrackKey, AudioSelectorSlotId>,
+}
+
+impl Default for TopNAudioSelector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TopNAudioSelector {
-    pub fn new<R: RngCore>(rng: &mut R) -> Self {
+    pub fn new() -> Self {
         // immunity_expiry is set to Instant::now() at construction; any packet arriving
         // later will have now >= construction_time, so is_immune() returns false.
         let init_instant = Instant::now();
@@ -71,24 +84,25 @@ impl TopNAudioSelector {
                 immunity_expiry: init_instant,
                 last_power: 0.0,
                 slot_timeline: SlotTimeline {
-                    timeline: Timeline::new(AUDIO_FREQUENCY, rng),
+                    timeline: Timeline::new(AUDIO_FREQUENCY),
                     pending_marker: false,
                 },
             }),
+            owner_slots: SecondaryMap::new(),
         }
     }
 
     #[inline]
-    pub fn filter(
+    pub(crate) fn filter(
         &mut self,
-        stream_id: StreamId,
+        stream_id: AudioStreamKey,
         pkt: &mut RtpPacket,
     ) -> Option<AudioSelectorSlotId> {
         // Step 1: Parse relative power and wall-clock arrival time.
         let Some(audio_level) = pkt.ext_vals.audio_level else {
             tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
-                stream_id = %stream_id.0,
+                stream_id = ?stream_id.0,
                 "audio selector dropped packet due to missing audio level"
             );
             return None;
@@ -103,8 +117,13 @@ impl TopNAudioSelector {
         }
 
         // Step 2: Owner fast-path — update timestamps and forward.
-        let owner_slot = self.slots.iter().position(|s| s.owner == Some(stream_id));
-        if let Some((idx, slot)) = owner_slot.and_then(|i| self.slots.get_mut(i).map(|s| (i, s))) {
+        let owner_slot = self.owner_slots.get(stream_id.0).copied();
+        if let Some((idx, slot)) = owner_slot.and_then(|slot_id| {
+            self.slots
+                .get_mut(slot_id.index())
+                .filter(|slot| slot.owner == Some(stream_id))
+                .map(|slot| (slot_id.index(), slot))
+        }) {
             slot.last_arrival_ts = Some(now);
             // Peak-hold with decay: a single quiet packet must not instantly demote rank.
             slot.last_power = slot.last_power.max(power);
@@ -137,7 +156,7 @@ impl TopNAudioSelector {
             } else {
                 tracing::debug!(
                     target: crate::log::TARGET_AUDIO,
-                    stream_id = %stream_id.0,
+                    stream_id = ?stream_id.0,
                     incoming_power = power,
                     quietest_power = quietest_slot.last_power,
                     quietest_slot = quietest_idx,
@@ -150,7 +169,12 @@ impl TopNAudioSelector {
         // Step 5: Execute the steal.
         let victim_idx = victim?;
         let slot = self.slots.get_mut(victim_idx)?;
+        if let Some(previous) = slot.owner {
+            let _ = self.owner_slots.remove(previous.0);
+        }
         slot.owner = Some(stream_id);
+        let slot_id = AudioSelectorSlotId::new(victim_idx);
+        let _ = self.owner_slots.insert(stream_id.0, slot_id);
         slot.last_arrival_ts = Some(now);
         slot.immunity_expiry = now.checked_add(NEWBORN_IMMUNITY).unwrap_or(now);
         slot.last_power = power;
@@ -171,10 +195,12 @@ impl TopNAudioSelector {
         }
     }
 
-    pub fn remove_track(&mut self, id: StreamId) {
+    #[cfg(test)]
+    pub(crate) fn remove_track(&mut self, id: AudioStreamKey) {
         for slot in &mut self.slots {
             if slot.owner == Some(id) {
                 slot.owner = None;
+                let _ = self.owner_slots.remove(id.0);
                 break;
             }
         }
@@ -183,8 +209,11 @@ impl TopNAudioSelector {
     pub fn cleanup(&mut self) -> Option<()> {
         let now = Instant::now();
         for slot in &mut self.slots {
-            if slot.owner.is_some() && slot.is_dead(now) {
-                slot.owner = None;
+            if slot.owner.is_some()
+                && slot.is_dead(now)
+                && let Some(owner) = slot.owner.take()
+            {
+                let _ = self.owner_slots.remove(owner.0);
             }
         }
         Some(())
@@ -223,33 +252,30 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     // A fixture that overflows should fail the test, not clamp into a pass.
     use super::*;
+    use std::cell::RefCell;
     use std::time::Duration;
 
     use str0m::rtp::ExtensionValues;
     use tokio::time::Instant;
 
-    use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp::RtpPacket;
-    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
 
     const TICK_MS: u64 = 20;
 
-    fn test_rng() -> impl RngCore {
-        seeded_rng(42)
-    }
-
     fn new_sel() -> TopNAudioSelector {
-        TopNAudioSelector::new(&mut test_rng())
+        TopNAudioSelector::new()
     }
 
-    fn make_stream() -> StreamId {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        (
-            ParticipantId::new(&mut seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed)))
-                .derive_track_id(TrackKind::Audio, "test"),
-            None,
-        )
+    thread_local! {
+        static TRACK_KEYS: RefCell<slotmap::SlotMap<TrackKey, ()>> =
+            RefCell::new(slotmap::SlotMap::with_key());
+    }
+
+    /// A fresh, distinct fanout key — the selector never looks the key back
+    /// up, so an unbacked one is fine here.
+    fn make_stream() -> AudioStreamKey {
+        let key = TRACK_KEYS.with(|keys| keys.borrow_mut().insert(()));
+        (key, None)
     }
 
     /// Build a packet with the given audio level arriving at `arrival_ts`.
@@ -323,7 +349,7 @@ mod tests {
         base: Instant,
         start_ms: u64,
         level: i8,
-    ) -> StreamId {
+    ) -> AudioStreamKey {
         let id = make_stream();
         for t in 0..5u64 {
             sel.filter(id, &mut pkt_at(base, start_ms + t * TICK_MS, level));
@@ -337,13 +363,13 @@ mod tests {
         base: Instant,
         start_ms: u64,
         level: i8,
-    ) -> Vec<StreamId> {
+    ) -> Vec<AudioStreamKey> {
         (0..SELECTOR_SLOTS)
             .map(|_| add_stream_at_level(sel, base, start_ms, level))
             .collect()
     }
 
-    fn slot_owners(sel: &TopNAudioSelector) -> Vec<Option<StreamId>> {
+    fn slot_owners(sel: &TopNAudioSelector) -> Vec<Option<AudioStreamKey>> {
         sel.slots.iter().map(|s| s.owner).collect()
     }
 

@@ -270,8 +270,11 @@ pub enum ExpandError {
 ///
 /// The reference chains: the first expansion resolves against the full NTP64
 /// delivered at route installation, and every one after that against the
-/// previously expanded value. The receiving host's own wall clock is never
-/// consulted, so expansion stays correct under clock skew.
+/// previously expanded value. The receiving host's own wall clock is
+/// consulted exactly once — at route installation, via `wall.ntp()`, to seed
+/// that initial reference — and never again: every later expansion chains off
+/// the previous expanded value instead of a fresh clock read, so it stays
+/// correct under clock skew that develops after installation.
 #[derive(Debug, Clone, Copy)]
 pub struct NtpExpander {
     reference: NtpTime,
