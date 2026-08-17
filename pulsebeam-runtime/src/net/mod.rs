@@ -12,6 +12,8 @@ pub mod udp;
 pub mod udp;
 
 pub use bound_udp::{BoundUdpSocket, bind_udp_socket};
+#[cfg(feature = "sim")]
+pub use bound_udp::{install_steering_flow, set_wrong_owner_injection};
 
 use std::{io, net::SocketAddr};
 
@@ -23,6 +25,7 @@ pub const BATCH_SIZE: usize = 32;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 1500;
 pub const MAX_UDP_GSO_PAYLOAD_SIZE: usize = u16::MAX as usize;
+pub const UDP_MAX_GSO_SEGMENTS: usize = 64;
 
 #[cfg(not(feature = "sim"))]
 fn bind_scalar_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
@@ -121,9 +124,10 @@ pub async fn bind(
     addr: SocketAddr,
     transport: Transport,
     external_addr: Option<SocketAddr>,
+    shard_index: u16,
 ) -> io::Result<UnifiedSocket> {
     let sock = match transport {
-        Transport::Udp(mode) => bind_udp_socket(addr, mode, external_addr)
+        Transport::Udp(mode) => bind_udp_socket(addr, mode, external_addr, shard_index)
             .await?
             .into_unified_socket()?,
         Transport::Tcp => {

@@ -24,6 +24,7 @@ libc = "0.2.186"
 once_cell = "1.21.4"
 parking_lot = { version = "0.12", optional = true }
 pulsebeam-core = { path = "../pulsebeam-core" }
+pulsebeam-routing = { path = "../pulsebeam-routing", optional = true }
 rand = { workspace = true }
 systemstat = "0.2.7"
 tachyonix = "0.3.1"
@@ -47,4 +48,4 @@ futures-test = "0.3.32"
 default = ["parking_lot"]
 deep-metrics = []
 parking_lot = ["dep:parking_lot", "once_cell/parking_lot"]
-sim = ["pulsebeam-core/sim", "dep:turmoil"]
+sim = ["pulsebeam-core/sim", "dep:turmoil", "dep:pulsebeam-routing"]

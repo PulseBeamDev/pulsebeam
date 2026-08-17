@@ -594,8 +594,10 @@ async fn bind_udp_sockets(
 ) -> Result<Vec<net::BoundUdpSocket>> {
     let mut sockets = Vec::with_capacity(workers);
 
-    for _ in 0..workers {
-        let socket = match net::bind_udp_socket(local_addr, mode, advertised_addr).await {
+    for shard_index in 0..workers {
+        let shard_index = u16::try_from(shard_index).unwrap_or(u16::MAX);
+        let socket = match net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await
+        {
             Ok(s) => s,
             Err(e) if sockets.is_empty() => {
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
