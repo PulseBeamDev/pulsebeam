@@ -6,9 +6,10 @@ use ahash::{HashMap, HashMapExt};
 use crate::control::state::ControlPlaneState;
 use crate::{
     control::{
-        core::{ControllerCore, ControllerEvent, ControllerEventQueue, RoomPlacement},
+        core::{ControllerCore, RoomPlacement},
         lanes::{Lanes, StreamLane, Subscriber, WildcardSubscriber},
         negotiator::{Negotiator, NegotiatorError},
+        outbox::{ControllerEvent, ControllerEventQueue},
         pending::{PendingSubscription, PendingSubscriptions},
         router::ShardRouter,
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},

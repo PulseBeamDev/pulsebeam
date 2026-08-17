@@ -1,48 +1,13 @@
-use std::collections::VecDeque;
-
 use crate::{
     control::{controller::ParticipantState, registry::RoomRegistry},
     entity::{ParticipantId, RoomId},
     id::ShardId,
     participant::ParticipantConfig,
-    shard::worker::{ShardCommand, ShardEvent, ShardEventMessage},
+    shard::worker::{ShardEvent, ShardEventMessage},
 };
 use str0m::Rtc;
 
 pub const DEFAULT_ROOM_SHARD_SLOT: usize = 16;
-
-#[derive(Debug)]
-pub enum ControllerEvent {
-    ShardCommandSent(ShardId, ShardCommand),
-}
-
-pub struct ControllerEventQueue {
-    queue: VecDeque<ControllerEvent>,
-    shard_count: usize,
-}
-
-impl ControllerEventQueue {
-    pub fn new(shard_count: usize) -> Self {
-        debug_assert!(shard_count > 0);
-        Self {
-            queue: VecDeque::with_capacity(64),
-            shard_count,
-        }
-    }
-
-    pub fn push(&mut self, event: ControllerEvent) {
-        self.queue.push_back(event);
-    }
-
-    pub fn pop(&mut self) -> Option<ControllerEvent> {
-        self.queue.pop_front()
-    }
-
-    pub fn send(&mut self, shard_id: ShardId, command: ShardCommand) {
-        debug_assert!(shard_id.index() < self.shard_count);
-        self.push(ControllerEvent::ShardCommandSent(shard_id, command));
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomPlacement {
