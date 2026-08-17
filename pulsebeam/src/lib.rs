@@ -29,6 +29,8 @@ mod bitrate;
 pub mod clock;
 pub mod control;
 pub mod entity;
+pub(crate) mod view;
+pub(crate) mod keys;
 pub mod id;
 pub(crate) mod log;
 pub mod message;
