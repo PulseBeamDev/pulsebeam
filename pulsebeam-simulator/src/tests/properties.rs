@@ -398,6 +398,13 @@ enum Budget {
     /// them nearly vacuous: with capacity at several times demand nothing has to be given up, so
     /// an allocator that starves a co-tenant the moment budget is tight would pass.
     Tight,
+    /// Not enough for everything, so something has to be given up.
+    ///
+    /// `Tight` cannot force that: it admits only capacities at or above demand, so the allocator
+    /// can serve every stream and merely lowers quality. A property about *shedding* needs a link
+    /// that cannot carry the whole demand, or its precondition is never met and the run is spent
+    /// simulating cases it then discards.
+    Starved,
 }
 
 impl Budget {
@@ -406,6 +413,11 @@ impl Budget {
             Budget::Ample => capacity_bps >= demand_bps.saturating_mul(2),
             Budget::Tight => {
                 capacity_bps >= demand_bps && capacity_bps < demand_bps.saturating_mul(3) / 2
+            }
+            // Below demand, but not so far below that nothing can be served at all - a link that
+            // carries no stream tests the floor, not the choice of what to drop.
+            Budget::Starved => {
+                capacity_bps < demand_bps && capacity_bps.saturating_mul(4) >= demand_bps
             }
         }
     }
@@ -700,6 +712,12 @@ fn config(cases: u32) -> ProptestConfig {
         // this many is a real sample of it.
         cases,
         max_shrink_iters: 8,
+        // Every case here is a full simulation, and `prop_assume!` in these properties rejects
+        // *after* running one. proptest's default budget of 1024 rejects would therefore spend
+        // eighty-five simulations per case it wants, which reads as a hung suite rather than a
+        // failing one. Bounding it to the case count makes an unmet precondition fail fast and
+        // say so.
+        max_global_rejects: cases,
         failure_persistence: Some(Box::new(
             proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
         )),
@@ -930,13 +948,19 @@ fn a_stream_with_layers_to_shed_keeps_moving() {
 /// the media alone the two are identical - a paused stream and a dead connection are both an
 /// absence of packets - so the client can only draw the right thing if it was told.
 ///
-/// The generator runs tight links so the allocator has to shed something. Whenever it does, the
-/// viewer must have heard about it.
+/// The generator runs *starved* links, so the allocator genuinely cannot carry everything and has
+/// to drop something. Whenever it does, the viewer must have heard about it.
+///
+/// It ran `Budget::Tight` until a keyframe defect was fixed, and that was never right: `Tight`
+/// admits only capacities at or above demand, so nothing has to be shed and the allocator merely
+/// lowers quality. The cases it was accepting were streams stuck at quality 0 because they had
+/// never received a keyframe - broken, not shed - so the property was being fed by the bug rather
+/// than by the behaviour it describes.
 #[test]
 fn a_stream_the_sfu_sheds_is_signalled_not_just_silent() {
     check(
         SATURATED,
-        scenarios(Demand::contended(), Budget::Tight, NO_FAULT),
+        scenarios(Demand::contended(), Budget::Starved, NO_FAULT),
         |scenario| {
             let report = scenario.run("pause_signalled");
             prop_assume!(report.samples > 0);
