@@ -45,6 +45,7 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[test]
@@ -712,12 +713,17 @@ fn config(cases: u32) -> ProptestConfig {
         // this many is a real sample of it.
         cases,
         max_shrink_iters: 8,
-        // Every case here is a full simulation, and `prop_assume!` in these properties rejects
-        // *after* running one. proptest's default budget of 1024 rejects would therefore spend
-        // eighty-five simulations per case it wants, which reads as a hung suite rather than a
-        // failing one. Bounding it to the case count makes an unmet precondition fail fast and
-        // say so.
-        max_global_rejects: cases,
+        // Every case here is a full simulation, and these properties `prop_assume!` *after*
+        // running one, so a rejected case costs as much as an accepted one. proptest's default of
+        // 1024 therefore lets a precondition that has stopped being reachable spend half an hour
+        // before saying so - which reads as a hung suite rather than a failing one, and did.
+        //
+        // The assumes left here only ask that a case produced data at all, which should hold
+        // almost always, so this is a backstop rather than a working budget: the two properties
+        // that rejected selectively now skip or starve by construction instead. Sixteen per wanted
+        // case leaves room for a genuinely unlucky run while keeping an unreachable precondition
+        // distinguishable from a hang.
+        max_global_rejects: cases.saturating_mul(16),
         failure_persistence: Some(Box::new(
             proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
         )),
@@ -1181,6 +1187,14 @@ fn an_underused_link_is_not_driven_into_loss() {
 /// entirely is not one of them.
 #[test]
 fn a_cheap_co_tenant_is_not_starved() {
+    // Counted rather than assumed. The condition below is a runtime outcome, so it cannot be moved
+    // into the generator, and rejecting on it after the fact throws away a whole simulation -
+    // which made this the slowest and least predictable property here, its cost set by how often
+    // the estimate happened to land above demand. Skipping the assertion instead keeps the case,
+    // and the tally makes the one risk of doing so visible: a property that silently stopped
+    // asserting anything would otherwise still be green.
+    let exercised = AtomicUsize::new(0);
+
     check(
         SATURATED,
         scenarios(Demand::contended(), Budget::Tight, ANY_FAULT),
@@ -1192,7 +1206,10 @@ fn a_cheap_co_tenant_is_not_starved() {
             // spend what it is given, so a starved co-tenant on a healthy link with a low estimate
             // is a bandwidth-estimation failure and belongs to the property above - conflating the
             // two here would leave neither diagnosable.
-            prop_assume!(report.estimate_last_bps > report.demand_last_bps);
+            if report.estimate_last_bps <= report.demand_last_bps {
+                return Ok(());
+            }
+            exercised.fetch_add(1, Ordering::Relaxed);
 
             let quality = report.forwarded_quality.get("cotenant").copied();
             prop_assert!(
@@ -1208,6 +1225,12 @@ fn a_cheap_co_tenant_is_not_starved() {
             );
             Ok(())
         },
+    );
+
+    assert!(
+        exercised.load(Ordering::Relaxed) > 0,
+        "no generated case reached the assertion: every one ended with the estimate at or below \
+         demand, so this property asserted nothing and passed vacuously"
     );
 }
 
