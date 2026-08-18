@@ -17,7 +17,7 @@ impl ControllerActor {
         &self,
         binding: &crate::control::lanes::StreamBinding,
         destination: crate::id::ShardId,
-    ) -> crate::view::StreamForwardingPlan {
+    ) -> crate::view::StreamPlan {
         let local_subscribers = binding
             .subscribers
             .get(&destination)
@@ -48,7 +48,7 @@ impl ControllerActor {
                 route: handle.route,
                 epoch: handle.epoch,
             });
-        crate::view::StreamForwardingPlan {
+        crate::view::StreamPlan {
             local_subscribers,
             remote_routes,
             reverse_route,

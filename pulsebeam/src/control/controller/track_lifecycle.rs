@@ -275,13 +275,13 @@ impl ControllerActor {
         };
         let mut local_subscribers: HashMap<
             crate::id::ShardId,
-            Vec<crate::shard::participants::ParticipantKey>,
+            Vec<(crate::shard::participants::ParticipantKey, ())>,
         > = HashMap::new();
         for (participant, shard, key) in self.core.registry.participants_in_room(&room_id) {
             if participant != origin
                 && let Some(key) = key
             {
-                local_subscribers.entry(shard).or_default().push(key);
+                local_subscribers.entry(shard).or_default().push((key, ()));
             }
         }
         let destinations: Vec<_> = local_subscribers.keys().copied().collect();
@@ -299,9 +299,7 @@ impl ControllerActor {
             let Some(key) = self.prepare_track_key(destination, track_id, origin) else {
                 continue;
             };
-            let plan = crate::view::AudioForwardingPlan {
-                track_id,
-                origin,
+            let plan = crate::view::AudioPlan {
                 local_subscribers: local_subscribers
                     .get(&destination)
                     .cloned()
@@ -340,9 +338,7 @@ impl ControllerActor {
                 epoch: route.epoch,
             })
             .collect();
-        let source_plan = crate::view::AudioForwardingPlan {
-            track_id,
-            origin,
+        let source_plan = crate::view::AudioPlan {
             local_subscribers: local_subscribers
                 .get(&publisher_shard)
                 .cloned()
@@ -364,9 +360,7 @@ impl ControllerActor {
             targets.push((
                 *destination,
                 *key,
-                crate::view::AudioForwardingPlan {
-                    track_id,
-                    origin,
+                crate::view::AudioPlan {
                     local_subscribers: local_subscribers
                         .get(destination)
                         .cloned()
@@ -377,15 +371,16 @@ impl ControllerActor {
                 Some(route),
             ));
         }
-        self.publish_audio_plans(targets).await;
+        self.publish_audio_plans(track_id, targets).await;
     }
 
     pub(super) async fn publish_audio_plans(
         &mut self,
+        track_id: crate::entity::TrackId,
         targets: Vec<(
             crate::id::ShardId,
             crate::shard::router::TrackKey,
-            crate::view::AudioForwardingPlan,
+            crate::view::AudioPlan,
             Option<RouteHandle>,
         )>,
     ) {
@@ -398,7 +393,7 @@ impl ControllerActor {
             return;
         };
         for (shard, key, plan, route) in targets {
-            let Some(binding) = self.track_bindings.get(&plan.track_id) else {
+            let Some(binding) = self.track_bindings.get(&track_id) else {
                 self.abort_transaction(now);
                 return;
             };
@@ -588,7 +583,7 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
     ) -> Option<(
         crate::shard::router::TrackKey,
-        crate::view::TrackForwardingPlan,
+        crate::view::VideoPlan,
     )> {
         let binding = self.track_bindings.get(&track_id)?;
         let fanout = if shard_id == binding.publisher_shard {
@@ -615,9 +610,7 @@ impl ControllerActor {
         }
         Some((
             fanout,
-            crate::view::TrackForwardingPlan {
-                track_id: binding.meta.id,
-                origin: binding.meta.origin,
+            crate::view::VideoPlan {
                 local_subscribers,
                 remote_routes,
                 reverse_route: binding
@@ -731,7 +724,7 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         fanout: crate::shard::router::TrackKey,
-        plan: crate::view::TrackForwardingPlan,
+        plan: crate::view::VideoPlan,
     ) -> Option<RouteHandle> {
         let now = tokio::time::Instant::now();
         if self.state.begin().is_err() {

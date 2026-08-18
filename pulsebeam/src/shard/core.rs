@@ -258,6 +258,9 @@ impl ShardCore {
                         }
                     }
                     crate::view::ViewOp::SetTrackPlan { key, plan } => {
+                        let Some((track_id, _)) = self.runtime.track_identity(*key) else {
+                            continue;
+                        };
                         let mut previous_participants = HashSet::new();
                         if let Some(previous) = self.view.tracks.resolve(*key) {
                             for &(participant, _) in &previous.local_subscribers {
@@ -268,30 +271,25 @@ impl ShardCore {
                                     .any(|&(current, _)| current == participant)
                                 {
                                     self.registry.unbind_subscribed_track(
-                                        participant,
-                                        previous.track_id,
-                                        *key,
+                                        participant, track_id, *key,
                                     );
                                 }
                             }
                         }
                         for &(participant, _) in &plan.local_subscribers {
                             if !previous_participants.contains(&participant) {
-                                self.registry.bind_subscribed_track(
-                                    participant,
-                                    plan.track_id,
-                                    *key,
-                                );
+                                self.registry.bind_subscribed_track(participant, track_id, *key);
                             }
                         }
                     }
                     crate::view::ViewOp::RemoveTrackPlan { key } => {
+                        let Some((track_id, _)) = self.runtime.track_identity(*key) else {
+                            continue;
+                        };
                         if let Some(previous) = self.view.tracks.resolve(*key) {
                             for &(participant, _) in &previous.local_subscribers {
                                 self.registry.unbind_subscribed_track(
-                                    participant,
-                                    previous.track_id,
-                                    *key,
+                                    participant, track_id, *key,
                                 );
                             }
                         }
@@ -384,6 +382,10 @@ impl ShardCore {
                     record_routing_drop("audio", "plan", "remote");
                     return;
                 };
+                let Some((track_id, track_origin)) = self.runtime.track_identity(track) else {
+                    record_routing_drop("audio", "runtime", "remote");
+                    return;
+                };
                 pkt.playout_time = self.wall.to_instant(playout);
                 pkt.arrival_ts = now;
                 pkt.rehome_extensions();
@@ -397,9 +399,9 @@ impl ShardCore {
                     track,
                     Origin::Remote,
                     AudioRtpEvent {
-                        stream_id: (plan.track_id, None),
+                        stream_id: (track_id, None),
                         pkt: *pkt,
-                        origin: plan.origin,
+                        origin: track_origin,
                         origin_key: None,
                         fanout: Some(track),
                     },

@@ -20,7 +20,7 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
         action: RouteAction,
         lane: StreamLane,
-        plan: crate::view::StreamForwardingPlan,
+        plan: crate::view::StreamPlan,
     ) -> Option<RouteHandle> {
         match lane {
             StreamLane::Data => {
@@ -38,10 +38,10 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         action: crate::route::RouteAction,
-        video_plan: Option<crate::view::TrackForwardingPlan>,
-        audio_plan: Option<crate::view::AudioForwardingPlan>,
-        data_plan: Option<crate::view::StreamForwardingPlan>,
-        reliable_plan: Option<crate::view::StreamForwardingPlan>,
+        video_plan: Option<crate::view::VideoPlan>,
+        audio_plan: Option<crate::view::AudioPlan>,
+        data_plan: Option<crate::view::StreamPlan>,
+        reliable_plan: Option<crate::view::StreamPlan>,
     ) -> Option<RouteHandle> {
         let now = tokio::time::Instant::now();
         if self.state.begin().is_err() {
