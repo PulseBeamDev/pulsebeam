@@ -445,6 +445,83 @@ mod tests {
         assert_eq!(writer.publish(), None);
     }
 
+    /// Aborting a generation must leave nothing behind for the next one to publish.
+    ///
+    /// `transact` unwinds by calling `abort` on every writer, so a staged op that survived would
+    /// be published by whichever generation committed next - carrying a route the allocator has
+    /// already taken back.
+    #[test]
+    fn aborting_a_generation_discards_what_it_staged() {
+        let shard = ShardId::new(0);
+        let (mut writer, mut rx) = new_shard_view(shard);
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+
+        writer.stage(
+            1,
+            ViewOp::InsertParticipant {
+                key: keys.insert(()),
+            },
+        );
+        writer.abort();
+
+        assert_eq!(
+            writer.publish(),
+            None,
+            "an aborted generation has nothing to publish"
+        );
+        assert!(rx.try_recv().is_err(), "and nothing reached the shard");
+    }
+
+    /// A published generation arrives whole, tagged with the generation that produced it.
+    #[test]
+    fn a_published_generation_reaches_the_shard_intact() {
+        let shard = ShardId::new(3);
+        let (mut writer, mut rx) = new_shard_view(shard);
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+
+        writer.stage(
+            7,
+            ViewOp::InsertParticipant {
+                key: keys.insert(()),
+            },
+        );
+        writer.stage(
+            7,
+            ViewOp::InsertParticipant {
+                key: keys.insert(()),
+            },
+        );
+        assert_eq!(writer.publish(), Some(7));
+
+        let delta = rx.try_recv().expect("the delta was sent");
+        assert_eq!(delta.shard, shard, "and to its own shard");
+        assert_eq!(delta.generation, 7);
+        assert_eq!(delta.ops.len(), 2, "with both staged ops");
+    }
+
+    /// A shard that has gone away yields no generation, which is what `transact` aborts on.
+    ///
+    /// Committing anyway would retire the slot of a route the surviving shards still believe in.
+    #[test]
+    fn publishing_to_a_departed_shard_yields_no_generation() {
+        let (mut writer, rx) = new_shard_view(ShardId::new(0));
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+        drop(rx);
+
+        writer.stage(
+            1,
+            ViewOp::InsertParticipant {
+                key: keys.insert(()),
+            },
+        );
+        assert_eq!(
+            writer.publish(),
+            None,
+            "a closed receiver is indistinguishable from an empty generation to the caller, and \
+             both mean the same thing: this generation did not land"
+        );
+    }
+
     #[test]
     fn stale_route_epoch_is_rejected_after_slot_reuse() {
         let route = RouteId::new(ShardId::new(0), 7);
