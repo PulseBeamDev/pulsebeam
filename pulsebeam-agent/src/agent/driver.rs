@@ -36,7 +36,7 @@ const UNROUTED_CAPACITY: usize = 128;
 /// never becomes routable at all.
 const UNROUTED_MAX_WAIT: Duration = Duration::from_secs(3);
 
-use pulsebeam_proto::signaling::Track;
+use pulsebeam_proto::signaling::Publication as Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -367,6 +367,9 @@ struct SubscriptionSubsystem {
     /// (min, max) receiver playout delay in ms; `None` = adaptive default.
     playout_delay_ms: Option<(u32, u32)>,
     upstream_active: HashMap<Mid, bool>,
+    /// How this client wants its audio slots filled. `None` until it says,
+    /// which the server reads as auto with no pins.
+    audio_intent: Option<pulsebeam_proto::signaling::AudioIntent>,
     upstream_dirty: bool,
 }
 
@@ -469,6 +472,7 @@ impl AgentDriver {
                 pending_deadline: None,
                 playout_delay_ms: None,
                 upstream_active: HashMap::new(),
+                audio_intent: None,
                 upstream_dirty: false,
             },
             session: SessionSubsystem {
@@ -1154,7 +1158,7 @@ impl AgentDriver {
         };
 
         match payload {
-            signaling::server_message::Payload::Update(update) => {
+            signaling::server_message::Payload::State(update) => {
                 let sync = self.slot_manager.sync(update);
                 let (assignments, discovered, removed) = (
                     sync.new_assignments,
@@ -1198,7 +1202,7 @@ impl AgentDriver {
                     }
                 }
                 for (mid, track) in assignments {
-                    let track_id = track.id.clone();
+                    let track_id = track.track_id.clone();
                     // A subscriber already holds the receiving half, from a subscription answered
                     // before this assignment existed. Wire its sender to the slot rather than
                     // replacing it, or the handle it is holding would never receive anything.
@@ -1312,20 +1316,22 @@ impl AgentDriver {
         let msg = signaling::ClientMessage {
             payload: Some(signaling::client_message::Payload::Intent(
                 signaling::ClientIntent {
-                    upstream_intents: self
+                    publish: self
                         .subscriptions
                         .upstream_active
                         .iter()
-                        .map(|(mid, active)| signaling::UpstreamIntent {
+                        .map(|(mid, active)| signaling::PublishIntent {
                             mid: mid.to_string(),
                             active: *active,
                         })
                         .collect(),
-                    downstream_requests: requests,
-                    playout_delay: self
-                        .subscriptions
-                        .playout_delay_ms
-                        .map(|(min_ms, max_ms)| signaling::PlayoutDelay { min_ms, max_ms }),
+                    video: requests,
+                    audio: self.subscriptions.audio_intent.clone(),
+                    ext: self.subscriptions.playout_delay_ms.map(|(min_ms, max_ms)| {
+                        signaling::Extensions {
+                            playout_delay: Some(signaling::PlayoutDelay { min_ms, max_ms }),
+                        }
+                    }),
                 },
             )),
         };

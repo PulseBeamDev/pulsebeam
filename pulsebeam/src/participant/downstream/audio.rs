@@ -36,6 +36,27 @@ pub struct AudioAllocator {
     /// M ≤ N provisioned slots; `None` entries are unfilled.
     slots: [Option<Slot>; SELECTOR_SLOTS],
     speakers_changed: bool,
+    /// What the client asked for. Auto with no pins until it says otherwise,
+    /// which is what the SFU did before a client could say anything about audio.
+    intent: AudioIntent,
+}
+
+/// A subscriber's audio selection policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioIntent {
+    /// Tracks that hold a slot regardless of loudness, in preference order.
+    pub pinned: Vec<TrackId>,
+    /// Fill the slots pinning does not claim by loudness.
+    pub auto: bool,
+}
+
+impl Default for AudioIntent {
+    fn default() -> Self {
+        Self {
+            pinned: Vec::new(),
+            auto: true,
+        }
+    }
 }
 
 pub struct Slot {
@@ -91,12 +112,33 @@ pub struct Heard {
 }
 
 impl AudioAllocator {
-    pub(crate) fn new(ctx: LogCtx) -> Self {
+    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         Self {
             ctx,
             slots: array::from_fn(|_| None),
             speakers_changed: false,
+            // Manual means the client drives everything, audio included: it
+            // hears nothing until it asks, exactly as it sees no video until it
+            // sends a request.
+            intent: AudioIntent {
+                pinned: Vec::new(),
+                auto: !manual_sub,
+            },
         }
+    }
+
+    pub fn set_intent(&mut self, intent: AudioIntent) {
+        self.intent = intent;
+    }
+
+    fn is_pinned(&self, track: TrackId) -> bool {
+        self.intent.pinned.contains(&track)
+    }
+
+    /// Whether a slot's current occupant is pinned, and so may not be stolen.
+    fn holds_pin(&self, slot: &Slot) -> bool {
+        slot.occupant
+            .is_some_and(|occupant| self.is_pinned(occupant.origin.track))
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
@@ -153,6 +195,12 @@ impl AudioAllocator {
             }
         }
         removed
+    }
+
+    /// How many audio mids this subscriber negotiated. The ceiling on both what
+    /// it can hear at once and how many tracks it may usefully pin.
+    pub fn slot_count(&self) -> usize {
+        self.slots.iter().flatten().count()
     }
 
     pub fn has_slot(&self, mid: Mid) -> bool {
@@ -268,6 +316,10 @@ impl AudioAllocator {
 
     /// Which slot this speaker gets, if any.
     fn slot_for(&self, origin: AudioOrigin, power: f32, now: Instant) -> Option<usize> {
+        let pinned = self.is_pinned(origin.track);
+        if !pinned && !self.intent.auto {
+            return None;
+        }
         if let Some((idx, _)) = self
             .provisioned()
             .find(|(_, slot)| slot.occupant.map(|o| o.origin) == Some(origin))
@@ -280,15 +332,19 @@ impl AudioAllocator {
         {
             return Some(idx);
         }
+        // A pinned occupant is never displaced, so it is not a candidate however
+        // quiet it goes - that is what pinning means.
         let (idx, quietest) = self
             .provisioned()
-            .filter(|(_, slot)| !slot.is_immune(now))
+            .filter(|(_, slot)| !slot.is_immune(now) && !self.holds_pin(slot))
             .min_by(|(_, a), (_, b)| {
                 a.last_power
                     .partial_cmp(&b.last_power)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })?;
-        if power > quietest.last_power {
+        // A pin takes its slot on arrival; loudness only decides between the
+        // tracks competing for what pinning left over.
+        if pinned || power > quietest.last_power {
             return Some(idx);
         }
         plog_debug!(
@@ -382,7 +438,7 @@ mod tests {
     }
 
     fn allocator_with(slots: usize) -> AudioAllocator {
-        let mut alloc = AudioAllocator::new(test_ctx());
+        let mut alloc = AudioAllocator::new(test_ctx(), false);
         for (mid, ssrc) in [("a0", 1000), ("a1", 1001), ("a2", 1002), ("a3", 1003)]
             .into_iter()
             .take(slots)
@@ -631,6 +687,142 @@ mod tests {
             1,
             "one mid is one slot, however many times it is offered"
         );
+    }
+
+    /// A pin holds its slot however quiet it goes.
+    ///
+    /// The point of pinning: a listener who asked for a specific speaker keeps
+    /// hearing them while louder people talk over them.
+    #[test]
+    fn a_pinned_track_is_never_displaced() {
+        let mut alloc = allocator_with(1);
+        let (pinned, shouter) = (origin(1), origin(2));
+        alloc.set_intent(AudioIntent {
+            pinned: vec![pinned.track],
+            auto: true,
+        });
+        let start = Instant::now();
+
+        alloc.on_rtp(
+            pinned,
+            &speaking_at_time(-70, start),
+            &mut StreamWriter::new(),
+        );
+        // Past immunity, so only the pin can be holding the slot.
+        let later = start + NEWBORN_IMMUNITY + Duration::from_millis(10);
+        assert!(
+            alloc
+                .on_rtp(
+                    shouter,
+                    &speaking_at_time(-5, later),
+                    &mut StreamWriter::new()
+                )
+                .is_none(),
+            "a far louder speaker does not take a pinned slot"
+        );
+        assert_eq!(heard_origins(&alloc), vec![pinned]);
+    }
+
+    /// A pin takes a slot on arrival rather than having to out-shout for it.
+    ///
+    /// Without this a pin only works for someone already talking, which is the
+    /// case that needed no pin.
+    #[test]
+    fn a_pin_claims_a_slot_from_a_louder_speaker() {
+        let mut alloc = allocator_with(1);
+        let (loud, pinned) = (origin(1), origin(2));
+        let start = Instant::now();
+
+        alloc.on_rtp(
+            loud,
+            &speaking_at_time(-10, start),
+            &mut StreamWriter::new(),
+        );
+        assert_eq!(heard_origins(&alloc), vec![loud]);
+
+        alloc.set_intent(AudioIntent {
+            pinned: vec![pinned.track],
+            auto: true,
+        });
+        let later = start + NEWBORN_IMMUNITY + Duration::from_millis(10);
+        alloc.on_rtp(
+            pinned,
+            &speaking_at_time(-70, later),
+            &mut StreamWriter::new(),
+        );
+        assert_eq!(
+            heard_origins(&alloc),
+            vec![pinned],
+            "the pin takes the slot even though it is quieter"
+        );
+    }
+
+    /// `auto: false` means exactly the pins and nothing else.
+    #[test]
+    fn nothing_unpinned_is_placed_when_auto_is_off() {
+        let mut alloc = allocator_with(3);
+        let (pinned, other) = (origin(1), origin(2));
+        alloc.set_intent(AudioIntent {
+            pinned: vec![pinned.track],
+            auto: false,
+        });
+
+        alloc.on_rtp(other, &speaking(-10), &mut StreamWriter::new());
+        assert!(
+            heard_origins(&alloc).is_empty(),
+            "a loud unpinned speaker is not placed when auto is off, however free the slots"
+        );
+
+        alloc.on_rtp(pinned, &speaking(-70), &mut StreamWriter::new());
+        assert_eq!(heard_origins(&alloc), vec![pinned]);
+    }
+
+    /// A manual subscriber hears nothing until it asks, exactly as it sees no
+    /// video until it sends a request.
+    #[test]
+    fn a_manual_subscriber_starts_silent() {
+        let mut alloc = AudioAllocator::new(test_ctx(), true);
+        alloc.add_slot(slot_config("a0", 1000));
+
+        alloc.on_rtp(origin(1), &speaking(-20), &mut StreamWriter::new());
+        assert!(heard_origins(&alloc).is_empty());
+
+        alloc.set_intent(AudioIntent::default());
+        alloc.on_rtp(origin(1), &speaking(-20), &mut StreamWriter::new());
+        assert_eq!(heard_origins(&alloc).len(), 1, "and hears once it asks");
+    }
+
+    /// Pinning one of a participant's tracks must not pin the other.
+    ///
+    /// The case that decides pins name tracks rather than people: a participant
+    /// sharing a screen publishes a second audio track, and a recording has to
+    /// be able to tell which one was captured.
+    #[test]
+    fn pinning_one_track_does_not_pin_another_from_the_same_participant() {
+        use crate::entity::TrackKind;
+        let mut alloc = allocator_with(1);
+        let participant = origin(1).participant;
+        let mic = AudioOrigin {
+            track: participant.derive_track_id(TrackKind::Audio, "mic"),
+            participant,
+        };
+        let screen = AudioOrigin {
+            track: participant.derive_track_id(TrackKind::Audio, "screen"),
+            participant,
+        };
+        assert_ne!(mic.track, screen.track);
+
+        alloc.set_intent(AudioIntent {
+            pinned: vec![mic.track],
+            auto: false,
+        });
+        alloc.on_rtp(screen, &speaking(-10), &mut StreamWriter::new());
+        assert!(
+            heard_origins(&alloc).is_empty(),
+            "the unpinned track of a pinned participant is still unpinned"
+        );
+        alloc.on_rtp(mic, &speaking(-70), &mut StreamWriter::new());
+        assert_eq!(heard_origins(&alloc), vec![mic]);
     }
 
     /// Contention is scoped to what this listener was given, and nothing else.

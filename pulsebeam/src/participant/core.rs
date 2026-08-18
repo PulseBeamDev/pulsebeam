@@ -1328,6 +1328,8 @@ impl ParticipantCore {
                 // count was always one behind and every intent was rejected).
                 self.signaling
                     .set_slot_count(self.downstream.video.slot_count());
+                self.signaling
+                    .set_audio_slot_count(self.downstream.audio_slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }

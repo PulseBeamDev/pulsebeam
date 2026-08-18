@@ -562,7 +562,7 @@ fn participant_availability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsebeam_proto::signaling::Track;
+    use pulsebeam_proto::signaling::Publication as Track;
 
     #[test]
     fn publications_collapse_into_participant_availability() {
@@ -570,19 +570,17 @@ mod tests {
             (
                 "video".to_owned(),
                 Publication::from_signaling(Track {
-                    id: "video".into(),
+                    track_id: "video".into(),
                     kind: 1,
                     participant_id: "alice".into(),
-                    meta: HashMap::new(),
                 }),
             ),
             (
                 "audio".to_owned(),
                 Publication::from_signaling(Track {
-                    id: "audio".into(),
+                    track_id: "audio".into(),
                     kind: 2,
                     participant_id: "alice".into(),
-                    meta: HashMap::new(),
                 }),
             ),
         ]
