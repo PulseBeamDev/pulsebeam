@@ -25,6 +25,7 @@ pub(crate) enum OutgoingCommand {
     /// is as large as its largest.
     SendMedia(Box<SendMedia>),
     SetPlayoutDelay(Option<(u32, u32)>),
+    SetAudioIntent(super::AudioIntent),
     Publish {
         kind: str0m::media::MediaKind,
         response: tokio::sync::oneshot::Sender<Result<super::LocalTrack, super::AgentError>>,

@@ -173,3 +173,161 @@ fn a_slot_carries_many_speakers_without_tearing_test() {
             },
         ]);
 }
+
+/// A pinned speaker is heard while louder people talk over them.
+///
+/// The whole point of pinning, and the case automatic selection cannot serve: a listener who has
+/// chosen somebody keeps hearing them without having to be the loudest thing in the room. Three
+/// speakers saturate the slots at volumes the pinned one cannot compete with, so a selector that
+/// only ranked by loudness would drop the pin and pass a byte count.
+#[test]
+fn a_pinned_speaker_is_heard_over_louder_ones_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::data_participant("quiet_pinned").speaking_at(-70))
+                .with_participant(Participant::data_participant("loud_a").speaking_at(-15))
+                .with_participant(Participant::data_participant("loud_b").speaking_at(-18))
+                .with_participant(Participant::data_participant("loud_c").speaking_at(-20))
+                .with_participant(Participant::subscriber("listener").hearing(3)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Let everyone be discovered before pinning anybody",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetAudioIntent {
+                description: "The listener pins the quiet speaker",
+                participant: "listener",
+                pinned: &["quiet_pinned"],
+                auto: true,
+            },
+            Step::Run {
+                description: "Three louder voices compete for the remaining slots",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckRxBytesInterval {
+                description: "The listener is still receiving audio",
+                participant: "listener",
+                min_bytes: 1,
+            },
+            // Asserted on who holds a slot *now*. `heard from` accumulates over the whole run and
+            // `CheckSpeakerRank` keeps a displaced speaker's last rank, so neither can state the
+            // claim: that the quietest voice in the room is still being carried, which it could
+            // never have won on loudness.
+            Step::CheckSpeakerHeld {
+                description: "The quietest speaker holds a slot because it was pinned",
+                participant: "listener",
+                speaker: "quiet_pinned",
+            },
+        ]);
+}
+
+/// `auto: false` hears the pins and nothing else.
+///
+/// The difference between "prefer these" and "only these". With three free slots and three louder
+/// speakers available, an implementation that treated the flag as advisory would fill them and
+/// still look healthy on every byte-level measure.
+#[test]
+fn auto_off_hears_exactly_the_pins_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::data_participant("chosen").speaking_at(-40))
+                .with_participant(Participant::data_participant("loud_a").speaking_at(-15))
+                .with_participant(Participant::data_participant("loud_b").speaking_at(-18))
+                .with_participant(Participant::subscriber("listener").hearing(3)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Let everyone be discovered",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetAudioIntent {
+                description: "The listener asks for one speaker and no automatic fill",
+                participant: "listener",
+                pinned: &["chosen"],
+                auto: false,
+            },
+            Step::Run {
+                description: "The louder two keep talking into slots that stay empty",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckHeardFrom {
+                description: "Only the pinned speaker is heard, though two slots are free",
+                participant: "listener",
+                expected: &["chosen"],
+            },
+        ]);
+}
+
+/// Pinning one of a participant's audio tracks does not pin the other.
+///
+/// This is why the wire pins tracks rather than people. A participant sharing a screen publishes
+/// its audio as a second track, and "pin Alice" is ambiguous the moment she does: a recording has
+/// to be able to say which of the two it captured, and a listener who pinned her microphone must
+/// not silently get her screen instead.
+#[test]
+fn pinning_one_audio_track_does_not_pin_another_from_the_same_participant_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::data_participant("alice").speaking_at(-45))
+                .with_participant(Participant::data_participant("bob").speaking_at(-15))
+                .with_participant(Participant::subscriber("listener").hearing(1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Let both be discovered",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetAudioIntent {
+                description: "The listener pins alice's audio and nothing else",
+                participant: "listener",
+                pinned: &["alice"],
+                auto: false,
+            },
+            Step::Run {
+                description: "Bob talks far louder into the one slot alice holds",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckHeardFrom {
+                description: "The single slot carries the pinned track, not the louder one",
+                participant: "listener",
+                expected: &["alice"],
+            },
+        ]);
+}
+
+/// A client that never mentions audio gets exactly what it got before the message existed.
+///
+/// The default is load bearing: every existing client sends no `AudioIntent` at all, and the
+/// protocol change must be invisible to them. Stated as its own plan rather than left implied by
+/// the other audio plans, because a default that quietly became `auto: false` would make all of
+/// them fail together and none of them say why.
+#[test]
+fn saying_nothing_about_audio_keeps_automatic_selection_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::data_participant("loud").speaking_at(-20))
+                .with_participant(Participant::data_participant("quiet").speaking_at(-45))
+                .with_participant(Participant::subscriber("listener").hearing(2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Nobody sets an audio intent",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckHeardFrom {
+                description: "Both speakers are forwarded, chosen by loudness alone",
+                participant: "listener",
+                expected: &["loud", "quiet"],
+            },
+            Step::CheckSpeakerRank {
+                description: "And ranked loudest first, as the list order carries",
+                participant: "listener",
+                expected: &[("loud", 0), ("quiet", 1)],
+            },
+        ]);
+}

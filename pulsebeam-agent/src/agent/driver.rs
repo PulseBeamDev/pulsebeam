@@ -621,6 +621,24 @@ impl AgentDriver {
         self.set_upstream_active(lease.mid, false);
     }
 
+    /// Replace the audio policy and schedule it.
+    ///
+    /// Declarative, so this overwrites rather than merges: the intent on the wire is the whole
+    /// policy, and a caller drops a pin by sending an intent without it.
+    fn set_audio_intent(&mut self, intent: crate::agent::AudioIntent) {
+        let wire = pulsebeam_proto::signaling::AudioIntent {
+            pinned: intent.pinned,
+            auto: intent.auto,
+        };
+        if self.subscriptions.audio_intent.as_ref() == Some(&wire) {
+            return;
+        }
+        self.subscriptions.audio_intent = Some(wire);
+        self.subscriptions.upstream_dirty = true;
+        self.subscriptions.pending_deadline = Some(self.now);
+        self.timers.notifier.notify_one();
+    }
+
     fn set_upstream_active(&mut self, mid: Mid, active: bool) {
         self.subscriptions.upstream_active.insert(mid, active);
         self.subscriptions.upstream_dirty = true;
@@ -860,6 +878,9 @@ impl AgentDriver {
             }
             OutgoingCommand::SetPlayoutDelay(bounds) => {
                 self.set_playout_delay(bounds);
+            }
+            OutgoingCommand::SetAudioIntent(intent) => {
+                self.set_audio_intent(intent);
             }
             OutgoingCommand::Publish { kind, response } => {
                 let result = self.publish_local_track(kind);

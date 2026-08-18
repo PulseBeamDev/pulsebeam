@@ -429,6 +429,33 @@ pub enum Step {
     },
 
     // ── Data channels ─────────────────────────────────────────────────────
+    /// A named speaker currently holds one of this subscriber's audio slots.
+    ///
+    /// Distinct from `CheckHeardFrom` and `CheckSpeakerRank`, which both carry history: the first
+    /// accumulates everyone heard over the whole run, and the second keeps a displaced speaker's
+    /// last rank. Neither can say who is being carried *now*, which is the only thing a pin
+    /// claims - it does not promise nobody else was ever heard, it promises this one is.
+    CheckSpeakerHeld {
+        description: &'static str,
+        participant: &'static str,
+        speaker: &'static str,
+    },
+
+    /// Set this participant's audio policy.
+    ///
+    /// `pinned` names participants for readability; the harness resolves each to that
+    /// participant's audio track ids, because the wire pins tracks - one participant can publish
+    /// a microphone and a screen share's audio, and pinning one must not pin the other.
+    ///
+    /// `auto` fills the slots pinning does not claim by loudness, which is the default a client
+    /// that never calls this gets.
+    SetAudioIntent {
+        description: &'static str,
+        participant: &'static str,
+        pinned: &'static [&'static str],
+        auto: bool,
+    },
+
     /// Call driver.declare_publish_topic().
     DeclarePublishTopic {
         description: &'static str,
@@ -790,6 +817,8 @@ enum PendingDriverOp {
     DeclareOrderedPublisher(String),
     DeclareOrderedSubscriber(String),
     PublishOrdered(String, Vec<u8>),
+    /// (pinned participant ids, auto)
+    SetAudioIntent(Vec<String>, bool),
 }
 
 #[derive(Clone)]
@@ -1187,6 +1216,37 @@ async fn run_participant(
                                 retry_ops.push(op);
                             }
                         }
+                        PendingDriverOp::SetAudioIntent(ref publishers, auto) => {
+                            // The wire pins tracks, so each publisher resolves through what this
+                            // agent has actually been told it publishes. A pin for somebody whose
+                            // audio it has not discovered yet is retried rather than sent empty -
+                            // an intent missing its pin would look like a passing plan that
+                            // asserted nothing.
+                            let mut pinned = Vec::new();
+                            let mut unresolved = false;
+                            for id in publishers {
+                                let tracks = ctx.agent.participant(id.clone()).audio_tracks();
+                                if tracks.is_empty() {
+                                    unresolved = true;
+                                    break;
+                                }
+                                pinned.extend(tracks);
+                            }
+                            if unresolved {
+                                retry_ops.push(op);
+                            } else {
+                                let agent = ctx.agent.clone();
+                                tokio::spawn(async move {
+                                    let _ = agent
+                                        .media()
+                                        .set_audio_intent(pulsebeam_agent::agent::AudioIntent {
+                                            pinned,
+                                            auto,
+                                        })
+                                        .await;
+                                });
+                            }
+                        }
                     }
                 }
                 if !retry_ops.is_empty() {
@@ -1385,6 +1445,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckDataReceived { .. } => "CheckDataReceived",
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
         Step::CheckDataSequence { .. } => "CheckDataSequence",
+        Step::SetAudioIntent { .. } => "SetAudioIntent",
+        Step::CheckSpeakerHeld { .. } => "CheckSpeakerHeld",
     }
 }
 
@@ -1722,6 +1784,35 @@ async fn execute_plan(
                     .push(PendingDriverOp::SetSubscriptions(subs));
             }
 
+            Step::SetAudioIntent {
+                description,
+                participant,
+                pinned,
+                auto,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, pinned={pinned:?}, auto={auto})"
+                );
+                let mut publishers = Vec::new();
+                for name in *pinned {
+                    let pub_handle = get_handle(handles, name, description)?;
+                    let id = pub_handle.shared.participant_id.lock().unwrap().clone();
+                    let id = id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step \"{description}\": pin target \"{name}\" has no runtime participant id yet; add a Step::Run before this step"
+                        )
+                    })?;
+                    publishers.push(id);
+                }
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::SetAudioIntent(publishers, *auto));
+            }
+
             Step::SubscribeAll {
                 description,
                 participant,
@@ -1959,6 +2050,33 @@ async fn execute_plan(
                 assert_eq!(
                     known, want,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  still known:  {known:?}\n  note:         anyone here who has left is a ghost - a tile and a name for\n                somebody who is not in the room"
+                );
+            }
+
+            Step::CheckSpeakerHeld {
+                description,
+                participant,
+                speaker,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, speaker {speaker})"
+                );
+                let want = get_handle(handles, speaker, description)?
+                    .shared
+                    .participant_id
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step \"{description}\": speaker \"{speaker}\" has no runtime participant id yet; add a Step::Run before this step"
+                        )
+                    })?;
+                let handle = get_handle(handles, participant, description)?;
+                let ranked = handle.audio_rx().ranked();
+                assert!(
+                    ranked.contains_key(&want),
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {speaker} to hold a slot\n  signalled:    {ranked:?}"
                 );
             }
 
