@@ -43,78 +43,46 @@ impl ControllerActor {
         data_plan: Option<crate::view::StreamPlan>,
         reliable_plan: Option<crate::view::StreamPlan>,
     ) -> Option<RouteHandle> {
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return None;
-        }
         // A stream granted here — a track's reverse route, an audio fanout, a
         // data lane — is announced once and never re-offered. Losing the
         // allocation loses the stream for the rest of the session, so this
         // retries for the same reason connection setup does.
-        let Some(handle) = self.reserve_endpoint_retrying(shard_id, now, "endpoint") else {
-            self.abort_transaction(now);
-            return None;
-        };
-
-        let published = self
-            .state
-            .pending()
-            .map(|tx| tx.generation)
-            .and_then(|generation| {
-                let view = self.view_mut(shard_id)?;
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::InstallRoute {
-                        route: handle.route,
-                        binding: crate::view::RouteBinding {
-                            epoch: handle.epoch,
-                            action,
-                        },
+        self.publish_with_route(shard_id, "endpoint", move |_, handle| {
+            let mut ops = vec![(
+                shard_id,
+                crate::view::ViewOp::InstallRoute {
+                    route: handle.route,
+                    binding: crate::view::RouteBinding {
+                        epoch: handle.epoch,
+                        action,
                     },
-                );
-                match (action, video_plan, audio_plan, data_plan, reliable_plan) {
-                    (RouteAction::Video { local_track }, Some(plan), _, _, _) => {
-                        view.stage(
-                            generation,
-                            crate::view::ViewOp::SetTrackPlan {
-                                key: local_track,
-                                plan,
-                            },
-                        );
-                    }
-                    (RouteAction::Audio { track }, _, Some(plan), _, _) => {
-                        view.stage(
-                            generation,
-                            crate::view::ViewOp::SetAudioPlan { key: track, plan },
-                        );
-                    }
-                    (RouteAction::Data { stream }, _, _, Some(plan), _) => {
-                        view.stage(
-                            generation,
-                            crate::view::ViewOp::SetDataPlan { key: stream, plan },
-                        );
-                    }
-                    (RouteAction::Reliable { stream }, _, _, _, Some(plan)) => {
-                        view.stage(
-                            generation,
-                            crate::view::ViewOp::SetReliablePlan { key: stream, plan },
-                        );
-                    }
-                    (RouteAction::Reverse { .. }, None, None, None, None) => {}
-                    _ => debug_assert!(false, "route action and compiled plan disagree"),
+                },
+            )];
+            let plan_op = match (action, video_plan, audio_plan, data_plan, reliable_plan) {
+                (RouteAction::Video { local_track }, Some(plan), _, _, _) => {
+                    Some(crate::view::ViewOp::SetTrackPlan {
+                        key: local_track,
+                        plan,
+                    })
                 }
-                view.publish()
-            });
-        let Some(_) = published else {
-            self.abort_transaction(now);
-            return None;
-        };
-        if self.state.commit().is_err() {
-            self.abort_transaction(now);
-            return None;
-        }
-        Some(handle)
+                (RouteAction::Audio { track }, _, Some(plan), _, _) => {
+                    Some(crate::view::ViewOp::SetAudioPlan { key: track, plan })
+                }
+                (RouteAction::Data { stream }, _, _, Some(plan), _) => {
+                    Some(crate::view::ViewOp::SetDataPlan { key: stream, plan })
+                }
+                (RouteAction::Reliable { stream }, _, _, _, Some(plan)) => {
+                    Some(crate::view::ViewOp::SetReliablePlan { key: stream, plan })
+                }
+                (RouteAction::Reverse { .. }, None, None, None, None) => None,
+                _ => {
+                    debug_assert!(false, "route action and compiled plan disagree");
+                    None
+                }
+            };
+            ops.extend(plan_op.map(|op| (shard_id, op)));
+            ops
+        })
     }
 
     /// Take a route out of the published view, then return its slot.
@@ -127,35 +95,21 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
         handle: RouteHandle,
     ) {
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
+        let retire = vec![(
+            shard_id,
+            crate::view::ViewOp::RetireRoute {
+                route: handle.route,
+                epoch: handle.epoch,
+            },
+        )];
+        if !self.publish_ops(retire) {
             return;
         }
-        let published = self
-            .state
-            .pending()
-            .map(|tx| tx.generation)
-            .and_then(|generation| {
-                let view = self.view_mut(shard_id)?;
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RetireRoute {
-                        route: handle.route,
-                        epoch: handle.epoch,
-                    },
-                );
-                view.publish()
-            });
-        let Some(_) = published else {
-            self.abort_transaction(now);
-            return;
-        };
-        if self.state.commit().is_err() {
-            self.abort_transaction(now);
-            return;
-        }
-        self.state
-            .release_endpoint(shard_id, handle.route.slot(), now);
+        self.state.release_endpoint(
+            shard_id,
+            handle.route.slot(),
+            tokio::time::Instant::now(),
+        );
     }
 
     /// Stage a participant's transport route as one lifecycle generation.

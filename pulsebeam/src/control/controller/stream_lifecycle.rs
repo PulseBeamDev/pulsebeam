@@ -12,6 +12,79 @@ fn should_publish_stream_views(retired: bool, added: bool) -> bool {
     !retired || added
 }
 
+/// The view ops a stream key implies.
+///
+/// None of these take a lane: `RuntimeStreamKey`'s variant *is* the lane, and
+/// passing one alongside meant every call site carried a second source of truth
+/// plus a `debug_assert` to catch the two disagreeing.
+fn insert_stream_runtime_op(
+    key: crate::shard::router::RuntimeStreamKey,
+    id: crate::shard::router::DataStreamId,
+    publisher: crate::shard::participants::ParticipantKey,
+) -> crate::view::ViewOp {
+    match key {
+        crate::shard::router::RuntimeStreamKey::Data(key) => {
+            crate::view::ViewOp::InsertDataRuntime { key, id, publisher }
+        }
+        crate::shard::router::RuntimeStreamKey::Reliable(key) => {
+            crate::view::ViewOp::InsertReliableRuntime { key, id, publisher }
+        }
+    }
+}
+
+fn set_stream_plan_op(
+    key: crate::shard::router::RuntimeStreamKey,
+    plan: crate::view::StreamPlan,
+) -> crate::view::ViewOp {
+    match key {
+        crate::shard::router::RuntimeStreamKey::Data(key) => {
+            crate::view::ViewOp::SetDataPlan { key, plan }
+        }
+        crate::shard::router::RuntimeStreamKey::Reliable(key) => {
+            crate::view::ViewOp::SetReliablePlan { key, plan }
+        }
+    }
+}
+
+fn remove_stream_ops(key: crate::shard::router::RuntimeStreamKey) -> [crate::view::ViewOp; 2] {
+    match key {
+        crate::shard::router::RuntimeStreamKey::Data(key) => [
+            crate::view::ViewOp::RemoveDataPlan { key },
+            crate::view::ViewOp::RemoveDataRuntime { key },
+        ],
+        crate::shard::router::RuntimeStreamKey::Reliable(key) => [
+            crate::view::ViewOp::RemoveReliablePlan { key },
+            crate::view::ViewOp::RemoveReliableRuntime { key },
+        ],
+    }
+}
+
+fn install_stream_route_op(
+    key: crate::shard::router::RuntimeStreamKey,
+    route: RouteHandle,
+) -> crate::view::ViewOp {
+    let action = match key {
+        crate::shard::router::RuntimeStreamKey::Data(stream) => RouteAction::Data { stream },
+        crate::shard::router::RuntimeStreamKey::Reliable(stream) => {
+            RouteAction::Reliable { stream }
+        }
+    };
+    crate::view::ViewOp::InstallRoute {
+        route: route.route,
+        binding: crate::view::RouteBinding {
+            epoch: route.epoch,
+            action,
+        },
+    }
+}
+
+fn retire_route_op(route: RouteHandle) -> crate::view::ViewOp {
+    crate::view::ViewOp::RetireRoute {
+        route: route.route,
+        epoch: route.epoch,
+    }
+}
+
 impl ControllerActor {
     pub(super) fn stream_plan(
         &self,
@@ -180,28 +253,6 @@ impl ControllerActor {
         }
     }
 
-    pub(super) fn stage_remove_stream_plan(
-        view: &mut crate::view::ShardViewWriter,
-        generation: u64,
-        lane: StreamLane,
-        key: crate::shard::router::RuntimeStreamKey,
-    ) {
-        match (lane, key) {
-            (StreamLane::Data, crate::shard::router::RuntimeStreamKey::Data(key)) => {
-                view.stage(generation, crate::view::ViewOp::RemoveDataPlan { key });
-                view.stage(generation, crate::view::ViewOp::RemoveDataRuntime { key });
-            }
-            (StreamLane::Reliable, crate::shard::router::RuntimeStreamKey::Reliable(key)) => {
-                view.stage(generation, crate::view::ViewOp::RemoveReliablePlan { key });
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RemoveReliableRuntime { key },
-                );
-            }
-            _ => debug_assert!(false, "stream key and lane disagree"),
-        }
-    }
-
     pub(super) async fn retire_stream_destinations(
         &mut self,
         id: &crate::shard::router::DataStreamId,
@@ -224,66 +275,19 @@ impl ControllerActor {
                 .retain(|route| !stale.iter().any(|(shard, _, _)| route.shard_id == *shard));
         }
 
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return false;
-        }
-        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
-            debug_assert!(false, "begin creates a pending lifecycle transaction");
-            return false;
-        };
+        let mut ops = Vec::new();
         for (destination, key, route) in stale {
-            let Some(view) = self.view_mut(*destination) else {
-                debug_assert!(false, "a stream route must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: route.route,
-                    epoch: route.epoch,
-                },
-            );
-            Self::stage_remove_stream_plan(view, generation, lane, *key);
+            ops.push((*destination, retire_route_op(*route)));
+            ops.extend(remove_stream_ops(*key).map(|op| (*destination, op)));
         }
         if let Some((key, plan)) = source_key.zip(source_plan) {
-            let Some(view) = self.view_mut(publisher_shard) else {
-                debug_assert!(false, "a stream publisher must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            match (lane, key) {
-                (StreamLane::Data, crate::shard::router::RuntimeStreamKey::Data(key)) => {
-                    view.stage(generation, crate::view::ViewOp::SetDataPlan { key, plan });
-                }
-                (StreamLane::Reliable, crate::shard::router::RuntimeStreamKey::Reliable(key)) => {
-                    view.stage(
-                        generation,
-                        crate::view::ViewOp::SetReliablePlan { key, plan },
-                    );
-                }
-                _ => debug_assert!(false, "stream key and lane disagree"),
-            }
+            ops.push((publisher_shard, set_stream_plan_op(key, plan)));
         }
-
-        let mut published = Vec::new();
-        for index in 0..self.views.len() {
-            let shard = crate::id::ShardId::new(index);
-            if self
-                .view_mut(shard)
-                .is_some_and(|view| view.publish().is_some())
-            {
-                published.push(shard);
-            }
-        }
-        if self.state.commit().is_err() {
-            debug_assert!(false, "a published stream retirement must commit");
-            self.abort_transaction(now);
+        if !self.publish_ops(ops) {
             return false;
         }
 
+        let now = tokio::time::Instant::now();
         for (destination, _, route) in stale {
             let Some(binding) = self.lanes.get_mut(lane).get_mut(id) else {
                 debug_assert!(false, "stream binding must survive route retirement");
@@ -320,53 +324,20 @@ impl ControllerActor {
                 Some((*destination, key, *route))
             })
             .collect();
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return false;
-        }
-        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
-            debug_assert!(false, "begin creates a pending lifecycle transaction");
-            return false;
-        };
+
+        let mut ops = Vec::new();
         for (destination, key, route) in &routes {
-            let Some(view) = self.view_mut(*destination) else {
-                debug_assert!(false, "a stream route must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: route.route,
-                    epoch: route.epoch,
-                },
-            );
-            Self::stage_remove_stream_plan(view, generation, lane, *key);
+            ops.push((*destination, retire_route_op(*route)));
+            ops.extend(remove_stream_ops(*key).map(|op| (*destination, op)));
         }
         if let Some(key) = source_key {
-            let Some(view) = self.view_mut(publisher_shard) else {
-                debug_assert!(false, "a stream publisher must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            Self::stage_remove_stream_plan(view, generation, lane, key);
+            ops.extend(remove_stream_ops(key).map(|op| (publisher_shard, op)));
         }
-        let mut published = Vec::new();
-        for index in 0..self.views.len() {
-            let shard = crate::id::ShardId::new(index);
-            if self
-                .view_mut(shard)
-                .is_some_and(|view| view.publish().is_some())
-            {
-                published.push(shard);
-            }
-        }
-        if self.state.commit().is_err() {
-            debug_assert!(false, "a published stream retirement must commit");
-            self.abort_transaction(now);
+        if !self.publish_ops(ops) {
             return false;
         }
+
+        let now = tokio::time::Instant::now();
         for (destination, _, route) in &routes {
             self.state
                 .release_endpoint(*destination, route.route.slot(), now);
@@ -474,24 +445,18 @@ impl ControllerActor {
         let Some(binding) = self.lanes.get(lane).get(&id) else {
             return;
         };
-        let publisher_key = binding.publisher;
-        let binding_data = (
-            binding.publisher_shard,
-            binding.key,
-            binding.destination_keys.clone(),
-            binding.routes.clone(),
-        );
+        let publisher = binding.publisher;
+        let publisher_shard = binding.publisher_shard;
+        let source_key = binding.key;
+        let destination_keys = binding.destination_keys.clone();
+        let routes = binding.routes.clone();
+
         let mut targets = Vec::new();
-        if let Some(key) = binding_data.1 {
-            targets.push((
-                binding_data.0,
-                key,
-                self.stream_plan(binding, binding_data.0),
-                None,
-            ));
+        if let Some(key) = source_key {
+            targets.push((publisher_shard, key, self.stream_plan(binding, publisher_shard), None));
         }
-        for (destination, key) in binding_data.2 {
-            let Some(route) = binding_data.3.get(&destination).copied() else {
+        for (destination, key) in destination_keys {
+            let Some(route) = routes.get(&destination).copied() else {
                 continue;
             };
             targets.push((
@@ -501,97 +466,14 @@ impl ControllerActor {
                 Some(route),
             ));
         }
-        if targets.is_empty() {
-            return;
-        }
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return;
-        }
-        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
-            return;
-        };
+
+        let mut ops = Vec::new();
         for (shard, key, plan, route) in targets {
-            let Some(view) = self.view_mut(shard) else {
-                self.abort_transaction(now);
-                return;
-            };
-            match (lane, key) {
-                (StreamLane::Data, crate::shard::router::RuntimeStreamKey::Data(key)) => {
-                    view.stage(
-                        generation,
-                        crate::view::ViewOp::InsertDataRuntime {
-                            key,
-                            id: id.clone(),
-                            publisher: publisher_key,
-                        },
-                    );
-                    view.stage(
-                        generation,
-                        crate::view::ViewOp::SetDataPlan {
-                            key,
-                            plan: plan.clone(),
-                        },
-                    );
-                    if let Some(route) = route {
-                        view.stage(
-                            generation,
-                            crate::view::ViewOp::InstallRoute {
-                                route: route.route,
-                                binding: crate::view::RouteBinding {
-                                    epoch: route.epoch,
-                                    action: RouteAction::Data { stream: key },
-                                },
-                            },
-                        );
-                    }
-                }
-                (StreamLane::Reliable, crate::shard::router::RuntimeStreamKey::Reliable(key)) => {
-                    view.stage(
-                        generation,
-                        crate::view::ViewOp::InsertReliableRuntime {
-                            key,
-                            id: id.clone(),
-                            publisher: publisher_key,
-                        },
-                    );
-                    view.stage(
-                        generation,
-                        crate::view::ViewOp::SetReliablePlan {
-                            key,
-                            plan: plan.clone(),
-                        },
-                    );
-                    if let Some(route) = route {
-                        view.stage(
-                            generation,
-                            crate::view::ViewOp::InstallRoute {
-                                route: route.route,
-                                binding: crate::view::RouteBinding {
-                                    epoch: route.epoch,
-                                    action: RouteAction::Reliable { stream: key },
-                                },
-                            },
-                        );
-                    }
-                }
-                _ => debug_assert!(false, "stream key and lane disagree"),
-            }
+            ops.push((shard, insert_stream_runtime_op(key, id.clone(), publisher)));
+            ops.push((shard, set_stream_plan_op(key, plan)));
+            ops.extend(route.map(|route| (shard, install_stream_route_op(key, route))));
         }
-        let mut affected = Vec::new();
-        for index in 0..self.views.len() {
-            let shard = crate::id::ShardId::new(index);
-            if self
-                .view_mut(shard)
-                .is_some_and(|view| view.publish().is_some())
-            {
-                affected.push(shard);
-            }
-        }
-        if self.state.commit().is_err() {
-            self.abort_transaction(now);
-        }
+        self.publish_ops(ops);
     }
 }
 

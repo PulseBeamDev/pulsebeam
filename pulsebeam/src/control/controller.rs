@@ -447,6 +447,89 @@ impl ControllerActor {
         None
     }
 
+    /// Publish one generation of view changes, all-or-nothing.
+    ///
+    /// Every lifecycle change has this shape — open a generation, stage ops
+    /// against the shards it touches, publish each affected view once, commit —
+    /// and every copy of it had to unwind by hand on each of the four ways it
+    /// can fail. Writing it once is what makes "one publish per shard per
+    /// generation" checkable by reading one function.
+    ///
+    /// `reserve` runs inside the generation because a route may only be
+    /// allocated against an open transaction; it hands its handle to `ops`,
+    /// which is the only reason the two are not separate calls.
+    fn transact<T>(
+        &mut self,
+        reserve: impl FnOnce(&mut Self, tokio::time::Instant) -> Option<T>,
+        ops: impl FnOnce(&Self, &T) -> Vec<(crate::id::ShardId, crate::view::ViewOp)>,
+    ) -> Option<T> {
+        let now = tokio::time::Instant::now();
+        if self.state.begin().is_err() {
+            debug_assert!(false, "lifecycle transactions serialise through this actor");
+            return None;
+        }
+        let Some(reserved) = reserve(self, now) else {
+            self.abort_transaction(now);
+            return None;
+        };
+        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
+            self.abort_transaction(now);
+            return None;
+        };
+        let mut staged = vec![false; self.views.len()];
+        for (shard_id, op) in ops(self, &reserved) {
+            let Some(slot) = staged.get_mut(shard_id.index()) else {
+                self.abort_transaction(now);
+                return None;
+            };
+            *slot = true;
+            let Some(view) = self.view_mut(shard_id) else {
+                self.abort_transaction(now);
+                return None;
+            };
+            view.stage(generation, op);
+        }
+        // A shard this generation staged ops for must accept them. An empty
+        // delta cannot happen there, so a publish that yields nothing means the
+        // shard is gone — and committing anyway would retire the slot of a
+        // route the surviving shards still believe in.
+        for (index, staged) in staged.into_iter().enumerate() {
+            let Some(view) = self.view_mut(crate::id::ShardId::new(index)) else {
+                continue;
+            };
+            if view.publish().is_none() && staged {
+                self.abort_transaction(now);
+                return None;
+            }
+        }
+        if self.state.commit().is_err() {
+            self.abort_transaction(now);
+            return None;
+        }
+        Some(reserved)
+    }
+
+    /// [`transact`](Self::transact) for a change that allocates nothing.
+    fn publish_ops(&mut self, ops: Vec<(crate::id::ShardId, crate::view::ViewOp)>) -> bool {
+        if ops.is_empty() {
+            return true;
+        }
+        self.transact(|_, _| Some(()), move |_, ()| ops).is_some()
+    }
+
+    /// [`transact`](Self::transact) for a change that mints one endpoint route.
+    fn publish_with_route(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        family: &'static str,
+        ops: impl FnOnce(&Self, &RouteHandle) -> Vec<(crate::id::ShardId, crate::view::ViewOp)>,
+    ) -> Option<RouteHandle> {
+        self.transact(
+            move |actor, now| actor.reserve_endpoint_retrying(shard_id, now, family),
+            ops,
+        )
+    }
+
     fn defer_subscribe(&mut self, deferred: PendingSubscription) {
         metrics::counter!("subscribe_deferred").increment(1);
         if !self.pending.hold_route(deferred) {
