@@ -6,7 +6,6 @@ use std::time::Duration;
 use crate::entity::AudioOrigin;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
-use crate::id::AudioSelectorSlotId;
 use crate::log::LogCtx;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::START_BANDWIDTH;
@@ -454,12 +453,11 @@ impl DownstreamAllocator {
     #[inline]
     pub fn on_forward_audio_rtp(
         &mut self,
-        slot_idx: AudioSelectorSlotId,
         origin: AudioOrigin,
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) {
-        self.audio.on_rtp(slot_idx, origin, pkt, writer);
+        self.audio.on_rtp(origin, pkt, writer);
     }
 
     /// Whether someone new took over an audio slot since this was last asked.

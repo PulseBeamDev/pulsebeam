@@ -12,7 +12,6 @@ use crate::shard::events::{
 };
 use crate::{
     entity::{TrackId, TrackKind},
-    id::AudioSelectorSlotId,
     keys::{DownstreamSlotKey, ParticipantKey},
     participant::{ParticipantConfig, batcher::GsoSendBatch},
     rtp::RtpPacket,
@@ -115,12 +114,11 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
     fn forward_audio_rtp(
         &mut self,
         subscriber: ParticipantKey,
-        slot_idx: AudioSelectorSlotId,
         origin: crate::entity::AudioOrigin,
         pkt: &RtpPacket,
     ) {
         if let Some(participant) = self.registry.resolve_mut(subscriber) {
-            participant.on_forward_audio_rtp(slot_idx, origin, pkt);
+            participant.on_forward_audio_rtp(origin, pkt);
             self.dirty.mark(subscriber, participant);
         }
     }

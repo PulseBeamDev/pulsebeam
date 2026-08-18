@@ -269,3 +269,57 @@ fn reliable_data_does_not_cross_rooms_test() {
             },
         ]);
 }
+/// Audio selection is a per-room decision. A loud room must not silence a quiet one.
+///
+/// Room alpha has four speakers talking over each other, one more than `MAX_SEND_AUDIO_SLOTS`.
+/// Room beta has one quiet speaker and one listener, and nothing in beta competes for anything:
+/// its listener has three slots and one voice to put in them.
+///
+/// The routing is not what is under test - control fans audio out by room, so beta's listener has
+/// a correct plan naming beta's speaker. What decides this is the selector those packets pass
+/// through on the way to that plan.
+///
+/// Four speakers in alpha rather than three, so a steal is guaranteed: a slot's owner is never
+/// made to re-contend, so with exactly three the streams that sent first would keep their slots.
+/// The steal always takes the quietest slot, which at -70 dBov against -30 is beta's speaker.
+///
+/// The claim is about a *later* window rather than the whole run. Whether beta's speaker grabs a
+/// slot during startup, before alpha has ramped up, depends on arrival order and so on the seed -
+/// and a cumulative "was ever heard" check passes on the strength of that one early moment even
+/// though the speaker is silenced for good a second later.
+#[test]
+fn audio_selection_does_not_cross_rooms_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room-alpha")
+                .with_participant(Participant::data_participant("alpha_loud").speaking_at(-30))
+                .with_participant(Participant::data_participant("alpha_louder").speaking_at(-25))
+                .with_participant(Participant::data_participant("alpha_evenmore").speaking_at(-20))
+                .with_participant(Participant::data_participant("alpha_loudest").speaking_at(-15)),
+        )
+        .with_room(
+            Room::new("room-beta")
+                .with_participant(Participant::data_participant("beta_speaker").speaking_at(-70))
+                .with_participant(Participant::subscriber("beta_listener").hearing(3)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Both rooms talk at once, until alpha has taken every slot",
+                duration: Duration::from_secs(10),
+            },
+            Step::Run {
+                description: "Steady state: alpha is saturated and stays that way",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckRxBytesInterval {
+                description: "Beta is still hearing its own speaker",
+                participant: "beta_listener",
+                min_bytes: 1,
+            },
+            Step::CheckHeardFrom {
+                description: "And it is hearing the speaker from its own room",
+                participant: "beta_listener",
+                expected: &["beta_speaker"],
+            },
+        ]);
+}
