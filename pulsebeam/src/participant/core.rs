@@ -467,11 +467,7 @@ impl ParticipantCore {
     }
 
     #[inline]
-    pub fn on_forward_audio_rtp(
-        &mut self,
-        origin: crate::entity::AudioOrigin,
-        pkt: &RtpPacket,
-    ) {
+    pub fn on_forward_audio_rtp(&mut self, origin: crate::entity::AudioOrigin, pkt: &RtpPacket) {
         self.downstream
             .on_forward_audio_rtp(origin, pkt, &mut self.stream_writer);
         if self.downstream.take_audio_speakers_changed() {
@@ -1610,8 +1606,7 @@ mod upstream_route_table_tests {
             );
             for (index, key) in table.ssrcs.iter().enumerate() {
                 assert_eq!(
-                    table.routes[index].ssrc,
-                    *key,
+                    table.routes[index].ssrc, *key,
                     "routes[{index}] must be the route for ssrcs[{index}]"
                 );
             }

@@ -453,7 +453,12 @@ impl ControllerActor {
 
         let mut targets = Vec::new();
         if let Some(key) = source_key {
-            targets.push((publisher_shard, key, self.stream_plan(binding, publisher_shard), None));
+            targets.push((
+                publisher_shard,
+                key,
+                self.stream_plan(binding, publisher_shard),
+                None,
+            ));
         }
         for (destination, key) in destination_keys {
             let Some(route) = routes.get(&destination).copied() else {

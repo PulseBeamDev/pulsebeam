@@ -269,14 +269,17 @@ impl ShardCore {
                                     .any(|&(current, _)| current == participant)
                                 {
                                     self.registry.unbind_subscribed_track(
-                                        participant, track_id, *key,
+                                        participant,
+                                        track_id,
+                                        *key,
                                     );
                                 }
                             }
                         }
                         for &(participant, _) in &plan.local_subscribers {
                             if !previous_participants.contains(&participant) {
-                                self.registry.bind_subscribed_track(participant, track_id, *key);
+                                self.registry
+                                    .bind_subscribed_track(participant, track_id, *key);
                             }
                         }
                     }
@@ -286,9 +289,8 @@ impl ShardCore {
                         };
                         if let Some(previous) = self.view.tracks.resolve(*key) {
                             for &(participant, _) in &previous.local_subscribers {
-                                self.registry.unbind_subscribed_track(
-                                    participant, track_id, *key,
-                                );
+                                self.registry
+                                    .unbind_subscribed_track(participant, track_id, *key);
                             }
                         }
                     }

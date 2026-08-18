@@ -471,15 +471,27 @@ mod tests {
         let (holder, rival) = (origin(1), origin(2));
         let start = Instant::now();
 
-        alloc.on_rtp(holder, &speaking_at_time(-30, start), &mut StreamWriter::new());
+        alloc.on_rtp(
+            holder,
+            &speaking_at_time(-30, start),
+            &mut StreamWriter::new(),
+        );
         // Past newborn immunity, so only the owner rule can be keeping the slot.
         let later = start + NEWBORN_IMMUNITY + Duration::from_millis(10);
-        alloc.on_rtp(holder, &speaking_at_time(-30, later), &mut StreamWriter::new());
+        alloc.on_rtp(
+            holder,
+            &speaking_at_time(-30, later),
+            &mut StreamWriter::new(),
+        );
 
         assert_eq!(heard_origins(&alloc), vec![holder]);
         assert!(
             alloc
-                .on_rtp(rival, &speaking_at_time(-31, later), &mut StreamWriter::new())
+                .on_rtp(
+                    rival,
+                    &speaking_at_time(-31, later),
+                    &mut StreamWriter::new()
+                )
                 .is_none(),
             "a quieter rival does not take an occupied slot"
         );
@@ -496,13 +508,29 @@ mod tests {
         let (first, second) = (origin(1), origin(2));
         let start = Instant::now();
 
-        alloc.on_rtp(first, &speaking_at_time(-40, start), &mut StreamWriter::new());
+        alloc.on_rtp(
+            first,
+            &speaking_at_time(-40, start),
+            &mut StreamWriter::new(),
+        );
         let steal_at = start + NEWBORN_IMMUNITY + Duration::from_millis(10);
-        alloc.on_rtp(second, &speaking_at_time(-20, steal_at), &mut StreamWriter::new());
-        assert_eq!(heard_origins(&alloc), vec![second], "the louder voice took it");
+        alloc.on_rtp(
+            second,
+            &speaking_at_time(-20, steal_at),
+            &mut StreamWriter::new(),
+        );
+        assert_eq!(
+            heard_origins(&alloc),
+            vec![second],
+            "the louder voice took it"
+        );
 
         let delayed = steal_at + Duration::from_millis(10);
-        alloc.on_rtp(first, &speaking_at_time(-10, delayed), &mut StreamWriter::new());
+        alloc.on_rtp(
+            first,
+            &speaking_at_time(-10, delayed),
+            &mut StreamWriter::new(),
+        );
         assert_eq!(
             heard_origins(&alloc),
             vec![second],
@@ -517,7 +545,11 @@ mod tests {
         let (departed, newcomer) = (origin(1), origin(2));
         let start = Instant::now();
 
-        alloc.on_rtp(departed, &speaking_at_time(-20, start), &mut StreamWriter::new());
+        alloc.on_rtp(
+            departed,
+            &speaking_at_time(-20, start),
+            &mut StreamWriter::new(),
+        );
         // Quieter than the previous owner, so only the slot being dead can admit it.
         let after_silence = start + DEAD_TIMEOUT + Duration::from_millis(10);
         alloc.on_rtp(
@@ -554,7 +586,10 @@ mod tests {
         let speaker = origin(1);
 
         alloc.on_rtp(speaker, &speaking(-30), &mut StreamWriter::new());
-        assert!(alloc.take_speakers_changed(), "the first occupant is a change");
+        assert!(
+            alloc.take_speakers_changed(),
+            "the first occupant is a change"
+        );
 
         alloc.on_rtp(speaker, &speaking(-20), &mut StreamWriter::new());
         assert!(
