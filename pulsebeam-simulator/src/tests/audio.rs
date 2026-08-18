@@ -47,10 +47,15 @@ fn audio_reaches_the_room_test() {
 /// as a listener in a room is. The quiet one must be the one left out - a selector that forwarded
 /// whoever arrived first would pass a byte count and fail this.
 ///
-/// Note the four speakers: the slot count is a property of the room, not of the listener, so
-/// asking to hear fewer does not create contention. An earlier version of this plan had two
-/// speakers and a listener asking for one slot, and passed only because the second audio mid had
-/// no send stream declared on it and silently dropped everything.
+/// Note the four speakers. The count that decides this is `MAX_SEND_AUDIO_SLOTS`, the audio mid
+/// count negotiated for one client - a property of the *listener*. The selector holding those
+/// slots lives on the shard and is shared by every room on it, so asking to hear fewer does not
+/// create contention, and neither does being in a different room. See
+/// `tests::room_isolation::audio_selection_does_not_cross_rooms_test`.
+///
+/// An earlier version of this plan had two speakers and a listener asking for one slot, and
+/// passed only because the second audio mid had no send stream declared on it and silently
+/// dropped everything.
 ///
 /// For a long time this could not pass at all: the SFU chose who filled a subscriber's audio slots
 /// and never said who they were, so packets arrived at the agent with nothing to deliver them to.
