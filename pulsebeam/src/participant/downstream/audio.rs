@@ -383,8 +383,11 @@ mod tests {
 
     fn allocator_with(slots: usize) -> AudioAllocator {
         let mut alloc = AudioAllocator::new(test_ctx());
-        for (idx, mid) in ["a0", "a1", "a2", "a3"].into_iter().take(slots).enumerate() {
-            alloc.add_slot(slot_config(mid, 1000u32.wrapping_add(idx as u32)));
+        for (mid, ssrc) in [("a0", 1000), ("a1", 1001), ("a2", 1002), ("a3", 1003)]
+            .into_iter()
+            .take(slots)
+        {
+            alloc.add_slot(slot_config(mid, ssrc));
         }
         alloc
     }
