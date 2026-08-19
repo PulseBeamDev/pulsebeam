@@ -861,7 +861,7 @@ impl ControllerActor {
                             debug_assert!(false, "data does not publish through the track path");
                         }
                     }
-                    if !self.publish_track_plans(track_id).await {
+                    if !self.publish_publication(track_id).await {
                         debug_assert!(false, "initial track plan publication must complete");
                     }
                     self.drain_pending_track_subscriptions(track_id).await;
@@ -985,7 +985,7 @@ impl ControllerActor {
             if track_id.kind() == crate::entity::TrackKind::Video {
                 self.install_video_runtimes(track_id).await;
             }
-            if !self.publish_track_plans(track_id).await {
+            if !self.publish_publication(track_id).await {
                 debug_assert!(false, "room track reconciliation must publish");
             }
         }

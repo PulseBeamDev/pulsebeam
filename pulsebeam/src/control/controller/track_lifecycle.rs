@@ -392,7 +392,7 @@ impl ControllerActor {
                 destination.route = Some(route);
             }
         }
-        if !self.publish_track_plans(track_id).await {
+        if !self.publish_publication(track_id).await {
             debug_assert!(false, "audio route installation must publish");
         }
     }
@@ -538,7 +538,7 @@ impl ControllerActor {
             }
         }
 
-        if !self.publish_track_plans(track.id).await {
+        if !self.publish_publication(track.id).await {
             debug_assert!(false, "track plan publication must complete");
         }
     }
@@ -577,7 +577,7 @@ impl ControllerActor {
             debug_assert!(false, "video unsubscription must publish");
         }
         if departure != crate::control::patterns::Departure::LastOnShard {
-            let _ = self.publish_track_plans(track.id).await;
+            let _ = self.publish_publication(track.id).await;
             return;
         }
         let Some(route) = self.catalog.get_mut(&track.id).and_then(|binding| {
@@ -586,7 +586,7 @@ impl ControllerActor {
                 .get_mut(&shard_id)
                 .and_then(|d| d.route.take())
         }) else {
-            let _ = self.publish_track_plans(track.id).await;
+            let _ = self.publish_publication(track.id).await;
             return;
         };
         if !self.retire_video_route(shard_id, route, track.id).await {
@@ -744,34 +744,77 @@ impl ControllerActor {
         })
     }
 
-    pub(super) async fn publish_track_plans(&mut self, track_id: crate::entity::TrackId) -> bool {
-        let Some(binding) = self.catalog.get(&track_id) else {
+    /// Publish one publication's compiled view to every shard that holds it.
+    ///
+    /// The same walk for every kind - the publisher's own shard plus each
+    /// destination, a runtime and a plan for each. What differs is which
+    /// runtime op names the arena, and that a data destination carries its
+    /// route install here rather than at grant time.
+    pub(super) async fn publish_publication(&mut self, id: crate::entity::TrackId) -> bool {
+        let Some(publication) = self.catalog.get(&id) else {
             return false;
         };
-        let mut shards: Vec<_> = binding.destinations.keys().copied().collect();
-        shards.push(binding.publisher_shard);
+        let kind = publication.kind();
+        let publisher_shard = publication.publisher_shard;
+        let publisher_key = publication.publisher_key;
+        let stream_id = match &publication.media {
+            crate::control::publication::Media::Data { topic, .. } => {
+                Some(crate::shard::router::DataStreamId::new(
+                    publication.room,
+                    publication.publisher,
+                    topic.clone(),
+                ))
+            }
+            _ => None,
+        };
+        let mut targets = vec![(publisher_shard, publication.origin_key, None)];
+        for (shard, held) in &publication.destinations {
+            targets.push((*shard, held.key, held.route));
+        }
+
         let mut ops = Vec::new();
-        for shard_id in shards {
-            let Some((fanout, plan)) = self.track_plan(track_id, shard_id) else {
+        for (shard, key, route) in targets {
+            let Some(plan) = self.plan_for(id, shard) else {
                 continue;
             };
-            let Some(descriptor) = self.track_descriptor(track_id, shard_id) else {
-                continue;
-            };
+            match (&stream_id, key.track()) {
+                (Some(stream_id), _) => {
+                    let Some(key) = key.stream() else {
+                        continue;
+                    };
+                    ops.push((
+                        shard,
+                        super::stream_lifecycle::insert_stream_runtime_op(
+                            key,
+                            stream_id.clone(),
+                            publisher_key,
+                        ),
+                    ));
+                    ops.extend(route.map(|route| {
+                        (
+                            shard,
+                            super::stream_lifecycle::install_stream_route_op(key, route),
+                        )
+                    }));
+                }
+                (None, Some(fanout)) => {
+                    let Some(descriptor) = self.track_descriptor(id, shard) else {
+                        continue;
+                    };
+                    ops.push((
+                        shard,
+                        crate::view::ViewOp::InsertTrackRuntime {
+                            key: fanout,
+                            descriptor,
+                        },
+                    ));
+                }
+                (None, None) => continue,
+            }
             ops.push((
-                shard_id,
-                crate::view::ViewOp::InsertTrackRuntime {
-                    key: fanout,
-                    descriptor,
-                },
-            ));
-            ops.push((
-                shard_id,
+                shard,
                 crate::view::ViewOp::SetPlan {
-                    target: plan_target(
-                        track_id.kind(),
-                        crate::control::publication::RuntimeKey::Track(fanout),
-                    ),
+                    target: plan_target(kind, key),
                     plan,
                 },
             ));

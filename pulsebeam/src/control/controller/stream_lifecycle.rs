@@ -17,7 +17,7 @@ fn should_publish_stream_views(retired: bool, added: bool) -> bool {
 /// None of these take a lane: `RuntimeStreamKey`'s variant *is* the lane, and
 /// passing one alongside meant every call site carried a second source of truth
 /// plus a `debug_assert` to catch the two disagreeing.
-fn insert_stream_runtime_op(
+pub(super) fn insert_stream_runtime_op(
     key: crate::shard::router::RuntimeStreamKey,
     id: crate::shard::router::DataStreamId,
     publisher: crate::shard::participants::ParticipantKey,
@@ -65,7 +65,7 @@ fn remove_stream_ops(key: crate::shard::router::RuntimeStreamKey) -> [crate::vie
     }
 }
 
-fn install_stream_route_op(
+pub(super) fn install_stream_route_op(
     key: crate::shard::router::RuntimeStreamKey,
     route: RouteHandle,
 ) -> crate::view::ViewOp {
@@ -512,54 +512,9 @@ impl ControllerActor {
             added = true;
         }
         if should_publish_stream_views(retired, added) {
-            self.publish_stream_views(id, lane).await;
+            self.publish_publication(data_publication_id(&id, lane))
+                .await;
         }
-    }
-
-    pub(super) async fn publish_stream_views(
-        &mut self,
-        id: crate::shard::router::DataStreamId,
-        lane: StreamLane,
-    ) {
-        let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
-            return;
-        };
-        let publisher = binding.publisher_key;
-        let publisher_shard = binding.publisher_shard;
-        let source_key = binding.origin_key.stream();
-        let destinations = binding.destinations.clone();
-
-        let mut targets = Vec::new();
-        if let Some(key) = source_key {
-            targets.push((
-                publisher_shard,
-                key,
-                self.stream_plan(&id, lane, publisher_shard),
-                None,
-            ));
-        }
-        for (destination, held) in &destinations {
-            let (destination, Some(route)) = (*destination, held.route) else {
-                continue;
-            };
-            let Some(key) = held.key.stream() else {
-                continue;
-            };
-            targets.push((
-                destination,
-                key,
-                self.stream_plan(&id, lane, destination),
-                Some(route),
-            ));
-        }
-
-        let mut ops = Vec::new();
-        for (shard, key, plan, route) in targets {
-            ops.push((shard, insert_stream_runtime_op(key, id.clone(), publisher)));
-            ops.push((shard, set_stream_plan_op(key, plan)));
-            ops.extend(route.map(|route| (shard, install_stream_route_op(key, route))));
-        }
-        self.publish_ops(ops);
     }
 }
 
