@@ -255,8 +255,22 @@ impl ParticipantId {
         }
     }
 
+    /// The stable, cluster-wide identity of a publication.
+    ///
+    /// Every semantic input is hashed. The kind used to be carried beside the
+    /// uuid without being hashed, so a video and an audio track with the same
+    /// label shared a uuid and were distinct only because `TrackId`'s `Eq`
+    /// covers the kind — fine as a map key, ambiguous as an identity.
+    ///
+    /// Any node derives the same id from the same inputs, which is what makes
+    /// it usable as an inter-node name. It is never what the data plane
+    /// carries: control compiles it to a dense `RouteId` and arena keys.
     pub fn derive_track_id(&self, kind: TrackKind, label: &str) -> TrackId {
-        let uuid = new_v8_sha3(&self.uuid, label.as_bytes());
+        let mut namespaced = Vec::with_capacity(label.len().saturating_add(8));
+        namespaced.extend_from_slice(kind.as_prefix().as_bytes());
+        namespaced.push(b'/');
+        namespaced.extend_from_slice(label.as_bytes());
+        let uuid = new_v8_sha3(&self.uuid, &namespaced);
         TrackId { kind, uuid }
     }
 }
@@ -423,19 +437,25 @@ pub struct AudioOrigin {
     pub track: TrackId,
 }
 
+impl TrackKind {
+    /// The identity prefix, which is also what distinguishes the kinds inside a
+    /// derived id.
+    pub fn as_prefix(self) -> &'static str {
+        match self {
+            TrackKind::Data => prefix::DATA_TRACK_ID,
+            TrackKind::Audio => prefix::AUDIO_TRACK_ID,
+            TrackKind::Video => prefix::VIDEO_TRACK_ID,
+        }
+    }
+}
+
 impl TrackId {
     pub fn kind(&self) -> TrackKind {
         self.kind
     }
 
     pub fn as_str(&self) -> String {
-        let prefix_str = match self.kind {
-            TrackKind::Data => prefix::DATA_TRACK_ID,
-            TrackKind::Audio => prefix::AUDIO_TRACK_ID,
-            TrackKind::Video => prefix::VIDEO_TRACK_ID,
-        };
-
-        encode_with_prefix(prefix_str, self.uuid.as_bytes())
+        encode_with_prefix(self.kind.as_prefix(), self.uuid.as_bytes())
     }
 }
 
@@ -897,6 +917,75 @@ mod tests {
         let p = ParticipantId::new();
         for c in p.derive_track_id(TrackKind::Video, "c").as_str().chars() {
             assert!(c.is_ascii_alphanumeric() || c == '_');
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn pid(seed: u8) -> ParticipantId {
+        ParticipantId::from_bytes([seed; 16])
+    }
+
+    /// The kind is part of the identity, not a label beside it. Before it was
+    /// hashed, these two shared a uuid and differed only by the struct field.
+    #[test]
+    fn one_label_under_two_kinds_is_two_identities() {
+        let p = pid(1);
+        let video = p.derive_track_id(TrackKind::Video, "cam");
+        let audio = p.derive_track_id(TrackKind::Audio, "cam");
+        assert_ne!(video, audio);
+        assert_ne!(
+            video.as_str(),
+            audio.as_str(),
+            "the encoded form must differ too, not just the in-memory key"
+        );
+    }
+
+    /// Same inputs, same id, on any node. This is what makes a derived id
+    /// usable as a cluster-wide name rather than a node-local handle.
+    #[test]
+    fn derivation_is_stable() {
+        let a = pid(7).derive_track_id(TrackKind::Data, "v1/rt/chat");
+        let b = pid(7).derive_track_id(TrackKind::Data, "v1/rt/chat");
+        assert_eq!(a, b);
+    }
+
+    /// Different publisher, different publication, even for one label.
+    #[test]
+    fn the_publisher_is_part_of_the_identity() {
+        let a = pid(1).derive_track_id(TrackKind::Data, "v1/rt/chat");
+        let b = pid(2).derive_track_id(TrackKind::Data, "v1/rt/chat");
+        assert_ne!(a, b);
+    }
+
+    /// The two data lanes are two publications of one topic, distinguished by
+    /// the label rather than by a lane field the routing layer has to carry.
+    #[test]
+    fn the_lanes_are_distinct_publications() {
+        let p = pid(3);
+        let realtime = p.derive_track_id(TrackKind::Data, "v1/rt/chat");
+        let reliable = p.derive_track_id(TrackKind::Data, "v1/rel/chat");
+        assert_ne!(realtime, reliable);
+    }
+
+    /// The label grammar is injective without escaping, which is the property
+    /// plain concatenation depends on: `rt` and `rel` are prefix-free after
+    /// `v1/`, and a topic cannot contain a separator.
+    #[test]
+    fn no_topic_and_lane_pair_collides_with_another() {
+        let p = pid(4);
+        let mut seen = std::collections::HashMap::new();
+        for lane in ["rt", "rel"] {
+            for topic in ["chat", "chat-2", "rel", "rt", "v1", "a_b", "relchat"] {
+                let label = format!("v1/{lane}/{topic}");
+                let id = p.derive_track_id(TrackKind::Data, &label);
+                if let Some(previous) = seen.insert(id, label.clone()) {
+                    panic!("{previous} and {label} derived the same identity");
+                }
+            }
         }
     }
 }
