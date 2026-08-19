@@ -304,81 +304,100 @@ impl ControllerActor {
         self.state.mint_track(shard_id, track_id, origin)
     }
 
-    pub(super) async fn install_audio_routes(&mut self, track_id: crate::entity::TrackId) {
-        let Some(binding) = self.catalog.get(&track_id) else {
-            return;
+    /// Give every shard that declared an interest a key and a route to reach
+    /// this publication by, and publish the result.
+    ///
+    /// The publisher's own shard is skipped: it holds the source, and a route
+    /// to itself would be a second hop to nowhere. `mint` is the per-kind step,
+    /// naming which arena the destination's key comes from and which route
+    /// action reaches it.
+    pub(super) async fn install_destinations(
+        &mut self,
+        id: crate::entity::TrackId,
+        mint: impl Fn(
+            &mut Self,
+            crate::id::ShardId,
+        ) -> Option<(
+            crate::control::publication::RuntimeKey,
+            crate::route::RouteAction,
+        )>,
+    ) -> bool {
+        let Some(publication) = self.catalog.get(&id) else {
+            return false;
         };
-        let origin = binding.publisher;
-        let publisher_shard = binding.publisher_shard;
-        let Some(room_id) = self
-            .core
-            .registry
-            .get_participant(&origin)
-            .map(|meta| meta.room_id)
-        else {
-            debug_assert!(false, "a published track must have a room");
-            return;
-        };
-        let subject = crate::control::patterns::Subject {
-            room: room_id,
-            publisher: origin,
-            name: track_id,
-        };
-        // The plan names its audiences rather than listing them. Membership
-        // lives on the shard, so a participant joining the room is one insert
-        // there instead of a rewrite of every audio plan in it.
-        let groups = self.audio_patterns.match_subject(&subject);
-        let mut destinations: Vec<crate::id::ShardId> = Vec::new();
-        for group in &groups {
-            for shard in self.audio_patterns.shards_of(*group) {
-                if !destinations.contains(&shard) {
-                    destinations.push(shard);
+        let publisher_shard = publication.publisher_shard;
+        let kind = publication.kind();
+        let mut wanted: Vec<crate::id::ShardId> = Vec::new();
+        for group in self.groups_of(publication) {
+            for shard in self.audience_shards(kind, group) {
+                if shard != publisher_shard && !wanted.contains(&shard) {
+                    wanted.push(shard);
                 }
             }
         }
-        for destination in destinations {
-            if destination == publisher_shard {
-                continue;
-            }
+
+        let mut added = false;
+        for destination in wanted {
             if self
                 .catalog
-                .get(&track_id)
-                .is_some_and(|binding| binding.destinations.contains_key(&destination))
+                .get(&id)
+                .is_some_and(|held| held.destinations.contains_key(&destination))
             {
                 continue;
             }
-            let Some(key) = self.prepare_track_key(destination, track_id, origin) else {
+            let Some((key, action)) = mint(self, destination) else {
                 continue;
             };
-            let plan = crate::view::AudioPlan {
-                groups: groups.clone(),
-                remote_routes: Vec::new(),
-                reverse_route: None,
+            let Some(plan) = self.plan_for(id, destination) else {
+                continue;
             };
             let Some(route) = self
-                .grant_route_binding(
-                    destination,
-                    RouteAction::Audio { track: key },
-                    Some((crate::view::PlanTarget::Audio(key), plan)),
-                )
+                .grant_route_binding(destination, action, Some((plan_target(kind, key), plan)))
                 .await
             else {
                 continue;
             };
-            let Some(binding) = self.catalog.get_mut(&track_id) else {
-                return;
+            let Some(publication) = self.catalog.get_mut(&id) else {
+                return false;
             };
-            binding.destinations.insert(
+            publication.destinations.insert(
                 destination,
                 crate::control::publication::Destination {
-                    key: crate::control::publication::RuntimeKey::Track(key),
-                    route: None,
+                    key,
+                    route: Some(route),
                 },
             );
-            if let Some(destination) = binding.destinations.get_mut(&destination) {
-                destination.route = Some(route);
-            }
+            added = true;
         }
+        added
+    }
+
+    /// The shards holding members of an audience, whichever image it lives in.
+    fn audience_shards(
+        &self,
+        kind: crate::entity::TrackKind,
+        group: crate::view::GroupId,
+    ) -> Vec<crate::id::ShardId> {
+        match kind {
+            crate::entity::TrackKind::Audio => self.audio_patterns.shards_of(group),
+            crate::entity::TrackKind::Video => self.video_patterns.shards_of(group),
+            crate::entity::TrackKind::Data => self.data_patterns.shards_of(group),
+        }
+    }
+
+    pub(super) async fn install_audio_routes(&mut self, track_id: crate::entity::TrackId) {
+        let installed = self
+            .install_destinations(track_id, |actor, destination| {
+                let publication = actor.catalog.get(&track_id)?;
+                let (id, origin) = (publication.id, publication.publisher);
+                let key = actor.prepare_track_key(destination, id, origin)?;
+                Some((
+                    crate::control::publication::RuntimeKey::Track(key),
+                    RouteAction::Audio { track: key },
+                ))
+            })
+            .await;
+        let _ = installed;
         if !self.publish_publication(track_id).await {
             debug_assert!(false, "audio route installation must publish");
         }

@@ -426,67 +426,19 @@ impl ControllerActor {
             debug_assert!(false, "stream route retirement must complete");
             return;
         }
-        let destinations = wanted;
-        let Some(publisher_shard) = self
-            .catalog
-            .get(&data_publication_id(&id, lane))
-            .map(|binding| binding.publisher_shard)
-        else {
-            return;
-        };
-        let mut added = false;
-        for destination in destinations {
-            let has_route = self
-                .catalog
-                .get(&data_publication_id(&id, lane))
-                .is_some_and(|binding| {
-                    binding
-                        .destinations
-                        .get(&destination)
-                        .is_some_and(|d| d.route.is_some())
-                });
-            if !needs_stream_route(publisher_shard, destination, has_route) {
-                continue;
-            }
-            let Some(key) = self.lanes.get(lane).mint(&mut self.state, destination, &id) else {
-                continue;
-            };
-            let Some(action) = self.lanes.get(lane).route_action(key) else {
-                debug_assert!(false, "stream preparation returned the wrong lane");
-                continue;
-            };
-            let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
-                return;
-            };
-            let plan = self.stream_plan(&id, lane, destination);
-            let Some(route) = self
-                .grant_route_binding(
-                    destination,
-                    action,
-                    Some((
-                        super::track_lifecycle::plan_target(
-                            crate::entity::TrackKind::Data,
-                            key.into(),
-                        ),
-                        plan.clone(),
-                    )),
-                )
-                .await
-            else {
-                continue;
-            };
-            let Some(binding) = self.catalog.get_mut(&data_publication_id(&id, lane)) else {
-                return;
-            };
-            binding.destinations.insert(
-                destination,
-                crate::control::publication::Destination {
-                    key: key.into(),
-                    route: Some(route),
-                },
-            );
-            added = true;
-        }
+        let publication_id = data_publication_id(&id, lane);
+        let stream = id.clone();
+        let added = self
+            .install_destinations(publication_id, move |actor, destination| {
+                let key = actor
+                    .lanes
+                    .get(lane)
+                    .mint(&mut actor.state, destination, &stream)?;
+                let action = actor.lanes.get(lane).route_action(key)?;
+                Some((key.into(), action))
+            })
+            .await;
+
         if should_publish_stream_views(retired, added) {
             self.publish_publication(data_publication_id(&id, lane))
                 .await;
