@@ -27,6 +27,9 @@
 use arrayvec::ArrayVec;
 use indexmap::{IndexMap, IndexSet};
 
+type Map<K, V> = IndexMap<K, V>;
+type Set<K> = IndexSet<K>;
+
 use crate::entity::{ParticipantId, RoomId};
 use crate::id::ShardId;
 use crate::keys::ParticipantKey;
@@ -171,15 +174,15 @@ pub(crate) enum Departure {
 
 #[derive(Debug)]
 struct Group<S> {
-    members: IndexMap<ParticipantId, Member<S>>,
-    per_shard: IndexMap<ShardId, u32>,
+    members: Map<ParticipantId, Member<S>>,
+    per_shard: Map<ShardId, u32>,
 }
 
 impl<S> Default for Group<S> {
     fn default() -> Self {
         Self {
-            members: IndexMap::new(),
-            per_shard: IndexMap::new(),
+            members: Map::default(),
+            per_shard: Map::default(),
         }
     }
 }
@@ -187,19 +190,19 @@ impl<S> Default for Group<S> {
 /// Declarations for one kind, and the groups they resolve to.
 #[derive(Debug)]
 pub(crate) struct PatternTable<N, S> {
-    ids: IndexMap<Pattern<N>, GroupId>,
+    ids: Map<Pattern<N>, GroupId>,
     groups: Vec<Option<Group<S>>>,
     free: Vec<GroupId>,
-    by_participant: IndexMap<ParticipantId, IndexSet<Pattern<N>>>,
+    by_participant: Map<ParticipantId, Set<Pattern<N>>>,
 }
 
 impl<N, S> Default for PatternTable<N, S> {
     fn default() -> Self {
         Self {
-            ids: IndexMap::new(),
+            ids: Map::default(),
             groups: Vec::new(),
             free: Vec::new(),
-            by_participant: IndexMap::new(),
+            by_participant: Map::default(),
         }
     }
 }
@@ -369,15 +372,24 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
 
     /// Members of a group that live on one shard — what that shard's compiled
     /// group image holds.
-    pub fn members_on(&self, group: GroupId, shard: ShardId) -> Vec<(ParticipantKey, S)> {
+    ///
+    /// Yields the participant id alongside the key because `ParticipantKey` is
+    /// a per-shard arena key: two participants on different shards can hold the
+    /// same one, so anything comparing identities across shards has to use the
+    /// id.
+    pub fn members_on(
+        &self,
+        group: GroupId,
+        shard: ShardId,
+    ) -> Vec<(ParticipantId, ParticipantKey, S)> {
         self.groups
             .get(group.0 as usize)
             .and_then(Option::as_ref)
             .map(|g| {
                 g.members
-                    .values()
-                    .filter(|m| m.shard == shard)
-                    .map(|m| (m.key, m.delivery))
+                    .iter()
+                    .filter(|(_, m)| m.shard == shard)
+                    .map(|(id, m)| (*id, m.key, m.delivery))
                     .collect()
             })
             .unwrap_or_default()

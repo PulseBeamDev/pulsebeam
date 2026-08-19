@@ -142,6 +142,11 @@ pub struct ControllerActor {
     /// fields duplicated per lane, so the two cannot drift.
     lanes: Lanes,
     pending: PendingSubscriptions,
+    /// Audio declarations, shadowing the room scan in `install_audio_routes`
+    /// until routing reads them instead of it. Every participant declares the
+    /// room wildcard, which is what the scan produces today; what is under
+    /// test is that declarations appear and disappear with the participant.
+    audio_patterns: crate::control::patterns::PatternTable<crate::entity::TrackId, ()>,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
 }
@@ -178,6 +183,7 @@ impl ControllerActor {
             track_bindings: HashMap::new(),
             lanes: Lanes::new(),
             pending: PendingSubscriptions::default(),
+            audio_patterns: crate::control::patterns::PatternTable::new(),
             #[cfg(not(feature = "sim"))]
             steering: None,
         }
@@ -898,6 +904,15 @@ impl ControllerActor {
         self.core
             .registry
             .bind_participant(&cfg.participant_id, binding);
+        self.audio_patterns.declare(
+            crate::control::patterns::Pattern::all(room_id),
+            cfg.participant_id,
+            crate::control::patterns::Member {
+                shard: shard_id,
+                key: binding,
+                delivery: (),
+            },
+        );
 
         self.reconcile_room_tracks(room_id).await;
 

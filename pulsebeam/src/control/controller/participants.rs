@@ -39,6 +39,7 @@ impl ControllerActor {
             self.release_route(retired.destination, retired.route).await;
         }
         self.pending.remove_participant(*participant_id);
+        self.audio_patterns.remove_participant(participant_id);
     }
 
     /// Retire whatever transport route a participant holds, if the registry
