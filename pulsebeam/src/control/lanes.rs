@@ -53,8 +53,9 @@ pub(crate) struct StreamBinding {
     pub publisher: ParticipantKey,
     pub key: Option<RuntimeStreamKey>,
     pub reverse_route: Option<RouteHandle>,
-    pub destination_keys: HashMap<ShardId, RuntimeStreamKey>,
-    pub routes: HashMap<ShardId, RouteHandle>,
+    /// Where this stream goes, one record per shard — the same shape a track
+    /// uses, so the procedures over it can be the same procedures.
+    pub destinations: indexmap::IndexMap<ShardId, crate::control::publication::Destination>,
 }
 
 impl StreamBinding {
@@ -64,8 +65,7 @@ impl StreamBinding {
             publisher,
             key: None,
             reverse_route: None,
-            destination_keys: HashMap::new(),
-            routes: HashMap::new(),
+            destinations: indexmap::IndexMap::new(),
         }
     }
 }

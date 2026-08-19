@@ -54,6 +54,28 @@ impl RuntimeKey {
             _ => None,
         }
     }
+
+    /// The data arenas' key, likewise. `RuntimeStreamKey` is the compiled form
+    /// the shard already speaks; this is the same distinction seen from the
+    /// catalog, where a media key is also possible.
+    pub fn stream(self) -> Option<crate::shard::router::RuntimeStreamKey> {
+        use crate::shard::router::RuntimeStreamKey;
+        match self {
+            Self::Unreliable(key) => Some(RuntimeStreamKey::Unreliable(key)),
+            Self::Reliable(key) => Some(RuntimeStreamKey::Reliable(key)),
+            Self::Track(_) => None,
+        }
+    }
+}
+
+impl From<crate::shard::router::RuntimeStreamKey> for RuntimeKey {
+    fn from(key: crate::shard::router::RuntimeStreamKey) -> Self {
+        use crate::shard::router::RuntimeStreamKey;
+        match key {
+            RuntimeStreamKey::Unreliable(key) => Self::Unreliable(key),
+            RuntimeStreamKey::Reliable(key) => Self::Reliable(key),
+        }
+    }
 }
 
 /// One shard that receives this publication: what it calls it there, and the

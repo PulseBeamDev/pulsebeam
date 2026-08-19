@@ -112,12 +112,15 @@ impl ControllerActor {
         let groups = self.data_patterns.match_subject(&subject);
         let remote_routes = if destination == binding.publisher_shard {
             binding
-                .routes
+                .destinations
                 .iter()
-                .map(|(shard_id, handle)| crate::view::RemoteRoutePlan {
-                    shard_id: *shard_id,
-                    route: handle.route,
-                    epoch: handle.epoch,
+                .filter_map(|(shard_id, held)| {
+                    let handle = held.route?;
+                    Some(crate::view::RemoteRoutePlan {
+                        shard_id: *shard_id,
+                        route: handle.route,
+                        epoch: handle.epoch,
+                    })
                 })
                 .collect()
         } else {
@@ -317,8 +320,7 @@ impl ControllerActor {
                 debug_assert!(false, "stream binding must survive route retirement");
                 return false;
             };
-            binding.routes.remove(destination);
-            binding.destination_keys.remove(destination);
+            binding.destinations.shift_remove(destination);
             self.state
                 .release_endpoint(*destination, route.route.slot(), now);
         }
@@ -335,17 +337,10 @@ impl ControllerActor {
         };
         let publisher_shard = binding.publisher_shard;
         let source_key = binding.key;
-        let destination_keys = binding.destination_keys.clone();
-        let routes: Vec<_> = binding
-            .routes
+        let destinations = binding.destinations.clone();
+        let routes: Vec<_> = destinations
             .iter()
-            .filter_map(|(destination, route)| {
-                let Some(key) = destination_keys.get(destination).copied() else {
-                    debug_assert!(false, "a stream route must have a destination key");
-                    return None;
-                };
-                Some((*destination, key, *route))
-            })
+            .filter_map(|(destination, held)| Some((*destination, held.key.stream()?, held.route?)))
             .collect();
 
         let mut ops = Vec::new();
@@ -370,7 +365,10 @@ impl ControllerActor {
                 .get(lane)
                 .retire_runtime(&mut self.state, publisher_shard, key);
         }
-        for (destination, key) in destination_keys {
+        for (destination, held) in destinations {
+            let Some(key) = held.key.stream() else {
+                continue;
+            };
             self.lanes
                 .get(lane)
                 .retire_runtime(&mut self.state, destination, key);
@@ -416,14 +414,13 @@ impl ControllerActor {
             .get(&id)
             .map(|binding| {
                 binding
-                    .routes
+                    .destinations
                     .iter()
-                    .filter_map(|(destination, route)| {
+                    .filter_map(|(destination, held)| {
                         if wanted.contains(destination) {
                             return None;
                         }
-                        let key = binding.destination_keys.get(destination).copied()?;
-                        Some((*destination, key, *route))
+                        Some((*destination, held.key.stream()?, held.route?))
                     })
                     .collect()
             })
@@ -444,11 +441,12 @@ impl ControllerActor {
         };
         let mut added = false;
         for destination in destinations {
-            let has_route = self
-                .lanes
-                .get(lane)
-                .get(&id)
-                .is_some_and(|binding| binding.routes.contains_key(&destination));
+            let has_route = self.lanes.get(lane).get(&id).is_some_and(|binding| {
+                binding
+                    .destinations
+                    .get(&destination)
+                    .is_some_and(|d| d.route.is_some())
+            });
             if !needs_stream_route(publisher_shard, destination, has_route) {
                 continue;
             }
@@ -472,8 +470,13 @@ impl ControllerActor {
             let Some(binding) = self.lanes.get_mut(lane).get_mut(&id) else {
                 return;
             };
-            binding.destination_keys.insert(destination, key);
-            binding.routes.insert(destination, route);
+            binding.destinations.insert(
+                destination,
+                crate::control::publication::Destination {
+                    key: key.into(),
+                    route: Some(route),
+                },
+            );
             added = true;
         }
         if should_publish_stream_views(retired, added) {
@@ -492,8 +495,7 @@ impl ControllerActor {
         let publisher = binding.publisher;
         let publisher_shard = binding.publisher_shard;
         let source_key = binding.key;
-        let destination_keys = binding.destination_keys.clone();
-        let routes = binding.routes.clone();
+        let destinations = binding.destinations.clone();
 
         let mut targets = Vec::new();
         if let Some(key) = source_key {
@@ -504,8 +506,11 @@ impl ControllerActor {
                 None,
             ));
         }
-        for (destination, key) in destination_keys {
-            let Some(route) = routes.get(&destination).copied() else {
+        for (destination, held) in &destinations {
+            let (destination, Some(route)) = (*destination, held.route) else {
+                continue;
+            };
+            let Some(key) = held.key.stream() else {
                 continue;
             };
             targets.push((
