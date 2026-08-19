@@ -939,9 +939,10 @@ impl ControllerActor {
             .map(|(group, _)| {
                 (
                     shard_id,
-                    crate::view::ViewOp::AudioGroupRemove {
+                    crate::view::ViewOp::GroupRemove {
                         group,
                         key: binding,
+                        kind: crate::view::AudienceKind::Audio,
                     },
                 )
             })
@@ -952,9 +953,10 @@ impl ControllerActor {
         {
             membership_ops.push((
                 shard_id,
-                crate::view::ViewOp::AudioGroupInsert {
+                crate::view::ViewOp::GroupInsert {
                     group,
                     key: binding,
+                    delivery: crate::view::Delivery::Audio,
                 },
             ));
         }

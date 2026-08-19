@@ -264,8 +264,54 @@ pub(crate) struct ShardViewDelta {
     pub ops: Vec<ViewOp>,
 }
 
+/// Which image a plan belongs to, and the key that names it there.
+///
+/// Video and audio share a key space but not an image, and the two data lanes
+/// have their own arenas, so the target says both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanTarget {
+    Video(TrackKey),
+    Audio(TrackKey),
+    Unreliable(UnreliableStreamKey),
+    Reliable(ReliableStreamKey),
+}
+
+/// What a member is served on in the audience it just joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Video(DownstreamSlotKey),
+    Audio,
+    Data(ChannelId),
+}
+
+/// Which audience a membership change is about, for the direction that carries
+/// no delivery key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AudienceKind {
+    Video,
+    Audio,
+    Data,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ViewOp {
+    SetPlan {
+        target: PlanTarget,
+        plan: ForwardingPlan,
+    },
+    RemovePlan {
+        target: PlanTarget,
+    },
+    GroupInsert {
+        group: GroupId,
+        key: ParticipantKey,
+        delivery: Delivery,
+    },
+    GroupRemove {
+        group: GroupId,
+        key: ParticipantKey,
+        kind: AudienceKind,
+    },
     InstallRoute {
         route: RouteId,
         binding: RouteBinding,
@@ -310,26 +356,6 @@ pub(crate) enum ViewOp {
     RemoveReliableRuntime {
         key: ReliableStreamKey,
     },
-    SetTrackPlan {
-        key: TrackKey,
-        plan: VideoPlan,
-    },
-    RemoveTrackPlan {
-        key: TrackKey,
-    },
-    SetAudioPlan {
-        key: TrackKey,
-        plan: AudioPlan,
-    },
-    VideoGroupInsert {
-        group: GroupId,
-        key: ParticipantKey,
-        slot: DownstreamSlotKey,
-    },
-    VideoGroupRemove {
-        group: GroupId,
-        key: ParticipantKey,
-    },
     /// A participant now consumes this track here. Stated by the control plane
     /// rather than inferred by the shard from successive plans: control is
     /// where a subscription begins, and a plan that names a shared audience no
@@ -343,40 +369,6 @@ pub(crate) enum ViewOp {
         participant: ParticipantKey,
         track: TrackId,
         fanout: TrackKey,
-    },
-    AudioGroupInsert {
-        group: GroupId,
-        key: ParticipantKey,
-    },
-    AudioGroupRemove {
-        group: GroupId,
-        key: ParticipantKey,
-    },
-    DataGroupInsert {
-        group: GroupId,
-        key: ParticipantKey,
-        channel: ChannelId,
-    },
-    DataGroupRemove {
-        group: GroupId,
-        key: ParticipantKey,
-    },
-    RemoveAudioPlan {
-        key: TrackKey,
-    },
-    SetUnreliablePlan {
-        key: UnreliableStreamKey,
-        plan: StreamPlan,
-    },
-    RemoveUnreliablePlan {
-        key: UnreliableStreamKey,
-    },
-    SetReliablePlan {
-        key: ReliableStreamKey,
-        plan: StreamPlan,
-    },
-    RemoveReliablePlan {
-        key: ReliableStreamKey,
     },
 }
 
@@ -415,26 +407,32 @@ impl ShardViewDelta {
                 | ViewOp::RemoveReliableRuntime { .. }
                 | ViewOp::BindSubscribedTrack { .. }
                 | ViewOp::UnbindSubscribedTrack { .. } => {}
-                ViewOp::SetTrackPlan { key, plan } => view.tracks.upsert(key, plan),
-                ViewOp::RemoveTrackPlan { key } => view.tracks.remove(key),
-                ViewOp::SetAudioPlan { key, plan } => view.audio.upsert(key, plan),
-                ViewOp::VideoGroupInsert { group, key, slot } => {
-                    view.video_groups.insert(group, key, slot);
-                }
-                ViewOp::VideoGroupRemove { group, key } => view.video_groups.remove(group, key),
-                ViewOp::AudioGroupInsert { group, key } => view.audio_groups.insert(group, key, ()),
-                ViewOp::AudioGroupRemove { group, key } => view.audio_groups.remove(group, key),
-                ViewOp::DataGroupInsert {
+                ViewOp::SetPlan { target, plan } => match target {
+                    PlanTarget::Video(key) => view.tracks.upsert(key, plan),
+                    PlanTarget::Audio(key) => view.audio.upsert(key, plan),
+                    PlanTarget::Unreliable(key) => view.unreliable.upsert(key, plan),
+                    PlanTarget::Reliable(key) => view.reliable.upsert(key, plan),
+                },
+                ViewOp::RemovePlan { target } => match target {
+                    PlanTarget::Video(key) => view.tracks.remove(key),
+                    PlanTarget::Audio(key) => view.audio.remove(key),
+                    PlanTarget::Unreliable(key) => view.unreliable.remove(key),
+                    PlanTarget::Reliable(key) => view.reliable.remove(key),
+                },
+                ViewOp::GroupInsert {
                     group,
                     key,
-                    channel,
-                } => view.data_groups.insert(group, key, channel),
-                ViewOp::DataGroupRemove { group, key } => view.data_groups.remove(group, key),
-                ViewOp::RemoveAudioPlan { key } => view.audio.remove(key),
-                ViewOp::SetUnreliablePlan { key, plan } => view.unreliable.upsert(key, plan),
-                ViewOp::RemoveUnreliablePlan { key } => view.unreliable.remove(key),
-                ViewOp::SetReliablePlan { key, plan } => view.reliable.upsert(key, plan),
-                ViewOp::RemoveReliablePlan { key } => view.reliable.remove(key),
+                    delivery,
+                } => match delivery {
+                    Delivery::Video(slot) => view.video_groups.insert(group, key, slot),
+                    Delivery::Audio => view.audio_groups.insert(group, key, ()),
+                    Delivery::Data(channel) => view.data_groups.insert(group, key, channel),
+                },
+                ViewOp::GroupRemove { group, key, kind } => match kind {
+                    AudienceKind::Video => view.video_groups.remove(group, key),
+                    AudienceKind::Audio => view.audio_groups.remove(group, key),
+                    AudienceKind::Data => view.data_groups.remove(group, key),
+                },
             }
         }
         debug_assert!(

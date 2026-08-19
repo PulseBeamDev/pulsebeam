@@ -281,20 +281,20 @@ impl ShardCore {
                     | crate::view::ViewOp::RemoveTrackRuntime { .. }
                     | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
                     | crate::view::ViewOp::RemoveReliableRuntime { .. }
-                    | crate::view::ViewOp::RemoveAudioPlan { .. }
-                    | crate::view::ViewOp::SetTrackPlan { .. }
-                    | crate::view::ViewOp::RemoveTrackPlan { .. }
-                    | crate::view::ViewOp::VideoGroupInsert { .. }
-                    | crate::view::ViewOp::VideoGroupRemove { .. }
-                    | crate::view::ViewOp::SetAudioPlan { .. }
-                    | crate::view::ViewOp::AudioGroupInsert { .. }
-                    | crate::view::ViewOp::AudioGroupRemove { .. }
-                    | crate::view::ViewOp::DataGroupInsert { .. }
-                    | crate::view::ViewOp::DataGroupRemove { .. }
-                    | crate::view::ViewOp::SetUnreliablePlan { .. }
-                    | crate::view::ViewOp::RemoveUnreliablePlan { .. }
-                    | crate::view::ViewOp::SetReliablePlan { .. }
-                    | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
+                    | crate::view::ViewOp::RemovePlan { .. }
+                    | crate::view::ViewOp::SetPlan { .. }
+                    | crate::view::ViewOp::RemovePlan { .. }
+                    | crate::view::ViewOp::GroupInsert { .. }
+                    | crate::view::ViewOp::GroupRemove { .. }
+                    | crate::view::ViewOp::SetPlan { .. }
+                    | crate::view::ViewOp::GroupInsert { .. }
+                    | crate::view::ViewOp::GroupRemove { .. }
+                    | crate::view::ViewOp::GroupInsert { .. }
+                    | crate::view::ViewOp::GroupRemove { .. }
+                    | crate::view::ViewOp::SetPlan { .. }
+                    | crate::view::ViewOp::RemovePlan { .. }
+                    | crate::view::ViewOp::SetPlan { .. }
+                    | crate::view::ViewOp::RemovePlan { .. } => {}
                 }
                 if let crate::view::ViewOp::RemoveParticipant { key } = op {
                     self.timers.cancel(*key);

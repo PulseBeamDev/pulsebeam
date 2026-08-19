@@ -100,7 +100,14 @@ impl ControllerActor {
             let ops = members
                 .into_iter()
                 .map(|(_, shard, key)| {
-                    (shard, crate::view::ViewOp::VideoGroupRemove { group, key })
+                    (
+                        shard,
+                        crate::view::ViewOp::GroupRemove {
+                            group,
+                            key,
+                            kind: crate::view::AudienceKind::Video,
+                        },
+                    )
                 })
                 .collect();
             if !self.publish_ops(ops) {
@@ -133,7 +140,12 @@ impl ControllerActor {
                 },
             );
             if let Some(key) = fanouts.get(destination).copied() {
-                view.stage(generation, crate::view::ViewOp::RemoveTrackPlan { key });
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: crate::view::PlanTarget::Video(key),
+                    },
+                );
                 view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
             }
             endpoint_releases.push((*destination, *route));
@@ -152,7 +164,12 @@ impl ControllerActor {
                 },
             );
             if let Some(key) = audio_fanouts.get(destination).copied() {
-                view.stage(generation, crate::view::ViewOp::RemoveAudioPlan { key });
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: crate::view::PlanTarget::Audio(key),
+                    },
+                );
                 view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
             }
             endpoint_releases.push((*destination, *route));
@@ -180,8 +197,8 @@ impl ControllerActor {
         };
         view.stage(
             generation,
-            crate::view::ViewOp::RemoveTrackPlan {
-                key: publisher_fanout,
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Video(publisher_fanout),
             },
         );
         view.stage(
@@ -192,8 +209,8 @@ impl ControllerActor {
         );
         view.stage(
             generation,
-            crate::view::ViewOp::RemoveAudioPlan {
-                key: publisher_fanout,
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Audio(publisher_fanout),
             },
         );
         for (&destination, &key) in &fanouts {
@@ -201,13 +218,23 @@ impl ControllerActor {
                 continue;
             }
             if let Some(view) = self.view_mut(destination) {
-                view.stage(generation, crate::view::ViewOp::RemoveTrackPlan { key });
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: crate::view::PlanTarget::Video(key),
+                    },
+                );
                 view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
             }
         }
         for (&destination, &key) in &audio_fanouts {
             if let Some(view) = self.view_mut(destination) {
-                view.stage(generation, crate::view::ViewOp::RemoveAudioPlan { key });
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: crate::view::PlanTarget::Audio(key),
+                    },
+                );
             }
         }
 
@@ -413,7 +440,13 @@ impl ControllerActor {
                     crate::view::ViewOp::InsertTrackRuntime { key, descriptor },
                 ));
             }
-            ops.push((shard_id, crate::view::ViewOp::SetAudioPlan { key, plan }));
+            ops.push((
+                shard_id,
+                crate::view::ViewOp::SetPlan {
+                    target: crate::view::PlanTarget::Audio(key),
+                    plan,
+                },
+            ));
             if let Some(route) = route {
                 ops.push((
                     shard_id,
@@ -505,10 +538,10 @@ impl ControllerActor {
             let ops = vec![
                 (
                     shard_id,
-                    crate::view::ViewOp::VideoGroupInsert {
+                    crate::view::ViewOp::GroupInsert {
                         group,
                         key: subscriber_key,
-                        slot,
+                        delivery: crate::view::Delivery::Video(slot),
                     },
                 ),
                 (
@@ -547,9 +580,10 @@ impl ControllerActor {
                     let _ = self.publish_ops(vec![
                         (
                             shard_id,
-                            crate::view::ViewOp::VideoGroupRemove {
+                            crate::view::ViewOp::GroupRemove {
                                 group,
                                 key: subscriber_key,
+                                kind: crate::view::AudienceKind::Video,
                             },
                         ),
                         (
@@ -597,7 +631,11 @@ impl ControllerActor {
         if let (Some(group), Some((_, key))) = (group, placement) {
             let mut ops = vec![(
                 shard_id,
-                crate::view::ViewOp::VideoGroupRemove { group, key },
+                crate::view::ViewOp::GroupRemove {
+                    group,
+                    key,
+                    kind: crate::view::AudienceKind::Video,
+                },
             )];
             if let Some(fanout) = self.track_fanout(track.id, shard_id) {
                 ops.push((
@@ -757,7 +795,10 @@ impl ControllerActor {
             ));
             ops.push((
                 shard_id,
-                crate::view::ViewOp::SetTrackPlan { key: fanout, plan },
+                crate::view::ViewOp::SetPlan {
+                    target: crate::view::PlanTarget::Video(fanout),
+                    plan,
+                },
             ));
         }
         self.publish_ops(ops)
@@ -785,7 +826,10 @@ impl ControllerActor {
                 ),
                 (
                     shard_id,
-                    crate::view::ViewOp::SetTrackPlan { key: fanout, plan },
+                    crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Video(fanout),
+                        plan,
+                    },
                 ),
             ]
         })
@@ -811,7 +855,13 @@ impl ControllerActor {
         for index in 0..self.views.len() {
             let target = crate::id::ShardId::new(index);
             if let Some((key, plan)) = self.track_plan(track_id, target) {
-                ops.push((target, crate::view::ViewOp::SetTrackPlan { key, plan }));
+                ops.push((
+                    target,
+                    crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Video(key),
+                        plan,
+                    },
+                ));
             }
         }
         if !self.publish_ops(ops) {

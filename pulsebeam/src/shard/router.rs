@@ -250,22 +250,22 @@ impl ShardRuntime {
             | crate::view::ViewOp::RetireTransport { .. }
             | crate::view::ViewOp::InsertParticipant { .. }
             | crate::view::ViewOp::RemoveParticipant { .. }
-            | crate::view::ViewOp::SetTrackPlan { .. }
-            | crate::view::ViewOp::RemoveTrackPlan { .. }
-            | crate::view::ViewOp::SetAudioPlan { .. }
-            | crate::view::ViewOp::VideoGroupInsert { .. }
-            | crate::view::ViewOp::VideoGroupRemove { .. }
+            | crate::view::ViewOp::SetPlan { .. }
+            | crate::view::ViewOp::RemovePlan { .. }
+            | crate::view::ViewOp::SetPlan { .. }
+            | crate::view::ViewOp::GroupInsert { .. }
+            | crate::view::ViewOp::GroupRemove { .. }
             | crate::view::ViewOp::BindSubscribedTrack { .. }
             | crate::view::ViewOp::UnbindSubscribedTrack { .. }
-            | crate::view::ViewOp::AudioGroupInsert { .. }
-            | crate::view::ViewOp::AudioGroupRemove { .. }
-            | crate::view::ViewOp::DataGroupInsert { .. }
-            | crate::view::ViewOp::DataGroupRemove { .. }
-            | crate::view::ViewOp::RemoveAudioPlan { .. }
-            | crate::view::ViewOp::SetUnreliablePlan { .. }
-            | crate::view::ViewOp::RemoveUnreliablePlan { .. }
-            | crate::view::ViewOp::SetReliablePlan { .. }
-            | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
+            | crate::view::ViewOp::GroupInsert { .. }
+            | crate::view::ViewOp::GroupRemove { .. }
+            | crate::view::ViewOp::GroupInsert { .. }
+            | crate::view::ViewOp::GroupRemove { .. }
+            | crate::view::ViewOp::RemovePlan { .. }
+            | crate::view::ViewOp::SetPlan { .. }
+            | crate::view::ViewOp::RemovePlan { .. }
+            | crate::view::ViewOp::SetPlan { .. }
+            | crate::view::ViewOp::RemovePlan { .. } => {}
         }
     }
 

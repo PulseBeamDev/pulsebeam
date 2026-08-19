@@ -47,7 +47,16 @@ impl ControllerActor {
         if let Some((key, shard)) = placement {
             let ops = retracted
                 .into_iter()
-                .map(|(group, _)| (shard, crate::view::ViewOp::DataGroupRemove { group, key }))
+                .map(|(group, _)| {
+                    (
+                        shard,
+                        crate::view::ViewOp::GroupRemove {
+                            group,
+                            key,
+                            kind: crate::view::AudienceKind::Data,
+                        },
+                    )
+                })
                 .collect();
             if !self.publish_ops(ops) {
                 debug_assert!(false, "data group retraction must publish");
@@ -105,7 +114,14 @@ impl ControllerActor {
                 .iter()
                 .filter_map(|pattern| {
                     let group = self.video_patterns.group_of(pattern)?;
-                    Some((shard, crate::view::ViewOp::VideoGroupRemove { group, key }))
+                    Some((
+                        shard,
+                        crate::view::ViewOp::GroupRemove {
+                            group,
+                            key,
+                            kind: crate::view::AudienceKind::Video,
+                        },
+                    ))
                 })
                 .collect();
             if !self.publish_ops(ops) {
@@ -140,7 +156,16 @@ impl ControllerActor {
         if let (Some(key), Some(shard)) = (key, shard) {
             let ops = retracted
                 .into_iter()
-                .map(|(group, _)| (shard, crate::view::ViewOp::AudioGroupRemove { group, key }))
+                .map(|(group, _)| {
+                    (
+                        shard,
+                        crate::view::ViewOp::GroupRemove {
+                            group,
+                            key,
+                            kind: crate::view::AudienceKind::Audio,
+                        },
+                    )
+                })
                 .collect();
             if !self.publish_ops(ops) {
                 debug_assert!(false, "audio group retraction must publish");

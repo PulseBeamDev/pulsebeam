@@ -37,23 +37,29 @@ fn set_stream_plan_op(
     plan: crate::view::StreamPlan,
 ) -> crate::view::ViewOp {
     match key {
-        crate::shard::router::RuntimeStreamKey::Unreliable(key) => {
-            crate::view::ViewOp::SetUnreliablePlan { key, plan }
-        }
-        crate::shard::router::RuntimeStreamKey::Reliable(key) => {
-            crate::view::ViewOp::SetReliablePlan { key, plan }
-        }
+        crate::shard::router::RuntimeStreamKey::Unreliable(key) => crate::view::ViewOp::SetPlan {
+            target: crate::view::PlanTarget::Unreliable(key),
+            plan,
+        },
+        crate::shard::router::RuntimeStreamKey::Reliable(key) => crate::view::ViewOp::SetPlan {
+            target: crate::view::PlanTarget::Reliable(key),
+            plan,
+        },
     }
 }
 
 fn remove_stream_ops(key: crate::shard::router::RuntimeStreamKey) -> [crate::view::ViewOp; 2] {
     match key {
         crate::shard::router::RuntimeStreamKey::Unreliable(key) => [
-            crate::view::ViewOp::RemoveUnreliablePlan { key },
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Unreliable(key),
+            },
             crate::view::ViewOp::RemoveUnreliableRuntime { key },
         ],
         crate::shard::router::RuntimeStreamKey::Reliable(key) => [
-            crate::view::ViewOp::RemoveReliablePlan { key },
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Reliable(key),
+            },
             crate::view::ViewOp::RemoveReliableRuntime { key },
         ],
     }
@@ -218,9 +224,10 @@ impl ControllerActor {
             .map(|(group, _)| {
                 (
                     shard_id,
-                    crate::view::ViewOp::DataGroupRemove {
+                    crate::view::ViewOp::GroupRemove {
                         group,
                         key: subscriber_key,
+                        kind: crate::view::AudienceKind::Data,
                     },
                 )
             })
@@ -228,10 +235,10 @@ impl ControllerActor {
         if let Some(group) = self.data_patterns.group_of(&pattern) {
             membership.push((
                 shard_id,
-                crate::view::ViewOp::DataGroupInsert {
+                crate::view::ViewOp::GroupInsert {
                     group,
                     key: subscriber_key,
-                    channel,
+                    delivery: crate::view::Delivery::Data(channel),
                 },
             ));
         }
@@ -274,7 +281,14 @@ impl ControllerActor {
             .zip(self.data_patterns.member_key(&pattern, &subscriber));
         self.data_patterns.undeclare(&pattern, &subscriber);
         if let Some((group, (shard, key))) = departing {
-            let ops = vec![(shard, crate::view::ViewOp::DataGroupRemove { group, key })];
+            let ops = vec![(
+                shard,
+                crate::view::ViewOp::GroupRemove {
+                    group,
+                    key,
+                    kind: crate::view::AudienceKind::Data,
+                },
+            )];
             if !self.publish_ops(ops) {
                 debug_assert!(false, "data group retraction must publish");
             }
