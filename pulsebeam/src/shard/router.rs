@@ -60,6 +60,7 @@ pub(crate) trait RoutingContext: ShardTransport {
         &mut self,
         subscriber: ParticipantKey,
         slot: DownstreamSlotKey,
+        track: TrackId,
         pkt: &RtpPacket,
         cache: Option<&TrackStreamCache>,
     );
@@ -250,6 +251,7 @@ impl ShardRuntime {
         };
         let rid = pkt.ext_vals.rid;
         let seq = pkt.seq_no;
+        let track_id = track.id;
         let cache = track.cache.get_or_insert_with(TrackStreamCache::new);
         let too_old = cache.push(pkt);
         let Some(packet) = too_old
@@ -260,7 +262,7 @@ impl ShardRuntime {
             return;
         };
         for &(subscriber, slot) in &plan.local_subscribers {
-            ctx.forward_video_rtp(subscriber, slot, packet, Some(cache));
+            ctx.forward_video_rtp(subscriber, slot, track_id, packet, Some(cache));
         }
         let playout = ctx.wall().to_ntp(packet.playout_time);
         let link_seq = &mut track.link_seq;

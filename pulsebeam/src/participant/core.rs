@@ -447,6 +447,7 @@ impl ParticipantCore {
     pub fn on_forward_rtp(
         &mut self,
         slot: crate::keys::DownstreamSlotKey,
+        track: crate::entity::TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
     ) {
@@ -460,7 +461,7 @@ impl ParticipantCore {
         );
         let promoted =
             self.downstream
-                .on_forward_rtp_slot(slot, pkt, cache, &mut self.stream_writer);
+                .on_forward_rtp_slot(slot, track, pkt, cache, &mut self.stream_writer);
         if promoted {
             self.signaling.mark_assignments_dirty();
         }

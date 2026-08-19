@@ -91,11 +91,12 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         &mut self,
         subscriber: ParticipantKey,
         slot: DownstreamSlotKey,
+        track: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
     ) {
         if let Some(participant) = self.registry.resolve_mut(subscriber) {
-            participant.on_forward_rtp(slot, pkt, cache);
+            participant.on_forward_rtp(slot, track, pkt, cache);
             self.dirty.mark(subscriber, participant);
         }
     }
