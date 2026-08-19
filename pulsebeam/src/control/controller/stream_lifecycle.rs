@@ -88,19 +88,20 @@ fn retire_route_op(route: RouteHandle) -> crate::view::ViewOp {
 impl ControllerActor {
     pub(super) fn stream_plan(
         &self,
+        id: &crate::shard::router::DataStreamId,
+        lane: StreamLane,
         binding: &crate::control::lanes::StreamBinding,
         destination: crate::id::ShardId,
     ) -> crate::view::StreamPlan {
-        let local_subscribers = binding
-            .subscribers
-            .get(&destination)
-            .map(|subscribers| {
-                subscribers
-                    .values()
-                    .map(|subscriber| (subscriber.key, subscriber.channel))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // As with audio: the plan names its audiences and the shard holds the
+        // membership, so a subscriber arriving does not rewrite the plan of
+        // every stream already published on the topic.
+        let subject = crate::control::patterns::Subject {
+            room: id.room_id,
+            publisher: id.publisher_id,
+            name: (id.topic.clone(), lane),
+        };
+        let groups = self.data_patterns.match_subject(&subject);
         let remote_routes = if destination == binding.publisher_shard {
             binding
                 .routes
@@ -122,8 +123,8 @@ impl ControllerActor {
                 epoch: handle.epoch,
             });
         crate::view::StreamPlan {
-            groups: Default::default(),
-            local_subscribers,
+            groups,
+            local_subscribers: Vec::new(),
             remote_routes,
             reverse_route,
         }
@@ -199,6 +200,48 @@ impl ControllerActor {
             key: subscriber_key,
             channel,
         };
+        let pattern = match publisher {
+            Some(publisher) => {
+                crate::control::patterns::Pattern::exact(room_id, publisher, (topic.clone(), lane))
+            }
+            None => {
+                crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
+            }
+        };
+        let (_, displaced) = self.data_patterns.declare(
+            pattern.clone(),
+            subscriber,
+            crate::control::patterns::Member {
+                shard: shard_id,
+                key: subscriber_key,
+                delivery: channel,
+            },
+        );
+        let mut membership: Vec<(crate::id::ShardId, crate::view::ViewOp)> = displaced
+            .into_iter()
+            .map(|(group, _)| {
+                (
+                    shard_id,
+                    crate::view::ViewOp::DataGroupRemove {
+                        group,
+                        key: subscriber_key,
+                    },
+                )
+            })
+            .collect();
+        if let Some(group) = self.data_patterns.group_of(&pattern) {
+            membership.push((
+                shard_id,
+                crate::view::ViewOp::DataGroupInsert {
+                    group,
+                    key: subscriber_key,
+                    channel,
+                },
+            ));
+        }
+        if !self.publish_ops(membership) {
+            debug_assert!(false, "data group membership must publish");
+        }
         let registry = self.lanes.get_mut(lane);
         let ids = match publisher {
             Some(publisher) => {
@@ -232,6 +275,25 @@ impl ControllerActor {
         publisher: Option<ParticipantId>,
         lane: StreamLane,
     ) {
+        let pattern = match publisher {
+            Some(publisher) => {
+                crate::control::patterns::Pattern::exact(room_id, publisher, (topic.clone(), lane))
+            }
+            None => {
+                crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
+            }
+        };
+        let departing = self
+            .data_patterns
+            .group_of(&pattern)
+            .zip(self.data_patterns.member_key(&pattern, &subscriber));
+        self.data_patterns.undeclare(&pattern, &subscriber);
+        if let Some((group, (shard, key))) = departing {
+            let ops = vec![(shard, crate::view::ViewOp::DataGroupRemove { group, key })];
+            if !self.publish_ops(ops) {
+                debug_assert!(false, "data group retraction must publish");
+            }
+        }
         let registry = self.lanes.get_mut(lane);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::shard::router::DataStreamId::new(
@@ -270,7 +332,8 @@ impl ControllerActor {
         };
         let publisher_shard = binding.publisher_shard;
         let source_key = binding.key;
-        let mut source_plan = source_key.map(|_| self.stream_plan(binding, publisher_shard));
+        let mut source_plan =
+            source_key.map(|_| self.stream_plan(id, lane, binding, publisher_shard));
         if let Some(plan) = source_plan.as_mut() {
             plan.remote_routes
                 .retain(|route| !stale.iter().any(|(shard, _, _)| route.shard_id == *shard));
@@ -419,7 +482,7 @@ impl ControllerActor {
             let Some(binding) = self.lanes.get(lane).get(&id) else {
                 return;
             };
-            let plan = self.stream_plan(binding, destination);
+            let plan = self.stream_plan(&id, lane, binding, destination);
             let Some(route) = self
                 .grant_route_with_plan(destination, action, lane, plan.clone())
                 .await
@@ -457,7 +520,7 @@ impl ControllerActor {
             targets.push((
                 publisher_shard,
                 key,
-                self.stream_plan(binding, publisher_shard),
+                self.stream_plan(&id, lane, binding, publisher_shard),
                 None,
             ));
         }
@@ -468,7 +531,7 @@ impl ControllerActor {
             targets.push((
                 destination,
                 key,
-                self.stream_plan(binding, destination),
+                self.stream_plan(&id, lane, binding, destination),
                 Some(route),
             ));
         }

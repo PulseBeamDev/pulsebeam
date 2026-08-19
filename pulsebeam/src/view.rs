@@ -26,19 +26,27 @@ pub(crate) struct GroupId(pub u32);
 /// One membership change serves every publication whose plan names the group,
 /// which is the point: a participant joining a room is one insert here, not a
 /// rewrite of every plan in it.
-#[derive(Debug, Default)]
-pub(crate) struct GroupImage {
-    members: Vec<Vec<ParticipantKey>>,
+#[derive(Debug)]
+pub(crate) struct GroupImage<D> {
+    members: Vec<Vec<(ParticipantKey, D)>>,
 }
 
-impl GroupImage {
-    pub fn members(&self, group: GroupId) -> &[ParticipantKey] {
+impl<D> Default for GroupImage<D> {
+    fn default() -> Self {
+        Self {
+            members: Vec::new(),
+        }
+    }
+}
+
+impl<D> GroupImage<D> {
+    pub fn members(&self, group: GroupId) -> &[(ParticipantKey, D)] {
         self.members
             .get(group.0 as usize)
             .map_or(&[][..], |m| &m[..])
     }
 
-    fn insert(&mut self, group: GroupId, key: ParticipantKey) {
+    fn insert(&mut self, group: GroupId, key: ParticipantKey, delivery: D) {
         let idx = group.0 as usize;
         if self.members.len() <= idx {
             self.members.resize_with(idx.saturating_add(1), Vec::new);
@@ -47,8 +55,10 @@ impl GroupImage {
             debug_assert!(false, "group slot must exist after resize");
             return;
         };
-        if !slot.contains(&key) {
-            slot.push(key);
+        if let Some(held) = slot.iter_mut().find(|(held, _)| *held == key) {
+            held.1 = delivery;
+        } else {
+            slot.push((key, delivery));
         }
     }
 
@@ -56,7 +66,7 @@ impl GroupImage {
         let Some(slot) = self.members.get_mut(group.0 as usize) else {
             return;
         };
-        slot.retain(|held| *held != key);
+        slot.retain(|(held, _)| *held != key);
     }
 }
 
@@ -68,7 +78,8 @@ pub(crate) struct ShardView {
     pub transports: TransportImage,
     pub tracks: ForwardingImage<TrackKey, DownstreamSlotKey>,
     pub audio: ForwardingImage<TrackKey, ()>,
-    pub audio_groups: GroupImage,
+    pub audio_groups: GroupImage<()>,
+    pub data_groups: GroupImage<ChannelId>,
     pub data: ForwardingImage<DataStreamKey, ChannelId>,
     pub reliable: ForwardingImage<ReliableStreamKey, ChannelId>,
 }
@@ -315,6 +326,15 @@ pub(crate) enum ViewOp {
         group: GroupId,
         key: ParticipantKey,
     },
+    DataGroupInsert {
+        group: GroupId,
+        key: ParticipantKey,
+        channel: ChannelId,
+    },
+    DataGroupRemove {
+        group: GroupId,
+        key: ParticipantKey,
+    },
     RemoveAudioPlan {
         key: TrackKey,
     },
@@ -370,8 +390,14 @@ impl ShardViewDelta {
                 ViewOp::SetTrackPlan { key, plan } => view.tracks.upsert(key, plan),
                 ViewOp::RemoveTrackPlan { key } => view.tracks.remove(key),
                 ViewOp::SetAudioPlan { key, plan } => view.audio.upsert(key, plan),
-                ViewOp::AudioGroupInsert { group, key } => view.audio_groups.insert(group, key),
+                ViewOp::AudioGroupInsert { group, key } => view.audio_groups.insert(group, key, ()),
                 ViewOp::AudioGroupRemove { group, key } => view.audio_groups.remove(group, key),
+                ViewOp::DataGroupInsert {
+                    group,
+                    key,
+                    channel,
+                } => view.data_groups.insert(group, key, channel),
+                ViewOp::DataGroupRemove { group, key } => view.data_groups.remove(group, key),
                 ViewOp::RemoveAudioPlan { key } => view.audio.remove(key),
                 ViewOp::SetDataPlan { key, plan } => view.data.upsert(key, plan),
                 ViewOp::RemoveDataPlan { key } => view.data.remove(key),

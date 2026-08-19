@@ -49,14 +49,19 @@ impl ControllerActor {
             .registry
             .transport_of(participant_id)
             .map(|(s, _)| s);
-        let retracted = self.audio_patterns.remove_participant(participant_id);
+        let retracted_audio = self.audio_patterns.remove_participant(participant_id);
+        let retracted_data = self.data_patterns.remove_participant(participant_id);
         if let (Some(key), Some(shard)) = (key, shard) {
-            let ops = retracted
-                .into_iter()
-                .map(|(group, _)| (shard, crate::view::ViewOp::AudioGroupRemove { group, key }))
-                .collect();
+            let ops =
+                retracted_audio
+                    .into_iter()
+                    .map(|(group, _)| (shard, crate::view::ViewOp::AudioGroupRemove { group, key }))
+                    .chain(retracted_data.into_iter().map(|(group, _)| {
+                        (shard, crate::view::ViewOp::DataGroupRemove { group, key })
+                    }))
+                    .collect();
             if !self.publish_ops(ops) {
-                debug_assert!(false, "audio group retraction must publish");
+                debug_assert!(false, "group retraction must publish");
             }
         }
     }

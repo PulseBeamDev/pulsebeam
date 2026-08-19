@@ -358,6 +358,19 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         matched
     }
 
+    /// Where a subscriber sits in a pattern's group, for addressing the op
+    /// that removes it.
+    pub fn member_key(
+        &self,
+        pattern: &Pattern<N>,
+        participant: &ParticipantId,
+    ) -> Option<(ShardId, ParticipantKey)> {
+        let id = *self.ids.get(pattern)?;
+        let group = self.groups.get(id.0 as usize).and_then(Option::as_ref)?;
+        let member = group.members.get(participant)?;
+        Some((member.shard, member.key))
+    }
+
     pub fn group_of(&self, pattern: &Pattern<N>) -> Option<GroupId> {
         self.ids.get(pattern).copied()
     }

@@ -147,6 +147,14 @@ pub struct ControllerActor {
     /// room wildcard, which is what the scan produces today; what is under
     /// test is that declarations appear and disappear with the participant.
     audio_patterns: crate::control::patterns::PatternTable<crate::entity::TrackId, ()>,
+    /// Data declarations. The lane sits inside the name rather than beside it,
+    /// so one table serves both without the paired-registry duplication - and
+    /// drops out of the key entirely once reliability becomes an attribute of
+    /// the publication instead of a namespace of its own.
+    data_patterns: crate::control::patterns::PatternTable<
+        (crate::track::Topic, StreamLane),
+        str0m::channel::ChannelId,
+    >,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
 }
@@ -184,6 +192,7 @@ impl ControllerActor {
             lanes: Lanes::new(),
             pending: PendingSubscriptions::default(),
             audio_patterns: crate::control::patterns::PatternTable::new(),
+            data_patterns: crate::control::patterns::PatternTable::new(),
             #[cfg(not(feature = "sim"))]
             steering: None,
         }

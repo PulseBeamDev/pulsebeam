@@ -20,7 +20,7 @@ use crate::{
     track::Topic,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum StreamLane {
     Data,
     Reliable,

@@ -308,6 +308,8 @@ impl ShardCore {
                     | crate::view::ViewOp::SetAudioPlan { .. }
                     | crate::view::ViewOp::AudioGroupInsert { .. }
                     | crate::view::ViewOp::AudioGroupRemove { .. }
+                    | crate::view::ViewOp::DataGroupInsert { .. }
+                    | crate::view::ViewOp::DataGroupRemove { .. }
                     | crate::view::ViewOp::SetDataPlan { .. }
                     | crate::view::ViewOp::RemoveDataPlan { .. }
                     | crate::view::ViewOp::SetReliablePlan { .. }
@@ -424,8 +426,14 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime
-                    .route_data_with_plan(stream, Origin::Remote, bytes, plan, &mut ctx);
+                self.runtime.route_data_with_plan(
+                    stream,
+                    Origin::Remote,
+                    bytes,
+                    plan,
+                    &view.data_groups,
+                    &mut ctx,
+                );
             }
             (crate::route::RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = view.reliable.resolve(stream) else {
@@ -443,6 +451,7 @@ impl ShardCore {
                     Origin::Remote,
                     bytes,
                     plan,
+                    &view.data_groups,
                     &mut ctx,
                 );
             }
@@ -575,8 +584,14 @@ impl ShardCore {
                 record_routing_drop("data", "plan", "local");
                 continue;
             };
-            self.runtime
-                .route_data_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
+            self.runtime.route_data_with_plan(
+                stream,
+                Origin::Local,
+                ev.pkt,
+                plan,
+                &view.data_groups,
+                &mut ctx,
+            );
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_reliable_data_sctp() else {
@@ -597,6 +612,7 @@ impl ShardCore {
                 Origin::Local,
                 ev.pkt,
                 plan,
+                &view.data_groups,
                 &mut ctx,
             );
         }

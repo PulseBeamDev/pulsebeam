@@ -211,6 +211,8 @@ impl ShardRuntime {
             | crate::view::ViewOp::SetAudioPlan { .. }
             | crate::view::ViewOp::AudioGroupInsert { .. }
             | crate::view::ViewOp::AudioGroupRemove { .. }
+            | crate::view::ViewOp::DataGroupInsert { .. }
+            | crate::view::ViewOp::DataGroupRemove { .. }
             | crate::view::ViewOp::RemoveAudioPlan { .. }
             | crate::view::ViewOp::SetDataPlan { .. }
             | crate::view::ViewOp::RemoveDataPlan { .. }
@@ -289,7 +291,7 @@ impl ShardRuntime {
         origin: Origin,
         event: AudioRtpEvent,
         plan: &crate::view::AudioPlan,
-        groups: &crate::view::GroupImage,
+        groups: &crate::view::GroupImage<()>,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(origin.is_local() || event.origin_key.is_none());
@@ -302,7 +304,7 @@ impl ShardRuntime {
             track: event.stream_id.0,
         };
         for group in &plan.groups {
-            for &subscriber in groups.members(*group) {
+            for &(subscriber, ()) in groups.members(*group) {
                 if Some(subscriber) == event.origin_key {
                     continue;
                 }
@@ -337,14 +339,17 @@ impl ShardRuntime {
         origin: Origin,
         packet: Vec<u8>,
         plan: &crate::view::StreamPlan,
+        groups: &crate::view::GroupImage<ChannelId>,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(runtime) = self.data.get_mut(stream) else {
             debug_assert!(false, "data key must resolve to runtime state");
             return;
         };
-        for &(subscriber, channel) in &plan.local_subscribers {
-            ctx.forward_sctp(subscriber, channel, &packet);
+        for group in &plan.groups {
+            for &(subscriber, channel) in groups.members(*group) {
+                ctx.forward_sctp(subscriber, channel, &packet);
+            }
         }
         if origin.is_local() {
             let playout = ctx.wall().ntp();
@@ -366,6 +371,7 @@ impl ShardRuntime {
         origin: Origin,
         frame: Vec<u8>,
         plan: &crate::view::StreamPlan,
+        groups: &crate::view::GroupImage<ChannelId>,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(!frame.is_empty());
@@ -373,8 +379,10 @@ impl ShardRuntime {
             debug_assert!(false, "reliable key must resolve to runtime state");
             return;
         };
-        for &(subscriber, channel) in &plan.local_subscribers {
-            ctx.forward_reliable_sctp(subscriber, channel, &frame);
+        for group in &plan.groups {
+            for &(subscriber, channel) in groups.members(*group) {
+                ctx.forward_reliable_sctp(subscriber, channel, &frame);
+            }
         }
         if origin.is_local() {
             let playout = ctx.wall().ntp();
