@@ -392,105 +392,9 @@ impl ControllerActor {
                 destination.route = Some(route);
             }
         }
-        let Some(binding) = self.track_bindings.get(&track_id) else {
-            return;
-        };
-        let remote_routes = binding
-            .destinations
-            .iter()
-            .filter_map(|(shard_id, held)| {
-                let route = held.route?;
-                Some(crate::view::RemoteRoutePlan {
-                    shard_id: *shard_id,
-                    route: route.route,
-                    epoch: route.epoch,
-                })
-            })
-            .collect();
-        let source_plan = crate::view::AudioPlan {
-            groups: groups.clone(),
-            remote_routes,
-            reverse_route: binding
-                .reverse_route
-                .map(|route| crate::view::RemoteRoutePlan {
-                    shard_id: publisher_shard,
-                    route: route.route,
-                    epoch: route.epoch,
-                }),
-        };
-        let mut targets = vec![(publisher_shard, binding.publisher_fanout, source_plan, None)];
-        for (destination, held) in &binding.destinations {
-            let (Some(key), Some(route)) = (held.key.track(), held.route) else {
-                continue;
-            };
-            targets.push((
-                *destination,
-                key,
-                crate::view::AudioPlan {
-                    groups: groups.clone(),
-                    remote_routes: Vec::new(),
-                    reverse_route: None,
-                },
-                Some(route),
-            ));
+        if !self.publish_track_plans(track_id).await {
+            debug_assert!(false, "audio route installation must publish");
         }
-        self.publish_audio_plans(track_id, targets).await;
-    }
-
-    pub(super) async fn publish_audio_plans(
-        &mut self,
-        track_id: crate::entity::TrackId,
-        targets: Vec<(
-            crate::id::ShardId,
-            crate::shard::router::TrackKey,
-            crate::view::AudioPlan,
-            Option<RouteHandle>,
-        )>,
-    ) {
-        let Some(publisher_shard) = self
-            .track_bindings
-            .get(&track_id)
-            .map(|binding| binding.publisher_shard)
-        else {
-            return;
-        };
-        let mut ops = Vec::new();
-        for (shard_id, key, plan, route) in targets {
-            // Compare shards, not keys. `TrackKey` indexes a per-shard arena,
-            // so the publisher's key and a destination's key are both
-            // `TrackKey(1v1)` as often as not — comparing them said "this is
-            // the publisher's own shard" for a remote destination and skipped
-            // its runtime, leaving a route pointing at nothing.
-            if shard_id != publisher_shard {
-                let Some(descriptor) = self.track_descriptor(track_id, shard_id) else {
-                    return;
-                };
-                ops.push((
-                    shard_id,
-                    crate::view::ViewOp::InsertTrackRuntime { key, descriptor },
-                ));
-            }
-            ops.push((
-                shard_id,
-                crate::view::ViewOp::SetPlan {
-                    target: crate::view::PlanTarget::Audio(key),
-                    plan,
-                },
-            ));
-            if let Some(route) = route {
-                ops.push((
-                    shard_id,
-                    crate::view::ViewOp::InstallRoute {
-                        route: route.route,
-                        binding: crate::view::RouteBinding {
-                            epoch: route.epoch,
-                            action: RouteAction::Audio { track: key },
-                        },
-                    },
-                ));
-            }
-        }
-        self.publish_ops(ops);
     }
 
     /// A shard reported a new local consumer for a track.
@@ -721,7 +625,12 @@ impl ControllerActor {
             publisher: binding.meta.origin,
             name: track_id,
         };
-        let groups = self.video_patterns.match_subject(&subject);
+        // The delivery key differs per kind so the tables are separate, but a
+        // match yields the same group ids either way.
+        let groups = match track_id.kind() {
+            crate::entity::TrackKind::Audio => self.audio_patterns.match_subject(&subject),
+            _ => self.video_patterns.match_subject(&subject),
+        };
         let mut remote_routes = Vec::new();
         if shard_id == binding.publisher_shard {
             for (destination, held) in &binding.destinations {
@@ -820,7 +729,10 @@ impl ControllerActor {
             ops.push((
                 shard_id,
                 crate::view::ViewOp::SetPlan {
-                    target: crate::view::PlanTarget::Video(fanout),
+                    target: plan_target(
+                        track_id.kind(),
+                        crate::control::publication::RuntimeKey::Track(fanout),
+                    ),
                     plan,
                 },
             ));
