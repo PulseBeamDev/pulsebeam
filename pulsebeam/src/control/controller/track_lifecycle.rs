@@ -258,61 +258,6 @@ impl ControllerActor {
         self.state.mint_track(shard_id, track_id, origin)
     }
 
-    /// Shadow check: the declarations must resolve to the same audience the
-    /// room scan just built, or the model that is about to replace the scan is
-    /// wrong. Debug-only, and compares as multisets because a group orders its
-    /// members by declaration and the scan orders them by registry walk.
-    fn shadow_audio_declarations(
-        &self,
-        room_id: crate::entity::RoomId,
-        origin: ParticipantId,
-        track_id: crate::entity::TrackId,
-        scanned: &HashMap<crate::id::ShardId, Vec<(crate::keys::ParticipantKey, ())>>,
-    ) {
-        if !cfg!(debug_assertions) {
-            return;
-        }
-        let subject = crate::control::patterns::Subject {
-            room: room_id,
-            publisher: origin,
-            name: track_id,
-        };
-        let mut declared: HashMap<crate::id::ShardId, Vec<crate::keys::ParticipantKey>> =
-            HashMap::new();
-        for group in self.audio_patterns.match_subject(&subject) {
-            for shard in self.audio_patterns.shards_of(group) {
-                for (participant, key, ()) in self.audio_patterns.members_on(group, shard) {
-                    if participant == origin {
-                        continue;
-                    }
-                    declared.entry(shard).or_default().push(key);
-                }
-            }
-        }
-
-        let mut declared: Vec<_> = declared
-            .into_iter()
-            .map(|(shard, mut keys)| {
-                keys.sort_unstable();
-                (shard, keys)
-            })
-            .collect();
-        let mut scanned: Vec<_> = scanned
-            .iter()
-            .map(|(shard, subs)| {
-                let mut keys: Vec<_> = subs.iter().map(|(key, ())| *key).collect();
-                keys.sort_unstable();
-                (*shard, keys)
-            })
-            .collect();
-        declared.sort_unstable();
-        scanned.sort_unstable();
-        debug_assert_eq!(
-            declared, scanned,
-            "audio declarations must resolve to the audience the room scan found"
-        );
-    }
-
     pub(super) async fn install_audio_routes(&mut self, track_id: crate::entity::TrackId) {
         let Some(binding) = self.track_bindings.get(&track_id) else {
             return;
@@ -328,18 +273,29 @@ impl ControllerActor {
             debug_assert!(false, "a published track must have a room");
             return;
         };
+        let subject = crate::control::patterns::Subject {
+            room: room_id,
+            publisher: origin,
+            name: track_id,
+        };
         let mut local_subscribers: HashMap<
             crate::id::ShardId,
             Vec<(crate::shard::participants::ParticipantKey, ())>,
         > = HashMap::new();
-        for (participant, shard, key) in self.core.registry.participants_in_room(&room_id) {
-            if participant != origin
-                && let Some(key) = key
-            {
-                local_subscribers.entry(shard).or_default().push((key, ()));
+        for group in self.audio_patterns.match_subject(&subject) {
+            for shard in self.audio_patterns.shards_of(group) {
+                for (participant, key, ()) in self.audio_patterns.members_on(group, shard) {
+                    // The publisher is excluded here rather than at the router
+                    // because a group spans shards and `ParticipantKey` does
+                    // not: the router's own self-check only fires where the
+                    // publisher is local.
+                    if participant == origin {
+                        continue;
+                    }
+                    local_subscribers.entry(shard).or_default().push((key, ()));
+                }
             }
         }
-        self.shadow_audio_declarations(room_id, origin, track_id, &local_subscribers);
 
         let destinations: Vec<_> = local_subscribers.keys().copied().collect();
         for destination in destinations {
