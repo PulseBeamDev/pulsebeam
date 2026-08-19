@@ -47,29 +47,6 @@ impl StreamLane {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct StreamBinding {
-    pub publisher_shard: ShardId,
-    pub publisher: ParticipantKey,
-    pub key: Option<RuntimeStreamKey>,
-    pub reverse_route: Option<RouteHandle>,
-    /// Where this stream goes, one record per shard — the same shape a track
-    /// uses, so the procedures over it can be the same procedures.
-    pub destinations: indexmap::IndexMap<ShardId, crate::control::publication::Destination>,
-}
-
-impl StreamBinding {
-    fn new(publisher_shard: ShardId, publisher: ParticipantKey) -> Self {
-        Self {
-            publisher_shard,
-            publisher,
-            key: None,
-            reverse_route: None,
-            destinations: indexmap::IndexMap::new(),
-        }
-    }
-}
-
 /// Which publishers are live on each topic.
 ///
 /// A wildcard subscription has to name every stream on its topic, and without
@@ -114,7 +91,6 @@ impl TopicIndex {
 
 pub(crate) struct LaneRegistry {
     lane: StreamLane,
-    bindings: HashMap<DataStreamId, StreamBinding>,
     by_topic: TopicIndex,
 }
 
@@ -122,22 +98,14 @@ impl LaneRegistry {
     pub(crate) fn new(lane: StreamLane) -> Self {
         Self {
             lane,
-            bindings: HashMap::new(),
             by_topic: TopicIndex::default(),
         }
     }
 
-    pub(crate) fn get(&self, id: &DataStreamId) -> Option<&StreamBinding> {
-        self.bindings.get(id)
-    }
-
-    pub(crate) fn get_mut(&mut self, id: &DataStreamId) -> Option<&mut StreamBinding> {
-        self.bindings.get_mut(id)
-    }
-
-    pub(crate) fn remove(&mut self, id: &DataStreamId) -> Option<StreamBinding> {
+    /// Forget a stream's topic. The publication itself lives in the catalog;
+    /// this is only the index that answers which publishers a topic has.
+    pub(crate) fn forget_topic(&mut self, id: &DataStreamId) {
         self.by_topic.remove(id);
-        self.bindings.remove(id)
     }
 
     /// Every live stream carrying `topic` in `room`. The set a wildcard
@@ -147,26 +115,10 @@ impl LaneRegistry {
     }
 
     /// Publish `id`, draining anyone who subscribed before it existed.
-    pub(crate) fn declare(
-        &mut self,
-        id: DataStreamId,
-        publisher_shard: ShardId,
-        publisher: ParticipantKey,
-        key: RuntimeStreamKey,
-    ) -> &mut StreamBinding {
-        debug_assert_eq!(
-            self.lane,
-            StreamLane::of(key),
-            "runtime key does not belong to this lane"
-        );
-        self.by_topic.insert(&id);
-        let binding = self
-            .bindings
-            .entry(id)
-            .or_insert_with(|| StreamBinding::new(publisher_shard, publisher));
-        debug_assert_eq!(binding.publisher_shard, publisher_shard);
-        binding.key = Some(key);
-        binding
+    /// Record that this topic has a publisher, for the wildcard subscriptions
+    /// that ask which streams exist on it.
+    pub(crate) fn note_topic(&mut self, id: &DataStreamId) {
+        self.by_topic.insert(id);
     }
 
     /// The route action that carries this lane's traffic. `None` when the key

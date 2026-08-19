@@ -1,4 +1,4 @@
-//! Invariants of one lane's stream catalog.
+//! Invariants of one lane's topic index.
 //!
 //! These run against `LaneRegistry` alone — no actor, no shard, no clock — which
 //! is the point of it being a separate type. Who subscribes to what is no longer
@@ -35,9 +35,8 @@ type Registry = LaneRegistry;
 /// Publish `id` on a `Data` registry. Every test below uses that lane; the
 /// lane-dependent parts are covered separately by
 /// `each_lane_mints_and_actions_only_its_own_key`.
-fn ready(reg: &mut Registry, id: &DataStreamId, on: ShardId) {
-    let key = RuntimeStreamKey::Unreliable(Default::default());
-    reg.declare(id.clone(), on, Default::default(), key);
+fn ready(reg: &mut Registry, id: &DataStreamId, _on: ShardId) {
+    reg.note_topic(id);
 }
 
 #[test]
@@ -77,50 +76,29 @@ fn ids_on_topic_is_scoped_to_the_room() {
 /// The topic index exists so a wildcard is a lookup instead of a scan. It is
 /// only safe while it agrees with the bindings it summarises, so every test
 /// that mutates the registry checks it.
-fn assert_index_agrees(reg: &Registry) {
-    let mut indexed: Vec<_> = reg
-        .by_topic
-        .publishers
-        .iter()
-        .flat_map(|((room, topic), publishers)| {
-            publishers
-                .iter()
-                .map(|publisher| DataStreamId::new(*room, *publisher, topic.clone()))
-        })
-        .collect();
-    let mut bound: Vec<_> = reg.bindings.keys().cloned().collect();
-    let sort_key = |id: &DataStreamId| (id.publisher_id, id.topic.as_ref().to_owned());
-    indexed.sort_by_key(sort_key);
-    bound.sort_by_key(sort_key);
-    assert_eq!(indexed, bound, "topic index disagrees with the bindings");
-}
 
 #[test]
 fn the_topic_index_tracks_every_declare_and_remove() {
     let mut reg = Registry::new(StreamLane::Unreliable);
-    assert_index_agrees(&reg);
 
     let first = stream(participant(1), "chat");
     let second = stream(participant(2), "chat");
     let other = stream(participant(3), "telemetry");
     for id in [&first, &second, &other] {
         ready(&mut reg, id, shard(0));
-        assert_index_agrees(&reg);
     }
 
     assert_eq!(reg.ids_on_topic(&room(), &topic("chat")).len(), 2);
 
-    reg.remove(&first);
-    assert_index_agrees(&reg);
+    reg.forget_topic(&first);
     assert_eq!(
         reg.ids_on_topic(&room(), &topic("chat")),
         vec![second.clone()],
         "removing one publisher must leave the others on the topic"
     );
 
-    reg.remove(&second);
-    reg.remove(&other);
-    assert_index_agrees(&reg);
+    reg.forget_topic(&second);
+    reg.forget_topic(&other);
     assert!(reg.ids_on_topic(&room(), &topic("chat")).is_empty());
 }
 
@@ -137,5 +115,4 @@ fn declaring_the_same_stream_twice_does_not_duplicate_it_on_its_topic() {
         vec![id],
         "a re-declared stream must appear on its topic exactly once"
     );
-    assert_index_agrees(&reg);
 }

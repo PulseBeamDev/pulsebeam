@@ -48,10 +48,15 @@ impl ControllerActor {
     }
 
     pub(super) async fn retire_participant_tracks(&mut self, participant_id: &ParticipantId) {
+        // Media only. The catalog holds every kind now, and a data stream
+        // retires through the lane path that owns its arena.
         let tracks: Vec<_> = self
             .catalog
             .iter()
-            .filter(|(_, binding)| binding.publisher == *participant_id)
+            .filter(|(_, binding)| {
+                binding.publisher == *participant_id
+                    && binding.kind() != crate::entity::TrackKind::Data
+            })
             .map(|(track_id, _)| *track_id)
             .collect();
         for track_id in tracks {

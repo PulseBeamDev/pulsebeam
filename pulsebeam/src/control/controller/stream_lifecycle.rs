@@ -93,12 +93,30 @@ fn retire_route_op(route: RouteHandle) -> crate::view::ViewOp {
     }
 }
 
+/// The catalog identity of a data stream.
+///
+/// `StreamLane` is the control plane's name for the lane and `DataLane` the
+/// label grammar's; they are the same two lanes, and this is the one place the
+/// two spellings meet.
+fn data_publication_id(
+    id: &crate::shard::router::DataStreamId,
+    lane: StreamLane,
+) -> crate::entity::TrackId {
+    let lane = match lane {
+        StreamLane::Unreliable => crate::track::DataLane::Realtime,
+        StreamLane::Reliable => crate::track::DataLane::Reliable,
+    };
+    let label = crate::track::publication_label(lane, &id.topic);
+    id.publisher_id
+        .derive_track_id(crate::entity::TrackKind::Data, &label)
+}
+
 impl ControllerActor {
     pub(super) fn stream_plan(
         &self,
         id: &crate::shard::router::DataStreamId,
         lane: StreamLane,
-        binding: &crate::control::lanes::StreamBinding,
+        binding: &crate::control::publication::Publication,
         destination: crate::id::ShardId,
     ) -> crate::view::StreamPlan {
         // As with audio: the plan names its audiences and the shard holds the
@@ -135,12 +153,40 @@ impl ControllerActor {
             debug_assert!(false, "a stream publisher must have a participant key");
             return;
         };
-        let binding = self
-            .lanes
-            .get_mut(lane)
-            .declare(id.clone(), shard_id, publisher, key);
+        // The topic index still lives with the lane registry, which is what
+        // answers "who else publishes this topic"; the publication itself is
+        // filed in the catalog like any other kind.
+        self.lanes.get_mut(lane).note_topic(&id);
+        let publication_id = data_publication_id(&id, lane);
+        let existing_reverse = self
+            .catalog
+            .get(&publication_id)
+            .and_then(|held| held.reverse_route);
+        let lane_label = match lane {
+            StreamLane::Unreliable => crate::track::DataLane::Realtime,
+            StreamLane::Reliable => crate::track::DataLane::Reliable,
+        };
+        self.catalog
+            .insert(crate::control::publication::Publication {
+                id: publication_id,
+                room: id.room_id,
+                publisher: id.publisher_id,
+                publisher_shard: shard_id,
+                publisher_key: publisher,
+                origin_key: key.into(),
+                reverse_route: existing_reverse,
+                destinations: self
+                    .catalog
+                    .get(&publication_id)
+                    .map(|held| held.destinations.clone())
+                    .unwrap_or_default(),
+                media: crate::control::publication::Media::Data {
+                    lane: lane_label,
+                    topic: id.topic.clone(),
+                },
+            });
 
-        if matches!(lane, StreamLane::Reliable) && binding.reverse_route.is_none() {
+        if matches!(lane, StreamLane::Reliable) && existing_reverse.is_none() {
             let Some(stream) = (match key {
                 crate::shard::router::RuntimeStreamKey::Reliable(stream) => Some(stream),
                 _ => None,
@@ -159,7 +205,7 @@ impl ControllerActor {
             else {
                 return;
             };
-            let Some(binding) = self.lanes.get_mut(lane).get_mut(&id) else {
+            let Some(binding) = self.catalog.get_mut(&data_publication_id(&id, lane)) else {
                 debug_assert!(false, "stream binding must survive reverse route install");
                 return;
             };
@@ -268,12 +314,12 @@ impl ControllerActor {
             RouteHandle,
         )],
     ) -> bool {
-        let Some(binding) = self.lanes.get(lane).get(id) else {
+        let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
             debug_assert!(false, "stale routes must belong to a stream binding");
             return false;
         };
         let publisher_shard = binding.publisher_shard;
-        let source_key = binding.key;
+        let source_key = binding.origin_key.stream();
         let mut source_plan =
             source_key.map(|_| self.stream_plan(id, lane, binding, publisher_shard));
         if let Some(plan) = source_plan.as_mut() {
@@ -295,7 +341,7 @@ impl ControllerActor {
 
         let now = tokio::time::Instant::now();
         for (destination, _, route) in stale {
-            let Some(binding) = self.lanes.get_mut(lane).get_mut(id) else {
+            let Some(binding) = self.catalog.get_mut(&data_publication_id(&id, lane)) else {
                 debug_assert!(false, "stream binding must survive route retirement");
                 return false;
             };
@@ -311,11 +357,11 @@ impl ControllerActor {
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) -> bool {
-        let Some(binding) = self.lanes.get(lane).get(&id) else {
+        let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
             return true;
         };
         let publisher_shard = binding.publisher_shard;
-        let source_key = binding.key;
+        let source_key = binding.origin_key.stream();
         let destinations = binding.destinations.clone();
         let routes: Vec<_> = destinations
             .iter()
@@ -352,7 +398,8 @@ impl ControllerActor {
                 .get(lane)
                 .retire_runtime(&mut self.state, destination, key);
         }
-        self.lanes.get_mut(lane).remove(&id);
+        self.catalog.remove(&data_publication_id(&id, lane));
+        self.lanes.get_mut(lane).forget_topic(&id);
         true
     }
 
@@ -388,9 +435,8 @@ impl ControllerActor {
         // table is what lets the binding stop tracking subscribers at all.
         let wanted = self.stream_destinations(&id, lane);
         let stale: Vec<_> = self
-            .lanes
-            .get(lane)
-            .get(&id)
+            .catalog
+            .get(&data_publication_id(&id, lane))
             .map(|binding| {
                 binding
                     .destinations
@@ -411,21 +457,23 @@ impl ControllerActor {
         }
         let destinations = wanted;
         let Some(publisher_shard) = self
-            .lanes
-            .get(lane)
-            .get(&id)
+            .catalog
+            .get(&data_publication_id(&id, lane))
             .map(|binding| binding.publisher_shard)
         else {
             return;
         };
         let mut added = false;
         for destination in destinations {
-            let has_route = self.lanes.get(lane).get(&id).is_some_and(|binding| {
-                binding
-                    .destinations
-                    .get(&destination)
-                    .is_some_and(|d| d.route.is_some())
-            });
+            let has_route = self
+                .catalog
+                .get(&data_publication_id(&id, lane))
+                .is_some_and(|binding| {
+                    binding
+                        .destinations
+                        .get(&destination)
+                        .is_some_and(|d| d.route.is_some())
+                });
             if !needs_stream_route(publisher_shard, destination, has_route) {
                 continue;
             }
@@ -436,7 +484,7 @@ impl ControllerActor {
                 debug_assert!(false, "stream preparation returned the wrong lane");
                 continue;
             };
-            let Some(binding) = self.lanes.get(lane).get(&id) else {
+            let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
                 return;
             };
             let plan = self.stream_plan(&id, lane, binding, destination);
@@ -446,7 +494,7 @@ impl ControllerActor {
             else {
                 continue;
             };
-            let Some(binding) = self.lanes.get_mut(lane).get_mut(&id) else {
+            let Some(binding) = self.catalog.get_mut(&data_publication_id(&id, lane)) else {
                 return;
             };
             binding.destinations.insert(
@@ -468,12 +516,12 @@ impl ControllerActor {
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) {
-        let Some(binding) = self.lanes.get(lane).get(&id) else {
+        let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
             return;
         };
-        let publisher = binding.publisher;
+        let publisher = binding.publisher_key;
         let publisher_shard = binding.publisher_shard;
-        let source_key = binding.key;
+        let source_key = binding.origin_key.stream();
         let destinations = binding.destinations.clone();
 
         let mut targets = Vec::new();
