@@ -18,22 +18,6 @@ use crate::id::ShardId;
 use crate::keys::{ParticipantKey, ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::route::RouteHandle;
 
-/// What a publication is called. The `TrackId` keying it is derived from
-/// exactly these fields.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Subject {
-    pub room: RoomId,
-    pub publisher: ParticipantId,
-    pub kind: TrackKind,
-    pub label: String,
-}
-
-impl Subject {
-    pub fn id(&self) -> TrackId {
-        self.publisher.derive_track_id(self.kind, &self.label)
-    }
-}
-
 /// A publication's key in one shard's arena, whichever arena that is.
 ///
 /// The variant is the arena. Video and audio share `tracks`; the data lanes
@@ -108,13 +92,46 @@ pub(crate) enum Media {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Publication {
-    pub subject: Subject,
+    /// The stable, cluster-wide identity. Derived from the publisher, the kind
+    /// and the label at announce; held rather than re-derived, because the
+    /// label is a property of how a track was named and nothing downstream
+    /// needs it again.
+    pub id: TrackId,
+    pub room: RoomId,
+    pub publisher: ParticipantId,
     pub publisher_shard: ShardId,
     pub publisher_key: ParticipantKey,
     pub origin_key: RuntimeKey,
     pub reverse_route: Option<RouteHandle>,
     pub destinations: IndexMap<ShardId, Destination>,
     pub media: Media,
+}
+
+impl Publication {
+    pub fn kind(&self) -> TrackKind {
+        self.id.kind()
+    }
+
+    /// `TrackMeta` is a projection of what is already here, not state. Storing
+    /// it would be a second copy free to drift.
+    pub fn meta(&self) -> crate::track::TrackMeta {
+        crate::track::TrackMeta {
+            room_id: self.room,
+            shard_id: self.publisher_shard,
+            id: self.id,
+            origin: self.publisher,
+        }
+    }
+
+    /// The label this was published under, for declarations that name a topic
+    /// rather than a track. Media publications are named by id, which embeds
+    /// the publisher, so they need no label to be found.
+    pub fn data_label(&self) -> Option<String> {
+        match &self.media {
+            Media::Data { lane, topic } => Some(crate::track::publication_label(*lane, topic)),
+            _ => None,
+        }
+    }
 }
 
 /// Compile a publication's forwarding plan for one shard.
@@ -172,23 +189,11 @@ pub(crate) fn forwarding_plan(
 pub(crate) struct Catalog {
     publications: IndexMap<TrackId, Publication>,
     by_room: IndexMap<(RoomId, TrackKind), IndexSet<TrackId>>,
-    by_label: IndexMap<(RoomId, TrackKind, String), IndexSet<TrackId>>,
     by_publisher: IndexMap<(RoomId, TrackKind, ParticipantId), IndexSet<TrackId>>,
-}
-
-impl Publication {
-    /// `TrackMeta` is a projection of the subject and the publisher's shard,
-    /// not state: room, id and origin all come from the subject, and the shard
-    /// is where the publisher lives. Storing it would be a second copy of
-    /// facts already held here, free to drift.
-    pub fn meta(&self) -> crate::track::TrackMeta {
-        crate::track::TrackMeta {
-            room_id: self.subject.room,
-            shard_id: self.publisher_shard,
-            id: self.subject.id(),
-            origin: self.subject.publisher,
-        }
-    }
+    /// Data only. A media publication is named by its id, which embeds the
+    /// publisher, so a declaration naming one resolves without an index; a data
+    /// declaration names a topic across publishers and cannot.
+    by_label: IndexMap<(RoomId, String), IndexSet<TrackId>>,
 }
 
 impl Catalog {
@@ -196,41 +201,41 @@ impl Catalog {
         Self::default()
     }
 
-    /// File a publication, returning the id it is known by.
-    ///
-    /// A derived id is a 128-bit hash, so this is the one place a collision
-    /// could put two subjects on one key, and the one place it is checked.
-    pub fn insert(&mut self, publication: Publication) -> TrackId {
-        let id = publication.subject.id();
-        let subject = publication.subject.clone();
+    /// File a publication. A derived id is a 128-bit hash, so this is the one
+    /// place two publications could collide on a key, and the one place it is
+    /// checked.
+    pub fn insert(&mut self, publication: Publication) {
+        let id = publication.id;
+        let (room, kind) = (publication.room, publication.kind());
         if let Some(existing) = self.publications.get(&id) {
-            debug_assert_eq!(
-                existing.subject, subject,
-                "two subjects derived one identity"
+            debug_assert!(
+                existing.room == room && existing.publisher == publication.publisher,
+                "two publications derived one identity"
             );
         }
-        self.by_room
-            .entry((subject.room, subject.kind))
-            .or_default()
-            .insert(id);
-        self.by_label
-            .entry((subject.room, subject.kind, subject.label.clone()))
-            .or_default()
-            .insert(id);
+        self.by_room.entry((room, kind)).or_default().insert(id);
         self.by_publisher
-            .entry((subject.room, subject.kind, subject.publisher))
+            .entry((room, kind, publication.publisher))
             .or_default()
             .insert(id);
+        if let Some(label) = publication.data_label() {
+            self.by_label.entry((room, label)).or_default().insert(id);
+        }
         self.publications.insert(id, publication);
-        id
     }
 
     pub fn remove(&mut self, id: &TrackId) -> Option<Publication> {
         let publication = self.publications.shift_remove(id)?;
-        let s = &publication.subject;
-        Self::unindex(&mut self.by_room, &(s.room, s.kind), id);
-        Self::unindex(&mut self.by_label, &(s.room, s.kind, s.label.clone()), id);
-        Self::unindex(&mut self.by_publisher, &(s.room, s.kind, s.publisher), id);
+        let (room, kind) = (publication.room, publication.kind());
+        Self::unindex(&mut self.by_room, &(room, kind), id);
+        Self::unindex(
+            &mut self.by_publisher,
+            &(room, kind, publication.publisher),
+            id,
+        );
+        if let Some(label) = publication.data_label() {
+            Self::unindex(&mut self.by_label, &(room, label), id);
+        }
         Some(publication)
     }
 
@@ -256,49 +261,41 @@ impl Catalog {
         self.publications.get_mut(id)
     }
 
-    /// The publications a declaration reaches.
-    ///
-    /// The inverse of matching a subject against the pattern table: that asks
-    /// "which audiences does this publication have", this asks "which
-    /// publications does this audience want", and a subscribe needs both.
-    pub fn matching(
+    pub fn contains(&self, id: &TrackId) -> bool {
+        self.publications.contains_key(id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&TrackId, &Publication)> {
+        self.publications.iter()
+    }
+
+    /// Every publication of a kind in a room.
+    pub fn in_room(&self, room: RoomId, kind: TrackKind) -> Vec<TrackId> {
+        self.by_room
+            .get(&(room, kind))
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Everything one publisher sends of a kind.
+    pub fn from_publisher(
         &self,
         room: RoomId,
         kind: TrackKind,
-        publisher: Option<ParticipantId>,
-        label: Option<&str>,
+        publisher: ParticipantId,
     ) -> Vec<TrackId> {
-        match (publisher, label) {
-            (Some(publisher), Some(label)) => {
-                // The room is not one of the hashed inputs — a participant
-                // belongs to one room, so the room is determined by the
-                // publisher rather than independent of it. Determined is not
-                // checked: the derived id alone resolves a publication in
-                // another room, so the subject is verified before it counts.
-                let id = publisher.derive_track_id(kind, label);
-                self.publications
-                    .get(&id)
-                    .filter(|held| held.subject.room == room)
-                    .map(|_| id)
-                    .into_iter()
-                    .collect()
-            }
-            (None, Some(label)) => self
-                .by_label
-                .get(&(room, kind, label.to_string()))
-                .map(|ids| ids.iter().copied().collect())
-                .unwrap_or_default(),
-            (Some(publisher), None) => self
-                .by_publisher
-                .get(&(room, kind, publisher))
-                .map(|ids| ids.iter().copied().collect())
-                .unwrap_or_default(),
-            (None, None) => self
-                .by_room
-                .get(&(room, kind))
-                .map(|ids| ids.iter().copied().collect())
-                .unwrap_or_default(),
-        }
+        self.by_publisher
+            .get(&(room, kind, publisher))
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every publisher of a data label in a room.
+    pub fn on_label(&self, room: RoomId, label: &str) -> Vec<TrackId> {
+        self.by_label
+            .get(&(room, label.to_string()))
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -313,6 +310,7 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::ExternalRoomId;
+    use crate::track::DataLane;
 
     fn room(name: &str) -> RoomId {
         RoomId::from_external(&ExternalRoomId::new(name).unwrap())
@@ -322,14 +320,11 @@ mod tests {
         ParticipantId::from_bytes([seed; 16])
     }
 
-    fn publication(r: RoomId, publisher: u8, kind: TrackKind, label: &str) -> Publication {
+    fn media(r: RoomId, publisher: u8, kind: TrackKind, label: &str) -> Publication {
         Publication {
-            subject: Subject {
-                room: r,
-                publisher: pid(publisher),
-                kind,
-                label: label.to_string(),
-            },
+            id: pid(publisher).derive_track_id(kind, label),
+            room: r,
+            publisher: pid(publisher),
             publisher_shard: ShardId::new(0),
             publisher_key: ParticipantKey::default(),
             origin_key: RuntimeKey::Track(TrackKey::default()),
@@ -339,109 +334,120 @@ mod tests {
         }
     }
 
-    /// The four ways a declaration can name what it wants, against one catalog.
-    /// A fully concrete one needs no index: its subject derives the id.
-    #[test]
-    fn every_pattern_form_finds_what_it_names() {
-        let mut catalog = Catalog::new();
-        let r = room("r");
-        for (publisher, label) in [(1, "mic"), (2, "mic"), (1, "screen")] {
-            catalog.insert(publication(r, publisher, TrackKind::Audio, label));
+    fn data(r: RoomId, publisher: u8, lane: DataLane, topic: &str) -> Publication {
+        let topic = crate::track::Topic::for_test(topic);
+        let label = crate::track::publication_label(lane, &topic);
+        Publication {
+            id: pid(publisher).derive_track_id(TrackKind::Data, &label),
+            room: r,
+            publisher: pid(publisher),
+            publisher_shard: ShardId::new(0),
+            publisher_key: ParticipantKey::default(),
+            origin_key: RuntimeKey::Unreliable(Default::default()),
+            reverse_route: None,
+            destinations: IndexMap::new(),
+            media: Media::Data { lane, topic },
         }
-
-        assert_eq!(
-            catalog
-                .matching(r, TrackKind::Audio, Some(pid(1)), Some("mic"))
-                .len(),
-            1,
-            "exact names one publication"
-        );
-        assert_eq!(
-            catalog
-                .matching(r, TrackKind::Audio, None, Some("mic"))
-                .len(),
-            2,
-            "a label across publishers names both"
-        );
-        assert_eq!(
-            catalog
-                .matching(r, TrackKind::Audio, Some(pid(1)), None)
-                .len(),
-            2,
-            "a publisher's whole output"
-        );
-        assert_eq!(
-            catalog.matching(r, TrackKind::Audio, None, None).len(),
-            3,
-            "everything of that kind in the room"
-        );
     }
 
-    /// Kind partitions the catalog, so audio declarations never reach video.
+    fn label_of(lane: DataLane, topic: &str) -> String {
+        crate::track::publication_label(lane, &crate::track::Topic::for_test(topic))
+    }
+
+    /// A media declaration names a track, and a track id embeds its publisher,
+    /// so it resolves without an index at all.
     #[test]
-    fn a_kind_never_matches_another() {
+    fn a_media_publication_is_found_by_its_id() {
         let mut catalog = Catalog::new();
         let r = room("r");
-        catalog.insert(publication(r, 1, TrackKind::Audio, "x"));
-        catalog.insert(publication(r, 1, TrackKind::Video, "x"));
+        let one = media(r, 1, TrackKind::Audio, "mic");
+        let id = one.id;
+        catalog.insert(one);
 
-        assert_eq!(catalog.matching(r, TrackKind::Audio, None, None).len(), 1);
-        assert_eq!(catalog.matching(r, TrackKind::Video, None, None).len(), 1);
-        assert_eq!(catalog.matching(r, TrackKind::Data, None, None).len(), 0);
+        assert!(catalog.contains(&id));
+        assert_eq!(catalog.in_room(r, TrackKind::Audio), vec![id]);
     }
 
-    /// Room isolation is structural: the room is a field of every index key, so
-    /// no query can reach across one.
+    /// A data declaration names a topic across publishers, which is the case
+    /// the label index exists for.
     #[test]
-    fn nothing_matches_across_rooms() {
+    fn a_data_label_finds_every_publisher_of_it() {
         let mut catalog = Catalog::new();
-        catalog.insert(publication(room("a"), 1, TrackKind::Audio, "mic"));
+        let r = room("r");
+        for publisher in [1u8, 2, 3] {
+            catalog.insert(data(r, publisher, DataLane::Realtime, "chat"));
+        }
+        catalog.insert(data(r, 1, DataLane::Reliable, "chat"));
 
-        assert!(
+        assert_eq!(
             catalog
-                .matching(room("b"), TrackKind::Audio, None, None)
-                .is_empty()
+                .on_label(r, &label_of(DataLane::Realtime, "chat"))
+                .len(),
+            3,
+            "every publisher on that lane, and only that lane"
         );
+    }
+
+    /// The lanes are separate publications of one topic, told apart by the
+    /// label rather than by a lane field the catalog has to carry.
+    #[test]
+    fn the_lanes_do_not_share_an_audience() {
+        let mut catalog = Catalog::new();
+        let r = room("r");
+        catalog.insert(data(r, 1, DataLane::Realtime, "chat"));
+        catalog.insert(data(r, 1, DataLane::Reliable, "chat"));
+
+        let realtime = catalog.on_label(r, &label_of(DataLane::Realtime, "chat"));
+        let reliable = catalog.on_label(r, &label_of(DataLane::Reliable, "chat"));
+        assert_eq!(realtime.len(), 1);
+        assert_eq!(reliable.len(), 1);
+        assert_ne!(realtime, reliable);
+    }
+
+    #[test]
+    fn a_publishers_output_is_scoped_to_its_kind_and_room() {
+        let mut catalog = Catalog::new();
+        let r = room("r");
+        catalog.insert(media(r, 1, TrackKind::Audio, "mic"));
+        catalog.insert(media(r, 1, TrackKind::Video, "cam"));
+        // A different participant: the same one cannot be in two rooms, and
+        // the id would not distinguish them if it were, since the room is not
+        // a hashed input. The collision assert in `insert` catches that.
+        catalog.insert(media(room("other"), 9, TrackKind::Audio, "mic"));
+
+        assert_eq!(catalog.from_publisher(r, TrackKind::Audio, pid(1)).len(), 1);
+        assert_eq!(catalog.from_publisher(r, TrackKind::Video, pid(1)).len(), 1);
         assert!(
             catalog
-                .matching(room("b"), TrackKind::Audio, Some(pid(1)), Some("mic"))
+                .from_publisher(room("nowhere"), TrackKind::Audio, pid(1))
                 .is_empty()
         );
     }
 
-    /// Removal has to clear all three indexes, or a later query resolves an id
-    /// the catalog no longer holds.
+    /// Removal has to clear every index, or a later query resolves an id the
+    /// catalog no longer holds.
     #[test]
     fn removal_leaves_no_index_entry_behind() {
         let mut catalog = Catalog::new();
         let r = room("r");
-        let id = catalog.insert(publication(r, 1, TrackKind::Audio, "mic"));
-        catalog.insert(publication(r, 2, TrackKind::Audio, "mic"));
+        let one = data(r, 1, DataLane::Realtime, "chat");
+        let id = one.id;
+        catalog.insert(one);
+        catalog.insert(data(r, 2, DataLane::Realtime, "chat"));
 
         assert!(catalog.remove(&id).is_some());
         assert_eq!(catalog.len(), 1);
+        assert!(!catalog.contains(&id));
         assert_eq!(
-            catalog.matching(r, TrackKind::Audio, None, Some("mic")),
-            catalog.matching(r, TrackKind::Audio, Some(pid(2)), Some("mic")),
-            "only the surviving publisher is reachable, by either route"
+            catalog
+                .on_label(r, &label_of(DataLane::Realtime, "chat"))
+                .len(),
+            1
         );
         assert!(
             catalog
-                .matching(r, TrackKind::Audio, Some(pid(1)), None)
+                .from_publisher(r, TrackKind::Data, pid(1))
                 .is_empty()
         );
-    }
-
-    /// Re-announcing the same subject is an update, not a second entry.
-    #[test]
-    fn re_announcing_one_subject_does_not_duplicate_it() {
-        let mut catalog = Catalog::new();
-        let r = room("r");
-        let first = catalog.insert(publication(r, 1, TrackKind::Audio, "mic"));
-        let again = catalog.insert(publication(r, 1, TrackKind::Audio, "mic"));
-
-        assert_eq!(first, again);
-        assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog.matching(r, TrackKind::Audio, None, None).len(), 1);
     }
 }
