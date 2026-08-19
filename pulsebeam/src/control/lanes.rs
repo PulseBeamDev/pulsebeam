@@ -124,13 +124,6 @@ impl Lanes {
             StreamLane::Reliable => &self.reliable,
         }
     }
-
-    pub(crate) fn get_mut(&mut self, lane: StreamLane) -> &mut LaneRegistry {
-        match lane {
-            StreamLane::Unreliable => &mut self.data,
-            StreamLane::Reliable => &mut self.reliable,
-        }
-    }
 }
 
 #[cfg(test)]

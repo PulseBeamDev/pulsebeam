@@ -48,17 +48,29 @@ impl ControllerActor {
     }
 
     pub(super) async fn retire_participant_tracks(&mut self, participant_id: &ParticipantId) {
-        // Media only. The catalog holds every kind now, and a data stream
-        // retires through the lane path that owns its arena.
-        let tracks: Vec<_> = self
+        // Media only: a data stream retires through the lane path that owns
+        // its arena. The room comes from the publication itself, since a
+        // participant that has already left the registry still has tracks to
+        // retire.
+        let rooms: Vec<_> = self
             .catalog
             .iter()
-            .filter(|(_, binding)| {
-                binding.publisher == *participant_id
-                    && binding.kind() != crate::entity::TrackKind::Data
-            })
-            .map(|(track_id, _)| *track_id)
+            .filter(|(_, held)| held.publisher == *participant_id)
+            .map(|(_, held)| held.room)
             .collect();
+        let mut tracks = Vec::new();
+        for room in rooms {
+            for kind in [
+                crate::entity::TrackKind::Video,
+                crate::entity::TrackKind::Audio,
+            ] {
+                for id in self.catalog.from_publisher(room, kind, *participant_id) {
+                    if !tracks.contains(&id) {
+                        tracks.push(id);
+                    }
+                }
+            }
+        }
         for track_id in tracks {
             if !self.retire_track_binding(track_id).await {
                 debug_assert!(false, "publisher track retirement must complete");

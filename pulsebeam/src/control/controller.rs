@@ -970,21 +970,11 @@ impl ControllerActor {
     }
 
     async fn reconcile_room_tracks(&mut self, room_id: crate::entity::RoomId) {
-        let track_ids: Vec<_> = self
+        for track_id in self
             .catalog
-            .iter()
-            .filter_map(|(track_id, binding)| {
-                self.core
-                    .registry
-                    .get_participant(&binding.publisher)
-                    .is_some_and(|participant| participant.room_id == room_id)
-                    .then_some(*track_id)
-            })
-            .collect();
-        for track_id in track_ids {
-            if track_id.kind() == crate::entity::TrackKind::Video {
-                self.install_video_runtimes(track_id).await;
-            }
+            .in_room(room_id, crate::entity::TrackKind::Video)
+        {
+            self.install_video_runtimes(track_id).await;
             if !self.publish_publication(track_id).await {
                 debug_assert!(false, "room track reconciliation must publish");
             }
@@ -995,21 +985,11 @@ impl ControllerActor {
     /// of the audience just arrived. Every later joiner on that shard is served
     /// by the routes this installed, and costs one membership op.
     async fn reconcile_room_audio(&mut self, room_id: crate::entity::RoomId) {
-        let track_ids: Vec<_> = self
+        for track_id in self
             .catalog
-            .iter()
-            .filter_map(|(track_id, binding)| {
-                self.core
-                    .registry
-                    .get_participant(&binding.publisher)
-                    .is_some_and(|participant| participant.room_id == room_id)
-                    .then_some(*track_id)
-            })
-            .collect();
-        for track_id in track_ids {
-            if track_id.kind() == crate::entity::TrackKind::Audio {
-                self.install_audio_routes(track_id).await;
-            }
+            .in_room(room_id, crate::entity::TrackKind::Audio)
+        {
+            self.install_audio_routes(track_id).await;
         }
     }
 }
