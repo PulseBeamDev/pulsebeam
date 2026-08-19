@@ -9,18 +9,11 @@
 //! action to emit, which arena to retire into — is a method here, and nowhere
 //! else.
 
-use ahash::{HashMap, HashMapExt};
-
 use crate::{
     control::state::ControlPlaneState,
-    entity::{ParticipantId, RoomId},
     id::ShardId,
-    route::{RouteAction, RouteHandle},
-    shard::{
-        participants::ParticipantKey,
-        router::{DataStreamId, RuntimeStreamKey},
-    },
-    track::Topic,
+    route::RouteAction,
+    shard::router::{DataStreamId, RuntimeStreamKey},
 };
 
 /// How a data stream is delivered.

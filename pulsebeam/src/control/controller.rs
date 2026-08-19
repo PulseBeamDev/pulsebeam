@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use ahash::{HashMap, HashMapExt};
+use ahash::HashMapExt;
 
 use crate::control::state::ControlPlaneState;
 use crate::{
@@ -30,6 +30,7 @@ use str0m::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+mod lifecycle;
 mod participants;
 mod routes;
 mod stream_lifecycle;
