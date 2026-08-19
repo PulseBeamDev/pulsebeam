@@ -525,7 +525,8 @@ impl ControllerActor {
         };
         let pattern =
             crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
-        let (membership, _) = self.video_patterns.declare(
+        let (membership, mut membership_ops) = crate::control::patterns::declare_audience(
+            &mut self.video_patterns,
             pattern.clone(),
             subscriber,
             crate::control::patterns::Member {
@@ -533,36 +534,19 @@ impl ControllerActor {
                 key: subscriber_key,
                 delivery: slot,
             },
+            crate::view::Delivery::Video(slot),
+            crate::view::AudienceKind::Video,
         );
-        if let Some(group) = self.video_patterns.group_of(&pattern) {
-            let ops = vec![
-                (
-                    shard_id,
-                    crate::view::ViewOp::GroupInsert {
-                        group,
-                        key: subscriber_key,
-                        delivery: crate::view::Delivery::Video(slot),
-                    },
-                ),
-                (
-                    shard_id,
-                    crate::view::ViewOp::BindSubscribedTrack {
-                        participant: subscriber_key,
-                        track: track.id,
-                        fanout,
-                    },
-                ),
-            ];
-            if !self.publish_ops(ops) {
-                debug_assert!(false, "video subscription must publish");
-            }
-        }
-        {
-            let Some(binding) = self.track_bindings.get_mut(&track.id) else {
-                debug_assert!(false, "a subscription must name a published track");
-                return;
-            };
-            binding.fanouts.insert(shard_id, fanout);
+        membership_ops.push((
+            shard_id,
+            crate::view::ViewOp::BindSubscribedTrack {
+                participant: subscriber_key,
+                track: track.id,
+                fanout,
+            },
+        ));
+        if !self.publish_ops(membership_ops) {
+            debug_assert!(false, "video subscription must publish");
         }
 
         if membership == crate::control::patterns::Membership::FirstOnShard {
@@ -575,27 +559,21 @@ impl ControllerActor {
                 // told which track a route carries by the route itself, so the
                 // retry re-stages this same key — dropping it here would mint a
                 // fresh one on every attempt and abandon the last in the arena.
-                self.video_patterns.undeclare(&pattern, &subscriber);
-                if let Some(group) = self.video_patterns.group_of(&pattern) {
-                    let _ = self.publish_ops(vec![
-                        (
-                            shard_id,
-                            crate::view::ViewOp::GroupRemove {
-                                group,
-                                key: subscriber_key,
-                                kind: crate::view::AudienceKind::Video,
-                            },
-                        ),
-                        (
-                            shard_id,
-                            crate::view::ViewOp::UnbindSubscribedTrack {
-                                participant: subscriber_key,
-                                track: track.id,
-                                fanout,
-                            },
-                        ),
-                    ]);
-                }
+                let (_, mut rollback) = crate::control::patterns::retract_audience(
+                    &mut self.video_patterns,
+                    &pattern,
+                    &subscriber,
+                    crate::view::AudienceKind::Video,
+                );
+                rollback.push((
+                    shard_id,
+                    crate::view::ViewOp::UnbindSubscribedTrack {
+                        participant: subscriber_key,
+                        track: track.id,
+                        fanout,
+                    },
+                ));
+                let _ = self.publish_ops(rollback);
                 self.defer_subscribe(crate::control::pending::PendingSubscription::new(
                     shard_id,
                     subscriber,
@@ -625,31 +603,28 @@ impl ControllerActor {
     ) {
         let pattern =
             crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
-        let placement = self.video_patterns.member_key(&pattern, &subscriber);
-        let group = self.video_patterns.group_of(&pattern);
-        let departure = self.video_patterns.undeclare(&pattern, &subscriber);
-        if let (Some(group), Some((_, key))) = (group, placement) {
-            let mut ops = vec![(
+        let subscriber_key = self
+            .video_patterns
+            .member_key(&pattern, &subscriber)
+            .map(|(_, key)| key);
+        let (departure, mut membership_ops) = crate::control::patterns::retract_audience(
+            &mut self.video_patterns,
+            &pattern,
+            &subscriber,
+            crate::view::AudienceKind::Video,
+        );
+        if let (Some(key), Some(fanout)) = (subscriber_key, self.track_fanout(track.id, shard_id)) {
+            membership_ops.push((
                 shard_id,
-                crate::view::ViewOp::GroupRemove {
-                    group,
-                    key,
-                    kind: crate::view::AudienceKind::Video,
+                crate::view::ViewOp::UnbindSubscribedTrack {
+                    participant: key,
+                    track: track.id,
+                    fanout,
                 },
-            )];
-            if let Some(fanout) = self.track_fanout(track.id, shard_id) {
-                ops.push((
-                    shard_id,
-                    crate::view::ViewOp::UnbindSubscribedTrack {
-                        participant: key,
-                        track: track.id,
-                        fanout,
-                    },
-                ));
-            }
-            if !self.publish_ops(ops) {
-                debug_assert!(false, "video unsubscription must publish");
-            }
+            ));
+        }
+        if !self.publish_ops(membership_ops) {
+            debug_assert!(false, "video unsubscription must publish");
         }
         if departure != crate::control::patterns::Departure::LastOnShard {
             let _ = self.publish_track_plans(track.id).await;

@@ -6,14 +6,24 @@ impl ControllerActor {
     /// Its subscriptions go with it, and any route that only it kept alive is
     /// retired — otherwise a shard keeps a route for a stream nobody there
     /// receives any more, and the slot never returns to the allocator.
+    /// Release everything a departing participant was consuming on the data
+    /// lanes.
+    ///
+    /// Its declarations name the streams, so they have to be resolved before
+    /// the declarations go. Any route it alone kept alive is retired by the
+    /// reconcile that follows — otherwise a shard keeps a route for a stream
+    /// nobody there receives, and the slot never returns to the allocator.
     pub(super) async fn retire_participant_streams(&mut self, participant_id: &ParticipantId) {
-        // What it consumed is what it declared. The streams affected have to be
-        // collected before the declarations go, since they are what says which
-        // ones to reconcile.
+        let (departures, ops) = crate::control::patterns::retract_participant(
+            &mut self.data_patterns,
+            participant_id,
+            crate::view::AudienceKind::Data,
+        );
+        if !self.publish_ops(ops) {
+            debug_assert!(false, "data group retraction must publish");
+        }
         let mut affected: Vec<(crate::shard::router::DataStreamId, StreamLane)> = Vec::new();
-        for pattern in self.data_patterns.declarations_of(participant_id) {
-            // A data declaration always names its topic; only the publisher
-            // position may wildcard.
+        for (pattern, _) in departures {
             let Some((topic, lane)) = pattern.name else {
                 debug_assert!(false, "a data declaration names its topic");
                 continue;
@@ -30,36 +40,6 @@ impl ControllerActor {
                 if !affected.iter().any(|(held, _)| *held == id) {
                     affected.push((id, lane));
                 }
-            }
-        }
-        let placement = self
-            .core
-            .registry
-            .get_participant(participant_id)
-            .and_then(|meta| meta.binding)
-            .zip(
-                self.core
-                    .registry
-                    .transport_of(participant_id)
-                    .map(|(s, _)| s),
-            );
-        let retracted = self.data_patterns.remove_participant(participant_id);
-        if let Some((key, shard)) = placement {
-            let ops = retracted
-                .into_iter()
-                .map(|(group, _)| {
-                    (
-                        shard,
-                        crate::view::ViewOp::GroupRemove {
-                            group,
-                            key,
-                            kind: crate::view::AudienceKind::Data,
-                        },
-                    )
-                })
-                .collect();
-            if !self.publish_ops(ops) {
-                debug_assert!(false, "data group retraction must publish");
             }
         }
         for (id, lane) in affected {
@@ -87,50 +67,36 @@ impl ControllerActor {
         &mut self,
         participant_id: &ParticipantId,
     ) {
-        // Video: the tracks it subscribed to are named by its own declarations,
-        // and a route only retires when it was that participant's alone.
-        let watched = self.video_patterns.declarations_of(participant_id);
-        let placement = self
+        let (video, mut ops) = crate::control::patterns::retract_participant(
+            &mut self.video_patterns,
+            participant_id,
+            crate::view::AudienceKind::Video,
+        );
+        let (_, audio_ops) = crate::control::patterns::retract_participant(
+            &mut self.audio_patterns,
+            participant_id,
+            crate::view::AudienceKind::Audio,
+        );
+        ops.extend(audio_ops);
+        if !self.publish_ops(ops) {
+            debug_assert!(false, "group retraction must publish");
+        }
+
+        // A video route is per (track, shard) and only retires with the last
+        // consumer on that shard, which is what LastOnShard reports.
+        let shard = self
             .core
             .registry
-            .get_participant(participant_id)
-            .and_then(|meta| meta.binding)
-            .zip(
-                self.core
-                    .registry
-                    .transport_of(participant_id)
-                    .map(|(s, _)| s),
-            );
-        let mut departures = Vec::new();
-        for pattern in &watched {
-            let Some(track_id) = pattern.name else {
-                continue;
-            };
-            let departure = self.video_patterns.undeclare(pattern, participant_id);
-            departures.push((track_id, departure));
-        }
-        if let Some((key, shard)) = placement {
-            let ops: Vec<_> = watched
-                .iter()
-                .filter_map(|pattern| {
-                    let group = self.video_patterns.group_of(pattern)?;
-                    Some((
-                        shard,
-                        crate::view::ViewOp::GroupRemove {
-                            group,
-                            key,
-                            kind: crate::view::AudienceKind::Video,
-                        },
-                    ))
-                })
-                .collect();
-            if !self.publish_ops(ops) {
-                debug_assert!(false, "video group retraction must publish");
-            }
-            for (track_id, departure) in departures {
+            .transport_of(participant_id)
+            .map(|(shard, _)| shard);
+        if let Some(shard) = shard {
+            for (pattern, departure) in video {
                 if departure != crate::control::patterns::Departure::LastOnShard {
                     continue;
                 }
+                let Some(track_id) = pattern.name else {
+                    continue;
+                };
                 let Some(route) = self
                     .track_bindings
                     .get_mut(&track_id)
@@ -142,35 +108,6 @@ impl ControllerActor {
             }
         }
         self.pending.remove_participant(*participant_id);
-        let key = self
-            .core
-            .registry
-            .get_participant(participant_id)
-            .and_then(|meta| meta.binding);
-        let shard = self
-            .core
-            .registry
-            .transport_of(participant_id)
-            .map(|(s, _)| s);
-        let retracted = self.audio_patterns.remove_participant(participant_id);
-        if let (Some(key), Some(shard)) = (key, shard) {
-            let ops = retracted
-                .into_iter()
-                .map(|(group, _)| {
-                    (
-                        shard,
-                        crate::view::ViewOp::GroupRemove {
-                            group,
-                            key,
-                            kind: crate::view::AudienceKind::Audio,
-                        },
-                    )
-                })
-                .collect();
-            if !self.publish_ops(ops) {
-                debug_assert!(false, "audio group retraction must publish");
-            }
-        }
     }
 
     /// Retire whatever transport route a participant holds, if the registry

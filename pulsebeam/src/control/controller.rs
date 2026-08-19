@@ -925,7 +925,8 @@ impl ControllerActor {
         self.core
             .registry
             .bind_participant(&cfg.participant_id, binding);
-        let (membership, displaced) = self.audio_patterns.declare(
+        let (membership, membership_ops) = crate::control::patterns::declare_audience(
+            &mut self.audio_patterns,
             crate::control::patterns::Pattern::all(room_id),
             cfg.participant_id,
             crate::control::patterns::Member {
@@ -933,33 +934,9 @@ impl ControllerActor {
                 key: binding,
                 delivery: (),
             },
+            crate::view::Delivery::Audio,
+            crate::view::AudienceKind::Audio,
         );
-        let mut membership_ops: Vec<(crate::id::ShardId, crate::view::ViewOp)> = displaced
-            .into_iter()
-            .map(|(group, _)| {
-                (
-                    shard_id,
-                    crate::view::ViewOp::GroupRemove {
-                        group,
-                        key: binding,
-                        kind: crate::view::AudienceKind::Audio,
-                    },
-                )
-            })
-            .collect();
-        if let Some(group) = self
-            .audio_patterns
-            .group_of(&crate::control::patterns::Pattern::all(room_id))
-        {
-            membership_ops.push((
-                shard_id,
-                crate::view::ViewOp::GroupInsert {
-                    group,
-                    key: binding,
-                    delivery: crate::view::Delivery::Audio,
-                },
-            ));
-        }
         if !self.publish_ops(membership_ops) {
             debug_assert!(false, "audio group membership must publish");
         }

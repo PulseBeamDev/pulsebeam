@@ -458,6 +458,93 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
     }
 }
 
+/// Declare an interest and produce the membership op that follows from it.
+///
+/// Every leg does the same three things on a subscribe — record the
+/// declaration, retract anything the new one subsumes, and tell the
+/// subscriber's shard — so they are one operation here rather than the same
+/// twenty lines at each call site.
+pub(crate) fn declare_audience<N, S>(
+    table: &mut PatternTable<N, S>,
+    pattern: Pattern<N>,
+    participant: ParticipantId,
+    member: Member<S>,
+    delivery: crate::view::Delivery,
+    kind: crate::view::AudienceKind,
+) -> (Membership, Vec<(ShardId, crate::view::ViewOp)>)
+where
+    N: std::hash::Hash + Eq + Clone,
+    S: Copy,
+{
+    let shard = member.shard;
+    let key = member.key;
+    let (membership, displaced) = table.declare(pattern.clone(), participant, member);
+    let mut ops: Vec<_> = displaced
+        .into_iter()
+        .map(|(group, _)| (shard, crate::view::ViewOp::GroupRemove { group, key, kind }))
+        .collect();
+    if membership != Membership::Unchanged
+        && let Some(group) = table.group_of(&pattern)
+    {
+        ops.push((
+            shard,
+            crate::view::ViewOp::GroupInsert {
+                group,
+                key,
+                delivery,
+            },
+        ));
+    }
+    (membership, ops)
+}
+
+/// The inverse: withdraw one declaration and say so.
+pub(crate) fn retract_audience<N, S>(
+    table: &mut PatternTable<N, S>,
+    pattern: &Pattern<N>,
+    participant: &ParticipantId,
+    kind: crate::view::AudienceKind,
+) -> (Departure, Vec<(ShardId, crate::view::ViewOp)>)
+where
+    N: std::hash::Hash + Eq + Clone,
+    S: Copy,
+{
+    let placement = table.member_key(pattern, participant);
+    let group = table.group_of(pattern);
+    let departure = table.undeclare(pattern, participant);
+    let ops = match (group, placement) {
+        (Some(group), Some((shard, key))) => {
+            vec![(shard, crate::view::ViewOp::GroupRemove { group, key, kind })]
+        }
+        _ => Vec::new(),
+    };
+    (departure, ops)
+}
+
+/// Withdraw everything a departing participant declared.
+pub(crate) fn retract_participant<N, S>(
+    table: &mut PatternTable<N, S>,
+    participant: &ParticipantId,
+    kind: crate::view::AudienceKind,
+) -> (
+    Vec<(Pattern<N>, Departure)>,
+    Vec<(ShardId, crate::view::ViewOp)>,
+)
+where
+    N: std::hash::Hash + Eq + Clone,
+    S: Copy,
+{
+    let held = table.declarations_of(participant);
+    let mut departures = Vec::new();
+    let mut ops = Vec::new();
+    for pattern in held {
+        let (departure, mut pattern_ops) = retract_audience(table, &pattern, participant, kind);
+        departures.push((pattern, departure));
+        ops.append(&mut pattern_ops);
+    }
+    (departures, ops)
+}
+
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is

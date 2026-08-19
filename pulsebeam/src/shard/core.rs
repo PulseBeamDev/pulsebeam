@@ -2,7 +2,6 @@ use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
 };
-use std::collections::HashSet;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;

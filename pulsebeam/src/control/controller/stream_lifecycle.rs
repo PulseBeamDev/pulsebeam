@@ -210,39 +210,19 @@ impl ControllerActor {
                 crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
             }
         };
-        let (_, displaced) = self.data_patterns.declare(
-            pattern.clone(),
+        let (_, membership_ops) = crate::control::patterns::declare_audience(
+            &mut self.data_patterns,
+            pattern,
             subscriber,
             crate::control::patterns::Member {
                 shard: shard_id,
                 key: subscriber_key,
                 delivery: channel,
             },
+            crate::view::Delivery::Data(channel),
+            crate::view::AudienceKind::Data,
         );
-        let mut membership: Vec<(crate::id::ShardId, crate::view::ViewOp)> = displaced
-            .into_iter()
-            .map(|(group, _)| {
-                (
-                    shard_id,
-                    crate::view::ViewOp::GroupRemove {
-                        group,
-                        key: subscriber_key,
-                        kind: crate::view::AudienceKind::Data,
-                    },
-                )
-            })
-            .collect();
-        if let Some(group) = self.data_patterns.group_of(&pattern) {
-            membership.push((
-                shard_id,
-                crate::view::ViewOp::GroupInsert {
-                    group,
-                    key: subscriber_key,
-                    delivery: crate::view::Delivery::Data(channel),
-                },
-            ));
-        }
-        if !self.publish_ops(membership) {
+        if !self.publish_ops(membership_ops) {
             debug_assert!(false, "data group membership must publish");
         }
         // Which streams this reaches is a catalog question now, not something
@@ -275,23 +255,14 @@ impl ControllerActor {
                 crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
             }
         };
-        let departing = self
-            .data_patterns
-            .group_of(&pattern)
-            .zip(self.data_patterns.member_key(&pattern, &subscriber));
-        self.data_patterns.undeclare(&pattern, &subscriber);
-        if let Some((group, (shard, key))) = departing {
-            let ops = vec![(
-                shard,
-                crate::view::ViewOp::GroupRemove {
-                    group,
-                    key,
-                    kind: crate::view::AudienceKind::Data,
-                },
-            )];
-            if !self.publish_ops(ops) {
-                debug_assert!(false, "data group retraction must publish");
-            }
+        let (_, membership_ops) = crate::control::patterns::retract_audience(
+            &mut self.data_patterns,
+            &pattern,
+            &subscriber,
+            crate::view::AudienceKind::Data,
+        );
+        if !self.publish_ops(membership_ops) {
+            debug_assert!(false, "data group retraction must publish");
         }
         let registry = self.lanes.get(lane);
         let ids: Vec<_> = match publisher {
