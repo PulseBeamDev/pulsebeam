@@ -7,11 +7,54 @@ impl ControllerActor {
     /// retired — otherwise a shard keeps a route for a stream nobody there
     /// receives any more, and the slot never returns to the allocator.
     pub(super) async fn retire_participant_streams(&mut self, participant_id: &ParticipantId) {
-        for lane in StreamLane::ALL {
-            let changed = self.lanes.get_mut(lane).retire_participant(participant_id);
-            for id in changed {
-                self.reconcile_stream(id, lane).await;
+        // What it consumed is what it declared. The streams affected have to be
+        // collected before the declarations go, since they are what says which
+        // ones to reconcile.
+        let mut affected: Vec<(crate::shard::router::DataStreamId, StreamLane)> = Vec::new();
+        for pattern in self.data_patterns.declarations_of(participant_id) {
+            // A data declaration always names its topic; only the publisher
+            // position may wildcard.
+            let Some((topic, lane)) = pattern.name else {
+                debug_assert!(false, "a data declaration names its topic");
+                continue;
+            };
+            let ids = match pattern.publisher {
+                Some(publisher) => vec![crate::shard::router::DataStreamId::new(
+                    pattern.room,
+                    publisher,
+                    topic,
+                )],
+                None => self.lanes.get(lane).ids_on_topic(&pattern.room, &topic),
+            };
+            for id in ids {
+                if !affected.iter().any(|(held, _)| *held == id) {
+                    affected.push((id, lane));
+                }
             }
+        }
+        let placement = self
+            .core
+            .registry
+            .get_participant(participant_id)
+            .and_then(|meta| meta.binding)
+            .zip(
+                self.core
+                    .registry
+                    .transport_of(participant_id)
+                    .map(|(s, _)| s),
+            );
+        let retracted = self.data_patterns.remove_participant(participant_id);
+        if let Some((key, shard)) = placement {
+            let ops = retracted
+                .into_iter()
+                .map(|(group, _)| (shard, crate::view::ViewOp::DataGroupRemove { group, key }))
+                .collect();
+            if !self.publish_ops(ops) {
+                debug_assert!(false, "data group retraction must publish");
+            }
+        }
+        for (id, lane) in affected {
+            self.reconcile_stream(id, lane).await;
         }
     }
 
@@ -49,19 +92,14 @@ impl ControllerActor {
             .registry
             .transport_of(participant_id)
             .map(|(s, _)| s);
-        let retracted_audio = self.audio_patterns.remove_participant(participant_id);
-        let retracted_data = self.data_patterns.remove_participant(participant_id);
+        let retracted = self.audio_patterns.remove_participant(participant_id);
         if let (Some(key), Some(shard)) = (key, shard) {
-            let ops =
-                retracted_audio
-                    .into_iter()
-                    .map(|(group, _)| (shard, crate::view::ViewOp::AudioGroupRemove { group, key }))
-                    .chain(retracted_data.into_iter().map(|(group, _)| {
-                        (shard, crate::view::ViewOp::DataGroupRemove { group, key })
-                    }))
-                    .collect();
+            let ops = retracted
+                .into_iter()
+                .map(|(group, _)| (shard, crate::view::ViewOp::AudioGroupRemove { group, key }))
+                .collect();
             if !self.publish_ops(ops) {
-                debug_assert!(false, "group retraction must publish");
+                debug_assert!(false, "audio group retraction must publish");
             }
         }
     }

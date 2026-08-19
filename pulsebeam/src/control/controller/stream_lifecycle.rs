@@ -177,7 +177,6 @@ impl ControllerActor {
             binding.reverse_route = Some(route);
         }
 
-        self.lanes.get_mut(lane).apply_wildcards(&id);
         self.reconcile_stream(id, lane).await;
     }
 
@@ -196,10 +195,6 @@ impl ControllerActor {
         channel: str0m::channel::ChannelId,
         lane: StreamLane,
     ) {
-        let entry = Subscriber {
-            key: subscriber_key,
-            channel,
-        };
         let pattern = match publisher {
             Some(publisher) => {
                 crate::control::patterns::Pattern::exact(room_id, publisher, (topic.clone(), lane))
@@ -242,25 +237,14 @@ impl ControllerActor {
         if !self.publish_ops(membership) {
             debug_assert!(false, "data group membership must publish");
         }
-        let registry = self.lanes.get_mut(lane);
-        let ids = match publisher {
-            Some(publisher) => {
-                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                registry
-                    .subscribe(id, shard_id, subscriber, entry)
-                    .into_iter()
-                    .collect()
-            }
-            None => registry.subscribe_wildcard(
-                room_id,
-                topic,
-                subscriber,
-                WildcardSubscriber {
-                    shard: shard_id,
-                    key: subscriber_key,
-                    channel,
-                },
-            ),
+        // Which streams this reaches is a catalog question now, not something
+        // the registry has to remember on the subscriber's behalf.
+        let registry = self.lanes.get(lane);
+        let ids: Vec<_> = match publisher {
+            Some(publisher) => vec![crate::shard::router::DataStreamId::new(
+                room_id, publisher, topic,
+            )],
+            None => registry.ids_on_topic(&room_id, &topic),
         };
         for id in ids {
             self.reconcile_stream(id, lane).await;
@@ -294,24 +278,14 @@ impl ControllerActor {
                 debug_assert!(false, "data group retraction must publish");
             }
         }
-        let registry = self.lanes.get_mut(lane);
+        let registry = self.lanes.get(lane);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::shard::router::DataStreamId::new(
                 room_id, publisher, topic,
             )],
-            None => {
-                registry.unsubscribe_wildcard(room_id, topic.clone(), &subscriber);
-                registry.ids_on_topic(&room_id, &topic)
-            }
+            None => registry.ids_on_topic(&room_id, &topic),
         };
-        // A named publisher also clears a subscription still parked against a
-        // stream that never became ready; a wildcard has nothing parked.
-        let drop_pending = publisher.is_some();
-        let changed: Vec<_> = ids
-            .into_iter()
-            .filter(|id| registry.unsubscribe(id, &subscriber, drop_pending))
-            .collect();
-        for id in changed {
+        for id in ids {
             self.reconcile_stream(id, lane).await;
         }
     }
@@ -371,7 +345,6 @@ impl ControllerActor {
         lane: StreamLane,
     ) -> bool {
         let Some(binding) = self.lanes.get(lane).get(&id) else {
-            self.lanes.get_mut(lane).forget_pending(&id);
             return true;
         };
         let publisher_shard = binding.publisher_shard;
@@ -420,11 +393,37 @@ impl ControllerActor {
         true
     }
 
+    /// The shards holding at least one declared consumer of this stream.
+    fn stream_destinations(
+        &self,
+        id: &crate::shard::router::DataStreamId,
+        lane: StreamLane,
+    ) -> Vec<crate::id::ShardId> {
+        let subject = crate::control::patterns::Subject {
+            room: id.room_id,
+            publisher: id.publisher_id,
+            name: (id.topic.clone(), lane),
+        };
+        let mut shards = Vec::new();
+        for group in self.data_patterns.match_subject(&subject) {
+            for shard in self.data_patterns.shards_of(group) {
+                if !shards.contains(&shard) {
+                    shards.push(shard);
+                }
+            }
+        }
+        shards
+    }
+
     pub(super) async fn reconcile_stream(
         &mut self,
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) {
+        // Which shards consume this stream is a question about declarations,
+        // not about what the binding happens to remember. Asking the pattern
+        // table is what lets the binding stop tracking subscribers at all.
+        let wanted = self.stream_destinations(&id, lane);
         let stale: Vec<_> = self
             .lanes
             .get(lane)
@@ -434,7 +433,7 @@ impl ControllerActor {
                     .routes
                     .iter()
                     .filter_map(|(destination, route)| {
-                        if binding.subscribers.contains_key(destination) {
+                        if wanted.contains(destination) {
                             return None;
                         }
                         let key = binding.destination_keys.get(destination).copied()?;
@@ -448,12 +447,7 @@ impl ControllerActor {
             debug_assert!(false, "stream route retirement must complete");
             return;
         }
-        let destinations: Vec<_> = self
-            .lanes
-            .get(lane)
-            .get(&id)
-            .map(|binding| binding.subscribers.keys().copied().collect())
-            .unwrap_or_default();
+        let destinations = wanted;
         let Some(publisher_shard) = self
             .lanes
             .get(lane)

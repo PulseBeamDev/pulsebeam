@@ -422,7 +422,8 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         self.ids.len()
     }
 
-    #[cfg(test)]
+    /// Everything a participant declared, for a departure that has to reconcile
+    /// the streams it was consuming before its declarations go.
     pub fn declarations_of(&self, participant: &ParticipantId) -> Vec<Pattern<N>> {
         self.by_participant
             .get(participant)
@@ -680,6 +681,43 @@ mod tests {
         assert!(table.group_of(&solo).is_none());
         assert_eq!(table.member_count(table.group_of(&shared).unwrap()), 1);
         assert!(table.declarations_of(&pid(1)).is_empty());
+    }
+
+    /// Subscribing before anything is published is not a special case: the
+    /// declaration simply matches nothing yet, and matches the publication the
+    /// moment it appears. The parked-subscriber map this replaces existed only
+    /// to express that.
+    #[test]
+    fn a_declaration_made_before_the_publication_matches_it_on_arrival() {
+        let mut table = Table::new();
+        let r = room("r");
+        let wanted = Pattern::any_publisher(r.clone(), "t".to_string());
+        table.declare(wanted, pid(1), member(0));
+
+        let arriving = subject(r, 9, "t");
+        assert_eq!(
+            table.match_subject(&arriving).len(),
+            1,
+            "a publication appearing later resolves to the waiting declaration"
+        );
+    }
+
+    /// And withdrawing it stops publications that appear afterwards from
+    /// reaching the subscriber - the failure here is silent, since nothing
+    /// errors, the subscriber just keeps receiving.
+    #[test]
+    fn a_withdrawn_declaration_does_not_reach_later_publications() {
+        let mut table = Table::new();
+        let r = room("r");
+        let wanted = Pattern::any_publisher(r.clone(), "t".to_string());
+
+        table.declare(wanted.clone(), pid(1), member(0));
+        assert_eq!(table.undeclare(&wanted, &pid(1)), Departure::LastOnShard);
+
+        assert!(
+            table.match_subject(&subject(r, 9, "t")).is_empty(),
+            "a publication appearing after the withdrawal reaches nobody"
+        );
     }
 
     /// A group id is recycled once its group dies. The shard resolves groups

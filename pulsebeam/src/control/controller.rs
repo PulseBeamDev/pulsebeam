@@ -7,7 +7,7 @@ use crate::control::state::ControlPlaneState;
 use crate::{
     control::{
         core::{ControllerCore, RoomPlacement},
-        lanes::{Lanes, StreamLane, Subscriber, WildcardSubscriber},
+        lanes::{Lanes, StreamLane},
         negotiator::{Negotiator, NegotiatorError},
         outbox::{ControllerEvent, ControllerEventQueue},
         pending::{PendingSubscription, PendingSubscriptions},
