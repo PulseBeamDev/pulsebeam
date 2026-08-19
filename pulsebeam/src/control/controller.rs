@@ -53,12 +53,13 @@ struct TrackBinding {
     publisher_shard: crate::id::ShardId,
     publisher_fanout: crate::shard::router::TrackKey,
     reverse_route: Option<RouteHandle>,
-    fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
-    /// Where this track's video is routed. Held here for the same reason
-    /// `audio_routes` is: a route outlives any one subscriber's interest.
-    video_routes: HashMap<crate::id::ShardId, RouteHandle>,
-    audio_fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
-    audio_routes: HashMap<crate::id::ShardId, RouteHandle>,
+    /// Where this track goes, one record per shard.
+    ///
+    /// Was two pairs of maps — `fanouts`/`video_routes` and
+    /// `audio_fanouts`/`audio_routes` — because the publish path never asked
+    /// what kind the track was and so carried both answers. It does now, and a
+    /// track is one kind, so one map serves it.
+    destinations: indexmap::IndexMap<crate::id::ShardId, crate::control::publication::Destination>,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -835,10 +836,7 @@ impl ControllerActor {
                         publisher_shard: shard_id,
                         publisher_fanout: fanout,
                         reverse_route: None,
-                        fanouts: HashMap::new(),
-                        video_routes: HashMap::new(),
-                        audio_fanouts: HashMap::new(),
-                        audio_routes: HashMap::new(),
+                        destinations: indexmap::IndexMap::new(),
                     },
                 );
                 let announced = self.on_track_published(shard_id, *track, fanout).await;

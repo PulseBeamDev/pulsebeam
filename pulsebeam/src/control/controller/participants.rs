@@ -97,11 +97,12 @@ impl ControllerActor {
                 let Some(track_id) = pattern.name else {
                     continue;
                 };
-                let Some(route) = self
-                    .track_bindings
-                    .get_mut(&track_id)
-                    .and_then(|binding| binding.video_routes.remove(&shard))
-                else {
+                let Some(route) = self.track_bindings.get_mut(&track_id).and_then(|binding| {
+                    binding
+                        .destinations
+                        .get_mut(&shard)
+                        .and_then(|d| d.route.take())
+                }) else {
                     continue;
                 };
                 self.release_route(shard, route).await;

@@ -46,6 +46,16 @@ pub(crate) enum RuntimeKey {
     Reliable(ReliableStreamKey),
 }
 
+impl RuntimeKey {
+    /// The media arena's key, for the paths that only ever hold one.
+    pub fn track(self) -> Option<TrackKey> {
+        match self {
+            Self::Track(key) => Some(key),
+            _ => None,
+        }
+    }
+}
+
 /// One shard that receives this publication: what it calls it there, and the
 /// route serving it.
 ///
@@ -63,14 +73,11 @@ pub(crate) struct Destination {
 #[derive(Debug, Clone)]
 pub(crate) enum Media {
     Video {
-        meta: crate::track::TrackMeta,
         publication: crate::track::Track,
         encodings: Vec<Option<str0m::media::Rid>>,
         states: crate::track::TrackStates,
     },
-    Audio {
-        meta: crate::track::TrackMeta,
-    },
+    Audio,
     Data {
         lane: crate::track::DataLane,
         topic: crate::track::Topic,
@@ -100,6 +107,21 @@ pub(crate) struct Catalog {
     by_room: IndexMap<(RoomId, TrackKind), IndexSet<TrackId>>,
     by_label: IndexMap<(RoomId, TrackKind, String), IndexSet<TrackId>>,
     by_publisher: IndexMap<(RoomId, TrackKind, ParticipantId), IndexSet<TrackId>>,
+}
+
+impl Publication {
+    /// `TrackMeta` is a projection of the subject and the publisher's shard,
+    /// not state: room, id and origin all come from the subject, and the shard
+    /// is where the publisher lives. Storing it would be a second copy of
+    /// facts already held here, free to drift.
+    pub fn meta(&self) -> crate::track::TrackMeta {
+        crate::track::TrackMeta {
+            room_id: self.subject.room,
+            shard_id: self.publisher_shard,
+            id: self.subject.id(),
+            origin: self.subject.publisher,
+        }
+    }
 }
 
 impl Catalog {
@@ -246,14 +268,7 @@ mod tests {
             origin_key: RuntimeKey::Track(TrackKey::default()),
             reverse_route: None,
             destinations: IndexMap::new(),
-            media: Media::Audio {
-                meta: crate::track::TrackMeta {
-                    room_id: r,
-                    shard_id: ShardId::new(0),
-                    id: pid(publisher).derive_track_id(kind, label),
-                    origin: pid(publisher),
-                },
-            },
+            media: Media::Audio,
         }
     }
 

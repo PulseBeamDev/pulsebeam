@@ -1,5 +1,23 @@
 use super::*;
 
+/// Which image a publication's plan belongs to. Video and audio share an arena
+/// and a key type, so the kind is what tells them apart — the one thing about a
+/// media kind the routing layer still has to know.
+fn plan_target(
+    kind: crate::entity::TrackKind,
+    key: crate::control::publication::RuntimeKey,
+) -> crate::view::PlanTarget {
+    use crate::control::publication::RuntimeKey;
+    match (kind, key) {
+        (crate::entity::TrackKind::Audio, RuntimeKey::Track(key)) => {
+            crate::view::PlanTarget::Audio(key)
+        }
+        (_, RuntimeKey::Track(key)) => crate::view::PlanTarget::Video(key),
+        (_, RuntimeKey::Unreliable(key)) => crate::view::PlanTarget::Unreliable(key),
+        (_, RuntimeKey::Reliable(key)) => crate::view::PlanTarget::Reliable(key),
+    }
+}
+
 impl ControllerActor {
     pub(super) async fn drain_pending_track_subscriptions(
         &mut self,
@@ -55,7 +73,7 @@ impl ControllerActor {
             if self
                 .track_bindings
                 .get(&track_id)
-                .is_some_and(|binding| binding.fanouts.contains_key(&destination))
+                .is_some_and(|binding| binding.destinations.contains_key(&destination))
             {
                 continue;
             }
@@ -70,7 +88,13 @@ impl ControllerActor {
                 );
                 return;
             };
-            binding.fanouts.insert(destination, key);
+            binding.destinations.insert(
+                destination,
+                crate::control::publication::Destination {
+                    key: crate::control::publication::RuntimeKey::Track(key),
+                    route: None,
+                },
+            );
         }
     }
 
@@ -82,34 +106,38 @@ impl ControllerActor {
         &mut self,
         generation: u64,
         now: tokio::time::Instant,
-        routes: &HashMap<crate::id::ShardId, RouteHandle>,
-        fanouts: &HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
-        target: impl Fn(crate::shard::router::TrackKey) -> crate::view::PlanTarget,
+        kind: crate::entity::TrackKind,
+        destinations: &indexmap::IndexMap<
+            crate::id::ShardId,
+            crate::control::publication::Destination,
+        >,
         releases: &mut Vec<(crate::id::ShardId, RouteHandle)>,
     ) -> bool {
-        for (destination, route) in routes {
+        for (destination, held) in destinations {
             let Some(view) = self.view_mut(*destination) else {
                 debug_assert!(false, "a track route must name a local view");
                 self.abort_transaction(now);
                 return false;
             };
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: route.route,
-                    epoch: route.epoch,
-                },
-            );
-            if let Some(key) = fanouts.get(destination).copied() {
+            if let Some(route) = held.route {
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RetireRoute {
+                        route: route.route,
+                        epoch: route.epoch,
+                    },
+                );
+                releases.push((*destination, route));
+            }
+            if let Some(key) = held.key.track() {
                 view.stage(
                     generation,
                     crate::view::ViewOp::RemovePlan {
-                        target: target(key),
+                        target: plan_target(kind, held.key),
                     },
                 );
                 view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
             }
-            releases.push((*destination, *route));
         }
         true
     }
@@ -125,13 +153,11 @@ impl ControllerActor {
             binding.meta.origin,
             track_id,
         );
-        let video_routes = binding.video_routes.clone();
+        let destinations = binding.destinations.clone();
         let publisher_shard = binding.publisher_shard;
         let publisher_fanout = binding.publisher_fanout;
         let reverse_route = binding.reverse_route;
-        let fanouts = binding.fanouts.clone();
-        let audio_fanouts = binding.audio_fanouts.clone();
-        let audio_routes = binding.audio_routes.clone();
+        let kind = track_id.kind();
         if let Some((group, members)) = self.video_patterns.retire_pattern(&retired_pattern) {
             let ops = members
                 .into_iter()
@@ -165,19 +191,8 @@ impl ControllerActor {
         if !self.stage_destination_retirement(
             generation,
             now,
-            &video_routes,
-            &fanouts,
-            crate::view::PlanTarget::Video,
-            &mut endpoint_releases,
-        ) {
-            return false;
-        }
-        if !self.stage_destination_retirement(
-            generation,
-            now,
-            &audio_routes,
-            &audio_fanouts,
-            crate::view::PlanTarget::Audio,
+            kind,
+            &destinations,
             &mut endpoint_releases,
         ) {
             return false;
@@ -221,7 +236,7 @@ impl ControllerActor {
                 target: crate::view::PlanTarget::Audio(publisher_fanout),
             },
         );
-        for (&destination, &key) in &fanouts {
+        for (&destination, held) in &destinations {
             if destination == publisher_shard {
                 continue;
             }
@@ -229,20 +244,12 @@ impl ControllerActor {
                 view.stage(
                     generation,
                     crate::view::ViewOp::RemovePlan {
-                        target: crate::view::PlanTarget::Video(key),
+                        target: plan_target(kind, held.key),
                     },
                 );
-                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
-            }
-        }
-        for (&destination, &key) in &audio_fanouts {
-            if let Some(view) = self.view_mut(destination) {
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RemovePlan {
-                        target: crate::view::PlanTarget::Audio(key),
-                    },
-                );
+                if let Some(key) = held.key.track() {
+                    view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
+                }
             }
         }
 
@@ -265,11 +272,10 @@ impl ControllerActor {
             self.state.release_endpoint(shard, route.route.slot(), now);
         }
         self.state.remove_track(publisher_shard, publisher_fanout);
-        for (&destination, &key) in &fanouts {
-            self.state.remove_track(destination, key);
-        }
-        for (&destination, &key) in &audio_fanouts {
-            self.state.remove_track(destination, key);
+        for (&destination, held) in &destinations {
+            if let Some(key) = held.key.track() {
+                self.state.remove_track(destination, key);
+            }
         }
         self.track_bindings.remove(&track_id);
         true
@@ -347,7 +353,7 @@ impl ControllerActor {
             if self
                 .track_bindings
                 .get(&track_id)
-                .is_some_and(|binding| binding.audio_fanouts.contains_key(&destination))
+                .is_some_and(|binding| binding.destinations.contains_key(&destination))
             {
                 continue;
             }
@@ -375,19 +381,30 @@ impl ControllerActor {
             let Some(binding) = self.track_bindings.get_mut(&track_id) else {
                 return;
             };
-            binding.audio_fanouts.insert(destination, key);
-            binding.audio_routes.insert(destination, route);
+            binding.destinations.insert(
+                destination,
+                crate::control::publication::Destination {
+                    key: crate::control::publication::RuntimeKey::Track(key),
+                    route: None,
+                },
+            );
+            if let Some(destination) = binding.destinations.get_mut(&destination) {
+                destination.route = Some(route);
+            }
         }
         let Some(binding) = self.track_bindings.get(&track_id) else {
             return;
         };
         let remote_routes = binding
-            .audio_routes
+            .destinations
             .iter()
-            .map(|(shard_id, route)| crate::view::RemoteRoutePlan {
-                shard_id: *shard_id,
-                route: route.route,
-                epoch: route.epoch,
+            .filter_map(|(shard_id, held)| {
+                let route = held.route?;
+                Some(crate::view::RemoteRoutePlan {
+                    shard_id: *shard_id,
+                    route: route.route,
+                    epoch: route.epoch,
+                })
             })
             .collect();
         let source_plan = crate::view::AudioPlan {
@@ -402,13 +419,13 @@ impl ControllerActor {
                 }),
         };
         let mut targets = vec![(publisher_shard, binding.publisher_fanout, source_plan, None)];
-        for (destination, key) in &binding.audio_fanouts {
-            let Some(route) = binding.audio_routes.get(destination).copied() else {
+        for (destination, held) in &binding.destinations {
+            let (Some(key), Some(route)) = (held.key.track(), held.route) else {
                 continue;
             };
             targets.push((
                 *destination,
-                *key,
+                key,
                 crate::view::AudioPlan {
                     groups: groups.clone(),
                     remote_routes: Vec::new(),
@@ -522,7 +539,11 @@ impl ControllerActor {
             };
             if shard_id == binding.publisher_shard {
                 binding.publisher_fanout
-            } else if let Some(&fanout) = binding.fanouts.get(&shard_id) {
+            } else if let Some(fanout) = binding
+                .destinations
+                .get(&shard_id)
+                .and_then(|d| d.key.track())
+            {
                 fanout
             } else {
                 let Some(fanout) = self.prepare_track_key(shard_id, track.id, track.origin) else {
@@ -532,7 +553,13 @@ impl ControllerActor {
                 let Some(binding) = self.track_bindings.get_mut(&track.id) else {
                     return;
                 };
-                binding.fanouts.insert(shard_id, fanout);
+                binding.destinations.insert(
+                    shard_id,
+                    crate::control::publication::Destination {
+                        key: crate::control::publication::RuntimeKey::Track(fanout),
+                        route: None,
+                    },
+                );
                 fanout
             }
         };
@@ -597,7 +624,9 @@ impl ControllerActor {
                 return;
             };
             if let Some(binding) = self.track_bindings.get_mut(&track.id) {
-                binding.video_routes.insert(shard_id, handle);
+                if let Some(destination) = binding.destinations.get_mut(&shard_id) {
+                    destination.route = Some(handle);
+                }
             }
         }
 
@@ -643,11 +672,12 @@ impl ControllerActor {
             let _ = self.publish_track_plans(track.id).await;
             return;
         }
-        let Some(route) = self
-            .track_bindings
-            .get_mut(&track.id)
-            .and_then(|binding| binding.video_routes.remove(&shard_id))
-        else {
+        let Some(route) = self.track_bindings.get_mut(&track.id).and_then(|binding| {
+            binding
+                .destinations
+                .get_mut(&shard_id)
+                .and_then(|d| d.route.take())
+        }) else {
             let _ = self.publish_track_plans(track.id).await;
             return;
         };
@@ -665,7 +695,10 @@ impl ControllerActor {
         if shard_id == binding.publisher_shard {
             Some(binding.publisher_fanout)
         } else {
-            binding.fanouts.get(&shard_id).copied()
+            binding
+                .destinations
+                .get(&shard_id)
+                .and_then(|d| d.key.track())
         }
     }
 
@@ -678,7 +711,10 @@ impl ControllerActor {
         let fanout = if shard_id == binding.publisher_shard {
             binding.publisher_fanout
         } else {
-            *binding.fanouts.get(&shard_id)?
+            binding
+                .destinations
+                .get(&shard_id)
+                .and_then(|d| d.key.track())?
         };
         let subject = crate::control::patterns::Subject {
             room: binding.meta.room_id,
@@ -688,10 +724,10 @@ impl ControllerActor {
         let groups = self.video_patterns.match_subject(&subject);
         let mut remote_routes = Vec::new();
         if shard_id == binding.publisher_shard {
-            for (destination, route) in &binding.video_routes {
-                if *destination == shard_id {
+            for (destination, held) in &binding.destinations {
+                let Some(route) = held.route.filter(|_| *destination != shard_id) else {
                     continue;
-                }
+                };
                 remote_routes.push(crate::view::RemoteRoutePlan {
                     shard_id: *destination,
                     route: route.route,
@@ -764,7 +800,7 @@ impl ControllerActor {
         let Some(binding) = self.track_bindings.get(&track_id) else {
             return false;
         };
-        let mut shards: Vec<_> = binding.fanouts.keys().copied().collect();
+        let mut shards: Vec<_> = binding.destinations.keys().copied().collect();
         shards.push(binding.publisher_shard);
         let mut ops = Vec::new();
         for shard_id in shards {
