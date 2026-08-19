@@ -306,6 +306,8 @@ impl ShardCore {
                     | crate::view::ViewOp::RemoveReliableRuntime { .. }
                     | crate::view::ViewOp::RemoveAudioPlan { .. }
                     | crate::view::ViewOp::SetAudioPlan { .. }
+                    | crate::view::ViewOp::AudioGroupInsert { .. }
+                    | crate::view::ViewOp::AudioGroupRemove { .. }
                     | crate::view::ViewOp::SetDataPlan { .. }
                     | crate::view::ViewOp::RemoveDataPlan { .. }
                     | crate::view::ViewOp::SetReliablePlan { .. }
@@ -407,6 +409,7 @@ impl ShardCore {
                         fanout: Some(track),
                     },
                     plan,
+                    &view.audio_groups,
                     &mut ctx,
                 );
             }
@@ -531,8 +534,14 @@ impl ShardCore {
                 record_routing_drop("audio", "plan", "local");
                 continue;
             };
-            self.runtime
-                .route_audio_with_plan(track, Origin::Local, ev, plan, &mut ctx);
+            self.runtime.route_audio_with_plan(
+                track,
+                Origin::Local,
+                ev,
+                plan,
+                &view.audio_groups,
+                &mut ctx,
+            );
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_video_rtp() else {

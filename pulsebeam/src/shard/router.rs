@@ -209,6 +209,8 @@ impl ShardRuntime {
             | crate::view::ViewOp::SetTrackPlan { .. }
             | crate::view::ViewOp::RemoveTrackPlan { .. }
             | crate::view::ViewOp::SetAudioPlan { .. }
+            | crate::view::ViewOp::AudioGroupInsert { .. }
+            | crate::view::ViewOp::AudioGroupRemove { .. }
             | crate::view::ViewOp::RemoveAudioPlan { .. }
             | crate::view::ViewOp::SetDataPlan { .. }
             | crate::view::ViewOp::RemoveDataPlan { .. }
@@ -287,21 +289,25 @@ impl ShardRuntime {
         origin: Origin,
         event: AudioRtpEvent,
         plan: &crate::view::AudioPlan,
+        groups: &crate::view::GroupImage,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(origin.is_local() || event.origin_key.is_none());
-        for &(subscriber, ()) in &plan.local_subscribers {
-            if Some(subscriber) == event.origin_key {
-                continue;
+        // The plan names audiences; membership lives in the group image, so a
+        // room's roster is resolved by array index rather than carried in every
+        // audio plan. `origin_key` is only `Some` where the publisher is local,
+        // which is the only shard its own key could appear on.
+        let audio_origin = AudioOrigin {
+            participant: event.origin,
+            track: event.stream_id.0,
+        };
+        for group in &plan.groups {
+            for &subscriber in groups.members(*group) {
+                if Some(subscriber) == event.origin_key {
+                    continue;
+                }
+                ctx.forward_audio_rtp(subscriber, audio_origin, &event.pkt);
             }
-            ctx.forward_audio_rtp(
-                subscriber,
-                AudioOrigin {
-                    participant: event.origin,
-                    track: event.stream_id.0,
-                },
-                &event.pkt,
-            );
         }
         if origin.is_local() {
             let playout = ctx.wall().to_ntp(event.pkt.playout_time);

@@ -33,15 +33,7 @@ type Set<K> = IndexSet<K>;
 use crate::entity::{ParticipantId, RoomId};
 use crate::id::ShardId;
 use crate::keys::ParticipantKey;
-
-/// A dense index into the group table.
-///
-/// Dense and integer so the compiled form the shard receives resolves a group
-/// by array index, not by hash. Ids are recycled when a group dies; the view
-/// ops that carry them are ordered per shard, so a retire always precedes the
-/// reuse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct GroupId(pub u32);
+pub(crate) use crate::view::GroupId;
 
 /// A concrete publication: what a publisher actually announced.
 #[derive(Debug, Clone, PartialEq, Eq)]

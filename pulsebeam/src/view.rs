@@ -1,6 +1,8 @@
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::manual_find, clippy::manual_flatten)]
 
+use arrayvec::ArrayVec;
+
 use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::{DownstreamSlotKey, ParticipantKey, TrackKey};
@@ -11,6 +13,53 @@ use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
 use str0m::media::Rid;
 
+/// A dense index into a shard's group table.
+///
+/// Dense and integer so the data plane resolves a group by array index rather
+/// than by hash. Ids are recycled once a group empties; view ops are ordered
+/// per shard, so a retire always precedes the reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct GroupId(pub u32);
+
+/// Local members of each audience, indexed by [`GroupId`].
+///
+/// One membership change serves every publication whose plan names the group,
+/// which is the point: a participant joining a room is one insert here, not a
+/// rewrite of every plan in it.
+#[derive(Debug, Default)]
+pub(crate) struct GroupImage {
+    members: Vec<Vec<ParticipantKey>>,
+}
+
+impl GroupImage {
+    pub fn members(&self, group: GroupId) -> &[ParticipantKey] {
+        self.members
+            .get(group.0 as usize)
+            .map_or(&[][..], |m| &m[..])
+    }
+
+    fn insert(&mut self, group: GroupId, key: ParticipantKey) {
+        let idx = group.0 as usize;
+        if self.members.len() <= idx {
+            self.members.resize_with(idx.saturating_add(1), Vec::new);
+        }
+        let Some(slot) = self.members.get_mut(idx) else {
+            debug_assert!(false, "group slot must exist after resize");
+            return;
+        };
+        if !slot.contains(&key) {
+            slot.push(key);
+        }
+    }
+
+    fn remove(&mut self, group: GroupId, key: ParticipantKey) {
+        let Some(slot) = self.members.get_mut(group.0 as usize) else {
+            return;
+        };
+        slot.retain(|held| *held != key);
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ShardView {
     pub shard: ShardId,
@@ -19,6 +68,7 @@ pub(crate) struct ShardView {
     pub transports: TransportImage,
     pub tracks: ForwardingImage<TrackKey, DownstreamSlotKey>,
     pub audio: ForwardingImage<TrackKey, ()>,
+    pub audio_groups: GroupImage,
     pub data: ForwardingImage<DataStreamKey, ChannelId>,
     pub reliable: ForwardingImage<ReliableStreamKey, ChannelId>,
 }
@@ -45,6 +95,10 @@ pub(crate) struct RemoteRoutePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForwardingPlan<D> {
     pub local_subscribers: Vec<(ParticipantKey, D)>,
+    /// Audiences this stream reaches whose membership is shared with other
+    /// streams, so a member joining or leaving does not rewrite this plan. At
+    /// most four, because only four patterns can match one subject.
+    pub groups: ArrayVec<GroupId, 4>,
     pub remote_routes: Vec<RemoteRoutePlan>,
     pub reverse_route: Option<RemoteRoutePlan>,
 }
@@ -53,6 +107,7 @@ impl<D> Default for ForwardingPlan<D> {
     fn default() -> Self {
         Self {
             local_subscribers: Vec::new(),
+            groups: ArrayVec::new(),
             remote_routes: Vec::new(),
             reverse_route: None,
         }
@@ -252,6 +307,14 @@ pub(crate) enum ViewOp {
         key: TrackKey,
         plan: AudioPlan,
     },
+    AudioGroupInsert {
+        group: GroupId,
+        key: ParticipantKey,
+    },
+    AudioGroupRemove {
+        group: GroupId,
+        key: ParticipantKey,
+    },
     RemoveAudioPlan {
         key: TrackKey,
     },
@@ -307,6 +370,8 @@ impl ShardViewDelta {
                 ViewOp::SetTrackPlan { key, plan } => view.tracks.upsert(key, plan),
                 ViewOp::RemoveTrackPlan { key } => view.tracks.remove(key),
                 ViewOp::SetAudioPlan { key, plan } => view.audio.upsert(key, plan),
+                ViewOp::AudioGroupInsert { group, key } => view.audio_groups.insert(group, key),
+                ViewOp::AudioGroupRemove { group, key } => view.audio_groups.remove(group, key),
                 ViewOp::RemoveAudioPlan { key } => view.audio.remove(key),
                 ViewOp::SetDataPlan { key, plan } => view.data.upsert(key, plan),
                 ViewOp::RemoveDataPlan { key } => view.data.remove(key),

@@ -122,6 +122,7 @@ impl ControllerActor {
                 epoch: handle.epoch,
             });
         crate::view::StreamPlan {
+            groups: Default::default(),
             local_subscribers,
             remote_routes,
             reverse_route,
