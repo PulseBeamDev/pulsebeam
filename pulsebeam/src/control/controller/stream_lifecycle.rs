@@ -293,54 +293,6 @@ impl ControllerActor {
         }
     }
 
-    pub(super) async fn retire_stream_destinations(
-        &mut self,
-        id: &crate::shard::router::DataStreamId,
-        lane: StreamLane,
-        stale: &[(
-            crate::id::ShardId,
-            crate::shard::router::RuntimeStreamKey,
-            RouteHandle,
-        )],
-    ) -> bool {
-        let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
-            debug_assert!(false, "stale routes must belong to a stream binding");
-            return false;
-        };
-        let publisher_shard = binding.publisher_shard;
-        let source_key = binding.origin_key.stream();
-        let mut source_plan =
-            source_key.and_then(|_| self.plan_for(data_publication_id(id, lane), publisher_shard));
-        if let Some(plan) = source_plan.as_mut() {
-            plan.remote_routes
-                .retain(|route| !stale.iter().any(|(shard, _, _)| route.shard_id == *shard));
-        }
-
-        let mut ops = Vec::new();
-        for (destination, key, route) in stale {
-            ops.push((*destination, retire_route_op(*route)));
-            ops.extend(remove_stream_ops(*key).map(|op| (*destination, op)));
-        }
-        if let Some((key, plan)) = source_key.zip(source_plan) {
-            ops.push((publisher_shard, set_stream_plan_op(key, plan)));
-        }
-        if !self.publish_ops(ops) {
-            return false;
-        }
-
-        let now = tokio::time::Instant::now();
-        for (destination, _, route) in stale {
-            let Some(binding) = self.catalog.get_mut(&data_publication_id(&id, lane)) else {
-                debug_assert!(false, "stream binding must survive route retirement");
-                return false;
-            };
-            binding.destinations.shift_remove(destination);
-            self.state
-                .release_endpoint(*destination, route.route.slot(), now);
-        }
-        true
-    }
-
     pub(super) async fn retire_stream_binding(
         &mut self,
         id: crate::shard::router::DataStreamId,
@@ -357,75 +309,24 @@ impl ControllerActor {
         .await
     }
 
-    /// The shards holding at least one declared consumer of this stream.
-    fn stream_destinations(
-        &self,
-        id: &crate::shard::router::DataStreamId,
-        lane: StreamLane,
-    ) -> Vec<crate::id::ShardId> {
-        let subject = crate::control::patterns::Subject {
-            room: id.room_id,
-            publisher: id.publisher_id,
-            name: (id.topic.clone(), lane),
-        };
-        let mut shards = Vec::new();
-        for group in self.data_patterns.match_subject(&subject) {
-            for shard in self.data_patterns.shards_of(group) {
-                if !shards.contains(&shard) {
-                    shards.push(shard);
-                }
-            }
-        }
-        shards
-    }
-
+    /// Make a stream's destinations match its declarations.
     pub(super) async fn reconcile_stream(
         &mut self,
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) {
-        // Which shards consume this stream is a question about declarations,
-        // not about what the binding happens to remember. Asking the pattern
-        // table is what lets the binding stop tracking subscribers at all.
-        let wanted = self.stream_destinations(&id, lane);
-        let stale: Vec<_> = self
-            .catalog
-            .get(&data_publication_id(&id, lane))
-            .map(|binding| {
-                binding
-                    .destinations
-                    .iter()
-                    .filter_map(|(destination, held)| {
-                        if wanted.contains(destination) {
-                            return None;
-                        }
-                        Some((*destination, held.key.stream()?, held.route?))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let retired = !stale.is_empty();
-        if retired && !self.retire_stream_destinations(&id, lane, &stale).await {
-            debug_assert!(false, "stream route retirement must complete");
-            return;
-        }
         let publication_id = data_publication_id(&id, lane);
         let stream = id.clone();
-        let added = self
-            .install_destinations(publication_id, move |actor, destination| {
-                let key = actor
-                    .lanes
-                    .get(lane)
-                    .mint(&mut actor.state, destination, &stream)?;
-                let action = actor.lanes.get(lane).route_action(key)?;
-                Some((key.into(), action))
-            })
-            .await;
-
-        if should_publish_stream_views(retired, added) {
-            self.publish_publication(data_publication_id(&id, lane))
-                .await;
-        }
+        self.install_destinations(publication_id, move |actor, destination| {
+            let key = actor
+                .lanes
+                .get(lane)
+                .mint(&mut actor.state, destination, &stream)?;
+            let action = actor.lanes.get(lane).route_action(key)?;
+            Some((key.into(), action))
+        })
+        .await;
+        self.publish_publication(publication_id).await;
     }
 }
 

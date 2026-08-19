@@ -311,6 +311,67 @@ impl ControllerActor {
     /// to itself would be a second hop to nowhere. `mint` is the per-kind step,
     /// naming which arena the destination's key comes from and which route
     /// action reaches it.
+    /// Drop the destinations a publication no longer has an audience on.
+    ///
+    /// A route to a shard where the last member left is a slot the allocator
+    /// cannot reuse and a runtime nothing resolves. Data retired these; audio
+    /// did not, so an audio route outlived its last listener on a shard until
+    /// the track itself went away.
+    pub(super) async fn retire_stale_destinations(
+        &mut self,
+        id: crate::entity::TrackId,
+        wanted: &[crate::id::ShardId],
+    ) -> bool {
+        let Some(publication) = self.catalog.get(&id) else {
+            return true;
+        };
+        let kind = publication.kind();
+        let stale: Vec<_> = publication
+            .destinations
+            .iter()
+            .filter(|(destination, _)| !wanted.contains(destination))
+            .map(|(destination, held)| (*destination, *held))
+            .collect();
+        if stale.is_empty() {
+            return true;
+        }
+
+        let mut ops = Vec::new();
+        for (destination, held) in &stale {
+            if let Some(route) = held.route {
+                ops.push((
+                    *destination,
+                    crate::view::ViewOp::RetireRoute {
+                        route: route.route,
+                        epoch: route.epoch,
+                    },
+                ));
+            }
+            ops.push((
+                *destination,
+                crate::view::ViewOp::RemovePlan {
+                    target: plan_target(kind, held.key),
+                },
+            ));
+            ops.push((*destination, runtime_removal_op(held.key)));
+        }
+        if !self.publish_ops(ops) {
+            return false;
+        }
+
+        let now = tokio::time::Instant::now();
+        for (destination, held) in &stale {
+            if let Some(route) = held.route {
+                self.state
+                    .release_endpoint(*destination, route.route.slot(), now);
+            }
+            if let Some(publication) = self.catalog.get_mut(&id) {
+                publication.destinations.shift_remove(destination);
+            }
+        }
+        true
+    }
+
     pub(super) async fn install_destinations(
         &mut self,
         id: crate::entity::TrackId,
@@ -334,6 +395,11 @@ impl ControllerActor {
                     wanted.push(shard);
                 }
             }
+        }
+
+        if !self.retire_stale_destinations(id, &wanted).await {
+            debug_assert!(false, "stale destination retirement must complete");
+            return false;
         }
 
         let mut added = false;
