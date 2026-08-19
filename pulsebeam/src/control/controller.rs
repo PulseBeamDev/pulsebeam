@@ -851,8 +851,22 @@ impl ControllerActor {
                     self.track_bindings.remove(&track_id);
                 }
                 if announced.is_some() {
-                    self.install_video_runtimes(track_id).await;
-                    self.install_audio_routes(track_id).await;
+                    // A track is one kind. Running both installers regardless
+                    // granted every video track audio routes that nothing ever
+                    // resolves - `route_audio_with_plan` is only reached for
+                    // audio RTP - while consuming route slots on every shard
+                    // with a listener.
+                    match track_id.kind() {
+                        crate::entity::TrackKind::Video => {
+                            self.install_video_runtimes(track_id).await;
+                        }
+                        crate::entity::TrackKind::Audio => {
+                            self.install_audio_routes(track_id).await;
+                        }
+                        crate::entity::TrackKind::Data => {
+                            debug_assert!(false, "data does not publish through the track path");
+                        }
+                    }
                     if !self.publish_track_plans(track_id).await {
                         debug_assert!(false, "initial track plan publication must complete");
                     }
@@ -974,7 +988,9 @@ impl ControllerActor {
             })
             .collect();
         for track_id in track_ids {
-            self.install_video_runtimes(track_id).await;
+            if track_id.kind() == crate::entity::TrackKind::Video {
+                self.install_video_runtimes(track_id).await;
+            }
             if !self.publish_track_plans(track_id).await {
                 debug_assert!(false, "room track reconciliation must publish");
             }
@@ -997,7 +1013,9 @@ impl ControllerActor {
             })
             .collect();
         for track_id in track_ids {
-            self.install_audio_routes(track_id).await;
+            if track_id.kind() == crate::entity::TrackKind::Audio {
+                self.install_audio_routes(track_id).await;
+            }
         }
     }
 }
