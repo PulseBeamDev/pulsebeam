@@ -147,10 +147,14 @@ pub struct ControllerActor {
     /// room wildcard, which is what the scan produces today; what is under
     /// test is that declarations appear and disappear with the participant.
     audio_patterns: crate::control::patterns::PatternTable<crate::entity::TrackId, ()>,
-    /// Data declarations. The lane sits inside the name rather than beside it,
-    /// so one table serves both without the paired-registry duplication - and
-    /// drops out of the key entirely once reliability becomes an attribute of
-    /// the publication instead of a namespace of its own.
+    /// Data declarations, keyed by topic *and* lane.
+    ///
+    /// Reliability is part of the subject rather than an attribute of the
+    /// publication: `Topic::publisher()` can be resolved `.ordered()` or
+    /// `.latest()`, and the two are independent namespaces, so the same name
+    /// carries both without either claiming it. Putting the lane in the name
+    /// keeps that separation while still letting one table serve both, instead
+    /// of the paired registries it replaces.
     data_patterns: crate::control::patterns::PatternTable<
         (crate::track::Topic, StreamLane),
         str0m::channel::ChannelId,
