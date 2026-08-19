@@ -37,8 +37,6 @@ pub(crate) enum StreamLane {
 }
 
 impl StreamLane {
-    pub(crate) const ALL: [StreamLane; 2] = [StreamLane::Unreliable, StreamLane::Reliable];
-
     /// The lane a runtime key belongs to. The key's variant is the only thing
     /// that decides it, so this is the one place that mapping is written.
     pub(crate) fn of(key: RuntimeStreamKey) -> Self {

@@ -252,20 +252,10 @@ impl ShardRuntime {
             | crate::view::ViewOp::RemoveParticipant { .. }
             | crate::view::ViewOp::SetPlan { .. }
             | crate::view::ViewOp::RemovePlan { .. }
-            | crate::view::ViewOp::SetPlan { .. }
             | crate::view::ViewOp::GroupInsert { .. }
             | crate::view::ViewOp::GroupRemove { .. }
             | crate::view::ViewOp::BindSubscribedTrack { .. }
-            | crate::view::ViewOp::UnbindSubscribedTrack { .. }
-            | crate::view::ViewOp::GroupInsert { .. }
-            | crate::view::ViewOp::GroupRemove { .. }
-            | crate::view::ViewOp::GroupInsert { .. }
-            | crate::view::ViewOp::GroupRemove { .. }
-            | crate::view::ViewOp::RemovePlan { .. }
-            | crate::view::ViewOp::SetPlan { .. }
-            | crate::view::ViewOp::RemovePlan { .. }
-            | crate::view::ViewOp::SetPlan { .. }
-            | crate::view::ViewOp::RemovePlan { .. } => {}
+            | crate::view::ViewOp::UnbindSubscribedTrack { .. } => {}
         }
     }
 

@@ -282,18 +282,8 @@ impl ShardCore {
                     | crate::view::ViewOp::RemoveReliableRuntime { .. }
                     | crate::view::ViewOp::RemovePlan { .. }
                     | crate::view::ViewOp::SetPlan { .. }
-                    | crate::view::ViewOp::RemovePlan { .. }
                     | crate::view::ViewOp::GroupInsert { .. }
-                    | crate::view::ViewOp::GroupRemove { .. }
-                    | crate::view::ViewOp::SetPlan { .. }
-                    | crate::view::ViewOp::GroupInsert { .. }
-                    | crate::view::ViewOp::GroupRemove { .. }
-                    | crate::view::ViewOp::GroupInsert { .. }
-                    | crate::view::ViewOp::GroupRemove { .. }
-                    | crate::view::ViewOp::SetPlan { .. }
-                    | crate::view::ViewOp::RemovePlan { .. }
-                    | crate::view::ViewOp::SetPlan { .. }
-                    | crate::view::ViewOp::RemovePlan { .. } => {}
+                    | crate::view::ViewOp::GroupRemove { .. } => {}
                 }
                 if let crate::view::ViewOp::RemoveParticipant { key } = op {
                     self.timers.cancel(*key);
