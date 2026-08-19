@@ -430,16 +430,21 @@ impl ControllerActor {
             Option<RouteHandle>,
         )>,
     ) {
-        let Some(publisher_fanout) = self
+        let Some(publisher_shard) = self
             .track_bindings
             .get(&track_id)
-            .map(|binding| binding.publisher_fanout)
+            .map(|binding| binding.publisher_shard)
         else {
             return;
         };
         let mut ops = Vec::new();
         for (shard_id, key, plan, route) in targets {
-            if key != publisher_fanout {
+            // Compare shards, not keys. `TrackKey` indexes a per-shard arena,
+            // so the publisher's key and a destination's key are both
+            // `TrackKey(1v1)` as often as not — comparing them said "this is
+            // the publisher's own shard" for a remote destination and skipped
+            // its runtime, leaving a route pointing at nothing.
+            if shard_id != publisher_shard {
                 let Some(descriptor) = self.track_descriptor(track_id, shard_id) else {
                     return;
                 };

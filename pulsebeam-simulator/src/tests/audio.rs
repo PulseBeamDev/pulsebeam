@@ -331,3 +331,43 @@ fn saying_nothing_about_audio_keeps_automatic_selection_test() {
             },
         ]);
 }
+
+/// Audio reaches a listener sitting on a different shard from the speaker.
+///
+/// Every other plan here puts the whole room on one shard, so the destination of an audio route
+/// always equalled the publisher's shard and `install_audio_routes` skipped it: across the entire
+/// suite, not one audio route was ever granted. The cross-shard audio path — minting a fanout key
+/// on the destination, granting the route, forwarding over it — had no coverage at all, which is
+/// how a video track could be granted audio routes nobody would ever notice.
+///
+/// Enough participants to make the placement hash split them; `CheckHeardFrom` then only passes if
+/// audio survived the crossing.
+#[test]
+fn audio_crosses_a_shard_boundary_test() {
+    LocalNodeSim::new()
+        .with_shards(2)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::data_participant("speaker").speaking_at(-25))
+                .with_participant(Participant::data_participant("second").speaking_at(-30))
+                .with_participant(Participant::subscriber("near").hearing(3))
+                .with_participant(Participant::subscriber("far").hearing(3))
+                .with_participant(Participant::subscriber("further").hearing(3)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Two speakers talk; listeners are spread across both shards",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckHeardFrom {
+                description: "a listener hears both speakers wherever it was placed",
+                participant: "far",
+                expected: &["speaker", "second"],
+            },
+            Step::CheckHeardFrom {
+                description: "and so does another, over its own route",
+                participant: "further",
+                expected: &["speaker", "second"],
+            },
+        ]);
+}
