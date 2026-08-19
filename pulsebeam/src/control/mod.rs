@@ -6,6 +6,7 @@ mod negotiator;
 pub(crate) mod outbox;
 pub(crate) mod patterns;
 pub(crate) mod pending;
+pub(crate) mod publication;
 mod registry;
 mod room;
 mod router;
