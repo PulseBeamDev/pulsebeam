@@ -1,13 +1,5 @@
 use super::*;
 
-fn needs_stream_route(
-    publisher_shard: crate::id::ShardId,
-    destination: crate::id::ShardId,
-    has_route: bool,
-) -> bool {
-    destination != publisher_shard && !has_route
-}
-
 fn should_publish_stream_views(retired: bool, added: bool) -> bool {
     !retired || added
 }
@@ -138,16 +130,6 @@ impl ControllerActor {
                 ))
             })
             .collect()
-    }
-
-    pub(super) fn stream_plan(
-        &self,
-        id: &crate::shard::router::DataStreamId,
-        lane: StreamLane,
-        destination: crate::id::ShardId,
-    ) -> crate::view::StreamPlan {
-        self.plan_for(data_publication_id(id, lane), destination)
-            .unwrap_or_default()
     }
 
     pub(super) async fn on_stream_ready(
@@ -327,7 +309,8 @@ impl ControllerActor {
         };
         let publisher_shard = binding.publisher_shard;
         let source_key = binding.origin_key.stream();
-        let mut source_plan = source_key.map(|_| self.stream_plan(id, lane, publisher_shard));
+        let mut source_plan =
+            source_key.and_then(|_| self.plan_for(data_publication_id(id, lane), publisher_shard));
         if let Some(plan) = source_plan.as_mut() {
             plan.remote_routes
                 .retain(|route| !stale.iter().any(|(shard, _, _)| route.shard_id == *shard));
@@ -449,16 +432,6 @@ impl ControllerActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn route_decision_excludes_the_publisher_and_existing_routes() {
-        let publisher = crate::id::ShardId::new(0);
-        let destination = crate::id::ShardId::new(1);
-
-        assert!(!needs_stream_route(publisher, publisher, false));
-        assert!(needs_stream_route(publisher, destination, false));
-        assert!(!needs_stream_route(publisher, destination, true));
-    }
 
     #[test]
     fn stream_views_publish_when_topology_changes() {

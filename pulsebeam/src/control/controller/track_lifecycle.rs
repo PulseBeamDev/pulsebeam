@@ -504,7 +504,7 @@ impl ControllerActor {
         }
 
         if membership == crate::control::patterns::Membership::FirstOnShard {
-            let Some((_, plan)) = self.track_plan(track.id, shard_id) else {
+            let Some(plan) = self.plan_for(track.id, shard_id) else {
                 debug_assert!(false, "a first subscription must have a compiled plan");
                 return;
             };
@@ -674,17 +674,6 @@ impl ControllerActor {
             publication.reverse_route,
             self.groups_of(publication),
             shard,
-        ))
-    }
-
-    pub(super) fn track_plan(
-        &self,
-        track_id: crate::entity::TrackId,
-        shard_id: crate::id::ShardId,
-    ) -> Option<(crate::shard::router::TrackKey, crate::view::VideoPlan)> {
-        Some((
-            self.track_fanout(track_id, shard_id)?,
-            self.plan_for(track_id, shard_id)?,
         ))
     }
 
@@ -878,7 +867,10 @@ impl ControllerActor {
         )];
         for index in 0..self.views.len() {
             let target = crate::id::ShardId::new(index);
-            if let Some((key, plan)) = self.track_plan(track_id, target) {
+            if let (Some(key), Some(plan)) = (
+                self.track_fanout(track_id, target),
+                self.plan_for(track_id, target),
+            ) {
                 ops.push((
                     target,
                     crate::view::ViewOp::SetPlan {
