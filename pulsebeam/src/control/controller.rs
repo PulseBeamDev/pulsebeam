@@ -904,7 +904,7 @@ impl ControllerActor {
         self.core
             .registry
             .bind_participant(&cfg.participant_id, binding);
-        let (_, displaced) = self.audio_patterns.declare(
+        let (membership, displaced) = self.audio_patterns.declare(
             crate::control::patterns::Pattern::all(room_id),
             cfg.participant_id,
             crate::control::patterns::Member {
@@ -913,7 +913,7 @@ impl ControllerActor {
                 delivery: (),
             },
         );
-        let mut membership: Vec<(crate::id::ShardId, crate::view::ViewOp)> = displaced
+        let mut membership_ops: Vec<(crate::id::ShardId, crate::view::ViewOp)> = displaced
             .into_iter()
             .map(|(group, _)| {
                 (
@@ -929,7 +929,7 @@ impl ControllerActor {
             .audio_patterns
             .group_of(&crate::control::patterns::Pattern::all(room_id))
         {
-            membership.push((
+            membership_ops.push((
                 shard_id,
                 crate::view::ViewOp::AudioGroupInsert {
                     group,
@@ -937,8 +937,15 @@ impl ControllerActor {
                 },
             ));
         }
-        if !self.publish_ops(membership) {
+        if !self.publish_ops(membership_ops) {
             debug_assert!(false, "audio group membership must publish");
+        }
+
+        // Membership changes do not touch audio plans, so a join only has to
+        // reach the room's audio tracks when this shard had no member of the
+        // group before and therefore holds no routes for them yet.
+        if membership == crate::control::patterns::Membership::FirstOnShard {
+            self.reconcile_room_audio(room_id).await;
         }
 
         self.reconcile_room_tracks(room_id).await;
@@ -968,10 +975,29 @@ impl ControllerActor {
             .collect();
         for track_id in track_ids {
             self.install_video_runtimes(track_id).await;
-            self.install_audio_routes(track_id).await;
             if !self.publish_track_plans(track_id).await {
                 debug_assert!(false, "room track reconciliation must publish");
             }
+        }
+    }
+
+    /// Give a shard routes to the room's audio, for the case its first member
+    /// of the audience just arrived. Every later joiner on that shard is served
+    /// by the routes this installed, and costs one membership op.
+    async fn reconcile_room_audio(&mut self, room_id: crate::entity::RoomId) {
+        let track_ids: Vec<_> = self
+            .track_bindings
+            .iter()
+            .filter_map(|(track_id, binding)| {
+                self.core
+                    .registry
+                    .get_participant(&binding.meta.origin)
+                    .is_some_and(|participant| participant.room_id == room_id)
+                    .then_some(*track_id)
+            })
+            .collect();
+        for track_id in track_ids {
+            self.install_audio_routes(track_id).await;
         }
     }
 }
