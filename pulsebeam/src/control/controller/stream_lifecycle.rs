@@ -23,8 +23,8 @@ fn insert_stream_runtime_op(
     publisher: crate::shard::participants::ParticipantKey,
 ) -> crate::view::ViewOp {
     match key {
-        crate::shard::router::RuntimeStreamKey::Data(key) => {
-            crate::view::ViewOp::InsertDataRuntime { key, id, publisher }
+        crate::shard::router::RuntimeStreamKey::Unreliable(key) => {
+            crate::view::ViewOp::InsertUnreliableRuntime { key, id, publisher }
         }
         crate::shard::router::RuntimeStreamKey::Reliable(key) => {
             crate::view::ViewOp::InsertReliableRuntime { key, id, publisher }
@@ -37,8 +37,8 @@ fn set_stream_plan_op(
     plan: crate::view::StreamPlan,
 ) -> crate::view::ViewOp {
     match key {
-        crate::shard::router::RuntimeStreamKey::Data(key) => {
-            crate::view::ViewOp::SetDataPlan { key, plan }
+        crate::shard::router::RuntimeStreamKey::Unreliable(key) => {
+            crate::view::ViewOp::SetUnreliablePlan { key, plan }
         }
         crate::shard::router::RuntimeStreamKey::Reliable(key) => {
             crate::view::ViewOp::SetReliablePlan { key, plan }
@@ -48,9 +48,9 @@ fn set_stream_plan_op(
 
 fn remove_stream_ops(key: crate::shard::router::RuntimeStreamKey) -> [crate::view::ViewOp; 2] {
     match key {
-        crate::shard::router::RuntimeStreamKey::Data(key) => [
-            crate::view::ViewOp::RemoveDataPlan { key },
-            crate::view::ViewOp::RemoveDataRuntime { key },
+        crate::shard::router::RuntimeStreamKey::Unreliable(key) => [
+            crate::view::ViewOp::RemoveUnreliablePlan { key },
+            crate::view::ViewOp::RemoveUnreliableRuntime { key },
         ],
         crate::shard::router::RuntimeStreamKey::Reliable(key) => [
             crate::view::ViewOp::RemoveReliablePlan { key },
@@ -64,7 +64,9 @@ fn install_stream_route_op(
     route: RouteHandle,
 ) -> crate::view::ViewOp {
     let action = match key {
-        crate::shard::router::RuntimeStreamKey::Data(stream) => RouteAction::Data { stream },
+        crate::shard::router::RuntimeStreamKey::Unreliable(stream) => {
+            RouteAction::Unreliable { stream }
+        }
         crate::shard::router::RuntimeStreamKey::Reliable(stream) => {
             RouteAction::Reliable { stream }
         }

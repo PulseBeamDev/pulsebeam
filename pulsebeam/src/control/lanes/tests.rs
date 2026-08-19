@@ -36,20 +36,20 @@ type Registry = LaneRegistry;
 /// lane-dependent parts are covered separately by
 /// `each_lane_mints_and_actions_only_its_own_key`.
 fn ready(reg: &mut Registry, id: &DataStreamId, on: ShardId) {
-    let key = RuntimeStreamKey::Data(Default::default());
+    let key = RuntimeStreamKey::Unreliable(Default::default());
     reg.declare(id.clone(), on, Default::default(), key);
 }
 
 #[test]
 fn each_lane_mints_and_actions_only_its_own_key() {
-    let data = Registry::new(StreamLane::Data);
+    let data = Registry::new(StreamLane::Unreliable);
     let reliable = Registry::new(StreamLane::Reliable);
-    let data_key = RuntimeStreamKey::Data(Default::default());
+    let data_key = RuntimeStreamKey::Unreliable(Default::default());
     let reliable_key = RuntimeStreamKey::Reliable(Default::default());
 
     assert!(matches!(
         data.route_action(data_key),
-        Some(RouteAction::Data { .. })
+        Some(RouteAction::Unreliable { .. })
     ));
     assert!(matches!(
         reliable.route_action(reliable_key),
@@ -64,7 +64,7 @@ fn each_lane_mints_and_actions_only_its_own_key() {
 
 #[test]
 fn ids_on_topic_is_scoped_to_the_room() {
-    let mut reg = Registry::new(StreamLane::Data);
+    let mut reg = Registry::new(StreamLane::Unreliable);
     let here = stream(participant(1), "chat");
     ready(&mut reg, &here, shard(0));
 
@@ -97,7 +97,7 @@ fn assert_index_agrees(reg: &Registry) {
 
 #[test]
 fn the_topic_index_tracks_every_declare_and_remove() {
-    let mut reg = Registry::new(StreamLane::Data);
+    let mut reg = Registry::new(StreamLane::Unreliable);
     assert_index_agrees(&reg);
 
     let first = stream(participant(1), "chat");
@@ -126,7 +126,7 @@ fn the_topic_index_tracks_every_declare_and_remove() {
 
 #[test]
 fn declaring_the_same_stream_twice_does_not_duplicate_it_on_its_topic() {
-    let mut reg = Registry::new(StreamLane::Data);
+    let mut reg = Registry::new(StreamLane::Unreliable);
     let id = stream(participant(1), "chat");
 
     ready(&mut reg, &id, shard(0));

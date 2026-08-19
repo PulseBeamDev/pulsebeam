@@ -94,7 +94,7 @@ pub(crate) struct StreamRecord {
 pub(crate) struct ShardArenas {
     pub participants: SlotMap<crate::keys::ParticipantKey, ParticipantRecord>,
     pub tracks: SlotMap<crate::keys::TrackKey, TrackRecord>,
-    pub data: SlotMap<crate::keys::DataStreamKey, StreamRecord>,
+    pub unreliable: SlotMap<crate::keys::UnreliableStreamKey, StreamRecord>,
     pub reliable: SlotMap<crate::keys::ReliableStreamKey, StreamRecord>,
 }
 
@@ -103,7 +103,7 @@ impl ShardArenas {
         Self {
             participants: SlotMap::with_key(),
             tracks: SlotMap::with_key(),
-            data: SlotMap::with_key(),
+            unreliable: SlotMap::with_key(),
             reliable: SlotMap::with_key(),
         }
     }
@@ -127,7 +127,7 @@ pub(crate) struct LifecycleTransaction {
     pub reservations: Vec<RouteReservation>,
     pub participants: Vec<(ShardId, crate::keys::ParticipantKey)>,
     pub tracks: Vec<(ShardId, crate::keys::TrackKey)>,
-    pub data: Vec<(ShardId, crate::keys::DataStreamKey)>,
+    pub unreliable: Vec<(ShardId, crate::keys::UnreliableStreamKey)>,
     pub reliable: Vec<(ShardId, crate::keys::ReliableStreamKey)>,
 }
 
@@ -138,7 +138,7 @@ impl LifecycleTransaction {
             reservations: Vec::new(),
             participants: Vec::new(),
             tracks: Vec::new(),
-            data: Vec::new(),
+            unreliable: Vec::new(),
             reliable: Vec::new(),
         }
     }
@@ -214,13 +214,13 @@ impl ControlPlaneState {
         &mut self,
         shard: ShardId,
         id: crate::shard::router::DataStreamId,
-    ) -> Option<crate::keys::DataStreamKey> {
+    ) -> Option<crate::keys::UnreliableStreamKey> {
         let key = self
             .arenas
             .get_mut(shard.index())
-            .map(|arena| arena.data.insert(StreamRecord { id }))?;
+            .map(|arena| arena.unreliable.insert(StreamRecord { id }))?;
         if let Some(tx) = self.pending.as_mut() {
-            tx.data.push((shard, key));
+            tx.unreliable.push((shard, key));
         }
         Some(key)
     }
@@ -261,11 +261,11 @@ impl ControlPlaneState {
         }
     }
 
-    pub fn remove_data(&mut self, shard: ShardId, key: crate::keys::DataStreamKey) {
+    pub fn remove_data(&mut self, shard: ShardId, key: crate::keys::UnreliableStreamKey) {
         let record = self
             .arenas
             .get_mut(shard.index())
-            .and_then(|arena| arena.data.remove(key));
+            .and_then(|arena| arena.unreliable.remove(key));
         if let Some(record) = record {
             debug_assert!(!record.id.topic.as_ref().is_empty());
         }
@@ -400,7 +400,7 @@ impl ControlPlaneState {
         for &(shard, key) in &tx.tracks {
             self.remove_track(shard, key);
         }
-        for &(shard, key) in &tx.data {
+        for &(shard, key) in &tx.unreliable {
             self.remove_data(shard, key);
         }
         for &(shard, key) in &tx.reliable {
@@ -491,7 +491,7 @@ mod tests {
         state.abort(Instant::now());
         assert!(state.arenas[0].participants.get(participant).is_none());
         assert!(state.arenas[0].tracks.get(track).is_none());
-        assert!(state.arenas[0].data.get(data).is_none());
+        assert!(state.arenas[0].unreliable.get(data).is_none());
         assert!(state.arenas[0].reliable.get(reliable).is_none());
     }
 

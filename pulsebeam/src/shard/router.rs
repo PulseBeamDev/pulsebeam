@@ -13,7 +13,7 @@ use crate::track::Topic;
 use super::events::AudioRtpEvent;
 use super::worker::{MediaPayload, Reverse, ShardFrame};
 
-pub(crate) use crate::keys::{DataStreamKey, ReliableStreamKey, TrackKey};
+pub(crate) use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DataStreamId {
@@ -24,7 +24,7 @@ pub(crate) struct DataStreamId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeStreamKey {
-    Data(DataStreamKey),
+    Unreliable(UnreliableStreamKey),
     Reliable(ReliableStreamKey),
 }
 
@@ -76,7 +76,12 @@ pub(crate) trait RoutingContext: ShardTransport {
         origin: AudioOrigin,
         pkt: &RtpPacket,
     );
-    fn forward_sctp(&mut self, subscriber: ParticipantKey, channel: ChannelId, pkt: &[u8]);
+    fn forward_unreliable_sctp(
+        &mut self,
+        subscriber: ParticipantKey,
+        channel: ChannelId,
+        pkt: &[u8],
+    );
     fn wall(&self) -> &WallAnchor;
     fn forward_reliable_sctp(
         &mut self,
@@ -97,10 +102,11 @@ struct TrackRuntime {
     audience: Vec<ParticipantKey>,
 }
 
-struct StreamRuntime {
+struct UnreliableRuntime {
     link_seq: u32,
 }
 
+/// The same stream, plus what the feedback path needs to address its publisher.
 pub(crate) struct ReliableRuntime {
     id: DataStreamId,
     publisher: ParticipantKey,
@@ -109,7 +115,7 @@ pub(crate) struct ReliableRuntime {
 
 pub(crate) struct ShardRuntime {
     tracks: SecondaryMap<TrackKey, TrackRuntime>,
-    data: SecondaryMap<DataStreamKey, StreamRuntime>,
+    unreliable: SecondaryMap<UnreliableStreamKey, UnreliableRuntime>,
     reliable: SecondaryMap<ReliableStreamKey, ReliableRuntime>,
     pub(crate) routes: RouteRuntime,
 }
@@ -118,7 +124,7 @@ impl ShardRuntime {
     pub fn new(shard_id: ShardId) -> Self {
         Self {
             tracks: SecondaryMap::new(),
-            data: SecondaryMap::new(),
+            unreliable: SecondaryMap::new(),
             reliable: SecondaryMap::new(),
             routes: RouteRuntime::new(shard_id),
         }
@@ -136,8 +142,8 @@ impl ShardRuntime {
         self.tracks.get(key).map(|track| track.audience.as_slice())
     }
 
-    pub(crate) fn retire_data_stream(&mut self, key: DataStreamKey) {
-        let _ = self.data.remove(key);
+    pub(crate) fn retire_data_stream(&mut self, key: UnreliableStreamKey) {
+        let _ = self.unreliable.remove(key);
     }
 
     pub(crate) fn retire_reliable_stream(&mut self, key: ReliableStreamKey) {
@@ -186,10 +192,12 @@ impl ShardRuntime {
                 }
             }
             crate::view::ViewOp::RemoveTrackRuntime { key } => self.retire_track(*key),
-            crate::view::ViewOp::InsertDataRuntime { key, .. } => {
-                let _ = self.data.insert(*key, StreamRuntime { link_seq: 0 });
+            crate::view::ViewOp::InsertUnreliableRuntime { key, .. } => {
+                let _ = self
+                    .unreliable
+                    .insert(*key, UnreliableRuntime { link_seq: 0 });
             }
-            crate::view::ViewOp::RemoveDataRuntime { key } => self.retire_data_stream(*key),
+            crate::view::ViewOp::RemoveUnreliableRuntime { key } => self.retire_data_stream(*key),
             crate::view::ViewOp::InsertReliableRuntime { key, id, publisher } => {
                 let _ = self.reliable.insert(
                     *key,
@@ -214,8 +222,8 @@ impl ShardRuntime {
             | crate::view::ViewOp::DataGroupInsert { .. }
             | crate::view::ViewOp::DataGroupRemove { .. }
             | crate::view::ViewOp::RemoveAudioPlan { .. }
-            | crate::view::ViewOp::SetDataPlan { .. }
-            | crate::view::ViewOp::RemoveDataPlan { .. }
+            | crate::view::ViewOp::SetUnreliablePlan { .. }
+            | crate::view::ViewOp::RemoveUnreliablePlan { .. }
             | crate::view::ViewOp::SetReliablePlan { .. }
             | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
         }
@@ -333,22 +341,22 @@ impl ShardRuntime {
         }
     }
 
-    pub fn route_data_with_plan(
+    pub fn route_unreliable_with_plan(
         &mut self,
-        stream: DataStreamKey,
+        stream: UnreliableStreamKey,
         origin: Origin,
         packet: Vec<u8>,
         plan: &crate::view::StreamPlan,
         groups: &crate::view::GroupImage<ChannelId>,
         ctx: &mut impl RoutingContext,
     ) {
-        let Some(runtime) = self.data.get_mut(stream) else {
+        let Some(runtime) = self.unreliable.get_mut(stream) else {
             debug_assert!(false, "data key must resolve to runtime state");
             return;
         };
         for group in &plan.groups {
             for &(subscriber, channel) in groups.members(*group) {
-                ctx.forward_sctp(subscriber, channel, &packet);
+                ctx.forward_unreliable_sctp(subscriber, channel, &packet);
             }
         }
         if origin.is_local() {
@@ -365,7 +373,7 @@ impl ShardRuntime {
         }
     }
 
-    pub fn route_reliable_data_with_plan(
+    pub fn route_reliable_with_plan(
         &mut self,
         stream: ReliableStreamKey,
         origin: Origin,

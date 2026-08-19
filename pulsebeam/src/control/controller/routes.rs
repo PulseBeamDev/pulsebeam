@@ -23,7 +23,7 @@ impl ControllerActor {
         plan: crate::view::StreamPlan,
     ) -> Option<RouteHandle> {
         match lane {
-            StreamLane::Data => {
+            StreamLane::Unreliable => {
                 self.grant_route_binding(shard_id, action, None, None, Some(plan), None)
                     .await
             }
@@ -68,8 +68,8 @@ impl ControllerActor {
                 (RouteAction::Audio { track }, _, Some(plan), _, _) => {
                     Some(crate::view::ViewOp::SetAudioPlan { key: track, plan })
                 }
-                (RouteAction::Data { stream }, _, _, Some(plan), _) => {
-                    Some(crate::view::ViewOp::SetDataPlan { key: stream, plan })
+                (RouteAction::Unreliable { stream }, _, _, Some(plan), _) => {
+                    Some(crate::view::ViewOp::SetUnreliablePlan { key: stream, plan })
                 }
                 (RouteAction::Reliable { stream }, _, _, _, Some(plan)) => {
                     Some(crate::view::ViewOp::SetReliablePlan { key: stream, plan })

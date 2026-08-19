@@ -1,10 +1,13 @@
 //! Per-lane data stream routing state.
 //!
-//! `Data` and `Reliable` are the same state machine over different runtime
-//! keys. Keeping them as one type instantiated twice is what stops the two
-//! copies drifting: every lane-dependent decision — which key to mint, which
-//! route action to emit, which arena to retire into — is a method here, and
-//! nowhere else.
+//! The two lanes are the same data channel. Reliable delivery is unreliable
+//! delivery plus a retransmit cache and the feedback to drive it, layered
+//! end-to-end over a hop-to-hop transport that guarantees neither — so the
+//! routing state machine is identical and only the runtime key differs.
+//! Keeping them as one type instantiated twice is what stops the two copies
+//! drifting: every lane-dependent decision — which key to mint, which route
+//! action to emit, which arena to retire into — is a method here, and nowhere
+//! else.
 
 use ahash::{HashMap, HashMapExt};
 
@@ -20,20 +23,27 @@ use crate::{
     track::Topic,
 };
 
+/// How a data stream is delivered.
+///
+/// Named for the guarantee rather than the medium: both lanes carry the same
+/// data channel, and `Unreliable` is the base the other adds to. The lane is
+/// part of a stream's identity, not a flag on it — `Topic::publisher()`
+/// resolves to `.ordered()` or `.latest()`, and one topic name can carry both
+/// at once without either claiming it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum StreamLane {
-    Data,
+    Unreliable,
     Reliable,
 }
 
 impl StreamLane {
-    pub(crate) const ALL: [StreamLane; 2] = [StreamLane::Data, StreamLane::Reliable];
+    pub(crate) const ALL: [StreamLane; 2] = [StreamLane::Unreliable, StreamLane::Reliable];
 
     /// The lane a runtime key belongs to. The key's variant is the only thing
     /// that decides it, so this is the one place that mapping is written.
     pub(crate) fn of(key: RuntimeStreamKey) -> Self {
         match key {
-            RuntimeStreamKey::Data(_) => StreamLane::Data,
+            RuntimeStreamKey::Unreliable(_) => StreamLane::Unreliable,
             RuntimeStreamKey::Reliable(_) => StreamLane::Reliable,
         }
     }
@@ -165,8 +175,8 @@ impl LaneRegistry {
     /// belongs to the other lane, which is a caller bug rather than a state.
     pub(crate) fn route_action(&self, key: RuntimeStreamKey) -> Option<RouteAction> {
         match (self.lane, key) {
-            (StreamLane::Data, RuntimeStreamKey::Data(stream)) => {
-                Some(RouteAction::Data { stream })
+            (StreamLane::Unreliable, RuntimeStreamKey::Unreliable(stream)) => {
+                Some(RouteAction::Unreliable { stream })
             }
             (StreamLane::Reliable, RuntimeStreamKey::Reliable(stream)) => {
                 Some(RouteAction::Reliable { stream })
@@ -182,9 +192,9 @@ impl LaneRegistry {
         id: &DataStreamId,
     ) -> Option<RuntimeStreamKey> {
         match self.lane {
-            StreamLane::Data => state
+            StreamLane::Unreliable => state
                 .mint_data(destination, id.clone())
-                .map(RuntimeStreamKey::Data),
+                .map(RuntimeStreamKey::Unreliable),
             StreamLane::Reliable => state
                 .mint_reliable(destination, id.clone())
                 .map(RuntimeStreamKey::Reliable),
@@ -198,7 +208,7 @@ impl LaneRegistry {
         key: RuntimeStreamKey,
     ) {
         match (self.lane, key) {
-            (StreamLane::Data, RuntimeStreamKey::Data(key)) => {
+            (StreamLane::Unreliable, RuntimeStreamKey::Unreliable(key)) => {
                 state.remove_data(destination, key);
             }
             (StreamLane::Reliable, RuntimeStreamKey::Reliable(key)) => {
@@ -218,21 +228,21 @@ pub(crate) struct Lanes {
 impl Lanes {
     pub(crate) fn new() -> Self {
         Self {
-            data: LaneRegistry::new(StreamLane::Data),
+            data: LaneRegistry::new(StreamLane::Unreliable),
             reliable: LaneRegistry::new(StreamLane::Reliable),
         }
     }
 
     pub(crate) fn get(&self, lane: StreamLane) -> &LaneRegistry {
         match lane {
-            StreamLane::Data => &self.data,
+            StreamLane::Unreliable => &self.data,
             StreamLane::Reliable => &self.reliable,
         }
     }
 
     pub(crate) fn get_mut(&mut self, lane: StreamLane) -> &mut LaneRegistry {
         match lane {
-            StreamLane::Data => &mut self.data,
+            StreamLane::Unreliable => &mut self.data,
             StreamLane::Reliable => &mut self.reliable,
         }
     }

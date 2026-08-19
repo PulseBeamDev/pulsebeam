@@ -22,7 +22,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
 use crate::id::ShardId;
-use crate::shard::router::{DataStreamKey, ReliableStreamKey, TrackKey};
+use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 
 /// How long a retired slot waits before it can be handed out again.
 ///
@@ -395,14 +395,14 @@ pub(crate) enum RouteAction {
     /// One route per audio stream and destination. The track key resolves the
     /// destination's compiled audio plan directly.
     Audio { track: TrackKey },
-    /// One route per (publisher, topic, destination) on the realtime lane.
+    /// One route per (publisher, topic, destination) on the unreliable lane.
     /// The destination installs it whether the local subscription named a
     /// publisher or was a wildcard — wildcards resolve to concrete streams as
     /// publishers are announced.
-    Data { stream: DataStreamKey },
-    /// The reliable-lane counterpart of `Data`. A separate variant rather
-    /// than a `lane: DataLane` field on `Data`, because the two lanes now
-    /// resolve through different arenas — the variant *is* the lane.
+    Unreliable { stream: UnreliableStreamKey },
+    /// The same, delivered reliably. A separate variant rather than a lane
+    /// field, because the two resolve through different arenas — the variant
+    /// *is* the lane.
     Reliable { stream: ReliableStreamKey },
     /// The reverse path for one published stream, resolving at the shard that
     /// owns the publisher.

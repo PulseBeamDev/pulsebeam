@@ -124,7 +124,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         }
     }
 
-    fn forward_sctp(
+    fn forward_unreliable_sctp(
         &mut self,
         subscriber: ParticipantKey,
         channel: str0m::channel::ChannelId,
@@ -246,7 +246,7 @@ impl ShardCore {
                             meta.bind_published_track(descriptor.id, *key);
                         }
                     }
-                    crate::view::ViewOp::InsertDataRuntime { publisher, key, id } => {
+                    crate::view::ViewOp::InsertUnreliableRuntime { publisher, key, id } => {
                         if let Some(meta) = self.registry.resolve_mut(*publisher) {
                             meta.bind_published_data_stream(&id.topic, *key);
                         }
@@ -302,7 +302,7 @@ impl ShardCore {
                     | crate::view::ViewOp::InsertParticipant { .. }
                     | crate::view::ViewOp::RemoveParticipant { .. }
                     | crate::view::ViewOp::RemoveTrackRuntime { .. }
-                    | crate::view::ViewOp::RemoveDataRuntime { .. }
+                    | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
                     | crate::view::ViewOp::RemoveReliableRuntime { .. }
                     | crate::view::ViewOp::RemoveAudioPlan { .. }
                     | crate::view::ViewOp::SetAudioPlan { .. }
@@ -310,8 +310,8 @@ impl ShardCore {
                     | crate::view::ViewOp::AudioGroupRemove { .. }
                     | crate::view::ViewOp::DataGroupInsert { .. }
                     | crate::view::ViewOp::DataGroupRemove { .. }
-                    | crate::view::ViewOp::SetDataPlan { .. }
-                    | crate::view::ViewOp::RemoveDataPlan { .. }
+                    | crate::view::ViewOp::SetUnreliablePlan { .. }
+                    | crate::view::ViewOp::RemoveUnreliablePlan { .. }
                     | crate::view::ViewOp::SetReliablePlan { .. }
                     | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
                 }
@@ -415,8 +415,8 @@ impl ShardCore {
                     &mut ctx,
                 );
             }
-            (crate::route::RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
-                let Some(plan) = view.data.resolve(stream) else {
+            (crate::route::RouteAction::Unreliable { stream }, MediaPayload::Data(bytes)) => {
+                let Some(plan) = view.unreliable.resolve(stream) else {
                     record_routing_drop("data", "plan", "remote");
                     return;
                 };
@@ -426,7 +426,7 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime.route_data_with_plan(
+                self.runtime.route_unreliable_with_plan(
                     stream,
                     Origin::Remote,
                     bytes,
@@ -446,7 +446,7 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime.route_reliable_data_with_plan(
+                self.runtime.route_reliable_with_plan(
                     stream,
                     Origin::Remote,
                     bytes,
@@ -580,11 +580,11 @@ impl ShardCore {
                 continue;
             };
             let view = &self.view;
-            let Some(plan) = view.data.resolve(stream) else {
+            let Some(plan) = view.unreliable.resolve(stream) else {
                 record_routing_drop("data", "plan", "local");
                 continue;
             };
-            self.runtime.route_data_with_plan(
+            self.runtime.route_unreliable_with_plan(
                 stream,
                 Origin::Local,
                 ev.pkt,
@@ -607,7 +607,7 @@ impl ShardCore {
                 record_routing_drop("reliable", "plan", "local");
                 continue;
             };
-            self.runtime.route_reliable_data_with_plan(
+            self.runtime.route_reliable_with_plan(
                 stream,
                 Origin::Local,
                 ev.pkt,

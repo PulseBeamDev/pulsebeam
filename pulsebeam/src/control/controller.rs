@@ -650,7 +650,7 @@ impl ControllerActor {
                 self.on_stream_ready(
                     shard_id,
                     id,
-                    crate::shard::router::RuntimeStreamKey::Data(key),
+                    crate::shard::router::RuntimeStreamKey::Unreliable(key),
                 )
                 .await;
                 None
@@ -694,7 +694,7 @@ impl ControllerActor {
                     topic,
                     publisher,
                     channel,
-                    StreamLane::Data,
+                    StreamLane::Unreliable,
                 )
                 .await;
                 None
@@ -738,7 +738,7 @@ impl ControllerActor {
                     subscriber,
                     topic,
                     publisher,
-                    StreamLane::Data,
+                    StreamLane::Unreliable,
                 )
                 .await;
                 None
@@ -764,7 +764,7 @@ impl ControllerActor {
                 topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                if !self.retire_stream_binding(id, StreamLane::Data).await {
+                if !self.retire_stream_binding(id, StreamLane::Unreliable).await {
                     debug_assert!(false, "data stream retirement must complete");
                 }
                 None

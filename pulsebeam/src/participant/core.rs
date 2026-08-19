@@ -33,7 +33,7 @@ use crate::participant::{
     upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamAllocator},
 };
 use crate::rtp::RtpPacket;
-use crate::shard::router::{DataStreamKey, ReliableStreamKey, TrackKey};
+use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
     KEYFRAME_DEBOUNCE, MAX_DATA_TOPIC_CHANNELS, StreamId, StreamWrite, StreamWriter, Topic, Track,
@@ -269,7 +269,7 @@ pub struct ParticipantCore {
     /// packet.
     published_track_fanouts: HashMap<TrackId, TrackKey>,
     subscribed_track_fanouts: HashMap<TrackId, TrackKey>,
-    data_pub_streams: HashMap<ChannelId, DataStreamKey>,
+    data_pub_streams: HashMap<ChannelId, UnreliableStreamKey>,
     reliable_pub_streams: HashMap<ChannelId, ReliableStreamKey>,
     reliable_sub_streams: HashMap<ChannelId, ReliableStreamKey>,
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
@@ -333,7 +333,11 @@ impl ParticipantCore {
     /// frame on that channel falls back to a room-scoped lookup; afterwards
     /// the key rides on the event and nothing on the packet path hashes a
     /// name.
-    pub(crate) fn bind_published_data_stream(&mut self, topic: &Topic, stream: DataStreamKey) {
+    pub(crate) fn bind_published_data_stream(
+        &mut self,
+        topic: &Topic,
+        stream: UnreliableStreamKey,
+    ) {
         let Some(&channel) = self.data_pub_channels.get(topic) else {
             return;
         };

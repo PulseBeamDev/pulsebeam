@@ -9,7 +9,7 @@ use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
-use crate::shard::router::{DataStreamKey, ReliableStreamKey, TrackKey};
+use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackLayer, TrackMeta};
 
 pub struct AudioRtpEvent {
@@ -105,7 +105,7 @@ pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
     audio_queue: VecDeque<AudioRtpEvent>,
     video_queue: VecDeque<VideoRtpEvent>,
-    data_queue: VecDeque<SctpEvent<DataStreamKey>>,
+    data_queue: VecDeque<SctpEvent<UnreliableStreamKey>>,
     reliable_data_queue: VecDeque<SctpEvent<ReliableStreamKey>>,
     shard_events: VecDeque<ShardEvent>,
 }
@@ -147,7 +147,7 @@ impl EventPipeline {
         self.shard_events.push_back(ev);
     }
 
-    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent<DataStreamKey>> {
+    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent<UnreliableStreamKey>> {
         self.data_queue.pop_front()
     }
 
@@ -366,7 +366,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_sctp(&mut self, _topic: Topic, stream: Option<DataStreamKey>, pkt: Vec<u8>) {
+    fn publish_sctp(&mut self, _topic: Topic, stream: Option<UnreliableStreamKey>, pkt: Vec<u8>) {
         self.pipeline
             .data_queue
             .push_back(SctpEvent { pkt, stream });

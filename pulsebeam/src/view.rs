@@ -7,7 +7,7 @@ use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::{DownstreamSlotKey, ParticipantKey, TrackKey};
 use crate::route::{RouteAction, RouteId, TransportHandle, TransportRoute};
-use crate::shard::router::{DataStreamKey, ReliableStreamKey};
+use crate::shard::router::{ReliableStreamKey, UnreliableStreamKey};
 use pulsebeam_runtime::mailbox;
 use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
@@ -80,7 +80,7 @@ pub(crate) struct ShardView {
     pub audio: ForwardingImage<TrackKey, ()>,
     pub audio_groups: GroupImage<()>,
     pub data_groups: GroupImage<ChannelId>,
-    pub data: ForwardingImage<DataStreamKey, ChannelId>,
+    pub unreliable: ForwardingImage<UnreliableStreamKey, ChannelId>,
     pub reliable: ForwardingImage<ReliableStreamKey, ChannelId>,
 }
 
@@ -291,13 +291,13 @@ pub(crate) enum ViewOp {
     RemoveTrackRuntime {
         key: TrackKey,
     },
-    InsertDataRuntime {
-        key: DataStreamKey,
+    InsertUnreliableRuntime {
+        key: UnreliableStreamKey,
         id: crate::shard::router::DataStreamId,
         publisher: ParticipantKey,
     },
-    RemoveDataRuntime {
-        key: DataStreamKey,
+    RemoveUnreliableRuntime {
+        key: UnreliableStreamKey,
     },
     InsertReliableRuntime {
         key: ReliableStreamKey,
@@ -338,12 +338,12 @@ pub(crate) enum ViewOp {
     RemoveAudioPlan {
         key: TrackKey,
     },
-    SetDataPlan {
-        key: DataStreamKey,
+    SetUnreliablePlan {
+        key: UnreliableStreamKey,
         plan: StreamPlan,
     },
-    RemoveDataPlan {
-        key: DataStreamKey,
+    RemoveUnreliablePlan {
+        key: UnreliableStreamKey,
     },
     SetReliablePlan {
         key: ReliableStreamKey,
@@ -383,8 +383,8 @@ impl ShardViewDelta {
                 ViewOp::RemoveParticipant { .. }
                 | ViewOp::InsertTrackRuntime { .. }
                 | ViewOp::RemoveTrackRuntime { .. }
-                | ViewOp::InsertDataRuntime { .. }
-                | ViewOp::RemoveDataRuntime { .. }
+                | ViewOp::InsertUnreliableRuntime { .. }
+                | ViewOp::RemoveUnreliableRuntime { .. }
                 | ViewOp::InsertReliableRuntime { .. }
                 | ViewOp::RemoveReliableRuntime { .. } => {}
                 ViewOp::SetTrackPlan { key, plan } => view.tracks.upsert(key, plan),
@@ -399,8 +399,8 @@ impl ShardViewDelta {
                 } => view.data_groups.insert(group, key, channel),
                 ViewOp::DataGroupRemove { group, key } => view.data_groups.remove(group, key),
                 ViewOp::RemoveAudioPlan { key } => view.audio.remove(key),
-                ViewOp::SetDataPlan { key, plan } => view.data.upsert(key, plan),
-                ViewOp::RemoveDataPlan { key } => view.data.remove(key),
+                ViewOp::SetUnreliablePlan { key, plan } => view.unreliable.upsert(key, plan),
+                ViewOp::RemoveUnreliablePlan { key } => view.unreliable.remove(key),
                 ViewOp::SetReliablePlan { key, plan } => view.reliable.upsert(key, plan),
                 ViewOp::RemoveReliablePlan { key } => view.reliable.remove(key),
             }
