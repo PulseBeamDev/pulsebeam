@@ -46,12 +46,12 @@ impl ControllerActor {
     }
 
     pub(super) async fn install_video_runtimes(&mut self, track_id: crate::entity::TrackId) {
-        let Some(binding) = self.track_bindings.get(&track_id) else {
+        let Some(binding) = self.catalog.get(&track_id) else {
             debug_assert!(false, "video runtime installation requires a track binding");
             return;
         };
         let publisher_shard = binding.publisher_shard;
-        let origin = binding.meta.origin;
+        let origin = binding.publisher;
         let Some(room_id) = self
             .core
             .registry
@@ -71,7 +71,7 @@ impl ControllerActor {
             .collect();
         for destination in destinations {
             if self
-                .track_bindings
+                .catalog
                 .get(&track_id)
                 .is_some_and(|binding| binding.destinations.contains_key(&destination))
             {
@@ -81,7 +81,7 @@ impl ControllerActor {
                 debug_assert!(false, "a subscriber shard must accept a track runtime");
                 continue;
             };
-            let Some(binding) = self.track_bindings.get_mut(&track_id) else {
+            let Some(binding) = self.catalog.get_mut(&track_id) else {
                 debug_assert!(
                     false,
                     "track binding disappeared during runtime installation"
@@ -143,19 +143,19 @@ impl ControllerActor {
     }
 
     pub(super) async fn retire_track_binding(&mut self, track_id: crate::entity::TrackId) -> bool {
-        let Some(binding) = self.track_bindings.get(&track_id) else {
+        let Some(binding) = self.catalog.get(&track_id) else {
             return true;
         };
         // Its subscribers never unsubscribe from a track that goes away, so the
         // declarations naming it have to be retired with it.
-        let retired_pattern = crate::control::patterns::Pattern::exact(
-            binding.meta.room_id,
-            binding.meta.origin,
-            track_id,
-        );
+        let retired_pattern =
+            crate::control::patterns::Pattern::exact(binding.room, binding.publisher, track_id);
         let destinations = binding.destinations.clone();
         let publisher_shard = binding.publisher_shard;
-        let publisher_fanout = binding.publisher_fanout;
+        let Some(publisher_fanout) = binding.origin_key.track() else {
+            debug_assert!(false, "a media publication holds a media key");
+            return false;
+        };
         let reverse_route = binding.reverse_route;
         let kind = track_id.kind();
         if let Some((group, members)) = self.video_patterns.retire_pattern(&retired_pattern) {
@@ -277,7 +277,7 @@ impl ControllerActor {
                 self.state.remove_track(destination, key);
             }
         }
-        self.track_bindings.remove(&track_id);
+        self.catalog.remove(&track_id);
         true
     }
 
@@ -315,10 +315,10 @@ impl ControllerActor {
     }
 
     pub(super) async fn install_audio_routes(&mut self, track_id: crate::entity::TrackId) {
-        let Some(binding) = self.track_bindings.get(&track_id) else {
+        let Some(binding) = self.catalog.get(&track_id) else {
             return;
         };
-        let origin = binding.meta.origin;
+        let origin = binding.publisher;
         let publisher_shard = binding.publisher_shard;
         let Some(room_id) = self
             .core
@@ -351,7 +351,7 @@ impl ControllerActor {
                 continue;
             }
             if self
-                .track_bindings
+                .catalog
                 .get(&track_id)
                 .is_some_and(|binding| binding.destinations.contains_key(&destination))
             {
@@ -378,7 +378,7 @@ impl ControllerActor {
             else {
                 continue;
             };
-            let Some(binding) = self.track_bindings.get_mut(&track_id) else {
+            let Some(binding) = self.catalog.get_mut(&track_id) else {
                 return;
             };
             binding.destinations.insert(
@@ -437,12 +437,16 @@ impl ControllerActor {
             return;
         }
         let fanout = {
-            let Some(binding) = self.track_bindings.get(&track.id) else {
+            let Some(binding) = self.catalog.get(&track.id) else {
                 debug_assert!(false, "a subscription must name a published track");
                 return;
             };
-            if shard_id == binding.publisher_shard {
-                binding.publisher_fanout
+            if let Some(fanout) = binding
+                .origin_key
+                .track()
+                .filter(|_| shard_id == binding.publisher_shard)
+            {
+                fanout
             } else if let Some(fanout) = binding
                 .destinations
                 .get(&shard_id)
@@ -454,7 +458,7 @@ impl ControllerActor {
                     debug_assert!(false, "a subscriber shard must accept a track runtime");
                     return;
                 };
-                let Some(binding) = self.track_bindings.get_mut(&track.id) else {
+                let Some(binding) = self.catalog.get_mut(&track.id) else {
                     return;
                 };
                 binding.destinations.insert(
@@ -527,7 +531,7 @@ impl ControllerActor {
                 ));
                 return;
             };
-            if let Some(binding) = self.track_bindings.get_mut(&track.id) {
+            if let Some(binding) = self.catalog.get_mut(&track.id) {
                 if let Some(destination) = binding.destinations.get_mut(&shard_id) {
                     destination.route = Some(handle);
                 }
@@ -576,7 +580,7 @@ impl ControllerActor {
             let _ = self.publish_track_plans(track.id).await;
             return;
         }
-        let Some(route) = self.track_bindings.get_mut(&track.id).and_then(|binding| {
+        let Some(route) = self.catalog.get_mut(&track.id).and_then(|binding| {
             binding
                 .destinations
                 .get_mut(&shard_id)
@@ -595,9 +599,9 @@ impl ControllerActor {
         track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
     ) -> Option<crate::shard::router::TrackKey> {
-        let binding = self.track_bindings.get(&track_id)?;
+        let binding = self.catalog.get(&track_id)?;
         if shard_id == binding.publisher_shard {
-            Some(binding.publisher_fanout)
+            binding.origin_key.track()
         } else {
             binding
                 .destinations
@@ -611,9 +615,9 @@ impl ControllerActor {
         track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
     ) -> Option<(crate::shard::router::TrackKey, crate::view::VideoPlan)> {
-        let binding = self.track_bindings.get(&track_id)?;
+        let binding = self.catalog.get(&track_id)?;
         let fanout = if shard_id == binding.publisher_shard {
-            binding.publisher_fanout
+            binding.origin_key.track()?
         } else {
             binding
                 .destinations
@@ -621,8 +625,8 @@ impl ControllerActor {
                 .and_then(|d| d.key.track())?
         };
         let subject = crate::control::patterns::Subject {
-            room: binding.meta.room_id,
-            publisher: binding.meta.origin,
+            room: binding.room,
+            publisher: binding.publisher,
             name: track_id,
         };
         // The delivery key differs per kind so the tables are separate, but a
@@ -675,21 +679,38 @@ impl ControllerActor {
         track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
     ) -> Option<crate::view::TrackDescriptor> {
-        let binding = self.track_bindings.get(&track_id)?;
+        let binding = self.catalog.get(&track_id)?;
+        // Only video carries encodings and layer states; audio's descriptor is
+        // the same shape with none of them.
+        let (encodings, states, publication) = match &binding.media {
+            crate::control::publication::Media::Video {
+                publication,
+                encodings,
+                states,
+            } => (encodings.clone(), states.clone(), publication.clone()),
+            _ => (
+                Vec::new(),
+                crate::track::TrackStates::default(),
+                crate::track::Track {
+                    meta: binding.meta(),
+                    layers: Vec::new(),
+                    reverse: binding.reverse_route,
+                },
+            ),
+        };
         Some(crate::view::TrackDescriptor {
-            id: binding.meta.id,
-            origin_key: binding.publisher_participant,
-            participant: (shard_id == binding.publisher_shard)
-                .then_some(binding.publisher_participant),
-            encodings: binding.encodings.clone(),
-            states: binding.states.clone(),
-            publication: binding.publication.clone(),
-            audience: self.track_audience_on_shard(binding.meta.origin, shard_id),
+            id: binding.id,
+            origin_key: binding.publisher_key,
+            participant: (shard_id == binding.publisher_shard).then_some(binding.publisher_key),
+            encodings,
+            states,
+            publication,
+            audience: self.track_audience_on_shard(binding.publisher, shard_id),
         })
     }
 
     pub(super) async fn publish_track_plans(&mut self, track_id: crate::entity::TrackId) -> bool {
-        let Some(binding) = self.track_bindings.get(&track_id) else {
+        let Some(binding) = self.catalog.get(&track_id) else {
             return false;
         };
         let mut shards: Vec<_> = binding.destinations.keys().copied().collect();

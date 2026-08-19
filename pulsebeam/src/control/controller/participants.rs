@@ -49,9 +49,9 @@ impl ControllerActor {
 
     pub(super) async fn retire_participant_tracks(&mut self, participant_id: &ParticipantId) {
         let tracks: Vec<_> = self
-            .track_bindings
+            .catalog
             .iter()
-            .filter(|(_, binding)| binding.meta.origin == *participant_id)
+            .filter(|(_, binding)| binding.publisher == *participant_id)
             .map(|(track_id, _)| *track_id)
             .collect();
         for track_id in tracks {
@@ -97,7 +97,7 @@ impl ControllerActor {
                 let Some(track_id) = pattern.name else {
                     continue;
                 };
-                let Some(route) = self.track_bindings.get_mut(&track_id).and_then(|binding| {
+                let Some(route) = self.catalog.get_mut(&track_id).and_then(|binding| {
                     binding
                         .destinations
                         .get_mut(&shard)
