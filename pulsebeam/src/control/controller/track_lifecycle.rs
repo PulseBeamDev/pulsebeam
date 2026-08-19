@@ -74,6 +74,46 @@ impl ControllerActor {
         }
     }
 
+    /// Stage the retirement of one kind's destination routes for a track.
+    ///
+    /// Video and audio differ only in which fanout map names the destination's
+    /// key and which image the plan lives in, so the walk is written once.
+    fn stage_destination_retirement(
+        &mut self,
+        generation: u64,
+        now: tokio::time::Instant,
+        routes: &HashMap<crate::id::ShardId, RouteHandle>,
+        fanouts: &HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
+        target: impl Fn(crate::shard::router::TrackKey) -> crate::view::PlanTarget,
+        releases: &mut Vec<(crate::id::ShardId, RouteHandle)>,
+    ) -> bool {
+        for (destination, route) in routes {
+            let Some(view) = self.view_mut(*destination) else {
+                debug_assert!(false, "a track route must name a local view");
+                self.abort_transaction(now);
+                return false;
+            };
+            view.stage(
+                generation,
+                crate::view::ViewOp::RetireRoute {
+                    route: route.route,
+                    epoch: route.epoch,
+                },
+            );
+            if let Some(key) = fanouts.get(destination).copied() {
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: target(key),
+                    },
+                );
+                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
+            }
+            releases.push((*destination, *route));
+        }
+        true
+    }
+
     pub(super) async fn retire_track_binding(&mut self, track_id: crate::entity::TrackId) -> bool {
         let Some(binding) = self.track_bindings.get(&track_id) else {
             return true;
@@ -85,11 +125,7 @@ impl ControllerActor {
             binding.meta.origin,
             track_id,
         );
-        let video_routes: Vec<(crate::id::ShardId, RouteHandle)> = binding
-            .video_routes
-            .iter()
-            .map(|(shard, route)| (*shard, *route))
-            .collect();
+        let video_routes = binding.video_routes.clone();
         let publisher_shard = binding.publisher_shard;
         let publisher_fanout = binding.publisher_fanout;
         let reverse_route = binding.reverse_route;
@@ -126,53 +162,25 @@ impl ControllerActor {
         };
 
         let mut endpoint_releases = Vec::new();
-        for (destination, route) in &video_routes {
-            let Some(view) = self.view_mut(*destination) else {
-                debug_assert!(false, "a video route must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: route.route,
-                    epoch: route.epoch,
-                },
-            );
-            if let Some(key) = fanouts.get(destination).copied() {
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RemovePlan {
-                        target: crate::view::PlanTarget::Video(key),
-                    },
-                );
-                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
-            }
-            endpoint_releases.push((*destination, *route));
+        if !self.stage_destination_retirement(
+            generation,
+            now,
+            &video_routes,
+            &fanouts,
+            crate::view::PlanTarget::Video,
+            &mut endpoint_releases,
+        ) {
+            return false;
         }
-        for (destination, route) in &audio_routes {
-            let Some(view) = self.view_mut(*destination) else {
-                debug_assert!(false, "an audio route must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: route.route,
-                    epoch: route.epoch,
-                },
-            );
-            if let Some(key) = audio_fanouts.get(destination).copied() {
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RemovePlan {
-                        target: crate::view::PlanTarget::Audio(key),
-                    },
-                );
-                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
-            }
-            endpoint_releases.push((*destination, *route));
+        if !self.stage_destination_retirement(
+            generation,
+            now,
+            &audio_routes,
+            &audio_fanouts,
+            crate::view::PlanTarget::Audio,
+            &mut endpoint_releases,
+        ) {
+            return false;
         }
         if let Some(route) = reverse_route {
             let Some(view) = self.view_mut(publisher_shard) else {
