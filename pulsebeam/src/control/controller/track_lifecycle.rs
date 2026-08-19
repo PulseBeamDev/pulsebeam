@@ -631,32 +631,15 @@ impl ControllerActor {
             crate::entity::TrackKind::Audio => self.audio_patterns.match_subject(&subject),
             _ => self.video_patterns.match_subject(&subject),
         };
-        let mut remote_routes = Vec::new();
-        if shard_id == binding.publisher_shard {
-            for (destination, held) in &binding.destinations {
-                let Some(route) = held.route.filter(|_| *destination != shard_id) else {
-                    continue;
-                };
-                remote_routes.push(crate::view::RemoteRoutePlan {
-                    shard_id: *destination,
-                    route: route.route,
-                    epoch: route.epoch,
-                });
-            }
-        }
         Some((
             fanout,
-            crate::view::VideoPlan {
+            crate::control::publication::forwarding_plan(
+                &binding.destinations,
+                binding.publisher_shard,
+                binding.reverse_route,
                 groups,
-                remote_routes,
-                reverse_route: binding
-                    .reverse_route
-                    .map(|route| crate::view::RemoteRoutePlan {
-                        shard_id: binding.publisher_shard,
-                        route: route.route,
-                        epoch: route.epoch,
-                    }),
-            },
+                shard_id,
+            ),
         ))
     }
 

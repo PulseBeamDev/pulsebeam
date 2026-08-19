@@ -117,6 +117,51 @@ pub(crate) struct Publication {
     pub media: Media,
 }
 
+/// Compile a publication's forwarding plan for one shard.
+///
+/// The same for every kind, because by this point everything that differed has
+/// already been resolved: the audiences are group ids, the destinations are a
+/// map, and the delivery key lives in the group image on the shard rather than
+/// here. What a caller still supplies is which groups matched, since the
+/// pattern tables are keyed differently per kind — that is a detail of
+/// matching, not of planning.
+///
+/// Remote routes only appear on the publisher's own plan: every other shard
+/// receives over a route rather than forwarding onward, so listing them
+/// elsewhere would invite a second hop.
+pub(crate) fn forwarding_plan(
+    destinations: &IndexMap<ShardId, Destination>,
+    publisher_shard: ShardId,
+    reverse_route: Option<RouteHandle>,
+    groups: arrayvec::ArrayVec<crate::view::GroupId, 4>,
+    shard: ShardId,
+) -> crate::view::ForwardingPlan {
+    let remote_routes = if shard == publisher_shard {
+        destinations
+            .iter()
+            .filter_map(|(destination, held)| {
+                let handle = held.route.filter(|_| *destination != publisher_shard)?;
+                Some(crate::view::RemoteRoutePlan {
+                    shard_id: *destination,
+                    route: handle.route,
+                    epoch: handle.epoch,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    crate::view::ForwardingPlan {
+        groups,
+        remote_routes,
+        reverse_route: reverse_route.map(|handle| crate::view::RemoteRoutePlan {
+            shard_id: publisher_shard,
+            route: handle.route,
+            epoch: handle.epoch,
+        }),
+    }
+}
+
 /// Every publication on the node, with the indexes a declaration needs to find
 /// the ones it matches.
 ///

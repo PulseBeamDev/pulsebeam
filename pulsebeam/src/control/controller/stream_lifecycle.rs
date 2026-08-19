@@ -110,34 +110,13 @@ impl ControllerActor {
             name: (id.topic.clone(), lane),
         };
         let groups = self.data_patterns.match_subject(&subject);
-        let remote_routes = if destination == binding.publisher_shard {
-            binding
-                .destinations
-                .iter()
-                .filter_map(|(shard_id, held)| {
-                    let handle = held.route?;
-                    Some(crate::view::RemoteRoutePlan {
-                        shard_id: *shard_id,
-                        route: handle.route,
-                        epoch: handle.epoch,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let reverse_route = binding
-            .reverse_route
-            .map(|handle| crate::view::RemoteRoutePlan {
-                shard_id: binding.publisher_shard,
-                route: handle.route,
-                epoch: handle.epoch,
-            });
-        crate::view::StreamPlan {
+        crate::control::publication::forwarding_plan(
+            &binding.destinations,
+            binding.publisher_shard,
+            binding.reverse_route,
             groups,
-            remote_routes,
-            reverse_route,
-        }
+            destination,
+        )
     }
 
     pub(super) async fn on_stream_ready(
