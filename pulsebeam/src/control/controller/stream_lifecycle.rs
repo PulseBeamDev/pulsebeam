@@ -363,48 +363,80 @@ impl ControllerActor {
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) -> bool {
-        let Some(binding) = self.catalog.get(&data_publication_id(&id, lane)) else {
+        let publication_id = data_publication_id(&id, lane);
+        let Some(publication) = self.catalog.get(&publication_id) else {
             return true;
         };
-        let publisher_shard = binding.publisher_shard;
-        let source_key = binding.origin_key.stream();
-        let destinations = binding.destinations.clone();
-        let routes: Vec<_> = destinations
-            .iter()
-            .filter_map(|(destination, held)| Some((*destination, held.key.stream()?, held.route?)))
-            .collect();
-
-        let mut ops = Vec::new();
-        for (destination, key, route) in &routes {
-            ops.push((*destination, retire_route_op(*route)));
-            ops.extend(remove_stream_ops(*key).map(|op| (*destination, op)));
-        }
-        if let Some(key) = source_key {
-            ops.extend(remove_stream_ops(key).map(|op| (publisher_shard, op)));
-        }
-        if !self.publish_ops(ops) {
-            return false;
-        }
+        let publisher_shard = publication.publisher_shard;
+        let origin_key = publication.origin_key;
+        let destinations = publication.destinations.clone();
 
         let now = tokio::time::Instant::now();
-        for (destination, _, route) in &routes {
-            self.state
-                .release_endpoint(*destination, route.route.slot(), now);
+        if self.state.begin().is_err() {
+            debug_assert!(false, "lifecycle transactions serialise through this actor");
+            return false;
         }
-        if let Some(key) = source_key {
+        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
+            debug_assert!(false, "begin creates a pending lifecycle transaction");
+            return false;
+        };
+
+        let mut releases = Vec::new();
+        if !self.stage_destination_retirement(
+            generation,
+            now,
+            crate::entity::TrackKind::Data,
+            &destinations,
+            &mut releases,
+        ) {
+            return false;
+        }
+        let Some(view) = self.view_mut(publisher_shard) else {
+            debug_assert!(false, "a stream publisher must name a local view");
+            self.abort_transaction(now);
+            return false;
+        };
+        view.stage(
+            generation,
+            crate::view::ViewOp::RemovePlan {
+                target: super::track_lifecycle::plan_target(
+                    crate::entity::TrackKind::Data,
+                    origin_key,
+                ),
+            },
+        );
+        view.stage(
+            generation,
+            super::track_lifecycle::runtime_removal_op(origin_key),
+        );
+
+        for index in 0..self.views.len() {
+            let shard = crate::id::ShardId::new(index);
+            if let Some(view) = self.view_mut(shard) {
+                let _ = view.publish();
+            }
+        }
+        if self.state.commit().is_err() {
+            debug_assert!(false, "a stream retirement must commit");
+            self.abort_transaction(now);
+            return false;
+        }
+        for (shard, route) in releases {
+            self.state.release_endpoint(shard, route.route.slot(), now);
+        }
+        if let Some(key) = origin_key.stream() {
             self.lanes
                 .get(lane)
                 .retire_runtime(&mut self.state, publisher_shard, key);
         }
         for (destination, held) in destinations {
-            let Some(key) = held.key.stream() else {
-                continue;
-            };
-            self.lanes
-                .get(lane)
-                .retire_runtime(&mut self.state, destination, key);
+            if let Some(key) = held.key.stream() {
+                self.lanes
+                    .get(lane)
+                    .retire_runtime(&mut self.state, destination, key);
+            }
         }
-        self.catalog.remove(&data_publication_id(&id, lane));
+        self.catalog.remove(&publication_id);
         true
     }
 

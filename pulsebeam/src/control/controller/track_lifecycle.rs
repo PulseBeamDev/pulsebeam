@@ -1,9 +1,21 @@
 use super::*;
 
+/// The op that removes a publication's runtime from the arena its key names.
+pub(super) fn runtime_removal_op(
+    key: crate::control::publication::RuntimeKey,
+) -> crate::view::ViewOp {
+    use crate::control::publication::RuntimeKey;
+    match key {
+        RuntimeKey::Track(key) => crate::view::ViewOp::RemoveTrackRuntime { key },
+        RuntimeKey::Unreliable(key) => crate::view::ViewOp::RemoveUnreliableRuntime { key },
+        RuntimeKey::Reliable(key) => crate::view::ViewOp::RemoveReliableRuntime { key },
+    }
+}
+
 /// Which image a publication's plan belongs to. Video and audio share an arena
 /// and a key type, so the kind is what tells them apart — the one thing about a
 /// media kind the routing layer still has to know.
-fn plan_target(
+pub(super) fn plan_target(
     kind: crate::entity::TrackKind,
     key: crate::control::publication::RuntimeKey,
 ) -> crate::view::PlanTarget {
@@ -102,7 +114,14 @@ impl ControllerActor {
     ///
     /// Video and audio differ only in which fanout map names the destination's
     /// key and which image the plan lives in, so the walk is written once.
-    fn stage_destination_retirement(
+    /// Stage the retirement of a publication's destinations, whatever arena
+    /// they live in.
+    ///
+    /// Staged rather than published directly, because a route pointing at a
+    /// runtime that has already gone is a packet dropped at the destination
+    /// with nothing to say why. The data lane used to retire without this and
+    /// carried the same hazard.
+    pub(super) fn stage_destination_retirement(
         &mut self,
         generation: u64,
         now: tokio::time::Instant,
@@ -115,7 +134,7 @@ impl ControllerActor {
     ) -> bool {
         for (destination, held) in destinations {
             let Some(view) = self.view_mut(*destination) else {
-                debug_assert!(false, "a track route must name a local view");
+                debug_assert!(false, "a destination must name a local view");
                 self.abort_transaction(now);
                 return false;
             };
@@ -129,15 +148,13 @@ impl ControllerActor {
                 );
                 releases.push((*destination, route));
             }
-            if let Some(key) = held.key.track() {
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RemovePlan {
-                        target: plan_target(kind, held.key),
-                    },
-                );
-                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
-            }
+            view.stage(
+                generation,
+                crate::view::ViewOp::RemovePlan {
+                    target: plan_target(kind, held.key),
+                },
+            );
+            view.stage(generation, runtime_removal_op(held.key));
         }
         true
     }
