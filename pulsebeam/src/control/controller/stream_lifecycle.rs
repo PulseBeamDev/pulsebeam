@@ -363,81 +363,15 @@ impl ControllerActor {
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) -> bool {
-        let publication_id = data_publication_id(&id, lane);
-        let Some(publication) = self.catalog.get(&publication_id) else {
-            return true;
-        };
-        let publisher_shard = publication.publisher_shard;
-        let origin_key = publication.origin_key;
-        let destinations = publication.destinations.clone();
-
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return false;
-        }
-        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
-            debug_assert!(false, "begin creates a pending lifecycle transaction");
-            return false;
-        };
-
-        let mut releases = Vec::new();
-        if !self.stage_destination_retirement(
-            generation,
-            now,
-            crate::entity::TrackKind::Data,
-            &destinations,
-            &mut releases,
-        ) {
-            return false;
-        }
-        let Some(view) = self.view_mut(publisher_shard) else {
-            debug_assert!(false, "a stream publisher must name a local view");
-            self.abort_transaction(now);
-            return false;
-        };
-        view.stage(
-            generation,
-            crate::view::ViewOp::RemovePlan {
-                target: super::track_lifecycle::plan_target(
-                    crate::entity::TrackKind::Data,
-                    origin_key,
-                ),
-            },
-        );
-        view.stage(
-            generation,
-            super::track_lifecycle::runtime_removal_op(origin_key),
-        );
-
-        for index in 0..self.views.len() {
-            let shard = crate::id::ShardId::new(index);
-            if let Some(view) = self.view_mut(shard) {
-                let _ = view.publish();
-            }
-        }
-        if self.state.commit().is_err() {
-            debug_assert!(false, "a stream retirement must commit");
-            self.abort_transaction(now);
-            return false;
-        }
-        for (shard, route) in releases {
-            self.state.release_endpoint(shard, route.route.slot(), now);
-        }
-        if let Some(key) = origin_key.stream() {
-            self.lanes
-                .get(lane)
-                .retire_runtime(&mut self.state, publisher_shard, key);
-        }
-        for (destination, held) in destinations {
-            if let Some(key) = held.key.stream() {
-                self.lanes
+        self.retire_publication(data_publication_id(&id, lane), move |actor, shard, key| {
+            if let Some(key) = key.stream() {
+                actor
+                    .lanes
                     .get(lane)
-                    .retire_runtime(&mut self.state, destination, key);
+                    .retire_runtime(&mut actor.state, shard, key);
             }
-        }
-        self.catalog.remove(&publication_id);
-        true
+        })
+        .await
     }
 
     /// The shards holding at least one declared consumer of this stream.

@@ -159,23 +159,33 @@ impl ControllerActor {
         true
     }
 
-    pub(super) async fn retire_track_binding(&mut self, track_id: crate::entity::TrackId) -> bool {
-        let Some(binding) = self.catalog.get(&track_id) else {
+    /// Retire a publication of any kind: its declarations, its routes, its
+    /// plans and its runtimes.
+    ///
+    /// Staged as one transaction so a route never outlives the runtime it
+    /// resolves to. `arena` is the only per-kind step left - a media key is
+    /// returned to the track arena, a data key to the lane's.
+    pub(super) async fn retire_publication(
+        &mut self,
+        id: crate::entity::TrackId,
+        arena: impl Fn(&mut Self, crate::id::ShardId, crate::control::publication::RuntimeKey),
+    ) -> bool {
+        let Some(publication) = self.catalog.get(&id) else {
             return true;
         };
-        // Its subscribers never unsubscribe from a track that goes away, so the
-        // declarations naming it have to be retired with it.
+        let kind = publication.kind();
+        let publisher_shard = publication.publisher_shard;
+        let origin_key = publication.origin_key;
+        let reverse_route = publication.reverse_route;
+        let destinations = publication.destinations.clone();
         let retired_pattern =
-            crate::control::patterns::Pattern::exact(binding.room, binding.publisher, track_id);
-        let destinations = binding.destinations.clone();
-        let publisher_shard = binding.publisher_shard;
-        let Some(publisher_fanout) = binding.origin_key.track() else {
-            debug_assert!(false, "a media publication holds a media key");
-            return false;
-        };
-        let reverse_route = binding.reverse_route;
-        let kind = track_id.kind();
-        if let Some((group, members)) = self.video_patterns.retire_pattern(&retired_pattern) {
+            crate::control::patterns::Pattern::exact(publication.room, publication.publisher, id);
+
+        // A video track's subscribers named it directly and never unsubscribe
+        // from something that goes away, so their declarations go with it.
+        if kind == crate::entity::TrackKind::Video
+            && let Some((group, members)) = self.video_patterns.retire_pattern(&retired_pattern)
+        {
             let ops = members
                 .into_iter()
                 .map(|(_, shard, key)| {
@@ -190,7 +200,7 @@ impl ControllerActor {
                 })
                 .collect();
             if !self.publish_ops(ops) {
-                debug_assert!(false, "video group retirement must publish");
+                debug_assert!(false, "group retirement must publish");
             }
         }
 
@@ -204,22 +214,16 @@ impl ControllerActor {
             return false;
         };
 
-        let mut endpoint_releases = Vec::new();
-        if !self.stage_destination_retirement(
-            generation,
-            now,
-            kind,
-            &destinations,
-            &mut endpoint_releases,
-        ) {
+        let mut releases = Vec::new();
+        if !self.stage_destination_retirement(generation, now, kind, &destinations, &mut releases) {
             return false;
         }
+        let Some(view) = self.view_mut(publisher_shard) else {
+            debug_assert!(false, "a publisher must name a local view");
+            self.abort_transaction(now);
+            return false;
+        };
         if let Some(route) = reverse_route {
-            let Some(view) = self.view_mut(publisher_shard) else {
-                debug_assert!(false, "a reverse route must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
             view.stage(
                 generation,
                 crate::view::ViewOp::RetireRoute {
@@ -227,75 +231,44 @@ impl ControllerActor {
                     epoch: route.epoch,
                 },
             );
-            endpoint_releases.push((publisher_shard, route));
+            releases.push((publisher_shard, route));
         }
-
-        let Some(view) = self.view_mut(publisher_shard) else {
-            debug_assert!(false, "a track publisher must name a local view");
-            self.abort_transaction(now);
-            return false;
-        };
         view.stage(
             generation,
             crate::view::ViewOp::RemovePlan {
-                target: crate::view::PlanTarget::Video(publisher_fanout),
+                target: plan_target(kind, origin_key),
             },
         );
-        view.stage(
-            generation,
-            crate::view::ViewOp::RemoveTrackRuntime {
-                key: publisher_fanout,
-            },
-        );
-        view.stage(
-            generation,
-            crate::view::ViewOp::RemovePlan {
-                target: crate::view::PlanTarget::Audio(publisher_fanout),
-            },
-        );
-        for (&destination, held) in &destinations {
-            if destination == publisher_shard {
-                continue;
-            }
-            if let Some(view) = self.view_mut(destination) {
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RemovePlan {
-                        target: plan_target(kind, held.key),
-                    },
-                );
-                if let Some(key) = held.key.track() {
-                    view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
-                }
-            }
-        }
+        view.stage(generation, runtime_removal_op(origin_key));
 
-        let mut published = Vec::new();
         for index in 0..self.views.len() {
-            let shard = crate::id::ShardId::new(index);
-            if self
-                .view_mut(shard)
-                .is_some_and(|view| view.publish().is_some())
-            {
-                published.push(shard);
+            if let Some(view) = self.view_mut(crate::id::ShardId::new(index)) {
+                let _ = view.publish();
             }
         }
         if self.state.commit().is_err() {
-            debug_assert!(false, "a published track retirement must commit");
+            debug_assert!(false, "a retirement must commit");
             self.abort_transaction(now);
             return false;
         }
-        for (shard, route) in endpoint_releases {
+        for (shard, route) in releases {
             self.state.release_endpoint(shard, route.route.slot(), now);
         }
-        self.state.remove_track(publisher_shard, publisher_fanout);
+        arena(self, publisher_shard, origin_key);
         for (&destination, held) in &destinations {
-            if let Some(key) = held.key.track() {
-                self.state.remove_track(destination, key);
-            }
+            arena(self, destination, held.key);
         }
-        self.catalog.remove(&track_id);
+        self.catalog.remove(&id);
         true
+    }
+
+    pub(super) async fn retire_track_binding(&mut self, track_id: crate::entity::TrackId) -> bool {
+        self.retire_publication(track_id, |actor, shard, key| {
+            if let Some(key) = key.track() {
+                actor.state.remove_track(shard, key);
+            }
+        })
+        .await
     }
 
     /// A shard reported a newly published track.
