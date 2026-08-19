@@ -4,6 +4,7 @@ pub(crate) mod core;
 pub(crate) mod lanes;
 mod negotiator;
 pub(crate) mod outbox;
+pub(crate) mod patterns;
 pub(crate) mod pending;
 mod registry;
 mod room;
