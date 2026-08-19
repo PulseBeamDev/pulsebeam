@@ -217,6 +217,10 @@ impl ShardRuntime {
             | crate::view::ViewOp::SetTrackPlan { .. }
             | crate::view::ViewOp::RemoveTrackPlan { .. }
             | crate::view::ViewOp::SetAudioPlan { .. }
+            | crate::view::ViewOp::VideoGroupInsert { .. }
+            | crate::view::ViewOp::VideoGroupRemove { .. }
+            | crate::view::ViewOp::BindSubscribedTrack { .. }
+            | crate::view::ViewOp::UnbindSubscribedTrack { .. }
             | crate::view::ViewOp::AudioGroupInsert { .. }
             | crate::view::ViewOp::AudioGroupRemove { .. }
             | crate::view::ViewOp::DataGroupInsert { .. }
@@ -255,6 +259,7 @@ impl ShardRuntime {
         fanout: TrackKey,
         pkt: RtpPacket,
         plan: &crate::view::VideoPlan,
+        groups: &crate::view::GroupImage<DownstreamSlotKey>,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(track) = self.tracks.get_mut(fanout) else {
@@ -273,8 +278,10 @@ impl ShardRuntime {
             debug_assert!(false, "a cached packet must be readable");
             return;
         };
-        for &(subscriber, slot) in &plan.local_subscribers {
-            ctx.forward_video_rtp(subscriber, slot, track_id, packet, Some(cache));
+        for group in &plan.groups {
+            for &(subscriber, slot) in groups.members(*group) {
+                ctx.forward_video_rtp(subscriber, slot, track_id, packet, Some(cache));
+            }
         }
         let playout = ctx.wall().to_ntp(packet.playout_time);
         let link_seq = &mut track.link_seq;
@@ -434,6 +441,7 @@ impl ShardRuntime {
         fanout: TrackKey,
         stats: crate::track::TrackStates,
         plan: &crate::view::VideoPlan,
+        groups: &crate::view::GroupImage<DownstreamSlotKey>,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(track) = self.tracks.get_mut(fanout) else {
@@ -442,8 +450,10 @@ impl ShardRuntime {
         };
         track.layer_states = stats;
         let states = &track.layer_states;
-        for &(subscriber, slot) in &plan.local_subscribers {
-            ctx.update_layer_states(subscriber, slot, states);
+        for group in &plan.groups {
+            for &(subscriber, slot) in groups.members(*group) {
+                ctx.update_layer_states(subscriber, slot, states);
+            }
         }
         for remote in &plan.remote_routes {
             ctx.send_frame(

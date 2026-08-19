@@ -126,7 +126,6 @@ impl ControllerActor {
             });
         crate::view::StreamPlan {
             groups,
-            local_subscribers: Vec::new(),
             remote_routes,
             reverse_route,
         }

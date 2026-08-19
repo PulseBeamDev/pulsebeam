@@ -371,6 +371,32 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         Some((member.shard, member.key))
     }
 
+    /// Drop a pattern outright, returning its group and everyone who was in
+    /// it. For a publication going away: its subscribers never unsubscribe, so
+    /// without this their declarations would outlive the thing they named.
+    pub fn retire_pattern(
+        &mut self,
+        pattern: &Pattern<N>,
+    ) -> Option<(GroupId, Vec<(ParticipantId, ShardId, ParticipantKey)>)> {
+        let id = self.ids.shift_remove(pattern)?;
+        let group = self.groups.get_mut(id.0 as usize).and_then(Option::take)?;
+        let members = group
+            .members
+            .iter()
+            .map(|(participant, member)| (*participant, member.shard, member.key))
+            .collect();
+        for participant in group.members.keys() {
+            if let Some(held) = self.by_participant.get_mut(participant) {
+                held.shift_remove(pattern);
+                if held.is_empty() {
+                    self.by_participant.shift_remove(participant);
+                }
+            }
+        }
+        self.free.push(id);
+        Some((id, members))
+    }
+
     pub fn group_of(&self, pattern: &Pattern<N>) -> Option<GroupId> {
         self.ids.get(pattern).copied()
     }

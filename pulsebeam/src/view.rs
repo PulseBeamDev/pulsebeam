@@ -76,12 +76,13 @@ pub(crate) struct ShardView {
     pub generation: u64,
     pub routes: RouteImage,
     pub transports: TransportImage,
-    pub tracks: ForwardingImage<TrackKey, DownstreamSlotKey>,
-    pub audio: ForwardingImage<TrackKey, ()>,
+    pub tracks: ForwardingImage<TrackKey>,
+    pub audio: ForwardingImage<TrackKey>,
+    pub video_groups: GroupImage<DownstreamSlotKey>,
     pub audio_groups: GroupImage<()>,
     pub data_groups: GroupImage<ChannelId>,
-    pub unreliable: ForwardingImage<UnreliableStreamKey, ChannelId>,
-    pub reliable: ForwardingImage<ReliableStreamKey, ChannelId>,
+    pub unreliable: ForwardingImage<UnreliableStreamKey>,
+    pub reliable: ForwardingImage<ReliableStreamKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,20 +105,22 @@ pub(crate) struct RemoteRoutePlan {
 /// and its origin; repeating them here made two sources of truth and a
 /// `debug_assert` to catch them diverging.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForwardingPlan<D> {
-    pub local_subscribers: Vec<(ParticipantKey, D)>,
-    /// Audiences this stream reaches whose membership is shared with other
-    /// streams, so a member joining or leaving does not rewrite this plan. At
-    /// most four, because only four patterns can match one subject.
+pub(crate) struct ForwardingPlan {
+    /// The audiences this stream reaches. Membership lives on the shard, so a
+    /// subscriber joining or leaving one does not rewrite this plan. At most
+    /// four, because only four patterns can match one subject.
+    ///
+    /// The delivery key an audience carries — a downstream slot for video, an
+    /// SCTP channel for data, nothing for audio — lives in the group image, not
+    /// here, so every kind's plan is the same type.
     pub groups: ArrayVec<GroupId, 4>,
     pub remote_routes: Vec<RemoteRoutePlan>,
     pub reverse_route: Option<RemoteRoutePlan>,
 }
 
-impl<D> Default for ForwardingPlan<D> {
+impl Default for ForwardingPlan {
     fn default() -> Self {
         Self {
-            local_subscribers: Vec::new(),
             groups: ArrayVec::new(),
             remote_routes: Vec::new(),
             reverse_route: None,
@@ -125,9 +128,9 @@ impl<D> Default for ForwardingPlan<D> {
     }
 }
 
-pub(crate) type VideoPlan = ForwardingPlan<DownstreamSlotKey>;
-pub(crate) type AudioPlan = ForwardingPlan<()>;
-pub(crate) type StreamPlan = ForwardingPlan<ChannelId>;
+pub(crate) type VideoPlan = ForwardingPlan;
+pub(crate) type AudioPlan = ForwardingPlan;
+pub(crate) type StreamPlan = ForwardingPlan;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
@@ -141,11 +144,11 @@ pub(crate) struct TrackDescriptor {
 }
 
 #[derive(Debug)]
-pub(crate) struct ForwardingImage<K: slotmap::Key, D> {
-    plans: SecondaryMap<K, ForwardingPlan<D>>,
+pub(crate) struct ForwardingImage<K: slotmap::Key> {
+    plans: SecondaryMap<K, ForwardingPlan>,
 }
 
-impl<K: slotmap::Key, D> Default for ForwardingImage<K, D> {
+impl<K: slotmap::Key> Default for ForwardingImage<K> {
     fn default() -> Self {
         Self {
             plans: SecondaryMap::new(),
@@ -153,12 +156,12 @@ impl<K: slotmap::Key, D> Default for ForwardingImage<K, D> {
     }
 }
 
-impl<K: slotmap::Key, D: Clone> ForwardingImage<K, D> {
-    pub fn resolve(&self, key: K) -> Option<&ForwardingPlan<D>> {
+impl<K: slotmap::Key> ForwardingImage<K> {
+    pub fn resolve(&self, key: K) -> Option<&ForwardingPlan> {
         self.plans.get(key)
     }
 
-    fn upsert(&mut self, key: K, plan: ForwardingPlan<D>) {
+    fn upsert(&mut self, key: K, plan: ForwardingPlan) {
         let _ = self.plans.insert(key, plan);
     }
 
@@ -318,6 +321,29 @@ pub(crate) enum ViewOp {
         key: TrackKey,
         plan: AudioPlan,
     },
+    VideoGroupInsert {
+        group: GroupId,
+        key: ParticipantKey,
+        slot: DownstreamSlotKey,
+    },
+    VideoGroupRemove {
+        group: GroupId,
+        key: ParticipantKey,
+    },
+    /// A participant now consumes this track here. Stated by the control plane
+    /// rather than inferred by the shard from successive plans: control is
+    /// where a subscription begins, and a plan that names a shared audience no
+    /// longer changes when one member joins it.
+    BindSubscribedTrack {
+        participant: ParticipantKey,
+        track: TrackId,
+        fanout: TrackKey,
+    },
+    UnbindSubscribedTrack {
+        participant: ParticipantKey,
+        track: TrackId,
+        fanout: TrackKey,
+    },
     AudioGroupInsert {
         group: GroupId,
         key: ParticipantKey,
@@ -386,10 +412,16 @@ impl ShardViewDelta {
                 | ViewOp::InsertUnreliableRuntime { .. }
                 | ViewOp::RemoveUnreliableRuntime { .. }
                 | ViewOp::InsertReliableRuntime { .. }
-                | ViewOp::RemoveReliableRuntime { .. } => {}
+                | ViewOp::RemoveReliableRuntime { .. }
+                | ViewOp::BindSubscribedTrack { .. }
+                | ViewOp::UnbindSubscribedTrack { .. } => {}
                 ViewOp::SetTrackPlan { key, plan } => view.tracks.upsert(key, plan),
                 ViewOp::RemoveTrackPlan { key } => view.tracks.remove(key),
                 ViewOp::SetAudioPlan { key, plan } => view.audio.upsert(key, plan),
+                ViewOp::VideoGroupInsert { group, key, slot } => {
+                    view.video_groups.insert(group, key, slot);
+                }
+                ViewOp::VideoGroupRemove { group, key } => view.video_groups.remove(group, key),
                 ViewOp::AudioGroupInsert { group, key } => view.audio_groups.insert(group, key, ()),
                 ViewOp::AudioGroupRemove { group, key } => view.audio_groups.remove(group, key),
                 ViewOp::DataGroupInsert {

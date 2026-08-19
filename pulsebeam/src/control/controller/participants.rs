@@ -78,8 +78,52 @@ impl ControllerActor {
         &mut self,
         participant_id: &ParticipantId,
     ) {
-        for retired in self.subscriptions.remove_participant(participant_id) {
-            self.release_route(retired.destination, retired.route).await;
+        // Video: the tracks it subscribed to are named by its own declarations,
+        // and a route only retires when it was that participant's alone.
+        let watched = self.video_patterns.declarations_of(participant_id);
+        let placement = self
+            .core
+            .registry
+            .get_participant(participant_id)
+            .and_then(|meta| meta.binding)
+            .zip(
+                self.core
+                    .registry
+                    .transport_of(participant_id)
+                    .map(|(s, _)| s),
+            );
+        let mut departures = Vec::new();
+        for pattern in &watched {
+            let Some(track_id) = pattern.name else {
+                continue;
+            };
+            let departure = self.video_patterns.undeclare(pattern, participant_id);
+            departures.push((track_id, departure));
+        }
+        if let Some((key, shard)) = placement {
+            let ops: Vec<_> = watched
+                .iter()
+                .filter_map(|pattern| {
+                    let group = self.video_patterns.group_of(pattern)?;
+                    Some((shard, crate::view::ViewOp::VideoGroupRemove { group, key }))
+                })
+                .collect();
+            if !self.publish_ops(ops) {
+                debug_assert!(false, "video group retraction must publish");
+            }
+            for (track_id, departure) in departures {
+                if departure != crate::control::patterns::Departure::LastOnShard {
+                    continue;
+                }
+                let Some(route) = self
+                    .track_bindings
+                    .get_mut(&track_id)
+                    .and_then(|binding| binding.video_routes.remove(&shard))
+                else {
+                    continue;
+                };
+                self.release_route(shard, route).await;
+            }
         }
         self.pending.remove_participant(*participant_id);
         let key = self

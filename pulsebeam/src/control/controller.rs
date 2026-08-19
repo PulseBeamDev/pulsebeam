@@ -54,6 +54,9 @@ struct TrackBinding {
     publisher_fanout: crate::shard::router::TrackKey,
     reverse_route: Option<RouteHandle>,
     fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
+    /// Where this track's video is routed. Held here for the same reason
+    /// `audio_routes` is: a route outlives any one subscriber's interest.
+    video_routes: HashMap<crate::id::ShardId, RouteHandle>,
     audio_fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
     audio_routes: HashMap<crate::id::ShardId, RouteHandle>,
 }
@@ -130,9 +133,13 @@ pub struct ControllerActor {
     /// The canonical lifecycle state. Only this actor mutates it, and no
     /// shard ever reads it — a shard reads the view projected from it.
     state: ControlPlaneState,
-    /// Who consumes what, and therefore which routes exist. The decision the
-    /// shard used to make by counting its own subscribers.
-    subscriptions: crate::control::subscriptions::TrackSubscriptions,
+    /// Video declarations. Always fully concrete: a video subscription *is* a
+    /// downstream slot allocation, and a slot belongs to one track, so a
+    /// pattern here can never wildcard the name.
+    video_patterns: crate::control::patterns::PatternTable<
+        crate::entity::TrackId,
+        crate::keys::DownstreamSlotKey,
+    >,
     /// One writer per shard. Never shared, never locked, and never handed to
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
@@ -190,7 +197,7 @@ impl ControllerActor {
             cluster_id: 0,
             node_id: 0,
             state: ControlPlaneState::new(shard_count),
-            subscriptions: crate::control::subscriptions::TrackSubscriptions::new(),
+            video_patterns: crate::control::patterns::PatternTable::new(),
             views,
             track_bindings: HashMap::new(),
             lanes: Lanes::new(),
@@ -829,6 +836,7 @@ impl ControllerActor {
                         publisher_fanout: fanout,
                         reverse_route: None,
                         fanouts: HashMap::new(),
+                        video_routes: HashMap::new(),
                         audio_fanouts: HashMap::new(),
                         audio_routes: HashMap::new(),
                     },
