@@ -34,7 +34,7 @@ impl ControllerActor {
                     publisher,
                     topic,
                 )],
-                None => self.lanes.get(lane).ids_on_topic(&pattern.room, &topic),
+                None => self.streams_on_topic(pattern.room, &topic, lane),
             };
             for id in ids {
                 if !affected.iter().any(|(held, _)| *held == id) {

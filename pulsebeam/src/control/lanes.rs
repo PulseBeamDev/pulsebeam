@@ -47,78 +47,13 @@ impl StreamLane {
     }
 }
 
-/// Which publishers are live on each topic.
-///
-/// A wildcard subscription has to name every stream on its topic, and without
-/// this that means walking every stream on the node. Kept beside the bindings
-/// rather than derived from them, so it is one lookup instead of one scan.
-#[derive(Default)]
-struct TopicIndex {
-    publishers: HashMap<(RoomId, Topic), Vec<ParticipantId>>,
-}
-
-impl TopicIndex {
-    fn insert(&mut self, id: &DataStreamId) {
-        let publishers = self
-            .publishers
-            .entry((id.room_id, id.topic.clone()))
-            .or_default();
-        if !publishers.contains(&id.publisher_id) {
-            publishers.push(id.publisher_id);
-        }
-    }
-
-    fn remove(&mut self, id: &DataStreamId) {
-        let key = (id.room_id, id.topic.clone());
-        let Some(publishers) = self.publishers.get_mut(&key) else {
-            return;
-        };
-        publishers.retain(|publisher| *publisher != id.publisher_id);
-        if publishers.is_empty() {
-            self.publishers.remove(&key);
-        }
-    }
-
-    fn streams(&self, room: &RoomId, topic: &Topic) -> Vec<DataStreamId> {
-        self.publishers
-            .get(&(*room, topic.clone()))
-            .into_iter()
-            .flatten()
-            .map(|publisher| DataStreamId::new(*room, *publisher, topic.clone()))
-            .collect()
-    }
-}
-
 pub(crate) struct LaneRegistry {
     lane: StreamLane,
-    by_topic: TopicIndex,
 }
 
 impl LaneRegistry {
     pub(crate) fn new(lane: StreamLane) -> Self {
-        Self {
-            lane,
-            by_topic: TopicIndex::default(),
-        }
-    }
-
-    /// Forget a stream's topic. The publication itself lives in the catalog;
-    /// this is only the index that answers which publishers a topic has.
-    pub(crate) fn forget_topic(&mut self, id: &DataStreamId) {
-        self.by_topic.remove(id);
-    }
-
-    /// Every live stream carrying `topic` in `room`. The set a wildcard
-    /// subscription resolves to at the moment it is made.
-    pub(crate) fn ids_on_topic(&self, room: &RoomId, topic: &Topic) -> Vec<DataStreamId> {
-        self.by_topic.streams(room, topic)
-    }
-
-    /// Publish `id`, draining anyone who subscribed before it existed.
-    /// Record that this topic has a publisher, for the wildcard subscriptions
-    /// that ask which streams exist on it.
-    pub(crate) fn note_topic(&mut self, id: &DataStreamId) {
-        self.by_topic.insert(id);
+        Self { lane }
     }
 
     /// The route action that carries this lane's traffic. `None` when the key

@@ -610,40 +610,75 @@ impl ControllerActor {
         }
     }
 
+    /// The audiences a publication reaches.
+    ///
+    /// The tables are per kind because the delivery key is - a video slot, an
+    /// audio slot chosen per packet, an SCTP channel - and the data table is
+    /// keyed by topic because a data declaration names one across publishers.
+    /// Selecting the table is the whole of what differs; a match yields the
+    /// same group ids either way.
+    pub(super) fn groups_of(
+        &self,
+        publication: &crate::control::publication::Publication,
+    ) -> arrayvec::ArrayVec<crate::view::GroupId, 4> {
+        use crate::control::publication::Media;
+        match &publication.media {
+            Media::Audio => self
+                .audio_patterns
+                .match_subject(&crate::control::patterns::Subject {
+                    room: publication.room,
+                    publisher: publication.publisher,
+                    name: publication.id,
+                }),
+            Media::Video { .. } => {
+                self.video_patterns
+                    .match_subject(&crate::control::patterns::Subject {
+                        room: publication.room,
+                        publisher: publication.publisher,
+                        name: publication.id,
+                    })
+            }
+            Media::Data { lane, topic } => {
+                let lane = match lane {
+                    crate::track::DataLane::Realtime => {
+                        crate::control::lanes::StreamLane::Unreliable
+                    }
+                    crate::track::DataLane::Reliable => crate::control::lanes::StreamLane::Reliable,
+                };
+                self.data_patterns
+                    .match_subject(&crate::control::patterns::Subject {
+                        room: publication.room,
+                        publisher: publication.publisher,
+                        name: (topic.clone(), lane),
+                    })
+            }
+        }
+    }
+
+    /// One publication's plan for one shard, whatever kind it is.
+    pub(super) fn plan_for(
+        &self,
+        id: crate::entity::TrackId,
+        shard: crate::id::ShardId,
+    ) -> Option<crate::view::ForwardingPlan> {
+        let publication = self.catalog.get(&id)?;
+        Some(crate::control::publication::forwarding_plan(
+            &publication.destinations,
+            publication.publisher_shard,
+            publication.reverse_route,
+            self.groups_of(publication),
+            shard,
+        ))
+    }
+
     pub(super) fn track_plan(
         &self,
         track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
     ) -> Option<(crate::shard::router::TrackKey, crate::view::VideoPlan)> {
-        let binding = self.catalog.get(&track_id)?;
-        let fanout = if shard_id == binding.publisher_shard {
-            binding.origin_key.track()?
-        } else {
-            binding
-                .destinations
-                .get(&shard_id)
-                .and_then(|d| d.key.track())?
-        };
-        let subject = crate::control::patterns::Subject {
-            room: binding.room,
-            publisher: binding.publisher,
-            name: track_id,
-        };
-        // The delivery key differs per kind so the tables are separate, but a
-        // match yields the same group ids either way.
-        let groups = match track_id.kind() {
-            crate::entity::TrackKind::Audio => self.audio_patterns.match_subject(&subject),
-            _ => self.video_patterns.match_subject(&subject),
-        };
         Some((
-            fanout,
-            crate::control::publication::forwarding_plan(
-                &binding.destinations,
-                binding.publisher_shard,
-                binding.reverse_route,
-                groups,
-                shard_id,
-            ),
+            self.track_fanout(track_id, shard_id)?,
+            self.plan_for(track_id, shard_id)?,
         ))
     }
 

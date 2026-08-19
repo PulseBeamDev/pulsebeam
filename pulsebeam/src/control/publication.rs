@@ -404,6 +404,18 @@ mod tests {
         assert_ne!(realtime, reliable);
     }
 
+    /// A topic is scoped to its room, which the lane registry's index used to
+    /// assert before the catalog took the question over.
+    #[test]
+    fn a_data_label_is_scoped_to_its_room() {
+        let mut catalog = Catalog::new();
+        catalog.insert(data(room("a"), 1, DataLane::Realtime, "chat"));
+
+        let label = label_of(DataLane::Realtime, "chat");
+        assert_eq!(catalog.on_label(room("a"), &label).len(), 1);
+        assert!(catalog.on_label(room("b"), &label).is_empty());
+    }
+
     #[test]
     fn a_publishers_output_is_scoped_to_its_kind_and_room() {
         let mut catalog = Catalog::new();
