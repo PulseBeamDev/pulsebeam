@@ -460,7 +460,17 @@ impl ControllerActor {
             };
             let plan = self.stream_plan(&id, lane, destination);
             let Some(route) = self
-                .grant_route_with_plan(destination, action, lane, plan.clone())
+                .grant_route_binding(
+                    destination,
+                    action,
+                    Some((
+                        super::track_lifecycle::plan_target(
+                            crate::entity::TrackKind::Data,
+                            key.into(),
+                        ),
+                        plan.clone(),
+                    )),
+                )
                 .await
             else {
                 continue;

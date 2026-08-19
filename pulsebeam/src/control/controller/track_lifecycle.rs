@@ -359,10 +359,7 @@ impl ControllerActor {
                 .grant_route_binding(
                     destination,
                     RouteAction::Audio { track: key },
-                    None,
-                    Some(plan),
-                    None,
-                    None,
+                    Some((crate::view::PlanTarget::Audio(key), plan)),
                 )
                 .await
             else {
