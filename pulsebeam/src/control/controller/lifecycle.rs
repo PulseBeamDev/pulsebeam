@@ -184,7 +184,7 @@ impl ControllerActor {
                         super::stream_lifecycle::insert_stream_runtime_op(
                             key,
                             stream_id.clone(),
-                            publisher_key,
+                            (shard == publisher_shard).then_some(publisher_key),
                         ),
                     ));
                     ops.extend(route.map(|route| {
@@ -243,7 +243,6 @@ impl ControllerActor {
                 }
             }
         }
-
         if !self.retire_stale_destinations(id, &wanted).await {
             debug_assert!(false, "stale destination retirement must complete");
             return false;

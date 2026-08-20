@@ -51,7 +51,13 @@ pub fn from_socket(
     socket: UdpSocket,
     external_addr: Option<SocketAddr>,
 ) -> io::Result<UdpTransport> {
-    from_shared(Arc::new(socket), external_addr)
+    build(
+        Arc::new(socket),
+        external_addr,
+        UdpMode::Scalar,
+        #[cfg(feature = "sim")]
+        None,
+    )
 }
 
 /// Build a transport over a socket shared with the rest of a `SO_REUSEPORT`
@@ -66,7 +72,17 @@ pub(crate) fn from_reuseport_member(
     external_addr: Option<SocketAddr>,
     member: crate::net::bound_udp::ReuseportMember,
 ) -> io::Result<UdpTransport> {
-    build(socket, external_addr, Some(member))
+    from_reuseport_member_with_mode(socket, external_addr, member, UdpMode::Scalar)
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn from_reuseport_member_with_mode(
+    socket: Arc<UdpSocket>,
+    external_addr: Option<SocketAddr>,
+    member: crate::net::bound_udp::ReuseportMember,
+    mode: UdpMode,
+) -> io::Result<UdpTransport> {
+    build(socket, external_addr, mode, Some(member))
 }
 
 /// Build a transport over a socket that may already have other transports on
@@ -79,6 +95,7 @@ pub fn from_shared(
     build(
         socket,
         external_addr,
+        UdpMode::Scalar,
         #[cfg(feature = "sim")]
         None,
     )
@@ -87,6 +104,7 @@ pub fn from_shared(
 fn build(
     socket: Arc<UdpSocket>,
     external_addr: Option<SocketAddr>,
+    mode: UdpMode,
     #[cfg(feature = "sim")] member: Option<crate::net::bound_udp::ReuseportMember>,
 ) -> io::Result<UdpTransport> {
     let local_addr = external_addr.unwrap_or(socket.local_addr()?);
@@ -95,6 +113,7 @@ fn build(
         sock: socket.clone(),
         local_addr,
         arena: vec![0; CHUNK_SIZE].into_boxed_slice(),
+        mode,
         #[cfg(feature = "sim")]
         member,
     };
@@ -149,11 +168,49 @@ pub struct UdpTransportReader {
     sock: Arc<UdpSocket>,
     local_addr: SocketAddr,
     arena: Box<[u8]>,
+    mode: UdpMode,
     /// Set when this socket is one of several bound to the same address. Its
     /// arrivals then come from the group rather than straight off the socket,
     /// because which member a datagram belongs to is the group's decision.
     #[cfg(feature = "sim")]
     member: Option<crate::net::bound_udp::ReuseportMember>,
+}
+
+#[cfg(test)]
+mod batch_shape_tests {
+    use super::*;
+
+    #[test]
+    fn batch_receive_preserves_gro_datagram_boundaries() {
+        let source: SocketAddr = "192.168.1.20:49152".parse().unwrap();
+        let destination: SocketAddr = "192.168.1.1:3478".parse().unwrap();
+        let mut out = Vec::new();
+
+        UdpTransportReader::append_datagram(
+            &mut out,
+            destination,
+            source,
+            vec![1, 2, 3, 4],
+            true,
+            UdpMode::Batch,
+        );
+        UdpTransportReader::append_datagram(
+            &mut out,
+            destination,
+            source,
+            vec![5, 6, 7, 8],
+            true,
+            UdpMode::Batch,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].transport, Transport::Udp(UdpMode::Batch));
+        assert_eq!(out[0].stride, 4);
+        assert_eq!(out[0].len, 8);
+        assert_eq!(out[0].next_packet(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(out[0].next_packet(), Some(&[5, 6, 7, 8][..]));
+        assert_eq!(out[0].next_packet(), None);
+    }
 }
 
 impl UdpTransportReader {
@@ -193,7 +250,14 @@ impl UdpTransportReader {
                             buf.len() <= CHUNK_SIZE,
                             "reuseport datagram exceeds the chunk size"
                         );
-                        Self::append_datagram(out, self.local_addr, src, buf, gro_enabled);
+                        Self::append_datagram(
+                            out,
+                            self.local_addr,
+                            src,
+                            buf,
+                            gro_enabled,
+                            self.mode,
+                        );
                     }
                     Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
                     Err(err) => return Err(err),
@@ -212,7 +276,14 @@ impl UdpTransportReader {
                     );
                     debug_assert!(n <= self.arena.len());
                     let buf = self.arena.get(..n).unwrap_or_default().to_vec();
-                    Self::append_datagram(out, self.local_addr, source, buf, gro_enabled);
+                    Self::append_datagram(
+                        out,
+                        self.local_addr,
+                        source,
+                        buf,
+                        gro_enabled,
+                        self.mode,
+                    );
                 }
                 Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
                 Err(err) => return Err(err),
@@ -228,6 +299,7 @@ impl UdpTransportReader {
         src: SocketAddr,
         buf: Vec<u8>,
         gro_enabled: bool,
+        mode: UdpMode,
     ) {
         let len = buf.len();
         debug_assert_ne!(len, 0);
@@ -244,7 +316,7 @@ impl UdpTransportReader {
             }
         }
         out.push(RecvPacketBatch {
-            transport: Transport::Udp(UdpMode::Scalar),
+            transport: Transport::Udp(mode),
             src,
             dst,
             buf,
@@ -330,7 +402,7 @@ impl UdpTransportWriter {
             for segment in batch.buf.chunks(batch.segment_size) {
                 self.try_send_datagram(now, batch.dst, segment)?;
             }
-            return Ok(true);
+            Ok(true)
         }
 
         #[cfg(not(feature = "sim"))]

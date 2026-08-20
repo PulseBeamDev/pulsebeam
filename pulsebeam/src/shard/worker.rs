@@ -287,6 +287,7 @@ pub(crate) enum ShardEvent {
     },
     ParticipantClosed {
         participant: ParticipantId,
+        key: crate::shard::participants::ParticipantKey,
     },
     TrackSubscribed {
         subscriber: ParticipantId,
@@ -844,6 +845,7 @@ mod architecture_tests {
     fn event_surface_has_an_exhaustive_guard() {
         let event = ShardEvent::ParticipantClosed {
             participant: ParticipantId::from_bytes([0; 16]),
+            key: crate::shard::participants::ParticipantKey::default(),
         };
         assert_eq!(event_variant(&event), 0);
     }

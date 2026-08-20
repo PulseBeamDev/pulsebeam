@@ -109,7 +109,7 @@ struct UnreliableRuntime {
 /// The same stream, plus what the feedback path needs to address its publisher.
 pub(crate) struct ReliableRuntime {
     id: DataStreamId,
-    publisher: ParticipantKey,
+    publisher: Option<ParticipantKey>,
     link_seq: u32,
 }
 
@@ -479,9 +479,10 @@ impl ShardRuntime {
         };
         let origin = match target {
             crate::route::ReverseTarget::Track { track } => self.track_origin(track),
-            crate::route::ReverseTarget::Topic { stream } => {
-                self.reliable.get(stream).map(|runtime| runtime.publisher)
-            }
+            crate::route::ReverseTarget::Topic { stream } => self
+                .reliable
+                .get(stream)
+                .and_then(|runtime| runtime.publisher),
         }?;
         Some((origin, target))
     }

@@ -13,7 +13,7 @@ use pulsebeam_agent::{
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -50,13 +50,20 @@ fn http_base_uri(ip: IpAddr, port: u16) -> String {
     }
 }
 
+fn unspecified_addr(ip: IpAddr) -> SocketAddr {
+    match ip {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
+
 impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let client = create_http_client();
         let server_base_uri = http_base_uri(server_ip, 7070);
         let api = HttpApiClient::new(client, &server_base_uri)?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = UdpSocket::bind(unspecified_addr(ip)).await?;
 
         Ok(Self {
             ip,
@@ -81,7 +88,7 @@ impl SimClientBuilder {
         let server_base_uri = http_base_uri(server_ip, 7070);
         let api = HttpApiClient::new(client, &server_base_uri)?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = UdpSocket::bind(unspecified_addr(ip)).await?;
         let server_tcp_addr = std::net::SocketAddr::new(server_ip, 3478);
 
         Ok(Self {
@@ -520,6 +527,9 @@ pub struct VideoReceiveStats {
     pub keyframes: u64,
     pub missing_parameter_sets: u64,
     pub non_contiguous: u64,
+    pub duplicate_ts_frames: u64,
+    pub ts_regression_count: u64,
+    pub max_ts_regression: u64,
     pub longest_frame_gap: Duration,
     pub first_frame_at: Option<Instant>,
     pub last_frame_at: Option<Instant>,
@@ -535,6 +545,13 @@ impl VideoReceiveStats {
                 .missing_parameter_sets
                 .saturating_sub(baseline.missing_parameter_sets),
             non_contiguous: self.non_contiguous.saturating_sub(baseline.non_contiguous),
+            duplicate_ts_frames: self
+                .duplicate_ts_frames
+                .saturating_sub(baseline.duplicate_ts_frames),
+            ts_regression_count: self
+                .ts_regression_count
+                .saturating_sub(baseline.ts_regression_count),
+            max_ts_regression: self.max_ts_regression.max(baseline.max_ts_regression),
             longest_frame_gap: self.longest_frame_gap.max(baseline.longest_frame_gap),
             first_frame_at: self.first_frame_at.or(baseline.first_frame_at),
             last_frame_at: self.last_frame_at,
@@ -575,6 +592,9 @@ impl VideoReceiveLog {
             keyframes: self.keyframes,
             missing_parameter_sets: self.missing_parameter_sets,
             non_contiguous: self.non_contiguous,
+            duplicate_ts_frames: self.duplicate_ts_frames,
+            ts_regression_count: self.ts_regression_count,
+            max_ts_regression: self.max_ts_regression,
             longest_frame_gap: self.longest_frame_gap,
             first_frame_at: self.first_frame_at,
             last_frame_at: self.last_frame_at,

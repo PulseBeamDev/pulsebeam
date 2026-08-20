@@ -47,12 +47,31 @@ impl SlotManager {
     }
 
     pub fn register(&mut self, mid: Mid) {
+        debug_assert!(!self.slots.iter().any(|slot| slot.mid == mid));
+        if self.slots.iter().any(|slot| slot.mid == mid) {
+            return;
+        }
         self.slots.push(ReceiverSlot {
             paused: false,
             speaker: None,
             mid,
             track_id: None,
         });
+    }
+
+    pub fn replace_slots(&mut self, mids: Vec<Mid>) {
+        for (track_id, publication) in self.active_tracks.drain() {
+            self.pending_tracks.entry(track_id).or_insert(publication);
+        }
+        self.slots = mids
+            .into_iter()
+            .map(|mid| ReceiverSlot {
+                mid,
+                track_id: None,
+                paused: false,
+                speaker: None,
+            })
+            .collect();
     }
 
     /// A track the SFU has told us about, whether or not it currently occupies a slot.

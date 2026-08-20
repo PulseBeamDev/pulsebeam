@@ -107,6 +107,67 @@ impl OrderedTopics {
         }
     }
 
+    pub(super) fn channel_templates(&self) -> Vec<(ChannelId, ChannelConfig)> {
+        self.publishers
+            .values()
+            .map(|publisher| {
+                (
+                    publisher.channel_id,
+                    ChannelConfig {
+                        label: label(DataTrackDirection::Publish, &publisher.handle.topic, None),
+                        ordered: true,
+                        reliability: Reliability::Reliable,
+                        negotiated: None,
+                        protocol: String::new(),
+                    },
+                )
+            })
+            .chain(self.subscribers.iter().map(|(topic, subscriber)| {
+                (
+                    subscriber.channel_id,
+                    ChannelConfig {
+                        label: label(DataTrackDirection::Subscribe, topic, None),
+                        ordered: true,
+                        reliability: Reliability::Reliable,
+                        negotiated: None,
+                        protocol: String::new(),
+                    },
+                )
+            }))
+            .collect()
+    }
+
+    pub(super) fn rebind_channels(&mut self, remap: &HashMap<ChannelId, ChannelId>) {
+        for publisher in self.publishers.values_mut() {
+            let Some(new_id) = remap.get(&publisher.channel_id).copied() else {
+                continue;
+            };
+            publisher.channel_id = new_id;
+            publisher.handle.channel_id = new_id;
+            publisher.opened = false;
+            publisher.stream_id = publisher.stream_id.wrapping_add(1);
+            debug_assert_ne!(publisher.stream_id, 0);
+            publisher.next_seq = 0;
+            publisher.retransmits.clear();
+        }
+        for subscriber in self.subscribers.values_mut() {
+            if let Some(new_id) = remap.get(&subscriber.channel_id).copied() {
+                subscriber.channel_id = new_id;
+                subscriber.publishers.clear();
+            }
+        }
+        self.publisher_channels = self
+            .publishers
+            .iter()
+            .map(|(topic, publisher)| (publisher.channel_id, topic.clone()))
+            .collect();
+        self.subscriber_channels = self
+            .subscribers
+            .iter()
+            .map(|(topic, subscriber)| (subscriber.channel_id, topic.clone()))
+            .collect();
+    }
+
     pub(super) fn declare_publisher(
         &mut self,
         rtc: &mut Rtc,

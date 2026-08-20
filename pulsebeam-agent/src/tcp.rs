@@ -17,6 +17,8 @@ pub(crate) struct TcpSession {
     buf: Vec<u8>,
     /// RFC 4571 reassembly buffer for incomplete frames.
     recv_accum: BytesMut,
+    /// A framed payload whose write was only partially accepted by TCP.
+    pending_write: BytesMut,
     /// Local address of the TCP socket (used as `Receive::destination`).
     local_addr: Option<SocketAddr>,
     /// Server's TCP address (used as `Receive::source`).
@@ -24,8 +26,8 @@ pub(crate) struct TcpSession {
 }
 
 impl TcpSession {
-    /// Maximum RFC 4571 payload — one MTU-sized datagram equivalent.
-    const MAX_FRAME: usize = 1_500;
+    /// RFC 4571's length field is the complete 16-bit unsigned range.
+    const MAX_FRAME: usize = u16::MAX as usize;
 
     /// No TCP connectivity; the select arm for this session parks indefinitely.
     pub(crate) fn inactive() -> Self {
@@ -33,6 +35,7 @@ impl TcpSession {
             stream: None,
             buf: vec![0u8; 2048],
             recv_accum: BytesMut::new(),
+            pending_write: BytesMut::new(),
             local_addr: None,
             server_addr: None,
         }
@@ -47,9 +50,14 @@ impl TcpSession {
             stream: Some(stream),
             buf: vec![0u8; 2048],
             recv_accum: BytesMut::new(),
+            pending_write: BytesMut::new(),
             local_addr,
             server_addr: Some(server_addr),
         }
+    }
+
+    pub(crate) fn server_addr(&self) -> Option<SocketAddr> {
+        self.server_addr
     }
 
     /// Await readable data on the stream.  Parks forever when there is no
@@ -119,7 +127,7 @@ impl TcpSession {
     }
 
     pub(crate) fn try_send(&mut self, payload: &[u8]) {
-        let Some(stream) = &mut self.stream else {
+        let Some(stream) = self.stream.as_ref() else {
             return;
         };
 
@@ -139,25 +147,46 @@ impl TcpSession {
         packet.extend_from_slice(&header);
         packet.extend_from_slice(payload);
 
+        while !self.pending_write.is_empty() {
+            match stream.try_write(&self.pending_write) {
+                Ok(0) => {
+                    self.close();
+                    return;
+                }
+                Ok(n) => {
+                    debug_assert!(n <= self.pending_write.len());
+                    if n > self.pending_write.len() {
+                        self.close();
+                        return;
+                    }
+                    self.pending_write.advance(n);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) => {
+                    tracing::warn!("TCP pending write failed, closing stream: {:?}", e);
+                    self.close();
+                    return;
+                }
+            }
+        }
+
         match stream.try_write(&packet) {
             Ok(n) if n == packet.len() => {}
             Ok(n) => {
-                // Partial write. Because TCP is a stream, a partial write corrupts
-                // the protocol alignment for all subsequent packets. Terminate connection.
-                tracing::warn!(
-                    "TCP partial write (wrote {}/{} bytes), killing stream",
-                    n,
-                    packet.len()
-                );
-                self.stream = None;
+                debug_assert!(n < packet.len());
+                let Some(remainder) = packet.get(n..) else {
+                    self.close();
+                    return;
+                };
+                self.pending_write.extend_from_slice(remainder);
+                debug_assert!(self.pending_write.len() <= Self::MAX_FRAME.saturating_add(2));
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Localhost engine congestion—drop the frame cleanly exactly like UDP
                 tracing::debug!("TCP write would block, frame dropped lossily");
             }
             Err(e) => {
                 tracing::warn!("TCP write failed, closing stream: {:?}", e);
-                self.stream = None;
+                self.close();
             }
         }
     }
@@ -165,5 +194,6 @@ impl TcpSession {
     pub(crate) fn close(&mut self) {
         self.stream = None;
         self.recv_accum.clear();
+        self.pending_write.clear();
     }
 }
