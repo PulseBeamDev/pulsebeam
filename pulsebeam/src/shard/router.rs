@@ -13,7 +13,7 @@ use crate::track::Topic;
 use super::events::AudioRtpEvent;
 use super::worker::{MediaPayload, Reverse, ShardFrame};
 
-pub(crate) use crate::keys::{DataStreamKey, ReliableStreamKey, TrackKey};
+pub(crate) use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DataStreamId {
@@ -24,7 +24,7 @@ pub(crate) struct DataStreamId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeStreamKey {
-    Data(DataStreamKey),
+    Unreliable(UnreliableStreamKey),
     Reliable(ReliableStreamKey),
 }
 
@@ -76,7 +76,12 @@ pub(crate) trait RoutingContext: ShardTransport {
         origin: AudioOrigin,
         pkt: &RtpPacket,
     );
-    fn forward_sctp(&mut self, subscriber: ParticipantKey, channel: ChannelId, pkt: &[u8]);
+    fn forward_unreliable_sctp(
+        &mut self,
+        subscriber: ParticipantKey,
+        channel: ChannelId,
+        pkt: &[u8],
+    );
     fn wall(&self) -> &WallAnchor;
     fn forward_reliable_sctp(
         &mut self,
@@ -97,19 +102,56 @@ struct TrackRuntime {
     audience: Vec<ParticipantKey>,
 }
 
-struct StreamRuntime {
+struct UnreliableRuntime {
     link_seq: u32,
 }
 
+/// The same stream, plus what the feedback path needs to address its publisher.
 pub(crate) struct ReliableRuntime {
     id: DataStreamId,
     publisher: ParticipantKey,
     link_seq: u32,
 }
 
+/// Hand a packet to every local member of the audiences a plan names.
+///
+/// The only thing that varies per kind is `deliver`, and the delivery key it
+/// receives — a downstream slot, an SCTP channel, or nothing at all.
+fn fanout_local<D: Copy>(
+    plan: &crate::view::ForwardingPlan,
+    groups: &crate::view::GroupImage<D>,
+    mut deliver: impl FnMut(ParticipantKey, D),
+) {
+    for group in &plan.groups {
+        for &(subscriber, delivery) in groups.members(*group) {
+            deliver(subscriber, delivery);
+        }
+    }
+}
+
+/// Forward a packet to the shards a plan routes to, numbering each hop so the
+/// destination can tell loss from reordering.
+fn fanout_remote(
+    plan: &crate::view::ForwardingPlan,
+    link_seq: &mut u32,
+    playout: u32,
+    mut payload: impl FnMut() -> MediaPayload,
+    ctx: &mut impl ShardTransport,
+) {
+    for remote in &plan.remote_routes {
+        let env = Envelope::media(
+            RouteHandle::new(remote.route, remote.epoch),
+            *link_seq,
+            playout,
+        );
+        *link_seq = link_seq.wrapping_add(1);
+        ctx.send_media(remote.shard_id, env, payload());
+    }
+}
+
 pub(crate) struct ShardRuntime {
     tracks: SecondaryMap<TrackKey, TrackRuntime>,
-    data: SecondaryMap<DataStreamKey, StreamRuntime>,
+    unreliable: SecondaryMap<UnreliableStreamKey, UnreliableRuntime>,
     reliable: SecondaryMap<ReliableStreamKey, ReliableRuntime>,
     pub(crate) routes: RouteRuntime,
 }
@@ -118,7 +160,7 @@ impl ShardRuntime {
     pub fn new(shard_id: ShardId) -> Self {
         Self {
             tracks: SecondaryMap::new(),
-            data: SecondaryMap::new(),
+            unreliable: SecondaryMap::new(),
             reliable: SecondaryMap::new(),
             routes: RouteRuntime::new(shard_id),
         }
@@ -136,8 +178,8 @@ impl ShardRuntime {
         self.tracks.get(key).map(|track| track.audience.as_slice())
     }
 
-    pub(crate) fn retire_data_stream(&mut self, key: DataStreamKey) {
-        let _ = self.data.remove(key);
+    pub(crate) fn retire_data_stream(&mut self, key: UnreliableStreamKey) {
+        let _ = self.unreliable.remove(key);
     }
 
     pub(crate) fn retire_reliable_stream(&mut self, key: ReliableStreamKey) {
@@ -186,10 +228,12 @@ impl ShardRuntime {
                 }
             }
             crate::view::ViewOp::RemoveTrackRuntime { key } => self.retire_track(*key),
-            crate::view::ViewOp::InsertDataRuntime { key, .. } => {
-                let _ = self.data.insert(*key, StreamRuntime { link_seq: 0 });
+            crate::view::ViewOp::InsertUnreliableRuntime { key, .. } => {
+                let _ = self
+                    .unreliable
+                    .insert(*key, UnreliableRuntime { link_seq: 0 });
             }
-            crate::view::ViewOp::RemoveDataRuntime { key } => self.retire_data_stream(*key),
+            crate::view::ViewOp::RemoveUnreliableRuntime { key } => self.retire_data_stream(*key),
             crate::view::ViewOp::InsertReliableRuntime { key, id, publisher } => {
                 let _ = self.reliable.insert(
                     *key,
@@ -206,16 +250,12 @@ impl ShardRuntime {
             | crate::view::ViewOp::RetireTransport { .. }
             | crate::view::ViewOp::InsertParticipant { .. }
             | crate::view::ViewOp::RemoveParticipant { .. }
-            | crate::view::ViewOp::SetTrackPlan { .. }
-            | crate::view::ViewOp::RemoveTrackPlan { .. }
-            | crate::view::ViewOp::SetAudioPlan { .. }
-            | crate::view::ViewOp::AudioGroupInsert { .. }
-            | crate::view::ViewOp::AudioGroupRemove { .. }
-            | crate::view::ViewOp::RemoveAudioPlan { .. }
-            | crate::view::ViewOp::SetDataPlan { .. }
-            | crate::view::ViewOp::RemoveDataPlan { .. }
-            | crate::view::ViewOp::SetReliablePlan { .. }
-            | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
+            | crate::view::ViewOp::SetPlan { .. }
+            | crate::view::ViewOp::RemovePlan { .. }
+            | crate::view::ViewOp::GroupInsert { .. }
+            | crate::view::ViewOp::GroupRemove { .. }
+            | crate::view::ViewOp::BindSubscribedTrack { .. }
+            | crate::view::ViewOp::UnbindSubscribedTrack { .. } => {}
         }
     }
 
@@ -245,6 +285,7 @@ impl ShardRuntime {
         fanout: TrackKey,
         pkt: RtpPacket,
         plan: &crate::view::VideoPlan,
+        groups: &crate::view::GroupImage<DownstreamSlotKey>,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(track) = self.tracks.get_mut(fanout) else {
@@ -263,24 +304,17 @@ impl ShardRuntime {
             debug_assert!(false, "a cached packet must be readable");
             return;
         };
-        for &(subscriber, slot) in &plan.local_subscribers {
+        fanout_local(plan, groups, |subscriber, slot| {
             ctx.forward_video_rtp(subscriber, slot, track_id, packet, Some(cache));
-        }
+        });
         let playout = ctx.wall().to_ntp(packet.playout_time);
-        let link_seq = &mut track.link_seq;
-        for remote in &plan.remote_routes {
-            let env = Envelope::media(
-                RouteHandle::new(remote.route, remote.epoch),
-                *link_seq,
-                playout.middle32(),
-            );
-            *link_seq = link_seq.wrapping_add(1);
-            ctx.send_media(
-                remote.shard_id,
-                env,
-                MediaPayload::Video(Box::new(packet.to_transit())),
-            );
-        }
+        fanout_remote(
+            plan,
+            &mut track.link_seq,
+            playout.middle32(),
+            || MediaPayload::Video(Box::new(packet.to_transit())),
+            ctx,
+        );
     }
 
     pub fn route_audio_with_plan(
@@ -289,7 +323,7 @@ impl ShardRuntime {
         origin: Origin,
         event: AudioRtpEvent,
         plan: &crate::view::AudioPlan,
-        groups: &crate::view::GroupImage,
+        groups: &crate::view::GroupImage<()>,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(origin.is_local() || event.origin_key.is_none());
@@ -301,71 +335,63 @@ impl ShardRuntime {
             participant: event.origin,
             track: event.stream_id.0,
         };
-        for group in &plan.groups {
-            for &subscriber in groups.members(*group) {
-                if Some(subscriber) == event.origin_key {
-                    continue;
-                }
-                ctx.forward_audio_rtp(subscriber, audio_origin, &event.pkt);
+        fanout_local(plan, groups, |subscriber, ()| {
+            if Some(subscriber) == event.origin_key {
+                return;
             }
-        }
+            ctx.forward_audio_rtp(subscriber, audio_origin, &event.pkt);
+        });
         if origin.is_local() {
             let playout = ctx.wall().to_ntp(event.pkt.playout_time);
             let Some(runtime) = self.tracks.get_mut(track) else {
                 debug_assert!(false, "audio key must resolve to runtime state");
                 return;
             };
-            for remote in &plan.remote_routes {
-                let env = Envelope::media(
-                    RouteHandle::new(remote.route, remote.epoch),
-                    runtime.link_seq,
-                    playout.middle32(),
-                );
-                runtime.link_seq = runtime.link_seq.wrapping_add(1);
-                ctx.send_media(
-                    remote.shard_id,
-                    env,
-                    MediaPayload::Audio(Box::new(event.pkt.to_transit())),
-                );
-            }
+            fanout_remote(
+                plan,
+                &mut runtime.link_seq,
+                playout.middle32(),
+                || MediaPayload::Audio(Box::new(event.pkt.to_transit())),
+                ctx,
+            );
         }
     }
 
-    pub fn route_data_with_plan(
+    pub fn route_unreliable_with_plan(
         &mut self,
-        stream: DataStreamKey,
+        stream: UnreliableStreamKey,
         origin: Origin,
         packet: Vec<u8>,
         plan: &crate::view::StreamPlan,
+        groups: &crate::view::GroupImage<ChannelId>,
         ctx: &mut impl RoutingContext,
     ) {
-        let Some(runtime) = self.data.get_mut(stream) else {
+        let Some(runtime) = self.unreliable.get_mut(stream) else {
             debug_assert!(false, "data key must resolve to runtime state");
             return;
         };
-        for &(subscriber, channel) in &plan.local_subscribers {
-            ctx.forward_sctp(subscriber, channel, &packet);
-        }
+        fanout_local(plan, groups, |subscriber, channel| {
+            ctx.forward_unreliable_sctp(subscriber, channel, &packet);
+        });
         if origin.is_local() {
             let playout = ctx.wall().ntp();
-            for remote in &plan.remote_routes {
-                let env = Envelope::media(
-                    RouteHandle::new(remote.route, remote.epoch),
-                    runtime.link_seq,
-                    playout.middle32(),
-                );
-                runtime.link_seq = runtime.link_seq.wrapping_add(1);
-                ctx.send_media(remote.shard_id, env, MediaPayload::Data(packet.clone()));
-            }
+            fanout_remote(
+                plan,
+                &mut runtime.link_seq,
+                playout.middle32(),
+                || MediaPayload::Data(packet.clone()),
+                ctx,
+            );
         }
     }
 
-    pub fn route_reliable_data_with_plan(
+    pub fn route_reliable_with_plan(
         &mut self,
         stream: ReliableStreamKey,
         origin: Origin,
         frame: Vec<u8>,
         plan: &crate::view::StreamPlan,
+        groups: &crate::view::GroupImage<ChannelId>,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(!frame.is_empty());
@@ -373,24 +399,22 @@ impl ShardRuntime {
             debug_assert!(false, "reliable key must resolve to runtime state");
             return;
         };
-        for &(subscriber, channel) in &plan.local_subscribers {
+        fanout_local(plan, groups, |subscriber, channel| {
             ctx.forward_reliable_sctp(subscriber, channel, &frame);
-        }
+        });
         if origin.is_local() {
             let playout = ctx.wall().ntp();
             let Some(runtime) = self.reliable.get_mut(stream) else {
                 debug_assert!(false, "reliable key must remain live during dispatch");
                 return;
             };
-            for remote in &plan.remote_routes {
-                let env = Envelope::media(
-                    RouteHandle::new(remote.route, remote.epoch),
-                    runtime.link_seq,
-                    playout.middle32(),
-                );
-                runtime.link_seq = runtime.link_seq.wrapping_add(1);
-                ctx.send_media(remote.shard_id, env, MediaPayload::Data(frame.clone()));
-            }
+            fanout_remote(
+                plan,
+                &mut runtime.link_seq,
+                playout.middle32(),
+                || MediaPayload::Data(frame.clone()),
+                ctx,
+            );
         }
     }
 
@@ -418,6 +442,7 @@ impl ShardRuntime {
         fanout: TrackKey,
         stats: crate::track::TrackStates,
         plan: &crate::view::VideoPlan,
+        groups: &crate::view::GroupImage<DownstreamSlotKey>,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(track) = self.tracks.get_mut(fanout) else {
@@ -426,9 +451,9 @@ impl ShardRuntime {
         };
         track.layer_states = stats;
         let states = &track.layer_states;
-        for &(subscriber, slot) in &plan.local_subscribers {
+        fanout_local(plan, groups, |subscriber, slot| {
             ctx.update_layer_states(subscriber, slot, states);
-        }
+        });
         for remote in &plan.remote_routes {
             ctx.send_frame(
                 remote.shard_id,

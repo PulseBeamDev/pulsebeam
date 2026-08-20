@@ -1,12 +1,5 @@
 use super::*;
 
-fn installs_video_route(change: crate::control::subscriptions::InterestChange) -> bool {
-    matches!(
-        change,
-        crate::control::subscriptions::InterestChange::Install
-    )
-}
-
 impl ControllerActor {
     pub(super) async fn drain_pending_track_subscriptions(
         &mut self,
@@ -81,17 +74,82 @@ impl ControllerActor {
         }
     }
 
+    /// Stage the retirement of one kind's destination routes for a track.
+    ///
+    /// Video and audio differ only in which fanout map names the destination's
+    /// key and which image the plan lives in, so the walk is written once.
+    fn stage_destination_retirement(
+        &mut self,
+        generation: u64,
+        now: tokio::time::Instant,
+        routes: &HashMap<crate::id::ShardId, RouteHandle>,
+        fanouts: &HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
+        target: impl Fn(crate::shard::router::TrackKey) -> crate::view::PlanTarget,
+        releases: &mut Vec<(crate::id::ShardId, RouteHandle)>,
+    ) -> bool {
+        for (destination, route) in routes {
+            let Some(view) = self.view_mut(*destination) else {
+                debug_assert!(false, "a track route must name a local view");
+                self.abort_transaction(now);
+                return false;
+            };
+            view.stage(
+                generation,
+                crate::view::ViewOp::RetireRoute {
+                    route: route.route,
+                    epoch: route.epoch,
+                },
+            );
+            if let Some(key) = fanouts.get(destination).copied() {
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: target(key),
+                    },
+                );
+                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
+            }
+            releases.push((*destination, *route));
+        }
+        true
+    }
+
     pub(super) async fn retire_track_binding(&mut self, track_id: crate::entity::TrackId) -> bool {
-        let video_routes = self.subscriptions.remove_stream(&track_id);
         let Some(binding) = self.track_bindings.get(&track_id) else {
             return true;
         };
+        // Its subscribers never unsubscribe from a track that goes away, so the
+        // declarations naming it have to be retired with it.
+        let retired_pattern = crate::control::patterns::Pattern::exact(
+            binding.meta.room_id,
+            binding.meta.origin,
+            track_id,
+        );
+        let video_routes = binding.video_routes.clone();
         let publisher_shard = binding.publisher_shard;
         let publisher_fanout = binding.publisher_fanout;
         let reverse_route = binding.reverse_route;
         let fanouts = binding.fanouts.clone();
         let audio_fanouts = binding.audio_fanouts.clone();
         let audio_routes = binding.audio_routes.clone();
+        if let Some((group, members)) = self.video_patterns.retire_pattern(&retired_pattern) {
+            let ops = members
+                .into_iter()
+                .map(|(_, shard, key)| {
+                    (
+                        shard,
+                        crate::view::ViewOp::GroupRemove {
+                            group,
+                            key,
+                            kind: crate::view::AudienceKind::Video,
+                        },
+                    )
+                })
+                .collect();
+            if !self.publish_ops(ops) {
+                debug_assert!(false, "video group retirement must publish");
+            }
+        }
 
         let now = tokio::time::Instant::now();
         if self.state.begin().is_err() {
@@ -104,43 +162,25 @@ impl ControllerActor {
         };
 
         let mut endpoint_releases = Vec::new();
-        for retired in &video_routes {
-            let Some(view) = self.view_mut(retired.destination) else {
-                debug_assert!(false, "a video route must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: retired.route.route,
-                    epoch: retired.route.epoch,
-                },
-            );
-            if let Some(key) = fanouts.get(&retired.destination).copied() {
-                view.stage(generation, crate::view::ViewOp::RemoveTrackPlan { key });
-                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
-            }
-            endpoint_releases.push((retired.destination, retired.route));
+        if !self.stage_destination_retirement(
+            generation,
+            now,
+            &video_routes,
+            &fanouts,
+            crate::view::PlanTarget::Video,
+            &mut endpoint_releases,
+        ) {
+            return false;
         }
-        for (destination, route) in &audio_routes {
-            let Some(view) = self.view_mut(*destination) else {
-                debug_assert!(false, "an audio route must name a local view");
-                self.abort_transaction(now);
-                return false;
-            };
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: route.route,
-                    epoch: route.epoch,
-                },
-            );
-            if let Some(key) = audio_fanouts.get(destination).copied() {
-                view.stage(generation, crate::view::ViewOp::RemoveAudioPlan { key });
-                view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
-            }
-            endpoint_releases.push((*destination, *route));
+        if !self.stage_destination_retirement(
+            generation,
+            now,
+            &audio_routes,
+            &audio_fanouts,
+            crate::view::PlanTarget::Audio,
+            &mut endpoint_releases,
+        ) {
+            return false;
         }
         if let Some(route) = reverse_route {
             let Some(view) = self.view_mut(publisher_shard) else {
@@ -165,8 +205,8 @@ impl ControllerActor {
         };
         view.stage(
             generation,
-            crate::view::ViewOp::RemoveTrackPlan {
-                key: publisher_fanout,
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Video(publisher_fanout),
             },
         );
         view.stage(
@@ -177,8 +217,8 @@ impl ControllerActor {
         );
         view.stage(
             generation,
-            crate::view::ViewOp::RemoveAudioPlan {
-                key: publisher_fanout,
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Audio(publisher_fanout),
             },
         );
         for (&destination, &key) in &fanouts {
@@ -186,13 +226,23 @@ impl ControllerActor {
                 continue;
             }
             if let Some(view) = self.view_mut(destination) {
-                view.stage(generation, crate::view::ViewOp::RemoveTrackPlan { key });
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: crate::view::PlanTarget::Video(key),
+                    },
+                );
                 view.stage(generation, crate::view::ViewOp::RemoveTrackRuntime { key });
             }
         }
         for (&destination, &key) in &audio_fanouts {
             if let Some(view) = self.view_mut(destination) {
-                view.stage(generation, crate::view::ViewOp::RemoveAudioPlan { key });
+                view.stage(
+                    generation,
+                    crate::view::ViewOp::RemovePlan {
+                        target: crate::view::PlanTarget::Audio(key),
+                    },
+                );
             }
         }
 
@@ -305,7 +355,6 @@ impl ControllerActor {
                 continue;
             };
             let plan = crate::view::AudioPlan {
-                local_subscribers: Vec::new(),
                 groups: groups.clone(),
                 remote_routes: Vec::new(),
                 reverse_route: None,
@@ -342,7 +391,6 @@ impl ControllerActor {
             })
             .collect();
         let source_plan = crate::view::AudioPlan {
-            local_subscribers: Vec::new(),
             groups: groups.clone(),
             remote_routes,
             reverse_route: binding
@@ -362,7 +410,6 @@ impl ControllerActor {
                 *destination,
                 *key,
                 crate::view::AudioPlan {
-                    local_subscribers: Vec::new(),
                     groups: groups.clone(),
                     remote_routes: Vec::new(),
                     reverse_route: None,
@@ -383,16 +430,21 @@ impl ControllerActor {
             Option<RouteHandle>,
         )>,
     ) {
-        let Some(publisher_fanout) = self
+        let Some(publisher_shard) = self
             .track_bindings
             .get(&track_id)
-            .map(|binding| binding.publisher_fanout)
+            .map(|binding| binding.publisher_shard)
         else {
             return;
         };
         let mut ops = Vec::new();
         for (shard_id, key, plan, route) in targets {
-            if key != publisher_fanout {
+            // Compare shards, not keys. `TrackKey` indexes a per-shard arena,
+            // so the publisher's key and a destination's key are both
+            // `TrackKey(1v1)` as often as not — comparing them said "this is
+            // the publisher's own shard" for a remote destination and skipped
+            // its runtime, leaving a route pointing at nothing.
+            if shard_id != publisher_shard {
                 let Some(descriptor) = self.track_descriptor(track_id, shard_id) else {
                     return;
                 };
@@ -401,7 +453,13 @@ impl ControllerActor {
                     crate::view::ViewOp::InsertTrackRuntime { key, descriptor },
                 ));
             }
-            ops.push((shard_id, crate::view::ViewOp::SetAudioPlan { key, plan }));
+            ops.push((
+                shard_id,
+                crate::view::ViewOp::SetPlan {
+                    target: crate::view::PlanTarget::Audio(key),
+                    plan,
+                },
+            ));
             if let Some(route) = route {
                 ops.push((
                     shard_id,
@@ -478,22 +536,33 @@ impl ControllerActor {
                 fanout
             }
         };
-        let change = self.subscriptions.subscribe(
-            shard_id,
-            track.id,
+        let pattern =
+            crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
+        let (membership, mut membership_ops) = crate::control::patterns::declare_audience(
+            &mut self.video_patterns,
+            pattern.clone(),
             subscriber,
-            (subscriber_key, slot),
-            track.shard_id,
+            crate::control::patterns::Member {
+                shard: shard_id,
+                key: subscriber_key,
+                delivery: slot,
+            },
+            crate::view::Delivery::Video(slot),
+            crate::view::AudienceKind::Video,
         );
-        {
-            let Some(binding) = self.track_bindings.get_mut(&track.id) else {
-                debug_assert!(false, "a subscription must name a published track");
-                return;
-            };
-            binding.fanouts.insert(shard_id, fanout);
+        membership_ops.push((
+            shard_id,
+            crate::view::ViewOp::BindSubscribedTrack {
+                participant: subscriber_key,
+                track: track.id,
+                fanout,
+            },
+        ));
+        if !self.publish_ops(membership_ops) {
+            debug_assert!(false, "video subscription must publish");
         }
 
-        if installs_video_route(change) {
+        if membership == crate::control::patterns::Membership::FirstOnShard {
             let Some((_, plan)) = self.track_plan(track.id, shard_id) else {
                 debug_assert!(false, "a first subscription must have a compiled plan");
                 return;
@@ -503,8 +572,21 @@ impl ControllerActor {
                 // told which track a route carries by the route itself, so the
                 // retry re-stages this same key — dropping it here would mint a
                 // fresh one on every attempt and abandon the last in the arena.
-                self.subscriptions
-                    .unsubscribe(shard_id, &track.id, &subscriber);
+                let (_, mut rollback) = crate::control::patterns::retract_audience(
+                    &mut self.video_patterns,
+                    &pattern,
+                    &subscriber,
+                    crate::view::AudienceKind::Video,
+                );
+                rollback.push((
+                    shard_id,
+                    crate::view::ViewOp::UnbindSubscribedTrack {
+                        participant: subscriber_key,
+                        track: track.id,
+                        fanout,
+                    },
+                ));
+                let _ = self.publish_ops(rollback);
                 self.defer_subscribe(crate::control::pending::PendingSubscription::new(
                     shard_id,
                     subscriber,
@@ -514,7 +596,9 @@ impl ControllerActor {
                 ));
                 return;
             };
-            self.subscriptions.installed(shard_id, track.id, handle);
+            if let Some(binding) = self.track_bindings.get_mut(&track.id) {
+                binding.video_routes.insert(shard_id, handle);
+            }
         }
 
         if !self.publish_track_plans(track.id).await {
@@ -530,15 +614,58 @@ impl ControllerActor {
         subscriber: ParticipantId,
         track: crate::track::TrackMeta,
     ) {
-        let crate::control::subscriptions::InterestChange::Retire { route } = self
-            .subscriptions
-            .unsubscribe(shard_id, &track.id, &subscriber)
+        let pattern =
+            crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
+        let subscriber_key = self
+            .video_patterns
+            .member_key(&pattern, &subscriber)
+            .map(|(_, key)| key);
+        let (departure, mut membership_ops) = crate::control::patterns::retract_audience(
+            &mut self.video_patterns,
+            &pattern,
+            &subscriber,
+            crate::view::AudienceKind::Video,
+        );
+        if let (Some(key), Some(fanout)) = (subscriber_key, self.track_fanout(track.id, shard_id)) {
+            membership_ops.push((
+                shard_id,
+                crate::view::ViewOp::UnbindSubscribedTrack {
+                    participant: key,
+                    track: track.id,
+                    fanout,
+                },
+            ));
+        }
+        if !self.publish_ops(membership_ops) {
+            debug_assert!(false, "video unsubscription must publish");
+        }
+        if departure != crate::control::patterns::Departure::LastOnShard {
+            let _ = self.publish_track_plans(track.id).await;
+            return;
+        }
+        let Some(route) = self
+            .track_bindings
+            .get_mut(&track.id)
+            .and_then(|binding| binding.video_routes.remove(&shard_id))
         else {
             let _ = self.publish_track_plans(track.id).await;
             return;
         };
         if !self.retire_video_route(shard_id, route, track.id).await {
             debug_assert!(false, "track route retirement must complete");
+        }
+    }
+
+    fn track_fanout(
+        &self,
+        track_id: crate::entity::TrackId,
+        shard_id: crate::id::ShardId,
+    ) -> Option<crate::shard::router::TrackKey> {
+        let binding = self.track_bindings.get(&track_id)?;
+        if shard_id == binding.publisher_shard {
+            Some(binding.publisher_fanout)
+        } else {
+            binding.fanouts.get(&shard_id).copied()
         }
     }
 
@@ -553,18 +680,20 @@ impl ControllerActor {
         } else {
             *binding.fanouts.get(&shard_id)?
         };
-        let mut local_subscribers = Vec::new();
+        let subject = crate::control::patterns::Subject {
+            room: binding.meta.room_id,
+            publisher: binding.meta.origin,
+            name: track_id,
+        };
+        let groups = self.video_patterns.match_subject(&subject);
         let mut remote_routes = Vec::new();
-        for (destination, route, subscribers) in self.subscriptions.plan_destinations(&track_id) {
-            if destination == shard_id {
-                local_subscribers.extend(subscribers);
-            }
-            if shard_id == binding.publisher_shard
-                && destination != shard_id
-                && let Some(route) = route
-            {
+        if shard_id == binding.publisher_shard {
+            for (destination, route) in &binding.video_routes {
+                if *destination == shard_id {
+                    continue;
+                }
                 remote_routes.push(crate::view::RemoteRoutePlan {
-                    shard_id: destination,
+                    shard_id: *destination,
                     route: route.route,
                     epoch: route.epoch,
                 });
@@ -573,8 +702,7 @@ impl ControllerActor {
         Some((
             fanout,
             crate::view::VideoPlan {
-                groups: Default::default(),
-                local_subscribers,
+                groups,
                 remote_routes,
                 reverse_route: binding
                     .reverse_route
@@ -655,7 +783,10 @@ impl ControllerActor {
             ));
             ops.push((
                 shard_id,
-                crate::view::ViewOp::SetTrackPlan { key: fanout, plan },
+                crate::view::ViewOp::SetPlan {
+                    target: crate::view::PlanTarget::Video(fanout),
+                    plan,
+                },
             ));
         }
         self.publish_ops(ops)
@@ -683,7 +814,10 @@ impl ControllerActor {
                 ),
                 (
                     shard_id,
-                    crate::view::ViewOp::SetTrackPlan { key: fanout, plan },
+                    crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Video(fanout),
+                        plan,
+                    },
                 ),
             ]
         })
@@ -709,7 +843,13 @@ impl ControllerActor {
         for index in 0..self.views.len() {
             let target = crate::id::ShardId::new(index);
             if let Some((key, plan)) = self.track_plan(track_id, target) {
-                ops.push((target, crate::view::ViewOp::SetTrackPlan { key, plan }));
+                ops.push((
+                    target,
+                    crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Video(key),
+                        plan,
+                    },
+                ));
             }
         }
         if !self.publish_ops(ops) {
@@ -718,17 +858,5 @@ impl ControllerActor {
         self.state
             .release_endpoint(shard_id, handle.route.slot(), tokio::time::Instant::now());
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::control::subscriptions::InterestChange;
-
-    #[test]
-    fn only_first_interest_installs_a_video_route() {
-        assert!(installs_video_route(InterestChange::Install));
-        assert!(!installs_video_route(InterestChange::None));
     }
 }

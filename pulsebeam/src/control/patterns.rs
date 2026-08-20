@@ -358,6 +358,45 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         matched
     }
 
+    /// Where a subscriber sits in a pattern's group, for addressing the op
+    /// that removes it.
+    pub fn member_key(
+        &self,
+        pattern: &Pattern<N>,
+        participant: &ParticipantId,
+    ) -> Option<(ShardId, ParticipantKey)> {
+        let id = *self.ids.get(pattern)?;
+        let group = self.groups.get(id.0 as usize).and_then(Option::as_ref)?;
+        let member = group.members.get(participant)?;
+        Some((member.shard, member.key))
+    }
+
+    /// Drop a pattern outright, returning its group and everyone who was in
+    /// it. For a publication going away: its subscribers never unsubscribe, so
+    /// without this their declarations would outlive the thing they named.
+    pub fn retire_pattern(
+        &mut self,
+        pattern: &Pattern<N>,
+    ) -> Option<(GroupId, Vec<(ParticipantId, ShardId, ParticipantKey)>)> {
+        let id = self.ids.shift_remove(pattern)?;
+        let group = self.groups.get_mut(id.0 as usize).and_then(Option::take)?;
+        let members = group
+            .members
+            .iter()
+            .map(|(participant, member)| (*participant, member.shard, member.key))
+            .collect();
+        for participant in group.members.keys() {
+            if let Some(held) = self.by_participant.get_mut(participant) {
+                held.shift_remove(pattern);
+                if held.is_empty() {
+                    self.by_participant.shift_remove(participant);
+                }
+            }
+        }
+        self.free.push(id);
+        Some((id, members))
+    }
+
     pub fn group_of(&self, pattern: &Pattern<N>) -> Option<GroupId> {
         self.ids.get(pattern).copied()
     }
@@ -409,13 +448,101 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         self.ids.len()
     }
 
-    #[cfg(test)]
+    /// Everything a participant declared, for a departure that has to reconcile
+    /// the streams it was consuming before its declarations go.
     pub fn declarations_of(&self, participant: &ParticipantId) -> Vec<Pattern<N>> {
         self.by_participant
             .get(participant)
             .map(|held| held.iter().cloned().collect())
             .unwrap_or_default()
     }
+}
+
+/// Declare an interest and produce the membership op that follows from it.
+///
+/// Every leg does the same three things on a subscribe — record the
+/// declaration, retract anything the new one subsumes, and tell the
+/// subscriber's shard — so they are one operation here rather than the same
+/// twenty lines at each call site.
+pub(crate) fn declare_audience<N, S>(
+    table: &mut PatternTable<N, S>,
+    pattern: Pattern<N>,
+    participant: ParticipantId,
+    member: Member<S>,
+    delivery: crate::view::Delivery,
+    kind: crate::view::AudienceKind,
+) -> (Membership, Vec<(ShardId, crate::view::ViewOp)>)
+where
+    N: std::hash::Hash + Eq + Clone,
+    S: Copy,
+{
+    let shard = member.shard;
+    let key = member.key;
+    let (membership, displaced) = table.declare(pattern.clone(), participant, member);
+    let mut ops: Vec<_> = displaced
+        .into_iter()
+        .map(|(group, _)| (shard, crate::view::ViewOp::GroupRemove { group, key, kind }))
+        .collect();
+    if membership != Membership::Unchanged
+        && let Some(group) = table.group_of(&pattern)
+    {
+        ops.push((
+            shard,
+            crate::view::ViewOp::GroupInsert {
+                group,
+                key,
+                delivery,
+            },
+        ));
+    }
+    (membership, ops)
+}
+
+/// The inverse: withdraw one declaration and say so.
+pub(crate) fn retract_audience<N, S>(
+    table: &mut PatternTable<N, S>,
+    pattern: &Pattern<N>,
+    participant: &ParticipantId,
+    kind: crate::view::AudienceKind,
+) -> (Departure, Vec<(ShardId, crate::view::ViewOp)>)
+where
+    N: std::hash::Hash + Eq + Clone,
+    S: Copy,
+{
+    let placement = table.member_key(pattern, participant);
+    let group = table.group_of(pattern);
+    let departure = table.undeclare(pattern, participant);
+    let ops = match (group, placement) {
+        (Some(group), Some((shard, key))) => {
+            vec![(shard, crate::view::ViewOp::GroupRemove { group, key, kind })]
+        }
+        _ => Vec::new(),
+    };
+    (departure, ops)
+}
+
+/// Withdraw everything a departing participant declared.
+pub(crate) fn retract_participant<N, S>(
+    table: &mut PatternTable<N, S>,
+    participant: &ParticipantId,
+    kind: crate::view::AudienceKind,
+) -> (
+    Vec<(Pattern<N>, Departure)>,
+    Vec<(ShardId, crate::view::ViewOp)>,
+)
+where
+    N: std::hash::Hash + Eq + Clone,
+    S: Copy,
+{
+    let held = table.declarations_of(participant);
+    let mut departures = Vec::new();
+    let mut ops = Vec::new();
+    for pattern in held {
+        let (departure, mut pattern_ops) = retract_audience(table, &pattern, participant, kind);
+        departures.push((pattern, departure));
+        ops.append(&mut pattern_ops);
+    }
+    (departures, ops)
 }
 
 #[cfg(test)]
@@ -667,6 +794,43 @@ mod tests {
         assert!(table.group_of(&solo).is_none());
         assert_eq!(table.member_count(table.group_of(&shared).unwrap()), 1);
         assert!(table.declarations_of(&pid(1)).is_empty());
+    }
+
+    /// Subscribing before anything is published is not a special case: the
+    /// declaration simply matches nothing yet, and matches the publication the
+    /// moment it appears. The parked-subscriber map this replaces existed only
+    /// to express that.
+    #[test]
+    fn a_declaration_made_before_the_publication_matches_it_on_arrival() {
+        let mut table = Table::new();
+        let r = room("r");
+        let wanted = Pattern::any_publisher(r.clone(), "t".to_string());
+        table.declare(wanted, pid(1), member(0));
+
+        let arriving = subject(r, 9, "t");
+        assert_eq!(
+            table.match_subject(&arriving).len(),
+            1,
+            "a publication appearing later resolves to the waiting declaration"
+        );
+    }
+
+    /// And withdrawing it stops publications that appear afterwards from
+    /// reaching the subscriber - the failure here is silent, since nothing
+    /// errors, the subscriber just keeps receiving.
+    #[test]
+    fn a_withdrawn_declaration_does_not_reach_later_publications() {
+        let mut table = Table::new();
+        let r = room("r");
+        let wanted = Pattern::any_publisher(r.clone(), "t".to_string());
+
+        table.declare(wanted.clone(), pid(1), member(0));
+        assert_eq!(table.undeclare(&wanted, &pid(1)), Departure::LastOnShard);
+
+        assert!(
+            table.match_subject(&subject(r, 9, "t")).is_empty(),
+            "a publication appearing after the withdrawal reaches nobody"
+        );
     }
 
     /// A group id is recycled once its group dies. The shard resolves groups

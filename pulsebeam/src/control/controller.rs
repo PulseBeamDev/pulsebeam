@@ -7,7 +7,7 @@ use crate::control::state::ControlPlaneState;
 use crate::{
     control::{
         core::{ControllerCore, RoomPlacement},
-        lanes::{Lanes, StreamLane, Subscriber, WildcardSubscriber},
+        lanes::{Lanes, StreamLane},
         negotiator::{Negotiator, NegotiatorError},
         outbox::{ControllerEvent, ControllerEventQueue},
         pending::{PendingSubscription, PendingSubscriptions},
@@ -54,6 +54,9 @@ struct TrackBinding {
     publisher_fanout: crate::shard::router::TrackKey,
     reverse_route: Option<RouteHandle>,
     fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
+    /// Where this track's video is routed. Held here for the same reason
+    /// `audio_routes` is: a route outlives any one subscriber's interest.
+    video_routes: HashMap<crate::id::ShardId, RouteHandle>,
     audio_fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
     audio_routes: HashMap<crate::id::ShardId, RouteHandle>,
 }
@@ -130,9 +133,13 @@ pub struct ControllerActor {
     /// The canonical lifecycle state. Only this actor mutates it, and no
     /// shard ever reads it — a shard reads the view projected from it.
     state: ControlPlaneState,
-    /// Who consumes what, and therefore which routes exist. The decision the
-    /// shard used to make by counting its own subscribers.
-    subscriptions: crate::control::subscriptions::TrackSubscriptions,
+    /// Video declarations. Always fully concrete: a video subscription *is* a
+    /// downstream slot allocation, and a slot belongs to one track, so a
+    /// pattern here can never wildcard the name.
+    video_patterns: crate::control::patterns::PatternTable<
+        crate::entity::TrackId,
+        crate::keys::DownstreamSlotKey,
+    >,
     /// One writer per shard. Never shared, never locked, and never handed to
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
@@ -147,6 +154,18 @@ pub struct ControllerActor {
     /// room wildcard, which is what the scan produces today; what is under
     /// test is that declarations appear and disappear with the participant.
     audio_patterns: crate::control::patterns::PatternTable<crate::entity::TrackId, ()>,
+    /// Data declarations, keyed by topic *and* lane.
+    ///
+    /// Reliability is part of the subject rather than an attribute of the
+    /// publication: `Topic::publisher()` can be resolved `.ordered()` or
+    /// `.latest()`, and the two are independent namespaces, so the same name
+    /// carries both without either claiming it. Putting the lane in the name
+    /// keeps that separation while still letting one table serve both, instead
+    /// of the paired registries it replaces.
+    data_patterns: crate::control::patterns::PatternTable<
+        (crate::track::Topic, StreamLane),
+        str0m::channel::ChannelId,
+    >,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
 }
@@ -178,12 +197,13 @@ impl ControllerActor {
             cluster_id: 0,
             node_id: 0,
             state: ControlPlaneState::new(shard_count),
-            subscriptions: crate::control::subscriptions::TrackSubscriptions::new(),
+            video_patterns: crate::control::patterns::PatternTable::new(),
             views,
             track_bindings: HashMap::new(),
             lanes: Lanes::new(),
             pending: PendingSubscriptions::default(),
             audio_patterns: crate::control::patterns::PatternTable::new(),
+            data_patterns: crate::control::patterns::PatternTable::new(),
             #[cfg(not(feature = "sim"))]
             steering: None,
         }
@@ -637,7 +657,7 @@ impl ControllerActor {
                 self.on_stream_ready(
                     shard_id,
                     id,
-                    crate::shard::router::RuntimeStreamKey::Data(key),
+                    crate::shard::router::RuntimeStreamKey::Unreliable(key),
                 )
                 .await;
                 None
@@ -681,7 +701,7 @@ impl ControllerActor {
                     topic,
                     publisher,
                     channel,
-                    StreamLane::Data,
+                    StreamLane::Unreliable,
                 )
                 .await;
                 None
@@ -725,7 +745,7 @@ impl ControllerActor {
                     subscriber,
                     topic,
                     publisher,
-                    StreamLane::Data,
+                    StreamLane::Unreliable,
                 )
                 .await;
                 None
@@ -751,7 +771,7 @@ impl ControllerActor {
                 topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                if !self.retire_stream_binding(id, StreamLane::Data).await {
+                if !self.retire_stream_binding(id, StreamLane::Unreliable).await {
                     debug_assert!(false, "data stream retirement must complete");
                 }
                 None
@@ -816,6 +836,7 @@ impl ControllerActor {
                         publisher_fanout: fanout,
                         reverse_route: None,
                         fanouts: HashMap::new(),
+                        video_routes: HashMap::new(),
                         audio_fanouts: HashMap::new(),
                         audio_routes: HashMap::new(),
                     },
@@ -830,8 +851,22 @@ impl ControllerActor {
                     self.track_bindings.remove(&track_id);
                 }
                 if announced.is_some() {
-                    self.install_video_runtimes(track_id).await;
-                    self.install_audio_routes(track_id).await;
+                    // A track is one kind. Running both installers regardless
+                    // granted every video track audio routes that nothing ever
+                    // resolves - `route_audio_with_plan` is only reached for
+                    // audio RTP - while consuming route slots on every shard
+                    // with a listener.
+                    match track_id.kind() {
+                        crate::entity::TrackKind::Video => {
+                            self.install_video_runtimes(track_id).await;
+                        }
+                        crate::entity::TrackKind::Audio => {
+                            self.install_audio_routes(track_id).await;
+                        }
+                        crate::entity::TrackKind::Data => {
+                            debug_assert!(false, "data does not publish through the track path");
+                        }
+                    }
                     if !self.publish_track_plans(track_id).await {
                         debug_assert!(false, "initial track plan publication must complete");
                     }
@@ -904,7 +939,8 @@ impl ControllerActor {
         self.core
             .registry
             .bind_participant(&cfg.participant_id, binding);
-        let (membership, displaced) = self.audio_patterns.declare(
+        let (membership, membership_ops) = crate::control::patterns::declare_audience(
+            &mut self.audio_patterns,
             crate::control::patterns::Pattern::all(room_id),
             cfg.participant_id,
             crate::control::patterns::Member {
@@ -912,31 +948,9 @@ impl ControllerActor {
                 key: binding,
                 delivery: (),
             },
+            crate::view::Delivery::Audio,
+            crate::view::AudienceKind::Audio,
         );
-        let mut membership_ops: Vec<(crate::id::ShardId, crate::view::ViewOp)> = displaced
-            .into_iter()
-            .map(|(group, _)| {
-                (
-                    shard_id,
-                    crate::view::ViewOp::AudioGroupRemove {
-                        group,
-                        key: binding,
-                    },
-                )
-            })
-            .collect();
-        if let Some(group) = self
-            .audio_patterns
-            .group_of(&crate::control::patterns::Pattern::all(room_id))
-        {
-            membership_ops.push((
-                shard_id,
-                crate::view::ViewOp::AudioGroupInsert {
-                    group,
-                    key: binding,
-                },
-            ));
-        }
         if !self.publish_ops(membership_ops) {
             debug_assert!(false, "audio group membership must publish");
         }
@@ -974,7 +988,9 @@ impl ControllerActor {
             })
             .collect();
         for track_id in track_ids {
-            self.install_video_runtimes(track_id).await;
+            if track_id.kind() == crate::entity::TrackKind::Video {
+                self.install_video_runtimes(track_id).await;
+            }
             if !self.publish_track_plans(track_id).await {
                 debug_assert!(false, "room track reconciliation must publish");
             }
@@ -997,7 +1013,9 @@ impl ControllerActor {
             })
             .collect();
         for track_id in track_ids {
-            self.install_audio_routes(track_id).await;
+            if track_id.kind() == crate::entity::TrackKind::Audio {
+                self.install_audio_routes(track_id).await;
+            }
         }
     }
 }

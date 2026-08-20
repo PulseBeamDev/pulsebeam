@@ -23,7 +23,7 @@ impl ControllerActor {
         plan: crate::view::StreamPlan,
     ) -> Option<RouteHandle> {
         match lane {
-            StreamLane::Data => {
+            StreamLane::Unreliable => {
                 self.grant_route_binding(shard_id, action, None, None, Some(plan), None)
                     .await
             }
@@ -60,19 +60,28 @@ impl ControllerActor {
             )];
             let plan_op = match (action, video_plan, audio_plan, data_plan, reliable_plan) {
                 (RouteAction::Video { local_track }, Some(plan), _, _, _) => {
-                    Some(crate::view::ViewOp::SetTrackPlan {
-                        key: local_track,
+                    Some(crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Video(local_track),
                         plan,
                     })
                 }
                 (RouteAction::Audio { track }, _, Some(plan), _, _) => {
-                    Some(crate::view::ViewOp::SetAudioPlan { key: track, plan })
+                    Some(crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Audio(track),
+                        plan,
+                    })
                 }
-                (RouteAction::Data { stream }, _, _, Some(plan), _) => {
-                    Some(crate::view::ViewOp::SetDataPlan { key: stream, plan })
+                (RouteAction::Unreliable { stream }, _, _, Some(plan), _) => {
+                    Some(crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Unreliable(stream),
+                        plan,
+                    })
                 }
                 (RouteAction::Reliable { stream }, _, _, _, Some(plan)) => {
-                    Some(crate::view::ViewOp::SetReliablePlan { key: stream, plan })
+                    Some(crate::view::ViewOp::SetPlan {
+                        target: crate::view::PlanTarget::Reliable(stream),
+                        plan,
+                    })
                 }
                 (RouteAction::Reverse { .. }, None, None, None, None) => None,
                 _ => {

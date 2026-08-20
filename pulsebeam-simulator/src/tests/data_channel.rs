@@ -367,7 +367,7 @@ fn ordered_topic_continues_after_publisher_reconnect() {
 /// and its own wildcard resolution, none of which a co-located room touches.
 /// `with_shards(2)` puts publisher and subscriber on different shards, so the
 /// payload is addressed by a route the destination allocated, resolved against
-/// its `RouteAction::Data { lane }`, and handed to the subscriber's channel.
+/// its `RouteAction::Unreliable { lane }`, and handed to the subscriber's channel.
 #[test]
 fn cross_shard_data_channel_forwarding_test() {
     LocalNodeSim::new()

@@ -23,8 +23,8 @@ fn insert_stream_runtime_op(
     publisher: crate::shard::participants::ParticipantKey,
 ) -> crate::view::ViewOp {
     match key {
-        crate::shard::router::RuntimeStreamKey::Data(key) => {
-            crate::view::ViewOp::InsertDataRuntime { key, id, publisher }
+        crate::shard::router::RuntimeStreamKey::Unreliable(key) => {
+            crate::view::ViewOp::InsertUnreliableRuntime { key, id, publisher }
         }
         crate::shard::router::RuntimeStreamKey::Reliable(key) => {
             crate::view::ViewOp::InsertReliableRuntime { key, id, publisher }
@@ -37,23 +37,29 @@ fn set_stream_plan_op(
     plan: crate::view::StreamPlan,
 ) -> crate::view::ViewOp {
     match key {
-        crate::shard::router::RuntimeStreamKey::Data(key) => {
-            crate::view::ViewOp::SetDataPlan { key, plan }
-        }
-        crate::shard::router::RuntimeStreamKey::Reliable(key) => {
-            crate::view::ViewOp::SetReliablePlan { key, plan }
-        }
+        crate::shard::router::RuntimeStreamKey::Unreliable(key) => crate::view::ViewOp::SetPlan {
+            target: crate::view::PlanTarget::Unreliable(key),
+            plan,
+        },
+        crate::shard::router::RuntimeStreamKey::Reliable(key) => crate::view::ViewOp::SetPlan {
+            target: crate::view::PlanTarget::Reliable(key),
+            plan,
+        },
     }
 }
 
 fn remove_stream_ops(key: crate::shard::router::RuntimeStreamKey) -> [crate::view::ViewOp; 2] {
     match key {
-        crate::shard::router::RuntimeStreamKey::Data(key) => [
-            crate::view::ViewOp::RemoveDataPlan { key },
-            crate::view::ViewOp::RemoveDataRuntime { key },
+        crate::shard::router::RuntimeStreamKey::Unreliable(key) => [
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Unreliable(key),
+            },
+            crate::view::ViewOp::RemoveUnreliableRuntime { key },
         ],
         crate::shard::router::RuntimeStreamKey::Reliable(key) => [
-            crate::view::ViewOp::RemoveReliablePlan { key },
+            crate::view::ViewOp::RemovePlan {
+                target: crate::view::PlanTarget::Reliable(key),
+            },
             crate::view::ViewOp::RemoveReliableRuntime { key },
         ],
     }
@@ -64,7 +70,9 @@ fn install_stream_route_op(
     route: RouteHandle,
 ) -> crate::view::ViewOp {
     let action = match key {
-        crate::shard::router::RuntimeStreamKey::Data(stream) => RouteAction::Data { stream },
+        crate::shard::router::RuntimeStreamKey::Unreliable(stream) => {
+            RouteAction::Unreliable { stream }
+        }
         crate::shard::router::RuntimeStreamKey::Reliable(stream) => {
             RouteAction::Reliable { stream }
         }
@@ -88,19 +96,20 @@ fn retire_route_op(route: RouteHandle) -> crate::view::ViewOp {
 impl ControllerActor {
     pub(super) fn stream_plan(
         &self,
+        id: &crate::shard::router::DataStreamId,
+        lane: StreamLane,
         binding: &crate::control::lanes::StreamBinding,
         destination: crate::id::ShardId,
     ) -> crate::view::StreamPlan {
-        let local_subscribers = binding
-            .subscribers
-            .get(&destination)
-            .map(|subscribers| {
-                subscribers
-                    .values()
-                    .map(|subscriber| (subscriber.key, subscriber.channel))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // As with audio: the plan names its audiences and the shard holds the
+        // membership, so a subscriber arriving does not rewrite the plan of
+        // every stream already published on the topic.
+        let subject = crate::control::patterns::Subject {
+            room: id.room_id,
+            publisher: id.publisher_id,
+            name: (id.topic.clone(), lane),
+        };
+        let groups = self.data_patterns.match_subject(&subject);
         let remote_routes = if destination == binding.publisher_shard {
             binding
                 .routes
@@ -122,8 +131,7 @@ impl ControllerActor {
                 epoch: handle.epoch,
             });
         crate::view::StreamPlan {
-            groups: Default::default(),
-            local_subscribers,
+            groups,
             remote_routes,
             reverse_route,
         }
@@ -176,7 +184,6 @@ impl ControllerActor {
             binding.reverse_route = Some(route);
         }
 
-        self.lanes.get_mut(lane).apply_wildcards(&id);
         self.reconcile_stream(id, lane).await;
     }
 
@@ -195,29 +202,37 @@ impl ControllerActor {
         channel: str0m::channel::ChannelId,
         lane: StreamLane,
     ) {
-        let entry = Subscriber {
-            key: subscriber_key,
-            channel,
-        };
-        let registry = self.lanes.get_mut(lane);
-        let ids = match publisher {
+        let pattern = match publisher {
             Some(publisher) => {
-                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                registry
-                    .subscribe(id, shard_id, subscriber, entry)
-                    .into_iter()
-                    .collect()
+                crate::control::patterns::Pattern::exact(room_id, publisher, (topic.clone(), lane))
             }
-            None => registry.subscribe_wildcard(
-                room_id,
-                topic,
-                subscriber,
-                WildcardSubscriber {
-                    shard: shard_id,
-                    key: subscriber_key,
-                    channel,
-                },
-            ),
+            None => {
+                crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
+            }
+        };
+        let (_, membership_ops) = crate::control::patterns::declare_audience(
+            &mut self.data_patterns,
+            pattern,
+            subscriber,
+            crate::control::patterns::Member {
+                shard: shard_id,
+                key: subscriber_key,
+                delivery: channel,
+            },
+            crate::view::Delivery::Data(channel),
+            crate::view::AudienceKind::Data,
+        );
+        if !self.publish_ops(membership_ops) {
+            debug_assert!(false, "data group membership must publish");
+        }
+        // Which streams this reaches is a catalog question now, not something
+        // the registry has to remember on the subscriber's behalf.
+        let registry = self.lanes.get(lane);
+        let ids: Vec<_> = match publisher {
+            Some(publisher) => vec![crate::shard::router::DataStreamId::new(
+                room_id, publisher, topic,
+            )],
+            None => registry.ids_on_topic(&room_id, &topic),
         };
         for id in ids {
             self.reconcile_stream(id, lane).await;
@@ -232,24 +247,31 @@ impl ControllerActor {
         publisher: Option<ParticipantId>,
         lane: StreamLane,
     ) {
-        let registry = self.lanes.get_mut(lane);
+        let pattern = match publisher {
+            Some(publisher) => {
+                crate::control::patterns::Pattern::exact(room_id, publisher, (topic.clone(), lane))
+            }
+            None => {
+                crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
+            }
+        };
+        let (_, membership_ops) = crate::control::patterns::retract_audience(
+            &mut self.data_patterns,
+            &pattern,
+            &subscriber,
+            crate::view::AudienceKind::Data,
+        );
+        if !self.publish_ops(membership_ops) {
+            debug_assert!(false, "data group retraction must publish");
+        }
+        let registry = self.lanes.get(lane);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::shard::router::DataStreamId::new(
                 room_id, publisher, topic,
             )],
-            None => {
-                registry.unsubscribe_wildcard(room_id, topic.clone(), &subscriber);
-                registry.ids_on_topic(&room_id, &topic)
-            }
+            None => registry.ids_on_topic(&room_id, &topic),
         };
-        // A named publisher also clears a subscription still parked against a
-        // stream that never became ready; a wildcard has nothing parked.
-        let drop_pending = publisher.is_some();
-        let changed: Vec<_> = ids
-            .into_iter()
-            .filter(|id| registry.unsubscribe(id, &subscriber, drop_pending))
-            .collect();
-        for id in changed {
+        for id in ids {
             self.reconcile_stream(id, lane).await;
         }
     }
@@ -270,7 +292,8 @@ impl ControllerActor {
         };
         let publisher_shard = binding.publisher_shard;
         let source_key = binding.key;
-        let mut source_plan = source_key.map(|_| self.stream_plan(binding, publisher_shard));
+        let mut source_plan =
+            source_key.map(|_| self.stream_plan(id, lane, binding, publisher_shard));
         if let Some(plan) = source_plan.as_mut() {
             plan.remote_routes
                 .retain(|route| !stale.iter().any(|(shard, _, _)| route.shard_id == *shard));
@@ -308,7 +331,6 @@ impl ControllerActor {
         lane: StreamLane,
     ) -> bool {
         let Some(binding) = self.lanes.get(lane).get(&id) else {
-            self.lanes.get_mut(lane).forget_pending(&id);
             return true;
         };
         let publisher_shard = binding.publisher_shard;
@@ -357,11 +379,37 @@ impl ControllerActor {
         true
     }
 
+    /// The shards holding at least one declared consumer of this stream.
+    fn stream_destinations(
+        &self,
+        id: &crate::shard::router::DataStreamId,
+        lane: StreamLane,
+    ) -> Vec<crate::id::ShardId> {
+        let subject = crate::control::patterns::Subject {
+            room: id.room_id,
+            publisher: id.publisher_id,
+            name: (id.topic.clone(), lane),
+        };
+        let mut shards = Vec::new();
+        for group in self.data_patterns.match_subject(&subject) {
+            for shard in self.data_patterns.shards_of(group) {
+                if !shards.contains(&shard) {
+                    shards.push(shard);
+                }
+            }
+        }
+        shards
+    }
+
     pub(super) async fn reconcile_stream(
         &mut self,
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) {
+        // Which shards consume this stream is a question about declarations,
+        // not about what the binding happens to remember. Asking the pattern
+        // table is what lets the binding stop tracking subscribers at all.
+        let wanted = self.stream_destinations(&id, lane);
         let stale: Vec<_> = self
             .lanes
             .get(lane)
@@ -371,7 +419,7 @@ impl ControllerActor {
                     .routes
                     .iter()
                     .filter_map(|(destination, route)| {
-                        if binding.subscribers.contains_key(destination) {
+                        if wanted.contains(destination) {
                             return None;
                         }
                         let key = binding.destination_keys.get(destination).copied()?;
@@ -385,12 +433,7 @@ impl ControllerActor {
             debug_assert!(false, "stream route retirement must complete");
             return;
         }
-        let destinations: Vec<_> = self
-            .lanes
-            .get(lane)
-            .get(&id)
-            .map(|binding| binding.subscribers.keys().copied().collect())
-            .unwrap_or_default();
+        let destinations = wanted;
         let Some(publisher_shard) = self
             .lanes
             .get(lane)
@@ -419,7 +462,7 @@ impl ControllerActor {
             let Some(binding) = self.lanes.get(lane).get(&id) else {
                 return;
             };
-            let plan = self.stream_plan(binding, destination);
+            let plan = self.stream_plan(&id, lane, binding, destination);
             let Some(route) = self
                 .grant_route_with_plan(destination, action, lane, plan.clone())
                 .await
@@ -457,7 +500,7 @@ impl ControllerActor {
             targets.push((
                 publisher_shard,
                 key,
-                self.stream_plan(binding, publisher_shard),
+                self.stream_plan(&id, lane, binding, publisher_shard),
                 None,
             ));
         }
@@ -468,7 +511,7 @@ impl ControllerActor {
             targets.push((
                 destination,
                 key,
-                self.stream_plan(binding, destination),
+                self.stream_plan(&id, lane, binding, destination),
                 Some(route),
             ));
         }
