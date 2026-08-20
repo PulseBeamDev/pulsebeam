@@ -5,7 +5,9 @@ members = [
   "pulsebeam-agent",
   "pulsebeam-cli",
   "pulsebeam-core",
+  "pulsebeam-ebpf",
   "pulsebeam-proto",
+  "pulsebeam-routing",
   "pulsebeam-runtime",
   "pulsebeam-simulator",
   "pulsebeam-testdata",
@@ -22,8 +24,11 @@ license = "AGPL-3.0"
 
 [workspace.dependencies]
 anyhow = "1"
+aya = "0.14.0"
+aya-ebpf = "0.2.1"
 bytes = "1.11.1"
 derive_more = { version = "2.1.1", features = ["full"] }
+fastrand = "2.3.0"
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"
 rand = "0.10.1"
@@ -39,7 +44,6 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full", "test-util", "tracing"] }
 tokio-util = "0.7.18"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
-triomphe = "0.1.15"
 turmoil = "0.7.2"
 
 [patch.crates-io]

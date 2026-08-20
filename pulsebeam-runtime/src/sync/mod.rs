@@ -98,10 +98,6 @@ mod primitives {
     pub use inner::*;
     pub use std::sync::{Barrier, BarrierWaitResult, Condvar, Once, OnceState, WaitTimeoutResult};
 
-    /// Zero-weak-count Arc — drops the weak-count word from every allocation and
-    /// the matching atomic acquire on every `clone()`.  This is the canonical
-    /// `Arc` for all internal SFU code; import via `crate::sync::Arc` (runtime)
-    /// or `pulsebeam_runtime::sync::Arc` (other crates).
     pub use std::sync::Arc;
 
     pub mod atomic {

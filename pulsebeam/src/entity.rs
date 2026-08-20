@@ -219,10 +219,16 @@ pub struct ParticipantId {
     uuid: Uuid,
 }
 
+impl Default for ParticipantId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ParticipantId {
-    pub fn new(rng: &mut impl RngCore) -> Self {
+    pub fn new() -> Self {
         let mut bytes = [0u8; 16];
-        rng.fill_bytes(&mut bytes);
+        pulsebeam_runtime::rand::os_rng().fill_bytes(&mut bytes);
         // Set UUID version 4
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         // Set UUID variant
@@ -306,6 +312,12 @@ pub struct ConnectionId {
     uuid: Uuid,
 }
 
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionId {
     pub const MIN: ConnectionId = ConnectionId {
         uuid: Uuid::from_u128(0),
@@ -314,9 +326,9 @@ impl ConnectionId {
         uuid: Uuid::from_u128(u128::MAX),
     };
 
-    pub fn new(rng: &mut impl RngCore) -> Self {
+    pub fn new() -> Self {
         let mut bytes = [0u8; 16];
-        rng.fill_bytes(&mut bytes);
+        pulsebeam_runtime::rand::os_rng().fill_bytes(&mut bytes);
         // Set UUID version 4
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         // Set UUID variant
@@ -514,7 +526,7 @@ mod tests {
 
     #[test]
     fn participant_id_roundtrip() {
-        let id = ParticipantId::new(&mut test_rng());
+        let id = ParticipantId::new();
         let parsed = ParticipantId::from_str(&id.as_str()).unwrap();
         assert_eq!(id, parsed);
     }
@@ -657,16 +669,16 @@ mod tests {
 
     #[test]
     fn participant_id_uniqueness() {
-        let mut rng = seeded_rng(0);
+        let _rng = seeded_rng(0);
         let mut seen = HashSet::new();
         for _ in 0..1000 {
-            assert!(seen.insert(ParticipantId::new(&mut rng).as_str()));
+            assert!(seen.insert(ParticipantId::new().as_str()));
         }
     }
 
     #[test]
     fn track_id_derivation_determinism() {
-        let p = ParticipantId::new(&mut test_rng());
+        let p = ParticipantId::new();
         let t1 = p.derive_track_id(TrackKind::Video, "cam");
         let t2 = p.derive_track_id(TrackKind::Video, "cam");
         assert_eq!(t1, t2);
@@ -675,7 +687,7 @@ mod tests {
 
     #[test]
     fn track_id_derivation_uniqueness() {
-        let p = ParticipantId::new(&mut test_rng());
+        let p = ParticipantId::new();
         let t1 = p.derive_track_id(TrackKind::Video, "cam");
         let t2 = p.derive_track_id(TrackKind::Audio, "mic");
         assert_ne!(t1, t2);
@@ -683,7 +695,7 @@ mod tests {
 
     #[test]
     fn participant_id_serde_roundtrip() {
-        let id = ParticipantId::new(&mut test_rng());
+        let id = ParticipantId::new();
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized: ParticipantId = serde_json::from_str(&serialized).unwrap();
         assert_eq!(id, deserialized);
@@ -691,7 +703,7 @@ mod tests {
 
     #[test]
     fn track_id_serde_roundtrip() {
-        let p = ParticipantId::new(&mut test_rng());
+        let p = ParticipantId::new();
         let id = p.derive_track_id(TrackKind::Video, "cam");
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized: TrackId = serde_json::from_str(&serialized).unwrap();
@@ -733,7 +745,7 @@ mod tests {
     #[test]
     fn participant_id_as_hashmap_key() {
         let mut map: HashMap<ParticipantId, String> = HashMap::new();
-        let id = ParticipantId::new(&mut test_rng());
+        let id = ParticipantId::new();
         map.insert(id, "value".to_string());
         assert_eq!(map.get(&id), Some(&"value".to_string()));
     }
@@ -741,7 +753,7 @@ mod tests {
     #[test]
     fn track_id_as_hashmap_key() {
         let mut map: HashMap<TrackId, String> = HashMap::new();
-        let p = ParticipantId::new(&mut test_rng());
+        let p = ParticipantId::new();
         let id = p.derive_track_id(TrackKind::Video, "cam");
         map.insert(id, "value".to_string());
         assert_eq!(map.get(&id), Some(&"value".to_string()));
@@ -764,14 +776,14 @@ mod tests {
 
     #[test]
     fn participant_id_copy_semantics() {
-        let id1 = ParticipantId::new(&mut test_rng());
+        let id1 = ParticipantId::new();
         let id2 = id1; // Copy
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn track_id_copy_semantics() {
-        let p = ParticipantId::new(&mut test_rng());
+        let p = ParticipantId::new();
         let id1 = p.derive_track_id(TrackKind::Video, "cam");
         let id2 = id1; // Copy
         assert_eq!(id1, id2);
@@ -814,9 +826,9 @@ mod tests {
 
     #[test]
     fn display_format() {
-        let mut rng = test_rng();
-        assert!(format!("{}", ParticipantId::new(&mut rng)).starts_with("pa_"));
-        let p = ParticipantId::new(&mut rng);
+        let _rng = test_rng();
+        assert!(format!("{}", ParticipantId::new()).starts_with("pa_"));
+        let p = ParticipantId::new();
         assert!(format!("{}", p.derive_track_id(TrackKind::Video, "c")).starts_with("vid_"));
         let ext = ExternalRoomId::new("test").unwrap();
         assert!(format!("{}", RoomId::from_external(&ext)).starts_with("rm_"));
@@ -824,8 +836,8 @@ mod tests {
 
     #[test]
     fn as_str_returns_valid_string() {
-        let mut rng = test_rng();
-        let participant_id = ParticipantId::new(&mut rng);
+        let _rng = test_rng();
+        let participant_id = ParticipantId::new();
         assert!(participant_id.as_str().starts_with("pa_"));
         assert_eq!(participant_id.as_str(), participant_id.as_str());
         let track_id = participant_id.derive_track_id(TrackKind::Video, "cam");
@@ -836,7 +848,7 @@ mod tests {
     #[test]
     fn parsing_from_client_input() {
         assert!(ExternalRoomId::from_str("my-conference-room").is_ok());
-        let participant_id = ParticipantId::new(&mut test_rng());
+        let participant_id = ParticipantId::new();
         let serialized = participant_id.as_str();
         let parsed = ParticipantId::from_str(&serialized).unwrap();
         assert_eq!(parsed, participant_id);
@@ -844,8 +856,8 @@ mod tests {
 
     #[test]
     fn storing_in_multiple_collections() {
-        let mut rng = test_rng();
-        let participant_id = ParticipantId::new(&mut rng);
+        let _rng = test_rng();
+        let participant_id = ParticipantId::new();
         let track_id = participant_id.derive_track_id(TrackKind::Video, "cam");
         let mut participant_map: HashMap<ParticipantId, Vec<TrackId>> = HashMap::new();
         let mut track_map: HashMap<TrackId, ParticipantId> = HashMap::new();
@@ -857,9 +869,9 @@ mod tests {
 
     #[test]
     fn comparison_and_ordering() {
-        let mut rng = test_rng();
-        let id1 = ParticipantId::new(&mut rng);
-        let id2 = ParticipantId::new(&mut rng);
+        let _rng = test_rng();
+        let id1 = ParticipantId::new();
+        let id2 = ParticipantId::new();
         assert_ne!(id1, id2);
         let mut ids = [id1, id2];
         ids.sort();
@@ -878,11 +890,11 @@ mod tests {
 
     #[test]
     fn ids_are_url_safe() {
-        let mut rng = test_rng();
-        for c in ParticipantId::new(&mut rng).as_str().chars() {
+        let _rng = test_rng();
+        for c in ParticipantId::new().as_str().chars() {
             assert!(c.is_ascii_alphanumeric() || c == '_');
         }
-        let p = ParticipantId::new(&mut rng);
+        let p = ParticipantId::new();
         for c in p.derive_track_id(TrackKind::Video, "c").as_str().chars() {
             assert!(c.is_ascii_alphanumeric() || c == '_');
         }

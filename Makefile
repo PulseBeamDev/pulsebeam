@@ -8,7 +8,7 @@ SIM := sim
 TARGET = pulsebeam
 TEST =
 
-.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean
+.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing
 all: build
 
 dev:
@@ -52,6 +52,16 @@ test-sim:
 test-sim-seed:
 	PULSEBEAM_SIM_SEED=$(SEED) $(CARGO_CMD) nextest run --cargo-profile $(SIM) \
 		-p pulsebeam-simulator --no-fail-fast $(TEST)
+
+# bpfel-unknown-none has no precompiled std, so it always needs nightly plus
+# `-Z build-std=core` — `rustup target add` cannot install it, tier-3 targets
+# ship no prebuilt sysroot. pulsebeam-ebpf/build.rs resolves and caches
+# bpf-linker, so no separate linker installation is needed.
+build-ebpf:
+	$(CARGO_CMD) +nightly build -Z build-std=core --target bpfel-unknown-none -p pulsebeam-ebpf --release
+
+test-routing:
+	$(CARGO_CMD) test -p pulsebeam-routing -- $(TEST)
 
 # Run the suite over many seeds.
 #

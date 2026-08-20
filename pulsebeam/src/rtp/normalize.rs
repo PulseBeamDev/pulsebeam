@@ -91,6 +91,7 @@ impl StreamNormalizer {
                 // structure on every keyframe, so it is the authoritative
                 // keyframe signal whenever present.
                 pkt.is_keyframe = dd.attached_structure.is_some();
+                pkt.is_frame_start = dd.start_of_frame;
                 pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
                 self.dd.structure().map(|s| s.decode_target_count)
             }
