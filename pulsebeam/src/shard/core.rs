@@ -292,13 +292,7 @@ impl ShardCore {
                     | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
                     | crate::view::ViewOp::RemoveReliableRuntime { .. }
                     | crate::view::ViewOp::RemovePlan { .. }
-                    | crate::view::ViewOp::SetPlan { .. }
-                    | crate::view::ViewOp::InsertVideoMember { .. }
-                    | crate::view::ViewOp::InsertAudioMember { .. }
-                    | crate::view::ViewOp::InsertDataMember { .. }
-                    | crate::view::ViewOp::RemoveVideoMember { .. }
-                    | crate::view::ViewOp::RemoveAudioMember { .. }
-                    | crate::view::ViewOp::RemoveDataMember { .. } => {}
+                    | crate::view::ViewOp::SetPlan { .. } => {}
                 }
                 if let crate::view::ViewOp::RemoveParticipant { key } = op {
                     self.timers.cancel(*key);
@@ -357,13 +351,8 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime.route_video_with_plan(
-                    local_track,
-                    *pkt,
-                    plan,
-                    &view.video_groups,
-                    &mut ctx,
-                );
+                self.runtime
+                    .route_video_with_plan(local_track, *pkt, plan, &mut ctx);
             }
             (crate::route::RouteAction::Audio { track }, MediaPayload::Audio(mut pkt)) => {
                 let Some(plan) = view.audio.resolve(track.raw()) else {
@@ -391,11 +380,9 @@ impl ShardCore {
                         stream_id: (track_id, None),
                         pkt: *pkt,
                         origin: track_origin,
-                        origin_key: None,
                         fanout: Some(track.raw()),
                     },
                     plan,
-                    &view.audio_groups,
                     &mut ctx,
                 );
             }
@@ -415,7 +402,6 @@ impl ShardCore {
                     Origin::Remote,
                     bytes,
                     plan,
-                    &view.data_groups,
                     &mut ctx,
                 );
             }
@@ -435,7 +421,6 @@ impl ShardCore {
                     Origin::Remote,
                     bytes,
                     plan,
-                    &view.data_groups,
                     &mut ctx,
                 );
             }
@@ -540,7 +525,6 @@ impl ShardCore {
                 Origin::Local,
                 ev,
                 plan,
-                &view.audio_groups,
                 &mut ctx,
             );
         }
@@ -566,7 +550,6 @@ impl ShardCore {
                 crate::keys::VideoTrackKey::new(fanout),
                 ev.pkt,
                 plan,
-                &view.video_groups,
                 &mut ctx,
             );
         }
@@ -584,14 +567,8 @@ impl ShardCore {
                 record_routing_drop("data", "plan", "local");
                 continue;
             };
-            self.runtime.route_unreliable_with_plan(
-                stream,
-                Origin::Local,
-                ev.pkt,
-                plan,
-                &view.data_groups,
-                &mut ctx,
-            );
+            self.runtime
+                .route_unreliable_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_reliable_data_sctp() else {
@@ -607,14 +584,8 @@ impl ShardCore {
                 record_routing_drop("reliable", "plan", "local");
                 continue;
             };
-            self.runtime.route_reliable_with_plan(
-                stream,
-                Origin::Local,
-                ev.pkt,
-                plan,
-                &view.data_groups,
-                &mut ctx,
-            );
+            self.runtime
+                .route_reliable_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
         }
         processed
     }
@@ -774,7 +745,6 @@ impl ShardCore {
             crate::keys::VideoTrackKey::new(fanout),
             states,
             plan,
-            &view.video_groups,
             &mut ctx,
         );
     }
@@ -917,8 +887,7 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime
-                    .apply_stats(local_track, stats, plan, &view.video_groups, &mut ctx);
+                self.runtime.apply_stats(local_track, stats, plan, &mut ctx);
             }
         }
     }

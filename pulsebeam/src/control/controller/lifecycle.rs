@@ -159,16 +159,8 @@ impl ControllerActor {
 
         // A video track's subscribers named it directly and never unsubscribe
         // from something that goes away, so their declarations go with it.
-        if kind == crate::entity::TrackKind::Video
-            && let Some((group, members)) = self.video_patterns.retire_pattern(&retired_pattern)
-        {
-            let ops = members
-                .into_iter()
-                .map(|(_, shard, key)| {
-                    (shard, crate::view::ViewOp::RemoveVideoMember { group, key })
-                })
-                .collect();
-            self.publish_ops(ops);
+        if kind == crate::entity::TrackKind::Video {
+            let _ = self.video_patterns.retire_pattern(&retired_pattern);
         }
 
         let now = tokio::time::Instant::now();
@@ -462,6 +454,25 @@ impl ControllerActor {
         true
     }
 
+    pub(super) async fn retire_stale_destinations(&mut self, id: crate::entity::TrackId) {
+        let stale = {
+            let Some(publication) = self.catalog.get(&id) else {
+                return;
+            };
+            let wanted: indexmap::IndexSet<_> =
+                self.publication_shards(publication).into_iter().collect();
+            publication
+                .destinations
+                .keys()
+                .filter(|destination| !wanted.contains(*destination))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        for destination in stale {
+            self.retire_destination(id, destination).await;
+        }
+    }
+
     pub(super) async fn retire_destination(
         &mut self,
         id: crate::entity::TrackId,
@@ -559,13 +570,7 @@ impl ControllerActor {
         }
     }
 
-    /// The audiences a publication reaches.
-    ///
-    /// The tables are per kind because the delivery key is - a video slot, an
-    /// audio slot chosen per packet, an SCTP channel - and the data table is
-    /// keyed by topic because a data declaration names one across publishers.
-    /// Selecting the table is the whole of what differs; a match yields the
-    /// same group ids either way.
+    /// Compile the final local recipients and inter-shard routes for one shard.
     pub(super) fn plan_for(
         &self,
         id: crate::entity::TrackId,
@@ -583,12 +588,16 @@ impl ControllerActor {
                     &publication.destinations,
                     publication.publisher_shard,
                     publication.reverse_route,
-                    self.video_patterns
-                        .match_subject(&crate::control::patterns::Subject {
-                            room: publication.room,
-                            publisher: publication.publisher,
-                            name: id,
-                        }),
+                    self.video_patterns.members_for(
+                        self.video_patterns
+                            .match_subject(&crate::control::patterns::Subject {
+                                room: publication.room,
+                                publisher: publication.publisher,
+                                name: id,
+                            }),
+                        shard,
+                        publication.publisher,
+                    ),
                     shard,
                 ),
             }),
@@ -601,12 +610,16 @@ impl ControllerActor {
                     &publication.destinations,
                     publication.publisher_shard,
                     publication.reverse_route,
-                    self.audio_patterns
-                        .match_subject(&crate::control::patterns::Subject {
-                            room: publication.room,
-                            publisher: publication.publisher,
-                            name: id,
-                        }),
+                    self.audio_patterns.members_for(
+                        self.audio_patterns
+                            .match_subject(&crate::control::patterns::Subject {
+                                room: publication.room,
+                                publisher: publication.publisher,
+                                name: id,
+                            }),
+                        shard,
+                        publication.publisher,
+                    ),
                     shard,
                 ),
             }),
@@ -622,12 +635,16 @@ impl ControllerActor {
                         &publication.destinations,
                         publication.publisher_shard,
                         publication.reverse_route,
-                        self.data_patterns
-                            .match_subject(&crate::control::patterns::Subject {
-                                room: publication.room,
-                                publisher: publication.publisher,
-                                name: (topic.clone(), (*lane).into()),
-                            }),
+                        self.data_patterns.members_for(
+                            self.data_patterns
+                                .match_subject(&crate::control::patterns::Subject {
+                                    room: publication.room,
+                                    publisher: publication.publisher,
+                                    name: (topic.clone(), (*lane).into()),
+                                }),
+                            shard,
+                            publication.publisher,
+                        ),
                         shard,
                     ),
                 })
@@ -644,12 +661,16 @@ impl ControllerActor {
                         &publication.destinations,
                         publication.publisher_shard,
                         publication.reverse_route,
-                        self.data_patterns
-                            .match_subject(&crate::control::patterns::Subject {
-                                room: publication.room,
-                                publisher: publication.publisher,
-                                name: (topic.clone(), (*lane).into()),
-                            }),
+                        self.data_patterns.members_for(
+                            self.data_patterns
+                                .match_subject(&crate::control::patterns::Subject {
+                                    room: publication.room,
+                                    publisher: publication.publisher,
+                                    name: (topic.clone(), (*lane).into()),
+                                }),
+                            shard,
+                            publication.publisher,
+                        ),
                         shard,
                     ),
                 })
@@ -723,53 +744,5 @@ impl ControllerActor {
                 .flat_map(|group| self.data_patterns.shards_of(group))
                 .collect(),
         }
-    }
-
-    fn publication_reaches_shard_inner(
-        &self,
-        publication: &crate::control::publication::Publication,
-        shard: crate::id::ShardId,
-    ) -> bool {
-        match &publication.media {
-            crate::control::publication::Media::Video { .. } => self
-                .video_patterns
-                .match_subject(&crate::control::patterns::Subject {
-                    room: publication.room,
-                    publisher: publication.publisher,
-                    name: publication.id,
-                })
-                .into_iter()
-                .any(|group| self.video_patterns.has_shard(group, shard)),
-            crate::control::publication::Media::Audio => self
-                .audio_patterns
-                .match_subject(&crate::control::patterns::Subject {
-                    room: publication.room,
-                    publisher: publication.publisher,
-                    name: publication.id,
-                })
-                .into_iter()
-                .any(|group| self.audio_patterns.has_shard(group, shard)),
-            crate::control::publication::Media::Data { lane, topic } => self
-                .data_patterns
-                .match_subject(&crate::control::patterns::Subject {
-                    room: publication.room,
-                    publisher: publication.publisher,
-                    name: (topic.clone(), (*lane).into()),
-                })
-                .into_iter()
-                .any(|group| self.data_patterns.has_shard(group, shard)),
-        }
-    }
-
-    pub(super) fn publication_reaches_shard(
-        &self,
-        id: crate::entity::TrackId,
-        shard: crate::id::ShardId,
-    ) -> bool {
-        let Some(publication) = self.catalog.get(&id) else {
-            return false;
-        };
-        publication.publisher_shard != shard
-            && self.publication_reaches_shard_inner(publication, shard)
     }
 }

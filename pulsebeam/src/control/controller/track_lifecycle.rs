@@ -259,7 +259,7 @@ impl ControllerActor {
                 (fanout, true)
             }
         };
-        let (membership, mut membership_ops) = crate::control::patterns::declare_audience(
+        let (membership, displaced) = crate::control::patterns::declare_audience(
             &mut self.video_patterns,
             pattern.clone(),
             subscriber,
@@ -270,6 +270,7 @@ impl ControllerActor {
             },
         );
         self.index_publication(track.id);
+        let mut membership_ops = Vec::new();
         membership_ops.push((
             shard_id,
             crate::view::ViewOp::BindSubscribedTrack {
@@ -311,19 +312,19 @@ impl ControllerActor {
                 .install_video_route(track.id, shard_id, fanout, plan)
                 .await
             else {
-                let (_, mut rollback) = crate::control::patterns::retract_audience(
+                let _ = crate::control::patterns::retract_audience(
                     &mut self.video_patterns,
                     &pattern,
                     &subscriber,
                 );
-                rollback.push((
+                let rollback = vec![(
                     shard_id,
                     crate::view::ViewOp::UnbindSubscribedTrack {
                         participant: subscriber_key,
                         track: track.id,
                         fanout,
                     },
-                ));
+                )];
                 self.publish_ops(rollback);
                 if new_destination {
                     if let Some(binding) = self.catalog.get_mut(&track.id) {
@@ -361,8 +362,39 @@ impl ControllerActor {
             else {
                 pulsebeam_runtime::fatal!("a subscribed video must belong to a publication");
             };
-            if !self.publish_plan_to(track.id, publisher_shard) {
-                debug_assert!(false, "publisher plan publication must complete");
+            if !self.publish_plan_to(track.id, shard_id) {
+                debug_assert!(false, "a changed video audience must publish its plan");
+            }
+            if publisher_shard != shard_id && !self.publish_plan_to(track.id, publisher_shard) {
+                debug_assert!(false, "a changed video audience must publish its plan");
+            }
+        }
+        for (_, departure, previous_shard, _) in displaced {
+            if previous_shard == shard_id {
+                continue;
+            }
+            if departure == crate::control::patterns::Departure::LastOnShard {
+                let Some(route) = self.catalog.get(&track.id).and_then(|binding| {
+                    binding
+                        .destinations
+                        .get(&previous_shard)
+                        .and_then(|destination| match destination {
+                            crate::control::publication::Destination::Forwarding {
+                                route, ..
+                            } => Some(*route),
+                            crate::control::publication::Destination::Discovery { .. } => None,
+                        })
+                }) else {
+                    continue;
+                };
+                if !self
+                    .retire_video_route(previous_shard, route, track.id)
+                    .await
+                {
+                    debug_assert!(false, "a displaced video route must retire");
+                }
+            } else if !self.publish_plan_to(track.id, previous_shard) {
+                debug_assert!(false, "a displaced video audience must publish its plan");
             }
         }
     }
@@ -381,11 +413,12 @@ impl ControllerActor {
             .video_patterns
             .member_key(&pattern, &subscriber)
             .map(|(_, key)| key);
-        let (departure, mut membership_ops) = crate::control::patterns::retract_audience(
+        let departure = crate::control::patterns::retract_audience(
             &mut self.video_patterns,
             &pattern,
             &subscriber,
         );
+        let mut membership_ops = Vec::new();
         if let (Some(key), Some(fanout)) = (subscriber_key, self.track_fanout(track.id, shard_id)) {
             membership_ops.push((
                 shard_id,
