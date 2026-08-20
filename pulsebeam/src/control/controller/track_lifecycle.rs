@@ -273,18 +273,23 @@ impl ControllerActor {
             debug_assert!(false, "a published track must have a room");
             return;
         };
-        let mut local_subscribers: HashMap<
-            crate::id::ShardId,
-            Vec<(crate::shard::participants::ParticipantKey, ())>,
-        > = HashMap::new();
-        for (participant, shard, key) in self.core.registry.participants_in_room(&room_id) {
-            if participant != origin
-                && let Some(key) = key
-            {
-                local_subscribers.entry(shard).or_default().push((key, ()));
+        let subject = crate::control::patterns::Subject {
+            room: room_id,
+            publisher: origin,
+            name: track_id,
+        };
+        // The plan names its audiences rather than listing them. Membership
+        // lives on the shard, so a participant joining the room is one insert
+        // there instead of a rewrite of every audio plan in it.
+        let groups = self.audio_patterns.match_subject(&subject);
+        let mut destinations: Vec<crate::id::ShardId> = Vec::new();
+        for group in &groups {
+            for shard in self.audio_patterns.shards_of(*group) {
+                if !destinations.contains(&shard) {
+                    destinations.push(shard);
+                }
             }
         }
-        let destinations: Vec<_> = local_subscribers.keys().copied().collect();
         for destination in destinations {
             if destination == publisher_shard {
                 continue;
@@ -300,10 +305,8 @@ impl ControllerActor {
                 continue;
             };
             let plan = crate::view::AudioPlan {
-                local_subscribers: local_subscribers
-                    .get(&destination)
-                    .cloned()
-                    .unwrap_or_default(),
+                local_subscribers: Vec::new(),
+                groups: groups.clone(),
                 remote_routes: Vec::new(),
                 reverse_route: None,
             };
@@ -339,10 +342,8 @@ impl ControllerActor {
             })
             .collect();
         let source_plan = crate::view::AudioPlan {
-            local_subscribers: local_subscribers
-                .get(&publisher_shard)
-                .cloned()
-                .unwrap_or_default(),
+            local_subscribers: Vec::new(),
+            groups: groups.clone(),
             remote_routes,
             reverse_route: binding
                 .reverse_route
@@ -361,10 +362,8 @@ impl ControllerActor {
                 *destination,
                 *key,
                 crate::view::AudioPlan {
-                    local_subscribers: local_subscribers
-                        .get(destination)
-                        .cloned()
-                        .unwrap_or_default(),
+                    local_subscribers: Vec::new(),
+                    groups: groups.clone(),
                     remote_routes: Vec::new(),
                     reverse_route: None,
                 },
@@ -574,6 +573,7 @@ impl ControllerActor {
         Some((
             fanout,
             crate::view::VideoPlan {
+                groups: Default::default(),
                 local_subscribers,
                 remote_routes,
                 reverse_route: binding

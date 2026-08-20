@@ -14,7 +14,7 @@
 //! answer to a question.
 #![deny(clippy::arithmetic_side_effects)]
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
@@ -58,18 +58,37 @@ pub(crate) enum InterestChange {
 /// Per-stream subscriber sets, keyed by the destination shard that holds
 /// them.
 ///
-/// Keyed by `(shard, stream)` rather than nested, because every question asked
-/// of it is about one shard's interest in one stream — never "who subscribes
-/// to this across the node", which is what a nested shape would optimise for.
+/// Nested stream-then-shard rather than flat `(shard, stream)`. A flat key
+/// makes `subscribe` a single lookup, but every *per-stream* question —
+/// `plan_destinations` on the publish path, `remove_stream` on teardown — then
+/// has to scan every interest on the node to find the handful belonging to one
+/// stream. Nesting keeps both O(shards holding that stream), and costs the
+/// point lookups only a second hash.
+///
+/// `by_participant` exists for the same reason on the other axis: a departure
+/// should cost what that participant subscribed to, not what the node holds.
+///
+/// Removal is `shift_remove` throughout, not `swap_remove`. Iteration order
+/// here becomes the order of `local_subscribers` and `remote_routes` in a
+/// published plan, so reordering on removal would change packet ordering under
+/// simulation — deterministic still, but differently, which would make any
+/// seed regression ambiguous. The maps that pay for it are small: subscribers
+/// on one shard for one stream, and shards holding one stream.
 #[derive(Debug)]
 pub(crate) struct Subscriptions<K, S> {
-    interest: IndexMap<(ShardId, K), Interest<S>>,
+    interest: IndexMap<K, IndexMap<ShardId, Interest<S>>>,
+    by_participant: IndexMap<ParticipantId, IndexSet<(K, ShardId)>>,
+    #[cfg(test)]
+    visited: std::cell::Cell<usize>,
 }
 
 impl<K, S> Default for Subscriptions<K, S> {
     fn default() -> Self {
         Self {
             interest: IndexMap::new(),
+            by_participant: IndexMap::new(),
+            #[cfg(test)]
+            visited: std::cell::Cell::new(0),
         }
     }
 }
@@ -89,10 +108,22 @@ impl<K: std::hash::Hash + Eq + Clone, S: Copy> Subscriptions<K, S> {
         payload: S,
         _publisher_shard: ShardId,
     ) -> InterestChange {
-        let interest = self.interest.entry((shard, stream)).or_default();
+        let interest = self
+            .interest
+            .entry(stream.clone())
+            .or_default()
+            .entry(shard)
+            .or_default();
         let was_empty = interest.subscribers.is_empty();
         interest.subscribers.insert(subscriber, payload);
-        if was_empty && interest.route.is_none() {
+        let needs_route = was_empty && interest.route.is_none();
+
+        self.by_participant
+            .entry(subscriber)
+            .or_default()
+            .insert((stream, shard));
+
+        if needs_route {
             InterestChange::Install
         } else {
             InterestChange::None
@@ -101,7 +132,12 @@ impl<K: std::hash::Hash + Eq + Clone, S: Copy> Subscriptions<K, S> {
 
     /// Record the route installed for a shard's interest.
     pub fn installed(&mut self, shard: ShardId, stream: K, route: RouteHandle) {
-        let interest = self.interest.entry((shard, stream)).or_default();
+        let interest = self
+            .interest
+            .entry(stream)
+            .or_default()
+            .entry(shard)
+            .or_default();
         debug_assert!(
             interest.route.is_none(),
             "a shard's interest holds one route at a time"
@@ -117,95 +153,138 @@ impl<K: std::hash::Hash + Eq + Clone, S: Copy> Subscriptions<K, S> {
         stream: &K,
         subscriber: &ParticipantId,
     ) -> InterestChange {
-        let key = (shard, stream.clone());
-        let Some(interest) = self.interest.get_mut(&key) else {
+        let Some(shards) = self.interest.get_mut(stream) else {
+            return InterestChange::None;
+        };
+        let Some(interest) = shards.get_mut(&shard) else {
             return InterestChange::None;
         };
         if interest.subscribers.shift_remove(subscriber).is_none() {
             return InterestChange::None;
         }
+        Self::forget_subscription(&mut self.by_participant, subscriber, stream, shard);
         if !interest.subscribers.is_empty() {
             return InterestChange::None;
         }
-        match interest.route.take() {
-            Some(route) => {
-                self.interest.shift_remove(&key);
-                InterestChange::Retire { route }
-            }
-            None => {
-                self.interest.shift_remove(&key);
-                InterestChange::None
-            }
+        let route = interest.route.take();
+        shards.shift_remove(&shard);
+        if shards.is_empty() {
+            self.interest.shift_remove(stream);
+        }
+        match route {
+            Some(route) => InterestChange::Retire { route },
+            None => InterestChange::None,
+        }
+    }
+
+    fn forget_subscription(
+        by_participant: &mut IndexMap<ParticipantId, IndexSet<(K, ShardId)>>,
+        subscriber: &ParticipantId,
+        stream: &K,
+        shard: ShardId,
+    ) {
+        let Some(owned) = by_participant.get_mut(subscriber) else {
+            return;
+        };
+        owned.shift_remove(&(stream.clone(), shard));
+        if owned.is_empty() {
+            by_participant.shift_remove(subscriber);
         }
     }
 
     pub fn plan_destinations(&self, stream: &K) -> Vec<(ShardId, Option<RouteHandle>, Vec<S>)> {
-        self.interest
+        let Some(shards) = self.interest.get(stream) else {
+            return Vec::new();
+        };
+        shards
             .iter()
-            .filter_map(|((shard, candidate), interest)| {
-                if candidate != stream {
-                    return None;
-                }
-                Some((
+            .map(|(shard, interest)| {
+                #[cfg(test)]
+                self.visited.set(self.visited.get().saturating_add(1));
+                (
                     *shard,
                     interest.route,
                     interest.subscribers.values().copied().collect(),
-                ))
+                )
             })
             .collect()
     }
 
     pub fn remove_stream(&mut self, stream: &K) -> Vec<Retired> {
+        let Some(shards) = self.interest.shift_remove(stream) else {
+            return Vec::new();
+        };
         let mut retired = Vec::new();
-        self.interest.retain(|(shard, candidate), interest| {
-            if candidate != stream {
-                return true;
+        for (shard, mut interest) in shards {
+            for subscriber in interest.subscribers.keys() {
+                Self::forget_subscription(&mut self.by_participant, subscriber, stream, shard);
             }
             if let Some(route) = interest.route.take() {
                 retired.push(Retired {
-                    destination: *shard,
+                    destination: shard,
                     route,
                 });
             }
-            false
-        });
+        }
         retired
     }
 
     /// Drop a participant from every stream it subscribed to, returning the
     /// routes that lose their last consumer as a result.
     pub fn remove_participant(&mut self, subscriber: &ParticipantId) -> Vec<Retired> {
+        let Some(owned) = self.by_participant.shift_remove(subscriber) else {
+            return Vec::new();
+        };
         let mut retired = Vec::new();
-        self.interest.retain(|(shard, _stream), interest| {
+        for (stream, shard) in owned {
+            let Some(shards) = self.interest.get_mut(&stream) else {
+                continue;
+            };
+            let Some(interest) = shards.get_mut(&shard) else {
+                continue;
+            };
             if interest.subscribers.shift_remove(subscriber).is_none() {
-                return true;
+                continue;
             }
             if !interest.subscribers.is_empty() {
-                return true;
+                continue;
             }
             if let Some(route) = interest.route.take() {
                 retired.push(Retired {
-                    destination: *shard,
+                    destination: shard,
                     route,
                 });
             }
-            false
-        });
+            shards.shift_remove(&shard);
+            if shards.is_empty() {
+                self.interest.shift_remove(&stream);
+            }
+        }
         retired
     }
 
     #[cfg(test)]
     pub fn route_for(&self, shard: ShardId, stream: &K) -> Option<RouteHandle> {
         self.interest
-            .get(&(shard, stream.clone()))
+            .get(stream)
+            .and_then(|shards| shards.get(&shard))
             .and_then(|i| i.route)
     }
 
     #[cfg(test)]
     pub fn subscriber_count(&self, shard: ShardId, stream: &K) -> usize {
         self.interest
-            .get(&(shard, stream.clone()))
+            .get(stream)
+            .and_then(|shards| shards.get(&shard))
             .map_or(0, |i| i.subscribers.len())
+    }
+
+    /// How many interest entries `plan_destinations` has walked since the last
+    /// reset. Structural: it must not grow with streams the caller did not ask
+    /// about.
+    #[cfg(test)]
+    pub fn take_visited(&self) -> usize {
+        self.visited.replace(0)
     }
 }
 
@@ -406,6 +485,112 @@ mod tests {
         assert!(
             subs.route_for(b, &t1).is_some(),
             "another shard's route for the same track survives"
+        );
+    }
+
+    /// The structural point of the nested shape: answering "where does this
+    /// stream go" must not depend on how many other streams the node holds.
+    /// Asserted as entries walked, not elapsed time, so it cannot go flaky.
+    #[test]
+    fn planning_one_stream_does_not_walk_the_others() {
+        let mut subs = TrackSubscriptions::new();
+        let shard = ShardId::new(1);
+        let target = track(200);
+
+        for seed in 0..64u8 {
+            subs.subscribe(
+                shard,
+                track(seed),
+                pid(seed),
+                (ParticipantKey::default(), DownstreamSlotKey::default()),
+                ShardId::new(9),
+            );
+        }
+        subs.subscribe(
+            shard,
+            target,
+            pid(1),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
+            ShardId::new(9),
+        );
+        subs.subscribe(
+            ShardId::new(2),
+            target,
+            pid(2),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
+            ShardId::new(9),
+        );
+
+        let _ = subs.take_visited();
+        let destinations = subs.plan_destinations(&target);
+        assert_eq!(destinations.len(), 2, "both shards holding it are planned");
+        assert_eq!(
+            subs.take_visited(),
+            2,
+            "only the target stream's own interest entries are walked"
+        );
+
+        assert_eq!(subs.plan_destinations(&track(250)), Vec::new());
+        assert_eq!(
+            subs.take_visited(),
+            0,
+            "a stream nobody subscribes to walks nothing at all"
+        );
+    }
+
+    /// A departure costs what that participant subscribed to. The routes it
+    /// was the last consumer of retire; the ones it shared do not.
+    #[test]
+    fn removing_a_participant_leaves_shared_routes_alone() {
+        let mut subs = TrackSubscriptions::new();
+        let shard = ShardId::new(0);
+        let (solo, shared) = (track(1), track(2));
+
+        for (t, who) in [(solo, pid(1)), (shared, pid(1)), (shared, pid(2))] {
+            subs.subscribe(
+                shard,
+                t,
+                who,
+                (ParticipantKey::default(), DownstreamSlotKey::default()),
+                ShardId::new(9),
+            );
+        }
+        subs.installed(shard, solo, handle(0));
+        subs.installed(shard, shared, handle(1));
+
+        let retired = subs.remove_participant(&pid(1));
+        assert_eq!(retired.len(), 1, "only the route it alone consumed retires");
+        assert_eq!(retired[0].route, handle(0));
+        assert_eq!(
+            subs.subscriber_count(shard, &shared),
+            1,
+            "the co-subscriber keeps the shared route"
+        );
+        assert!(subs.route_for(shard, &shared).is_some());
+    }
+
+    /// Removing a stream must also forget it on the participant axis, or a
+    /// later departure would try to retire a route that no longer exists.
+    #[test]
+    fn removing_a_stream_forgets_it_on_both_axes() {
+        let mut subs = TrackSubscriptions::new();
+        let shard = ShardId::new(0);
+        let t = track(5);
+
+        subs.subscribe(
+            shard,
+            t,
+            pid(1),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
+            ShardId::new(9),
+        );
+        subs.installed(shard, t, handle(0));
+
+        let retired = subs.remove_stream(&t);
+        assert_eq!(retired.len(), 1);
+        assert!(
+            subs.remove_participant(&pid(1)).is_empty(),
+            "the participant no longer holds a subscription to a dead stream"
         );
     }
 }

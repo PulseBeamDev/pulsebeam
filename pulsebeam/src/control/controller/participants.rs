@@ -39,6 +39,26 @@ impl ControllerActor {
             self.release_route(retired.destination, retired.route).await;
         }
         self.pending.remove_participant(*participant_id);
+        let key = self
+            .core
+            .registry
+            .get_participant(participant_id)
+            .and_then(|meta| meta.binding);
+        let shard = self
+            .core
+            .registry
+            .transport_of(participant_id)
+            .map(|(s, _)| s);
+        let retracted = self.audio_patterns.remove_participant(participant_id);
+        if let (Some(key), Some(shard)) = (key, shard) {
+            let ops = retracted
+                .into_iter()
+                .map(|(group, _)| (shard, crate::view::ViewOp::AudioGroupRemove { group, key }))
+                .collect();
+            if !self.publish_ops(ops) {
+                debug_assert!(false, "audio group retraction must publish");
+            }
+        }
     }
 
     /// Retire whatever transport route a participant holds, if the registry
