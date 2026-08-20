@@ -2,7 +2,6 @@ use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
 };
-use std::collections::HashSet;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
@@ -91,11 +90,12 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         &mut self,
         subscriber: ParticipantKey,
         slot: DownstreamSlotKey,
+        track: TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
     ) {
         if let Some(participant) = self.registry.resolve_mut(subscriber) {
-            participant.on_forward_rtp(slot, pkt, cache);
+            participant.on_forward_rtp(slot, track, pkt, cache);
             self.dirty.mark(subscriber, participant);
         }
     }
@@ -123,7 +123,7 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
         }
     }
 
-    fn forward_sctp(
+    fn forward_unreliable_sctp(
         &mut self,
         subscriber: ParticipantKey,
         channel: str0m::channel::ChannelId,
@@ -245,7 +245,7 @@ impl ShardCore {
                             meta.bind_published_track(descriptor.id, *key);
                         }
                     }
-                    crate::view::ViewOp::InsertDataRuntime { publisher, key, id } => {
+                    crate::view::ViewOp::InsertUnreliableRuntime { publisher, key, id } => {
                         if let Some(meta) = self.registry.resolve_mut(*publisher) {
                             meta.bind_published_data_stream(&id.topic, *key);
                         }
@@ -255,44 +255,21 @@ impl ShardCore {
                             meta.bind_published_reliable_stream(&id.topic, *key);
                         }
                     }
-                    crate::view::ViewOp::SetTrackPlan { key, plan } => {
-                        let Some((track_id, _)) = self.runtime.track_identity(*key) else {
-                            continue;
-                        };
-                        let mut previous_participants = HashSet::new();
-                        if let Some(previous) = self.view.tracks.resolve(*key) {
-                            for &(participant, _) in &previous.local_subscribers {
-                                previous_participants.insert(participant);
-                                if !plan
-                                    .local_subscribers
-                                    .iter()
-                                    .any(|&(current, _)| current == participant)
-                                {
-                                    self.registry.unbind_subscribed_track(
-                                        participant,
-                                        track_id,
-                                        *key,
-                                    );
-                                }
-                            }
-                        }
-                        for &(participant, _) in &plan.local_subscribers {
-                            if !previous_participants.contains(&participant) {
-                                self.registry
-                                    .bind_subscribed_track(participant, track_id, *key);
-                            }
-                        }
+                    crate::view::ViewOp::BindSubscribedTrack {
+                        participant,
+                        track,
+                        fanout,
+                    } => {
+                        self.registry
+                            .bind_subscribed_track(*participant, *track, *fanout);
                     }
-                    crate::view::ViewOp::RemoveTrackPlan { key } => {
-                        let Some((track_id, _)) = self.runtime.track_identity(*key) else {
-                            continue;
-                        };
-                        if let Some(previous) = self.view.tracks.resolve(*key) {
-                            for &(participant, _) in &previous.local_subscribers {
-                                self.registry
-                                    .unbind_subscribed_track(participant, track_id, *key);
-                            }
-                        }
+                    crate::view::ViewOp::UnbindSubscribedTrack {
+                        participant,
+                        track,
+                        fanout,
+                    } => {
+                        self.registry
+                            .unbind_subscribed_track(*participant, *track, *fanout);
                     }
                     crate::view::ViewOp::InstallRoute { .. }
                     | crate::view::ViewOp::RetireRoute { .. }
@@ -301,14 +278,12 @@ impl ShardCore {
                     | crate::view::ViewOp::InsertParticipant { .. }
                     | crate::view::ViewOp::RemoveParticipant { .. }
                     | crate::view::ViewOp::RemoveTrackRuntime { .. }
-                    | crate::view::ViewOp::RemoveDataRuntime { .. }
+                    | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
                     | crate::view::ViewOp::RemoveReliableRuntime { .. }
-                    | crate::view::ViewOp::RemoveAudioPlan { .. }
-                    | crate::view::ViewOp::SetAudioPlan { .. }
-                    | crate::view::ViewOp::SetDataPlan { .. }
-                    | crate::view::ViewOp::RemoveDataPlan { .. }
-                    | crate::view::ViewOp::SetReliablePlan { .. }
-                    | crate::view::ViewOp::RemoveReliablePlan { .. } => {}
+                    | crate::view::ViewOp::RemovePlan { .. }
+                    | crate::view::ViewOp::SetPlan { .. }
+                    | crate::view::ViewOp::GroupInsert { .. }
+                    | crate::view::ViewOp::GroupRemove { .. } => {}
                 }
                 if let crate::view::ViewOp::RemoveParticipant { key } = op {
                     self.timers.cancel(*key);
@@ -374,8 +349,13 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime
-                    .route_video_with_plan(local_track, *pkt, plan, &mut ctx);
+                self.runtime.route_video_with_plan(
+                    local_track,
+                    *pkt,
+                    plan,
+                    &view.video_groups,
+                    &mut ctx,
+                );
             }
             (crate::route::RouteAction::Audio { track }, MediaPayload::Audio(mut pkt)) => {
                 let Some(plan) = view.audio.resolve(track) else {
@@ -406,11 +386,12 @@ impl ShardCore {
                         fanout: Some(track),
                     },
                     plan,
+                    &view.audio_groups,
                     &mut ctx,
                 );
             }
-            (crate::route::RouteAction::Data { stream }, MediaPayload::Data(bytes)) => {
-                let Some(plan) = view.data.resolve(stream) else {
+            (crate::route::RouteAction::Unreliable { stream }, MediaPayload::Data(bytes)) => {
+                let Some(plan) = view.unreliable.resolve(stream) else {
                     record_routing_drop("data", "plan", "remote");
                     return;
                 };
@@ -420,8 +401,14 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime
-                    .route_data_with_plan(stream, Origin::Remote, bytes, plan, &mut ctx);
+                self.runtime.route_unreliable_with_plan(
+                    stream,
+                    Origin::Remote,
+                    bytes,
+                    plan,
+                    &view.data_groups,
+                    &mut ctx,
+                );
             }
             (crate::route::RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = view.reliable.resolve(stream) else {
@@ -434,11 +421,12 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime.route_reliable_data_with_plan(
+                self.runtime.route_reliable_with_plan(
                     stream,
                     Origin::Remote,
                     bytes,
                     plan,
+                    &view.data_groups,
                     &mut ctx,
                 );
             }
@@ -530,8 +518,14 @@ impl ShardCore {
                 record_routing_drop("audio", "plan", "local");
                 continue;
             };
-            self.runtime
-                .route_audio_with_plan(track, Origin::Local, ev, plan, &mut ctx);
+            self.runtime.route_audio_with_plan(
+                track,
+                Origin::Local,
+                ev,
+                plan,
+                &view.audio_groups,
+                &mut ctx,
+            );
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_video_rtp() else {
@@ -549,7 +543,7 @@ impl ShardCore {
                 continue;
             };
             self.runtime
-                .route_video_with_plan(fanout, ev.pkt, plan, &mut ctx);
+                .route_video_with_plan(fanout, ev.pkt, plan, &view.video_groups, &mut ctx);
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_data_sctp() else {
@@ -561,12 +555,18 @@ impl ShardCore {
                 continue;
             };
             let view = &self.view;
-            let Some(plan) = view.data.resolve(stream) else {
+            let Some(plan) = view.unreliable.resolve(stream) else {
                 record_routing_drop("data", "plan", "local");
                 continue;
             };
-            self.runtime
-                .route_data_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
+            self.runtime.route_unreliable_with_plan(
+                stream,
+                Origin::Local,
+                ev.pkt,
+                plan,
+                &view.data_groups,
+                &mut ctx,
+            );
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_reliable_data_sctp() else {
@@ -582,11 +582,12 @@ impl ShardCore {
                 record_routing_drop("reliable", "plan", "local");
                 continue;
             };
-            self.runtime.route_reliable_data_with_plan(
+            self.runtime.route_reliable_with_plan(
                 stream,
                 Origin::Local,
                 ev.pkt,
                 plan,
+                &view.data_groups,
                 &mut ctx,
             );
         }
@@ -732,7 +733,8 @@ impl ShardCore {
             return;
         };
         debug_assert_eq!(runtime_track_id, track_id);
-        let Some(plan) = self.view.tracks.resolve(fanout) else {
+        let view = &self.view;
+        let Some(plan) = view.tracks.resolve(fanout) else {
             record_routing_drop("stats", "plan", "local");
             return;
         };
@@ -742,7 +744,8 @@ impl ShardCore {
             router,
             wall: &self.wall,
         };
-        self.runtime.apply_stats(fanout, states, plan, &mut ctx);
+        self.runtime
+            .apply_stats(fanout, states, plan, &view.video_groups, &mut ctx);
     }
 
     fn send_keyframe_request(
@@ -872,7 +875,8 @@ impl ShardCore {
                     router,
                     wall: &self.wall,
                 };
-                self.runtime.apply_stats(local_track, stats, plan, &mut ctx);
+                self.runtime
+                    .apply_stats(local_track, stats, plan, &view.video_groups, &mut ctx);
             }
         }
     }

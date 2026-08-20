@@ -3806,6 +3806,16 @@ impl LocalNodeSim {
             rng_seed: super::sim_seed(),
             subnet: None,
             tcp_only: false,
+            // One shard for now, which is wrong and is meant to change.
+            //
+            // A single-shard node never crosses a shard boundary, so every
+            // route, destination runtime and remote plan on the forwarding path
+            // goes unexercised - which is how cross-shard audio stayed broken
+            // through 103 passing plans. Raising this to 16 is a one-line
+            // change that currently fails two plans, both pre-existing and both
+            // reproduced by the ignored tests in `cross_shard.rs`. It becomes
+            // the default once the publication catalog lands, since that is
+            // what removes the shard-local key confusion behind them.
             num_shards: 1,
             buggify_permille: 0,
             link: LinkProfile::default(),

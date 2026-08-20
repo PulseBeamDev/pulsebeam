@@ -470,11 +470,12 @@ impl DownstreamAllocator {
     pub fn on_forward_rtp_slot(
         &mut self,
         slot: crate::keys::DownstreamSlotKey,
+        track: crate::entity::TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        self.video.on_rtp_slot(slot, pkt, cache, writer)
+        self.video.on_rtp_slot(slot, track, pkt, cache, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.

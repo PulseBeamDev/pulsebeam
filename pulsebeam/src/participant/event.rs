@@ -1,7 +1,7 @@
 use crate::entity::{ParticipantId, TrackId};
 use crate::keys::DownstreamSlotKey;
 use crate::rtp::RtpPacket;
-use crate::shard::router::{DataStreamKey, ReliableStreamKey, TrackKey};
+use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
 use str0m::channel::ChannelId;
 
@@ -36,7 +36,7 @@ pub(crate) trait ParticipantSink {
     fn exit(&mut self);
 
     fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<TrackKey>, pkt: RtpPacket);
-    fn publish_sctp(&mut self, topic: Topic, stream: Option<DataStreamKey>, pkt: Vec<u8>);
+    fn publish_sctp(&mut self, topic: Topic, stream: Option<UnreliableStreamKey>, pkt: Vec<u8>);
 
     fn publish_reliable_data_topic(&mut self, topic: Topic);
     fn unpublish_reliable_data_topic(&mut self, topic: Topic);
@@ -156,7 +156,12 @@ pub mod test_utils {
             self.publish_rtp_calls.push(stream_id);
         }
 
-        fn publish_sctp(&mut self, topic: Topic, _stream: Option<DataStreamKey>, _pkt: Vec<u8>) {
+        fn publish_sctp(
+            &mut self,
+            topic: Topic,
+            _stream: Option<UnreliableStreamKey>,
+            _pkt: Vec<u8>,
+        ) {
             self.publish_sctp_calls.push(topic);
         }
 

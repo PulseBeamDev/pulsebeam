@@ -220,11 +220,6 @@ impl Signaling {
         }
     }
 
-    /// What the client last asked for, or the default when it has said nothing.
-    pub fn audio_intent(&self) -> AudioIntent {
-        self.last_audio_intent.clone().unwrap_or_default()
-    }
-
     pub fn mark_tracks_dirty(&mut self) {
         self.dirty_roster = true;
     }
