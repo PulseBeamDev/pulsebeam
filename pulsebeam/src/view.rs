@@ -1,7 +1,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::manual_find, clippy::manual_flatten)]
 
-use crate::entity::{ParticipantId, TrackId};
+use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::{DownstreamSlotKey, ParticipantKey, TrackKey};
 use crate::route::{RouteAction, RouteId, TransportHandle, TransportRoute};
@@ -17,10 +17,10 @@ pub(crate) struct ShardView {
     pub generation: u64,
     pub routes: RouteImage,
     pub transports: TransportImage,
-    pub tracks: TrackForwardingImage,
-    pub audio: AudioForwardingImage,
-    pub data: DataForwardingImage,
-    pub reliable: ReliableForwardingImage,
+    pub tracks: ForwardingImage<TrackKey, DownstreamSlotKey>,
+    pub audio: ForwardingImage<TrackKey, ()>,
+    pub data: ForwardingImage<DataStreamKey, ChannelId>,
+    pub reliable: ForwardingImage<ReliableStreamKey, ChannelId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,23 +30,38 @@ pub(crate) struct RemoteRoutePlan {
     pub epoch: u16,
 }
 
+/// Where one stream's packets go on one shard.
+///
+/// The same shape for video, audio and both data lanes, because it is the same
+/// question: which local participants get a copy, which sibling shards get one,
+/// and where feedback goes back to. `D` is the destination-local delivery key —
+/// a downstream slot for video, an SCTP channel for data, nothing for audio,
+/// whose selector picks a slot per packet.
+///
+/// Deliberately carries no stream identity. The shard resolves this plan
+/// *through* a key into its own runtime arena, which already knows the track id
+/// and its origin; repeating them here made two sources of truth and a
+/// `debug_assert` to catch them diverging.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackForwardingPlan {
-    pub track_id: TrackId,
-    pub origin: ParticipantId,
-    pub local_subscribers: Vec<(ParticipantKey, DownstreamSlotKey)>,
+pub(crate) struct ForwardingPlan<D> {
+    pub local_subscribers: Vec<(ParticipantKey, D)>,
     pub remote_routes: Vec<RemoteRoutePlan>,
     pub reverse_route: Option<RemoteRoutePlan>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AudioForwardingPlan {
-    pub track_id: TrackId,
-    pub origin: ParticipantId,
-    pub local_subscribers: Vec<ParticipantKey>,
-    pub remote_routes: Vec<RemoteRoutePlan>,
-    pub reverse_route: Option<RemoteRoutePlan>,
+impl<D> Default for ForwardingPlan<D> {
+    fn default() -> Self {
+        Self {
+            local_subscribers: Vec::new(),
+            remote_routes: Vec::new(),
+            reverse_route: None,
+        }
+    }
 }
+
+pub(crate) type VideoPlan = ForwardingPlan<DownstreamSlotKey>;
+pub(crate) type AudioPlan = ForwardingPlan<()>;
+pub(crate) type StreamPlan = ForwardingPlan<ChannelId>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
@@ -59,85 +74,29 @@ pub(crate) struct TrackDescriptor {
     pub audience: Vec<ParticipantKey>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StreamForwardingPlan {
-    pub local_subscribers: Vec<(ParticipantKey, ChannelId)>,
-    pub remote_routes: Vec<RemoteRoutePlan>,
-    pub reverse_route: Option<RemoteRoutePlan>,
+#[derive(Debug)]
+pub(crate) struct ForwardingImage<K: slotmap::Key, D> {
+    plans: SecondaryMap<K, ForwardingPlan<D>>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct TrackForwardingImage {
-    plans: SecondaryMap<TrackKey, TrackForwardingPlan>,
+impl<K: slotmap::Key, D> Default for ForwardingImage<K, D> {
+    fn default() -> Self {
+        Self {
+            plans: SecondaryMap::new(),
+        }
+    }
 }
 
-impl TrackForwardingImage {
-    pub fn resolve(&self, key: TrackKey) -> Option<&TrackForwardingPlan> {
+impl<K: slotmap::Key, D: Clone> ForwardingImage<K, D> {
+    pub fn resolve(&self, key: K) -> Option<&ForwardingPlan<D>> {
         self.plans.get(key)
     }
 
-    fn upsert(&mut self, key: TrackKey, plan: TrackForwardingPlan) {
+    fn upsert(&mut self, key: K, plan: ForwardingPlan<D>) {
         let _ = self.plans.insert(key, plan);
     }
 
-    fn remove(&mut self, key: TrackKey) {
-        let _ = self.plans.remove(key);
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct AudioForwardingImage {
-    plans: SecondaryMap<TrackKey, AudioForwardingPlan>,
-}
-
-impl AudioForwardingImage {
-    pub fn resolve(&self, key: TrackKey) -> Option<&AudioForwardingPlan> {
-        self.plans.get(key)
-    }
-
-    fn upsert(&mut self, key: TrackKey, plan: AudioForwardingPlan) {
-        let _ = self.plans.insert(key, plan);
-    }
-
-    fn remove(&mut self, key: TrackKey) {
-        let _ = self.plans.remove(key);
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct DataForwardingImage {
-    plans: SecondaryMap<DataStreamKey, StreamForwardingPlan>,
-}
-
-impl DataForwardingImage {
-    pub fn resolve(&self, key: DataStreamKey) -> Option<&StreamForwardingPlan> {
-        self.plans.get(key)
-    }
-
-    fn upsert(&mut self, key: DataStreamKey, plan: StreamForwardingPlan) {
-        let _ = self.plans.insert(key, plan);
-    }
-
-    fn remove(&mut self, key: DataStreamKey) {
-        let _ = self.plans.remove(key);
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct ReliableForwardingImage {
-    plans: SecondaryMap<ReliableStreamKey, StreamForwardingPlan>,
-}
-
-impl ReliableForwardingImage {
-    pub fn resolve(&self, key: ReliableStreamKey) -> Option<&StreamForwardingPlan> {
-        self.plans.get(key)
-    }
-
-    fn upsert(&mut self, key: ReliableStreamKey, plan: StreamForwardingPlan) {
-        let _ = self.plans.insert(key, plan);
-    }
-
-    fn remove(&mut self, key: ReliableStreamKey) {
+    fn remove(&mut self, key: K) {
         let _ = self.plans.remove(key);
     }
 }
@@ -284,28 +243,28 @@ pub(crate) enum ViewOp {
     },
     SetTrackPlan {
         key: TrackKey,
-        plan: TrackForwardingPlan,
+        plan: VideoPlan,
     },
     RemoveTrackPlan {
         key: TrackKey,
     },
     SetAudioPlan {
         key: TrackKey,
-        plan: AudioForwardingPlan,
+        plan: AudioPlan,
     },
     RemoveAudioPlan {
         key: TrackKey,
     },
     SetDataPlan {
         key: DataStreamKey,
-        plan: StreamForwardingPlan,
+        plan: StreamPlan,
     },
     RemoveDataPlan {
         key: DataStreamKey,
     },
     SetReliablePlan {
         key: ReliableStreamKey,
-        plan: StreamForwardingPlan,
+        plan: StreamPlan,
     },
     RemoveReliablePlan {
         key: ReliableStreamKey,

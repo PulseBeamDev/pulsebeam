@@ -21,15 +21,27 @@ use crate::id::ShardId;
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::route::RouteHandle;
 
-/// One destination shard's interest in one stream.
-#[derive(Debug, Default)]
-struct Interest {
-    /// Local subscribers on that shard. A set, not a count: an unsubscribe
-    /// for somebody who never subscribed must not retire a live route, and a
-    /// repeated subscribe must not inflate a count that then never returns to
-    /// zero.
-    subscribers: IndexMap<ParticipantId, (ParticipantKey, DownstreamSlotKey)>,
+/// One destination shard's interest in one stream: who wants it there, and
+/// the route serving them.
+///
+/// The destination-local forwarding key is deliberately *not* here. It
+/// outlives the interest — video keeps its fanout key across an unsubscribe so
+/// a resubscribe does not mint a second one and abandon the first in the
+/// arena — so tying it to a record that dies with the last subscriber would
+/// leak arena slots.
+#[derive(Debug)]
+struct Interest<S> {
+    subscribers: IndexMap<ParticipantId, S>,
     route: Option<RouteHandle>,
+}
+
+impl<S> Default for Interest<S> {
+    fn default() -> Self {
+        Self {
+            subscribers: IndexMap::new(),
+            route: None,
+        }
+    }
 }
 
 /// What the caller must do about a change in interest.
@@ -50,11 +62,11 @@ pub(crate) enum InterestChange {
 /// of it is about one shard's interest in one stream — never "who subscribes
 /// to this across the node", which is what a nested shape would optimise for.
 #[derive(Debug)]
-pub(crate) struct Subscriptions<K> {
-    interest: IndexMap<(ShardId, K), Interest>,
+pub(crate) struct Subscriptions<K, S> {
+    interest: IndexMap<(ShardId, K), Interest<S>>,
 }
 
-impl<K: std::hash::Hash + Eq + Clone> Default for Subscriptions<K> {
+impl<K, S> Default for Subscriptions<K, S> {
     fn default() -> Self {
         Self {
             interest: IndexMap::new(),
@@ -62,7 +74,7 @@ impl<K: std::hash::Hash + Eq + Clone> Default for Subscriptions<K> {
     }
 }
 
-impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
+impl<K: std::hash::Hash + Eq + Clone, S: Copy> Subscriptions<K, S> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -74,15 +86,12 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
         shard: ShardId,
         stream: K,
         subscriber: ParticipantId,
-        subscriber_key: ParticipantKey,
-        slot: DownstreamSlotKey,
+        payload: S,
         _publisher_shard: ShardId,
     ) -> InterestChange {
         let interest = self.interest.entry((shard, stream)).or_default();
         let was_empty = interest.subscribers.is_empty();
-        interest
-            .subscribers
-            .insert(subscriber, (subscriber_key, slot));
+        interest.subscribers.insert(subscriber, payload);
         if was_empty && interest.route.is_none() {
             InterestChange::Install
         } else {
@@ -133,11 +142,7 @@ impl<K: std::hash::Hash + Eq + Clone> Subscriptions<K> {
     pub fn plan_destinations(
         &self,
         stream: &K,
-    ) -> Vec<(
-        ShardId,
-        Option<RouteHandle>,
-        Vec<(ParticipantKey, DownstreamSlotKey)>,
-    )> {
+    ) -> Vec<(ShardId, Option<RouteHandle>, Vec<S>)> {
         self.interest
             .iter()
             .filter_map(|((shard, candidate), interest)| {
@@ -215,7 +220,8 @@ pub(crate) struct Retired {
 }
 
 /// The video/audio flavour, keyed by track.
-pub(crate) type TrackSubscriptions = Subscriptions<TrackId>;
+pub(crate) type TrackSubscriber = (ParticipantKey, DownstreamSlotKey);
+pub(crate) type TrackSubscriptions = Subscriptions<TrackId, TrackSubscriber>;
 
 #[cfg(test)]
 mod tests {
@@ -247,8 +253,7 @@ mod tests {
                 shard,
                 t,
                 pid(1),
-                ParticipantKey::default(),
-                DownstreamSlotKey::default(),
+                (ParticipantKey::default(), DownstreamSlotKey::default()),
                 ShardId::new(9)
             ),
             InterestChange::Install,
@@ -260,8 +265,7 @@ mod tests {
                 shard,
                 t,
                 pid(2),
-                ParticipantKey::default(),
-                DownstreamSlotKey::default(),
+                (ParticipantKey::default(), DownstreamSlotKey::default()),
                 ShardId::new(9)
             ),
             InterestChange::None,
@@ -279,8 +283,7 @@ mod tests {
             shard,
             t,
             pid(1),
-            ParticipantKey::default(),
-            DownstreamSlotKey::default(),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
             ShardId::new(9),
         );
         subs.installed(shard, t, handle(0));
@@ -288,8 +291,7 @@ mod tests {
             shard,
             t,
             pid(2),
-            ParticipantKey::default(),
-            DownstreamSlotKey::default(),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
             ShardId::new(9),
         );
 
@@ -312,8 +314,7 @@ mod tests {
                 ShardId::new(1),
                 t,
                 pid(1),
-                ParticipantKey::default(),
-                DownstreamSlotKey::default(),
+                (ParticipantKey::default(), DownstreamSlotKey::default()),
                 ShardId::new(9)
             ),
             InterestChange::Install
@@ -323,8 +324,7 @@ mod tests {
                 ShardId::new(2),
                 t,
                 pid(2),
-                ParticipantKey::default(),
-                DownstreamSlotKey::default(),
+                (ParticipantKey::default(), DownstreamSlotKey::default()),
                 ShardId::new(9)
             ),
             InterestChange::Install,
@@ -344,8 +344,7 @@ mod tests {
             shard,
             t,
             pid(1),
-            ParticipantKey::default(),
-            DownstreamSlotKey::default(),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
             ShardId::new(9),
         );
         subs.installed(shard, t, handle(0));
@@ -354,8 +353,7 @@ mod tests {
                 shard,
                 t,
                 pid(1),
-                ParticipantKey::default(),
-                DownstreamSlotKey::default(),
+                (ParticipantKey::default(), DownstreamSlotKey::default()),
                 ShardId::new(9)
             ),
             InterestChange::None
@@ -385,8 +383,7 @@ mod tests {
             a,
             t1,
             pid(1),
-            ParticipantKey::default(),
-            DownstreamSlotKey::default(),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
             ShardId::new(9),
         );
         subs.installed(a, t1, handle(0));
@@ -394,8 +391,7 @@ mod tests {
             a,
             t2,
             pid(1),
-            ParticipantKey::default(),
-            DownstreamSlotKey::default(),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
             ShardId::new(9),
         );
         subs.installed(a, t2, handle(1));
@@ -403,8 +399,7 @@ mod tests {
             b,
             t1,
             pid(2),
-            ParticipantKey::default(),
-            DownstreamSlotKey::default(),
+            (ParticipantKey::default(), DownstreamSlotKey::default()),
             ShardId::new(9),
         );
         subs.installed(b, t1, handle(2));

@@ -230,20 +230,28 @@ impl ShardRuntime {
         self.tracks.get(key).map(|track| track.origin_key)
     }
 
+    /// The identity behind a fanout key.
+    ///
+    /// Forwarding plans carry no identity, so this arena is the only place a
+    /// key's track and publisher are recorded.
+    pub(crate) fn track_identity(&self, key: TrackKey) -> Option<(TrackId, ParticipantId)> {
+        self.tracks
+            .get(key)
+            .map(|track| (track.id, track.publication.meta.origin))
+    }
+
     #[inline]
     pub fn route_video_with_plan(
         &mut self,
         fanout: TrackKey,
         pkt: RtpPacket,
-        plan: &crate::view::TrackForwardingPlan,
+        plan: &crate::view::VideoPlan,
         ctx: &mut impl RoutingContext,
     ) {
-        let track_id = self.tracks.get(fanout).map(|track| track.id);
         let Some(track) = self.tracks.get_mut(fanout) else {
             debug_assert!(false, "compiled video key must resolve to runtime state");
             return;
         };
-        debug_assert_eq!(track_id, Some(plan.track_id));
         let rid = pkt.ext_vals.rid;
         let seq = pkt.seq_no;
         let cache = track.cache.get_or_insert_with(TrackStreamCache::new);
@@ -280,10 +288,9 @@ impl ShardRuntime {
         track: TrackKey,
         origin: Origin,
         mut event: AudioRtpEvent,
-        plan: &crate::view::AudioForwardingPlan,
+        plan: &crate::view::AudioPlan,
         ctx: &mut impl RoutingContext,
     ) {
-        debug_assert_eq!(plan.track_id, event.stream_id.0);
         debug_assert!(origin.is_local() || event.origin_key.is_none());
         let Some(slot_idx) = self
             .audio_selector
@@ -291,7 +298,7 @@ impl ShardRuntime {
         else {
             return;
         };
-        for &subscriber in &plan.local_subscribers {
+        for &(subscriber, ()) in &plan.local_subscribers {
             if Some(subscriber) == event.origin_key {
                 continue;
             }
@@ -332,7 +339,7 @@ impl ShardRuntime {
         stream: DataStreamKey,
         origin: Origin,
         packet: Vec<u8>,
-        plan: &crate::view::StreamForwardingPlan,
+        plan: &crate::view::StreamPlan,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(runtime) = self.data.get_mut(stream) else {
@@ -361,7 +368,7 @@ impl ShardRuntime {
         stream: ReliableStreamKey,
         origin: Origin,
         frame: Vec<u8>,
-        plan: &crate::view::StreamForwardingPlan,
+        plan: &crate::view::StreamPlan,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(!frame.is_empty());
@@ -393,7 +400,7 @@ impl ShardRuntime {
     pub fn route_reliable_control(
         &self,
         bytes: Vec<u8>,
-        plan: &crate::view::StreamForwardingPlan,
+        plan: &crate::view::StreamPlan,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(target) = plan.reverse_route else {
@@ -413,15 +420,13 @@ impl ShardRuntime {
         &mut self,
         fanout: TrackKey,
         stats: crate::track::TrackStates,
-        plan: &crate::view::TrackForwardingPlan,
+        plan: &crate::view::VideoPlan,
         ctx: &mut impl RoutingContext,
     ) {
-        let track_id = self.tracks.get(fanout).map(|track| track.id);
         let Some(track) = self.tracks.get_mut(fanout) else {
             debug_assert!(false, "stats key must resolve to runtime state");
             return;
         };
-        debug_assert_eq!(track_id, Some(plan.track_id));
         track.layer_states = stats;
         let states = &track.layer_states;
         for &(subscriber, slot) in &plan.local_subscribers {
