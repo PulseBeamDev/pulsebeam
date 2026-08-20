@@ -244,6 +244,27 @@ fn duplicates() -> &'static Mutex<HashMap<IpAddr, f64>> {
     DUPLICATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn gro_windows() -> &'static Mutex<HashMap<IpAddr, Duration>> {
+    static GRO_WINDOWS: std::sync::OnceLock<Mutex<HashMap<IpAddr, Duration>>> =
+        std::sync::OnceLock::new();
+    GRO_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_gro_window(ip: IpAddr, window: Duration) {
+    gro_windows()
+        .lock()
+        .expect("shaper GRO windows poisoned")
+        .insert(ip, window);
+}
+
+pub fn gro_enabled(ip: IpAddr) -> bool {
+    gro_windows()
+        .lock()
+        .expect("shaper GRO windows poisoned")
+        .get(&ip)
+        .is_some_and(|window| !window.is_zero())
+}
+
 pub fn set_duplicate(ip: IpAddr, probability: f64) {
     assert!(
         (0.0..=1.0).contains(&probability),
@@ -273,6 +294,11 @@ fn losses() -> &'static Mutex<HashMap<IpAddr, Loss>> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub delivered: u64,
+    pub gso_batches: u64,
+    pub gso_segments: u64,
+    pub gro_batches: u64,
+    pub gro_datagrams: u64,
+    pub missing_tx_timestamps: u64,
     /// Dropped because the bottleneck buffer was full. Distinct from configured loss: this is
     /// congestion, and a controller that causes a lot of it is overusing the link.
     pub dropped_overflow: u64,
@@ -289,6 +315,26 @@ pub struct Stats {
     /// controller actually sits behind. Weighted by packet rather than by time: on a link worth
     /// measuring the two agree closely, and per-packet needs no timer.
     pub backlog_sum: Duration,
+}
+
+pub fn record_gso_batch(ip: IpAddr, segments: usize) {
+    debug_assert!(segments > 1);
+    record(ip, |stats| {
+        stats.gso_batches = stats.gso_batches.saturating_add(1);
+        stats.gso_segments = stats
+            .gso_segments
+            .saturating_add(u64::try_from(segments).unwrap_or(u64::MAX));
+    });
+}
+
+pub fn record_gro_batch(ip: IpAddr, datagrams: usize) {
+    debug_assert!(datagrams > 1);
+    record(ip, |stats| {
+        stats.gro_batches = stats.gro_batches.saturating_add(1);
+        stats.gro_datagrams = stats
+            .gro_datagrams
+            .saturating_add(u64::try_from(datagrams).unwrap_or(u64::MAX));
+    });
 }
 
 impl Stats {
@@ -391,6 +437,10 @@ pub fn clear() {
     duplicates()
         .lock()
         .expect("shaper duplicates poisoned")
+        .clear();
+    gro_windows()
+        .lock()
+        .expect("shaper GRO windows poisoned")
         .clear();
     reorders().lock().expect("shaper reorders poisoned").clear();
     stats_map().lock().expect("shaper stats poisoned").clear();

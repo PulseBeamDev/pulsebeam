@@ -5,6 +5,7 @@ mod events;
 pub mod metrics;
 pub(crate) mod participants;
 mod reliable;
+pub(crate) mod recorder;
 pub mod router;
 mod timer;
 pub mod worker;

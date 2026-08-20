@@ -5,6 +5,7 @@ mod negotiator;
 mod registry;
 mod room;
 mod router;
+pub(crate) mod stats_aggregator;
 pub mod tcp_acceptor;
 pub mod ufrag;
 
