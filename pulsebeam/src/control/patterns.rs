@@ -23,6 +23,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 use arrayvec::ArrayVec;
 use indexmap::{IndexMap, IndexSet};
+use std::marker::PhantomData;
 
 type Map<K, V> = IndexMap<K, V>;
 type Set<K> = IndexSet<K>;
@@ -30,11 +31,59 @@ type Set<K> = IndexSet<K>;
 use crate::entity::{ParticipantId, RoomId};
 use crate::id::ShardId;
 use crate::keys::ParticipantKey;
-pub(crate) use crate::view::GroupId;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum AnyAudience {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum VideoAudience {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum AudioAudience {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum DataAudience {}
 
-type AudienceOps = Vec<(ShardId, crate::view::ViewOp)>;
+#[derive(Debug)]
+pub(crate) struct GroupId<K = AnyAudience>(pub u32, PhantomData<fn() -> K>);
+
+impl<K> GroupId<K> {
+    pub(crate) const fn new(index: u32) -> Self {
+        Self(index, PhantomData)
+    }
+}
+
+impl<K> Copy for GroupId<K> {}
+
+impl<K> Clone for GroupId<K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K> PartialEq for GroupId<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<K> Eq for GroupId<K> {}
+
+impl<K> std::hash::Hash for GroupId<K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<K> PartialOrd for GroupId<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K> Ord for GroupId<K> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
 type Displaced<G> = (GroupId<G>, Departure, ShardId, ParticipantKey);
-type RetiredPattern<G> = (GroupId<G>, Vec<(ParticipantId, ShardId, ParticipantKey)>);
 
 /// A concrete publication: what a publisher actually announced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,7 +232,7 @@ impl<S> Default for Group<S> {
 
 /// Declarations for one kind, and the groups they resolve to.
 #[derive(Debug)]
-pub(crate) struct PatternTable<N, S, G = crate::view::AnyAudience> {
+pub(crate) struct PatternTable<N, S, G = AnyAudience> {
     ids: Map<Pattern<N>, GroupId<G>>,
     groups: Vec<Option<Group<S>>>,
     free: Vec<GroupId<G>>,
@@ -465,6 +514,13 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
             .unwrap_or_default()
     }
 
+    pub fn publications_of_pattern(&self, pattern: &Pattern<N>) -> Vec<crate::entity::TrackId> {
+        self.group_of(pattern)
+            .into_iter()
+            .flat_map(|group| self.publications_of(group))
+            .collect()
+    }
+
     /// Where a subscriber sits in a pattern's group, for addressing the op
     /// that removes it.
     pub fn member_key(
@@ -478,17 +534,49 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
         Some((member.shard, member.key))
     }
 
+    pub fn members_for(
+        &self,
+        groups: ArrayVec<GroupId<G>, 4>,
+        shard: ShardId,
+        excluded: ParticipantId,
+    ) -> Vec<(ParticipantKey, S)>
+    where
+        S: Copy,
+    {
+        let mut members = IndexMap::new();
+        for group_id in groups {
+            let Some(group) = self
+                .groups
+                .get(group_id.0 as usize)
+                .and_then(Option::as_ref)
+            else {
+                debug_assert!(false, "a matched audience group must exist");
+                continue;
+            };
+            for (participant, member) in &group.members {
+                if *participant != excluded && member.shard == shard {
+                    let previous = members.insert(member.key, member.delivery);
+                    debug_assert!(
+                        previous.is_none(),
+                        "normalized declarations must not duplicate a local recipient"
+                    );
+                }
+            }
+        }
+        members.into_iter().collect()
+    }
+
     /// Drop a pattern outright, returning its group and everyone who was in
     /// it. For a publication going away: its subscribers never unsubscribe, so
     /// without this their declarations would outlive the thing they named.
-    pub fn retire_pattern(&mut self, pattern: &Pattern<N>) -> Option<RetiredPattern<G>> {
-        let id = self.ids.shift_remove(pattern)?;
-        let group = self.groups.get_mut(id.0 as usize).and_then(Option::take)?;
-        let members = group
-            .members
-            .iter()
-            .map(|(participant, member)| (*participant, member.shard, member.key))
-            .collect();
+    pub fn retire_pattern(&mut self, pattern: &Pattern<N>) -> bool {
+        let Some(id) = self.ids.shift_remove(pattern) else {
+            return false;
+        };
+        let Some(group) = self.groups.get_mut(id.0 as usize).and_then(Option::take) else {
+            debug_assert!(false, "a pattern id must resolve to a live group");
+            return false;
+        };
         for participant in group.members.keys() {
             if let Some(held) = self.by_participant.get_mut(participant) {
                 held.shift_remove(pattern);
@@ -499,7 +587,7 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
         }
         self.free.push(id);
         self.matched.shift_remove(&id);
-        Some((id, members))
+        true
     }
 
     pub fn group_of(&self, pattern: &Pattern<N>) -> Option<GroupId<G>> {
@@ -541,13 +629,6 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
             .flat_map(|g| g.per_shard.keys().copied())
     }
 
-    pub fn has_shard(&self, group: GroupId<G>, shard: ShardId) -> bool {
-        self.groups
-            .get(group.0 as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|group| group.per_shard.contains_key(&shard))
-    }
-
     #[cfg(test)]
     pub fn member_count(&self, group: GroupId) -> usize {
         self.groups
@@ -571,78 +652,46 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
     }
 }
 
-/// Declare an interest and produce the membership op that follows from it.
-///
-/// Every leg does the same three things on a subscribe — record the
-/// declaration, retract anything the new one subsumes, and tell the
-/// subscriber's shard — so they are one operation here rather than the same
-/// twenty lines at each call site.
 pub(crate) fn declare_audience<N, S, G>(
     table: &mut PatternTable<N, S, G>,
     pattern: Pattern<N>,
     participant: ParticipantId,
     member: Member<S>,
-) -> (Membership, AudienceOps)
+) -> (Membership, Vec<Displaced<G>>)
 where
     N: std::hash::Hash + Eq + Clone,
-    S: crate::view::AudienceSpec<G> + PartialEq + std::fmt::Debug,
+    S: Copy + PartialEq + std::fmt::Debug,
 {
-    let shard = member.shard;
-    let key = member.key;
-    let delivery = member.delivery;
-    let (membership, displaced) = table.declare(pattern.clone(), participant, member);
-    let mut ops: Vec<_> = displaced
-        .into_iter()
-        .map(|(group, _, shard, key)| (shard, S::remove(group, key)))
-        .collect();
-    if membership != Membership::Unchanged
-        && let Some(group) = table.group_of(&pattern)
-    {
-        ops.push((shard, S::insert(group, key, delivery)));
-    }
-    (membership, ops)
+    table.declare(pattern, participant, member)
 }
 
-/// The inverse: withdraw one declaration and say so.
 pub(crate) fn retract_audience<N, S, G>(
     table: &mut PatternTable<N, S, G>,
     pattern: &Pattern<N>,
     participant: &ParticipantId,
-) -> (Departure, AudienceOps)
+) -> Departure
 where
     N: std::hash::Hash + Eq + Clone,
-    S: crate::view::AudienceSpec<G> + PartialEq + std::fmt::Debug,
+    S: Copy + PartialEq + std::fmt::Debug,
 {
-    let placement = table.member_key(pattern, participant);
-    let group = table.group_of(pattern);
-    let departure = table.undeclare(pattern, participant);
-    let ops = match (group, placement) {
-        (Some(group), Some((shard, key))) => {
-            vec![(shard, S::remove(group, key))]
-        }
-        _ => Vec::new(),
-    };
-    (departure, ops)
+    table.undeclare(pattern, participant)
 }
 
-/// Withdraw everything a departing participant declared.
 pub(crate) fn retract_participant<N, S, G>(
     table: &mut PatternTable<N, S, G>,
     participant: &ParticipantId,
-) -> (Vec<(Pattern<N>, Departure)>, AudienceOps)
+) -> Vec<(Pattern<N>, Departure)>
 where
     N: std::hash::Hash + Eq + Clone,
-    S: crate::view::AudienceSpec<G> + PartialEq + std::fmt::Debug,
+    S: Copy + PartialEq + std::fmt::Debug,
 {
     let held = table.declarations_of(participant);
     let mut departures = Vec::new();
-    let mut ops = Vec::new();
     for pattern in held {
-        let (departure, mut pattern_ops) = retract_audience(table, &pattern, participant);
+        let departure = retract_audience(table, &pattern, participant);
         departures.push((pattern, departure));
-        ops.append(&mut pattern_ops);
     }
-    (departures, ops)
+    departures
 }
 
 #[cfg(test)]
@@ -947,6 +996,54 @@ mod tests {
         assert_eq!(table.members_on(id, ShardId::new(1)).len(), 1);
         assert_eq!(table.members_on(id, ShardId::new(2)).len(), 0);
         assert_eq!(table.shards_of(id).count(), 2);
+    }
+
+    #[test]
+    fn compiled_members_exclude_the_publication_owner() {
+        let mut table = Table::new();
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+        let publisher_key = keys.insert(());
+        let subscriber_key = keys.insert(());
+        let remote_key = keys.insert(());
+        let pattern = Pattern::all(room("r"));
+
+        table.declare(
+            pattern.clone(),
+            pid(1),
+            Member {
+                shard: ShardId::new(0),
+                key: publisher_key,
+                delivery: 0,
+            },
+        );
+        table.declare(
+            pattern.clone(),
+            pid(2),
+            Member {
+                shard: ShardId::new(0),
+                key: subscriber_key,
+                delivery: 1,
+            },
+        );
+        table.declare(
+            pattern,
+            pid(3),
+            Member {
+                shard: ShardId::new(1),
+                key: remote_key,
+                delivery: 2,
+            },
+        );
+
+        let subject = subject(room("r"), 1, "published");
+        assert_eq!(
+            table.members_for(table.match_subject(&subject), ShardId::new(0), pid(1)),
+            vec![(subscriber_key, 1)]
+        );
+        assert_eq!(
+            table.members_for(table.match_subject(&subject), ShardId::new(1), pid(1)),
+            vec![(remote_key, 2)]
+        );
     }
 
     /// A departure takes every declaration with it, and empties the groups it

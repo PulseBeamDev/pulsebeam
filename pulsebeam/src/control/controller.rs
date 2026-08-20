@@ -135,7 +135,7 @@ pub struct ControllerActor {
     video_patterns: crate::control::patterns::PatternTable<
         crate::entity::TrackId,
         crate::keys::DownstreamSlotKey,
-        crate::view::VideoAudience,
+        crate::control::patterns::VideoAudience,
     >,
     /// One writer per shard. Never shared, never locked, and never handed to
     /// a shard: the one-publish-per-generation budget is only checkable
@@ -152,7 +152,7 @@ pub struct ControllerActor {
     audio_patterns: crate::control::patterns::PatternTable<
         crate::entity::TrackId,
         (),
-        crate::view::AudioAudience,
+        crate::control::patterns::AudioAudience,
     >,
     /// Data declarations, keyed by topic *and* lane.
     ///
@@ -165,7 +165,7 @@ pub struct ControllerActor {
     data_patterns: crate::control::patterns::PatternTable<
         (crate::track::Topic, StreamLane),
         str0m::channel::ChannelId,
-        crate::view::DataAudience,
+        crate::control::patterns::DataAudience,
     >,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
@@ -823,7 +823,6 @@ impl ControllerActor {
                 publisher,
             } => {
                 self.on_stream_unsubscription(
-                    shard_id,
                     room_id,
                     subscriber,
                     topic,
@@ -839,7 +838,6 @@ impl ControllerActor {
                 topic,
             } => {
                 self.on_stream_unsubscription(
-                    shard_id,
                     room_id,
                     subscriber,
                     topic,
@@ -1077,7 +1075,7 @@ impl ControllerActor {
         self.core
             .registry
             .bind_participant(&cfg.participant_id, binding);
-        let (membership, membership_ops) = crate::control::patterns::declare_audience(
+        let _membership = crate::control::patterns::declare_audience(
             &mut self.audio_patterns,
             crate::control::patterns::Pattern::all(room_id),
             cfg.participant_id,
@@ -1087,7 +1085,6 @@ impl ControllerActor {
                 delivery: (),
             },
         );
-        self.publish_ops(membership_ops);
 
         let audio_tracks: Vec<_> = self
             .catalog
@@ -1097,12 +1094,7 @@ impl ControllerActor {
             self.index_publication(track_id);
         }
 
-        // Membership changes do not touch audio plans, so a join only has to
-        // reach the room's audio tracks when this shard had no member of the
-        // group before and therefore holds no routes for them yet.
-        if membership == crate::control::patterns::Membership::FirstOnShard {
-            self.reconcile_room_audio(room_id, shard_id).await;
-        }
+        self.reconcile_room_audio(room_id, shard_id).await;
 
         self.reconcile_room_tracks(room_id, shard_id).await;
 

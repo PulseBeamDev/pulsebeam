@@ -10,14 +10,8 @@ impl ControllerActor {
     /// nobody there receives, and the slot never returns to the allocator.
     pub(super) async fn retire_participant_streams(&mut self, participant_id: &ParticipantId) {
         self.pending_streams.remove_participant(*participant_id);
-        let shard = self
-            .core
-            .registry
-            .transport_of(participant_id)
-            .map(|(shard, _)| shard);
-        let (departures, ops) =
+        let departures =
             crate::control::patterns::retract_participant(&mut self.data_patterns, participant_id);
-        self.publish_ops(ops);
         let mut affected = indexmap::IndexSet::new();
         for (pattern, _) in departures {
             let Some((topic, lane)) = pattern.name else {
@@ -37,13 +31,6 @@ impl ControllerActor {
             }
         }
         for (id, lane) in affected {
-            let publication_id =
-                crate::control::controller::stream_lifecycle::data_publication_id(&id, lane);
-            if let Some(shard) = shard
-                && !self.publication_reaches_shard(publication_id, shard)
-            {
-                self.retire_destination(publication_id, shard).await;
-            }
             self.reconcile_stream(id, lane).await;
         }
     }
@@ -76,12 +63,16 @@ impl ControllerActor {
         &mut self,
         participant_id: &ParticipantId,
     ) {
-        let (video, mut ops) =
+        let video =
             crate::control::patterns::retract_participant(&mut self.video_patterns, participant_id);
-        let (_, audio_ops) =
+        let audio_tracks: indexmap::IndexSet<_> = self
+            .audio_patterns
+            .declarations_of(participant_id)
+            .into_iter()
+            .flat_map(|pattern| self.audio_patterns.publications_of_pattern(&pattern))
+            .collect();
+        let _ =
             crate::control::patterns::retract_participant(&mut self.audio_patterns, participant_id);
-        ops.extend(audio_ops);
-        self.publish_ops(ops);
 
         // A video route is per (track, shard) and only retires with the last
         // consumer on that shard, which is what LastOnShard reports.
@@ -115,6 +106,10 @@ impl ControllerActor {
                     debug_assert!(false, "participant video route retirement must complete");
                 }
             }
+        }
+        for track_id in audio_tracks {
+            self.retire_stale_destinations(track_id).await;
+            let _ = self.publish_publication(track_id).await;
         }
         self.pending.remove_participant(*participant_id);
     }

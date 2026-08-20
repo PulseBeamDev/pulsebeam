@@ -18,11 +18,6 @@ pub struct AudioRtpEvent {
     /// The semantic origin, which subscribers need in order to attribute the
     /// audio. Read once per delivery, never hashed.
     pub origin: ParticipantId,
-    /// The origin's compiled key, present only for a locally published
-    /// stream. It exists so the fanout can skip the publisher without
-    /// hashing its name back to a key; a remote origin has no key here and
-    /// no member of this room to skip.
-    pub origin_key: Option<ParticipantKey>,
     /// The publisher's compiled fanout — see [`VideoRtpEvent::fanout`].
     pub fanout: Option<TrackKey>,
 }
@@ -360,7 +355,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 stream_id,
                 pkt,
                 origin: self.id,
-                origin_key: Some(self.key),
                 fanout,
             }),
             TrackKind::Video => self.pipeline.video_queue.push_back(VideoRtpEvent {
@@ -550,7 +544,6 @@ mod tests {
 
         let event = pipeline.pop_audio_rtp().expect("audio was queued");
         assert_eq!(event.origin, expected);
-        assert!(event.origin_key.is_some());
     }
 
     /// Queues drain in the order they were filled. Media is a sequence, and reordering it here

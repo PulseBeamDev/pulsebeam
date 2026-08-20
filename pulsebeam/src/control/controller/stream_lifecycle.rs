@@ -204,7 +204,14 @@ impl ControllerActor {
                 crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
             }
         };
-        let (_, membership_ops) = crate::control::patterns::declare_audience(
+        let displaced_ids: indexmap::IndexSet<_> = self
+            .data_patterns
+            .declarations_of(&subscriber)
+            .into_iter()
+            .filter(|held| pattern.subsumes(held))
+            .flat_map(|held| self.data_patterns.publications_of_pattern(&held))
+            .collect();
+        let _ = crate::control::patterns::declare_audience(
             &mut self.data_patterns,
             pattern,
             subscriber,
@@ -214,15 +221,30 @@ impl ControllerActor {
                 delivery: channel,
             },
         );
-        self.publish_ops(membership_ops);
         // Which streams this reaches is a catalog question now, not something
         // the registry has to remember on the subscriber's behalf.
-        let ids: Vec<_> = match publisher {
-            Some(publisher) => vec![crate::shard::router::DataStreamId::new(
-                room_id, publisher, topic,
-            )],
-            None => self.streams_on_topic(room_id, &topic, lane),
+        let mut ids: indexmap::IndexSet<_> = match publisher {
+            Some(publisher) => [crate::shard::router::DataStreamId::new(
+                room_id,
+                publisher,
+                topic.clone(),
+            )]
+            .into_iter()
+            .collect(),
+            None => self
+                .streams_on_topic(room_id, &topic, lane)
+                .into_iter()
+                .collect(),
         };
+        for publication_id in displaced_ids {
+            if let Some(publication) = self.catalog.get(&publication_id) {
+                ids.insert(crate::shard::router::DataStreamId::new(
+                    publication.room,
+                    publication.publisher,
+                    topic.clone(),
+                ));
+            }
+        }
         for id in &ids {
             let publication_id = data_publication_id(id, lane);
             if self.catalog.contains(&publication_id) {
@@ -236,7 +258,6 @@ impl ControllerActor {
 
     pub(super) async fn on_stream_unsubscription(
         &mut self,
-        shard_id: crate::id::ShardId,
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: crate::track::Topic,
@@ -251,12 +272,11 @@ impl ControllerActor {
                 crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
             }
         };
-        let (_, membership_ops) = crate::control::patterns::retract_audience(
+        let _ = crate::control::patterns::retract_audience(
             &mut self.data_patterns,
             &pattern,
             &subscriber,
         );
-        self.publish_ops(membership_ops);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::shard::router::DataStreamId::new(
                 room_id, publisher, topic,
@@ -264,10 +284,6 @@ impl ControllerActor {
             None => self.streams_on_topic(room_id, &topic, lane),
         };
         for id in ids {
-            let publication_id = data_publication_id(&id, lane);
-            if !self.publication_reaches_shard(publication_id, shard_id) {
-                self.retire_destination(publication_id, shard_id).await;
-            }
             let _ = self.reconcile_stream(id, lane).await;
         }
     }
@@ -288,6 +304,7 @@ impl ControllerActor {
         lane: StreamLane,
     ) -> bool {
         let publication_id = data_publication_id(&id, lane);
+        self.retire_stale_destinations(publication_id).await;
         let stream = id.clone();
         let complete = self
             .install_destinations(publication_id, move |actor, destination| {

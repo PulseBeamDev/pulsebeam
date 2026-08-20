@@ -148,23 +148,16 @@ impl Publication {
 
 /// Compile a publication's forwarding plan for one shard.
 ///
-/// The same for every kind, because by this point everything that differed has
-/// already been resolved: the audiences are group ids, the destinations are a
-/// map, and the delivery key lives in the group image on the shard rather than
-/// here. What a caller still supplies is which groups matched, since the
-/// pattern tables are keyed differently per kind — that is a detail of
-/// matching, not of planning.
-///
 /// Remote routes only appear on the publisher's own plan: every other shard
 /// receives over a route rather than forwarding onward, so listing them
 /// elsewhere would invite a second hop.
-pub(crate) fn forwarding_plan<G>(
+pub(crate) fn forwarding_plan<D>(
     destinations: &IndexMap<ShardId, Destination>,
     publisher_shard: ShardId,
     reverse_route: Option<RouteHandle>,
-    groups: arrayvec::ArrayVec<crate::view::GroupId<G>, 4>,
+    recipients: Vec<(ParticipantKey, D)>,
     shard: ShardId,
-) -> crate::view::ForwardingPlan<G> {
+) -> crate::view::ForwardingPlan<D> {
     let remote_routes = if shard == publisher_shard {
         destinations
             .iter()
@@ -184,7 +177,7 @@ pub(crate) fn forwarding_plan<G>(
         Vec::new()
     };
     crate::view::ForwardingPlan {
-        groups,
+        recipients,
         remote_routes,
         reverse_route: reverse_route.map(|handle| crate::view::RemoteRoutePlan { handle }),
     }

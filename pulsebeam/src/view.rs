@@ -1,9 +1,6 @@
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::manual_find, clippy::manual_flatten)]
 
-use arrayvec::ArrayVec;
-use std::marker::PhantomData;
-
 use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::{
@@ -16,129 +13,16 @@ use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
 use str0m::media::Rid;
 
-/// A dense index into a shard's group table.
-///
-/// Dense and integer so the data plane resolves a group by array index rather
-/// than by hash. Ids are recycled once a group empties; view ops are ordered
-/// per shard, so a retire always precedes the reuse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum AnyAudience {}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum VideoAudience {}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum AudioAudience {}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum DataAudience {}
-
-#[derive(Debug)]
-pub(crate) struct GroupId<K = AnyAudience>(pub u32, PhantomData<fn() -> K>);
-
-impl<K> GroupId<K> {
-    pub(crate) const fn new(index: u32) -> Self {
-        Self(index, PhantomData)
-    }
-}
-
-impl<K> Copy for GroupId<K> {}
-
-impl<K> Clone for GroupId<K> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<K> PartialEq for GroupId<K> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl<K> Eq for GroupId<K> {}
-
-impl<K> std::hash::Hash for GroupId<K> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl<K> PartialOrd for GroupId<K> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<K> Ord for GroupId<K> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-/// Local members of each audience, indexed by [`GroupId`].
-///
-/// One membership change serves every publication whose plan names the group,
-/// which is the point: a participant joining a room is one insert here, not a
-/// rewrite of every plan in it.
-#[derive(Debug)]
-pub(crate) struct GroupImage<D, K = AnyAudience> {
-    members: Vec<SecondaryMap<ParticipantKey, D>>,
-    marker: PhantomData<fn() -> K>,
-}
-
-impl<D, K> Default for GroupImage<D, K> {
-    fn default() -> Self {
-        Self {
-            members: Vec::new(),
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<D, K> GroupImage<D, K> {
-    pub fn members(&self, group: GroupId<K>) -> impl Iterator<Item = (ParticipantKey, D)> + '_
-    where
-        D: Copy,
-    {
-        self.members
-            .get(group.0 as usize)
-            .into_iter()
-            .flat_map(|members| members.iter())
-            .map(|(key, delivery)| (key, *delivery))
-    }
-
-    fn insert(&mut self, group: GroupId<K>, key: ParticipantKey, delivery: D) {
-        let idx = group.0 as usize;
-        if self.members.len() <= idx {
-            self.members
-                .resize_with(idx.saturating_add(1), SecondaryMap::new);
-        }
-        let Some(slot) = self.members.get_mut(idx) else {
-            debug_assert!(false, "group slot must exist after resize");
-            return;
-        };
-        let _ = slot.insert(key, delivery);
-    }
-
-    fn remove(&mut self, group: GroupId<K>, key: ParticipantKey) {
-        let Some(slot) = self.members.get_mut(group.0 as usize) else {
-            return;
-        };
-        let _ = slot.remove(key);
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct ShardView {
     pub shard: ShardId,
     pub generation: u64,
     pub routes: RouteImage,
     pub transports: TransportImage,
-    pub tracks: ForwardingImage<TrackKey, VideoAudience>,
-    pub audio: ForwardingImage<TrackKey, AudioAudience>,
-    pub video_groups: GroupImage<DownstreamSlotKey, VideoAudience>,
-    pub audio_groups: GroupImage<(), AudioAudience>,
-    pub data_groups: GroupImage<ChannelId, DataAudience>,
-    pub unreliable: ForwardingImage<UnreliableStreamKey, DataAudience>,
-    pub reliable: ForwardingImage<ReliableStreamKey, DataAudience>,
+    pub tracks: ForwardingImage<TrackKey, DownstreamSlotKey>,
+    pub audio: ForwardingImage<TrackKey, ()>,
+    pub unreliable: ForwardingImage<UnreliableStreamKey, ChannelId>,
+    pub reliable: ForwardingImage<ReliableStreamKey, ChannelId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,32 +43,25 @@ pub(crate) struct RemoteRoutePlan {
 /// and its origin; repeating them here made two sources of truth and a
 /// `debug_assert` to catch them diverging.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForwardingPlan<K = AnyAudience> {
-    /// The audiences this stream reaches. Membership lives on the shard, so a
-    /// subscriber joining or leaving one does not rewrite this plan. At most
-    /// four, because only four patterns can match one subject.
-    ///
-    /// The delivery key an audience carries — a downstream slot for video, an
-    /// SCTP channel for data, nothing for audio — lives in the group image, not
-    /// here, so every kind's plan is the same type.
-    pub groups: ArrayVec<GroupId<K>, 4>,
+pub(crate) struct ForwardingPlan<D> {
+    pub recipients: Vec<(ParticipantKey, D)>,
     pub remote_routes: Vec<RemoteRoutePlan>,
     pub reverse_route: Option<RemoteRoutePlan>,
 }
 
-impl<K> Default for ForwardingPlan<K> {
+impl<D> Default for ForwardingPlan<D> {
     fn default() -> Self {
         Self {
-            groups: ArrayVec::new(),
+            recipients: Vec::new(),
             remote_routes: Vec::new(),
             reverse_route: None,
         }
     }
 }
 
-pub(crate) type VideoPlan = ForwardingPlan<VideoAudience>;
-pub(crate) type AudioPlan = ForwardingPlan<AudioAudience>;
-pub(crate) type StreamPlan = ForwardingPlan<DataAudience>;
+pub(crate) type VideoPlan = ForwardingPlan<DownstreamSlotKey>;
+pub(crate) type AudioPlan = ForwardingPlan<()>;
+pub(crate) type StreamPlan = ForwardingPlan<ChannelId>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
@@ -197,11 +74,11 @@ pub(crate) struct TrackDescriptor {
 }
 
 #[derive(Debug)]
-pub(crate) struct ForwardingImage<K: slotmap::Key, G = AnyAudience> {
-    plans: SecondaryMap<K, ForwardingPlan<G>>,
+pub(crate) struct ForwardingImage<K: slotmap::Key, D> {
+    plans: SecondaryMap<K, ForwardingPlan<D>>,
 }
 
-impl<K: slotmap::Key, G> Default for ForwardingImage<K, G> {
+impl<K: slotmap::Key, D> Default for ForwardingImage<K, D> {
     fn default() -> Self {
         Self {
             plans: SecondaryMap::new(),
@@ -209,12 +86,12 @@ impl<K: slotmap::Key, G> Default for ForwardingImage<K, G> {
     }
 }
 
-impl<K: slotmap::Key, G> ForwardingImage<K, G> {
-    pub fn resolve(&self, key: K) -> Option<&ForwardingPlan<G>> {
+impl<K: slotmap::Key, D> ForwardingImage<K, D> {
+    pub fn resolve(&self, key: K) -> Option<&ForwardingPlan<D>> {
         self.plans.get(key)
     }
 
-    fn upsert(&mut self, key: K, plan: ForwardingPlan<G>) {
+    fn upsert(&mut self, key: K, plan: ForwardingPlan<D>) {
         let _ = self.plans.insert(key, plan);
     }
 
@@ -355,32 +232,6 @@ pub(crate) enum ViewOp {
     RemovePlan {
         target: PlanRemoval,
     },
-    InsertVideoMember {
-        group: GroupId<VideoAudience>,
-        key: ParticipantKey,
-        slot: DownstreamSlotKey,
-    },
-    InsertAudioMember {
-        group: GroupId<AudioAudience>,
-        key: ParticipantKey,
-    },
-    InsertDataMember {
-        group: GroupId<DataAudience>,
-        key: ParticipantKey,
-        channel: ChannelId,
-    },
-    RemoveVideoMember {
-        group: GroupId<VideoAudience>,
-        key: ParticipantKey,
-    },
-    RemoveAudioMember {
-        group: GroupId<AudioAudience>,
-        key: ParticipantKey,
-    },
-    RemoveDataMember {
-        group: GroupId<DataAudience>,
-        key: ParticipantKey,
-    },
     InstallRoute {
         binding: RouteBinding,
     },
@@ -430,9 +281,7 @@ pub(crate) enum ViewOp {
         key: ReliableStreamKey,
     },
     /// A participant now consumes this track here. Stated by the control plane
-    /// rather than inferred by the shard from successive plans: control is
-    /// where a subscription begins, and a plan that names a shared audience no
-    /// longer changes when one member joins it.
+    /// rather than inferred by the shard from successive plan replacements.
     BindSubscribedTrack {
         participant: ParticipantKey,
         track: TrackId,
@@ -443,45 +292,6 @@ pub(crate) enum ViewOp {
         track: TrackId,
         fanout: TrackKey,
     },
-}
-
-pub(crate) trait AudienceSpec<K>: Copy {
-    fn insert(group: GroupId<K>, key: ParticipantKey, delivery: Self) -> ViewOp;
-    fn remove(group: GroupId<K>, key: ParticipantKey) -> ViewOp;
-}
-
-impl AudienceSpec<VideoAudience> for DownstreamSlotKey {
-    fn insert(group: GroupId<VideoAudience>, key: ParticipantKey, slot: Self) -> ViewOp {
-        ViewOp::InsertVideoMember { group, key, slot }
-    }
-
-    fn remove(group: GroupId<VideoAudience>, key: ParticipantKey) -> ViewOp {
-        ViewOp::RemoveVideoMember { group, key }
-    }
-}
-
-impl AudienceSpec<AudioAudience> for () {
-    fn insert(group: GroupId<AudioAudience>, key: ParticipantKey, _delivery: Self) -> ViewOp {
-        ViewOp::InsertAudioMember { group, key }
-    }
-
-    fn remove(group: GroupId<AudioAudience>, key: ParticipantKey) -> ViewOp {
-        ViewOp::RemoveAudioMember { group, key }
-    }
-}
-
-impl AudienceSpec<DataAudience> for ChannelId {
-    fn insert(group: GroupId<DataAudience>, key: ParticipantKey, channel: Self) -> ViewOp {
-        ViewOp::InsertDataMember {
-            group,
-            key,
-            channel,
-        }
-    }
-
-    fn remove(group: GroupId<DataAudience>, key: ParticipantKey) -> ViewOp {
-        ViewOp::RemoveDataMember { group, key }
-    }
 }
 
 impl ShardViewDelta {
@@ -560,26 +370,6 @@ impl ShardViewDelta {
                     PlanRemoval::Unreliable(key) => view.unreliable.remove(key),
                     PlanRemoval::Reliable(key) => view.reliable.remove(key),
                 },
-                ViewOp::InsertVideoMember { group, key, slot } => {
-                    view.video_groups.insert(group, key, slot);
-                }
-                ViewOp::InsertAudioMember { group, key } => {
-                    view.audio_groups.insert(group, key, ());
-                }
-                ViewOp::InsertDataMember {
-                    group,
-                    key,
-                    channel,
-                } => view.data_groups.insert(group, key, channel),
-                ViewOp::RemoveVideoMember { group, key } => {
-                    view.video_groups.remove(group, key);
-                }
-                ViewOp::RemoveAudioMember { group, key } => {
-                    view.audio_groups.remove(group, key);
-                }
-                ViewOp::RemoveDataMember { group, key } => {
-                    view.data_groups.remove(group, key);
-                }
             }
         }
         view.generation = self.generation;
@@ -694,12 +484,6 @@ impl ViewOp {
             Self::RetireTransport { handle } => handle.shard() == shard,
             Self::SetPlan { .. }
             | Self::RemovePlan { .. }
-            | Self::InsertVideoMember { .. }
-            | Self::InsertAudioMember { .. }
-            | Self::InsertDataMember { .. }
-            | Self::RemoveVideoMember { .. }
-            | Self::RemoveAudioMember { .. }
-            | Self::RemoveDataMember { .. }
             | Self::InsertParticipant { .. }
             | Self::RemoveParticipant { .. }
             | Self::InsertTrackRuntime { .. }

@@ -8,6 +8,36 @@ fn cross_shard_video_room() -> super::common::Room {
 }
 
 #[test]
+fn video_does_not_loop_back_to_publisher_test() {
+    LocalNodeSim::new()
+        .with_room(
+            super::common::Room::new("video-no-loopback")
+                .with_participant(Participant::publisher("publisher", &["q"]).and_subscribes())
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the publisher and viewer",
+                duration: Duration::from_secs(5),
+            },
+            Step::Run {
+                description: "Forward the track to the viewer",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoQuality {
+                description: "Viewer receives the publisher video",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50).allow_gaps(5),
+            },
+            Step::CheckVideoNotReceivedFrom {
+                description: "Publisher receives no looped-back video",
+                participant: "publisher",
+                publisher: "publisher",
+            },
+        ]);
+}
+
+#[test]
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
 fn cross_shard_stats_reach_the_subscriber_allocator() {
     super::common::LocalNodeSim::new()
