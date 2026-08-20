@@ -1,5 +1,198 @@
 # Routing
 
+## Overview
+
+Think of the controller as a compiler and each shard as a small packet
+executor. The controller turns room state into a concrete forwarding plan once;
+the shard then executes that plan for every packet without scanning the room or
+asking another shard what to do.
+
+```text
+                         CONTROL PLANE (slow path)
+
+  rooms, participants, tracks, subscriptions
+                         │
+                         ▼
+                    controller
+             chooses owners and recipients
+                         │
+                         ▼
+               compiled forwarding plan
+              published as one coherent view
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+       shard 0        shard 1        shard 2
+       owns ...       owns ...       owns ...
+
+
+                          DATA PLANE (fast path)
+
+  client ── UDP / ICE-TCP ──► classifier
+                              eBPF, userspace or simulator
+                                      │
+                         route = shard + slot + epoch
+                                      │
+                ┌─────────────────────┴─────────────────────┐
+                │                                           │
+          first packet                               media / data
+                │                                           │
+                ▼                                           ▼
+       admitting shard ──► transport owner           publisher shard
+                │              │                           │
+                │              └─ authenticate             │ read plan
+                │                    │                     │
+                │                    ▼                ┌────┴────┐
+                │               controller            │         │
+                │                    │             local      remote
+                └── demux auth ◄─────┘                │         │
+                                                     ▼         ▼
+                                                direct     envelope(route)
+                                                                  │
+                                                                  ▼
+                                                           recipient shard
+                                                                  │
+                                                    validate epoch, find key
+                                                                  │
+                                                                  ▼
+                                                         execute media/data
+```
+
+### The data structures behind the picture
+
+The controller starts with names that are useful for room logic. A
+`ParticipantId`, `TrackId`, `RoomId` or data `Topic` can be looked up and
+compared, but none of them belongs in the packet path. The controller compiles
+those names into this shape:
+
+```text
+  controller state                         shard-owned published view
+  ────────────────                         ──────────────────────────
+
+  Publication {                             ShardView {
+    id: TrackId                                generation
+    publisher: ParticipantId                   transports: slot -> binding
+    publisher_shard                            routes:     slot -> binding
+    origin_key                                 video plans: local track key -> plan
+    destinations:                              audio plans: local track key -> plan
+      shard -> Destination                     data plans:  local stream key -> plan
+    reverse_route                              }
+  }
+
+  Destination {
+    Discovery { video_key }
+    or
+    Forwarding {
+      key: shard-local runtime key
+      route: RouteHandle
+    }
+  }
+
+  ForwardingPlan<D> {
+    recipients:   [(ParticipantKey, D)]
+    remote_routes: [RouteHandle]
+    reverse_route: Option<RouteHandle>
+  }
+```
+
+`Publication` is the controller's catalog record. It knows the semantic
+identity of a publication and, for each receiving shard, the local runtime key
+and, when forwarding is installed, its route. A video destination can briefly
+be `Discovery` while the shard learns about a track; the controller replaces it
+with `Forwarding` before packets are sent. `Destination` is one record instead
+of separate maps for audio, video and data, which keeps the shard identity and
+the local key together.
+
+`ShardView` is the compiled input to the data plane. Its route and transport
+tables are indexed by the route's slot. Its forwarding images are indexed by
+the local arena keys. A `ForwardingPlan<D>` says exactly what to do for one
+published stream: deliver to these local participants, send one copy to these
+remote shards, and use this reverse route for feedback. It does not contain a
+track name or subscription pattern.
+
+The generic `D` is the one detail that differs by payload:
+
+```text
+  video              D = DownstreamSlotKey
+  audio              D = ()                    (the audio plan selects the slot)
+  unreliable data    D = ChannelId
+  reliable data      D = ChannelId
+```
+
+The data lanes still have separate stream-key arenas and separate plan images.
+The type and the arena therefore say which lane a packet belongs to; there is
+no second mutable `lane` flag that could disagree with its destination key.
+
+The route table makes the last step just as explicit:
+
+```text
+  routes[route.slot] = RouteBinding {
+    handle: RouteHandle,
+    action: RouteAction,
+  }
+
+  RouteAction =
+      Video       { local_track }
+    | Audio       { track }
+    | Unreliable  { stream }
+    | Reliable    { stream }
+    | Reverse     { target }
+```
+
+The route handle checks that the slot and epoch are still the expected
+incarnation. The action already contains the shard-local key, so successful
+resolution is the final lookup: there is no `TrackId` or topic map after it.
+Mutable packet history, such as the last link sequence and loss counters, is
+kept separately in shard-local route runtime state. The published view is the
+decision; the runtime entry is only the accounting needed while executing it.
+
+On the wire, the two route families are deliberately different types even
+though they use the same packed layout:
+
+```text
+  PackedRoute:       [ shard: 12 bits | slot: 20 bits ]
+
+  TransportHandle:   TransportRoute + epoch
+                     client ICE / DTLS / SRTP state
+
+  RouteHandle:       RouteId + epoch
+                     inter-shard or inter-node endpoint state
+
+  Envelope:          version | type | epoch | route | extension
+```
+
+The shard bits tell the classifier where to send the packet. The slot is a
+dense local index, and the epoch identifies which occupant of that slot the
+packet was meant for. A delayed packet for an old occupant therefore fails
+closed instead of reaching a newly connected participant. Keeping
+`TransportRoute` and `RouteId` as distinct types prevents a client transport
+address from being accidentally used as an endpoint address.
+
+The first packet is special because there is no established flow affinity yet.
+The ICE ufrag carries the transport route. The packet may initially arrive at
+an admitting shard selected by the socket hash; the route identifies the
+transport owner that performs the WebRTC authentication. When authentication
+succeeds, the owner reports it through the controller. The controller marks
+the demux entry on the admitting shard and installs affinity for subsequent
+packets. The authentication signal therefore returns to the shard that owns
+the demux entry instead of being recorded only where authentication happened.
+
+After that, the fast path is deliberately boring. The publisher's shard reads
+the already-compiled plan. A local recipient is called directly. A remote
+recipient gets a fixed envelope containing its route, so the same classifier
+can steer it to the destination shard. That shard checks the route's epoch,
+turns the route into a small local table index, and executes the selected
+video, audio, unreliable-data, reliable-data or feedback action. Packets never
+carry participant or track names, and the controller never compiles the
+publisher as its own recipient.
+
+When room state changes, only the control path gets complicated: the controller
+recomputes affected plans, publishes a new generation, and sends the resulting
+deltas to the shards. A packet racing an unapplied or retired route is dropped
+instead of making the data path wait. Moving a destination creates a new route
+rather than changing the shard encoded in a live one, so stale packets remain
+harmless.
+
 How a packet finds the code that owns it.
 
 This document is the *model*: the invariants, the reasoning, and the wire
