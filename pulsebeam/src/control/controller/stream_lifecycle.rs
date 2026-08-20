@@ -1,13 +1,5 @@
 use super::*;
 
-fn needs_stream_route(
-    publisher_shard: crate::id::ShardId,
-    destination: crate::id::ShardId,
-    has_route: bool,
-) -> bool {
-    destination != publisher_shard && !has_route
-}
-
 fn should_publish_stream_views(retired: bool, added: bool) -> bool {
     !retired || added
 }
@@ -17,7 +9,7 @@ fn should_publish_stream_views(retired: bool, added: bool) -> bool {
 /// None of these take a lane: `RuntimeStreamKey`'s variant *is* the lane, and
 /// passing one alongside meant every call site carried a second source of truth
 /// plus a `debug_assert` to catch the two disagreeing.
-fn insert_stream_runtime_op(
+pub(super) fn insert_stream_runtime_op(
     key: crate::shard::router::RuntimeStreamKey,
     id: crate::shard::router::DataStreamId,
     publisher: crate::shard::participants::ParticipantKey,
@@ -65,7 +57,7 @@ fn remove_stream_ops(key: crate::shard::router::RuntimeStreamKey) -> [crate::vie
     }
 }
 
-fn install_stream_route_op(
+pub(super) fn install_stream_route_op(
     key: crate::shard::router::RuntimeStreamKey,
     route: RouteHandle,
 ) -> crate::view::ViewOp {
@@ -93,48 +85,51 @@ fn retire_route_op(route: RouteHandle) -> crate::view::ViewOp {
     }
 }
 
+/// The label a data stream is published under.
+fn data_label(topic: &crate::track::Topic, lane: StreamLane) -> String {
+    let lane = match lane {
+        StreamLane::Unreliable => crate::track::DataLane::Realtime,
+        StreamLane::Reliable => crate::track::DataLane::Reliable,
+    };
+    crate::track::publication_label(lane, topic)
+}
+
+/// The catalog identity of a data stream.
+///
+/// `StreamLane` is the control plane's name for the lane and `DataLane` the
+/// label grammar's; they are the same two lanes, and this is the one place the
+/// two spellings meet.
+fn data_publication_id(
+    id: &crate::shard::router::DataStreamId,
+    lane: StreamLane,
+) -> crate::entity::TrackId {
+    let label = data_label(&id.topic, lane);
+    id.publisher_id
+        .derive_track_id(crate::entity::TrackKind::Data, &label)
+}
+
 impl ControllerActor {
-    pub(super) fn stream_plan(
+    /// Every stream on a topic and lane in a room. The catalog indexes data by
+    /// label precisely for this: a wildcard subscription names a topic across
+    /// publishers, which an id-keyed lookup cannot answer.
+    pub(super) fn streams_on_topic(
         &self,
-        id: &crate::shard::router::DataStreamId,
+        room: crate::entity::RoomId,
+        topic: &crate::track::Topic,
         lane: StreamLane,
-        binding: &crate::control::lanes::StreamBinding,
-        destination: crate::id::ShardId,
-    ) -> crate::view::StreamPlan {
-        // As with audio: the plan names its audiences and the shard holds the
-        // membership, so a subscriber arriving does not rewrite the plan of
-        // every stream already published on the topic.
-        let subject = crate::control::patterns::Subject {
-            room: id.room_id,
-            publisher: id.publisher_id,
-            name: (id.topic.clone(), lane),
-        };
-        let groups = self.data_patterns.match_subject(&subject);
-        let remote_routes = if destination == binding.publisher_shard {
-            binding
-                .routes
-                .iter()
-                .map(|(shard_id, handle)| crate::view::RemoteRoutePlan {
-                    shard_id: *shard_id,
-                    route: handle.route,
-                    epoch: handle.epoch,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let reverse_route = binding
-            .reverse_route
-            .map(|handle| crate::view::RemoteRoutePlan {
-                shard_id: binding.publisher_shard,
-                route: handle.route,
-                epoch: handle.epoch,
-            });
-        crate::view::StreamPlan {
-            groups,
-            remote_routes,
-            reverse_route,
-        }
+    ) -> Vec<crate::shard::router::DataStreamId> {
+        self.catalog
+            .on_label(room, &data_label(topic, lane))
+            .into_iter()
+            .filter_map(|id| {
+                let held = self.catalog.get(&id)?;
+                Some(crate::shard::router::DataStreamId::new(
+                    held.room,
+                    held.publisher,
+                    topic.clone(),
+                ))
+            })
+            .collect()
     }
 
     pub(super) async fn on_stream_ready(
@@ -153,12 +148,36 @@ impl ControllerActor {
             debug_assert!(false, "a stream publisher must have a participant key");
             return;
         };
-        let binding = self
-            .lanes
-            .get_mut(lane)
-            .declare(id.clone(), shard_id, publisher, key);
+        let publication_id = data_publication_id(&id, lane);
+        let existing_reverse = self
+            .catalog
+            .get(&publication_id)
+            .and_then(|held| held.reverse_route);
+        let lane_label = match lane {
+            StreamLane::Unreliable => crate::track::DataLane::Realtime,
+            StreamLane::Reliable => crate::track::DataLane::Reliable,
+        };
+        self.catalog
+            .insert(crate::control::publication::Publication {
+                id: publication_id,
+                room: id.room_id,
+                publisher: id.publisher_id,
+                publisher_shard: shard_id,
+                publisher_key: publisher,
+                origin_key: key.into(),
+                reverse_route: existing_reverse,
+                destinations: self
+                    .catalog
+                    .get(&publication_id)
+                    .map(|held| held.destinations.clone())
+                    .unwrap_or_default(),
+                media: crate::control::publication::Media::Data {
+                    lane: lane_label,
+                    topic: id.topic.clone(),
+                },
+            });
 
-        if matches!(lane, StreamLane::Reliable) && binding.reverse_route.is_none() {
+        if matches!(lane, StreamLane::Reliable) && existing_reverse.is_none() {
             let Some(stream) = (match key {
                 crate::shard::router::RuntimeStreamKey::Reliable(stream) => Some(stream),
                 _ => None,
@@ -177,7 +196,7 @@ impl ControllerActor {
             else {
                 return;
             };
-            let Some(binding) = self.lanes.get_mut(lane).get_mut(&id) else {
+            let Some(binding) = self.catalog.get_mut(&data_publication_id(&id, lane)) else {
                 debug_assert!(false, "stream binding must survive reverse route install");
                 return;
             };
@@ -227,12 +246,11 @@ impl ControllerActor {
         }
         // Which streams this reaches is a catalog question now, not something
         // the registry has to remember on the subscriber's behalf.
-        let registry = self.lanes.get(lane);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::shard::router::DataStreamId::new(
                 room_id, publisher, topic,
             )],
-            None => registry.ids_on_topic(&room_id, &topic),
+            None => self.streams_on_topic(room_id, &topic, lane),
         };
         for id in ids {
             self.reconcile_stream(id, lane).await;
@@ -264,65 +282,15 @@ impl ControllerActor {
         if !self.publish_ops(membership_ops) {
             debug_assert!(false, "data group retraction must publish");
         }
-        let registry = self.lanes.get(lane);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::shard::router::DataStreamId::new(
                 room_id, publisher, topic,
             )],
-            None => registry.ids_on_topic(&room_id, &topic),
+            None => self.streams_on_topic(room_id, &topic, lane),
         };
         for id in ids {
             self.reconcile_stream(id, lane).await;
         }
-    }
-
-    pub(super) async fn retire_stream_destinations(
-        &mut self,
-        id: &crate::shard::router::DataStreamId,
-        lane: StreamLane,
-        stale: &[(
-            crate::id::ShardId,
-            crate::shard::router::RuntimeStreamKey,
-            RouteHandle,
-        )],
-    ) -> bool {
-        let Some(binding) = self.lanes.get(lane).get(id) else {
-            debug_assert!(false, "stale routes must belong to a stream binding");
-            return false;
-        };
-        let publisher_shard = binding.publisher_shard;
-        let source_key = binding.key;
-        let mut source_plan =
-            source_key.map(|_| self.stream_plan(id, lane, binding, publisher_shard));
-        if let Some(plan) = source_plan.as_mut() {
-            plan.remote_routes
-                .retain(|route| !stale.iter().any(|(shard, _, _)| route.shard_id == *shard));
-        }
-
-        let mut ops = Vec::new();
-        for (destination, key, route) in stale {
-            ops.push((*destination, retire_route_op(*route)));
-            ops.extend(remove_stream_ops(*key).map(|op| (*destination, op)));
-        }
-        if let Some((key, plan)) = source_key.zip(source_plan) {
-            ops.push((publisher_shard, set_stream_plan_op(key, plan)));
-        }
-        if !self.publish_ops(ops) {
-            return false;
-        }
-
-        let now = tokio::time::Instant::now();
-        for (destination, _, route) in stale {
-            let Some(binding) = self.lanes.get_mut(lane).get_mut(id) else {
-                debug_assert!(false, "stream binding must survive route retirement");
-                return false;
-            };
-            binding.routes.remove(destination);
-            binding.destination_keys.remove(destination);
-            self.state
-                .release_endpoint(*destination, route.route.slot(), now);
-        }
-        true
     }
 
     pub(super) async fn retire_stream_binding(
@@ -330,215 +298,41 @@ impl ControllerActor {
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) -> bool {
-        let Some(binding) = self.lanes.get(lane).get(&id) else {
-            return true;
-        };
-        let publisher_shard = binding.publisher_shard;
-        let source_key = binding.key;
-        let destination_keys = binding.destination_keys.clone();
-        let routes: Vec<_> = binding
-            .routes
-            .iter()
-            .filter_map(|(destination, route)| {
-                let Some(key) = destination_keys.get(destination).copied() else {
-                    debug_assert!(false, "a stream route must have a destination key");
-                    return None;
-                };
-                Some((*destination, key, *route))
-            })
-            .collect();
-
-        let mut ops = Vec::new();
-        for (destination, key, route) in &routes {
-            ops.push((*destination, retire_route_op(*route)));
-            ops.extend(remove_stream_ops(*key).map(|op| (*destination, op)));
-        }
-        if let Some(key) = source_key {
-            ops.extend(remove_stream_ops(key).map(|op| (publisher_shard, op)));
-        }
-        if !self.publish_ops(ops) {
-            return false;
-        }
-
-        let now = tokio::time::Instant::now();
-        for (destination, _, route) in &routes {
-            self.state
-                .release_endpoint(*destination, route.route.slot(), now);
-        }
-        if let Some(key) = source_key {
-            self.lanes
-                .get(lane)
-                .retire_runtime(&mut self.state, publisher_shard, key);
-        }
-        for (destination, key) in destination_keys {
-            self.lanes
-                .get(lane)
-                .retire_runtime(&mut self.state, destination, key);
-        }
-        self.lanes.get_mut(lane).remove(&id);
-        true
-    }
-
-    /// The shards holding at least one declared consumer of this stream.
-    fn stream_destinations(
-        &self,
-        id: &crate::shard::router::DataStreamId,
-        lane: StreamLane,
-    ) -> Vec<crate::id::ShardId> {
-        let subject = crate::control::patterns::Subject {
-            room: id.room_id,
-            publisher: id.publisher_id,
-            name: (id.topic.clone(), lane),
-        };
-        let mut shards = Vec::new();
-        for group in self.data_patterns.match_subject(&subject) {
-            for shard in self.data_patterns.shards_of(group) {
-                if !shards.contains(&shard) {
-                    shards.push(shard);
-                }
+        self.retire_publication(data_publication_id(&id, lane), move |actor, shard, key| {
+            if let Some(key) = key.stream() {
+                actor
+                    .lanes
+                    .get(lane)
+                    .retire_runtime(&mut actor.state, shard, key);
             }
-        }
-        shards
+        })
+        .await
     }
 
+    /// Make a stream's destinations match its declarations.
     pub(super) async fn reconcile_stream(
         &mut self,
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) {
-        // Which shards consume this stream is a question about declarations,
-        // not about what the binding happens to remember. Asking the pattern
-        // table is what lets the binding stop tracking subscribers at all.
-        let wanted = self.stream_destinations(&id, lane);
-        let stale: Vec<_> = self
-            .lanes
-            .get(lane)
-            .get(&id)
-            .map(|binding| {
-                binding
-                    .routes
-                    .iter()
-                    .filter_map(|(destination, route)| {
-                        if wanted.contains(destination) {
-                            return None;
-                        }
-                        let key = binding.destination_keys.get(destination).copied()?;
-                        Some((*destination, key, *route))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let retired = !stale.is_empty();
-        if retired && !self.retire_stream_destinations(&id, lane, &stale).await {
-            debug_assert!(false, "stream route retirement must complete");
-            return;
-        }
-        let destinations = wanted;
-        let Some(publisher_shard) = self
-            .lanes
-            .get(lane)
-            .get(&id)
-            .map(|binding| binding.publisher_shard)
-        else {
-            return;
-        };
-        let mut added = false;
-        for destination in destinations {
-            let has_route = self
+        let publication_id = data_publication_id(&id, lane);
+        let stream = id.clone();
+        self.install_destinations(publication_id, move |actor, destination| {
+            let key = actor
                 .lanes
                 .get(lane)
-                .get(&id)
-                .is_some_and(|binding| binding.routes.contains_key(&destination));
-            if !needs_stream_route(publisher_shard, destination, has_route) {
-                continue;
-            }
-            let Some(key) = self.lanes.get(lane).mint(&mut self.state, destination, &id) else {
-                continue;
-            };
-            let Some(action) = self.lanes.get(lane).route_action(key) else {
-                debug_assert!(false, "stream preparation returned the wrong lane");
-                continue;
-            };
-            let Some(binding) = self.lanes.get(lane).get(&id) else {
-                return;
-            };
-            let plan = self.stream_plan(&id, lane, binding, destination);
-            let Some(route) = self
-                .grant_route_with_plan(destination, action, lane, plan.clone())
-                .await
-            else {
-                continue;
-            };
-            let Some(binding) = self.lanes.get_mut(lane).get_mut(&id) else {
-                return;
-            };
-            binding.destination_keys.insert(destination, key);
-            binding.routes.insert(destination, route);
-            added = true;
-        }
-        if should_publish_stream_views(retired, added) {
-            self.publish_stream_views(id, lane).await;
-        }
-    }
-
-    pub(super) async fn publish_stream_views(
-        &mut self,
-        id: crate::shard::router::DataStreamId,
-        lane: StreamLane,
-    ) {
-        let Some(binding) = self.lanes.get(lane).get(&id) else {
-            return;
-        };
-        let publisher = binding.publisher;
-        let publisher_shard = binding.publisher_shard;
-        let source_key = binding.key;
-        let destination_keys = binding.destination_keys.clone();
-        let routes = binding.routes.clone();
-
-        let mut targets = Vec::new();
-        if let Some(key) = source_key {
-            targets.push((
-                publisher_shard,
-                key,
-                self.stream_plan(&id, lane, binding, publisher_shard),
-                None,
-            ));
-        }
-        for (destination, key) in destination_keys {
-            let Some(route) = routes.get(&destination).copied() else {
-                continue;
-            };
-            targets.push((
-                destination,
-                key,
-                self.stream_plan(&id, lane, binding, destination),
-                Some(route),
-            ));
-        }
-
-        let mut ops = Vec::new();
-        for (shard, key, plan, route) in targets {
-            ops.push((shard, insert_stream_runtime_op(key, id.clone(), publisher)));
-            ops.push((shard, set_stream_plan_op(key, plan)));
-            ops.extend(route.map(|route| (shard, install_stream_route_op(key, route))));
-        }
-        self.publish_ops(ops);
+                .mint(&mut actor.state, destination, &stream)?;
+            let action = actor.lanes.get(lane).route_action(key)?;
+            Some((key.into(), action))
+        })
+        .await;
+        self.publish_publication(publication_id).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn route_decision_excludes_the_publisher_and_existing_routes() {
-        let publisher = crate::id::ShardId::new(0);
-        let destination = crate::id::ShardId::new(1);
-
-        assert!(!needs_stream_route(publisher, publisher, false));
-        assert!(needs_stream_route(publisher, destination, false));
-        assert!(!needs_stream_route(publisher, destination, true));
-    }
 
     #[test]
     fn stream_views_publish_when_topology_changes() {

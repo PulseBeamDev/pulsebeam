@@ -9,18 +9,11 @@
 //! action to emit, which arena to retire into — is a method here, and nowhere
 //! else.
 
-use ahash::{HashMap, HashMapExt};
-
 use crate::{
     control::state::ControlPlaneState,
-    entity::{ParticipantId, RoomId},
     id::ShardId,
-    route::{RouteAction, RouteHandle},
-    shard::{
-        participants::ParticipantKey,
-        router::{DataStreamId, RuntimeStreamKey},
-    },
-    track::Topic,
+    route::RouteAction,
+    shard::router::{DataStreamId, RuntimeStreamKey},
 };
 
 /// How a data stream is delivered.
@@ -47,126 +40,13 @@ impl StreamLane {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct StreamBinding {
-    pub publisher_shard: ShardId,
-    pub publisher: ParticipantKey,
-    pub key: Option<RuntimeStreamKey>,
-    pub reverse_route: Option<RouteHandle>,
-    pub destination_keys: HashMap<ShardId, RuntimeStreamKey>,
-    pub routes: HashMap<ShardId, RouteHandle>,
-}
-
-impl StreamBinding {
-    fn new(publisher_shard: ShardId, publisher: ParticipantKey) -> Self {
-        Self {
-            publisher_shard,
-            publisher,
-            key: None,
-            reverse_route: None,
-            destination_keys: HashMap::new(),
-            routes: HashMap::new(),
-        }
-    }
-}
-
-/// Which publishers are live on each topic.
-///
-/// A wildcard subscription has to name every stream on its topic, and without
-/// this that means walking every stream on the node. Kept beside the bindings
-/// rather than derived from them, so it is one lookup instead of one scan.
-#[derive(Default)]
-struct TopicIndex {
-    publishers: HashMap<(RoomId, Topic), Vec<ParticipantId>>,
-}
-
-impl TopicIndex {
-    fn insert(&mut self, id: &DataStreamId) {
-        let publishers = self
-            .publishers
-            .entry((id.room_id, id.topic.clone()))
-            .or_default();
-        if !publishers.contains(&id.publisher_id) {
-            publishers.push(id.publisher_id);
-        }
-    }
-
-    fn remove(&mut self, id: &DataStreamId) {
-        let key = (id.room_id, id.topic.clone());
-        let Some(publishers) = self.publishers.get_mut(&key) else {
-            return;
-        };
-        publishers.retain(|publisher| *publisher != id.publisher_id);
-        if publishers.is_empty() {
-            self.publishers.remove(&key);
-        }
-    }
-
-    fn streams(&self, room: &RoomId, topic: &Topic) -> Vec<DataStreamId> {
-        self.publishers
-            .get(&(*room, topic.clone()))
-            .into_iter()
-            .flatten()
-            .map(|publisher| DataStreamId::new(*room, *publisher, topic.clone()))
-            .collect()
-    }
-}
-
 pub(crate) struct LaneRegistry {
     lane: StreamLane,
-    bindings: HashMap<DataStreamId, StreamBinding>,
-    by_topic: TopicIndex,
 }
 
 impl LaneRegistry {
     pub(crate) fn new(lane: StreamLane) -> Self {
-        Self {
-            lane,
-            bindings: HashMap::new(),
-            by_topic: TopicIndex::default(),
-        }
-    }
-
-    pub(crate) fn get(&self, id: &DataStreamId) -> Option<&StreamBinding> {
-        self.bindings.get(id)
-    }
-
-    pub(crate) fn get_mut(&mut self, id: &DataStreamId) -> Option<&mut StreamBinding> {
-        self.bindings.get_mut(id)
-    }
-
-    pub(crate) fn remove(&mut self, id: &DataStreamId) -> Option<StreamBinding> {
-        self.by_topic.remove(id);
-        self.bindings.remove(id)
-    }
-
-    /// Every live stream carrying `topic` in `room`. The set a wildcard
-    /// subscription resolves to at the moment it is made.
-    pub(crate) fn ids_on_topic(&self, room: &RoomId, topic: &Topic) -> Vec<DataStreamId> {
-        self.by_topic.streams(room, topic)
-    }
-
-    /// Publish `id`, draining anyone who subscribed before it existed.
-    pub(crate) fn declare(
-        &mut self,
-        id: DataStreamId,
-        publisher_shard: ShardId,
-        publisher: ParticipantKey,
-        key: RuntimeStreamKey,
-    ) -> &mut StreamBinding {
-        debug_assert_eq!(
-            self.lane,
-            StreamLane::of(key),
-            "runtime key does not belong to this lane"
-        );
-        self.by_topic.insert(&id);
-        let binding = self
-            .bindings
-            .entry(id)
-            .or_insert_with(|| StreamBinding::new(publisher_shard, publisher));
-        debug_assert_eq!(binding.publisher_shard, publisher_shard);
-        binding.key = Some(key);
-        binding
+        Self { lane }
     }
 
     /// The route action that carries this lane's traffic. `None` when the key
@@ -235,13 +115,6 @@ impl Lanes {
         match lane {
             StreamLane::Unreliable => &self.data,
             StreamLane::Reliable => &self.reliable,
-        }
-    }
-
-    pub(crate) fn get_mut(&mut self, lane: StreamLane) -> &mut LaneRegistry {
-        match lane {
-            StreamLane::Unreliable => &mut self.data,
-            StreamLane::Reliable => &mut self.reliable,
         }
     }
 }

@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use ahash::{HashMap, HashMapExt};
+use ahash::HashMapExt;
 
 use crate::control::state::ControlPlaneState;
 use crate::{
@@ -30,6 +30,7 @@ use str0m::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+mod lifecycle;
 mod participants;
 mod routes;
 mod stream_lifecycle;
@@ -42,23 +43,6 @@ pub struct ParticipantState {
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
-}
-
-struct TrackBinding {
-    meta: crate::track::TrackMeta,
-    publication: crate::track::Track,
-    publisher_participant: crate::shard::participants::ParticipantKey,
-    encodings: Vec<Option<str0m::media::Rid>>,
-    states: crate::track::TrackStates,
-    publisher_shard: crate::id::ShardId,
-    publisher_fanout: crate::shard::router::TrackKey,
-    reverse_route: Option<RouteHandle>,
-    fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
-    /// Where this track's video is routed. Held here for the same reason
-    /// `audio_routes` is: a route outlives any one subscriber's interest.
-    video_routes: HashMap<crate::id::ShardId, RouteHandle>,
-    audio_fanouts: HashMap<crate::id::ShardId, crate::shard::router::TrackKey>,
-    audio_routes: HashMap<crate::id::ShardId, RouteHandle>,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -144,7 +128,8 @@ pub struct ControllerActor {
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
     views: Vec<crate::view::ShardViewWriter>,
-    track_bindings: HashMap<crate::entity::TrackId, TrackBinding>,
+    /// Every publication on this node, whatever kind.
+    catalog: crate::control::publication::Catalog,
     /// Data and reliable stream routing. One type per lane rather than three
     /// fields duplicated per lane, so the two cannot drift.
     lanes: Lanes,
@@ -199,7 +184,7 @@ impl ControllerActor {
             state: ControlPlaneState::new(shard_count),
             video_patterns: crate::control::patterns::PatternTable::new(),
             views,
-            track_bindings: HashMap::new(),
+            catalog: crate::control::publication::Catalog::new(),
             lanes: Lanes::new(),
             pending: PendingSubscriptions::default(),
             audio_patterns: crate::control::patterns::PatternTable::new(),
@@ -583,7 +568,7 @@ impl ControllerActor {
             // A participant that left, or a track that was retired, takes its
             // deferred work with it rather than being resurrected here.
             if self.core.registry.get_participant(&subscriber).is_none()
-                || !self.track_bindings.contains_key(&track.id)
+                || !self.catalog.contains(&track.id)
             {
                 continue;
             }
@@ -620,7 +605,7 @@ impl ControllerActor {
                 slot,
                 track,
             } => {
-                if !self.track_bindings.contains_key(&track.id) {
+                if !self.catalog.contains(&track.id) {
                     // Track ids come from the client, so a subscription may
                     // name something that does not exist and never will. Cap
                     // how many a single participant can park here; the whole
@@ -820,35 +805,45 @@ impl ControllerActor {
                 let track_id = track.meta.id;
                 let fanout = self.prepare_track_key(shard_id, track_id, track.meta.origin)?;
                 let track_id = track.meta.id;
-                self.track_bindings.insert(
-                    track_id,
-                    TrackBinding {
-                        meta: track.meta.clone(),
-                        publication: track.as_ref().clone(),
-                        publisher_participant: self
-                            .core
-                            .registry
-                            .get_participant(&track.meta.origin)
-                            .and_then(|meta| meta.binding)?,
-                        encodings: track.layers.iter().map(|layer| layer.rid).collect(),
-                        states,
+                let publisher_key = self
+                    .core
+                    .registry
+                    .get_participant(&track.meta.origin)
+                    .and_then(|meta| meta.binding)?;
+                self.catalog
+                    .insert(crate::control::publication::Publication {
+                        id: track_id,
+                        room: track.meta.room_id,
+                        publisher: track.meta.origin,
                         publisher_shard: shard_id,
-                        publisher_fanout: fanout,
+                        publisher_key,
+                        origin_key: crate::control::publication::RuntimeKey::Track(fanout),
                         reverse_route: None,
-                        fanouts: HashMap::new(),
-                        video_routes: HashMap::new(),
-                        audio_fanouts: HashMap::new(),
-                        audio_routes: HashMap::new(),
-                    },
-                );
+                        destinations: indexmap::IndexMap::new(),
+                        media: match track_id.kind() {
+                            crate::entity::TrackKind::Audio => {
+                                crate::control::publication::Media::Audio
+                            }
+                            _ => crate::control::publication::Media::Video {
+                                publication: track.as_ref().clone(),
+                                encodings: track.layers.iter().map(|layer| layer.rid).collect(),
+                                states,
+                            },
+                        },
+                    });
                 let announced = self.on_track_published(shard_id, *track, fanout).await;
                 if let Some(track) = &announced {
-                    if let Some(binding) = self.track_bindings.get_mut(&track_id) {
-                        binding.reverse_route = track.reverse;
-                        binding.publication = track.clone();
+                    if let Some(publication) = self.catalog.get_mut(&track_id) {
+                        publication.reverse_route = track.reverse;
+                        if let crate::control::publication::Media::Video {
+                            publication: held, ..
+                        } = &mut publication.media
+                        {
+                            *held = track.clone();
+                        }
                     }
                 } else {
-                    self.track_bindings.remove(&track_id);
+                    self.catalog.remove(&track_id);
                 }
                 if announced.is_some() {
                     // A track is one kind. Running both installers regardless
@@ -867,7 +862,7 @@ impl ControllerActor {
                             debug_assert!(false, "data does not publish through the track path");
                         }
                     }
-                    if !self.publish_track_plans(track_id).await {
+                    if !self.publish_publication(track_id).await {
                         debug_assert!(false, "initial track plan publication must complete");
                     }
                     self.drain_pending_track_subscriptions(track_id).await;
@@ -976,22 +971,12 @@ impl ControllerActor {
     }
 
     async fn reconcile_room_tracks(&mut self, room_id: crate::entity::RoomId) {
-        let track_ids: Vec<_> = self
-            .track_bindings
-            .iter()
-            .filter_map(|(track_id, binding)| {
-                self.core
-                    .registry
-                    .get_participant(&binding.meta.origin)
-                    .is_some_and(|participant| participant.room_id == room_id)
-                    .then_some(*track_id)
-            })
-            .collect();
-        for track_id in track_ids {
-            if track_id.kind() == crate::entity::TrackKind::Video {
-                self.install_video_runtimes(track_id).await;
-            }
-            if !self.publish_track_plans(track_id).await {
+        for track_id in self
+            .catalog
+            .in_room(room_id, crate::entity::TrackKind::Video)
+        {
+            self.install_video_runtimes(track_id).await;
+            if !self.publish_publication(track_id).await {
                 debug_assert!(false, "room track reconciliation must publish");
             }
         }
@@ -1001,21 +986,11 @@ impl ControllerActor {
     /// of the audience just arrived. Every later joiner on that shard is served
     /// by the routes this installed, and costs one membership op.
     async fn reconcile_room_audio(&mut self, room_id: crate::entity::RoomId) {
-        let track_ids: Vec<_> = self
-            .track_bindings
-            .iter()
-            .filter_map(|(track_id, binding)| {
-                self.core
-                    .registry
-                    .get_participant(&binding.meta.origin)
-                    .is_some_and(|participant| participant.room_id == room_id)
-                    .then_some(*track_id)
-            })
-            .collect();
-        for track_id in track_ids {
-            if track_id.kind() == crate::entity::TrackKind::Audio {
-                self.install_audio_routes(track_id).await;
-            }
+        for track_id in self
+            .catalog
+            .in_room(room_id, crate::entity::TrackKind::Audio)
+        {
+            self.install_audio_routes(track_id).await;
         }
     }
 }

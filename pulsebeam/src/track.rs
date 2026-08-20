@@ -698,12 +698,26 @@ mod data_track {
     }
 
     impl DataLane {
-        fn as_str(self) -> &'static str {
+        pub fn as_str(self) -> &'static str {
             match self {
                 DataLane::Realtime => "rt",
                 DataLane::Reliable => "rel",
             }
         }
+    }
+
+    /// The canonical label naming a data *publication*: a topic on a lane.
+    ///
+    /// Direction and scope describe a channel, not the thing published on it,
+    /// so they are absent here — a publisher's channel and a subscriber's
+    /// channel for the same topic name one publication between them.
+    ///
+    /// Injective without escaping, which is why this can be plain
+    /// concatenation: `rt` and `rel` are prefix-free after `v1/`, and a topic
+    /// is `[A-Za-z0-9_-]+` by the grammar above, so it can carry no separator.
+    /// That is enforced where a label is parsed, not assumed here.
+    pub fn publication_label(lane: DataLane, topic: &crate::track::Topic) -> String {
+        format!("v1/{}/{}", lane.as_str(), topic)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]

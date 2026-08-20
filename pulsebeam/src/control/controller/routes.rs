@@ -11,42 +11,25 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
         action: crate::route::RouteAction,
     ) -> Option<RouteHandle> {
-        self.grant_route_binding(shard_id, action, None, None, None, None)
-            .await
+        self.grant_route_binding(shard_id, action, None).await
     }
 
-    pub(super) async fn grant_route_with_plan(
-        &mut self,
-        shard_id: crate::id::ShardId,
-        action: RouteAction,
-        lane: StreamLane,
-        plan: crate::view::StreamPlan,
-    ) -> Option<RouteHandle> {
-        match lane {
-            StreamLane::Unreliable => {
-                self.grant_route_binding(shard_id, action, None, None, Some(plan), None)
-                    .await
-            }
-            StreamLane::Reliable => {
-                self.grant_route_binding(shard_id, action, None, None, None, Some(plan))
-                    .await
-            }
-        }
-    }
-
+    /// Grant a route and publish the plan it serves, in one generation.
+    ///
+    /// A stream granted here — a track's reverse route, an audio fanout, a data
+    /// lane — is announced once and never re-offered. Losing the allocation
+    /// loses the stream for the rest of the session, so this retries for the
+    /// same reason connection setup does.
+    ///
+    /// The plan is one type for every kind now, so where this took four
+    /// mutually exclusive `Option`s and a match to prove only one was set, it
+    /// takes the plan and the image it belongs to.
     pub(super) async fn grant_route_binding(
         &mut self,
         shard_id: crate::id::ShardId,
         action: crate::route::RouteAction,
-        video_plan: Option<crate::view::VideoPlan>,
-        audio_plan: Option<crate::view::AudioPlan>,
-        data_plan: Option<crate::view::StreamPlan>,
-        reliable_plan: Option<crate::view::StreamPlan>,
+        plan: Option<(crate::view::PlanTarget, crate::view::ForwardingPlan)>,
     ) -> Option<RouteHandle> {
-        // A stream granted here — a track's reverse route, an audio fanout, a
-        // data lane — is announced once and never re-offered. Losing the
-        // allocation loses the stream for the rest of the session, so this
-        // retries for the same reason connection setup does.
         self.publish_with_route(shard_id, "endpoint", move |_, handle| {
             let mut ops = vec![(
                 shard_id,
@@ -58,38 +41,11 @@ impl ControllerActor {
                     },
                 },
             )];
-            let plan_op = match (action, video_plan, audio_plan, data_plan, reliable_plan) {
-                (RouteAction::Video { local_track }, Some(plan), _, _, _) => {
-                    Some(crate::view::ViewOp::SetPlan {
-                        target: crate::view::PlanTarget::Video(local_track),
-                        plan,
-                    })
-                }
-                (RouteAction::Audio { track }, _, Some(plan), _, _) => {
-                    Some(crate::view::ViewOp::SetPlan {
-                        target: crate::view::PlanTarget::Audio(track),
-                        plan,
-                    })
-                }
-                (RouteAction::Unreliable { stream }, _, _, Some(plan), _) => {
-                    Some(crate::view::ViewOp::SetPlan {
-                        target: crate::view::PlanTarget::Unreliable(stream),
-                        plan,
-                    })
-                }
-                (RouteAction::Reliable { stream }, _, _, _, Some(plan)) => {
-                    Some(crate::view::ViewOp::SetPlan {
-                        target: crate::view::PlanTarget::Reliable(stream),
-                        plan,
-                    })
-                }
-                (RouteAction::Reverse { .. }, None, None, None, None) => None,
-                _ => {
-                    debug_assert!(false, "route action and compiled plan disagree");
-                    None
-                }
-            };
-            ops.extend(plan_op.map(|op| (shard_id, op)));
+            ops.extend(
+                plan.map(|(target, plan)| {
+                    (shard_id, crate::view::ViewOp::SetPlan { target, plan })
+                }),
+            );
             ops
         })
     }
