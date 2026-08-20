@@ -1,8 +1,6 @@
 use std::io;
 use std::time::Duration;
 
-use ahash::HashMapExt;
-
 use crate::control::state::ControlPlaneState;
 use crate::{
     control::{
@@ -10,7 +8,7 @@ use crate::{
         lanes::{Lanes, StreamLane},
         negotiator::{Negotiator, NegotiatorError},
         outbox::{ControllerEvent, ControllerEventQueue},
-        pending::{PendingSubscription, PendingSubscriptions},
+        pending::{PendingStream, PendingStreams, PendingSubscription, PendingSubscriptions},
         router::ShardRouter,
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
         ufrag::IceUfrag,
@@ -137,6 +135,7 @@ pub struct ControllerActor {
     video_patterns: crate::control::patterns::PatternTable<
         crate::entity::TrackId,
         crate::keys::DownstreamSlotKey,
+        crate::view::VideoAudience,
     >,
     /// One writer per shard. Never shared, never locked, and never handed to
     /// a shard: the one-publish-per-generation budget is only checkable
@@ -148,11 +147,13 @@ pub struct ControllerActor {
     /// fields duplicated per lane, so the two cannot drift.
     lanes: Lanes,
     pending: PendingSubscriptions,
-    /// Audio declarations, shadowing the room scan in `install_audio_routes`
-    /// until routing reads them instead of it. Every participant declares the
-    /// room wildcard, which is what the scan produces today; what is under
-    /// test is that declarations appear and disappear with the participant.
-    audio_patterns: crate::control::patterns::PatternTable<crate::entity::TrackId, ()>,
+    pending_streams: PendingStreams,
+    pending_audio: Vec<crate::entity::TrackId>,
+    audio_patterns: crate::control::patterns::PatternTable<
+        crate::entity::TrackId,
+        (),
+        crate::view::AudioAudience,
+    >,
     /// Data declarations, keyed by topic *and* lane.
     ///
     /// Reliability is part of the subject rather than an attribute of the
@@ -164,6 +165,7 @@ pub struct ControllerActor {
     data_patterns: crate::control::patterns::PatternTable<
         (crate::track::Topic, StreamLane),
         str0m::channel::ChannelId,
+        crate::view::DataAudience,
     >,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
@@ -201,6 +203,8 @@ impl ControllerActor {
             catalog: crate::control::publication::Catalog::new(),
             lanes: Lanes::new(),
             pending: PendingSubscriptions::default(),
+            pending_streams: PendingStreams::default(),
+            pending_audio: Vec::new(),
             audio_patterns: crate::control::patterns::PatternTable::new(),
             data_patterns: crate::control::patterns::PatternTable::new(),
             #[cfg(not(feature = "sim"))]
@@ -267,6 +271,25 @@ impl ControllerActor {
         self.views.get_mut(shard_id.index())
     }
 
+    fn publish_staged_views(&mut self) -> bool {
+        let mut published = false;
+        for view in &mut self.views {
+            if !view.has_staged() {
+                continue;
+            }
+            if view.publish().is_some() {
+                published = true;
+            } else if published {
+                pulsebeam_runtime::fatal!(
+                    "a shard view closed after another shard accepted the same generation"
+                );
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) async fn run(
         mut self,
         mut command_rx: mailbox::Receiver<ControllerCommand>,
@@ -316,6 +339,8 @@ impl ControllerActor {
                 _ = poll_interval.tick() => {
                     self.router.poll_loads();
                     self.retry_deferred_subscribes().await;
+                    self.retry_deferred_streams().await;
+                    self.retry_deferred_audio().await;
                 }
 
                 Some(ev) = pending_rx.recv() => {
@@ -391,7 +416,9 @@ impl ControllerActor {
                                 break;
                             }
                             pulsebeam_runtime::mailbox::TrySendError::Closed(_) => {
-                                tracing::warn!(%shard_id, "shard command mailbox is closed");
+                                pulsebeam_runtime::fatal!(
+                                    "a shard command mailbox closed before its command was delivered"
+                                );
                             }
                         },
                     }
@@ -509,13 +536,12 @@ impl ControllerActor {
             self.abort_transaction(now);
             return None;
         };
-        let mut staged = vec![false; self.views.len()];
         for (shard_id, op) in ops(self, &reserved) {
-            let Some(slot) = staged.get_mut(shard_id.index()) else {
+            if !op.is_owned_by(shard_id) {
+                debug_assert!(false, "a view op must target its owning shard");
                 self.abort_transaction(now);
                 return None;
-            };
-            *slot = true;
+            }
             let Some(view) = self.view_mut(shard_id) else {
                 self.abort_transaction(now);
                 return None;
@@ -526,14 +552,9 @@ impl ControllerActor {
         // delta cannot happen there, so a publish that yields nothing means the
         // shard is gone — and committing anyway would retire the slot of a
         // route the surviving shards still believe in.
-        for (index, staged) in staged.into_iter().enumerate() {
-            let Some(view) = self.view_mut(crate::id::ShardId::new(index)) else {
-                continue;
-            };
-            if view.publish().is_none() && staged {
-                self.abort_transaction(now);
-                return None;
-            }
+        if !self.publish_staged_views() {
+            self.abort_transaction(now);
+            return None;
         }
         if self.state.commit().is_err() {
             self.abort_transaction(now);
@@ -543,11 +564,15 @@ impl ControllerActor {
     }
 
     /// [`transact`](Self::transact) for a change that allocates nothing.
-    fn publish_ops(&mut self, ops: Vec<(crate::id::ShardId, crate::view::ViewOp)>) -> bool {
+    fn publish_ops(&mut self, ops: Vec<(crate::id::ShardId, crate::view::ViewOp)>) {
         if ops.is_empty() {
-            return true;
+            return;
         }
-        self.transact(|_, _| Some(()), move |_, ()| ops).is_some()
+        if self.transact(|_, _| Some(()), move |_, ()| ops).is_none() {
+            pulsebeam_runtime::fatal!(
+                "a control-plane view update could not be accepted by every owning shard"
+            );
+        }
     }
 
     /// [`transact`](Self::transact) for a change that mints one endpoint route.
@@ -596,6 +621,52 @@ impl ControllerActor {
             }
             self.on_track_subscribed(shard_id, subscriber, subscriber_key, slot, track)
                 .await;
+        }
+    }
+
+    fn defer_stream(
+        &mut self,
+        shard_id: crate::id::ShardId,
+        id: crate::shard::router::DataStreamId,
+        lane: StreamLane,
+    ) {
+        self.pending_streams
+            .hold(PendingStream { shard_id, id, lane });
+    }
+
+    async fn retry_deferred_streams(&mut self) {
+        let pending = self.pending_streams.take();
+        for PendingStream { shard_id, id, lane } in pending {
+            if self
+                .core
+                .registry
+                .get_participant(&id.publisher_id)
+                .is_none()
+            {
+                continue;
+            }
+            if !self.on_stream_ready(shard_id, id.clone(), lane).await {
+                self.defer_stream(shard_id, id, lane);
+            }
+        }
+    }
+
+    fn defer_audio(&mut self, track_id: crate::entity::TrackId) {
+        if !self.pending_audio.contains(&track_id) {
+            self.pending_audio.push(track_id);
+        }
+    }
+
+    async fn retry_deferred_audio(&mut self) {
+        let pending = std::mem::take(&mut self.pending_audio);
+        for track_id in pending {
+            if self
+                .catalog
+                .get(&track_id)
+                .is_some_and(|p| p.kind() == crate::entity::TrackKind::Audio)
+            {
+                self.install_audio_routes(track_id).await;
+            }
         }
     }
 
@@ -666,13 +737,12 @@ impl ControllerActor {
                 topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                let key = self.state.mint_data(shard_id, id.clone())?;
-                self.on_stream_ready(
-                    shard_id,
-                    id,
-                    crate::shard::router::RuntimeStreamKey::Unreliable(key),
-                )
-                .await;
+                if !self
+                    .on_stream_ready(shard_id, id.clone(), StreamLane::Unreliable)
+                    .await
+                {
+                    self.defer_stream(shard_id, id, StreamLane::Unreliable);
+                }
                 None
             }
             ShardEvent::ReliableDataTopicPublished {
@@ -681,13 +751,12 @@ impl ControllerActor {
                 topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
-                let key = self.state.mint_reliable(shard_id, id.clone())?;
-                self.on_stream_ready(
-                    shard_id,
-                    id,
-                    crate::shard::router::RuntimeStreamKey::Reliable(key),
-                )
-                .await;
+                if !self
+                    .on_stream_ready(shard_id, id.clone(), StreamLane::Reliable)
+                    .await
+                {
+                    self.defer_stream(shard_id, id, StreamLane::Reliable);
+                }
                 None
             }
             ShardEvent::DataTopicSubscribed {
@@ -754,6 +823,7 @@ impl ControllerActor {
                 publisher,
             } => {
                 self.on_stream_unsubscription(
+                    shard_id,
                     room_id,
                     subscriber,
                     topic,
@@ -769,6 +839,7 @@ impl ControllerActor {
                 topic,
             } => {
                 self.on_stream_unsubscription(
+                    shard_id,
                     room_id,
                     subscriber,
                     topic,
@@ -784,6 +855,7 @@ impl ControllerActor {
                 topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                self.pending_streams.remove(&id, StreamLane::Unreliable);
                 if !self.retire_stream_binding(id, StreamLane::Unreliable).await {
                     debug_assert!(false, "data stream retirement must complete");
                 }
@@ -795,6 +867,7 @@ impl ControllerActor {
                 topic,
             } => {
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                self.pending_streams.remove(&id, StreamLane::Reliable);
                 if !self.retire_stream_binding(id, StreamLane::Reliable).await {
                     debug_assert!(false, "reliable stream retirement must complete");
                 }
@@ -841,13 +914,38 @@ impl ControllerActor {
             }
             ShardEvent::TrackPublished { track, states } => {
                 let track_id = track.meta.id;
-                let fanout = self.prepare_track_key(shard_id, track_id, track.meta.origin)?;
-                let track_id = track.meta.id;
-                let publisher_key = self
+                if self.catalog.contains(&track_id) {
+                    debug_assert!(false, "a publication must be announced once");
+                    return None;
+                }
+                let Some(publisher_key) = self
                     .core
                     .registry
                     .get_participant(&track.meta.origin)
-                    .and_then(|meta| meta.binding)?;
+                    .and_then(|meta| meta.binding)
+                else {
+                    debug_assert!(false, "a published track must have a participant key");
+                    return None;
+                };
+                let fanout = self.prepare_track_key(shard_id, track_id, track.meta.origin)?;
+                let track_id = track.meta.id;
+                let origin_key = match track_id.kind() {
+                    crate::entity::TrackKind::Video => {
+                        crate::control::publication::RuntimeKey::Video(
+                            crate::keys::VideoTrackKey::new(fanout),
+                        )
+                    }
+                    crate::entity::TrackKind::Audio => {
+                        crate::control::publication::RuntimeKey::Audio(
+                            crate::keys::AudioTrackKey::new(fanout),
+                        )
+                    }
+                    crate::entity::TrackKind::Data => {
+                        debug_assert!(false, "data does not publish through the track path");
+                        self.state.remove_track(shard_id, fanout);
+                        return None;
+                    }
+                };
                 self.catalog
                     .insert(crate::control::publication::Publication {
                         id: track_id,
@@ -855,7 +953,7 @@ impl ControllerActor {
                         publisher: track.meta.origin,
                         publisher_shard: shard_id,
                         publisher_key,
-                        origin_key: crate::control::publication::RuntimeKey::Track(fanout),
+                        origin_key,
                         reverse_route: None,
                         destinations: indexmap::IndexMap::new(),
                         media: match track_id.kind() {
@@ -869,6 +967,7 @@ impl ControllerActor {
                             },
                         },
                     });
+                self.index_publication(track_id);
                 let announced = self.on_track_published(shard_id, *track, fanout).await;
                 if let Some(track) = &announced {
                     if let Some(publication) = self.catalog.get_mut(&track_id) {
@@ -882,6 +981,7 @@ impl ControllerActor {
                     }
                 } else {
                     self.catalog.remove(&track_id);
+                    self.state.remove_track(shard_id, fanout);
                 }
                 if announced.is_some() {
                     // A track is one kind. Running both installers regardless
@@ -891,7 +991,12 @@ impl ControllerActor {
                     // with a listener.
                     match track_id.kind() {
                         crate::entity::TrackKind::Video => {
-                            self.install_video_runtimes(track_id).await;
+                            let Some(room_id) = self.catalog.get(&track_id).map(|p| p.room) else {
+                                debug_assert!(false, "a published track must have a room");
+                                return None;
+                            };
+                            self.install_video_runtimes_for_room(track_id, room_id)
+                                .await;
                         }
                         crate::entity::TrackKind::Audio => {
                             self.install_audio_routes(track_id).await;
@@ -981,21 +1086,25 @@ impl ControllerActor {
                 key: binding,
                 delivery: (),
             },
-            crate::view::Delivery::Audio,
-            crate::view::AudienceKind::Audio,
         );
-        if !self.publish_ops(membership_ops) {
-            debug_assert!(false, "audio group membership must publish");
+        self.publish_ops(membership_ops);
+
+        let audio_tracks: Vec<_> = self
+            .catalog
+            .in_room(room_id, crate::entity::TrackKind::Audio)
+            .collect();
+        for track_id in audio_tracks {
+            self.index_publication(track_id);
         }
 
         // Membership changes do not touch audio plans, so a join only has to
         // reach the room's audio tracks when this shard had no member of the
         // group before and therefore holds no routes for them yet.
         if membership == crate::control::patterns::Membership::FirstOnShard {
-            self.reconcile_room_audio(room_id).await;
+            self.reconcile_room_audio(room_id, shard_id).await;
         }
 
-        self.reconcile_room_tracks(room_id).await;
+        self.reconcile_room_tracks(room_id, shard_id).await;
 
         self.eq.send(
             shard_id,
@@ -1008,13 +1117,18 @@ impl ControllerActor {
         Ok(answer)
     }
 
-    async fn reconcile_room_tracks(&mut self, room_id: crate::entity::RoomId) {
-        for track_id in self
+    async fn reconcile_room_tracks(
+        &mut self,
+        room_id: crate::entity::RoomId,
+        destination: crate::id::ShardId,
+    ) {
+        let tracks: Vec<_> = self
             .catalog
             .in_room(room_id, crate::entity::TrackKind::Video)
-        {
-            self.install_video_runtimes(track_id).await;
-            if !self.publish_publication(track_id).await {
+            .collect();
+        for track_id in tracks {
+            self.install_video_runtime(track_id, destination).await;
+            if !self.publish_publication_to(track_id, destination).await {
                 debug_assert!(false, "room track reconciliation must publish");
             }
         }
@@ -1023,12 +1137,35 @@ impl ControllerActor {
     /// Give a shard routes to the room's audio, for the case its first member
     /// of the audience just arrived. Every later joiner on that shard is served
     /// by the routes this installed, and costs one membership op.
-    async fn reconcile_room_audio(&mut self, room_id: crate::entity::RoomId) {
-        for track_id in self
-            .catalog
-            .in_room(room_id, crate::entity::TrackKind::Audio)
-        {
-            self.install_audio_routes(track_id).await;
+    async fn reconcile_room_audio(
+        &mut self,
+        room_id: crate::entity::RoomId,
+        destination: crate::id::ShardId,
+    ) {
+        let group = self
+            .audio_patterns
+            .group_of(&crate::control::patterns::Pattern::all(room_id));
+        let tracks: Vec<_> = group
+            .into_iter()
+            .flat_map(|group| self.audio_patterns.publications_of(group))
+            .collect();
+        for track_id in tracks {
+            if !self.install_audio_destination(track_id, destination).await {
+                self.defer_audio(track_id);
+                continue;
+            }
+            if !self.publish_publication_to(track_id, destination).await {
+                debug_assert!(false, "room audio reconciliation must publish");
+                continue;
+            }
+            let Some(publisher_shard) = self.catalog.get(&track_id).map(|p| p.publisher_shard)
+            else {
+                debug_assert!(false, "room audio track must belong to a publication");
+                continue;
+            };
+            if !self.publish_plan_to(track_id, publisher_shard) {
+                debug_assert!(false, "room audio publisher plan must publish");
+            }
         }
     }
 }

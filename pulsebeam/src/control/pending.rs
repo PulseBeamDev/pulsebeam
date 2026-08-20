@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::{
+    control::lanes::StreamLane,
     entity::{ParticipantId, TrackId},
     id::ShardId,
     keys::{DownstreamSlotKey, ParticipantKey},
+    shard::router::DataStreamId,
     track::TrackMeta,
 };
 
@@ -24,6 +26,45 @@ pub(crate) struct PendingSubscription {
     pub(crate) slot: DownstreamSlotKey,
     pub(crate) track: TrackMeta,
     blocked: Blocked,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingStream {
+    pub(crate) shard_id: ShardId,
+    pub(crate) id: DataStreamId,
+    pub(crate) lane: StreamLane,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingStreams {
+    awaiting_route: VecDeque<PendingStream>,
+}
+
+impl PendingStreams {
+    pub(crate) fn hold(&mut self, stream: PendingStream) {
+        if self.awaiting_route.iter().any(|pending| {
+            pending.shard_id == stream.shard_id
+                && pending.id == stream.id
+                && pending.lane == stream.lane
+        }) {
+            return;
+        }
+        self.awaiting_route.push_back(stream);
+    }
+
+    pub(crate) fn take(&mut self) -> Vec<PendingStream> {
+        self.awaiting_route.drain(..).collect()
+    }
+
+    pub(crate) fn remove(&mut self, id: &DataStreamId, lane: StreamLane) {
+        self.awaiting_route
+            .retain(|pending| pending.id != *id || pending.lane != lane);
+    }
+
+    pub(crate) fn remove_participant(&mut self, participant: ParticipantId) {
+        self.awaiting_route
+            .retain(|pending| pending.id.publisher_id != participant);
+    }
 }
 
 impl PendingSubscription {
@@ -71,10 +112,10 @@ impl PendingSubscriptions {
             return false;
         }
         let subscriber = subscription.subscriber;
-        if self.awaiting_route.len() >= MAX_ROUTE_RETRIES {
-            if let Some(dropped) = self.awaiting_route.pop_front() {
-                self.release(dropped.subscriber);
-            }
+        if self.awaiting_route.len() >= MAX_ROUTE_RETRIES
+            && let Some(dropped) = self.awaiting_route.pop_front()
+        {
+            self.release(dropped.subscriber);
         }
         subscription.blocked = Blocked::AwaitingRoute;
         self.awaiting_route.push_back(subscription);
@@ -162,7 +203,10 @@ impl PendingSubscriptions {
 
     fn retain(&mut self, participant: ParticipantId) {
         let count = self.counts.entry(participant).or_default();
-        *count = count.saturating_add(1);
+        let Some(next) = count.checked_add(1) else {
+            pulsebeam_runtime::fatal!("pending subscription count cannot overflow");
+        };
+        *count = next;
         debug_assert!(*count <= MAX_BLOCKED_SUBSCRIPTIONS_PER_PARTICIPANT);
     }
 
@@ -171,9 +215,11 @@ impl PendingSubscriptions {
             debug_assert!(false, "pending subscription count must be present");
             return;
         };
-        debug_assert_ne!(*count, 0);
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+        let Some(next) = count.checked_sub(1) else {
+            pulsebeam_runtime::fatal!("pending subscription count cannot underflow");
+        };
+        *count = next;
+        if next == 0 {
             self.counts.remove(&participant);
         }
     }
@@ -207,6 +253,18 @@ mod tests {
             DownstreamSlotKey::default(),
             track(seed),
         )
+    }
+
+    fn stream(seed: u8, lane: StreamLane) -> PendingStream {
+        PendingStream {
+            shard_id: ShardId::new(1),
+            id: DataStreamId::new(
+                track(seed).room_id,
+                participant(seed),
+                crate::track::Topic::for_test("topic"),
+            ),
+            lane,
+        }
     }
 
     #[test]
@@ -252,5 +310,25 @@ mod tests {
         assert!(pending.awaiting_publication.is_empty());
         assert!(pending.awaiting_route.is_empty());
         assert!(pending.counts.is_empty());
+    }
+
+    #[test]
+    fn deferred_streams_are_unique_and_departures_remove_them() {
+        let mut pending = PendingStreams::default();
+        let item = stream(1, StreamLane::Unreliable);
+        pending.hold(item.clone());
+        pending.hold(item);
+        pending.hold(stream(1, StreamLane::Reliable));
+        pending.hold(stream(2, StreamLane::Unreliable));
+
+        pending.remove(
+            &stream(1, StreamLane::Unreliable).id,
+            StreamLane::Unreliable,
+        );
+        assert_eq!(pending.take().len(), 2);
+
+        pending.hold(stream(1, StreamLane::Unreliable));
+        pending.remove_participant(participant(1));
+        assert!(pending.take().is_empty());
     }
 }
