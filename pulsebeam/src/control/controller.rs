@@ -103,6 +103,17 @@ pub enum ControllerError {
 
 const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+fn source_authentication_command(
+    source_shard: crate::id::ShardId,
+    source: std::net::SocketAddr,
+    handle: TransportHandle,
+) -> (crate::id::ShardId, ShardCommand) {
+    (
+        source_shard,
+        ShardCommand::AuthenticateTransport { source, handle },
+    )
+}
+
 pub struct ControllerActor {
     router: ShardRouter,
     core: ControllerCore,
@@ -589,14 +600,20 @@ impl ControllerActor {
             ShardEvent::TransportAuthenticated {
                 source,
                 destination,
+                source_shard,
+                handle,
                 shard,
             } => {
                 debug_assert_eq!(shard, shard_id);
+                debug_assert_eq!(handle.shard(), shard);
                 let Ok(shard_index) = u16::try_from(shard.index()) else {
                     debug_assert!(false, "a shard id must fit the steering map value");
                     return None;
                 };
                 self.pin_flow_to_owner(source, destination, shard_index);
+                let (source_shard, command) =
+                    source_authentication_command(source_shard, source, handle);
+                self.eq.send(source_shard, command);
                 None
             }
             ShardEvent::TrackSubscribed {
@@ -1124,5 +1141,26 @@ mod tests {
                 "a connection is handed off once, not repeatedly"
             );
         });
+    }
+
+    #[test]
+    fn authentication_acknowledgment_targets_the_tuple_hash_shard() {
+        let source_shard = ShardId::new(0);
+        let owner = ShardId::new(2);
+        let handle = crate::route::TransportHandle::new(dummy_route(owner.index()), 7);
+        let source = "203.0.113.7:40000".parse().unwrap();
+
+        let (shard, command) = source_authentication_command(source_shard, source, handle);
+        assert_eq!(shard, source_shard);
+        match command {
+            ShardCommand::AuthenticateTransport {
+                source: acknowledged_source,
+                handle: acknowledged_handle,
+            } => {
+                assert_eq!(acknowledged_source, source);
+                assert_eq!(acknowledged_handle, handle);
+            }
+            _ => panic!("unexpected source authentication command"),
+        }
     }
 }

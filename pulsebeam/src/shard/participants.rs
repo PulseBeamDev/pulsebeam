@@ -165,12 +165,14 @@ impl ParticipantRegistry {
         self.demuxer.learn(src, handle);
     }
 
+    pub fn authenticate_addr(&mut self, src: SocketAddr, handle: TransportHandle) {
+        self.demuxer.authenticate(src, handle);
+    }
+
     /// The route a participant's authenticated address belongs to.
     ///
-    /// The demuxer already cached this address when it classified the flow's
-    /// bootstrap, so there is nothing to install here — this only reports the
-    /// handle so the shard can tell control which flow to pin in the steering
-    /// map.
+    /// Reports the route handle so the shard can tell control which flow to
+    /// pin in the steering map.
     pub fn authenticated_handle(&self, key: ParticipantKey) -> Option<TransportHandle> {
         let Some(meta) = self.participants.get(key) else {
             debug_assert!(false, "authenticated participant must still be registered");
