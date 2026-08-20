@@ -12,7 +12,7 @@ use pulsebeam_agent::{
 };
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -325,6 +325,7 @@ impl SimClientBuilder {
 /// delivered a decodable entry point.
 #[derive(Default, Debug, Clone)]
 pub struct VideoReceiveLog {
+    pub by_publisher: BTreeMap<String, u64>,
     pub frames: u64,
     pub keyframes: u64,
     pub non_contiguous: u64,
@@ -586,6 +587,10 @@ fn annexb_nalu_types(data: &[u8]) -> Vec<pulsebeam_core::h264::NalFlags> {
 }
 
 impl VideoReceiveLog {
+    pub fn frames_from(&self, publisher: &str) -> u64 {
+        self.by_publisher.get(publisher).copied().unwrap_or(0)
+    }
+
     pub fn stats(&self) -> VideoReceiveStats {
         VideoReceiveStats {
             frames: self.frames,
@@ -602,7 +607,7 @@ impl VideoReceiveLog {
         }
     }
 
-    fn record(&mut self, frame: &pulsebeam_agent::MediaFrame) {
+    fn record(&mut self, publisher: &str, frame: &pulsebeam_agent::MediaFrame) {
         let now = Instant::now();
         if let Some(previous) = self.last_frame_at {
             let gap = now.saturating_duration_since(previous);
@@ -613,6 +618,7 @@ impl VideoReceiveLog {
         }
         self.first_frame_at.get_or_insert(now);
         self.last_frame_at = Some(now);
+        *self.by_publisher.entry(publisher.to_owned()).or_default() += 1;
         self.frames += 1;
         self.bytes += frame.data.len() as u64;
         if frame.is_keyframe {
@@ -820,6 +826,7 @@ impl SimClient {
                         self.ctx
                             .remote_tracks
                             .insert(publication_id.clone(), publication_id);
+                        let publisher_id = track.publisher_id().to_owned();
                         let log = self.ctx.video_rx.clone();
                         self.join_set.spawn(async move {
                             // The agent forwards RTP; reassemble frames here (the
@@ -827,11 +834,11 @@ impl SimClient {
                             let mut receiver = pulsebeam_agent::FrameReceiver::new();
                             while let Ok(rtp) = track.recv().await {
                                 for frame in receiver.push(rtp) {
-                                    log.lock().unwrap().record(&frame);
+                                    log.lock().unwrap().record(&publisher_id, &frame);
                                 }
                             }
                             for frame in receiver.flush() {
-                                log.lock().unwrap().record(&frame);
+                                log.lock().unwrap().record(&publisher_id, &frame);
                             }
                         });
 
