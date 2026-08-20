@@ -171,18 +171,47 @@ it and steers on that alone.
 
 This is why the ufrag carries cluster and node while the inter-node envelope
 does not — the ufrag is the one place with no context, and it is chosen by us,
-so it is free to carry what is needed. It is also why a bootstrap packet
-creates **no durable state**: a flood of forged ufrags may spend parser work,
-but it cannot make the node remember anything.
+so it is free to carry what is needed.
 
 **Established.** Anything that is not STUN belongs to a flow that already
 exists, and steering comes from flow affinity — a bounded cache keyed by
 source address.
 
-That cache **evicts rather than refuses**. Refusing admission when full lets an
-attacker lock out new legitimate flows; least-recently-used eviction means
-authenticated churn degrades into replacement, while a live call — which
-touches its entry on every packet — keeps its place.
+### The ufrag is a hint, not a credential
+
+Written out in full because it reads like a hole and keeps being re-litigated.
+Anyone can forge a ufrag: it is unauthenticated, it names a route directly, and
+a bootstrap packet carrying one **does** put an entry in the address cache
+before anything has been verified. Three properties make that harmless, and they
+have to be read together.
+
+**Admission grants nothing.** Steering decides which shard looks at a packet,
+not whether the packet is honoured. The owning shard still resolves the route in
+its published view, and str0m still runs ICE, DTLS and SRTP over it. A forged
+ufrag buys parser work and a cache slot; it cannot deliver a byte, create a
+participant, or reach anyone else's media.
+
+**A flood cannot displace a live flow.** The cache **evicts rather than
+refuses** — refusing when full would let an attacker lock out new legitimate
+flows — and it evicts least-recently-used. Every cache *hit* refreshes the
+entry's timestamp, so a participant sending media holds the most recently used
+entry for its route while forged entries are touched once at admission. Eviction
+picks the minimum, so a flood evicts its own oldest entry. It churns its own
+ring. A live call keeps its place precisely because it is live.
+
+**Marking entries "authenticated" is unsound, and was tried.** The obvious
+hardening — flag entries once the flow authenticates, and never let an
+unflagged entry evict a flagged one — has no correct place to set the flag.
+`SO_REUSEPORT` picks the *admitting* shard by hashing the 4-tuple, while the
+shard that authenticates is the route's *owner*, and those are usually not the
+same shard. The entry that would need marking is never the one that learns the
+flow is real, so the flag would have to be attributed back across shards to
+mean anything. Least-recently-used already delivers the property the flag was
+reaching for, without needing to know who authenticated what.
+
+The `# Security hardening` comment on the demuxer states the same argument
+beside the code that implements it. If these two ever disagree, the code is
+right and one of the documents has a bug.
 
 **NAT rebinding needs no special case.** A changed tuple produces fresh ICE
 connectivity checks, which are STUN, which carry the ufrag, which re-derives

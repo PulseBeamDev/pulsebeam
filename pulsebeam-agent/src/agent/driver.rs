@@ -36,7 +36,7 @@ const UNROUTED_CAPACITY: usize = 128;
 /// never becomes routable at all.
 const UNROUTED_MAX_WAIT: Duration = Duration::from_secs(3);
 
-use pulsebeam_proto::signaling::Track;
+use pulsebeam_proto::signaling::Publication as Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -367,6 +367,9 @@ struct SubscriptionSubsystem {
     /// (min, max) receiver playout delay in ms; `None` = adaptive default.
     playout_delay_ms: Option<(u32, u32)>,
     upstream_active: HashMap<Mid, bool>,
+    /// How this client wants its audio slots filled. `None` until it says,
+    /// which the server reads as auto with no pins.
+    audio_intent: Option<pulsebeam_proto::signaling::AudioIntent>,
     upstream_dirty: bool,
 }
 
@@ -469,6 +472,7 @@ impl AgentDriver {
                 pending_deadline: None,
                 playout_delay_ms: None,
                 upstream_active: HashMap::new(),
+                audio_intent: None,
                 upstream_dirty: false,
             },
             session: SessionSubsystem {
@@ -615,6 +619,24 @@ impl AgentDriver {
             return;
         }
         self.set_upstream_active(lease.mid, false);
+    }
+
+    /// Replace the audio policy and schedule it.
+    ///
+    /// Declarative, so this overwrites rather than merges: the intent on the wire is the whole
+    /// policy, and a caller drops a pin by sending an intent without it.
+    fn set_audio_intent(&mut self, intent: crate::agent::AudioIntent) {
+        let wire = pulsebeam_proto::signaling::AudioIntent {
+            pinned: intent.pinned,
+            auto: intent.auto,
+        };
+        if self.subscriptions.audio_intent.as_ref() == Some(&wire) {
+            return;
+        }
+        self.subscriptions.audio_intent = Some(wire);
+        self.subscriptions.upstream_dirty = true;
+        self.subscriptions.pending_deadline = Some(self.now);
+        self.timers.notifier.notify_one();
     }
 
     fn set_upstream_active(&mut self, mid: Mid, active: bool) {
@@ -856,6 +878,9 @@ impl AgentDriver {
             }
             OutgoingCommand::SetPlayoutDelay(bounds) => {
                 self.set_playout_delay(bounds);
+            }
+            OutgoingCommand::SetAudioIntent(intent) => {
+                self.set_audio_intent(intent);
             }
             OutgoingCommand::Publish { kind, response } => {
                 let result = self.publish_local_track(kind);
@@ -1154,7 +1179,7 @@ impl AgentDriver {
         };
 
         match payload {
-            signaling::server_message::Payload::Update(update) => {
+            signaling::server_message::Payload::State(update) => {
                 let sync = self.slot_manager.sync(update);
                 let (assignments, discovered, removed) = (
                     sync.new_assignments,
@@ -1198,7 +1223,7 @@ impl AgentDriver {
                     }
                 }
                 for (mid, track) in assignments {
-                    let track_id = track.id.clone();
+                    let track_id = track.track_id.clone();
                     // A subscriber already holds the receiving half, from a subscription answered
                     // before this assignment existed. Wire its sender to the slot rather than
                     // replacing it, or the handle it is holding would never receive anything.
@@ -1312,20 +1337,22 @@ impl AgentDriver {
         let msg = signaling::ClientMessage {
             payload: Some(signaling::client_message::Payload::Intent(
                 signaling::ClientIntent {
-                    upstream_intents: self
+                    publish: self
                         .subscriptions
                         .upstream_active
                         .iter()
-                        .map(|(mid, active)| signaling::UpstreamIntent {
+                        .map(|(mid, active)| signaling::PublishIntent {
                             mid: mid.to_string(),
                             active: *active,
                         })
                         .collect(),
-                    downstream_requests: requests,
-                    playout_delay: self
-                        .subscriptions
-                        .playout_delay_ms
-                        .map(|(min_ms, max_ms)| signaling::PlayoutDelay { min_ms, max_ms }),
+                    video: requests,
+                    audio: self.subscriptions.audio_intent.clone(),
+                    ext: self.subscriptions.playout_delay_ms.map(|(min_ms, max_ms)| {
+                        signaling::Extensions {
+                            playout_delay: Some(signaling::PlayoutDelay { min_ms, max_ms }),
+                        }
+                    }),
                 },
             )),
         };

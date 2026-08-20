@@ -547,10 +547,7 @@ impl ControllerActor {
         &self,
         track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
-    ) -> Option<(
-        crate::shard::router::TrackKey,
-        crate::view::VideoPlan,
-    )> {
+    ) -> Option<(crate::shard::router::TrackKey, crate::view::VideoPlan)> {
         let binding = self.track_bindings.get(&track_id)?;
         let fanout = if shard_id == binding.publisher_shard {
             binding.publisher_fanout
@@ -718,11 +715,8 @@ impl ControllerActor {
         if !self.publish_ops(ops) {
             return false;
         }
-        self.state.release_endpoint(
-            shard_id,
-            handle.route.slot(),
-            tokio::time::Instant::now(),
-        );
+        self.state
+            .release_endpoint(shard_id, handle.route.slot(), tokio::time::Instant::now());
         true
     }
 }

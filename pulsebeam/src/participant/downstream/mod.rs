@@ -6,14 +6,15 @@ use std::time::Duration;
 use crate::entity::AudioOrigin;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
-use crate::id::AudioSelectorSlotId;
 use crate::log::LogCtx;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
-use crate::track::{StreamWriter, Track, TrackLayer};
+use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
+pub use audio::AudioIntent;
+use indexmap::IndexMap;
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
 use str0m::rtp::{SeqNo, Ssrc};
@@ -210,6 +211,13 @@ pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
     pub video: VideoAllocator,
     audio: AudioAllocator,
+    /// Audio publications in the room, whether or not anyone is hearing them.
+    ///
+    /// The allocator claims slots dynamically and needs no registration to do
+    /// it, but the roster does: a client cannot pin a speaker it was never told
+    /// exists, and until someone is loud enough to be forwarded there is
+    /// otherwise nothing that names them.
+    audio_tracks: IndexMap<TrackId, TrackMeta>,
 
     available_bandwidth: BweFilter,
     last_desired: Bitrate,
@@ -226,7 +234,8 @@ impl DownstreamAllocator {
     pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         Self {
             video: VideoAllocator::new(ctx, manual_sub),
-            audio: AudioAllocator::new(ctx),
+            audio: AudioAllocator::new(ctx, manual_sub),
+            audio_tracks: IndexMap::new(),
             dirty_allocation: false,
 
             available_bandwidth: BweFilter::new(START_BANDWIDTH),
@@ -294,8 +303,25 @@ impl DownstreamAllocator {
         if track.meta.id.kind() == TrackKind::Video {
             self.video.add_track(track);
             self.dirty_allocation = true;
+            return;
         }
-        // Audio tracks need no static registration; slots are claimed dynamically.
+        // The allocator claims audio slots dynamically, so this registration is
+        // purely so the roster can name the track before anyone hears it.
+        self.audio_tracks.insert(track.meta.id, track.meta);
+    }
+
+    /// Apply the client's audio selection policy.
+    pub fn set_audio_intent(&mut self, intent: AudioIntent) {
+        self.audio.set_intent(intent);
+    }
+
+    pub fn audio_slot_count(&self) -> usize {
+        self.audio.slot_count()
+    }
+
+    /// Audio publications in the room, in announcement order.
+    pub fn audio_tracks(&self) -> impl Iterator<Item = &TrackMeta> {
+        self.audio_tracks.values()
     }
 
     pub(super) fn remove_track(&mut self, track_id: &TrackId) -> bool {
@@ -307,7 +333,8 @@ impl DownstreamAllocator {
         // rebalance. A speaker leaving still has to stop being announced, or the room keeps a
         // tile for somebody who is not in it.
         let audio_removed = self.audio.remove_track(track_id);
-        removed || audio_removed
+        let announced = self.audio_tracks.shift_remove(track_id).is_some();
+        removed || audio_removed || announced
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
@@ -454,12 +481,11 @@ impl DownstreamAllocator {
     #[inline]
     pub fn on_forward_audio_rtp(
         &mut self,
-        slot_idx: AudioSelectorSlotId,
         origin: AudioOrigin,
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) {
-        self.audio.on_rtp(slot_idx, origin, pkt, writer);
+        self.audio.on_rtp(origin, pkt, writer);
     }
 
     /// Whether someone new took over an audio slot since this was last asked.

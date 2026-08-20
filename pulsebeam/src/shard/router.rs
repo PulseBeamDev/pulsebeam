@@ -2,10 +2,9 @@ use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
 use str0m::media::Rid;
 
-use crate::audio_selector::TopNAudioSelector;
 use crate::clock::WallAnchor;
 use crate::entity::{AudioOrigin, ParticipantId, TrackId};
-use crate::id::{AudioSelectorSlotId, ShardId};
+use crate::id::ShardId;
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::route::{Envelope, RouteAction, RouteHandle, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
@@ -73,7 +72,6 @@ pub(crate) trait RoutingContext: ShardTransport {
     fn forward_audio_rtp(
         &mut self,
         subscriber: ParticipantKey,
-        slot_idx: AudioSelectorSlotId,
         origin: AudioOrigin,
         pkt: &RtpPacket,
     );
@@ -112,7 +110,6 @@ pub(crate) struct ShardRuntime {
     tracks: SecondaryMap<TrackKey, TrackRuntime>,
     data: SecondaryMap<DataStreamKey, StreamRuntime>,
     reliable: SecondaryMap<ReliableStreamKey, ReliableRuntime>,
-    audio_selector: TopNAudioSelector,
     pub(crate) routes: RouteRuntime,
 }
 
@@ -122,7 +119,6 @@ impl ShardRuntime {
             tracks: SecondaryMap::new(),
             data: SecondaryMap::new(),
             reliable: SecondaryMap::new(),
-            audio_selector: TopNAudioSelector::new(),
             routes: RouteRuntime::new(shard_id),
         }
     }
@@ -287,24 +283,17 @@ impl ShardRuntime {
         &mut self,
         track: TrackKey,
         origin: Origin,
-        mut event: AudioRtpEvent,
+        event: AudioRtpEvent,
         plan: &crate::view::AudioPlan,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(origin.is_local() || event.origin_key.is_none());
-        let Some(slot_idx) = self
-            .audio_selector
-            .filter((track, event.stream_id.1), &mut event.pkt)
-        else {
-            return;
-        };
         for &(subscriber, ()) in &plan.local_subscribers {
             if Some(subscriber) == event.origin_key {
                 continue;
             }
             ctx.forward_audio_rtp(
                 subscriber,
-                slot_idx,
                 AudioOrigin {
                     participant: event.origin,
                     track: event.stream_id.0,

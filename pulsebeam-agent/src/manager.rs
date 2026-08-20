@@ -1,4 +1,4 @@
-use pulsebeam_proto::signaling::VideoRequest;
+use pulsebeam_proto::signaling::VideoIntent;
 use std::collections::{HashMap, HashSet};
 use str0m::media::Mid;
 
@@ -68,7 +68,7 @@ impl SubscriptionManager {
 
     /// Reconciles desired state with available slots.
     /// Implements "Sticky Assignments" algorithm.
-    pub fn reconcile(&mut self) -> (bool, Vec<VideoRequest>) {
+    pub fn reconcile(&mut self) -> (bool, Vec<VideoIntent>) {
         tracing::debug!(
             "reconcile: slots={:?}, desired={:?}, active={:?}",
             self.slots,
@@ -109,10 +109,10 @@ impl SubscriptionManager {
             .iter()
             .filter_map(|mid| {
                 let sub = next_assignments.get(mid)?;
-                Some(VideoRequest {
+                Some(VideoIntent {
                     mid: mid.to_string(),
                     track_id: sub.track_id.clone(),
-                    target_height: sub.height,
+                    height: sub.height,
                     min_height: sub.min_height,
                     min_fps: sub.min_fps,
                     priority: sub.priority,

@@ -457,3 +457,135 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    use super::*;
+    use crate::entity::{ExternalRoomId, TrackKind};
+
+    fn identity() -> SinkIdentity {
+        let room = ExternalRoomId::new("room").unwrap();
+        SinkIdentity {
+            id: ParticipantId::new(),
+            key: ParticipantKey::default(),
+            room_id: RoomId::from_external(&room),
+        }
+    }
+
+    fn stream(kind: TrackKind) -> StreamId {
+        (ParticipantId::new().derive_track_id(kind, "t"), None)
+    }
+
+    /// Each kind of event lands in its own queue, and only its own.
+    ///
+    /// Everything a participant produces fans out through this one sink, and the shard drains the
+    /// queues separately at different rates - audio per packet, lifecycle per tick. A misfiled
+    /// event is not dropped, it is delivered to the wrong loop, which is far harder to see than a
+    /// loss: the media keeps flowing and the wrong thing acts on it.
+    #[test]
+    fn every_event_lands_in_its_own_queue() {
+        let mut pipeline = EventPipeline::with_capacity(4);
+        let who = identity();
+
+        let mut sink = pipeline.participant_sink(who);
+        sink.publish_rtp(stream(TrackKind::Audio), None, RtpPacket::default());
+        sink.publish_rtp(stream(TrackKind::Video), None, RtpPacket::default());
+        sink.publish_sctp(Topic::for_test("t"), None, vec![1]);
+        sink.exit();
+
+        assert!(pipeline.pop_audio_rtp().is_some(), "audio went to audio");
+        assert!(pipeline.pop_video_rtp().is_some(), "video went to video");
+        assert!(pipeline.pop_data_sctp().is_some(), "data went to data");
+        assert!(
+            pipeline.pop_participant_event().is_some(),
+            "lifecycle went to participant events"
+        );
+
+        assert!(pipeline.pop_audio_rtp().is_none(), "and nothing crossed");
+        assert!(pipeline.pop_video_rtp().is_none());
+        assert!(pipeline.pop_data_sctp().is_none());
+        assert!(pipeline.pop_reliable_data_sctp().is_none());
+    }
+
+    /// Data has no RTP form, so a data-kind stream must not become a media packet.
+    #[test]
+    fn a_data_track_is_not_forwarded_as_media() {
+        let mut pipeline = EventPipeline::with_capacity(2);
+        let who = identity();
+        pipeline.participant_sink(who).publish_rtp(
+            stream(TrackKind::Data),
+            None,
+            RtpPacket::default(),
+        );
+
+        assert!(pipeline.pop_audio_rtp().is_none());
+        assert!(pipeline.pop_video_rtp().is_none());
+        assert!(!pipeline.has_pending(), "and it queued nothing at all");
+    }
+
+    /// Audio carries who spoke; video does not need to.
+    ///
+    /// Audio slots are shared and stolen, so the subscriber cannot tell from the media who it is
+    /// hearing - the origin has to travel with the packet. Video arrives on a slot bound to one
+    /// track, so it is already unambiguous.
+    #[test]
+    fn audio_carries_its_origin() {
+        let mut pipeline = EventPipeline::with_capacity(2);
+        let who = identity();
+        let expected = who.id;
+        pipeline.participant_sink(who).publish_rtp(
+            stream(TrackKind::Audio),
+            None,
+            RtpPacket::default(),
+        );
+
+        let event = pipeline.pop_audio_rtp().expect("audio was queued");
+        assert_eq!(event.origin, expected);
+        assert!(event.origin_key.is_some());
+    }
+
+    /// Queues drain in the order they were filled. Media is a sequence, and reordering it here
+    /// would be indistinguishable from reordering on the wire.
+    #[test]
+    fn a_queue_preserves_order() {
+        let mut pipeline = EventPipeline::with_capacity(4);
+        let who = identity();
+        let mut sink = pipeline.participant_sink(who);
+        for n in 0..3u8 {
+            sink.publish_sctp(Topic::for_test("t"), None, vec![n]);
+        }
+
+        let drained: Vec<Vec<u8>> = std::iter::from_fn(|| pipeline.pop_data_sctp())
+            .map(|event| event.pkt)
+            .collect();
+        assert_eq!(drained, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    /// `has_pending` decides whether the shard loops again, so it has to agree with every queue.
+    /// One it does not check is work the shard parks on until something else happens to wake it.
+    #[test]
+    fn has_pending_agrees_with_every_queue() {
+        let who = identity();
+
+        let mut pipeline = EventPipeline::with_capacity(2);
+        assert!(!pipeline.has_pending(), "an empty pipeline has no work");
+
+        pipeline.push_shard_event(ShardEvent::ParticipantClosed {
+            participant: who.id,
+        });
+        assert!(pipeline.has_pending(), "a shard event is work");
+        assert!(pipeline.pop_shard_event().is_some());
+        assert!(!pipeline.has_pending());
+
+        pipeline.participant_sink(who).publish_rtp(
+            stream(TrackKind::Video),
+            None,
+            RtpPacket::default(),
+        );
+        assert!(pipeline.has_pending(), "so is a video packet");
+        assert!(pipeline.pop_video_rtp().is_some());
+        assert!(!pipeline.has_pending(), "and draining it clears the flag");
+    }
+}

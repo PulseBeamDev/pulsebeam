@@ -105,11 +105,8 @@ impl ControllerActor {
         if !self.publish_ops(retire) {
             return;
         }
-        self.state.release_endpoint(
-            shard_id,
-            handle.route.slot(),
-            tokio::time::Instant::now(),
-        );
+        self.state
+            .release_endpoint(shard_id, handle.route.slot(), tokio::time::Instant::now());
     }
 
     /// Stage a participant's transport route as one lifecycle generation.
