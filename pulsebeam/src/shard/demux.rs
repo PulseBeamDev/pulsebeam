@@ -64,10 +64,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 /// touched once at admission. Eviction takes the minimum, so a flood evicts its
 /// own oldest entry and churns its own ring.
 ///
-/// **Do not add an `authenticated` flag.** It was tried and dropped: there is
-/// no correct place to set it. `SO_REUSEPORT` picks the admitting shard by
-/// 4-tuple hash while the authenticating shard is the route's owner, so the
-/// entry needing the mark is never the one that learns the flow is real.
+/// An authenticated entry is marked by the route owner and acknowledged back
+/// to the shard that admitted the bootstrap. Authenticated entries are not
+/// evicted while an unauthenticated entry for the same scope is available.
 ///
 /// * **Total cache cap** (`MAX_ADDR_ENTRIES`): bounds the fast-path `addr_map`.
 /// * **Per-route cap** (`MAX_ADDRS_PER_ROUTE`): bounds how many source
@@ -89,6 +88,7 @@ pub struct Demuxer {
 #[derive(Clone, Copy)]
 struct CachedRoute {
     handle: TransportHandle,
+    authenticated: bool,
     /// `clock` at the last hit. A flood's entries are touched once; a live
     /// call's entry is touched continuously, which is what makes it survive.
     used: u64,
@@ -127,14 +127,20 @@ impl Demuxer {
     /// list is already full.
     fn evict_lru_for_route(&mut self, route: TransportRoute) -> Option<SocketAddr> {
         let addrs = self.route_addrs.get(&route)?;
-        let mut victim: Option<(SocketAddr, u64)> = None;
+        let mut victim: Option<(SocketAddr, bool, u64)> = None;
         for addr in addrs {
-            let used = self.addr_map.get(addr).map_or(0, |entry| entry.used);
-            if victim.is_none_or(|(_, worst)| used < worst) {
-                victim = Some((*addr, used));
+            let Some(entry) = self.addr_map.get(addr) else {
+                debug_assert!(false, "route address index must point into the cache");
+                continue;
+            };
+            if victim.is_none_or(|(_, authenticated, used)| {
+                (!entry.authenticated && authenticated)
+                    || (entry.authenticated == authenticated && entry.used < used)
+            }) {
+                victim = Some((*addr, entry.authenticated, entry.used));
             }
         }
-        let (addr, _) = victim?;
+        let (addr, _, _) = victim?;
         self.addr_map.remove(&addr);
         if let Some(addrs) = self.route_addrs.get_mut(&route) {
             addrs.retain(|cached| *cached != addr);
@@ -148,13 +154,16 @@ impl Demuxer {
     /// never happens — it is the flood path, and the point is that a flood
     /// degrades into churn instead of locking legitimate clients out.
     fn evict_lru_global(&mut self) {
-        let mut victim: Option<(SocketAddr, TransportRoute, u64)> = None;
+        let mut victim: Option<(SocketAddr, TransportRoute, bool, u64)> = None;
         for (addr, entry) in &self.addr_map {
-            if victim.is_none_or(|(_, _, worst)| entry.used < worst) {
-                victim = Some((*addr, entry.handle.route, entry.used));
+            if victim.is_none_or(|(_, _, authenticated, used)| {
+                (!entry.authenticated && authenticated)
+                    || (entry.authenticated == authenticated && entry.used < used)
+            }) {
+                victim = Some((*addr, entry.handle.route, entry.authenticated, entry.used));
             }
         }
-        let Some((addr, route, _)) = victim else {
+        let Some((addr, route, _, _)) = victim else {
             return;
         };
         self.addr_map.remove(&addr);
@@ -165,7 +174,6 @@ impl Demuxer {
     }
 
     /// Removes a route and all associated address-cache entries.
-    /// Returns the previously-cached authenticated addresses.
     pub fn unregister(&mut self, route: TransportRoute) -> Vec<SocketAddr> {
         if let Some(addrs) = self.route_addrs.remove(&route) {
             for addr in &addrs {
@@ -214,6 +222,9 @@ impl Demuxer {
         let stamp = self.tick();
         match self.addr_map.get_mut(&src) {
             Some(entry) if entry.handle.route == handle.route => {
+                if entry.handle.epoch != handle.epoch {
+                    entry.authenticated = false;
+                }
                 entry.used = stamp;
                 entry.handle = handle;
             }
@@ -225,6 +236,28 @@ impl Demuxer {
                 self.admit(src, handle, stamp);
             }
             None => self.admit(src, handle, stamp),
+        }
+    }
+
+    /// Marks a cached source address as authenticated for this exact route.
+    ///
+    /// The route owner calls this locally and the controller sends the same
+    /// fact to the shard whose tuple hash admitted the bootstrap. A missing
+    /// entry is repaired as an authenticated admission: the entry may have
+    /// been evicted before ICE completed, but the owner has already verified
+    /// this address for this route.
+    pub fn authenticate(&mut self, src: SocketAddr, handle: TransportHandle) {
+        let stamp = self.tick();
+        match self.addr_map.get_mut(&src) {
+            Some(entry) if entry.handle == handle => {
+                entry.authenticated = true;
+                entry.used = stamp;
+            }
+            Some(_) => {
+                self.forget(src);
+                self.admit_authenticated(src, handle, stamp);
+            }
+            None => self.admit_authenticated(src, handle, stamp),
         }
     }
 
@@ -245,6 +278,20 @@ impl Demuxer {
     /// shard keep forwarding a flow it does not own — the rest of a handshake
     /// carries no ufrag, so an uncached address is an undeliverable one.
     fn admit(&mut self, src: SocketAddr, handle: TransportHandle, stamp: u64) {
+        self.admit_with_authentication(src, handle, stamp, false);
+    }
+
+    fn admit_authenticated(&mut self, src: SocketAddr, handle: TransportHandle, stamp: u64) {
+        self.admit_with_authentication(src, handle, stamp, true);
+    }
+
+    fn admit_with_authentication(
+        &mut self,
+        src: SocketAddr,
+        handle: TransportHandle,
+        stamp: u64,
+        authenticated: bool,
+    ) {
         if self.addr_map.len() >= MAX_ADDR_ENTRIES {
             self.evict_lru_global();
         }
@@ -267,6 +314,7 @@ impl Demuxer {
             src,
             CachedRoute {
                 handle,
+                authenticated,
                 used: stamp,
             },
         );
@@ -390,10 +438,11 @@ mod demux_tests {
     /// issue sequentially from 0 and epochs start at 0 — so this needed no
     /// knowledge of the victim at all.
     ///
-    /// Eviction is the answer rather than gating admission on authentication:
-    /// gating starves the forwarding path, because a shard that does not own a
-    /// route never authenticates it and so could never route the DTLS that
-    /// follows the bootstrap.
+    /// Eviction is still the answer rather than gating admission on
+    /// authentication: the forwarding shard must cache the bootstrap before
+    /// the owner can send its authenticated acknowledgment, and it must route
+    /// the DTLS that follows the bootstrap while that acknowledgment is in
+    /// flight.
     #[test]
     fn a_flood_on_one_route_cannot_lock_out_its_real_client() {
         let mut d = Demuxer::new();
@@ -436,10 +485,9 @@ mod demux_tests {
     /// classification is what makes the second one deliverable: DTLS carries no
     /// ufrag, so an uncached address has nothing to classify and is dropped.
     ///
-    /// This is why admission must not be gated on authentication. A forwarding
-    /// shard never authenticates the flow — the owner does — so a gate leaves
-    /// it permanently unable to forward anything but the bootstrap, and the
-    /// handshake stalls until some other message repairs it.
+    /// This is why admission must not be gated on authentication. The
+    /// forwarding shard must carry the handshake until the owner can send its
+    /// acknowledgment back.
     #[test]
     fn a_shard_that_does_not_own_a_route_still_routes_the_rest_of_the_flow() {
         let mut d = Demuxer::new();
@@ -451,8 +499,8 @@ mod demux_tests {
         let bootstrap = make_batch(client, stun_with_ufrag(&ice.encode()));
         assert_eq!(d.demux(&bootstrap), Some(handle));
 
-        // Everything after it carries no ufrag. It must still resolve, from the
-        // same shard, with no authentication and no cross-shard message.
+        // Everything after it carries no ufrag. It must still resolve while the
+        // owner-side authentication acknowledgment is in flight.
         let dtls = make_batch(
             client,
             std::vec![0x16, 0xfe, 0xfd, 0x00, 0x01, 0x02, 0x03, 0x04],
@@ -468,6 +516,61 @@ mod demux_tests {
             std::vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
         );
         assert_eq!(d.demux(&media), Some(handle));
+    }
+
+    #[test]
+    fn authenticated_entries_survive_unauthenticated_route_churn() {
+        let mut d = Demuxer::new();
+        let (ice, handle) = ufrag(3, 1);
+        let client = src(1234);
+
+        assert_eq!(
+            d.demux(&make_batch(client, stun_with_ufrag(&ice.encode()))),
+            Some(handle)
+        );
+        d.authenticate(client, handle);
+        assert!(
+            d.addr_map
+                .get(&client)
+                .is_some_and(|entry| entry.authenticated)
+        );
+
+        for port in 40000..(40000 + u16::try_from(MAX_ADDRS_PER_ROUTE * 3).unwrap()) {
+            let noise = src(port);
+            let _ = d.demux(&make_batch(noise, stun_with_ufrag(&ice.encode())));
+        }
+
+        assert!(
+            d.addr_map
+                .get(&client)
+                .is_some_and(|entry| entry.authenticated),
+            "the sender shard must protect the acknowledged flow from route-local churn"
+        );
+    }
+
+    #[test]
+    fn learning_a_new_epoch_clears_the_old_authentication() {
+        let mut d = Demuxer::new();
+        let (first_ice, first) = ufrag(3, 1);
+        let second = TransportHandle::new(first.route, first.epoch + 1);
+        let client = src(1234);
+
+        assert_eq!(
+            d.demux(&make_batch(client, stun_with_ufrag(&first_ice.encode()))),
+            Some(first)
+        );
+        d.authenticate(client, first);
+        d.learn(client, second);
+
+        assert_eq!(
+            d.addr_map.get(&client).map(|entry| entry.handle),
+            Some(second)
+        );
+        assert!(
+            !d.addr_map
+                .get(&client)
+                .is_some_and(|entry| entry.authenticated)
+        );
     }
 
     /// The owner of a route must be able to route a flow it only ever saw
@@ -533,6 +636,16 @@ mod demux_tests {
     #[test]
     fn a_global_flood_still_admits_a_new_client() {
         let mut d = Demuxer::new();
+        let (protected_ice, protected_handle) = ufrag(3, 9999);
+        let protected = src(1234);
+        assert_eq!(
+            d.demux(&make_batch(
+                protected,
+                stun_with_ufrag(&protected_ice.encode()),
+            )),
+            Some(protected_handle)
+        );
+        d.authenticate(protected, protected_handle);
 
         // Saturate the global budget across many routes. The flood lives on
         // 10.x.x.x so it cannot collide with the newcomer's address.
@@ -568,6 +681,12 @@ mod demux_tests {
         assert!(
             d.addr_map.len() <= MAX_ADDR_ENTRIES,
             "eviction must keep the cache within its bound"
+        );
+        assert!(
+            d.addr_map
+                .get(&protected)
+                .is_some_and(|entry| entry.authenticated),
+            "global churn must not evict an acknowledged flow before unauthenticated entries"
         );
     }
 

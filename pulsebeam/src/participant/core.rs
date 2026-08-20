@@ -248,6 +248,7 @@ pub struct ParticipantCore {
     pending_fanout: VecDeque<PendingFanout>,
     pending_rtc_mutations: VecDeque<PendingRtcMutation>,
     last_ingress: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    last_ingress_shard: Option<crate::id::ShardId>,
     rtc_deadline: Option<Instant>,
     rtc_clock: Instant,
     rtc_needs_drain: bool,
@@ -377,6 +378,7 @@ impl ParticipantCore {
             pending_fanout: VecDeque::new(),
             pending_rtc_mutations: VecDeque::new(),
             last_ingress: None,
+            last_ingress_shard: None,
             rtc_deadline: None,
             rtc_clock: now,
             rtc_needs_drain: true,
@@ -425,8 +427,9 @@ impl ParticipantCore {
         }
     }
 
-    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
+    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch, source_shard: crate::id::ShardId) {
         self.last_ingress = Some((batch.src, batch.dst));
+        self.last_ingress_shard = Some(source_shard);
         if self.pending_ingress.len() >= MAX_PENDING_INGRESS {
             let _ = self.pending_ingress.pop_front();
             metrics::counter!("participant_ingress_shed").increment(1);
@@ -1054,8 +1057,10 @@ impl ParticipantCore {
             // below. Falls through to the catch-all with every other event this
             // participant does not act on.
             Event::IceConnectionStateChange(state) if state.is_connected() => {
-                if let Some((source, destination)) = self.last_ingress {
-                    events.connected(source, destination);
+                if let (Some((source, destination)), Some(source_shard)) =
+                    (self.last_ingress, self.last_ingress_shard)
+                {
+                    events.connected(source, destination, source_shard);
                 }
             }
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
