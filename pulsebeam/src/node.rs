@@ -90,6 +90,8 @@ pub struct NodeBuilder {
 
     worker_execution: WorkerExecution,
 
+    ebpf: bool,
+
     /// When `true`, UDP candidates are suppressed so that clients are forced
     /// to use the TCP path.  Used in simulation tests that exercise TCP-only
     /// connectivity.
@@ -120,6 +122,7 @@ impl NodeBuilder {
             http_api: None,
             internal_metrics: None,
             worker_execution: WorkerExecution::ThreadPerWorker,
+            ebpf: true,
             tcp_only: false,
             room_shard_slot: crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
             room_placement: crate::control::core::RoomPlacement::Hashed,
@@ -210,6 +213,11 @@ impl NodeBuilder {
     /// Run shard workers on the current Tokio runtime instead of spawning one thread per worker.
     pub fn with_current_runtime(mut self) -> Self {
         self.worker_execution = WorkerExecution::SharedRuntime;
+        self
+    }
+
+    pub fn without_ebpf(mut self) -> Self {
+        self.ebpf = false;
         self
     }
 
@@ -310,13 +318,27 @@ impl NodeBuilder {
         )
         .await?;
 
+        debug_assert!(!udp_sockets.is_empty());
+
         #[cfg(not(feature = "sim"))]
-        let steering = crate::ebpf::attach(&udp_sockets)?;
+        let steering = if self.ebpf {
+            crate::ebpf::attach(&udp_sockets)?
+        } else {
+            metrics::gauge!("ebpf_steering_attached").set(0.0);
+            tracing::info!("eBPF UDP steering disabled; using userspace bootstrap forwarding");
+            None
+        };
 
         let tcp_listener = bind_tcp_listener(local_addr)
             .await
             .context("binding tcp listener")?;
-        let tcp_local_addr = primary_external_addr.unwrap_or(tcp_listener.local_addr()?);
+        let bound_tcp_addr = tcp_listener.local_addr()?;
+        tracing::info!(
+            local_addr = ?bound_tcp_addr,
+            workers = udp_sockets.len(),
+            "RTC listeners ready"
+        );
+        let tcp_local_addr = primary_external_addr.unwrap_or(bound_tcp_addr);
 
         let tcp_sockets: Vec<net::tcp::TcpTransport> = (0..workers_count)
             .map(|_| net::tcp::TcpTransport::new(tcp_local_addr))
@@ -554,7 +576,7 @@ impl NodeBuilder {
             };
 
             let local_addr = listener.local_addr().ok();
-            tracing::debug!("signaling api listening on {:?}", local_addr);
+            tracing::info!("signaling api listening on {:?}", local_addr);
 
             let api_cfg = api::ApiConfig {
                 base_path: "/api/v1".to_string(),
@@ -1188,6 +1210,7 @@ mod tests {
         assert!(builder.internal_metrics.is_none());
         assert!(!builder.tcp_only, "UDP candidates are offered by default");
         assert!(matches!(builder.udp_mode, UdpMode::Batch));
+        assert!(builder.ebpf);
         assert!(matches!(
             builder.worker_execution,
             WorkerExecution::ThreadPerWorker
@@ -1211,13 +1234,15 @@ mod tests {
             .external_addrs(vec![addr])
             .room_shard_slot(9)
             .round_robin_rooms()
-            .tcp_only();
+            .tcp_only()
+            .without_ebpf();
 
         assert_eq!(builder.workers, 4);
         assert_eq!(builder.local_addr, Some(addr));
         assert_eq!(builder.external_addrs, vec![addr]);
         assert_eq!(builder.room_shard_slot, 9);
         assert!(builder.tcp_only);
+        assert!(!builder.ebpf);
         assert!(matches!(
             builder.room_placement,
             crate::control::core::RoomPlacement::RoundRobin

@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+use anyhow::{Context, Result};
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::rand;
@@ -98,7 +99,15 @@ fn main() {
         .unwrap_or_else(|err| pulsebeam_runtime::fatal!("cannot build the node runtime: {err}"));
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers, rtc_port, args.iface));
+    if let Err(err) = rt.block_on(run(
+        shutdown.clone(),
+        workers,
+        rtc_port,
+        args.iface,
+        args.dev,
+    )) {
+        pulsebeam_runtime::fatal!("server failed: {err:#}");
+    }
     shutdown.cancel();
 }
 
@@ -107,7 +116,8 @@ pub async fn run(
     workers: usize,
     rtc_port: u16,
     network_interface: Option<String>,
-) {
+    dev: bool,
+) -> Result<()> {
     let external_ips =
         pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
     let external_addrs: Vec<SocketAddr> = external_ips
@@ -124,7 +134,6 @@ pub async fn run(
         ?external_addrs,
         "Starting node with advertised RTC addresses"
     );
-    tracing::info!("API listening on {http_api_addr}");
     let rng = rand::os_rng();
     let node_builder = NodeBuilder::new()
         .workers(workers)
@@ -133,6 +142,11 @@ pub async fn run(
         .rng(rng)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr);
+    let node_builder = if dev {
+        node_builder.without_ebpf()
+    } else {
+        node_builder
+    };
 
     let node = node_builder.run(shutdown.child_token());
     // Not `spawn`: under `--features sim` a bound socket belongs to a
@@ -140,15 +154,18 @@ pub async fn run(
     // It runs on this thread either way, so nothing is lost by saying so.
     let node_handle = tokio::task::spawn_local(node);
 
-    tracing::info!("server started...");
+    tracing::info!("starting server...");
 
     tokio::select! {
-        Err(err) = node_handle => {
-            tracing::warn!("node exited with error: {err}");
+        result = node_handle => {
+            result.context("node task failed")??;
+            tracing::warn!("node stopped");
         }
         _ = pulsebeam_runtime::system::wait_for_signal() => {
             tracing::info!("shutting down gracefully...");
             shutdown.cancel();
         }
     }
+
+    Ok(())
 }
