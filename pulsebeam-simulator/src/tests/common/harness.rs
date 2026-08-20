@@ -1,7 +1,10 @@
 use crate::tests::common::client::{
     AudioReceiveLog, MAX_CONCEALABLE_GAP, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
-use crate::tests::common::{reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip};
+use crate::tests::common::{
+    DEFAULT_SIM_BUGGIFY_PERMILLE, DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout,
+    start_sfu_node_with, subnet_ip, subnet_ip_v6,
+};
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
@@ -785,6 +788,16 @@ pub enum Step {
         topic: &'static str,
         excluded: &'static [u8],
     },
+    /// Assert the exact number of payloads received on a topic.
+    ///
+    /// Presence-only checks cannot distinguish one correct fanout from a duplicate storm or a
+    /// subscriber that received only the first of several intended messages.
+    CheckDataCount {
+        description: &'static str,
+        participant: &'static str,
+        topic: &'static str,
+        expected: usize,
+    },
     CheckDataSequence {
         description: &'static str,
         participant: &'static str,
@@ -878,6 +891,7 @@ impl ParticipantShared {
 struct ParticipantHandle {
     shared: Arc<ParticipantShared>,
     cmd_tx: mpsc::Sender<ParticipantCmd>,
+    room_name: &'static str,
     /// TX bytes at the start of the most recent Step::Run (for interval checks).
     interval_tx_baseline: u64,
     /// RX bytes at the start of the most recent Step::Run (for interval checks).
@@ -894,6 +908,7 @@ struct ParticipantHandle {
     /// something known to be true.
     publishes_video: bool,
     publishes_audio: bool,
+    observes_video: bool,
     /// Whether the plan has this participant in the room right now.
     present: bool,
     /// How each departure ended, in order: `true` for a graceful leave, `false` for a crash.
@@ -1444,6 +1459,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckMinBwe { .. } => "CheckMinBwe",
         Step::CheckDataReceived { .. } => "CheckDataReceived",
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
+        Step::CheckDataCount { .. } => "CheckDataCount",
         Step::CheckDataSequence { .. } => "CheckDataSequence",
         Step::SetAudioIntent { .. } => "SetAudioIntent",
         Step::CheckSpeakerHeld { .. } => "CheckSpeakerHeld",
@@ -1996,15 +2012,32 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
                 let stats = handle.video_stats_since_interval();
-                // Only the frame floor. The decodability and continuity bounds are cumulative
-                // counters, and a difference between two of them does not mean what it looks
-                // like; asking about frames arriving in a window is what this exists for.
                 assert!(
                     stats.frames >= quality.min_frames,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} frames in the last interval\n  actual:       frames={}, keyframes={}\n  note:         a cumulative count would still show every frame from before the\n                disturbance; this asks whether anything arrived after it",
                     quality.min_frames,
                     stats.frames,
                     stats.keyframes,
+                );
+                assert!(
+                    stats.missing_parameter_sets <= quality.max_missing_parameter_sets,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} keyframes without parameter sets in the interval, maximum {}",
+                    stats.missing_parameter_sets,
+                    quality.max_missing_parameter_sets
+                );
+                assert!(
+                    stats.non_contiguous <= quality.max_non_contiguous,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} non-contiguous frames in the interval, maximum {}",
+                    stats.non_contiguous,
+                    quality.max_non_contiguous
+                );
+                assert_eq!(
+                    stats.duplicate_ts_frames, 0,
+                    "step {n}/{total} {kind}: {description} ({participant}) duplicated RTP timestamps in the interval"
+                );
+                assert_eq!(
+                    stats.ts_regression_count, 0,
+                    "step {n}/{total} {kind}: {description} ({participant}) regressed RTP timestamps in the interval"
                 );
             }
 
@@ -2518,6 +2551,24 @@ async fn execute_plan(
                 );
             }
 
+            Step::CheckDataCount {
+                description,
+                participant,
+                topic,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, topic={topic})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let data_received = handle.shared.data_received.lock().unwrap();
+                let actual = data_received.get(*topic).map_or(0, Vec::len);
+                assert_eq!(
+                    actual, *expected,
+                    "step {n}/{total} {kind}: {description} ({participant}, {topic}): expected exactly {expected} payloads, got {actual}"
+                );
+            }
+
             Step::CheckDataSequence {
                 description,
                 participant,
@@ -2628,9 +2679,8 @@ fn get_handle<'a>(
 /// aimed at bitrate or frames. The two failures this exists for both shipped and were found by
 /// hand.
 ///
-/// Deliberately only the *safety* half. "Everyone who should be known is known" is liveness and
-/// depends on discovery timing, which would make this flake; what it asserts is that nothing is
-/// known that should not be, and that whatever is known is described correctly.
+/// It checks both safety and settled liveness: no departed or superseded identity may remain, and
+/// every live publication must be visible to every live observer after a settled run.
 fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
     // Every participant id the plan has ever created, and what it means now.
     #[derive(Clone, Copy)]
@@ -2699,11 +2749,41 @@ fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
             let Some(subject) = handles.get(name) else {
                 continue;
             };
-            let (video, _audio) = handle.media_kinds_of(id);
+            assert_eq!(
+                subject.room_name, handle.room_name,
+                "\nroom state inconsistent after {after}\n  observer:     {observer} ({})\n  subject:      {name} ({})\n  problem:      a publication crossed room boundaries",
+                handle.room_name, subject.room_name
+            );
+            let (video, audio) = handle.media_kinds_of(id);
             assert_eq!(
                 video, subject.publishes_video,
                 "\nroom state inconsistent after {after}\n  observer:     {observer}\n  subject:      {name}\n  believes video: {video}, actually publishes video: {}\n  note:         a participant believed to send video that does not is a phantom\n                tile; announcing audio in `tracks_upsert` caused exactly this,\n                and put anyone sending both on screen twice",
                 subject.publishes_video
+            );
+            assert_eq!(
+                audio, subject.publishes_audio,
+                "\nroom state inconsistent after {after}\n  observer:     {observer}\n  subject:      {name}\n  believes audio: {audio}, actually publishes audio: {}\n  note:         the participant projection must not lose or invent an audio publication",
+                subject.publishes_audio
+            );
+        }
+
+        if !handle.observes_video {
+            continue;
+        }
+        for (name, subject) in handles {
+            if name == observer
+                || subject.room_name != handle.room_name
+                || !subject.present
+                || !subject.publishes_video
+            {
+                continue;
+            }
+            let Some(id) = subject.participant_id() else {
+                continue;
+            };
+            assert!(
+                known.contains(&id),
+                "\nroom state did not converge after {after}\n  observer:     {observer}\n  missing:      {name} ({id})\n  known:        {known:?}\n  note:         a live publication must eventually be visible to every live observer"
             );
         }
     }
@@ -2711,7 +2791,7 @@ fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
 
 /// A `Step::Run` shorter than this is a pause mid-transition, not a settled room, so the state
 /// invariant is not asked of it. Signalling a join or a departure is a round trip or two.
-const ROOM_SETTLE_FLOOR: Duration = Duration::from_secs(1);
+const ROOM_SETTLE_FLOOR: Duration = Duration::from_secs(3);
 
 fn assert_video_quality(
     n: usize,
@@ -3789,7 +3869,7 @@ pub struct LocalNodeSim {
     tcp_only: bool,
     num_shards: usize,
     link: LinkProfile,
-    buggify_permille: u32,
+    ip_version: turmoil::IpVersion,
 }
 
 impl Default for LocalNodeSim {
@@ -3806,19 +3886,9 @@ impl LocalNodeSim {
             rng_seed: super::sim_seed(),
             subnet: None,
             tcp_only: false,
-            // One shard for now, which is wrong and is meant to change.
-            //
-            // A single-shard node never crosses a shard boundary, so every
-            // route, destination runtime and remote plan on the forwarding path
-            // goes unexercised - which is how cross-shard audio stayed broken
-            // through 103 passing plans. Raising this to 16 is a one-line
-            // change that currently fails two plans, both pre-existing and both
-            // reproduced by the ignored tests in `cross_shard.rs`. It becomes
-            // the default once the publication catalog lands, since that is
-            // what removes the shard-local key confusion behind them.
-            num_shards: 1,
-            buggify_permille: 0,
+            num_shards: DEFAULT_SIM_SHARDS,
             link: LinkProfile::default(),
+            ip_version: turmoil::IpVersion::V4,
         }
     }
 
@@ -3856,16 +3926,6 @@ impl LocalNodeSim {
         self
     }
 
-    /// Inject failures at declared points, `permille` parts per thousand.
-    ///
-    /// Off everywhere else, so the rest of the suite keeps asserting against a system where
-    /// nothing unexpected fails. A plan that turns this on is asserting something different: that
-    /// the recovery paths hold, not that the happy path is correct.
-    pub fn with_buggify(mut self, permille: u32) -> Self {
-        self.buggify_permille = permille;
-        self
-    }
-
     #[allow(unused)]
     pub fn with_rng_seed(mut self, seed: u64) -> Self {
         self.rng_seed = seed;
@@ -3878,6 +3938,14 @@ impl LocalNodeSim {
         self
     }
 
+    /// Run the complete node and client scenario over Turmoil's IPv6 network.
+    /// The default remains IPv4 so existing scenario names stay concise; this
+    /// switch changes every bound and advertised address together.
+    pub fn with_ipv6(mut self) -> Self {
+        self.ip_version = turmoil::IpVersion::V6;
+        self
+    }
+
     /// Spread the node across N worker shards.
     ///
     /// Independent of [`Self::with_tcp_only`]. Over UDP the shard a datagram
@@ -3885,6 +3953,7 @@ impl LocalNodeSim {
     /// exactly as the kernel does — so a plan that sets this is also exercising
     /// the demuxer's shard check and the arrival path a real deployment uses.
     pub fn with_shards(mut self, n: usize) -> Self {
+        assert!(n > 0, "a simulation node must have at least one shard");
         self.num_shards = n;
         self
     }
@@ -3918,7 +3987,7 @@ impl LocalNodeSim {
         // from turmoil's RNG, so it has to be seeded too or a sweep replays one
         // impairment pattern under every seed.
         pulsebeam_runtime::net::shaper::seed_impairments(self.rng_seed);
-        pulsebeam_runtime::buggify::enable(self.buggify_permille, self.rng_seed);
+        pulsebeam_runtime::buggify::enable(DEFAULT_SIM_BUGGIFY_PERMILLE, self.rng_seed);
         tracing::info!(
             seed = self.rng_seed,
             "simulation plan seed; replay with `make test-sim-seed SEED={}`",
@@ -3935,6 +4004,7 @@ impl LocalNodeSim {
             + Duration::from_secs(60);
 
         let mut sim = turmoil::Builder::new()
+            .ip_version(self.ip_version.clone())
             .simulation_duration(sim_duration)
             .tick_duration(self.tick_duration)
             .min_message_latency(self.link.min_latency)
@@ -3947,8 +4017,16 @@ impl LocalNodeSim {
             .build();
 
         let subnet = self.subnet.unwrap_or_else(reserve_subnet);
-        let server_ip = subnet_ip(subnet, 1);
-        let coordinator_ip = subnet_ip(subnet, 254);
+        let server_ip = if self.ip_version == turmoil::IpVersion::V6 {
+            subnet_ip_v6(subnet, 1)
+        } else {
+            subnet_ip(subnet, 1)
+        };
+        let coordinator_ip = if self.ip_version == turmoil::IpVersion::V6 {
+            subnet_ip_v6(subnet, 254)
+        } else {
+            subnet_ip(subnet, 254)
+        };
         let seed = self.rng_seed;
         let tcp_only = self.tcp_only;
         let num_shards = self.num_shards;
@@ -3978,7 +4056,11 @@ impl LocalNodeSim {
         let mut ip_counter = 2u8;
         for room in &self.rooms {
             for participant in &room.participants {
-                let ip = subnet_ip(subnet, ip_counter);
+                let ip = if self.ip_version == turmoil::IpVersion::V6 {
+                    subnet_ip_v6(subnet, ip_counter)
+                } else {
+                    subnet_ip(subnet, ip_counter)
+                };
                 ip_counter += 1;
 
                 name_to_ip.insert(participant.name, ip);
@@ -4011,6 +4093,7 @@ impl LocalNodeSim {
                     ParticipantHandle {
                         shared: shared.clone(),
                         cmd_tx,
+                        room_name: room.name,
                         interval_tx_baseline: 0,
                         interval_rx_baseline: 0,
                         subscribed_at: None,
@@ -4018,6 +4101,7 @@ impl LocalNodeSim {
                         publishes_video: matches!(participant.role, Role::Publisher)
                             || participant.subscribes && !participant.rids.is_empty(),
                         publishes_audio: participant.audio_level_dbov.is_some(),
+                        observes_video: participant.slots > 0 || participant.subscribes,
                         present: !participant.starts_disconnected,
                         departed_cleanly: true,
                         departures: Vec::new(),

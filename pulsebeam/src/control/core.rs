@@ -53,8 +53,9 @@ impl ControllerCore {
             }
             ShardEvent::ParticipantClosed {
                 participant: participant_id,
+                ..
             } => {
-                self.delete_participant(&participant_id);
+                let _ = self.registry.disconnect_participant(&participant_id);
             }
             // Facts the controller records elsewhere, or that only the shard
             // acts on. Listed rather than wildcarded so a new event has to be
@@ -92,6 +93,8 @@ impl ControllerCore {
             .collect();
         self.registry
             .add_participant(state.participant_id, state.room_id, shard_id, transport);
+        self.registry
+            .set_connection_id(&state.participant_id, state.connection_id);
         ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,

@@ -94,6 +94,9 @@ pub enum ControllerError {
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
 
+    #[error("participant connection generation is stale")]
+    StaleConnection,
+
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
 
@@ -402,6 +405,14 @@ impl ControllerActor {
         state: ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
+        let current = self
+            .core
+            .registry
+            .get_participant(&state.participant_id)
+            .and_then(|meta| meta.connection_id);
+        if current != state.old_connection_id {
+            return Err(ControllerError::StaleConnection);
+        }
         self.retire_participant_tracks(&state.participant_id).await;
         self.retire_participant_streams(&state.participant_id).await;
         self.retire_participant_subscriptions(&state.participant_id)
@@ -791,7 +802,16 @@ impl ControllerActor {
             }
             ShardEvent::ParticipantClosed {
                 participant: participant_id,
+                key,
             } => {
+                let current = self
+                    .core
+                    .registry
+                    .get_participant(&participant_id)
+                    .and_then(|meta| meta.binding);
+                if current != Some(key) {
+                    return None;
+                }
                 self.retire_participant_tracks(&participant_id).await;
                 self.retire_participant_streams(&participant_id).await;
                 self.retire_participant_subscriptions(&participant_id).await;
@@ -809,6 +829,7 @@ impl ControllerActor {
                     shard_id,
                     ShardEvent::ParticipantClosed {
                         participant: participant_id,
+                        key,
                     },
                 ))
             }

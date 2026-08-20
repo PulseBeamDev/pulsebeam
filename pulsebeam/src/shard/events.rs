@@ -581,6 +581,7 @@ mod tests {
 
         pipeline.push_shard_event(ShardEvent::ParticipantClosed {
             participant: who.id,
+            key: who.key,
         });
         assert!(pipeline.has_pending(), "a shard event is work");
         assert!(pipeline.pop_shard_event().is_some());

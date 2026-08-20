@@ -471,6 +471,18 @@ mod tests {
         msg
     }
 
+    fn build_large_stun_binding_request(server_ufrag: &str) -> Vec<u8> {
+        let mut msg = build_stun_binding_request(server_ufrag);
+        const SOFTWARE_ATTR_TYPE: u16 = 0x8022;
+        const SOFTWARE_LEN: usize = 5_600;
+        msg.extend_from_slice(&SOFTWARE_ATTR_TYPE.to_be_bytes());
+        msg.extend_from_slice(&u16::try_from(SOFTWARE_LEN).unwrap().to_be_bytes());
+        msg.extend(std::iter::repeat_n(0x5a, SOFTWARE_LEN));
+        let attr_len = msg.len().saturating_sub(STUN_HEADER_LEN);
+        msg[2..4].copy_from_slice(&u16::try_from(attr_len).unwrap().to_be_bytes());
+        msg
+    }
+
     /// Build a STUN binding request with no USERNAME attribute at all.
     fn build_stun_binding_request_without_username() -> Vec<u8> {
         let mut msg = Vec::with_capacity(STUN_HEADER_LEN);
@@ -532,6 +544,31 @@ mod tests {
                 second.is_err(),
                 "a validated connection must be handed off exactly once"
             );
+        });
+    }
+
+    #[test]
+    fn test_valid_large_rfc4571_first_frame_hands_off() {
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = test_config();
+            let handle = TcpAcceptorHandle::spawn(listener, config, CancellationToken::new());
+            let mut event_rx = handle.event_rx;
+
+            let transport = TransportRoute::new(ShardId::new(1), 9);
+            let ufrag = IceUfrag::new(config.cluster_id, config.node_id, transport, 4).encode();
+            let payload = build_large_stun_binding_request(&ufrag);
+            assert!(payload.len() > 1_500);
+            let _client = connect_and_send(addr, &payload).await;
+
+            let conn = recv_event(&mut event_rx)
+                .await
+                .expect("a valid large RFC 4571 frame must hand off");
+            assert_eq!(conn.handle, TransportHandle::new(transport, 4));
+            assert!(conn.stream.has_pending());
         });
     }
 

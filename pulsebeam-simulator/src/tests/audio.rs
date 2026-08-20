@@ -33,6 +33,17 @@ fn audio_reaches_the_room_test() {
                 participant: "listener",
                 min_bytes: 1,
             },
+            Step::CheckHeardFrom {
+                description: "The listener attributes the audio to the speaker",
+                participant: "listener",
+                expected: &["speaker"],
+            },
+            Step::CheckAudioStreams {
+                description: "The listener uses one intact audio stream",
+                participant: "listener",
+                min_speakers: 1,
+                max_streams: 3,
+            },
         ]);
 }
 
@@ -345,7 +356,6 @@ fn saying_nothing_about_audio_keeps_automatic_selection_test() {
 #[test]
 fn audio_crosses_a_shard_boundary_test() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::data_participant("speaker").speaking_at(-25))

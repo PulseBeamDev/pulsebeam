@@ -343,7 +343,7 @@ pub(crate) enum ViewOp {
     InsertUnreliableRuntime {
         key: UnreliableStreamKey,
         id: crate::shard::router::DataStreamId,
-        publisher: ParticipantKey,
+        publisher: Option<ParticipantKey>,
     },
     RemoveUnreliableRuntime {
         key: UnreliableStreamKey,
@@ -351,7 +351,7 @@ pub(crate) enum ViewOp {
     InsertReliableRuntime {
         key: ReliableStreamKey,
         id: crate::shard::router::DataStreamId,
-        publisher: ParticipantKey,
+        publisher: Option<ParticipantKey>,
     },
     RemoveReliableRuntime {
         key: ReliableStreamKey,

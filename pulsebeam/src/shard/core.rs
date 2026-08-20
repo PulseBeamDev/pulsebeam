@@ -246,12 +246,16 @@ impl ShardCore {
                         }
                     }
                     crate::view::ViewOp::InsertUnreliableRuntime { publisher, key, id } => {
-                        if let Some(meta) = self.registry.resolve_mut(*publisher) {
+                        if let Some(publisher) = publisher
+                            && let Some(meta) = self.registry.resolve_mut(*publisher)
+                        {
                             meta.bind_published_data_stream(&id.topic, *key);
                         }
                     }
                     crate::view::ViewOp::InsertReliableRuntime { publisher, key, id } => {
-                        if let Some(meta) = self.registry.resolve_mut(*publisher) {
+                        if let Some(publisher) = publisher
+                            && let Some(meta) = self.registry.resolve_mut(*publisher)
+                        {
                             meta.bind_published_reliable_stream(&id.topic, *key);
                         }
                     }
@@ -665,9 +669,12 @@ impl ShardCore {
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantClosed {
                             participant: participant_id,
+                            key: participant_key,
                         });
                 }
-                ParticipantEvent::Control(ev) => self.pipeline.push_shard_event(ev),
+                ParticipantEvent::Control(ev) => {
+                    self.pipeline.push_shard_event(ev);
+                }
                 ParticipantEvent::Internal(ev) => match ev {
                     crate::shard::events::ShardInternalEvent::TrackStatsUpdated {
                         track_id,
@@ -814,6 +821,7 @@ impl ShardCore {
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantClosed {
                             participant: config.participant_id,
+                            key,
                         });
                     return Some(());
                 }

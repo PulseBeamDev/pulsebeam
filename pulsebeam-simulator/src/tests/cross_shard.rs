@@ -1,36 +1,17 @@
-//! Pre-existing cross-shard defects, pinned.
+//! Cross-shard lifecycle and data-plane invariants.
 //!
-//! Every other plan in this suite runs on one shard, so nothing on the
-//! forwarding path ever crosses a shard boundary: routes are granted only when
-//! the destination differs from the publisher's shard, and with one shard it
-//! never does. Across 103 passing plans, not one audio route was ever cut.
-//!
-//! Raising `LocalNodeSim`'s default shard count to 16 is a one-line change. It
-//! fails the two plans below, both of which fail identically on the commit
-//! before any of this branch's work — they are latent defects the single-shard
-//! default was hiding, not regressions.
-//!
-//! They are `#[ignore]`d rather than deleted so the reproductions survive. Both
-//! live in code the publication catalog replaces, and the shard-local key
-//! confusion behind them is what that catalog removes by construction, so they
-//! are expected to be fixed there rather than patched here. Run with
-//! `make test-sim TEST=cross_shard -- --ignored`.
+//! These plans deliberately force publishers and subscribers onto different
+//! shard owners. A passing local-delivery test is not evidence that a route,
+//! envelope, destination runtime, or subscriber key survived the shard hop.
 
-use super::common::{LocalNodeSim, Participant, Room, Step};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step};
 use std::time::Duration;
 
-/// A paused assignment never resumes when its publisher sits on another shard.
-///
-/// Bandwidth is restored to 5 Mbit/s and the estimate stays near 456 kbit/s, so
-/// the allocator never un-pauses. Not a routing fault: instrumenting
-/// `record_routing_drop` over the whole run shows no media dropped at any
-/// stage, and extending the recovery window to 600s does not help, so the
-/// estimate is suppressed rather than converging slowly.
+/// A paused assignment resumes when its publisher sits on another shard.
 #[test]
-#[ignore = "pre-existing: paused stream does not resume across a shard boundary"]
 fn paused_stream_resumes_across_a_shard_boundary_test() {
     LocalNodeSim::new()
-        .with_shards(16)
+        .with_link(LinkProfile::fiber())
         .with_bandwidth(500_000)
         .with_room(
             Room::new("room1")
@@ -69,18 +50,10 @@ fn paused_stream_resumes_across_a_shard_boundary_test() {
         ]);
 }
 
-/// Publisher-scoped data subscription mis-routes once publishers are spread
-/// across shards.
-///
-/// Fails at two shards and passes at sixteen, so which placement breaks it
-/// depends on the hash — the defect is in the scoped path, not in a particular
-/// shard count. Publisher scoping is the thing per-publisher stream identity
-/// buys, so this is the sharpest data-lane claim the suite makes.
+/// Publisher-scoped data subscriptions preserve publisher identity across shards.
 #[test]
-#[ignore = "pre-existing: scoped data subscription mis-routes across shards"]
 fn data_channel_scoped_subscribe_across_shards_test() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(
             Room::new("room-scoped")
                 .with_participant(Participant::data_participant("pub_a"))
@@ -157,6 +130,12 @@ fn data_channel_scoped_subscribe_across_shards_test() {
                 topic: "scoped_topic",
                 excluded: b"payload-from-b",
             },
+            Step::CheckDataCount {
+                description: "scoped_a received exactly one matching payload",
+                participant: "scoped_a",
+                topic: "scoped_topic",
+                expected: 1,
+            },
             // scoped_b: must receive B's payload, must NOT receive A's payload.
             Step::CheckDataReceived {
                 description: "scoped_b received pub_b payload",
@@ -170,6 +149,12 @@ fn data_channel_scoped_subscribe_across_shards_test() {
                 topic: "scoped_topic",
                 excluded: b"payload-from-a",
             },
+            Step::CheckDataCount {
+                description: "scoped_b received exactly one matching payload",
+                participant: "scoped_b",
+                topic: "scoped_topic",
+                expected: 1,
+            },
             // aggregate: must receive both payloads.
             Step::CheckDataReceived {
                 description: "aggregate received pub_a payload",
@@ -182,6 +167,12 @@ fn data_channel_scoped_subscribe_across_shards_test() {
                 participant: "aggregate",
                 topic: "scoped_topic",
                 expected: b"payload-from-b",
+            },
+            Step::CheckDataCount {
+                description: "aggregate received exactly both payloads",
+                participant: "aggregate",
+                topic: "scoped_topic",
+                expected: 2,
             },
         ]);
 }

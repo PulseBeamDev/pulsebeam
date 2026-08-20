@@ -194,6 +194,30 @@ impl Demuxer {
         let src = batch.src;
 
         let stamp = self.tick();
+        if let pulsebeam_routing::classify::ClientVerdict::Bootstrap { handle, .. } =
+            pulsebeam_routing::classify::classify_client_for_node(
+                batch.data(),
+                self.cluster_id,
+                self.node_id,
+                self.shard_count,
+            )
+        {
+            let addressed = to_local_handle(handle);
+            if self
+                .addr_map
+                .get(&src)
+                .is_some_and(|entry| entry.handle == addressed)
+            {
+                if let Some(entry) = self.addr_map.get_mut(&src) {
+                    entry.used = stamp;
+                }
+                return Some(addressed);
+            }
+            self.forget(src);
+            self.admit(src, addressed, stamp);
+            return Some(addressed);
+        }
+
         if let Some(entry) = self.addr_map.get_mut(&src) {
             entry.used = stamp;
             return Some(entry.handle);
@@ -629,6 +653,34 @@ mod demux_tests {
             d.demux(&media),
             Some(second),
             "unregistering the abandoned route must not evict the live one"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_reclassifies_an_address_cached_for_the_previous_route() {
+        let mut d = Demuxer::new();
+        let (first_ice, first) = ufrag(3, 1);
+        let (second_ice, second) = ufrag(3, 2);
+        let client = src(1234);
+
+        assert_eq!(
+            d.demux(&make_batch(client, stun_with_ufrag(&first_ice.encode()))),
+            Some(first)
+        );
+        d.authenticate(client, first);
+
+        assert_eq!(
+            d.demux(&make_batch(client, stun_with_ufrag(&second_ice.encode()))),
+            Some(second)
+        );
+        assert_eq!(
+            d.addr_map.get(&client).map(|entry| entry.handle),
+            Some(second)
+        );
+        assert!(
+            !d.addr_map
+                .get(&client)
+                .is_some_and(|entry| entry.authenticated)
         );
     }
 

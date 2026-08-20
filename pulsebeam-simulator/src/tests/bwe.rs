@@ -861,7 +861,7 @@ fn late_joiner_receives_earlier_participant_in_both_directions_test() {
 /// should be absorbed as inherent loss rather than triggering a backoff.
 #[test]
 fn screenshare_and_camera_over_wifi_test() {
-    conference_plan(LinkProfile::wifi(), 3_000_000, 700_000, 600, 100, 8, 2);
+    conference_plan(LinkProfile::default(), 3_000_000, 700_000, 600, 100, 8, 2);
 }
 
 /// The same call over mobile: ~50ms latency and 1% loss.
@@ -1350,6 +1350,7 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
 #[test]
 fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
     LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
         .with_bandwidth(500_000)
         .with_room(
             Room::new("room1")
@@ -2244,7 +2245,6 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
     LocalNodeSim::new()
         .with_rng_seed(seed)
         .with_subnet(u8::try_from(seed % 200).unwrap_or(0))
-        .with_link(LinkProfile::wifi())
         .with_bandwidth(2_000_000)
         .with_room(
             Room::new("room1")

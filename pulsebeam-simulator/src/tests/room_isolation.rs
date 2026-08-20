@@ -6,10 +6,9 @@
 //!
 //! Every other plan in this suite runs a single room, which is what let a shard-wide audio
 //! selector go unnoticed: with one room, "shard-wide" and "room-wide" are the same thing and
-//! nothing can tell them apart. These plans exist to tell them apart. Each puts two rooms on one
-//! shard - `num_shards` defaults to 1, so they land together without asking - and gives both rooms
-//! the same shape, so a leak in either direction is a failure rather than an asymmetry nobody
-//! looked at.
+//! nothing can tell them apart. These plans exist to tell them apart. Each gives both rooms the
+//! same shape, so a leak in either direction is a failure rather than an asymmetry nobody looked
+//! at.
 //!
 //! Topic names are deliberately identical across the two rooms. A boundary that holds only because
 //! the two sides picked different names is not a boundary.
