@@ -38,18 +38,7 @@ impl ControllerActor {
         for retired in self.subscriptions.remove_participant(participant_id) {
             self.release_route(retired.destination, retired.route).await;
         }
-        // A subscription naming a track that was never published waits here
-        // for a publish that may never come. Without this it outlives the
-        // subscriber: track ids are client-supplied, so a client could join,
-        // subscribe to invented ids, disconnect, and leave the entries behind
-        // for the life of the process — unbounded memory, and an O(pending)
-        // scan on every subsequent publish.
-        for pending in self.pending_track_subscriptions.values_mut() {
-            pending.retain(|entry| entry.subscriber != *participant_id);
-        }
-        self.pending_track_subscriptions
-            .retain(|_, entries| !entries.is_empty());
-        self.pending_track_counts.remove(participant_id);
+        self.pending.remove_participant(*participant_id);
     }
 
     /// Retire whatever transport route a participant holds, if the registry

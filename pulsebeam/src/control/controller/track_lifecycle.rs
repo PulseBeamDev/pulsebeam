@@ -12,17 +12,8 @@ impl ControllerActor {
         &mut self,
         track_id: crate::entity::TrackId,
     ) {
-        let pending = self
-            .pending_track_subscriptions
-            .remove(&track_id)
-            .unwrap_or_default();
+        let pending = self.pending.take_published(track_id);
         for subscription in pending {
-            if let Some(count) = self.pending_track_counts.get_mut(&subscription.subscriber) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.pending_track_counts.remove(&subscription.subscriber);
-                }
-            }
             self.on_track_subscribed(
                 subscription.shard_id,
                 subscription.subscriber,
@@ -40,27 +31,7 @@ impl ControllerActor {
         subscriber: ParticipantId,
         slot: crate::keys::DownstreamSlotKey,
     ) {
-        let mut removed = false;
-        if let Some(pending) = self.pending_track_subscriptions.get_mut(&track_id) {
-            pending.retain(|entry| {
-                let matches = entry.subscriber == subscriber && entry.slot == slot;
-                removed |= matches;
-                !matches
-            });
-        }
-        if self
-            .pending_track_subscriptions
-            .get(&track_id)
-            .is_some_and(Vec::is_empty)
-        {
-            self.pending_track_subscriptions.remove(&track_id);
-        }
-        if removed && let Some(count) = self.pending_track_counts.get_mut(&subscriber) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.pending_track_counts.remove(&subscriber);
-            }
-        }
+        self.pending.remove(track_id, subscriber, slot);
     }
 
     pub(super) async fn install_video_runtimes(&mut self, track_id: crate::entity::TrackId) {
@@ -304,13 +275,13 @@ impl ControllerActor {
         };
         let mut local_subscribers: HashMap<
             crate::id::ShardId,
-            Vec<crate::shard::participants::ParticipantKey>,
+            Vec<(crate::shard::participants::ParticipantKey, ())>,
         > = HashMap::new();
         for (participant, shard, key) in self.core.registry.participants_in_room(&room_id) {
             if participant != origin
                 && let Some(key) = key
             {
-                local_subscribers.entry(shard).or_default().push(key);
+                local_subscribers.entry(shard).or_default().push((key, ()));
             }
         }
         let destinations: Vec<_> = local_subscribers.keys().copied().collect();
@@ -328,9 +299,7 @@ impl ControllerActor {
             let Some(key) = self.prepare_track_key(destination, track_id, origin) else {
                 continue;
             };
-            let plan = crate::view::AudioForwardingPlan {
-                track_id,
-                origin,
+            let plan = crate::view::AudioPlan {
                 local_subscribers: local_subscribers
                     .get(&destination)
                     .cloned()
@@ -369,9 +338,7 @@ impl ControllerActor {
                 epoch: route.epoch,
             })
             .collect();
-        let source_plan = crate::view::AudioForwardingPlan {
-            track_id,
-            origin,
+        let source_plan = crate::view::AudioPlan {
             local_subscribers: local_subscribers
                 .get(&publisher_shard)
                 .cloned()
@@ -393,9 +360,7 @@ impl ControllerActor {
             targets.push((
                 *destination,
                 *key,
-                crate::view::AudioForwardingPlan {
-                    track_id,
-                    origin,
+                crate::view::AudioPlan {
                     local_subscribers: local_subscribers
                         .get(destination)
                         .cloned()
@@ -406,62 +371,41 @@ impl ControllerActor {
                 Some(route),
             ));
         }
-        self.publish_audio_plans(targets).await;
+        self.publish_audio_plans(track_id, targets).await;
     }
 
     pub(super) async fn publish_audio_plans(
         &mut self,
+        track_id: crate::entity::TrackId,
         targets: Vec<(
             crate::id::ShardId,
             crate::shard::router::TrackKey,
-            crate::view::AudioForwardingPlan,
+            crate::view::AudioPlan,
             Option<RouteHandle>,
         )>,
     ) {
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return;
-        }
-        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
+        let Some(publisher_fanout) = self
+            .track_bindings
+            .get(&track_id)
+            .map(|binding| binding.publisher_fanout)
+        else {
             return;
         };
-        for (shard, key, plan, route) in targets {
-            let Some(binding) = self.track_bindings.get(&plan.track_id) else {
-                self.abort_transaction(now);
-                return;
-            };
-            let publisher_fanout = binding.publisher_fanout;
-            let descriptor = crate::view::TrackDescriptor {
-                id: binding.meta.id,
-                origin_key: binding.publisher_participant,
-                participant: (shard == binding.publisher_shard)
-                    .then_some(binding.publisher_participant),
-                encodings: binding.encodings.clone(),
-                states: binding.states.clone(),
-                publication: binding.publication.clone(),
-                audience: self.track_audience_on_shard(binding.meta.origin, shard),
-            };
-            let Some(view) = self.view_mut(shard) else {
-                self.abort_transaction(now);
-                return;
-            };
+        let mut ops = Vec::new();
+        for (shard_id, key, plan, route) in targets {
             if key != publisher_fanout {
-                view.stage(
-                    generation,
+                let Some(descriptor) = self.track_descriptor(track_id, shard_id) else {
+                    return;
+                };
+                ops.push((
+                    shard_id,
                     crate::view::ViewOp::InsertTrackRuntime { key, descriptor },
-                );
+                ));
             }
-            view.stage(
-                generation,
-                crate::view::ViewOp::SetAudioPlan {
-                    key,
-                    plan: plan.clone(),
-                },
-            );
+            ops.push((shard_id, crate::view::ViewOp::SetAudioPlan { key, plan }));
             if let Some(route) = route {
-                view.stage(
-                    generation,
+                ops.push((
+                    shard_id,
                     crate::view::ViewOp::InstallRoute {
                         route: route.route,
                         binding: crate::view::RouteBinding {
@@ -469,22 +413,10 @@ impl ControllerActor {
                             action: RouteAction::Audio { track: key },
                         },
                     },
-                );
+                ));
             }
         }
-        let mut affected = Vec::new();
-        for index in 0..self.views.len() {
-            let shard = crate::id::ShardId::new(index);
-            if self
-                .view_mut(shard)
-                .is_some_and(|view| view.publish().is_some())
-            {
-                affected.push(shard);
-            }
-        }
-        if self.state.commit().is_err() {
-            self.abort_transaction(now);
-        }
+        self.publish_ops(ops);
     }
 
     /// A shard reported a new local consumer for a track.
@@ -551,8 +483,7 @@ impl ControllerActor {
             shard_id,
             track.id,
             subscriber,
-            subscriber_key,
-            slot,
+            (subscriber_key, slot),
             track.shard_id,
         );
         {
@@ -575,13 +506,13 @@ impl ControllerActor {
                 // fresh one on every attempt and abandon the last in the arena.
                 self.subscriptions
                     .unsubscribe(shard_id, &track.id, &subscriber);
-                self.defer_subscribe(DeferredSubscribe {
+                self.defer_subscribe(crate::control::pending::PendingSubscription::new(
                     shard_id,
                     subscriber,
                     subscriber_key,
                     slot,
                     track,
-                });
+                ));
                 return;
             };
             self.subscriptions.installed(shard_id, track.id, handle);
@@ -618,7 +549,7 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
     ) -> Option<(
         crate::shard::router::TrackKey,
-        crate::view::TrackForwardingPlan,
+        crate::view::VideoPlan,
     )> {
         let binding = self.track_bindings.get(&track_id)?;
         let fanout = if shard_id == binding.publisher_shard {
@@ -645,9 +576,7 @@ impl ControllerActor {
         }
         Some((
             fanout,
-            crate::view::TrackForwardingPlan {
-                track_id: binding.meta.id,
-                origin: binding.meta.origin,
+            crate::view::VideoPlan {
                 local_subscribers,
                 remote_routes,
                 reverse_route: binding
@@ -684,186 +613,116 @@ impl ControllerActor {
             .collect()
     }
 
+    /// What a shard needs to hold a runtime entry for this track.
+    ///
+    /// Identical for video and audio: the fanout key differs, the track behind
+    /// it does not.
+    fn track_descriptor(
+        &self,
+        track_id: crate::entity::TrackId,
+        shard_id: crate::id::ShardId,
+    ) -> Option<crate::view::TrackDescriptor> {
+        let binding = self.track_bindings.get(&track_id)?;
+        Some(crate::view::TrackDescriptor {
+            id: binding.meta.id,
+            origin_key: binding.publisher_participant,
+            participant: (shard_id == binding.publisher_shard)
+                .then_some(binding.publisher_participant),
+            encodings: binding.encodings.clone(),
+            states: binding.states.clone(),
+            publication: binding.publication.clone(),
+            audience: self.track_audience_on_shard(binding.meta.origin, shard_id),
+        })
+    }
+
     pub(super) async fn publish_track_plans(&mut self, track_id: crate::entity::TrackId) -> bool {
         let Some(binding) = self.track_bindings.get(&track_id) else {
             return false;
         };
-        let publisher_shard = binding.publisher_shard;
-        let fanout_shards: Vec<_> = binding.fanouts.keys().copied().collect();
-        let mut plans = Vec::new();
-        for shard_id in fanout_shards {
-            if let Some(plan) = self.track_plan(track_id, shard_id) {
-                plans.push((shard_id, plan));
-            }
-        }
-        if let Some(plan) = self.track_plan(track_id, publisher_shard) {
-            plans.push((publisher_shard, plan));
-        }
-        if plans.is_empty() {
-            return true;
-        }
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return false;
-        }
-        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
-            return false;
-        };
-        for (shard_id, (fanout, plan)) in plans {
-            let Some(binding) = self.track_bindings.get(&track_id) else {
-                self.abort_transaction(now);
-                return false;
+        let mut shards: Vec<_> = binding.fanouts.keys().copied().collect();
+        shards.push(binding.publisher_shard);
+        let mut ops = Vec::new();
+        for shard_id in shards {
+            let Some((fanout, plan)) = self.track_plan(track_id, shard_id) else {
+                continue;
             };
-            let descriptor = crate::view::TrackDescriptor {
-                id: binding.meta.id,
-                origin_key: binding.publisher_participant,
-                participant: (shard_id == binding.publisher_shard)
-                    .then_some(binding.publisher_participant),
-                encodings: binding.encodings.clone(),
-                states: binding.states.clone(),
-                publication: binding.publication.clone(),
-                audience: self.track_audience_on_shard(binding.meta.origin, shard_id),
+            let Some(descriptor) = self.track_descriptor(track_id, shard_id) else {
+                continue;
             };
-            let Some(view) = self.view_mut(shard_id) else {
-                self.abort_transaction(now);
-                return false;
-            };
-            view.stage(
-                generation,
+            ops.push((
+                shard_id,
                 crate::view::ViewOp::InsertTrackRuntime {
                     key: fanout,
                     descriptor,
                 },
-            );
-            view.stage(
-                generation,
+            ));
+            ops.push((
+                shard_id,
                 crate::view::ViewOp::SetTrackPlan { key: fanout, plan },
-            );
+            ));
         }
-        let mut affected = Vec::new();
-        for index in 0..self.views.len() {
-            let shard_id = crate::id::ShardId::new(index);
-            if let Some(view) = self.view_mut(shard_id)
-                && view.publish().is_some()
-            {
-                affected.push(shard_id);
-            }
-        }
-        if self.state.commit().is_err() {
-            self.abort_transaction(now);
-            return false;
-        }
-        true
+        self.publish_ops(ops)
     }
 
     pub(super) async fn install_video_route(
         &mut self,
         shard_id: crate::id::ShardId,
         fanout: crate::shard::router::TrackKey,
-        plan: crate::view::TrackForwardingPlan,
+        plan: crate::view::VideoPlan,
     ) -> Option<RouteHandle> {
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return None;
-        }
-        let Some(handle) = self.reserve_endpoint_retrying(shard_id, now, "video") else {
-            self.abort_transaction(now);
-            return None;
-        };
-        let generation = self.state.pending()?.generation;
-        let Some(view) = self.view_mut(shard_id) else {
-            self.abort_transaction(now);
-            return None;
-        };
-        view.stage(
-            generation,
-            crate::view::ViewOp::InstallRoute {
-                route: handle.route,
-                binding: crate::view::RouteBinding {
-                    epoch: handle.epoch,
-                    action: crate::route::RouteAction::Video {
-                        local_track: fanout,
+        self.publish_with_route(shard_id, "video", move |_, handle| {
+            vec![
+                (
+                    shard_id,
+                    crate::view::ViewOp::InstallRoute {
+                        route: handle.route,
+                        binding: crate::view::RouteBinding {
+                            epoch: handle.epoch,
+                            action: crate::route::RouteAction::Video {
+                                local_track: fanout,
+                            },
+                        },
                     },
-                },
-            },
-        );
-        view.stage(
-            generation,
-            crate::view::ViewOp::SetTrackPlan { key: fanout, plan },
-        );
-        let mut affected = Vec::new();
-        for index in 0..self.views.len() {
-            let target = crate::id::ShardId::new(index);
-            if let Some(view) = self.view_mut(target)
-                && view.publish().is_some()
-            {
-                affected.push(target);
-            }
-        }
-        if self.state.commit().is_err() {
-            self.abort_transaction(now);
-            return None;
-        }
-        Some(handle)
+                ),
+                (
+                    shard_id,
+                    crate::view::ViewOp::SetTrackPlan { key: fanout, plan },
+                ),
+            ]
+        })
     }
 
+    /// Take a shard's video route out of the view, then return its slot.
+    ///
+    /// Every other shard's plan is restaged in the same generation, so no shard
+    /// keeps forwarding to a route that is no longer there.
     pub(super) async fn retire_video_route(
         &mut self,
         shard_id: crate::id::ShardId,
         handle: RouteHandle,
         track_id: crate::entity::TrackId,
     ) -> bool {
-        let now = tokio::time::Instant::now();
-        if self.state.begin().is_err() {
-            return false;
-        }
-        let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
-            return false;
-        };
-        if let Some(view) = self.view_mut(shard_id) {
-            view.stage(
-                generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: handle.route,
-                    epoch: handle.epoch,
-                },
-            );
-        }
-        let mut affected = vec![shard_id];
+        let mut ops = vec![(
+            shard_id,
+            crate::view::ViewOp::RetireRoute {
+                route: handle.route,
+                epoch: handle.epoch,
+            },
+        )];
         for index in 0..self.views.len() {
             let target = crate::id::ShardId::new(index);
-            if let Some(plan) = self.track_plan(track_id, target)
-                && let Some(view) = self.view_mut(target)
-            {
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::SetTrackPlan {
-                        key: plan.0,
-                        plan: plan.1,
-                    },
-                );
-                if target != shard_id {
-                    affected.push(target);
-                }
+            if let Some((key, plan)) = self.track_plan(track_id, target) {
+                ops.push((target, crate::view::ViewOp::SetTrackPlan { key, plan }));
             }
         }
-        affected.sort_by_key(|shard| shard.index());
-        affected.dedup();
-        let mut published = Vec::new();
-        for target in affected {
-            if let Some(view) = self.view_mut(target)
-                && view.publish().is_some()
-            {
-                published.push(target);
-            }
-        }
-        if self.state.commit().is_err() {
+        if !self.publish_ops(ops) {
             return false;
         }
-        self.state
-            .release_endpoint(shard_id, handle.route.slot(), now);
+        self.state.release_endpoint(
+            shard_id,
+            handle.route.slot(),
+            tokio::time::Instant::now(),
+        );
         true
     }
 }
