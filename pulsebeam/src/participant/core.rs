@@ -467,14 +467,9 @@ impl ParticipantCore {
     }
 
     #[inline]
-    pub fn on_forward_audio_rtp(
-        &mut self,
-        slot_idx: crate::id::AudioSelectorSlotId,
-        origin: crate::entity::AudioOrigin,
-        pkt: &RtpPacket,
-    ) {
+    pub fn on_forward_audio_rtp(&mut self, origin: crate::entity::AudioOrigin, pkt: &RtpPacket) {
         self.downstream
-            .on_forward_audio_rtp(slot_idx, origin, pkt, &mut self.stream_writer);
+            .on_forward_audio_rtp(origin, pkt, &mut self.stream_writer);
         if self.downstream.take_audio_speakers_changed() {
             self.signaling.mark_assignments_dirty();
         }
@@ -1333,6 +1328,8 @@ impl ParticipantCore {
                 // count was always one behind and every intent was rejected).
                 self.signaling
                     .set_slot_count(self.downstream.video.slot_count());
+                self.signaling
+                    .set_audio_slot_count(self.downstream.audio_slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
@@ -1611,8 +1608,7 @@ mod upstream_route_table_tests {
             );
             for (index, key) in table.ssrcs.iter().enumerate() {
                 assert_eq!(
-                    table.routes[index].ssrc,
-                    *key,
+                    table.routes[index].ssrc, *key,
                     "routes[{index}] must be the route for ssrcs[{index}]"
                 );
             }

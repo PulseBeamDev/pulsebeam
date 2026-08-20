@@ -464,3 +464,151 @@ async fn track_route_duration(req: Request<axum::body::Body>, next: Next) -> Res
         .record(duration);
     response
 }
+
+#[cfg(test)]
+mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    use super::*;
+
+    fn cfg() -> ApiConfig {
+        ApiConfig {
+            base_path: "/api/v1".to_owned(),
+            default_host: "localhost:7070".to_owned(),
+        }
+    }
+
+    fn state(manual_sub: bool) -> ParticipantState {
+        let room = ExternalRoomId::new("room").unwrap();
+        ParticipantState {
+            manual_sub,
+            room_id: RoomId::from_external(&room),
+            participant_id: ParticipantId::new(),
+            connection_id: ConnectionId::new(),
+            old_connection_id: None,
+        }
+    }
+
+    /// The `Location` a client is told to talk to has to come back to this node.
+    #[test]
+    fn location_is_built_from_the_forwarding_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("sfu.example"));
+
+        let url = build_location(&headers, &cfg(), "/rooms/r/participants/p", &state(false))
+            .expect("a valid forwarding header pair makes a valid url");
+
+        assert!(url.starts_with("https://sfu.example/api/v1/rooms/r/participants/p"));
+    }
+
+    /// Behind no proxy there is still an answer, or a direct client could not reconnect.
+    #[test]
+    fn location_falls_back_to_the_configured_host() {
+        let url = build_location(&HeaderMap::new(), &cfg(), "/p", &state(false))
+            .expect("no forwarding headers is not an error");
+        assert!(url.starts_with("http://localhost:7070/api/v1/p"));
+    }
+
+    /// `manual_sub` has to survive the round trip: the URL is the only thing carrying it back, and
+    /// a manual subscriber that silently became automatic would start receiving video it never
+    /// asked for - and, since v2, audio too.
+    #[test]
+    fn manual_sub_travels_in_the_location_url() {
+        let manual = build_location(&HeaderMap::new(), &cfg(), "/p", &state(true)).unwrap();
+        assert!(
+            manual.contains("manual_sub=true"),
+            "a manual subscriber's mode must be in the url it is told to come back to: {manual}"
+        );
+
+        let automatic = build_location(&HeaderMap::new(), &cfg(), "/p", &state(false)).unwrap();
+        assert!(
+            !automatic.contains("manual_sub"),
+            "and must not appear when it was not asked for: {automatic}"
+        );
+    }
+
+    /// A host header is client-supplied, so it can contain bytes no URL may.
+    ///
+    /// `panic = "abort"` means a panic in a handler takes the node down, so this has to be an
+    /// error rather than an unwrap.
+    #[test]
+    fn an_unusable_host_is_an_error_rather_than_a_panic() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", HeaderValue::from_static("a host"));
+        let result = build_location(&headers, &cfg(), "/p", &state(false));
+        assert!(matches!(result, Err(ApiError::BadUrl)));
+    }
+
+    /// The status code is the whole API contract for a failure: a client retries a 503 and gives
+    /// up on a 400, so mapping one to the other changes what every caller does.
+    #[test]
+    fn each_failure_maps_to_the_status_a_client_acts_on() {
+        let cases = [
+            (
+                ApiError::BadRequest("x".into()),
+                StatusCode::BAD_REQUEST,
+                "a malformed request is the caller's to fix",
+            ),
+            (
+                ApiError::IdValidation(IdValidationError::TooLong(4)),
+                StatusCode::BAD_REQUEST,
+                "so is an unusable id",
+            ),
+            (
+                ApiError::JoinError(controller::ControllerError::ServiceUnavailable),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a busy controller is worth retrying",
+            ),
+            (
+                ApiError::ServiceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "and so is a busy node",
+            ),
+            (
+                ApiError::RateLimited,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limiting has its own code so a client can back off rather than give up",
+            ),
+            (
+                ApiError::BadUrl,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a url this node could not build is this node's fault",
+            ),
+            (
+                ApiError::Unknown("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "and so is anything unclassified",
+            ),
+        ];
+
+        for (error, want, why) in cases {
+            assert_eq!(error.into_response().status(), want, "{why}");
+        }
+    }
+
+    /// The headers a client needs to reconnect must both be present and usable.
+    #[test]
+    fn the_response_carries_both_the_location_and_the_connection_tag() {
+        let headers = ParticipantResponseHeaders {
+            location: "http://localhost:7070/api/v1/p".to_owned(),
+            etag: ConnectionId::new(),
+        }
+        .to_header_map()
+        .expect("a well-formed location and etag convert");
+
+        assert!(headers.contains_key(LOCATION));
+        assert!(headers.contains_key(ETAG));
+    }
+
+    /// A location that cannot become a header value is a 500, not a panic - same reason as above.
+    #[test]
+    fn an_unusable_location_header_is_an_error() {
+        let result = ParticipantResponseHeaders {
+            location: "http://host/\u{7f}".to_owned(),
+            etag: ConnectionId::new(),
+        }
+        .to_header_map();
+        assert!(matches!(result, Err(ApiError::BadUrl)));
+    }
+}

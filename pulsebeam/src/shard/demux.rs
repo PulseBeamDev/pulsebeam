@@ -20,8 +20,9 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 /// `no_std` classifier — the same classifier the Aya eBPF program and the
 /// simulator's steering adapter use. `Demuxer` never parses STUN or the ufrag
 /// itself; it calls `pulsebeam_routing::classify::classify_client_for_node` on
-/// packet bytes. A bootstrap result is returned to the caller but is not
-/// cached until str0m has authenticated the source address.
+/// packet bytes. A bootstrap result is both returned to the caller *and*
+/// cached, before anything has authenticated the source — see the security
+/// note below for why that is safe.
 ///
 /// Resolving a route does not imply this shard owns it — see the note on
 /// cross-shard arrivals below.
@@ -46,12 +47,27 @@ const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 ///
 /// # Security hardening
 ///
-/// The authenticated cache is bounded and **evicts rather than refuses**. A
-/// bootstrap packet never creates durable state, so a flood of fabricated
-/// ufrags can spend parser work but cannot poison a participant's address
-/// entry. Least-recently-used eviction means authenticated churn degrades into
-/// replacement while a live call — which touches its entry on every packet —
-/// keeps its place.
+/// The ufrag is a steering hint, not a credential. It is unauthenticated, it
+/// names a route directly, and a forged one *does* get an entry here before
+/// anything is verified. Three properties make that harmless, and they have to
+/// be read together — `docs/routing.md` carries the same argument in prose.
+///
+/// **Admission grants nothing.** Steering decides which shard looks at a
+/// packet, not whether it is honoured: the owning shard still resolves the
+/// route in its published view, and str0m still runs ICE, DTLS and SRTP. A
+/// forged ufrag buys parser work and a cache slot, nothing else.
+///
+/// **A flood cannot displace a live flow.** The cache **evicts rather than
+/// refuses** — refusing when full would let an attacker lock out new legitimate
+/// flows. Every cache *hit* refreshes `used`, so a participant sending media
+/// holds the most recently used entry for its route while forged entries are
+/// touched once at admission. Eviction takes the minimum, so a flood evicts its
+/// own oldest entry and churns its own ring.
+///
+/// **Do not add an `authenticated` flag.** It was tried and dropped: there is
+/// no correct place to set it. `SO_REUSEPORT` picks the admitting shard by
+/// 4-tuple hash while the authenticating shard is the route's owner, so the
+/// entry needing the mark is never the one that learns the flow is real.
 ///
 /// * **Total cache cap** (`MAX_ADDR_ENTRIES`): bounds the fast-path `addr_map`.
 /// * **Per-route cap** (`MAX_ADDRS_PER_ROUTE`): bounds how many source

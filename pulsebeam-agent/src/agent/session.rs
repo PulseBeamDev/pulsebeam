@@ -290,6 +290,22 @@ impl Media {
         result.await.map_err(|_| AgentError::Closed)?
     }
 
+    /// How this client wants its audio slots filled.
+    ///
+    /// Declarative and complete: what is sent replaces what came before, so a caller drops a pin
+    /// by sending an intent without it rather than by calling an opposite. Sending nothing at all
+    /// leaves the default, which is what the SFU did before a client could say anything about
+    /// audio: fill every slot by loudness.
+    pub async fn set_audio_intent(&self, intent: AudioIntent) -> Result<(), AgentError> {
+        self.agent
+            .inner
+            .commands
+            .send(OutgoingCommand::SetAudioIntent(intent))
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        Ok(())
+    }
+
     pub async fn set_playout_delay(&self, bounds: Option<(u32, u32)>) -> Result<(), AgentError> {
         self.agent
             .inner
@@ -298,6 +314,47 @@ impl Media {
             .await
             .map_err(|_| AgentError::Closed)?;
         Ok(())
+    }
+}
+
+/// A subscriber's audio selection policy.
+///
+/// Pins name tracks rather than participants because selection ranks tracks: one participant may
+/// publish a microphone and a screen-share audio track, and pinning one must not pin the other.
+/// `Participant::audio()` resolves a person to their tracks for the common case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioIntent {
+    /// Tracks that hold a slot regardless of loudness, in preference order. Pins beyond the
+    /// negotiated slot count are ignored rather than rejected.
+    pub pinned: Vec<String>,
+    /// Fill the slots pinning does not claim by loudness. `false` hears only the pins.
+    pub auto: bool,
+}
+
+impl Default for AudioIntent {
+    fn default() -> Self {
+        Self {
+            pinned: Vec::new(),
+            auto: true,
+        }
+    }
+}
+
+impl AudioIntent {
+    /// Hear only these tracks, and nothing else.
+    pub fn only(pinned: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            pinned: pinned.into_iter().map(Into::into).collect(),
+            auto: false,
+        }
+    }
+
+    /// Hold slots for these tracks, and fill what is left by loudness.
+    pub fn pinning(pinned: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            pinned: pinned.into_iter().map(Into::into).collect(),
+            auto: true,
+        }
     }
 }
 
@@ -347,6 +404,24 @@ impl Participant {
                     && publication.kind() == Some(str0m::media::MediaKind::Video)
                     && publication.is_paused()
             })
+    }
+
+    /// The audio tracks this participant is publishing, for pinning.
+    ///
+    /// Usually one. A participant sharing a screen with its audio publishes two, and they are
+    /// separately pinnable - which is why this returns a list rather than an option.
+    pub fn audio_tracks(&self) -> Vec<String> {
+        self.agent
+            .inner
+            .publications
+            .borrow()
+            .values()
+            .filter(|publication| {
+                publication.publisher_id() == self.id
+                    && publication.kind() == Some(str0m::media::MediaKind::Audio)
+            })
+            .map(|publication| publication.id().to_owned())
+            .collect()
     }
 
     pub fn has_audio(&self) -> bool {
@@ -562,7 +637,7 @@ fn participant_availability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsebeam_proto::signaling::Track;
+    use pulsebeam_proto::signaling::Publication as Track;
 
     #[test]
     fn publications_collapse_into_participant_availability() {
@@ -570,19 +645,17 @@ mod tests {
             (
                 "video".to_owned(),
                 Publication::from_signaling(Track {
-                    id: "video".into(),
+                    track_id: "video".into(),
                     kind: 1,
                     participant_id: "alice".into(),
-                    meta: HashMap::new(),
                 }),
             ),
             (
                 "audio".to_owned(),
                 Publication::from_signaling(Track {
-                    id: "audio".into(),
+                    track_id: "audio".into(),
                     kind: 2,
                     participant_id: "alice".into(),
-                    meta: HashMap::new(),
                 }),
             ),
         ]

@@ -1,4 +1,4 @@
-use pulsebeam_proto::signaling::Track;
+use pulsebeam_proto::signaling::Publication;
 use std::collections::HashMap;
 use str0m::media::Mid;
 
@@ -32,8 +32,8 @@ pub struct Speaker {
 }
 
 pub struct SlotManager {
-    pending_tracks: HashMap<TrackId, Track>,
-    active_tracks: HashMap<TrackId, Track>,
+    pending_tracks: HashMap<TrackId, Publication>,
+    active_tracks: HashMap<TrackId, Publication>,
     slots: Vec<ReceiverSlot>,
 }
 
@@ -59,14 +59,14 @@ impl SlotManager {
     ///
     /// A subscription the viewer has hidden (`target_height = 0`) is never assigned a slot, so
     /// `assigned` cannot see it, but the publication itself is still known.
-    pub fn known(&self, track_id: &str) -> Option<Track> {
+    pub fn known(&self, track_id: &str) -> Option<Publication> {
         self.active_tracks
             .get(track_id)
             .or_else(|| self.pending_tracks.get(track_id))
             .cloned()
     }
 
-    pub fn assigned(&self, track_id: &str) -> Option<(Mid, Track)> {
+    pub fn assigned(&self, track_id: &str) -> Option<(Mid, Publication)> {
         let track = self.active_tracks.get(track_id)?.clone();
         let slot = self
             .slots
@@ -99,23 +99,23 @@ impl SlotManager {
         speakers
     }
 
-    pub fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> SyncOutcome {
-        let mut new_assignments: Vec<(Mid, Track)> = Vec::new();
-        let mut audio_arrivals: Vec<(Mid, Track)> = Vec::new();
+    pub fn sync(&mut self, state: pulsebeam_proto::signaling::ServerState) -> SyncOutcome {
+        let mut new_assignments: Vec<(Mid, Publication)> = Vec::new();
+        let mut audio_arrivals: Vec<(Mid, Publication)> = Vec::new();
         let mut speakers_changed = false;
         let mut pause_changes: Vec<(TrackId, bool)> = Vec::new();
         let mut newly_discovered_tracks = Vec::new();
-        let removed_tracks = update.tracks_remove.clone();
+        let removed_tracks = state.publications_removed.clone();
 
-        for t in update.tracks_remove {
-            self.pending_tracks.remove(&t);
-            self.active_tracks.remove(&t);
-            // And any slot still naming them. The assignment that vacates a slot usually arrives
-            // too, but not always - a snapshot resync carries no removals by design - and a slot
-            // left naming a departed track goes on reporting them as a speaker. The room saying
-            // they are gone is enough on its own.
+        for id in state.publications_removed {
+            self.pending_tracks.remove(&id);
+            self.active_tracks.remove(&id);
+            // And any slot still naming it. The binding that vacates the slot
+            // usually arrives in the same message, but a publication being gone
+            // is enough on its own - a slot left naming a departed track goes on
+            // reporting them as a speaker.
             for slot in &mut self.slots {
-                if slot.track_id.as_deref() == Some(t.as_str()) {
+                if slot.track_id.as_deref() == Some(id.as_str()) {
                     speakers_changed |= slot.speaker.is_some();
                     slot.speaker = None;
                     slot.track_id = None;
@@ -123,126 +123,134 @@ impl SlotManager {
             }
         }
 
-        for t in update.tracks_upsert {
-            if self.active_tracks.contains_key(&t.id) {
-                continue;
-            }
-            if self.pending_tracks.contains_key(&t.id) {
-                continue;
-            }
-
-            newly_discovered_tracks.push(t.clone());
-            self.pending_tracks.insert(t.id.clone(), t);
-        }
-
-        for a in update.assignments_remove {
-            if let Some(s) = self
-                .slots
-                .iter_mut()
-                .find(|s| s.mid.as_bytes() == a.as_bytes())
+        for publication in state.publications_added {
+            if self.active_tracks.contains_key(&publication.track_id)
+                || self.pending_tracks.contains_key(&publication.track_id)
             {
-                s.track_id = None;
+                continue;
             }
+            newly_discovered_tracks.push(publication.clone());
+            self.pending_tracks
+                .insert(publication.track_id.clone(), publication);
         }
 
-        for a in update.assignments_upsert {
-            let Some(s) = self
-                .slots
-                .iter_mut()
-                .find(|s| s.mid.as_bytes() == a.mid.as_bytes())
-            else {
-                continue;
-            };
-
-            if s.track_id.as_deref() == Some(&a.track_id) {
-                // Same track in the same slot, so this upsert exists because something else about
-                // the assignment moved - in practice, because the SFU started or stopped
-                // forwarding it. Returning early here is what dropped every pause transition on
-                // the floor, leaving a client unable to tell a paused stream from a dead network.
-                if s.paused != a.paused {
-                    s.paused = a.paused;
-                    pause_changes.push((a.track_id.clone(), a.paused));
+        // Each binding group is complete when present, so the slots it does not
+        // name are vacant. That is what removes the need for a removal list.
+        if let Some(video) = state.video {
+            let mut bound = Vec::new();
+            for slot in &mut self.slots {
+                if slot.speaker.is_some() {
+                    continue;
                 }
-                continue;
+                let binding = video
+                    .items
+                    .iter()
+                    .find(|b| slot.mid.as_bytes() == b.mid.as_bytes());
+                let Some(binding) = binding else {
+                    slot.track_id = None;
+                    continue;
+                };
+                if slot.track_id.as_deref() == Some(&binding.track_id) {
+                    if slot.paused != binding.paused {
+                        slot.paused = binding.paused;
+                        pause_changes.push((binding.track_id.clone(), binding.paused));
+                    }
+                } else {
+                    slot.track_id = Some(binding.track_id.clone());
+                    slot.paused = binding.paused;
+                    if binding.paused {
+                        pause_changes.push((binding.track_id.clone(), true));
+                    }
+                }
+                bound.push((slot.mid, binding.track_id.clone()));
             }
-
-            s.track_id = Some(a.track_id.clone());
-            s.paused = a.paused;
-            if a.paused {
-                pause_changes.push((a.track_id.clone(), true));
-            }
-
-            if let Some(track) = self.pending_tracks.remove(&a.track_id) {
-                let mid = s.mid;
-                self.active_tracks.insert(a.track_id, track.clone());
-                new_assignments.push((mid, track));
+            for (mid, track_id) in bound {
+                if self.active_tracks.contains_key(&track_id) {
+                    continue;
+                }
+                if let Some(publication) = self.pending_tracks.remove(&track_id) {
+                    self.active_tracks.insert(track_id, publication.clone());
+                    new_assignments.push((mid, publication));
+                }
             }
         }
 
-        for a in update.audio_remove {
-            if let Some(s) = self
-                .slots
-                .iter_mut()
-                .find(|s| s.mid.as_bytes() == a.as_bytes())
-            {
-                speakers_changed |= s.speaker.is_some();
-                s.speaker = None;
-                s.track_id = None;
+        // Ordered loudest first, so the index is the rank. There is no rank on
+        // the wire to disagree with the ordering.
+        if let Some(audio) = state.audio {
+            let mut bound = Vec::new();
+            for slot in &mut self.slots {
+                let found = audio
+                    .items
+                    .iter()
+                    .enumerate()
+                    .find(|(_, b)| slot.mid.as_bytes() == b.mid.as_bytes());
+                let Some((rank, binding)) = found else {
+                    if slot.speaker.take().is_some() {
+                        speakers_changed = true;
+                        slot.track_id = None;
+                    }
+                    continue;
+                };
+                let rebound = slot.track_id.as_deref() != Some(&binding.track_id);
+                slot.track_id = Some(binding.track_id.clone());
+                bound.push((
+                    slot.mid,
+                    rank,
+                    binding.track_id.clone(),
+                    binding.level_dbov,
+                    rebound,
+                ));
+            }
+            for (mid, rank, track_id, level_dbov, rebound) in bound {
+                let publication = self
+                    .pending_tracks
+                    .remove(&track_id)
+                    .or_else(|| self.active_tracks.get(&track_id).cloned());
+                let participant_id = publication
+                    .as_ref()
+                    .map(|p| p.participant_id.clone())
+                    .unwrap_or_default();
+                let speaker = Speaker {
+                    participant_id,
+                    track_id: track_id.clone(),
+                    rank: u32::try_from(rank).unwrap_or(u32::MAX),
+                    level_dbov,
+                };
+                if let Some(slot) = self.slots.iter_mut().find(|s| s.mid == mid) {
+                    speakers_changed |= slot.speaker.as_ref() != Some(&speaker);
+                    slot.speaker = Some(speaker);
+                }
+                // The publication is in the roster now, so this is a lookup
+                // rather than a track synthesised from the binding.
+                if let Some(publication) = publication {
+                    self.active_tracks.insert(track_id, publication.clone());
+                    if rebound {
+                        audio_arrivals.push((mid, publication));
+                    }
+                }
             }
         }
 
-        for a in update.audio_upsert {
-            let Some(s) = self
-                .slots
-                .iter_mut()
-                .find(|s| s.mid.as_bytes() == a.mid.as_bytes())
-            else {
+        // A slot can be told which track it carries before the publication that
+        // describes it arrives, so binding only at the moment the group is
+        // applied loses the delivery entirely and the subscriber waits forever.
+        // Restricted to slots with no speaker: an audio slot is served by
+        // `audio_arrivals`, and reporting it here as well would insert a second
+        // delivery target for one mid, silently replacing the first.
+        let pending: Vec<(Mid, TrackId)> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.speaker.is_none())
+            .filter_map(|slot| Some((slot.mid, slot.track_id.clone()?)))
+            .filter(|(_, track_id)| !self.active_tracks.contains_key(track_id))
+            .collect();
+        for (mid, track_id) in pending {
+            let Some(publication) = self.pending_tracks.remove(&track_id) else {
                 continue;
             };
-            let speaker = Speaker {
-                participant_id: a.participant_id.clone(),
-                track_id: a.track_id.clone(),
-                rank: a.rank,
-                level_dbov: a.level_dbov,
-            };
-            speakers_changed |= s.speaker.as_ref() != Some(&speaker);
-            s.speaker = Some(speaker);
-
-            if s.track_id.as_deref() == Some(&a.track_id) {
-                continue;
-            }
-            s.track_id = Some(a.track_id.clone());
-            // Built from the assignment, not looked up in `tracks_upsert`: a speaker never
-            // appears there. That list is video the client may subscribe to, and an audio entry
-            // in it becomes a second tile for somebody who already has one.
-            let mid = s.mid;
-            audio_arrivals.push((
-                mid,
-                Track {
-                    id: a.track_id.clone(),
-                    kind: i32::from(pulsebeam_proto::signaling::TrackKind::Audio),
-                    participant_id: a.participant_id.clone(),
-                    meta: Default::default(),
-                },
-            ));
-        }
-
-        for slot in &self.slots {
-            let Some(track_id) = &slot.track_id else {
-                continue;
-            };
-
-            if self.active_tracks.contains_key(track_id) {
-                continue;
-            }
-
-            let Some(track) = self.pending_tracks.remove(track_id) else {
-                continue;
-            };
-
-            let mid = slot.mid;
-            self.active_tracks.insert(track_id.clone(), track.clone());
-            new_assignments.push((mid, track));
+            self.active_tracks.insert(track_id, publication.clone());
+            new_assignments.push((mid, publication));
         }
 
         SyncOutcome {
@@ -258,8 +266,8 @@ impl SlotManager {
 
 /// What changed in the room, from one server state update.
 pub struct SyncOutcome {
-    pub new_assignments: Vec<(Mid, Track)>,
-    pub newly_discovered_tracks: Vec<pulsebeam_proto::signaling::Track>,
+    pub new_assignments: Vec<(Mid, Publication)>,
+    pub newly_discovered_tracks: Vec<pulsebeam_proto::signaling::Publication>,
     pub removed_tracks: Vec<TrackId>,
     /// Tracks whose forwarding state changed, and what it changed to.
     pub pause_changes: Vec<(TrackId, bool)>,
@@ -269,80 +277,67 @@ pub struct SyncOutcome {
     ///
     /// Separate from `new_assignments` because nobody subscribed to these: the SFU chooses who is
     /// heard, and the speaker is described entirely by the assignment.
-    pub audio_arrivals: Vec<(Mid, Track)>,
+    pub audio_arrivals: Vec<(Mid, Publication)>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsebeam_proto::signaling::{StateUpdate, Track as ProtoTrack, VideoAssignment};
+    use pulsebeam_proto::signaling::{
+        AudioBinding, AudioBindings, Publication as ProtoTrack, ServerState, VideoBinding,
+        VideoBindings,
+    };
 
-    fn update(assignments: Vec<VideoAssignment>, tracks: Vec<ProtoTrack>) -> StateUpdate {
-        StateUpdate {
-            seq: 1,
-            is_snapshot: false,
-            tracks_upsert: tracks,
-            tracks_remove: Vec::new(),
-            assignments_upsert: assignments,
-            assignments_remove: Vec::new(),
-            audio_upsert: Vec::new(),
-            audio_remove: Vec::new(),
+    fn update(video: Vec<VideoBinding>, tracks: Vec<ProtoTrack>) -> ServerState {
+        ServerState {
+            participants_added: Vec::new(),
+            participants_removed: Vec::new(),
+            publications_added: tracks,
+            publications_removed: Vec::new(),
+            video: Some(VideoBindings { items: video }),
+            audio: None,
         }
     }
 
-    fn audio_update(
-        audio: Vec<pulsebeam_proto::signaling::AudioAssignment>,
-        tracks: Vec<ProtoTrack>,
-    ) -> StateUpdate {
-        StateUpdate {
-            seq: 1,
-            is_snapshot: false,
-            tracks_upsert: tracks,
-            tracks_remove: Vec::new(),
-            assignments_upsert: Vec::new(),
-            assignments_remove: Vec::new(),
-            audio_upsert: audio,
-            audio_remove: Vec::new(),
+    fn audio_update(audio: Vec<AudioBinding>, tracks: Vec<ProtoTrack>) -> ServerState {
+        ServerState {
+            participants_added: Vec::new(),
+            participants_removed: Vec::new(),
+            publications_added: tracks,
+            publications_removed: Vec::new(),
+            video: None,
+            audio: Some(AudioBindings { items: audio }),
         }
     }
 
-    fn speaking(
-        mid: &str,
-        track_id: &str,
-        rank: u32,
-        level_dbov: i32,
-    ) -> pulsebeam_proto::signaling::AudioAssignment {
-        // Mirrors the SFU: the speaker's identity travels in the assignment, never in a track.
-        let participant_id = track_id.trim_start_matches("audio-").to_owned();
-        pulsebeam_proto::signaling::AudioAssignment {
+    /// Ordered loudest first by the caller: the index is the rank, so these
+    /// helpers take no rank and the list order carries it.
+    fn speaking(mid: &str, track_id: &str, level_dbov: i32) -> AudioBinding {
+        AudioBinding {
             mid: mid.to_owned(),
             track_id: track_id.to_owned(),
-            participant_id,
-            rank,
             level_dbov,
         }
     }
 
     fn audio_track(id: &str, publisher: &str) -> ProtoTrack {
         ProtoTrack {
-            id: id.to_owned(),
+            track_id: id.to_owned(),
             kind: 2,
             participant_id: publisher.to_owned(),
-            meta: Default::default(),
         }
     }
 
     fn track(id: &str) -> ProtoTrack {
         ProtoTrack {
-            id: id.to_owned(),
+            track_id: id.to_owned(),
             kind: 1,
             participant_id: "pub".to_owned(),
-            meta: Default::default(),
         }
     }
 
-    fn assignment(mid: &str, track_id: &str, paused: bool) -> VideoAssignment {
-        VideoAssignment {
+    fn assignment(mid: &str, track_id: &str, paused: bool) -> VideoBinding {
+        VideoBinding {
             mid: mid.to_owned(),
             track_id: track_id.to_owned(),
             paused,
@@ -390,14 +385,20 @@ mod tests {
         slots.register(Mid::from("a0"));
 
         let sync = slots.sync(audio_update(
-            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![speaking("a0", "audio-alice", -30)],
             vec![audio_track("audio-alice", "alice")],
         ));
 
         assert_eq!(
-            sync.new_assignments.len(),
+            sync.audio_arrivals.len(),
             1,
             "the audio track must be bound to its mid"
+        );
+        assert!(
+            sync.new_assignments.is_empty(),
+            "an audio binding is not a subscription: reporting it as both would insert two \
+             delivery targets for one mid, the second silently replacing the sink the first \
+             handed to the application"
         );
         assert!(sync.speakers_changed);
         assert_eq!(
@@ -418,18 +419,18 @@ mod tests {
         let mut slots = SlotManager::new();
         slots.register(Mid::from("a0"));
         slots.sync(audio_update(
-            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![speaking("a0", "audio-alice", -30)],
             vec![audio_track("audio-alice", "alice")],
         ));
 
         let sync = slots.sync(audio_update(
-            vec![speaking("a0", "audio-bob", 0, -12)],
+            vec![speaking("a0", "audio-bob", -12)],
             vec![audio_track("audio-bob", "bob")],
         ));
 
         assert!(sync.speakers_changed);
         assert_eq!(
-            sync.new_assignments.len(),
+            sync.audio_arrivals.len(),
             1,
             "the new speaker needs its own delivery, not the one the old speaker held"
         );
@@ -438,7 +439,11 @@ mod tests {
         assert_eq!(speakers[0].participant_id, "bob");
     }
 
-    /// Ranking is what a UI draws, and it must not depend on which order the slots were filled.
+    /// Ranking is what a UI draws, and the list order is the only thing carrying it.
+    ///
+    /// There is no rank field on the wire any more, so a client that reordered the group - by mid,
+    /// by arrival, by anything - would silently invent its own ranking. The server sends loudest
+    /// first and the client must preserve exactly that, whichever slots they landed in.
     #[test]
     fn speakers_are_reported_loudest_first() {
         let mut slots = SlotManager::new();
@@ -447,8 +452,8 @@ mod tests {
 
         slots.sync(audio_update(
             vec![
-                speaking("a0", "audio-alice", 1, -40),
-                speaking("a1", "audio-bob", 0, -12),
+                speaking("a1", "audio-bob", -12),
+                speaking("a0", "audio-alice", -40),
             ],
             vec![
                 audio_track("audio-alice", "alice"),
@@ -472,13 +477,13 @@ mod tests {
         let mut slots = SlotManager::new();
         slots.register(Mid::from("a0"));
         slots.sync(audio_update(
-            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![speaking("a0", "audio-alice", -30)],
             vec![audio_track("audio-alice", "alice")],
         ));
 
-        let mut update = audio_update(Vec::new(), Vec::new());
-        update.audio_remove = vec!["a0".to_owned()];
-        let sync = slots.sync(update);
+        // The group is complete when present, so an empty one vacates every
+        // slot. That is what removes the need for a removal list.
+        let sync = slots.sync(audio_update(Vec::new(), Vec::new()));
 
         assert!(sync.speakers_changed);
         assert!(slots.speakers().is_empty(), "nobody is being heard");
@@ -486,22 +491,22 @@ mod tests {
 
     /// A speaker who leaves stops being reported, even if the slot is never explicitly vacated.
     ///
-    /// The SFU normally sends both: the track goes from `tracks_remove` and the slot from
-    /// `audio_remove`. A snapshot resync carries no removals at all, though, so a client that
-    /// waited for the second would keep naming somebody who had left - a ghost speaker, and a
-    /// tile for a person who is not in the room.
+    /// The publication going away is enough on its own. Waiting for the audio group to vacate the
+    /// slot as well would leave a client naming somebody who had left in the window between the
+    /// two - a ghost speaker, and a tile for a person who is not in the room.
     #[test]
     fn a_departed_track_is_dropped_from_its_slot() {
         let mut slots = SlotManager::new();
         slots.register(Mid::from("a0"));
         slots.sync(audio_update(
-            vec![speaking("a0", "audio-alice", 0, -30)],
+            vec![speaking("a0", "audio-alice", -30)],
             vec![audio_track("audio-alice", "alice")],
         ));
         assert_eq!(slots.speakers().len(), 1, "alice is being heard");
 
         let mut gone = audio_update(Vec::new(), Vec::new());
-        gone.tracks_remove = vec!["audio-alice".to_owned()];
+        gone.audio = None;
+        gone.publications_removed = vec!["audio-alice".to_owned()];
         let sync = slots.sync(gone);
 
         assert!(sync.speakers_changed, "the application has to be told");

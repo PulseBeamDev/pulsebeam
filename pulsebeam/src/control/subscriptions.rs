@@ -139,10 +139,7 @@ impl<K: std::hash::Hash + Eq + Clone, S: Copy> Subscriptions<K, S> {
         }
     }
 
-    pub fn plan_destinations(
-        &self,
-        stream: &K,
-    ) -> Vec<(ShardId, Option<RouteHandle>, Vec<S>)> {
+    pub fn plan_destinations(&self, stream: &K) -> Vec<(ShardId, Option<RouteHandle>, Vec<S>)> {
         self.interest
             .iter()
             .filter_map(|((shard, candidate), interest)| {

@@ -1,6 +1,30 @@
 syntax = "proto3";
 package signaling;
 
+// Declarative signaling between a client and the SFU.
+//
+// One rule of naming, applied throughout: an `*Intent` is what the client
+// wants, a `*Binding` is what the server decided. The client never learns
+// whether the server agreed except by reading the bindings it gets back.
+//
+// Ids are opaque strings. Clients must not parse them.
+//
+// The alternatives were measured and rejected, and this comment exists so they
+// are not re-proposed. Sending the underlying 16 bytes is ~1.6x smaller but
+// announces that an id is a UUID: every SDK would then need the prefix +
+// Crockford base32 codec from `entity.rs` to correlate with the HTTP API, which
+// returns the string form, and the id could never change shape again.
+// Session-scoped integer handles are smaller still, but save ~13KB on a message
+// sent once at join and ~500 B/s on the hot path — bindings are already bounded
+// by the subscriber's slot count — in exchange for two handle spaces, an
+// allocator, a reuse hazard, and a decode boundary where the two can be
+// confused. Compression buys ~2x at best, because 500 UUIDs are ~8KB of
+// irreducible entropy, for a codec dependency in every SDK.
+//
+// The roster is ~80KB at 500 participants, paid once at join. If that becomes a
+// problem, scope the roster to what a client can display before revisiting any
+// of the above.
+
 // ========================================================================
 // 1. Enums & Core Entities
 // ========================================================================
@@ -11,163 +35,182 @@ enum TrackKind {
   AUDIO = 2;
 }
 
-message Track {
-  string id = 1;
-  TrackKind kind = 2;
-  string participant_id = 3;
-  // Extensible metadata (e.g. "display_name", "is_muted", "avatar_url").
-  map<string, string> meta = 4;
+// Somebody publishing in the room.
+//
+// Deliberately one field. It exists so participants are an entity rather than a
+// string repeated on every track, and so clients build tiles from people rather
+// than from a track list. Do not add display names, avatars or mute state:
+// those belong to the application's own signaling, and carrying them makes
+// every roster update pay for data the SFU never reads.
+//
+// Derived from publications, so a participant who publishes nothing does not
+// appear. The SFU has no room-membership signal to build a fuller roster from -
+// a participant only ever learns of another when a track is announced to it -
+// and applications get presence from their own backend. If that changes, this
+// is the message that carries it.
+message Participant {
+  string participant_id = 1;
 }
 
-message VideoAssignment {
-  string mid = 1;
-  string track_id = 2;
-  // Feedback indicating if the stream is actively flowing or halted by the SFU.
+// Something a participant is publishing.
+//
+// Audio appears here too. Selection ranks tracks, and one participant may
+// publish two of them (microphone, screen-share audio), so a recording has to be
+// able to say which track it captured and a pin has to be able to name one of
+// them. Clients build tiles from the participant roster, not from this list —
+// which is what makes announcing audio here safe, where announcing it in a
+// video-shaped track list was not.
+message Publication {
+  string track_id = 1;
+  string participant_id = 2;
+  TrackKind kind = 3;
+}
+
+// ========================================================================
+// 2. Server -> Client
+// ========================================================================
+
+message VideoBinding {
+  string track_id = 1;
+  // The m-line carrying it. Bounded at 16 characters: str0m stores a mid as
+  // [u8; 16] and truncates silently past that.
+  string mid = 2;
+  // Feedback indicating the stream is halted by the SFU rather than flowing.
   bool paused = 3;
 }
 
-// Which speaker currently occupies one of the subscriber's audio slots.
+// Which speaker occupies one of the subscriber's audio slots.
 //
-// Audio slots are not assigned the way video slots are. The SFU forwards only the
-// loudest few speakers and steals a slot the moment someone louder starts talking,
-// so the occupant of a `mid` changes on its own and a client cannot infer who it is
-// hearing from the media alone.
+// Audio slots are not assigned the way video slots are. The SFU forwards only
+// the loudest few speakers and steals a slot the moment someone louder starts
+// talking, so the occupant of a mid changes on its own and a client cannot infer
+// who it is hearing from the media alone.
 //
-// `rank` is the ordering that matters to a UI: 0 is the loudest speaker currently
-// being forwarded. Slots themselves stay fixed; only who sits in them moves.
-message AudioAssignment {
-  string mid = 1;
-  string track_id = 2;
-
-  // Who is speaking. Carried here rather than as an entry in `tracks_upsert`,
-  // because that list means "video tracks you can subscribe to" and a client is
-  // entitled to treat every entry as one. Announcing audio there gave every
-  // heard speaker a second, video-shaped track and duplicated them on screen.
-  string participant_id = 5;
-
-  // 0 is the loudest currently-forwarded speaker. Ranks are contiguous over the
-  // speakers being forwarded, so the set of ranks is 0..N for N occupied slots.
-  uint32 rank = 3;
-
-  // Most recent loudness, in negative dBov as RFC 6464 carries it: 0 is full
+// Ordered loudest first. The position in the list *is* the rank, so there is no
+// rank field that can disagree with it.
+message AudioBinding {
+  string track_id = 1;
+  string mid = 2;
+  // Most recent loudness in negative dBov, as RFC 6464 carries it: 0 is full
   // scale, around -30 is ordinary speech, quieter is more negative. Present so a
-  // recording has the loudness envelope without re-deriving it from the media, and
-  // so a UI can show speaking intensity rather than a binary indicator.
-  int32 level_dbov = 4;
+  // recording has the loudness envelope without re-deriving it from the media,
+  // and so a UI can show intensity rather than a binary indicator.
+  int32 level_dbov = 3;
 }
 
-// ========================================================================
-// 2. Server -> Client (Unified State Synchronization)
-// ========================================================================
+// Each group is complete when present and unchanged when absent, which is what
+// lets a speaker change send only the audio group. Audio churns far faster than
+// video — a slot steal is rate-limited only by newborn immunity, so several per
+// second is reachable — and resending every video binding to say one speaker
+// moved cost several hundred bytes to carry a few. Proto3 cannot tell an empty
+// repeated field from an absent one, so the wrapper carries the distinction:
+// present-but-empty means nothing is bound, absent means unchanged.
+message VideoBindings { repeated VideoBinding items = 1; }
+message AudioBindings { repeated AudioBinding items = 1; }
 
-message StateUpdate {
-  // Monotonically strictly incrementing sequence number.
-  // Used for gap detection and ordering validation.
-  uint64 seq = 1;
-
-  // If true, the client must clear local state before applying this update.
-  // If false, the client applies changes incrementally.
-  bool is_snapshot = 2;
-
-  // Room Topology (Available Tracks)
-  repeated Track tracks_upsert = 3;
-  repeated string tracks_remove = 4;
-
-  // User State (Active Assignments)
-  repeated VideoAssignment assignments_upsert = 5;
-  repeated string assignments_remove = 6;
-
-  // Who is currently being heard, and how loudly. Sent when the set of forwarded
-  // speakers or their ordering changes; `audio_remove` carries the mids whose slot
-  // fell silent.
-  repeated AudioAssignment audio_upsert = 7;
-  repeated string audio_remove = 8;
-}
-
-// ========================================================================
-// 3. Client -> Server (Declarative Intent)
-// ========================================================================
-
-// Per received video stream, `VideoRequest` tells the server how the stream is
-// being consumed so it can spend the subscriber's limited downlink bandwidth
-// where it matters most. The server chooses one simulcast layer per stream to
-// maximize perceived quality within the available budget.
+// The room as this subscriber sees it.
 //
-// Under bandwidth contention the server, per subscriber:
+// The roster is a log: a participant or publication enters once and leaves once,
+// so it is carried as added/removed rather than resent. The bindings are bounded
+// by the subscriber's negotiated slot count, so they are sent whole and there is
+// nothing to reconcile — no sequence number, no snapshot flag, no removal list,
+// and no resync request. The signaling channel is reliable and ordered, so gaps
+// cannot happen and detecting them was never earning its keep.
+message ServerState {
+  repeated Participant participants_added = 1;
+  repeated string participants_removed = 2;   // participant ids
+  repeated Publication publications_added = 3;
+  repeated string publications_removed = 4;   // track ids
+  optional VideoBindings video = 5;
+  optional AudioBindings audio = 6;
+}
+
+// ========================================================================
+// 3. Client -> Server
+// ========================================================================
+
+// How one received video stream is being consumed, so the server can spend a
+// subscriber's limited downlink where it matters. The server chooses one
+// simulcast layer per stream to maximize perceived quality within the budget.
+//
+// Under contention the server, per subscriber:
 //   1. guarantees each stream its `min_height` floor, in `priority` order
 //      (least-important droppable streams give way first), then
-//   2. raises streams toward their `height` target, in `priority` order, one
-//      quality step at a time.
+//   2. raises streams toward `height`, in `priority` order, one step at a time.
 //
-// Optimal use: set `height` to what you actually render, `min_height` to the
-// lowest quality you still want (or 0 to allow pausing), and `priority` to how
-// much this stream matters relative to your others.
-message VideoRequest {
+// Set `height` to what you actually render, `min_height` to the lowest quality
+// you still want (or 0 to allow pausing), and `priority` to how much this stream
+// matters relative to your others.
+message VideoIntent {
+  // The m-line this subscriber wants the track delivered on. The client owns
+  // its own mids and this binding is authoritative; the server only chooses
+  // which layer to put there. Bounded at 16 characters, as elsewhere.
   string mid = 1;
   string track_id = 2;
 
   // TARGET render height in physical pixels — the size you are actually
-  // displaying this stream at. Primary quality lever: the server will not send
-  // meaningfully more than this, because pixels beyond your display size are
-  // invisible. Update it whenever your layout changes (resize, pin, fullscreen).
-  //   0  = hidden / off-screen → the server sends nothing (frees bandwidth).
-  //   >0 = the server picks the simulcast layer that best matches this size.
+  // displaying at. The primary quality lever: the server will not send
+  // meaningfully more, because pixels beyond your display size are invisible.
+  // Update it whenever your layout changes (resize, pin, fullscreen).
+  //   0  = hidden / off-screen; the server sends nothing and frees the bandwidth
+  //   >0 = the server picks the simulcast layer that best matches
   // Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
   // the streams you are actually looking at.
-  uint32 target_height = 3;
+  uint32 height = 3;
 
-  // Relative importance for bandwidth contention — decides the ORDER in which
-  // streams keep and gain quality when not everything fits. Higher = more
-  // important; 0 = least. It is an order only, not a size (size is `height`),
-  // so do not encode display size here.
-  //
-  // A free scalar, so it can be driven continuously and dynamically — e.g. from
-  // an active-speaker score, gaze/focus, or a proximity/danger sensor.
-  // Suggested (non-binding) convention: 0 background, 100 normal, 200 focused /
-  // active speaker, 255+ safety-critical. Any monotonically increasing scheme
-  // works.
-  uint32 priority = 4;
+  // FLOOR: the lowest render height to keep under contention. The server holds
+  // the stream at or above this as long as it can, dropping below it only when
+  // no budget remains after higher-`priority` streams.
+  //   0              = droppable: may be paused entirely
+  //   0 < n < height = keep at least ~n px (a small always-visible tile)
+  //   n == height    = pin at full quality: never degrade
+  uint32 min_height = 4;
 
-  // FLOOR: the lowest render height to keep for this stream under contention.
-  // The server holds the stream at or above this resolution as long as it
-  // possibly can, dropping below it (to paused) only when no budget remains
-  // after higher-`priority` streams.
-  //   0              = droppable: may be paused entirely under contention
-  //                    (use for background/auxiliary streams).
-  //   0 < n < height = keep at least ~n px (e.g. a small always-visible tile).
-  //   n == height    = pin at full quality: never degrade (safety-critical /
-  //                    focused stream).
-  //
-  // Examples:
-  //   Teleoperation front camera : height=1080 priority=255 min_height=1080
-  //   Teleoperation side camera  : height=480  priority=5   min_height=0
-  //   Conference active speaker  : height=720  priority=200 min_height=180
-  //   Conference other tile      : height=360  priority=10  min_height=90
-  //   Conference minimized tile  : height=0
-  uint32 min_height = 5;
+  // FLOOR: the lowest frame rate to keep under contention, for scalable
+  // (Dependency Descriptor) streams. The temporal analog of `min_height`: the
+  // server sheds temporal layers to save bandwidth but never below the decode
+  // target that still delivers this many frames per second. Ignored for
+  // non-scalable streams and when the stream advertises no frame rate.
+  uint32 min_fps = 5;
 
-  // FLOOR: the lowest frame rate to keep for this stream under contention, for
-  // scalable (Dependency Descriptor) streams. The temporal analog of
-  // `min_height`: the server sheds temporal layers to save bandwidth, but never
-  // below the decode target that still delivers at least this many frames per
-  // second. Ignored for non-scalable streams (they have no temporal layers to
-  // shed) and when the stream advertises no frame rate.
-  //   0   = no temporal floor: may be shed to the base temporal layer (lowest
-  //         fps) or paused, per `min_height`.
-  //   >0  = keep at least ~this fps (e.g. motion/teleop streams that must stay
-  //         smooth even at reduced resolution).
+  // Relative importance for contention — the ORDER in which streams keep and
+  // gain quality when not everything fits. Higher is more important; 0 is least.
+  // An order only, not a size, so do not encode display size here.
   //
-  // Examples:
-  //   Teleoperation camera (must stay smooth) : height=720 min_height=180 min_fps=30
-  //   Conference tile (smoothness optional)   : height=360 min_height=90  min_fps=0
-  uint32 min_fps = 6;
+  // A free scalar, so it can be driven continuously — from an active-speaker
+  // score, gaze/focus, or a proximity sensor. Suggested convention: 0
+  // background, 100 normal, 200 focused, 255+ safety-critical.
+  uint32 priority = 6;
 }
 
-message UpstreamIntent {
+// How this subscriber wants its audio slots filled.
+//
+// Auto is the default and the common case: `{ auto: true, pinned: [] }` is what
+// a client that sends no AudioIntent gets, and matches the SFU's behaviour
+// before this message existed. Pinning is the exception layered on top.
+//
+// Pins name tracks rather than participants because selection ranks tracks: one
+// participant may publish a microphone and a screen-share audio track, and
+// pinning one must not pin the other.
+message AudioIntent {
+  // Tracks that hold a slot regardless of loudness, in preference order. Pins
+  // beyond the negotiated slot count are ignored rather than rejected.
+  repeated string pinned = 1;
+  // Fill the slots pinning does not claim by loudness. false = hear only pins.
+  bool auto = 2;
+}
+
+// Publisher intent for explicit stop.
+//   active=false: explicit unpublish.
+//   active=true:  advisory; the server may also publish implicitly.
+//
+// Kept rather than inferred from the media. VLA describes the layers of a stream
+// that is already flowing and never withdraws one, and it is video-only, so an
+// audio publisher has nothing to withdraw with. Inferring from silence would
+// trade an exact signal for a timeout that flaps on a network stall, and DTX
+// means a muted participant legitimately sends nothing indefinitely.
+message PublishIntent {
   string mid = 1;
-  // Publisher intent for explicit stop behavior.
-  // - active=false: explicit stop/unpublish intent from publisher.
-  // - active=true: advisory publish intent; server may also publish implicitly.
   bool active = 2;
 }
 
@@ -180,29 +223,32 @@ message UpstreamIntent {
 //                     `max` is the hard latency ceiling — the receiver conceals
 //                     rather than buffer past it.
 //
-// ONE-WAY: every session starts in adaptive mode (browser owns the jitter buffer;
-// no extension is sent). This message transitions the session to FIXED mode.
-// The extension is sticky in libwebrtc — there is no wire "unset" — so returning
-// to true adaptive requires a new session. Client SDKs must encode this constraint
-// in their API (e.g. `setLatency` is a one-way call; `latencyLocked` flag).
+// ONE-WAY: every session starts adaptive (the browser owns the jitter buffer and
+// no extension is sent). This transitions the session to FIXED. The extension is
+// sticky in libwebrtc — there is no wire "unset" — so returning to adaptive
+// requires a new session. Client SDKs must encode that constraint in their API.
 message PlayoutDelay {
   uint32 min_ms = 1;
   uint32 max_ms = 2;
 }
 
-message ClientIntent {
-  repeated VideoRequest downstream_requests = 1;
-  repeated UpstreamIntent upstream_intents = 2;
+// Options that are set once per session if ever. Behind one tag so the
+// single-byte tag range stays available to fields sent on every message.
+message Extensions {
+  // Absent → adaptive (initial) state. This is the ONLY way to get true adaptive
+  // behaviour: once sent, it is permanent for the session, so omitting it again
+  // does nothing to the receiver's already-stamped bounds.
+  // Present → fixed mode: the SFU stamps these bounds on ALL egress RTP, audio
+  // and video together, preserving lip-sync.
+  optional PlayoutDelay playout_delay = 1;
+}
 
-  // Absent → adaptive (initial) state: browser owns the jitter buffer; SFU
-  //          stamps no extension. This is the ONLY way to get true adaptive
-  //          behavior — once `playout_delay` is sent it is permanent for the
-  //          session (sticky extension, no wire unset). Do NOT send this field
-  //          and then omit it hoping to reset; omission after a prior send does
-  //          nothing to the receiver's already-stamped bounds.
-  // Present → fixed mode: SFU stamps these bounds on ALL egress RTP (audio +
-  //           video together, preserving A/V lip-sync).
-  optional PlayoutDelay playout_delay = 3;
+message ClientIntent {
+  repeated VideoIntent video = 1;
+  AudioIntent audio = 2;
+  repeated PublishIntent publish = 3;
+  // 4..14 are reserved for fields sent on every message; see Extensions.
+  Extensions ext = 15;
 }
 
 // ========================================================================
@@ -212,13 +258,12 @@ message ClientIntent {
 message ClientMessage {
   oneof payload {
     ClientIntent intent = 1;
-    bool request_sync = 2;
   }
 }
 
 message ServerMessage {
   oneof payload {
-    StateUpdate update = 1;
+    ServerState state = 1;
     string error = 2;
   }
 }

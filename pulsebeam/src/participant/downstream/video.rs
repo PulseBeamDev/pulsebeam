@@ -827,6 +827,21 @@ impl Slot {
         let Some(staging) = self.desired.as_ref() else {
             return;
         };
+        // The fanout key is what addresses the request to the publisher's shard,
+        // and it arrives asynchronously: the control plane publishes it in the
+        // view delta that installs this subscription, some time after the
+        // subscribe. Until it lands the shard can only drop the request, so
+        // issuing one now would burn a retry - and enough of those reach
+        // keepalive cadence having never sent a single PLI, which leaves the
+        // subscriber black until something else happens to ask.
+        //
+        // Media dropped in that same window is fine and self-heals, because more
+        // of it is always coming. A keyframe request is one-shot; losing it
+        // costs the whole stream.
+        let Some(fanout) = fanouts.get(&staging.stream_id().0).copied() else {
+            return;
+        };
+
         let last_at = self.staging_keyframe_last_at;
         let retries = self.staging_keyframe_retries;
 
@@ -862,7 +877,7 @@ impl Slot {
             );
         }
 
-        events.request_keyframe(staging, fanouts.get(&staging.stream_id().0).copied());
+        events.request_keyframe(staging, Some(fanout));
     }
 
     fn switch_to(&mut self, new_layer: &TrackLayer, force: bool) -> bool {
@@ -1994,6 +2009,18 @@ mod assignment_tests {
         assert_eq!(allocator.slots().count(), 2);
     }
 
+    /// The fanout bindings a subscription has once its view delta has landed.
+    ///
+    /// Tests that exercise retry cadence need this: an empty map means the
+    /// binding has not arrived yet, and no request may be issued in that state.
+    fn bound_fanouts(allocator: &VideoAllocator) -> HashMap<TrackId, TrackKey> {
+        let mut keys: SlotMap<TrackKey, ()> = SlotMap::with_key();
+        allocator
+            .tracks()
+            .map(|meta| (meta.id, keys.insert(())))
+            .collect()
+    }
+
     #[test]
     fn route_subscription_initializes_keyframe_retry_state() {
         let mut allocator = setup_allocator();
@@ -2018,12 +2045,39 @@ mod assignment_tests {
             "reconcile_routes no longer emits an immediate keyframe request"
         );
 
+        let fanouts = bound_fanouts(&allocator);
         let mut queue = MockParticipantSink::new();
-        allocator.retry_keyframe_requests(now, &mut queue, &HashMap::new());
+        allocator.retry_keyframe_requests(now, &mut queue, &fanouts);
         assert_eq!(
             queue.request_keyframe_calls.len(),
             1,
             "retry_keyframe_requests should not send an immediate duplicate PLI after reconcile_routes"
+        );
+
+        // Before the view delta lands there is nothing to address the request
+        // to, and the shard would only drop it. Issuing anyway burns a retry,
+        // and enough of those reach keepalive cadence having never sent a PLI -
+        // which leaves the subscriber black. See
+        // `late_joiner_receives_earlier_participant_in_both_directions_test`.
+        let mut unbound = MockParticipantSink::new();
+        let mut fresh = setup_allocator();
+        let fresh_tracks = add_tracks(&mut fresh, 1);
+        add_slots(&mut fresh, 1);
+        let low = fresh
+            .track(&fresh_tracks.ids[0])
+            .unwrap()
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
+        let slot = fresh.slots.values_mut().next().unwrap();
+        slot.set_roles_for_test(None, Some(&low));
+        slot.paused = false;
+        fresh.reconcile_routes(&mut unbound);
+        fresh.retry_keyframe_requests(now, &mut unbound, &HashMap::new());
+        assert_eq!(
+            unbound.request_keyframe_calls.len(),
+            0,
+            "a keyframe request must not be issued before its fanout binding exists"
         );
     }
 
@@ -3895,10 +3949,14 @@ mod slot_switch_tests {
         fx.ingest_all(&high, &f);
         assert!(fx.emitted.len() > before);
 
-        // PLI is what unblocks the switch.
+        // PLI is what unblocks the switch. The fanout binding is what addresses
+        // it: without one the shard can only drop the request, so `pli_retry`
+        // withholds it rather than burning a retry on a request that cannot land.
         let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
-        fx.slot
-            .pli_retry(Instant::now(), &mut sink, &HashMap::new());
+        let mut keys: SlotMap<TrackKey, ()> = SlotMap::with_key();
+        let fanouts: HashMap<TrackId, TrackKey> =
+            [(low.stream_id().0, keys.insert(()))].into_iter().collect();
+        fx.slot.pli_retry(Instant::now(), &mut sink, &fanouts);
         assert_eq!(
             sink.request_keyframe_calls.first().map(|c| c.0),
             Some(low.stream_id()),

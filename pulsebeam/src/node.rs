@@ -1170,3 +1170,81 @@ mod internal {
         StatusCode::OK
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // Convenience only: a test is not a shard, so nothing here is
+    // cross-core. See docs/thread-per-core.md.
+    use super::*;
+
+    /// The defaults are the deployment nobody configures, so they are a contract.
+    ///
+    /// `run()` is orchestration the simulation covers end to end; what a unit test can hold is the
+    /// configuration it starts from, where a silent change turns into a differently-shaped node
+    /// with every test still green.
+    #[test]
+    fn the_defaults_describe_a_single_worker_node_with_no_services() {
+        let builder = NodeBuilder::new();
+
+        assert_eq!(builder.workers, 1);
+        assert!(builder.local_addr.is_none());
+        assert!(builder.external_addrs.is_empty());
+        assert!(builder.http_api.is_none(), "no API is exposed unless asked");
+        assert!(builder.internal_metrics.is_none());
+        assert!(!builder.tcp_only, "UDP candidates are offered by default");
+        assert!(matches!(builder.udp_mode, UdpMode::Batch));
+        assert!(matches!(
+            builder.worker_execution,
+            WorkerExecution::ThreadPerWorker
+        ));
+        assert!(matches!(
+            builder.room_placement,
+            crate::control::core::RoomPlacement::Hashed
+        ));
+        assert_eq!(
+            builder.room_shard_slot,
+            crate::control::core::DEFAULT_ROOM_SHARD_SLOT
+        );
+    }
+
+    #[test]
+    fn the_builder_records_what_it_was_asked_for() {
+        let addr: SocketAddr = "127.0.0.1:7070".parse().unwrap();
+        let builder = NodeBuilder::new()
+            .workers(4)
+            .local_addr(addr)
+            .external_addrs(vec![addr])
+            .room_shard_slot(9)
+            .round_robin_rooms()
+            .tcp_only();
+
+        assert_eq!(builder.workers, 4);
+        assert_eq!(builder.local_addr, Some(addr));
+        assert_eq!(builder.external_addrs, vec![addr]);
+        assert_eq!(builder.room_shard_slot, 9);
+        assert!(builder.tcp_only);
+        assert!(matches!(
+            builder.room_placement,
+            crate::control::core::RoomPlacement::RoundRobin
+        ));
+    }
+
+    /// A zero-participant slot would divide by zero when placement asks which slot a room is on.
+    /// Rejecting it at the builder is the difference between a misconfiguration and a crash on the
+    /// first join.
+    #[test]
+    #[should_panic(expected = "at least one participant")]
+    fn a_shard_slot_must_hold_somebody() {
+        let _ = NodeBuilder::new().room_shard_slot(0);
+    }
+
+    /// `Default` and `new` must not drift: one is what most callers get and the other is what the
+    /// tests above pin down.
+    #[test]
+    fn default_is_new() {
+        let (a, b) = (NodeBuilder::default(), NodeBuilder::new());
+        assert_eq!(a.workers, b.workers);
+        assert_eq!(a.room_shard_slot, b.room_shard_slot);
+        assert_eq!(a.tcp_only, b.tcp_only);
+    }
+}
