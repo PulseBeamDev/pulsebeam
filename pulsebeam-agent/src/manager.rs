@@ -132,6 +132,11 @@ impl SubscriptionManager {
         self.active_assignments.clear();
     }
 
+    pub fn replace_slots(&mut self, slots: Vec<Mid>) {
+        self.slots = slots;
+        self.active_assignments.clear();
+    }
+
     pub fn remove_track(&mut self, track_id: &str) {
         debug_assert!(!track_id.is_empty());
         self.desired

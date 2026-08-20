@@ -1,5 +1,10 @@
 # Simulation testing
 
+The profile and convergence contract for new tests is in
+[`docs/sim.md`](sim.md). This document explains determinism, seeds, oracles and
+measurement discipline; it is not permission for each plan to invent its own
+network defaults.
+
 The SFU is tested by running it against a simulated network — simulated clock,
 simulated randomness, modelled capacity, queueing, loss, reordering and
 partitions. The approach is FoundationDB's and TigerBeetle's: **one seed
@@ -9,7 +14,7 @@ determines one entire run**, so anything found can be replayed exactly.
 
 | Command | What it is |
 |---|---|
-| `make test` | what CI runs: 584 unit tests + 71 simulation plans |
+| `make test` | what CI runs: unit tests + 107 active simulation tests (110 registered, 3 ignored) |
 | `make test-sim-seed SEED=<n>` | replay one seed exactly |
 | `make sim-sweep` | search for seeds nobody has tried |
 
@@ -151,9 +156,9 @@ wrong and nothing goes wrong in a simulator unless the simulator makes it. Aroun
 `debug_assert!`/`fatal!` sites here assert a condition cannot arise, and the route-install callers
 each have a rollback that had never executed.
 
-`buggify!("site")` declares such a point; `.with_buggify(permille)` arms it for a plan. Off
-everywhere else, so the rest of the suite keeps testing the happy path, and compiled out entirely
-without the `sim` feature.
+`buggify!("site")` declares such a point; the shared simulator profile arms it at 10‰ and
+`.with_buggify(permille)` overrides that rate for a named recovery plan. It is compiled out
+entirely without the `sim` feature.
 
 Two rules learned immediately:
 
@@ -188,9 +193,9 @@ scoped to a listener's experience, and a 200ms gap is a lost syllable where the 
 is a stutter nobody remarks on. `AudioStream` has the raw material (`packets`, `longest_gap`); what
 is missing is an `AudioQoe` with its own bar, mirroring `Qoe` rather than reusing it.
 
-**Temporal layers.** Generated scenarios never publish with `with_temporal_dd`, so shedding
-framerate instead of pausing a stream - the graceful degradation a weak link should get - is
-untested by any property.
+**Temporal layers.** One generated scenario publishes with `with_temporal_dd` and exercises
+framerate shedding. The generated suite still lacks temporal-layer coverage across the full
+cross-shard, opaque-payload, marker-only and recovery matrix; that remains a planned gap.
 
 **Torn frames.** 1,370 across a suite run, measured and reported, asserted on by nothing. A frame
 preceded by a sequence hole is visible corruption.

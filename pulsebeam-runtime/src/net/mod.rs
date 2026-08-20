@@ -3,6 +3,8 @@ mod bound_udp;
 #[cfg(feature = "sim")]
 pub mod shaper;
 pub mod tcp;
+#[cfg(feature = "sim")]
+pub mod udp_batch_sim;
 pub mod udp_scalar;
 
 #[cfg(target_os = "linux")]
@@ -142,6 +144,9 @@ pub async fn bind(
 }
 
 pub enum UnifiedSocket {
+    #[cfg(feature = "sim")]
+    Udp(udp_batch_sim::UdpTransport),
+    #[cfg(not(feature = "sim"))]
     Udp(udp::UdpTransport),
     UdpScalar(udp_scalar::UdpTransport),
 }
@@ -206,6 +211,9 @@ impl UnifiedSocket {
 
     pub fn transport(&self) -> Transport {
         match self {
+            #[cfg(feature = "sim")]
+            Self::Udp(_) => Transport::Udp(UdpMode::Batch),
+            #[cfg(not(feature = "sim"))]
             Self::Udp(_) => Transport::Udp(udp::MODE),
             Self::UdpScalar(_) => Transport::Udp(UdpMode::Scalar),
         }

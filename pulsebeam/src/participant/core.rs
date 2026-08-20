@@ -275,6 +275,8 @@ pub struct ParticipantCore {
     reliable_sub_streams: HashMap<ChannelId, ReliableStreamKey>,
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
     reliable_channels: ReliableChannels,
+    pending_data_pub_streams: HashMap<Topic, UnreliableStreamKey>,
+    pending_reliable_pub_streams: HashMap<Topic, ReliableStreamKey>,
 
     /// Attributes str0m's own logs to this participant, for the simulator only.
     ///
@@ -339,10 +341,11 @@ impl ParticipantCore {
         topic: &Topic,
         stream: UnreliableStreamKey,
     ) {
-        let Some(&channel) = self.data_pub_channels.get(topic) else {
-            return;
-        };
-        self.data_pub_streams.insert(channel, stream);
+        if let Some(&channel) = self.data_pub_channels.get(topic) {
+            self.data_pub_streams.insert(channel, stream);
+        } else {
+            self.pending_data_pub_streams.insert(topic.clone(), stream);
+        }
     }
 
     pub(crate) fn bind_published_reliable_stream(
@@ -350,10 +353,12 @@ impl ParticipantCore {
         topic: &Topic,
         stream: ReliableStreamKey,
     ) {
-        let Some(channel) = self.reliable_channels.publisher_channel(topic) else {
-            return;
-        };
-        self.reliable_pub_streams.insert(channel, stream);
+        if let Some(channel) = self.reliable_channels.publisher_channel(topic) {
+            self.reliable_pub_streams.insert(channel, stream);
+        } else {
+            self.pending_reliable_pub_streams
+                .insert(topic.clone(), stream);
+        }
     }
 
     pub fn new(
@@ -412,6 +417,8 @@ impl ParticipantCore {
             data_pub_channels: HashMap::new(),
             data_sub_channels: HashMap::new(),
             reliable_channels: ReliableChannels::new(),
+            pending_data_pub_streams: HashMap::new(),
+            pending_reliable_pub_streams: HashMap::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -1129,6 +1136,12 @@ impl ParticipantCore {
                                 self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
                                 return;
                             }
+                            if e.direction == DataTrackDirection::Publish
+                                && let Some(stream) =
+                                    self.pending_reliable_pub_streams.remove(&e.topic)
+                            {
+                                self.reliable_pub_streams.insert(cid, stream);
+                            }
                             self.data_topic_channels.insert(cid, e);
                             return;
                         }
@@ -1164,6 +1177,10 @@ impl ParticipantCore {
                         match e.direction {
                             DataTrackDirection::Publish => {
                                 self.data_pub_channels.insert(e.topic.clone(), cid);
+                                if let Some(stream) = self.pending_data_pub_streams.remove(&e.topic)
+                                {
+                                    self.data_pub_streams.insert(cid, stream);
+                                }
                                 events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
@@ -1474,6 +1491,8 @@ impl ParticipantCore {
         self.data_pub_channels.clear();
         self.data_sub_channels.clear();
         self.reliable_channels.clear();
+        self.pending_data_pub_streams.clear();
+        self.pending_reliable_pub_streams.clear();
         self.reliable_pub_streams.clear();
         self.reliable_sub_streams.clear();
     }
@@ -1487,12 +1506,17 @@ impl ParticipantCore {
         if ch.lane == DataLane::Reliable {
             self.reliable_pub_streams.remove(&cid);
             self.reliable_sub_streams.remove(&cid);
+            if ch.direction == DataTrackDirection::Publish {
+                self.pending_reliable_pub_streams.remove(&ch.topic);
+            }
             self.reliable_channels.close(ch, events);
             return;
         }
 
         match ch.direction {
             DataTrackDirection::Publish => {
+                self.data_pub_streams.remove(&cid);
+                self.pending_data_pub_streams.remove(&ch.topic);
                 self.data_pub_channels.remove(&ch.topic);
                 events.unpublish_data_topic(ch.topic);
             }

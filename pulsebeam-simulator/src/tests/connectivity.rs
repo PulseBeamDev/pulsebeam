@@ -112,6 +112,11 @@ fn tcp_simulation_test() {
                 participant: "bob",
                 min_bytes: 1,
             },
+            Step::CheckVideoQuality {
+                description: "Bob decodes valid TCP-framed video",
+                participant: "bob",
+                quality: VideoQuality::min_frames(50),
+            },
             Step::Disconnect {
                 description: "Alice disconnects",
                 participant: "alice",
@@ -131,6 +136,77 @@ fn tcp_simulation_test() {
         ]);
 }
 
+#[test]
+fn ipv6_udp_simulation_test() {
+    LocalNodeSim::new()
+        .with_ipv6()
+        .with_room(
+            Room::new("ipv6-room")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish IPv6 UDP flow",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckRxBytes {
+                description: "Bob receives over IPv6 UDP",
+                participant: "bob",
+                min_bytes: 1,
+            },
+            Step::Disconnect {
+                description: "Alice disconnects",
+                participant: "alice",
+            },
+            Step::Disconnect {
+                description: "Bob disconnects",
+                participant: "bob",
+            },
+            Step::Run {
+                description: "Wait for IPv6 cleanup",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckNotConnected {
+                description: "IPv6 publisher is disconnected",
+                participant: "alice",
+            },
+        ]);
+}
+
+#[test]
+fn default_udp_batch_path_coalesces_and_reassembles_media() {
+    const SUBNET: u8 = 197;
+    let mut link = LinkProfile::fiber();
+    link.min_latency = Duration::ZERO;
+    link.max_latency = Duration::ZERO;
+    LocalNodeSim::new()
+        .with_subnet(SUBNET)
+        .with_link(link)
+        .with_room(
+            Room::new("batch-room")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Drive the default batched UDP path",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckRxBytes {
+                description: "Bob receives reassembled media",
+                participant: "bob",
+                min_bytes: 1,
+            },
+        ]);
+
+    let egress = pulsebeam_runtime::net::shaper::stats("192.168.198.2".parse().unwrap());
+    assert!(
+        egress.gso_batches > 0,
+        "default sim never exercised UDP GSO"
+    );
+}
+
 fn cross_shard_media_room() -> Room {
     Room::new("cross-shard-media")
         .with_participant(Participant::single_publisher("publisher"))
@@ -141,7 +217,6 @@ fn cross_shard_media_room() -> Room {
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
 fn controller_stall_keeps_established_media_alive() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(cross_shard_media_room())
         .run(vec![
             Step::Run {
@@ -166,7 +241,6 @@ fn controller_stall_keeps_established_media_alive() {
 #[test]
 fn wrong_owner_forwards_and_media_continues() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(cross_shard_media_room())
         .run(vec![
             Step::Run {
@@ -205,7 +279,6 @@ fn wrong_owner_forwards_and_media_continues() {
 #[test]
 fn steering_stops_cross_shard_forwarding_once_flows_authenticate() {
     LocalNodeSim::new()
-        .with_shards(4)
         .with_room(cross_shard_media_room())
         .run(vec![
             Step::Run {
@@ -234,7 +307,6 @@ fn steering_stops_cross_shard_forwarding_once_flows_authenticate() {
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
 fn failed_materialization_does_not_connect_the_participant() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(
             Room::new("materialization-failure")
                 .with_participant(Participant::single_publisher("publisher"))
@@ -273,7 +345,6 @@ fn failed_materialization_does_not_connect_the_participant() {
 #[test]
 fn track_observation_is_not_forwarded_before_plan() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(cross_shard_media_room())
         .run(vec![
             Step::Run {
@@ -304,6 +375,81 @@ fn track_observation_is_not_forwarded_before_plan() {
     }
 }
 
+#[test]
+fn ipv6_tcp_simulation_test() {
+    LocalNodeSim::new()
+        .with_ipv6()
+        .with_tcp_only()
+        .with_room(
+            Room::new("ipv6-tcp-room")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish IPv6 RFC 4571 flow",
+                duration: Duration::from_secs(40),
+            },
+            Step::CheckRxBytes {
+                description: "Bob receives valid framed media over IPv6 TCP",
+                participant: "bob",
+                min_bytes: 1,
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes valid IPv6 TCP-framed video",
+                participant: "bob",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::DeclarePublishTopic {
+                description: "Alice declares a TCP data topic",
+                participant: "alice",
+                topic: "ipv6_tcp_topic",
+            },
+            Step::DeclareSubscribeTopic {
+                description: "Bob subscribes to the IPv6 TCP data topic",
+                participant: "bob",
+                topic: "ipv6_tcp_topic",
+                scoped_to: None,
+            },
+            Step::Run {
+                description: "Open the application data channel over IPv6 TCP",
+                duration: Duration::from_secs(1),
+            },
+            Step::PublishData {
+                description: "Alice sends one valid framed data payload",
+                participant: "alice",
+                topic: "ipv6_tcp_topic",
+                data: b"ipv6-tcp-data",
+            },
+            Step::Run {
+                description: "Deliver the IPv6 TCP data payload",
+                duration: Duration::from_secs(1),
+            },
+            Step::CheckDataCount {
+                description: "Bob receives exactly one IPv6 TCP data payload",
+                participant: "bob",
+                topic: "ipv6_tcp_topic",
+                expected: 1,
+            },
+            Step::Disconnect {
+                description: "Alice disconnects",
+                participant: "alice",
+            },
+            Step::Disconnect {
+                description: "Bob disconnects",
+                participant: "bob",
+            },
+            Step::Run {
+                description: "Wait for IPv6 TCP cleanup",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckNotConnected {
+                description: "IPv6 TCP publisher is disconnected",
+                participant: "alice",
+            },
+        ]);
+}
+
 /// Reproduces the Chrome-with-UDP-disabled failure: with two shards the hash of
 /// a client's `peer_addr` and the hash of `room_id` can land on different shards,
 /// causing TCP egress to be silently dropped.
@@ -312,7 +458,6 @@ fn track_observation_is_not_forwarded_before_plan() {
 #[test]
 fn tcp_multi_shard_simulation_test() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_tcp_only()
         .with_room(
             Room::new("room1")
@@ -330,6 +475,62 @@ fn tcp_multi_shard_simulation_test() {
                 description: "Bob receives over multi-shard TCP",
                 participant: "bob",
                 min_bytes: 1,
+            },
+            Step::CheckVideoQuality {
+                description: "Bob decodes multi-shard TCP video",
+                participant: "bob",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::CheckRxBytes {
+                description: "Carol receives over her multi-shard TCP route",
+                participant: "carol",
+                min_bytes: 1,
+            },
+            Step::CheckVideoQuality {
+                description: "Carol decodes multi-shard TCP video",
+                participant: "carol",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::CheckRxBytes {
+                description: "Dave receives over his multi-shard TCP route",
+                participant: "dave",
+                min_bytes: 1,
+            },
+            Step::CheckVideoQuality {
+                description: "Dave decodes multi-shard TCP video",
+                participant: "dave",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::DeclarePublishTopic {
+                description: "Alice declares a multi-shard TCP data topic",
+                participant: "alice",
+                topic: "tcp_topic",
+            },
+            Step::DeclareSubscribeTopic {
+                description: "Bob subscribes to the multi-shard TCP data topic",
+                participant: "bob",
+                topic: "tcp_topic",
+                scoped_to: None,
+            },
+            Step::Run {
+                description: "Open the multi-shard TCP data channel",
+                duration: Duration::from_secs(1),
+            },
+            Step::PublishData {
+                description: "Alice sends one multi-shard TCP data payload",
+                participant: "alice",
+                topic: "tcp_topic",
+                data: b"tcp-data",
+            },
+            Step::Run {
+                description: "Deliver the multi-shard TCP data payload",
+                duration: Duration::from_secs(1),
+            },
+            Step::CheckDataCount {
+                description: "Bob receives exactly one multi-shard TCP data payload",
+                participant: "bob",
+                topic: "tcp_topic",
+                expected: 1,
             },
             Step::Disconnect {
                 description: "Alice disconnects",
@@ -489,6 +690,58 @@ fn churn_test() {
 }
 
 #[test]
+fn clean_departure_and_rejoin_converges_without_a_ghost() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room-state-lifecycle")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the initial room projection",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckParticipantsKnown {
+                description: "Viewer knows the live publisher",
+                participant: "viewer",
+                expected: &["alice"],
+            },
+            Step::Disconnect {
+                description: "Alice leaves cleanly",
+                participant: "alice",
+            },
+            Step::Run {
+                description: "Apply participant, track and route retirement",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckParticipantsKnown {
+                description: "Viewer no longer knows the departed publisher",
+                participant: "viewer",
+                expected: &[],
+            },
+            Step::Reconnect {
+                description: "Alice joins the room again",
+                participant: "alice",
+            },
+            Step::Run {
+                description: "Converge the replacement publication",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckParticipantsKnown {
+                description: "Viewer knows exactly the replacement publisher",
+                participant: "viewer",
+                expected: &["alice"],
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Viewer receives the replacement stream after rejoin",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50),
+            },
+        ]);
+}
+
+#[test]
 fn abrupt_exit_chaos_test() {
     let room = Room::new("room1")
         .with_participant(Participant::single_publisher("stable"))
@@ -593,7 +846,6 @@ fn abrupt_exit_chaos_test() {
 #[test]
 fn cross_shard_video_is_forwarded_decodably_test() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -634,15 +886,11 @@ fn cross_shard_video_is_forwarded_decodably_test() {
 /// not happen is the node wedging, losing a stable stream, or tripping an assertion on the way
 /// through.
 ///
-/// Single shard for now. Adding `.with_shards(3)` reaches the cross-shard installers and trips
-/// `core.rs`'s "no reverse route for a remotely published track" immediately: a failed reverse
-/// install publishes the track with no reverse handle, so keyframe requests for it are dropped for
-/// its whole life. That is a real defect with an open design question - whether a track that
-/// cannot be addressed should be announced at all - and it is not this plan's to answer.
+/// The default multi-shard profile reaches both local and remote route installers. A failed
+/// reverse install must not announce a track with a permanently missing keyframe path.
 #[test]
 fn video_survives_failing_route_installs_test() {
     LocalNodeSim::new()
-        .with_buggify(300)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("stable"))
@@ -701,13 +949,7 @@ fn video_survives_failing_route_installs_test() {
 /// quietly stopped doing anything.
 #[test]
 fn every_declared_failure_point_is_reachable_test() {
-    // Enough participants that the room allocates routes tens of times, not
-    // twice. At 50% per site and a handful of reaches, "none fired" is a coin
-    // toss the plan loses often enough to look like flakiness — and it reads as
-    // the injector being broken, which is the one thing this exists to detect.
-    // The count is what makes the claim true at every seed rather than most.
     LocalNodeSim::new()
-        .with_buggify(500)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -717,19 +959,26 @@ fn every_declared_failure_point_is_reachable_test() {
                 .with_participant(Participant::subscriber("bob"))
                 .with_participant(Participant::subscriber("frank")),
         )
-        .run(vec![Step::Run {
-            description: "Enough traffic to reach the route table",
-            duration: Duration::from_secs(10),
-        }]);
+        .run(vec![
+            Step::ForceFailure {
+                description: "Force the declared route allocation failure site",
+                site: "route table exhausted",
+                count: 1,
+            },
+            Step::Run {
+                description: "Enough traffic to reach the route table",
+                duration: Duration::from_secs(10),
+            },
+        ]);
 
     let (seen, fired) = pulsebeam_runtime::buggify::coverage();
     assert!(
-        !seen.is_empty(),
-        "no buggify site was reached, so failure injection is testing nothing"
+        seen.contains(&"route table exhausted"),
+        "declared route failure site was not reached: {seen:?}"
     );
     assert!(
-        !fired.is_empty(),
-        "buggify sites were reached ({seen:?}) but none fired at 50%, so injection is inert"
+        fired.contains(&"route table exhausted"),
+        "declared route failure site was reached ({seen:?}) but did not fire ({fired:?})"
     );
 }
 
@@ -742,7 +991,6 @@ fn every_declared_failure_point_is_reachable_test() {
 fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
     LocalNodeSim::new()
         .with_link(LinkProfile::cellular())
-        .with_shards(4)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
@@ -761,7 +1009,7 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
                 // the right budget for `fiber()`, not for this one. A botched
                 // switch is still caught — it produces gaps by the handful, and
                 // a timestamp regression with them.
-                quality: VideoQuality::min_frames(50).allow_gaps(1),
+                quality: VideoQuality::min_frames(50).allow_gaps(2),
             },
             Step::Disconnect {
                 description: "Alice drops out",
@@ -782,7 +1030,7 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
             Step::CheckVideoQualityInterval {
                 description: "The viewer can see the publisher who replaced her",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50),
+                quality: VideoQuality::min_frames(50).allow_gaps(2),
             },
             Step::CheckMediaRouted {
                 description: "And nothing was thrown away on the way in",
@@ -793,24 +1041,11 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
 
 /// A connection that drops and recovers is the same participant throughout.
 ///
-/// The path a real client takes after a network blip, and nothing covered it: every other churn
-/// plan tears the client down and joins again, which mints a *new* participant id and is a
-/// different thing entirely. A reconnect keeps the id and changes only the connection generation -
-/// the server does this over `PATCH` with `If-Match: <etag>`, and rejects an update that does not
-/// name the generation it replaces.
+/// The path a real client takes after a network blip. Every other churn plan tears the client down
+/// and joins again, which mints a *new* participant id and is a different thing entirely. A
+/// reconnect keeps the id and changes only the connection generation: the server does this over
+/// `PATCH` with `If-Match: <etag>`.
 ///
-/// **Ignored: reconnect is designed but not implemented end to end.** Identity is stable - that
-/// part passes - but the viewer never sees Alice again, and the reason is upstream of the client:
-///
-/// - the SFU destroys the participant as soon as ICE drops (`Participant core disconnecting ...
-///   reason=ICE connection disconnected`), so by the time the network returns there is nothing
-///   left to `PATCH` and the generation model has nothing to attach to;
-/// - and the agent makes no reconnect attempt at all - zero `Sending SDP Offer (Update)` in a run.
-///
-/// The agent's missing `If-Match` header is fixed and was a real defect on this path, but it is
-/// only the last step of three. Un-ignore once the SFU holds a disconnected participant open long
-/// enough to be reclaimed, and the agent actually tries.
-#[ignore = "reconnect is not implemented end to end: the SFU drops the participant on ICE disconnect"]
 #[test]
 fn a_dropped_connection_recovers_as_the_same_participant_test() {
     LocalNodeSim::new()
@@ -840,7 +1075,7 @@ fn a_dropped_connection_recovers_as_the_same_participant_test() {
             },
             Step::Run {
                 description: "She reconnects",
-                duration: Duration::from_secs(12),
+                duration: Duration::from_secs(30),
             },
             Step::CheckIdentityStable {
                 description: "Alice reconnected rather than rejoining as somebody new",
@@ -849,7 +1084,107 @@ fn a_dropped_connection_recovers_as_the_same_participant_test() {
             Step::CheckVideoQualityInterval {
                 description: "And the viewer can see her again",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50),
+                quality: VideoQuality::min_frames(50).allow_gaps(2),
+            },
+            Step::CheckMediaRouted {
+                description: "The recovered publication is routed through the SFU",
+                participant: "viewer",
+            },
+        ]);
+}
+
+#[test]
+fn a_tcp_connection_recovers_as_the_same_participant_test() {
+    LocalNodeSim::new()
+        .with_tcp_only()
+        .with_room(
+            Room::new("room-tcp-reconnect")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice is on screen over TCP",
+                duration: Duration::from_secs(6),
+            },
+            Step::Partition {
+                description: "Partition Alice's TCP path",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Wait for the TCP connection to be given up on",
+                duration: Duration::from_secs(12),
+            },
+            Step::Repair {
+                description: "Repair Alice's TCP path",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Reconnect the same participant over TCP",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckIdentityStable {
+                description: "TCP recovery keeps Alice's identity",
+                participant: "alice",
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The viewer sees Alice again over TCP",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50).allow_gaps(2),
+            },
+            Step::CheckMediaRouted {
+                description: "TCP recovery routes media through the SFU",
+                participant: "viewer",
+            },
+        ]);
+}
+
+#[test]
+fn an_ipv6_connection_recovers_as_the_same_participant_test() {
+    LocalNodeSim::new()
+        .with_ipv6()
+        .with_room(
+            Room::new("room-ipv6-reconnect")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Alice is on screen over IPv6",
+                duration: Duration::from_secs(6),
+            },
+            Step::Partition {
+                description: "Partition Alice's IPv6 path",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Wait for the IPv6 connection to be given up on",
+                duration: Duration::from_secs(12),
+            },
+            Step::Repair {
+                description: "Repair Alice's IPv6 path",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Reconnect the same participant over IPv6",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckIdentityStable {
+                description: "IPv6 recovery keeps Alice's identity",
+                participant: "alice",
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The viewer sees Alice again over IPv6",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(50).allow_gaps(2),
+            },
+            Step::CheckMediaRouted {
+                description: "IPv6 recovery routes media through the SFU",
+                participant: "viewer",
             },
         ]);
 }

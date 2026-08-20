@@ -12,7 +12,7 @@ fn should_publish_stream_views(retired: bool, added: bool) -> bool {
 pub(super) fn insert_stream_runtime_op(
     key: crate::shard::router::RuntimeStreamKey,
     id: crate::shard::router::DataStreamId,
-    publisher: crate::shard::participants::ParticipantKey,
+    publisher: Option<crate::shard::participants::ParticipantKey>,
 ) -> crate::view::ViewOp {
     match key {
         crate::shard::router::RuntimeStreamKey::Unreliable(key) => {

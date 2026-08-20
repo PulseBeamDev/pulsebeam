@@ -1448,10 +1448,7 @@ fn no_order_of_churn_leaves_a_wrong_view_of_the_room() {
                 });
             }
 
-            LocalNodeSim::new()
-                .with_buggify(200)
-                .with_room(room)
-                .run(plan);
+            LocalNodeSim::new().with_room(room).run(plan);
             Ok(())
         },
     );

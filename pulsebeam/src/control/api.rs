@@ -107,6 +107,9 @@ impl IntoResponse for ApiError {
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::JoinError(controller::ControllerError::StaleConnection) => {
+                StatusCode::PRECONDITION_FAILED
+            }
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ApiError::JoinError(controller::ControllerError::Unknown(_))
             | ApiError::JoinError(controller::ControllerError::IOError(_))

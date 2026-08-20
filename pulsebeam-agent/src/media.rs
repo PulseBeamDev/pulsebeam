@@ -5,6 +5,7 @@ use tokio::sync::watch;
 
 use crate::{MediaFrame, agent::LocalEncoding};
 
+#[derive(Clone)]
 pub struct KeyframeNotifier(watch::Sender<u64>);
 
 #[derive(Clone, Debug)]
@@ -18,6 +19,10 @@ impl KeyframeNotifier {
 
     pub fn notify(&self) {
         self.0.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    pub(crate) fn receiver(&self) -> KeyframeReceiver {
+        KeyframeReceiver(self.0.subscribe())
     }
 }
 

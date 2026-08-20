@@ -255,6 +255,38 @@ impl LayerController {
         self.notifiers.insert(key, notifier);
     }
 
+    pub fn rebind(&mut self, old_mid: Mid, new_mid: Mid) {
+        debug_assert_ne!(old_mid, new_mid);
+        let keys: Vec<_> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|(mid, _)| *mid == old_mid)
+            .collect();
+        debug_assert!(!keys.is_empty());
+        for old_key @ (_, rid) in keys {
+            let new_key = (new_mid, rid);
+            debug_assert!(!self.states.contains_key(&new_key));
+            debug_assert!(!self.notifiers.contains_key(&new_key));
+            if let Some(position) = self.order.iter().position(|key| *key == old_key) {
+                let Some(order_key) = self.order.get_mut(position) else {
+                    debug_assert!(false, "layer controller order position must remain valid");
+                    continue;
+                };
+                *order_key = new_key;
+            }
+            if let Some(state) = self.states.remove(&old_key) {
+                self.states.insert(new_key, state);
+            }
+            if let Some(notifier) = self.notifiers.remove(&old_key) {
+                self.notifiers.insert(new_key, notifier);
+            }
+            if let Some(last_request) = self.last_keyframe_request.remove(&old_key) {
+                self.last_keyframe_request.insert(new_key, last_request);
+            }
+        }
+    }
+
     pub fn update_available(&mut self, bw: Bitrate) {
         self.available_bps = bw.as_f64();
     }

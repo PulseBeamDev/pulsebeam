@@ -232,7 +232,7 @@ impl NodeBuilder {
             .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
         if self.external_addrs.is_empty() {
             return Err(anyhow::anyhow!(
-                "NodeBuilder requires at least one external IPv4 address; call `.external_addrs(...)`"
+                "NodeBuilder requires at least one external address; call `.external_addrs(...)`"
             ));
         }
 
@@ -255,11 +255,6 @@ impl NodeBuilder {
             }
         }
 
-        if v4_addrs.is_empty() {
-            return Err(anyhow::anyhow!(
-                "NodeBuilder requires at least one IPv4 external address in `.external_addrs(...)`"
-            ));
-        }
         if v4_addrs.len() > 1 {
             return Err(anyhow::anyhow!(
                 "NodeBuilder currently supports exactly one external IPv4 address"

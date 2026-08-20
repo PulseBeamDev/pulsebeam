@@ -8,7 +8,7 @@ pub use harness::{
 
 use pulsebeam_runtime::net::UdpMode;
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
@@ -17,6 +17,9 @@ use std::{
 ///
 /// Fixed, so an ordinary run reproduces exactly and a failure bisects.
 pub const DEFAULT_SIM_SEED: u64 = 0xDEAD_BEEF;
+pub const DEFAULT_SIM_SHARDS: usize = 4;
+pub const DEFAULT_SIM_BUGGIFY_PERMILLE: u32 = 10;
+pub const DEFAULT_SIM_UDP_MODE: UdpMode = UdpMode::Batch;
 
 /// The seed for this process, `DEFAULT_SIM_SEED` unless `PULSEBEAM_SIM_SEED`
 /// overrides it.
@@ -71,6 +74,26 @@ pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {
     format!("192.168.{subnet}.{host}").parse().unwrap()
 }
 
+pub fn subnet_ip_v6(subnet: u8, host: u8) -> IpAddr {
+    IpAddr::V6(Ipv6Addr::new(
+        0xfe80,
+        0,
+        0,
+        0,
+        0,
+        0,
+        u16::from(subnet),
+        u16::from(host),
+    ))
+}
+
+pub fn unspecified_addr(ip: IpAddr, port: u16) -> SocketAddr {
+    match ip {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+    }
+}
+
 /// Start an SFU node in the simulation.
 ///
 /// `shards` above one also sets `room_shard_slot(1)` and `round_robin_rooms()`.
@@ -91,15 +114,15 @@ pub async fn start_sfu_node_with(
 ) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
-    let local_addr: SocketAddr = format!("0.0.0.0:{rtc_port}").parse()?;
-    let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
+    let local_addr = unspecified_addr(ip, rtc_port);
+    let http_api_addr = unspecified_addr(ip, 7070);
 
     let mut builder = pulsebeam::node::NodeBuilder::new()
         .workers(shards)
         .local_addr(local_addr)
         .external_addrs(vec![external_addr])
         .rng(rng)
-        .with_udp_mode(UdpMode::Scalar)
+        .with_udp_mode(DEFAULT_SIM_UDP_MODE)
         .with_http_api(http_api_addr)
         .with_current_runtime();
     if shards > 1 {
@@ -112,6 +135,26 @@ pub async fn start_sfu_node_with(
         .run(tokio_util::sync::CancellationToken::new())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod default_profile_tests {
+    use super::*;
+
+    #[test]
+    fn default_profile_is_the_production_like_failure_matrix() {
+        assert!(DEFAULT_SIM_SHARDS > 1);
+        assert!(DEFAULT_SIM_BUGGIFY_PERMILLE > 0);
+        assert_eq!(DEFAULT_SIM_UDP_MODE, UdpMode::Batch);
+
+        let link = LinkProfile::default();
+        assert!(link.loss > 0.0);
+        assert!(link.loss_model.is_some());
+        assert!(link.feedback.is_some());
+        assert!(link.reorder.probability > Reorder::NONE.probability);
+        assert!(link.reorder.delay > Reorder::NONE.delay);
+        assert!(link.duplicate > 0.0);
+    }
 }
 
 /// Run a Turmoil simulation run with a real-time timeout.

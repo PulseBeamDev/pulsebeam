@@ -1,4 +1,4 @@
-use super::{UdpMode, UnifiedSocket, udp_scalar};
+use super::{UdpMode, UnifiedSocket, udp_batch_sim, udp_scalar};
 use crate::sync::Arc;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_routing::steer::{self, FlowKey, SteerEnv, Verdict};
@@ -12,8 +12,13 @@ use std::{
 };
 
 pub struct BoundUdpSocket {
-    socket: udp_scalar::UdpTransport,
+    socket: SimUdpTransport,
     local_addr: SocketAddr,
+}
+
+enum SimUdpTransport {
+    Batch(udp_batch_sim::UdpTransport),
+    Scalar(udp_scalar::UdpTransport),
 }
 
 impl BoundUdpSocket {
@@ -21,7 +26,10 @@ impl BoundUdpSocket {
         self.local_addr
     }
     pub fn into_unified_socket(self) -> io::Result<UnifiedSocket> {
-        Ok(UnifiedSocket::UdpScalar(self.socket))
+        Ok(match self.socket {
+            SimUdpTransport::Batch(socket) => UnifiedSocket::Udp(socket),
+            SimUdpTransport::Scalar(socket) => UnifiedSocket::UdpScalar(socket),
+        })
     }
 }
 
@@ -538,7 +546,7 @@ fn spawn_pump(group: &Rc<ReuseportGroup>) {
 /// runs. See [`ReuseportGroup`].
 pub async fn bind_udp_socket(
     addr: SocketAddr,
-    _mode: UdpMode,
+    mode: UdpMode,
     external_addr: Option<SocketAddr>,
     shard_index: u16,
 ) -> io::Result<BoundUdpSocket> {
@@ -566,8 +574,22 @@ pub async fn bind_udp_socket(
         group,
         index: usize::from(shard_index),
     };
-    let socket = udp_scalar::from_reuseport_member(socket, external_addr, member)?;
-    let local_addr = socket.local_addr();
+    let socket = match mode {
+        UdpMode::Batch => SimUdpTransport::Batch(udp_batch_sim::from_reuseport_member(
+            socket,
+            external_addr,
+            member,
+        )?),
+        UdpMode::Scalar => SimUdpTransport::Scalar(udp_scalar::from_reuseport_member(
+            socket,
+            external_addr,
+            member,
+        )?),
+    };
+    let local_addr = match &socket {
+        SimUdpTransport::Batch(socket) => socket.local_addr(),
+        SimUdpTransport::Scalar(socket) => socket.local_addr(),
+    };
     Ok(BoundUdpSocket { socket, local_addr })
 }
 
