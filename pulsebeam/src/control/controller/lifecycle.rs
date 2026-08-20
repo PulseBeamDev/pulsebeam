@@ -7,21 +7,15 @@
 
 use super::*;
 
-/// Which image a publication's plan belongs to. Video and audio share an arena
-/// and a key type, so the kind is what tells them apart — the one thing about a
-/// media kind the routing layer still has to know.
-pub(super) fn plan_target(
-    kind: crate::entity::TrackKind,
+pub(super) fn plan_removal(
     key: crate::control::publication::RuntimeKey,
-) -> crate::view::PlanTarget {
+) -> crate::view::PlanRemoval {
     use crate::control::publication::RuntimeKey;
-    match (kind, key) {
-        (crate::entity::TrackKind::Audio, RuntimeKey::Track(key)) => {
-            crate::view::PlanTarget::Audio(key)
-        }
-        (_, RuntimeKey::Track(key)) => crate::view::PlanTarget::Video(key),
-        (_, RuntimeKey::Unreliable(key)) => crate::view::PlanTarget::Unreliable(key),
-        (_, RuntimeKey::Reliable(key)) => crate::view::PlanTarget::Reliable(key),
+    match key {
+        RuntimeKey::Video(key) => crate::view::PlanRemoval::Video(key),
+        RuntimeKey::Audio(key) => crate::view::PlanRemoval::Audio(key),
+        RuntimeKey::Unreliable(key) => crate::view::PlanRemoval::Unreliable(key),
+        RuntimeKey::Reliable(key) => crate::view::PlanRemoval::Reliable(key),
     }
 }
 
@@ -31,24 +25,125 @@ pub(super) fn runtime_removal_op(
 ) -> crate::view::ViewOp {
     use crate::control::publication::RuntimeKey;
     match key {
-        RuntimeKey::Track(key) => crate::view::ViewOp::RemoveTrackRuntime { key },
+        RuntimeKey::Video(key) => crate::view::ViewOp::RemoveTrackRuntime {
+            key: crate::keys::TrackRuntimeKey::Video(key),
+        },
+        RuntimeKey::Audio(key) => crate::view::ViewOp::RemoveTrackRuntime {
+            key: crate::keys::TrackRuntimeKey::Audio(key),
+        },
         RuntimeKey::Unreliable(key) => crate::view::ViewOp::RemoveUnreliableRuntime { key },
         RuntimeKey::Reliable(key) => crate::view::ViewOp::RemoveReliableRuntime { key },
     }
 }
 
+pub(super) fn remove_runtime_key(
+    state: &mut crate::control::state::ControlPlaneState,
+    shard: crate::id::ShardId,
+    key: crate::control::publication::RuntimeKey,
+) {
+    match key {
+        crate::control::publication::RuntimeKey::Video(key) => {
+            state.remove_track(shard, key.raw());
+        }
+        crate::control::publication::RuntimeKey::Audio(key) => {
+            state.remove_track(shard, key.raw());
+        }
+        crate::control::publication::RuntimeKey::Unreliable(key) => {
+            state.remove_data(shard, key);
+        }
+        crate::control::publication::RuntimeKey::Reliable(key) => {
+            state.remove_reliable(shard, key);
+        }
+    }
+}
+
 impl ControllerActor {
+    pub(super) fn index_publication(&mut self, id: crate::entity::TrackId) {
+        let Some(publication) = self.catalog.get(&id) else {
+            debug_assert!(false, "an indexed publication must exist in the catalog");
+            return;
+        };
+        let room = publication.room;
+        let publisher = publication.publisher;
+        match &publication.media {
+            crate::control::publication::Media::Video { .. } => {
+                self.video_patterns.attach_publication(
+                    &crate::control::patterns::Subject {
+                        room,
+                        publisher,
+                        name: id,
+                    },
+                    id,
+                );
+            }
+            crate::control::publication::Media::Audio => {
+                self.audio_patterns.attach_publication(
+                    &crate::control::patterns::Subject {
+                        room,
+                        publisher,
+                        name: id,
+                    },
+                    id,
+                );
+            }
+            crate::control::publication::Media::Data { lane, topic } => {
+                self.data_patterns.attach_publication(
+                    &crate::control::patterns::Subject {
+                        room,
+                        publisher,
+                        name: (topic.clone(), (*lane).into()),
+                    },
+                    id,
+                );
+            }
+        }
+    }
+
+    pub(super) fn unindex_publication(&mut self, id: crate::entity::TrackId) {
+        let Some(publication) = self.catalog.get(&id) else {
+            return;
+        };
+        let room = publication.room;
+        let publisher = publication.publisher;
+        match &publication.media {
+            crate::control::publication::Media::Video { .. } => {
+                self.video_patterns.detach_publication(
+                    &crate::control::patterns::Subject {
+                        room,
+                        publisher,
+                        name: id,
+                    },
+                    id,
+                );
+            }
+            crate::control::publication::Media::Audio => self.audio_patterns.detach_publication(
+                &crate::control::patterns::Subject {
+                    room,
+                    publisher,
+                    name: id,
+                },
+                id,
+            ),
+            crate::control::publication::Media::Data { lane, topic } => {
+                self.data_patterns.detach_publication(
+                    &crate::control::patterns::Subject {
+                        room,
+                        publisher,
+                        name: (topic.clone(), (*lane).into()),
+                    },
+                    id,
+                );
+            }
+        }
+    }
+
     /// Retire a publication of any kind: its declarations, its routes, its
     /// plans and its runtimes.
     ///
     /// Staged as one transaction so a route never outlives the runtime it
-    /// resolves to. `arena` is the only per-kind step left - a media key is
-    /// returned to the track arena, a data key to the lane's.
-    pub(super) async fn retire_publication(
-        &mut self,
-        id: crate::entity::TrackId,
-        arena: impl Fn(&mut Self, crate::id::ShardId, crate::control::publication::RuntimeKey),
-    ) -> bool {
+    /// resolves to.
+    pub(super) async fn retire_publication(&mut self, id: crate::entity::TrackId) -> bool {
+        self.pending_audio.retain(|pending| *pending != id);
         let Some(publication) = self.catalog.get(&id) else {
             return true;
         };
@@ -57,8 +152,10 @@ impl ControllerActor {
         let origin_key = publication.origin_key;
         let reverse_route = publication.reverse_route;
         let destinations = publication.destinations.clone();
-        let retired_pattern =
-            crate::control::patterns::Pattern::exact(publication.room, publication.publisher, id);
+        let room = publication.room;
+        let publisher = publication.publisher;
+        self.unindex_publication(id);
+        let retired_pattern = crate::control::patterns::Pattern::exact(room, publisher, id);
 
         // A video track's subscribers named it directly and never unsubscribe
         // from something that goes away, so their declarations go with it.
@@ -68,74 +165,53 @@ impl ControllerActor {
             let ops = members
                 .into_iter()
                 .map(|(_, shard, key)| {
-                    (
-                        shard,
-                        crate::view::ViewOp::GroupRemove {
-                            group,
-                            key,
-                            kind: crate::view::AudienceKind::Video,
-                        },
-                    )
+                    (shard, crate::view::ViewOp::RemoveVideoMember { group, key })
                 })
                 .collect();
-            if !self.publish_ops(ops) {
-                debug_assert!(false, "group retirement must publish");
-            }
+            self.publish_ops(ops);
         }
 
         let now = tokio::time::Instant::now();
         if self.state.begin().is_err() {
-            debug_assert!(false, "lifecycle transactions serialise through this actor");
-            return false;
+            pulsebeam_runtime::fatal!("lifecycle transactions must be serial");
         }
         let Some(generation) = self.state.pending().map(|tx| tx.generation) else {
-            debug_assert!(false, "begin creates a pending lifecycle transaction");
-            return false;
+            pulsebeam_runtime::fatal!("a begun lifecycle transaction must be pending");
         };
 
         let mut releases = Vec::new();
-        if !self.stage_destination_retirement(generation, now, kind, &destinations, &mut releases) {
-            return false;
-        }
+        self.stage_destination_retirement(id, room, generation, &destinations, &mut releases);
         let Some(view) = self.view_mut(publisher_shard) else {
-            debug_assert!(false, "a publisher must name a local view");
-            self.abort_transaction(now);
-            return false;
+            pulsebeam_runtime::fatal!("a publisher must name a local view");
         };
         if let Some(route) = reverse_route {
             view.stage(
                 generation,
-                crate::view::ViewOp::RetireRoute {
-                    route: route.route,
-                    epoch: route.epoch,
-                },
+                crate::view::ViewOp::RetireRoute { handle: route },
             );
             releases.push((publisher_shard, route));
         }
         view.stage(
             generation,
             crate::view::ViewOp::RemovePlan {
-                target: plan_target(kind, origin_key),
+                target: plan_removal(origin_key),
             },
         );
         view.stage(generation, runtime_removal_op(origin_key));
 
-        for index in 0..self.views.len() {
-            if let Some(view) = self.view_mut(crate::id::ShardId::new(index)) {
-                let _ = view.publish();
-            }
-        }
-        if self.state.commit().is_err() {
-            debug_assert!(false, "a retirement must commit");
+        if !self.publish_staged_views() {
             self.abort_transaction(now);
             return false;
+        }
+        if self.state.commit().is_err() {
+            pulsebeam_runtime::fatal!("a published retirement must commit");
         }
         for (shard, route) in releases {
             self.state.release_endpoint(shard, route.route.slot(), now);
         }
-        arena(self, publisher_shard, origin_key);
+        remove_runtime_key(&mut self.state, publisher_shard, origin_key);
         for (&destination, held) in &destinations {
-            arena(self, destination, held.key);
+            remove_runtime_key(&mut self.state, destination, held.key());
         }
         self.catalog.remove(&id);
         true
@@ -151,72 +227,167 @@ impl ControllerActor {
         let Some(publication) = self.catalog.get(&id) else {
             return false;
         };
-        let kind = publication.kind();
         let publisher_shard = publication.publisher_shard;
-        let publisher_key = publication.publisher_key;
-        let stream_id = match &publication.media {
-            crate::control::publication::Media::Data { topic, .. } => {
-                Some(crate::shard::router::DataStreamId::new(
-                    publication.room,
-                    publication.publisher,
-                    topic.clone(),
-                ))
-            }
-            _ => None,
-        };
         let mut targets = vec![(publisher_shard, publication.origin_key, None)];
         for (shard, held) in &publication.destinations {
-            targets.push((*shard, held.key, held.route));
+            let (key, route) = match held {
+                crate::control::publication::Destination::Discovery { key } => {
+                    (crate::control::publication::RuntimeKey::Video(*key), None)
+                }
+                crate::control::publication::Destination::Forwarding { key, route } => {
+                    (*key, Some(*route))
+                }
+            };
+            targets.push((*shard, key, route));
         }
 
         let mut ops = Vec::new();
         for (shard, key, route) in targets {
-            let Some(plan) = self.plan_for(id, shard) else {
-                continue;
+            let Some(target_ops) = self.publication_ops(id, shard, key, route) else {
+                return false;
             };
-            match (&stream_id, key.track()) {
-                (Some(stream_id), _) => {
-                    let Some(key) = key.stream() else {
-                        continue;
+            ops.extend(target_ops);
+        }
+        self.publish_ops(ops);
+        true
+    }
+
+    pub(super) async fn publish_publication_to(
+        &mut self,
+        id: crate::entity::TrackId,
+        shard: crate::id::ShardId,
+    ) -> bool {
+        let Some((key, route)) = self.catalog.get(&id).and_then(|publication| {
+            if shard == publication.publisher_shard {
+                Some((publication.origin_key, None))
+            } else {
+                publication.destinations.get(&shard).map(|destination| {
+                    let key = destination.key();
+                    let route = match destination {
+                        crate::control::publication::Destination::Discovery { .. } => None,
+                        crate::control::publication::Destination::Forwarding { route, .. } => {
+                            Some(*route)
+                        }
                     };
+                    (key, route)
+                })
+            }
+        }) else {
+            return false;
+        };
+        let Some(ops) = self.publication_ops(id, shard, key, route) else {
+            return false;
+        };
+        self.publish_ops(ops);
+        true
+    }
+
+    pub(super) fn publish_plan_to(
+        &mut self,
+        id: crate::entity::TrackId,
+        shard: crate::id::ShardId,
+    ) -> bool {
+        let Some(key) = self.catalog.get(&id).and_then(|publication| {
+            if shard == publication.publisher_shard {
+                Some(publication.origin_key)
+            } else {
+                publication
+                    .destinations
+                    .get(&shard)
+                    .map(|destination| destination.key())
+            }
+        }) else {
+            return false;
+        };
+        let Some(plan) = self.plan_for(id, shard, key) else {
+            return false;
+        };
+        self.publish_ops(vec![(shard, crate::view::ViewOp::SetPlan { update: plan })]);
+        true
+    }
+
+    fn publication_ops(
+        &self,
+        id: crate::entity::TrackId,
+        shard: crate::id::ShardId,
+        key: crate::control::publication::RuntimeKey,
+        route: Option<RouteHandle>,
+    ) -> Option<Vec<(crate::id::ShardId, crate::view::ViewOp)>> {
+        let publication = self.catalog.get(&id)?;
+        let plan = self.plan_for(id, shard, key)?;
+        let mut ops = Vec::with_capacity(3);
+        let mut install_plan = true;
+        match (&publication.media, key) {
+            (
+                crate::control::publication::Media::Data { topic, .. },
+                crate::control::publication::RuntimeKey::Unreliable(_)
+                | crate::control::publication::RuntimeKey::Reliable(_),
+            ) => {
+                let stream = key.stream()?;
+                let stream_id = crate::shard::router::DataStreamId::new(
+                    publication.room,
+                    publication.publisher,
+                    topic.clone(),
+                );
+                ops.push((
+                    shard,
+                    super::stream_lifecycle::insert_stream_runtime_op(
+                        stream,
+                        stream_id,
+                        (shard == publication.publisher_shard).then_some(publication.publisher_key),
+                    ),
+                ));
+                if let Some(route) = route {
                     ops.push((
                         shard,
-                        super::stream_lifecycle::insert_stream_runtime_op(
-                            key,
-                            stream_id.clone(),
-                            (shard == publisher_shard).then_some(publisher_key),
-                        ),
+                        super::stream_lifecycle::install_stream_route_op(stream, route),
                     ));
-                    ops.extend(route.map(|route| {
-                        (
-                            shard,
-                            super::stream_lifecycle::install_stream_route_op(key, route),
-                        )
-                    }));
                 }
-                (None, Some(fanout)) => {
-                    let Some(descriptor) = self.track_descriptor(id, shard) else {
-                        continue;
-                    };
+            }
+            (
+                crate::control::publication::Media::Video { .. },
+                crate::control::publication::RuntimeKey::Video(fanout),
+            ) => {
+                let descriptor = self.track_descriptor(id, shard)?;
+                if shard != publication.publisher_shard && route.is_none() {
+                    install_plan = false;
+                    ops.push((
+                        shard,
+                        crate::view::ViewOp::AnnounceTrack {
+                            publication: Box::new(descriptor.publication),
+                        },
+                    ));
+                } else {
                     ops.push((
                         shard,
                         crate::view::ViewOp::InsertTrackRuntime {
-                            key: fanout,
+                            key: crate::keys::TrackRuntimeKey::Video(fanout),
                             descriptor,
                         },
                     ));
                 }
-                (None, None) => continue,
             }
-            ops.push((
-                shard,
-                crate::view::ViewOp::SetPlan {
-                    target: plan_target(kind, key),
-                    plan,
-                },
-            ));
+            (
+                crate::control::publication::Media::Audio,
+                crate::control::publication::RuntimeKey::Audio(fanout),
+            ) => {
+                ops.push((
+                    shard,
+                    crate::view::ViewOp::InsertTrackRuntime {
+                        key: crate::keys::TrackRuntimeKey::Audio(fanout),
+                        descriptor: self.track_descriptor(id, shard)?,
+                    },
+                ));
+            }
+            _ => {
+                debug_assert!(false, "a publication target must match its media kind");
+                return None;
+            }
         }
-        self.publish_ops(ops)
+        if install_plan {
+            ops.push((shard, crate::view::ViewOp::SetPlan { update: plan }));
+        }
+        Some(ops)
     }
 
     pub(super) async fn install_destinations(
@@ -231,131 +402,116 @@ impl ControllerActor {
         )>,
     ) -> bool {
         let Some(publication) = self.catalog.get(&id) else {
-            return false;
+            return true;
         };
         let publisher_shard = publication.publisher_shard;
-        let kind = publication.kind();
-        let mut wanted: Vec<crate::id::ShardId> = Vec::new();
-        for group in self.groups_of(publication) {
-            for shard in self.audience_shards(kind, group) {
-                if shard != publisher_shard && !wanted.contains(&shard) {
-                    wanted.push(shard);
-                }
+        let mut wanted = indexmap::IndexSet::new();
+        for shard in self.publication_shards(publication) {
+            if shard != publisher_shard {
+                wanted.insert(shard);
             }
         }
-        if !self.retire_stale_destinations(id, &wanted).await {
-            debug_assert!(false, "stale destination retirement must complete");
-            return false;
-        }
-
-        let mut added = false;
+        let mut complete = true;
         for destination in wanted {
-            if self
-                .catalog
-                .get(&id)
-                .is_some_and(|held| held.destinations.contains_key(&destination))
-            {
-                continue;
-            }
-            let Some((key, action)) = mint(self, destination) else {
-                continue;
-            };
-            let Some(plan) = self.plan_for(id, destination) else {
-                continue;
-            };
-            let Some(route) = self
-                .grant_route_binding(destination, action, Some((plan_target(kind, key), plan)))
-                .await
-            else {
-                continue;
-            };
-            let Some(publication) = self.catalog.get_mut(&id) else {
-                return false;
-            };
-            publication.destinations.insert(
-                destination,
-                crate::control::publication::Destination {
-                    key,
-                    route: Some(route),
-                },
-            );
-            added = true;
+            complete &= self.install_destination(id, destination, &mint).await;
         }
-        added
+        complete
     }
 
-    /// Give every shard that declared an interest a key and a route to reach
-    /// this publication by, and publish the result.
-    ///
-    /// The publisher's own shard is skipped: it holds the source, and a route
-    /// to itself would be a second hop to nowhere. `mint` is the per-kind step,
-    /// naming which arena the destination's key comes from and which route
-    /// action reaches it.
-    /// Drop the destinations a publication no longer has an audience on.
-    ///
-    /// A route to a shard where the last member left is a slot the allocator
-    /// cannot reuse and a runtime nothing resolves. Data retired these; audio
-    /// did not, so an audio route outlived its last listener on a shard until
-    /// the track itself went away.
-    pub(super) async fn retire_stale_destinations(
+    pub(super) async fn install_destination(
         &mut self,
         id: crate::entity::TrackId,
-        wanted: &[crate::id::ShardId],
+        destination: crate::id::ShardId,
+        mint: &impl Fn(
+            &mut Self,
+            crate::id::ShardId,
+        ) -> Option<(
+            crate::control::publication::RuntimeKey,
+            crate::route::RouteAction,
+        )>,
     ) -> bool {
-        let Some(publication) = self.catalog.get(&id) else {
-            return true;
-        };
-        let kind = publication.kind();
-        let stale: Vec<_> = publication
-            .destinations
-            .iter()
-            .filter(|(destination, _)| !wanted.contains(destination))
-            .map(|(destination, held)| (*destination, *held))
-            .collect();
-        if stale.is_empty() {
+        if self
+            .catalog
+            .get(&id)
+            .is_some_and(|publication| publication.destinations.contains_key(&destination))
+        {
             return true;
         }
-
-        let mut ops = Vec::new();
-        for (destination, held) in &stale {
-            if let Some(route) = held.route {
-                ops.push((
-                    *destination,
-                    crate::view::ViewOp::RetireRoute {
-                        route: route.route,
-                        epoch: route.epoch,
-                    },
-                ));
-            }
-            ops.push((
-                *destination,
-                crate::view::ViewOp::RemovePlan {
-                    target: plan_target(kind, held.key),
-                },
-            ));
-            ops.push((*destination, runtime_removal_op(held.key)));
-        }
-        if !self.publish_ops(ops) {
+        let Some((key, action)) = mint(self, destination) else {
             return false;
-        }
-
-        let now = tokio::time::Instant::now();
-        for (destination, held) in &stale {
-            if let Some(route) = held.route {
-                self.state
-                    .release_endpoint(*destination, route.route.slot(), now);
-            }
-            if let Some(publication) = self.catalog.get_mut(&id) {
-                publication.destinations.shift_remove(destination);
-            }
-        }
+        };
+        let Some(plan) = self.plan_for(id, destination, key) else {
+            remove_runtime_key(&mut self.state, destination, key);
+            debug_assert!(false, "a destination key must match its publication plan");
+            return false;
+        };
+        let Some(route) = self
+            .grant_route_binding(destination, action, Some(plan))
+            .await
+        else {
+            remove_runtime_key(&mut self.state, destination, key);
+            return false;
+        };
+        let Some(publication) = self.catalog.get_mut(&id) else {
+            pulsebeam_runtime::fatal!("a destination must belong to its publication");
+        };
+        publication.destinations.insert(
+            destination,
+            crate::control::publication::Destination::Forwarding { key, route },
+        );
         true
     }
 
-    /// Stage the retirement of one kind's destination routes for a track.
-    ///
-    /// Video and audio differ only in which fanout map names the destination's
-    /// key and which image the plan lives in, so the walk is written once.
+    pub(super) async fn retire_destination(
+        &mut self,
+        id: crate::entity::TrackId,
+        destination: crate::id::ShardId,
+    ) {
+        let Some(room_id) = self.catalog.get(&id).map(|publication| publication.room) else {
+            return;
+        };
+        let Some(held) = self
+            .catalog
+            .get_mut(&id)
+            .and_then(|publication| publication.destinations.shift_remove(&destination))
+        else {
+            return;
+        };
+        let mut ops = Vec::with_capacity(3);
+        let key = held.key();
+        let route = match held {
+            crate::control::publication::Destination::Discovery { .. } => {
+                ops.push((
+                    destination,
+                    crate::view::ViewOp::WithdrawTrack { id, room_id },
+                ));
+                None
+            }
+            crate::control::publication::Destination::Forwarding { route, .. } => {
+                ops.push((
+                    destination,
+                    crate::view::ViewOp::RetireRoute { handle: route },
+                ));
+                ops.push((
+                    destination,
+                    crate::view::ViewOp::RemovePlan {
+                        target: plan_removal(key),
+                    },
+                ));
+                ops.push((destination, runtime_removal_op(key)));
+                Some(route)
+            }
+        };
+        self.publish_ops(ops);
+
+        let now = tokio::time::Instant::now();
+        if let Some(route) = route {
+            self.state
+                .release_endpoint(destination, route.route.slot(), now);
+        }
+        remove_runtime_key(&mut self.state, destination, key);
+    }
+
     /// Stage the retirement of a publication's destinations, whatever arena
     /// they live in.
     ///
@@ -365,40 +521,42 @@ impl ControllerActor {
     /// carried the same hazard.
     pub(super) fn stage_destination_retirement(
         &mut self,
+        id: crate::entity::TrackId,
+        room_id: crate::entity::RoomId,
         generation: u64,
-        now: tokio::time::Instant,
-        kind: crate::entity::TrackKind,
         destinations: &indexmap::IndexMap<
             crate::id::ShardId,
             crate::control::publication::Destination,
         >,
         releases: &mut Vec<(crate::id::ShardId, RouteHandle)>,
-    ) -> bool {
+    ) {
         for (destination, held) in destinations {
             let Some(view) = self.view_mut(*destination) else {
-                debug_assert!(false, "a destination must name a local view");
-                self.abort_transaction(now);
-                return false;
+                pulsebeam_runtime::fatal!("a destination must name a local view");
             };
-            if let Some(route) = held.route {
-                view.stage(
-                    generation,
-                    crate::view::ViewOp::RetireRoute {
-                        route: route.route,
-                        epoch: route.epoch,
-                    },
-                );
-                releases.push((*destination, route));
+            match *held {
+                crate::control::publication::Destination::Discovery { .. } => {
+                    view.stage(
+                        generation,
+                        crate::view::ViewOp::WithdrawTrack { id, room_id },
+                    );
+                }
+                crate::control::publication::Destination::Forwarding { key, route } => {
+                    view.stage(
+                        generation,
+                        crate::view::ViewOp::RetireRoute { handle: route },
+                    );
+                    releases.push((*destination, route));
+                    view.stage(
+                        generation,
+                        crate::view::ViewOp::RemovePlan {
+                            target: plan_removal(key),
+                        },
+                    );
+                    view.stage(generation, runtime_removal_op(key));
+                }
             }
-            view.stage(
-                generation,
-                crate::view::ViewOp::RemovePlan {
-                    target: plan_target(kind, held.key),
-                },
-            );
-            view.stage(generation, runtime_removal_op(held.key));
         }
-        true
     }
 
     /// The audiences a publication reaches.
@@ -408,70 +566,210 @@ impl ControllerActor {
     /// keyed by topic because a data declaration names one across publishers.
     /// Selecting the table is the whole of what differs; a match yields the
     /// same group ids either way.
-    pub(super) fn groups_of(
+    pub(super) fn plan_for(
+        &self,
+        id: crate::entity::TrackId,
+        shard: crate::id::ShardId,
+        key: crate::control::publication::RuntimeKey,
+    ) -> Option<crate::view::PlanUpdate> {
+        let publication = self.catalog.get(&id)?;
+        match (&publication.media, key) {
+            (
+                crate::control::publication::Media::Video { .. },
+                crate::control::publication::RuntimeKey::Video(key),
+            ) => Some(crate::view::PlanUpdate::Video {
+                key,
+                plan: crate::control::publication::forwarding_plan(
+                    &publication.destinations,
+                    publication.publisher_shard,
+                    publication.reverse_route,
+                    self.video_patterns
+                        .match_subject(&crate::control::patterns::Subject {
+                            room: publication.room,
+                            publisher: publication.publisher,
+                            name: id,
+                        }),
+                    shard,
+                ),
+            }),
+            (
+                crate::control::publication::Media::Audio,
+                crate::control::publication::RuntimeKey::Audio(key),
+            ) => Some(crate::view::PlanUpdate::Audio {
+                key,
+                plan: crate::control::publication::forwarding_plan(
+                    &publication.destinations,
+                    publication.publisher_shard,
+                    publication.reverse_route,
+                    self.audio_patterns
+                        .match_subject(&crate::control::patterns::Subject {
+                            room: publication.room,
+                            publisher: publication.publisher,
+                            name: id,
+                        }),
+                    shard,
+                ),
+            }),
+            (
+                crate::control::publication::Media::Data { lane, topic },
+                crate::control::publication::RuntimeKey::Unreliable(key),
+            ) if crate::control::lanes::StreamLane::from(*lane)
+                == crate::control::lanes::StreamLane::Unreliable =>
+            {
+                Some(crate::view::PlanUpdate::Unreliable {
+                    key,
+                    plan: crate::control::publication::forwarding_plan(
+                        &publication.destinations,
+                        publication.publisher_shard,
+                        publication.reverse_route,
+                        self.data_patterns
+                            .match_subject(&crate::control::patterns::Subject {
+                                room: publication.room,
+                                publisher: publication.publisher,
+                                name: (topic.clone(), (*lane).into()),
+                            }),
+                        shard,
+                    ),
+                })
+            }
+            (
+                crate::control::publication::Media::Data { lane, topic },
+                crate::control::publication::RuntimeKey::Reliable(key),
+            ) if crate::control::lanes::StreamLane::from(*lane)
+                == crate::control::lanes::StreamLane::Reliable =>
+            {
+                Some(crate::view::PlanUpdate::Reliable {
+                    key,
+                    plan: crate::control::publication::forwarding_plan(
+                        &publication.destinations,
+                        publication.publisher_shard,
+                        publication.reverse_route,
+                        self.data_patterns
+                            .match_subject(&crate::control::patterns::Subject {
+                                room: publication.room,
+                                publisher: publication.publisher,
+                                name: (topic.clone(), (*lane).into()),
+                            }),
+                        shard,
+                    ),
+                })
+            }
+            _ => {
+                debug_assert!(false, "a runtime key must match its publication plan");
+                None
+            }
+        }
+    }
+
+    pub(super) fn video_plan_for(
+        &self,
+        id: crate::entity::TrackId,
+        shard: crate::id::ShardId,
+    ) -> Option<crate::view::VideoPlan> {
+        let key = self.catalog.get(&id).and_then(|publication| {
+            if publication.publisher_shard == shard {
+                publication.origin_key
+            } else {
+                publication.destinations.get(&shard)?.key()
+            }
+            .track()
+        })?;
+        match self.plan_for(
+            id,
+            shard,
+            crate::control::publication::RuntimeKey::Video(crate::keys::VideoTrackKey::new(key)),
+        )? {
+            crate::view::PlanUpdate::Video { plan, .. } => Some(plan),
+            _ => {
+                debug_assert!(false, "a video route must have a video plan");
+                None
+            }
+        }
+    }
+
+    fn publication_shards(
         &self,
         publication: &crate::control::publication::Publication,
-    ) -> arrayvec::ArrayVec<crate::view::GroupId, 4> {
-        use crate::control::publication::Media;
+    ) -> Vec<crate::id::ShardId> {
         match &publication.media {
-            Media::Audio => self
+            crate::control::publication::Media::Video { .. } => self
+                .video_patterns
+                .match_subject(&crate::control::patterns::Subject {
+                    room: publication.room,
+                    publisher: publication.publisher,
+                    name: publication.id,
+                })
+                .into_iter()
+                .flat_map(|group| self.video_patterns.shards_of(group))
+                .collect(),
+            crate::control::publication::Media::Audio => self
                 .audio_patterns
                 .match_subject(&crate::control::patterns::Subject {
                     room: publication.room,
                     publisher: publication.publisher,
                     name: publication.id,
-                }),
-            Media::Video { .. } => {
-                self.video_patterns
-                    .match_subject(&crate::control::patterns::Subject {
-                        room: publication.room,
-                        publisher: publication.publisher,
-                        name: publication.id,
-                    })
-            }
-            Media::Data { lane, topic } => {
-                let lane = match lane {
-                    crate::track::DataLane::Realtime => {
-                        crate::control::lanes::StreamLane::Unreliable
-                    }
-                    crate::track::DataLane::Reliable => crate::control::lanes::StreamLane::Reliable,
-                };
-                self.data_patterns
-                    .match_subject(&crate::control::patterns::Subject {
-                        room: publication.room,
-                        publisher: publication.publisher,
-                        name: (topic.clone(), lane),
-                    })
-            }
+                })
+                .into_iter()
+                .flat_map(|group| self.audio_patterns.shards_of(group))
+                .collect(),
+            crate::control::publication::Media::Data { lane, topic } => self
+                .data_patterns
+                .match_subject(&crate::control::patterns::Subject {
+                    room: publication.room,
+                    publisher: publication.publisher,
+                    name: (topic.clone(), (*lane).into()),
+                })
+                .into_iter()
+                .flat_map(|group| self.data_patterns.shards_of(group))
+                .collect(),
         }
     }
 
-    /// One publication's plan for one shard, whatever kind it is.
-    pub(super) fn plan_for(
+    fn publication_reaches_shard_inner(
+        &self,
+        publication: &crate::control::publication::Publication,
+        shard: crate::id::ShardId,
+    ) -> bool {
+        match &publication.media {
+            crate::control::publication::Media::Video { .. } => self
+                .video_patterns
+                .match_subject(&crate::control::patterns::Subject {
+                    room: publication.room,
+                    publisher: publication.publisher,
+                    name: publication.id,
+                })
+                .into_iter()
+                .any(|group| self.video_patterns.has_shard(group, shard)),
+            crate::control::publication::Media::Audio => self
+                .audio_patterns
+                .match_subject(&crate::control::patterns::Subject {
+                    room: publication.room,
+                    publisher: publication.publisher,
+                    name: publication.id,
+                })
+                .into_iter()
+                .any(|group| self.audio_patterns.has_shard(group, shard)),
+            crate::control::publication::Media::Data { lane, topic } => self
+                .data_patterns
+                .match_subject(&crate::control::patterns::Subject {
+                    room: publication.room,
+                    publisher: publication.publisher,
+                    name: (topic.clone(), (*lane).into()),
+                })
+                .into_iter()
+                .any(|group| self.data_patterns.has_shard(group, shard)),
+        }
+    }
+
+    pub(super) fn publication_reaches_shard(
         &self,
         id: crate::entity::TrackId,
         shard: crate::id::ShardId,
-    ) -> Option<crate::view::ForwardingPlan> {
-        let publication = self.catalog.get(&id)?;
-        Some(crate::control::publication::forwarding_plan(
-            &publication.destinations,
-            publication.publisher_shard,
-            publication.reverse_route,
-            self.groups_of(publication),
-            shard,
-        ))
-    }
-
-    /// The shards holding members of an audience, whichever image it lives in.
-    fn audience_shards(
-        &self,
-        kind: crate::entity::TrackKind,
-        group: crate::view::GroupId,
-    ) -> Vec<crate::id::ShardId> {
-        match kind {
-            crate::entity::TrackKind::Audio => self.audio_patterns.shards_of(group),
-            crate::entity::TrackKind::Video => self.video_patterns.shards_of(group),
-            crate::entity::TrackKind::Data => self.data_patterns.shards_of(group),
-        }
+    ) -> bool {
+        let Some(publication) = self.catalog.get(&id) else {
+            return false;
+        };
+        publication.publisher_shard != shard
+            && self.publication_reaches_shard_inner(publication, shard)
     }
 }

@@ -1,11 +1,6 @@
 use super::*;
 
 impl ControllerActor {
-    /// Release everything a departing participant was consuming.
-    ///
-    /// Its subscriptions go with it, and any route that only it kept alive is
-    /// retired — otherwise a shard keeps a route for a stream nobody there
-    /// receives any more, and the slot never returns to the allocator.
     /// Release everything a departing participant was consuming on the data
     /// lanes.
     ///
@@ -14,15 +9,16 @@ impl ControllerActor {
     /// reconcile that follows — otherwise a shard keeps a route for a stream
     /// nobody there receives, and the slot never returns to the allocator.
     pub(super) async fn retire_participant_streams(&mut self, participant_id: &ParticipantId) {
-        let (departures, ops) = crate::control::patterns::retract_participant(
-            &mut self.data_patterns,
-            participant_id,
-            crate::view::AudienceKind::Data,
-        );
-        if !self.publish_ops(ops) {
-            debug_assert!(false, "data group retraction must publish");
-        }
-        let mut affected: Vec<(crate::shard::router::DataStreamId, StreamLane)> = Vec::new();
+        self.pending_streams.remove_participant(*participant_id);
+        let shard = self
+            .core
+            .registry
+            .transport_of(participant_id)
+            .map(|(shard, _)| shard);
+        let (departures, ops) =
+            crate::control::patterns::retract_participant(&mut self.data_patterns, participant_id);
+        self.publish_ops(ops);
+        let mut affected = indexmap::IndexSet::new();
         for (pattern, _) in departures {
             let Some((topic, lane)) = pattern.name else {
                 debug_assert!(false, "a data declaration names its topic");
@@ -37,12 +33,17 @@ impl ControllerActor {
                 None => self.streams_on_topic(pattern.room, &topic, lane),
             };
             for id in ids {
-                if !affected.iter().any(|(held, _)| *held == id) {
-                    affected.push((id, lane));
-                }
+                affected.insert((id, lane));
             }
         }
         for (id, lane) in affected {
+            let publication_id =
+                crate::control::controller::stream_lifecycle::data_publication_id(&id, lane);
+            if let Some(shard) = shard
+                && !self.publication_reaches_shard(publication_id, shard)
+            {
+                self.retire_destination(publication_id, shard).await;
+            }
             self.reconcile_stream(id, lane).await;
         }
     }
@@ -52,25 +53,16 @@ impl ControllerActor {
         // its arena. The room comes from the publication itself, since a
         // participant that has already left the registry still has tracks to
         // retire.
-        let rooms: Vec<_> = self
+        let tracks: Vec<_> = self
             .catalog
-            .iter()
-            .filter(|(_, held)| held.publisher == *participant_id)
-            .map(|(_, held)| held.room)
+            .published_by_participant(*participant_id)
+            .filter(|id| {
+                matches!(
+                    id.kind(),
+                    crate::entity::TrackKind::Video | crate::entity::TrackKind::Audio
+                )
+            })
             .collect();
-        let mut tracks = Vec::new();
-        for room in rooms {
-            for kind in [
-                crate::entity::TrackKind::Video,
-                crate::entity::TrackKind::Audio,
-            ] {
-                for id in self.catalog.from_publisher(room, kind, *participant_id) {
-                    if !tracks.contains(&id) {
-                        tracks.push(id);
-                    }
-                }
-            }
-        }
         for track_id in tracks {
             if !self.retire_track_binding(track_id).await {
                 debug_assert!(false, "publisher track retirement must complete");
@@ -84,20 +76,12 @@ impl ControllerActor {
         &mut self,
         participant_id: &ParticipantId,
     ) {
-        let (video, mut ops) = crate::control::patterns::retract_participant(
-            &mut self.video_patterns,
-            participant_id,
-            crate::view::AudienceKind::Video,
-        );
-        let (_, audio_ops) = crate::control::patterns::retract_participant(
-            &mut self.audio_patterns,
-            participant_id,
-            crate::view::AudienceKind::Audio,
-        );
+        let (video, mut ops) =
+            crate::control::patterns::retract_participant(&mut self.video_patterns, participant_id);
+        let (_, audio_ops) =
+            crate::control::patterns::retract_participant(&mut self.audio_patterns, participant_id);
         ops.extend(audio_ops);
-        if !self.publish_ops(ops) {
-            debug_assert!(false, "group retraction must publish");
-        }
+        self.publish_ops(ops);
 
         // A video route is per (track, shard) and only retires with the last
         // consumer on that shard, which is what LastOnShard reports.
@@ -114,15 +98,22 @@ impl ControllerActor {
                 let Some(track_id) = pattern.name else {
                     continue;
                 };
-                let Some(route) = self.catalog.get_mut(&track_id).and_then(|binding| {
+                let Some(route) = self.catalog.get(&track_id).and_then(|binding| {
                     binding
                         .destinations
-                        .get_mut(&shard)
-                        .and_then(|d| d.route.take())
+                        .get(&shard)
+                        .and_then(|destination| match destination {
+                            crate::control::publication::Destination::Forwarding {
+                                route, ..
+                            } => Some(*route),
+                            crate::control::publication::Destination::Discovery { .. } => None,
+                        })
                 }) else {
                     continue;
                 };
-                self.release_route(shard, route).await;
+                if !self.retire_video_route(shard, route, track_id).await {
+                    debug_assert!(false, "participant video route retirement must complete");
+                }
             }
         }
         self.pending.remove_participant(*participant_id);

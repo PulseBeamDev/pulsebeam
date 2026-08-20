@@ -65,10 +65,15 @@ impl Room {
             .map(|(shard_id, _)| *shard_id)
     }
 
+    pub fn shard_ids(&self) -> impl Iterator<Item = ShardId> + '_ {
+        self.participant_shards.keys().copied()
+    }
+
     pub fn participant_count(&self) -> usize {
         self.participants.len()
     }
 
+    #[cfg(test)]
     pub fn participant_ids(&self) -> impl Iterator<Item = &ParticipantId> {
         self.participants.keys()
     }

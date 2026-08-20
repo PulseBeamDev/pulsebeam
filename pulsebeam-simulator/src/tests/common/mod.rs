@@ -137,26 +137,6 @@ pub async fn start_sfu_node_with(
     Ok(())
 }
 
-#[cfg(test)]
-mod default_profile_tests {
-    use super::*;
-
-    #[test]
-    fn default_profile_is_the_production_like_failure_matrix() {
-        assert!(DEFAULT_SIM_SHARDS > 1);
-        assert!(DEFAULT_SIM_BUGGIFY_PERMILLE > 0);
-        assert_eq!(DEFAULT_SIM_UDP_MODE, UdpMode::Batch);
-
-        let link = LinkProfile::default();
-        assert!(link.loss > 0.0);
-        assert!(link.loss_model.is_some());
-        assert!(link.feedback.is_some());
-        assert!(link.reorder.probability > Reorder::NONE.probability);
-        assert!(link.reorder.delay > Reorder::NONE.delay);
-        assert!(link.duplicate > 0.0);
-    }
-}
-
 /// Run a Turmoil simulation run with a real-time timeout.
 ///
 /// This prevents tests from hanging forever if the simulation time stops advancing.
@@ -178,5 +158,25 @@ pub fn run_sim_or_timeout(sim: &mut turmoil::Sim<'_>, timeout: Duration) -> turm
         if is_finished {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod default_profile_tests {
+    use super::*;
+
+    #[test]
+    fn default_profile_is_the_production_like_failure_matrix() {
+        const { assert!(DEFAULT_SIM_SHARDS > 1) };
+        const { assert!(DEFAULT_SIM_BUGGIFY_PERMILLE > 0) };
+        assert_eq!(DEFAULT_SIM_UDP_MODE, UdpMode::Batch);
+
+        let link = LinkProfile::default();
+        assert!(link.loss > 0.0);
+        assert!(link.loss_model.is_some());
+        assert!(link.feedback.is_some());
+        assert!(link.reorder.probability > Reorder::NONE.probability);
+        assert!(link.reorder.delay > Reorder::NONE.delay);
+        assert!(link.duplicate > 0.0);
     }
 }

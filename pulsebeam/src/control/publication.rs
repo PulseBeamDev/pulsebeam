@@ -15,7 +15,9 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::ShardId;
-use crate::keys::{ParticipantKey, ReliableStreamKey, TrackKey, UnreliableStreamKey};
+use crate::keys::{
+    AudioTrackKey, ParticipantKey, ReliableStreamKey, TrackKey, UnreliableStreamKey, VideoTrackKey,
+};
 use crate::route::RouteHandle;
 
 /// A publication's key in one shard's arena, whichever arena that is.
@@ -25,16 +27,17 @@ use crate::route::RouteHandle;
 /// needs to know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeKey {
-    Track(TrackKey),
+    Video(VideoTrackKey),
+    Audio(AudioTrackKey),
     Unreliable(UnreliableStreamKey),
     Reliable(ReliableStreamKey),
 }
 
 impl RuntimeKey {
-    /// The media arena's key, for the paths that only ever hold one.
     pub fn track(self) -> Option<TrackKey> {
         match self {
-            Self::Track(key) => Some(key),
+            Self::Video(key) => Some(key.raw()),
+            Self::Audio(key) => Some(key.raw()),
             _ => None,
         }
     }
@@ -47,7 +50,7 @@ impl RuntimeKey {
         match self {
             Self::Unreliable(key) => Some(RuntimeStreamKey::Unreliable(key)),
             Self::Reliable(key) => Some(RuntimeStreamKey::Reliable(key)),
-            Self::Track(_) => None,
+            Self::Video(_) | Self::Audio(_) => None,
         }
     }
 }
@@ -70,9 +73,18 @@ impl From<crate::shard::router::RuntimeStreamKey> for RuntimeKey {
 /// is what stops it being compared against a key from somewhere else — the
 /// mistake that made cross-shard audio silently undeliverable.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Destination {
-    pub key: RuntimeKey,
-    pub route: Option<RouteHandle>,
+pub(crate) enum Destination {
+    Discovery { key: VideoTrackKey },
+    Forwarding { key: RuntimeKey, route: RouteHandle },
+}
+
+impl Destination {
+    pub(crate) fn key(self) -> RuntimeKey {
+        match self {
+            Self::Discovery { key } => RuntimeKey::Video(key),
+            Self::Forwarding { key, .. } => key,
+        }
+    }
 }
 
 /// Only what a kind genuinely adds beyond the subject.
@@ -146,23 +158,26 @@ impl Publication {
 /// Remote routes only appear on the publisher's own plan: every other shard
 /// receives over a route rather than forwarding onward, so listing them
 /// elsewhere would invite a second hop.
-pub(crate) fn forwarding_plan(
+pub(crate) fn forwarding_plan<G>(
     destinations: &IndexMap<ShardId, Destination>,
     publisher_shard: ShardId,
     reverse_route: Option<RouteHandle>,
-    groups: arrayvec::ArrayVec<crate::view::GroupId, 4>,
+    groups: arrayvec::ArrayVec<crate::view::GroupId<G>, 4>,
     shard: ShardId,
-) -> crate::view::ForwardingPlan {
+) -> crate::view::ForwardingPlan<G> {
     let remote_routes = if shard == publisher_shard {
         destinations
             .iter()
             .filter_map(|(destination, held)| {
-                let handle = held.route.filter(|_| *destination != publisher_shard)?;
-                Some(crate::view::RemoteRoutePlan {
-                    shard_id: *destination,
-                    route: handle.route,
-                    epoch: handle.epoch,
-                })
+                if *destination == publisher_shard {
+                    return None;
+                }
+                match held {
+                    Destination::Forwarding { route, .. } => {
+                        Some(crate::view::RemoteRoutePlan { handle: *route })
+                    }
+                    Destination::Discovery { .. } => None,
+                }
             })
             .collect()
     } else {
@@ -171,11 +186,7 @@ pub(crate) fn forwarding_plan(
     crate::view::ForwardingPlan {
         groups,
         remote_routes,
-        reverse_route: reverse_route.map(|handle| crate::view::RemoteRoutePlan {
-            shard_id: publisher_shard,
-            route: handle.route,
-            epoch: handle.epoch,
-        }),
+        reverse_route: reverse_route.map(|handle| crate::view::RemoteRoutePlan { handle }),
     }
 }
 
@@ -190,6 +201,7 @@ pub(crate) struct Catalog {
     publications: IndexMap<TrackId, Publication>,
     by_room: IndexMap<(RoomId, TrackKind), IndexSet<TrackId>>,
     by_publisher: IndexMap<(RoomId, TrackKind, ParticipantId), IndexSet<TrackId>>,
+    by_origin: IndexMap<ParticipantId, IndexSet<TrackId>>,
     /// Data only. A media publication is named by its id, which embeds the
     /// publisher, so a declaration naming one resolves without an index; a data
     /// declaration names a topic across publishers and cannot.
@@ -218,6 +230,10 @@ impl Catalog {
             .entry((room, kind, publication.publisher))
             .or_default()
             .insert(id);
+        self.by_origin
+            .entry(publication.publisher)
+            .or_default()
+            .insert(id);
         if let Some(label) = publication.data_label() {
             self.by_label.entry((room, label)).or_default().insert(id);
         }
@@ -233,6 +249,7 @@ impl Catalog {
             &(room, kind, publication.publisher),
             id,
         );
+        Self::unindex(&mut self.by_origin, &publication.publisher, id);
         if let Some(label) = publication.data_label() {
             Self::unindex(&mut self.by_label, &(room, label), id);
         }
@@ -265,37 +282,48 @@ impl Catalog {
         self.publications.contains_key(id)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&TrackId, &Publication)> {
-        self.publications.iter()
-    }
-
     /// Every publication of a kind in a room.
-    pub fn in_room(&self, room: RoomId, kind: TrackKind) -> Vec<TrackId> {
+    pub fn in_room(&self, room: RoomId, kind: TrackKind) -> impl Iterator<Item = TrackId> + '_ {
         self.by_room
             .get(&(room, kind))
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(IndexSet::iter)
+            .copied()
     }
 
     /// Everything one publisher sends of a kind.
-    pub fn from_publisher(
+    #[cfg(test)]
+    pub fn published_by(
         &self,
         room: RoomId,
         kind: TrackKind,
         publisher: ParticipantId,
-    ) -> Vec<TrackId> {
+    ) -> impl Iterator<Item = TrackId> + '_ {
         self.by_publisher
             .get(&(room, kind, publisher))
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(IndexSet::iter)
+            .copied()
+    }
+
+    pub fn published_by_participant(
+        &self,
+        publisher: ParticipantId,
+    ) -> impl Iterator<Item = TrackId> + '_ {
+        self.by_origin
+            .get(&publisher)
+            .into_iter()
+            .flat_map(IndexSet::iter)
+            .copied()
     }
 
     /// Every publisher of a data label in a room.
-    pub fn on_label(&self, room: RoomId, label: &str) -> Vec<TrackId> {
+    pub fn on_label(&self, room: RoomId, label: &str) -> impl Iterator<Item = TrackId> + '_ {
         self.by_label
             .get(&(room, label.to_string()))
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(IndexSet::iter)
+            .copied()
     }
 
     #[cfg(test)]
@@ -327,7 +355,7 @@ mod tests {
             publisher: pid(publisher),
             publisher_shard: ShardId::new(0),
             publisher_key: ParticipantKey::default(),
-            origin_key: RuntimeKey::Track(TrackKey::default()),
+            origin_key: RuntimeKey::Audio(AudioTrackKey::new(TrackKey::default())),
             reverse_route: None,
             destinations: IndexMap::new(),
             media: Media::Audio,
@@ -365,7 +393,10 @@ mod tests {
         catalog.insert(one);
 
         assert!(catalog.contains(&id));
-        assert_eq!(catalog.in_room(r, TrackKind::Audio), vec![id]);
+        assert_eq!(
+            catalog.in_room(r, TrackKind::Audio).collect::<Vec<_>>(),
+            vec![id]
+        );
     }
 
     /// A data declaration names a topic across publishers, which is the case
@@ -382,7 +413,7 @@ mod tests {
         assert_eq!(
             catalog
                 .on_label(r, &label_of(DataLane::Realtime, "chat"))
-                .len(),
+                .count(),
             3,
             "every publisher on that lane, and only that lane"
         );
@@ -399,9 +430,8 @@ mod tests {
 
         let realtime = catalog.on_label(r, &label_of(DataLane::Realtime, "chat"));
         let reliable = catalog.on_label(r, &label_of(DataLane::Reliable, "chat"));
-        assert_eq!(realtime.len(), 1);
-        assert_eq!(reliable.len(), 1);
-        assert_ne!(realtime, reliable);
+        assert_eq!(realtime.count(), 1);
+        assert_eq!(reliable.count(), 1);
     }
 
     /// A topic is scoped to its room, which the lane registry's index used to
@@ -412,8 +442,8 @@ mod tests {
         catalog.insert(data(room("a"), 1, DataLane::Realtime, "chat"));
 
         let label = label_of(DataLane::Realtime, "chat");
-        assert_eq!(catalog.on_label(room("a"), &label).len(), 1);
-        assert!(catalog.on_label(room("b"), &label).is_empty());
+        assert_eq!(catalog.on_label(room("a"), &label).count(), 1);
+        assert_eq!(catalog.on_label(room("b"), &label).count(), 0);
     }
 
     #[test]
@@ -427,12 +457,13 @@ mod tests {
         // a hashed input. The collision assert in `insert` catches that.
         catalog.insert(media(room("other"), 9, TrackKind::Audio, "mic"));
 
-        assert_eq!(catalog.from_publisher(r, TrackKind::Audio, pid(1)).len(), 1);
-        assert_eq!(catalog.from_publisher(r, TrackKind::Video, pid(1)).len(), 1);
-        assert!(
+        assert_eq!(catalog.published_by(r, TrackKind::Audio, pid(1)).count(), 1);
+        assert_eq!(catalog.published_by(r, TrackKind::Video, pid(1)).count(), 1);
+        assert_eq!(
             catalog
-                .from_publisher(room("nowhere"), TrackKind::Audio, pid(1))
-                .is_empty()
+                .published_by(room("nowhere"), TrackKind::Audio, pid(1))
+                .count(),
+            0
         );
     }
 
@@ -453,13 +484,9 @@ mod tests {
         assert_eq!(
             catalog
                 .on_label(r, &label_of(DataLane::Realtime, "chat"))
-                .len(),
+                .count(),
             1
         );
-        assert!(
-            catalog
-                .from_publisher(r, TrackKind::Data, pid(1))
-                .is_empty()
-        );
+        assert_eq!(catalog.published_by(r, TrackKind::Data, pid(1)).count(), 0);
     }
 }

@@ -27,66 +27,63 @@ impl ControllerActor {
         self.pending.remove(track_id, subscriber, slot);
     }
 
-    pub(super) async fn install_video_runtimes(&mut self, track_id: crate::entity::TrackId) {
+    pub(super) async fn install_video_runtime(
+        &mut self,
+        track_id: crate::entity::TrackId,
+        destination: crate::id::ShardId,
+    ) {
         let Some(binding) = self.catalog.get(&track_id) else {
             debug_assert!(false, "video runtime installation requires a track binding");
             return;
         };
-        let publisher_shard = binding.publisher_shard;
+        if destination == binding.publisher_shard || binding.destinations.contains_key(&destination)
+        {
+            return;
+        }
         let origin = binding.publisher;
-        let Some(room_id) = self
-            .core
-            .registry
-            .get_participant(&origin)
-            .map(|meta| meta.room_id)
-        else {
-            debug_assert!(false, "a published track must have a room");
+        let Some(key) = self.prepare_track_key(destination, track_id, origin) else {
+            debug_assert!(false, "a subscriber shard must accept a track runtime");
+            return;
+        };
+        let Some(binding) = self.catalog.get_mut(&track_id) else {
+            debug_assert!(
+                false,
+                "track binding disappeared during runtime installation"
+            );
+            self.state.remove_track(destination, key);
+            return;
+        };
+        binding.destinations.insert(
+            destination,
+            crate::control::publication::Destination::Discovery {
+                key: crate::keys::VideoTrackKey::new(key),
+            },
+        );
+    }
+
+    pub(super) async fn install_video_runtimes_for_room(
+        &mut self,
+        track_id: crate::entity::TrackId,
+        room_id: crate::entity::RoomId,
+    ) {
+        let publisher_shard = self.catalog.get(&track_id).map(|p| p.publisher_shard);
+        let Some(publisher_shard) = publisher_shard else {
+            debug_assert!(false, "a video runtime installation requires a publication");
             return;
         };
         let destinations: Vec<_> = self
             .core
             .registry
-            .participants_in_room(&room_id)
-            .into_iter()
-            .map(|(_, shard, _)| shard)
+            .shards_in_room(&room_id)
             .filter(|shard| *shard != publisher_shard)
             .collect();
         for destination in destinations {
-            if self
-                .catalog
-                .get(&track_id)
-                .is_some_and(|binding| binding.destinations.contains_key(&destination))
-            {
-                continue;
-            }
-            let Some(key) = self.prepare_track_key(destination, track_id, origin) else {
-                debug_assert!(false, "a subscriber shard must accept a track runtime");
-                continue;
-            };
-            let Some(binding) = self.catalog.get_mut(&track_id) else {
-                debug_assert!(
-                    false,
-                    "track binding disappeared during runtime installation"
-                );
-                return;
-            };
-            binding.destinations.insert(
-                destination,
-                crate::control::publication::Destination {
-                    key: crate::control::publication::RuntimeKey::Track(key),
-                    route: None,
-                },
-            );
+            self.install_video_runtime(track_id, destination).await;
         }
     }
 
     pub(super) async fn retire_track_binding(&mut self, track_id: crate::entity::TrackId) -> bool {
-        self.retire_publication(track_id, |actor, shard, key| {
-            if let Some(key) = key.track() {
-                actor.state.remove_track(shard, key);
-            }
-        })
-        .await
+        self.retire_publication(track_id).await
     }
 
     /// A shard reported a newly published track.
@@ -101,15 +98,25 @@ impl ControllerActor {
         mut track: crate::track::Track,
         fanout: crate::shard::router::TrackKey,
     ) -> Option<crate::track::Track> {
-        let handle = self
-            .grant_route(
-                shard_id,
-                crate::route::RouteAction::Reverse {
-                    target: crate::route::ReverseTarget::Track { track: fanout },
-                },
-            )
-            .await?;
-        track.reverse = Some(handle);
+        if track.meta.id.kind() == crate::entity::TrackKind::Data {
+            debug_assert!(false, "data does not publish through the track path");
+            return None;
+        }
+        if track.meta.id.kind() == crate::entity::TrackKind::Video {
+            let handle = self
+                .grant_route(
+                    shard_id,
+                    crate::route::RouteAction::Reverse {
+                        target: crate::route::ReverseTarget::Track {
+                            track: crate::keys::VideoTrackKey::new(fanout),
+                        },
+                    },
+                )
+                .await?;
+            track.reverse = Some(handle);
+        } else {
+            track.reverse = None;
+        }
         Some(track)
     }
 
@@ -123,21 +130,47 @@ impl ControllerActor {
     }
 
     pub(super) async fn install_audio_routes(&mut self, track_id: crate::entity::TrackId) {
-        let installed = self
+        let complete = self
             .install_destinations(track_id, |actor, destination| {
-                let publication = actor.catalog.get(&track_id)?;
-                let (id, origin) = (publication.id, publication.publisher);
-                let key = actor.prepare_track_key(destination, id, origin)?;
-                Some((
-                    crate::control::publication::RuntimeKey::Track(key),
-                    RouteAction::Audio { track: key },
-                ))
+                actor.mint_audio_destination(track_id, destination)
             })
             .await;
-        let _ = installed;
+        if !complete {
+            self.defer_audio(track_id);
+        }
         if !self.publish_publication(track_id).await {
             debug_assert!(false, "audio route installation must publish");
         }
+    }
+
+    fn mint_audio_destination(
+        &mut self,
+        track_id: crate::entity::TrackId,
+        destination: crate::id::ShardId,
+    ) -> Option<(
+        crate::control::publication::RuntimeKey,
+        crate::route::RouteAction,
+    )> {
+        let publication = self.catalog.get(&track_id)?;
+        let (id, origin) = (publication.id, publication.publisher);
+        let key = self.prepare_track_key(destination, id, origin)?;
+        Some((
+            crate::control::publication::RuntimeKey::Audio(crate::keys::AudioTrackKey::new(key)),
+            RouteAction::Audio {
+                track: crate::keys::AudioTrackKey::new(key),
+            },
+        ))
+    }
+
+    pub(super) async fn install_audio_destination(
+        &mut self,
+        track_id: crate::entity::TrackId,
+        destination: crate::id::ShardId,
+    ) -> bool {
+        self.install_destination(track_id, destination, &|actor, destination| {
+            actor.mint_audio_destination(track_id, destination)
+        })
+        .await
     }
 
     /// A shard reported a new local consumer for a track.
@@ -179,7 +212,10 @@ impl ControllerActor {
             debug_assert!(false, "track metadata room must match its origin");
             return;
         }
-        let fanout = {
+        let pattern =
+            crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
+        let previous_member = self.video_patterns.member_key(&pattern, &subscriber);
+        let (fanout, new_destination) = {
             let Some(binding) = self.catalog.get(&track.id) else {
                 debug_assert!(false, "a subscription must name a published track");
                 return;
@@ -189,33 +225,40 @@ impl ControllerActor {
                 .track()
                 .filter(|_| shard_id == binding.publisher_shard)
             {
-                fanout
-            } else if let Some(fanout) = binding
-                .destinations
-                .get(&shard_id)
-                .and_then(|d| d.key.track())
-            {
-                fanout
+                (fanout, false)
+            } else if let Some(destination) = binding.destinations.get(&shard_id) {
+                let (fanout, new_destination) = match destination {
+                    crate::control::publication::Destination::Discovery { key } => {
+                        (key.raw(), true)
+                    }
+                    crate::control::publication::Destination::Forwarding {
+                        key: crate::control::publication::RuntimeKey::Video(key),
+                        ..
+                    } => (key.raw(), false),
+                    crate::control::publication::Destination::Forwarding { .. } => {
+                        debug_assert!(false, "a video destination must carry a video key");
+                        return;
+                    }
+                };
+                (fanout, new_destination)
             } else {
                 let Some(fanout) = self.prepare_track_key(shard_id, track.id, track.origin) else {
                     debug_assert!(false, "a subscriber shard must accept a track runtime");
                     return;
                 };
                 let Some(binding) = self.catalog.get_mut(&track.id) else {
+                    self.state.remove_track(shard_id, fanout);
                     return;
                 };
                 binding.destinations.insert(
                     shard_id,
-                    crate::control::publication::Destination {
-                        key: crate::control::publication::RuntimeKey::Track(fanout),
-                        route: None,
+                    crate::control::publication::Destination::Discovery {
+                        key: crate::keys::VideoTrackKey::new(fanout),
                     },
                 );
-                fanout
+                (fanout, true)
             }
         };
-        let pattern =
-            crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
         let (membership, mut membership_ops) = crate::control::patterns::declare_audience(
             &mut self.video_patterns,
             pattern.clone(),
@@ -225,9 +268,8 @@ impl ControllerActor {
                 key: subscriber_key,
                 delivery: slot,
             },
-            crate::view::Delivery::Video(slot),
-            crate::view::AudienceKind::Video,
         );
+        self.index_publication(track.id);
         membership_ops.push((
             shard_id,
             crate::view::ViewOp::BindSubscribedTrack {
@@ -236,25 +278,43 @@ impl ControllerActor {
                 fanout,
             },
         ));
-        if !self.publish_ops(membership_ops) {
-            debug_assert!(false, "video subscription must publish");
-        }
-
-        if membership == crate::control::patterns::Membership::FirstOnShard {
-            let Some(plan) = self.plan_for(track.id, shard_id) else {
-                debug_assert!(false, "a first subscription must have a compiled plan");
-                return;
+        if let Some((previous_shard, previous_key)) = previous_member
+            && (previous_shard != shard_id || previous_key != subscriber_key)
+        {
+            let Some(previous_fanout) = self.track_fanout(track.id, previous_shard) else {
+                pulsebeam_runtime::fatal!("a previous video subscription must have a fanout");
             };
-            let Some(handle) = self.install_video_route(shard_id, fanout, plan).await else {
-                // The fanout key stays. Only the route failed, and the shard is
-                // told which track a route carries by the route itself, so the
-                // retry re-stages this same key — dropping it here would mint a
-                // fresh one on every attempt and abandon the last in the arena.
+            membership_ops.push((
+                previous_shard,
+                crate::view::ViewOp::UnbindSubscribedTrack {
+                    participant: previous_key,
+                    track: track.id,
+                    fanout: previous_fanout,
+                },
+            ));
+        }
+        self.publish_ops(membership_ops);
+
+        let needs_remote_route = self
+            .catalog
+            .get(&track.id)
+            .is_some_and(|binding| binding.publisher_shard != shard_id);
+        let mut route_installed = false;
+        if membership == crate::control::patterns::Membership::FirstOnShard
+            && needs_remote_route
+            && new_destination
+        {
+            let Some(plan) = self.video_plan_for(track.id, shard_id) else {
+                pulsebeam_runtime::fatal!("a first subscription must have a compiled video plan");
+            };
+            let Some(handle) = self
+                .install_video_route(track.id, shard_id, fanout, plan)
+                .await
+            else {
                 let (_, mut rollback) = crate::control::patterns::retract_audience(
                     &mut self.video_patterns,
                     &pattern,
                     &subscriber,
-                    crate::view::AudienceKind::Video,
                 );
                 rollback.push((
                     shard_id,
@@ -264,7 +324,13 @@ impl ControllerActor {
                         fanout,
                     },
                 ));
-                let _ = self.publish_ops(rollback);
+                self.publish_ops(rollback);
+                if new_destination {
+                    if let Some(binding) = self.catalog.get_mut(&track.id) {
+                        binding.destinations.shift_remove(&shard_id);
+                    }
+                    self.state.remove_track(shard_id, fanout);
+                }
                 self.defer_subscribe(crate::control::pending::PendingSubscription::new(
                     shard_id,
                     subscriber,
@@ -274,15 +340,30 @@ impl ControllerActor {
                 ));
                 return;
             };
-            if let Some(binding) = self.catalog.get_mut(&track.id) {
-                if let Some(destination) = binding.destinations.get_mut(&shard_id) {
-                    destination.route = Some(handle);
-                }
-            }
+            let Some(binding) = self.catalog.get_mut(&track.id) else {
+                pulsebeam_runtime::fatal!("a video route must belong to its publication");
+            };
+            let Some(destination) = binding.destinations.get_mut(&shard_id) else {
+                pulsebeam_runtime::fatal!("a video route must have a destination binding");
+            };
+            let crate::control::publication::Destination::Discovery { key } = *destination else {
+                pulsebeam_runtime::fatal!("a first video route must start from discovery");
+            };
+            *destination = crate::control::publication::Destination::Forwarding {
+                key: crate::control::publication::RuntimeKey::Video(key),
+                route: handle,
+            };
+            route_installed = true;
         }
 
-        if !self.publish_publication(track.id).await {
-            debug_assert!(false, "track plan publication must complete");
+        if route_installed || membership != crate::control::patterns::Membership::Unchanged {
+            let Some(publisher_shard) = self.catalog.get(&track.id).map(|p| p.publisher_shard)
+            else {
+                pulsebeam_runtime::fatal!("a subscribed video must belong to a publication");
+            };
+            if !self.publish_plan_to(track.id, publisher_shard) {
+                debug_assert!(false, "publisher plan publication must complete");
+            }
         }
     }
 
@@ -304,7 +385,6 @@ impl ControllerActor {
             &mut self.video_patterns,
             &pattern,
             &subscriber,
-            crate::view::AudienceKind::Video,
         );
         if let (Some(key), Some(fanout)) = (subscriber_key, self.track_fanout(track.id, shard_id)) {
             membership_ops.push((
@@ -316,18 +396,21 @@ impl ControllerActor {
                 },
             ));
         }
-        if !self.publish_ops(membership_ops) {
-            debug_assert!(false, "video unsubscription must publish");
-        }
+        self.publish_ops(membership_ops);
         if departure != crate::control::patterns::Departure::LastOnShard {
             let _ = self.publish_publication(track.id).await;
             return;
         }
-        let Some(route) = self.catalog.get_mut(&track.id).and_then(|binding| {
+        let Some(route) = self.catalog.get(&track.id).and_then(|binding| {
             binding
                 .destinations
-                .get_mut(&shard_id)
-                .and_then(|d| d.route.take())
+                .get(&shard_id)
+                .and_then(|destination| match destination {
+                    crate::control::publication::Destination::Forwarding { route, .. } => {
+                        Some(*route)
+                    }
+                    crate::control::publication::Destination::Discovery { .. } => None,
+                })
         }) else {
             let _ = self.publish_publication(track.id).await;
             return;
@@ -349,31 +432,8 @@ impl ControllerActor {
             binding
                 .destinations
                 .get(&shard_id)
-                .and_then(|d| d.key.track())
+                .and_then(|d| d.key().track())
         }
-    }
-
-    pub(super) fn track_audience_on_shard(
-        &self,
-        origin: ParticipantId,
-        shard: crate::id::ShardId,
-    ) -> Vec<crate::shard::participants::ParticipantKey> {
-        let Some(room_id) = self
-            .core
-            .registry
-            .get_participant(&origin)
-            .map(|meta| meta.room_id)
-        else {
-            debug_assert!(false, "a published track must have a room");
-            return Vec::new();
-        };
-        self.core
-            .registry
-            .participants_in_room(&room_id)
-            .into_iter()
-            .filter(|(_, owner, key)| *owner == shard && key.is_some())
-            .filter_map(|(_, _, key)| key)
-            .collect()
     }
 
     /// What a shard needs to hold a runtime entry for this track.
@@ -411,26 +471,35 @@ impl ControllerActor {
             encodings,
             states,
             publication,
-            audience: self.track_audience_on_shard(binding.publisher, shard_id),
         })
     }
 
     pub(super) async fn install_video_route(
         &mut self,
+        track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
         fanout: crate::shard::router::TrackKey,
         plan: crate::view::VideoPlan,
     ) -> Option<RouteHandle> {
+        let descriptor = self.track_descriptor(track_id, shard_id)?;
         self.publish_with_route(shard_id, "video", move |_, handle| {
             vec![
                 (
                     shard_id,
+                    crate::view::ViewOp::InsertTrackRuntime {
+                        key: crate::keys::TrackRuntimeKey::Video(crate::keys::VideoTrackKey::new(
+                            fanout,
+                        )),
+                        descriptor,
+                    },
+                ),
+                (
+                    shard_id,
                     crate::view::ViewOp::InstallRoute {
-                        route: handle.route,
                         binding: crate::view::RouteBinding {
-                            epoch: handle.epoch,
+                            handle: *handle,
                             action: crate::route::RouteAction::Video {
-                                local_track: fanout,
+                                local_track: crate::keys::VideoTrackKey::new(fanout),
                             },
                         },
                     },
@@ -438,8 +507,10 @@ impl ControllerActor {
                 (
                     shard_id,
                     crate::view::ViewOp::SetPlan {
-                        target: crate::view::PlanTarget::Video(fanout),
-                        plan,
+                        update: crate::view::PlanUpdate::Video {
+                            key: crate::keys::VideoTrackKey::new(fanout),
+                            plan,
+                        },
                     },
                 ),
             ]
@@ -456,31 +527,43 @@ impl ControllerActor {
         handle: RouteHandle,
         track_id: crate::entity::TrackId,
     ) -> bool {
-        let mut ops = vec![(
-            shard_id,
-            crate::view::ViewOp::RetireRoute {
-                route: handle.route,
-                epoch: handle.epoch,
-            },
-        )];
+        let Some(destination) = self
+            .catalog
+            .get_mut(&track_id)
+            .and_then(|binding| binding.destinations.get_mut(&shard_id))
+        else {
+            debug_assert!(false, "a video route must have a destination binding");
+            return false;
+        };
+        let crate::control::publication::Destination::Forwarding {
+            key: crate::control::publication::RuntimeKey::Video(key),
+            route: current,
+        } = *destination
+        else {
+            debug_assert!(false, "a video route must be forwarding");
+            return false;
+        };
+        debug_assert_eq!(current, handle);
+        *destination = crate::control::publication::Destination::Discovery { key };
+        let mut ops = vec![(shard_id, crate::view::ViewOp::RetireRoute { handle })];
         for index in 0..self.views.len() {
             let target = crate::id::ShardId::new(index);
             if let (Some(key), Some(plan)) = (
                 self.track_fanout(track_id, target),
-                self.plan_for(track_id, target),
+                self.video_plan_for(track_id, target),
             ) {
                 ops.push((
                     target,
                     crate::view::ViewOp::SetPlan {
-                        target: crate::view::PlanTarget::Video(key),
-                        plan,
+                        update: crate::view::PlanUpdate::Video {
+                            key: crate::keys::VideoTrackKey::new(key),
+                            plan,
+                        },
                     },
                 ));
             }
         }
-        if !self.publish_ops(ops) {
-            return false;
-        }
+        self.publish_ops(ops);
         self.state
             .release_endpoint(shard_id, handle.route.slot(), tokio::time::Instant::now());
         true

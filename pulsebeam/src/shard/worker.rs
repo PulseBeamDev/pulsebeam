@@ -2,7 +2,7 @@
 //! startup and never again. Carries the sanctioned exception in
 //! `shard::metrics`; nothing else here may share.
 
-use std::pin::Pin;
+use std::{collections::VecDeque, pin::Pin};
 #[allow(
     clippy::disallowed_types,
     reason = "Arc<ShardMetrics>, one per shard, see module note"
@@ -35,9 +35,7 @@ use super::core::{ShardCore, ShardTransport};
 ///
 /// Deliberately large and preallocated. Every entry is one topology change
 /// (publish, subscribe, teardown, participant lifecycle) — control-rate events,
-/// not per-packet — so a healthy node never comes close. A full queue sheds the
-/// event and increments `shard_event_shed`; the next event or view update can
-/// restore the derived state without blocking the shard.
+/// not per-packet — so a healthy node never comes close.
 pub(crate) const SHARD_EVENT_CAPACITY: usize = 65_536;
 
 /// Depth of the controller -> shard command queue.
@@ -64,7 +62,6 @@ pub(crate) const SHARD_VIEW_CAPACITY: usize = 1024;
 pub(crate) const SHARD_COMMAND_BUDGET: usize = 64;
 pub(crate) const SHARD_FRAME_BUDGET: usize = 256;
 pub(crate) const SHARD_VIEW_OP_BUDGET: usize = 256;
-pub(crate) const SHARD_VIEW_BACKLOG_OP_CAPACITY: usize = 16_384;
 pub(crate) const SHARD_PIPELINE_BUDGET: usize = 512;
 pub(crate) const SHARD_EVENT_BUDGET: usize = 1024;
 pub(crate) const SHARD_UDP_BATCH_BUDGET: usize = 256;
@@ -124,10 +121,6 @@ fn describe_shard_metrics() {
         "recoverable packet or topology drops by lane, stage, and origin"
     );
     metrics::describe_counter!(
-        "shard_event_shed",
-        "topology events shed because the controller mailbox was full"
-    );
-    metrics::describe_counter!(
         "shard_wrong_owner_drop",
         "packets received by a shard that does not own their transport route"
     );
@@ -138,10 +131,6 @@ fn describe_shard_metrics() {
     metrics::describe_counter!(
         "shard_long_tick",
         "ticks longer than the realtime latency alarm threshold"
-    );
-    metrics::describe_counter!(
-        "view_backlog_shed",
-        "view operations discarded after the bounded coalescing backlog filled"
     );
     metrics::describe_counter!(
         "upstream_route_miss",
@@ -413,6 +402,7 @@ pub(crate) struct ShardWorker {
     tcp_socket: net::tcp::TcpTransport,
     command_rx: mailbox::Receiver<ShardCommand>,
     event_tx: mailbox::Sender<ShardEventMessage>,
+    shard_event_backlog: VecDeque<ShardEvent>,
     frame_rx: mailbox::Receiver<ShardFrame>,
     router: ChannelTransport,
     #[allow(
@@ -475,6 +465,7 @@ impl ShardWorker {
             tcp_socket,
             command_rx,
             event_tx,
+            shard_event_backlog: VecDeque::new(),
             frame_rx,
             router,
             metrics,
@@ -591,6 +582,9 @@ impl ShardWorker {
     }
 
     async fn wait_for_inputs(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), ShardError> {
+        if !self.shard_event_backlog.is_empty() {
+            return Ok(());
+        }
         let deadline = self.next_wait_deadline();
         let has_timer = if let Some(d) = deadline {
             sleep.as_mut().reset(d);
@@ -615,7 +609,7 @@ impl ShardWorker {
     }
 
     fn tick(&mut self, now: Instant) {
-        if self.core.apply_view_deltas(SHARD_VIEW_OP_BUDGET) == SHARD_VIEW_OP_BUDGET {
+        if self.core.apply_view_deltas(SHARD_VIEW_OP_BUDGET) >= SHARD_VIEW_OP_BUDGET {
             self.tick_budget_hit("view");
         }
         // phase 1: input
@@ -702,14 +696,15 @@ impl ShardWorker {
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
     }
 
-    /// Hand this tick's topology events to the controller.
-    ///
-    /// Events never wait on the controller. `try_send` keeps the shard's media
-    /// loop independent; a full queue sheds this recoverable topology hint and
-    /// records it for diagnosis.
+    /// Hand this tick's topology events to the controller without dropping
+    /// lifecycle state when the controller mailbox is temporarily full.
     fn flush_shard_events(&mut self) -> Result<(), ShardError> {
         for _ in 0..SHARD_EVENT_BUDGET {
-            let Some(event) = self.core.pop_shard_event() else {
+            let event = self
+                .shard_event_backlog
+                .pop_front()
+                .or_else(|| self.core.pop_shard_event());
+            let Some(event) = event else {
                 break;
             };
             match self.event_tx.try_send((self.router.shard_id, event)) {
@@ -718,19 +713,14 @@ impl ShardWorker {
                     tracing::warn!("shard event channel is closed, exiting");
                     return Err(ShardError::ManagerDisconnected);
                 }
-                Err(mailbox::TrySendError::Full(_ev)) => {
-                    metrics::counter!("shard_event_shed").increment(1);
-                    #[cfg(feature = "sim")]
-                    crate::sim_metrics::record_routing_counter("shard_event_shed");
-                    tracing::error!(
-                        shard = %self.router.shard_id,
-                        "shard event queue is full; shedding a recoverable control event"
-                    );
+                Err(mailbox::TrySendError::Full(ev)) => {
+                    self.shard_event_backlog.push_front(ev.1);
+                    break;
                 }
             }
         }
 
-        if self.core.has_pending_events() {
+        if !self.shard_event_backlog.is_empty() || self.core.has_pending_events() {
             self.tick_budget_hit("shard_events");
         }
 

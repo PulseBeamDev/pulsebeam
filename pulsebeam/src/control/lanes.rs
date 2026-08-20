@@ -29,13 +29,20 @@ pub(crate) enum StreamLane {
     Reliable,
 }
 
-impl StreamLane {
-    /// The lane a runtime key belongs to. The key's variant is the only thing
-    /// that decides it, so this is the one place that mapping is written.
-    pub(crate) fn of(key: RuntimeStreamKey) -> Self {
-        match key {
-            RuntimeStreamKey::Unreliable(_) => StreamLane::Unreliable,
-            RuntimeStreamKey::Reliable(_) => StreamLane::Reliable,
+impl From<StreamLane> for crate::track::DataLane {
+    fn from(lane: StreamLane) -> Self {
+        match lane {
+            StreamLane::Unreliable => Self::Realtime,
+            StreamLane::Reliable => Self::Reliable,
+        }
+    }
+}
+
+impl From<crate::track::DataLane> for StreamLane {
+    fn from(lane: crate::track::DataLane) -> Self {
+        match lane {
+            crate::track::DataLane::Realtime => Self::Unreliable,
+            crate::track::DataLane::Reliable => Self::Reliable,
         }
     }
 }
@@ -76,23 +83,6 @@ impl LaneRegistry {
             StreamLane::Reliable => state
                 .mint_reliable(destination, id.clone())
                 .map(RuntimeStreamKey::Reliable),
-        }
-    }
-
-    pub(crate) fn retire_runtime(
-        &self,
-        state: &mut ControlPlaneState,
-        destination: ShardId,
-        key: RuntimeStreamKey,
-    ) {
-        match (self.lane, key) {
-            (StreamLane::Unreliable, RuntimeStreamKey::Unreliable(key)) => {
-                state.remove_data(destination, key);
-            }
-            (StreamLane::Reliable, RuntimeStreamKey::Reliable(key)) => {
-                state.remove_reliable(destination, key);
-            }
-            _ => debug_assert!(false, "stream key and lane disagree"),
         }
     }
 }

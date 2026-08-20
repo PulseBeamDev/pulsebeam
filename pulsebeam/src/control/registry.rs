@@ -126,6 +126,7 @@ impl RoomRegistry {
         meta.connection_id = Some(connection_id);
     }
 
+    #[cfg(test)]
     pub fn participants_in_room(
         &self,
         room_id: &RoomId,
@@ -139,6 +140,13 @@ impl RoomRegistry {
                 Some((*participant, meta.shard_id, meta.binding))
             })
             .collect()
+    }
+
+    pub fn shards_in_room(&self, room_id: &RoomId) -> impl Iterator<Item = ShardId> + '_ {
+        self.rooms
+            .get(room_id)
+            .into_iter()
+            .flat_map(Room::shard_ids)
     }
 
     /// Record the arena key the owning shard reported for this participant.

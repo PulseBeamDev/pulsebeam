@@ -22,7 +22,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
 use crate::id::ShardId;
-use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
+use crate::keys::{AudioTrackKey, VideoTrackKey};
+use crate::shard::router::{ReliableStreamKey, UnreliableStreamKey};
 
 /// How long a retired slot waits before it can be handed out again.
 ///
@@ -78,18 +79,18 @@ impl PackedRoute {
     pub const MAX_SLOT: u32 = ROUTE_SLOT_MASK;
     pub const MAX_SHARD: u32 = ROUTE_SHARD_MASK;
 
-    /// Packs a shard and its local slot. `slot` must fit in 20 bits and
-    /// `shard` in 12 — both are asserted, not silently truncated, because a
-    /// truncated shard id would steer a packet to the wrong worker without
-    /// ever failing loudly.
+    /// Packs a shard and its local slot. Invalid values are a programming or
+    /// configuration error: truncating either one would address a different
+    /// worker or slot.
     pub const fn new(shard: ShardId, slot: u32) -> Self {
-        debug_assert!(slot <= Self::MAX_SLOT, "route slot overflows 20 bits");
-        // Asserted below to fit in 12 bits, so the truncation clippy warns
-        // about cannot happen for any shard this format actually supports.
+        assert!(slot <= Self::MAX_SLOT, "route slot overflows 20 bits");
+        assert!(
+            shard.index() <= Self::MAX_SHARD as usize,
+            "shard id overflows 12 bits"
+        );
         #[allow(clippy::cast_possible_truncation)]
         let shard_bits = shard.index() as u32;
-        debug_assert!(shard_bits <= Self::MAX_SHARD, "shard id overflows 12 bits");
-        Self(((shard_bits & ROUTE_SHARD_MASK) << ROUTE_SLOT_BITS) | (slot & ROUTE_SLOT_MASK))
+        Self((shard_bits << ROUTE_SLOT_BITS) | slot)
     }
 
     /// The checked constructor, for anywhere the shard or slot is derived
@@ -281,8 +282,7 @@ pub fn peek_shard(buf: &[u8]) -> Option<ShardId> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Envelope {
     pub ty: EnvelopeType,
-    pub epoch: u16,
-    pub route: RouteId,
+    pub handle: RouteHandle,
     pub extension: u64,
 }
 
@@ -298,8 +298,7 @@ impl Envelope {
     pub fn media(handle: RouteHandle, link_seq: u32, playout_ntp32: u32) -> Self {
         Self {
             ty: EnvelopeType::Media,
-            epoch: handle.epoch,
-            route: handle.route,
+            handle,
             extension: (u64::from(link_seq) << 32) | u64::from(playout_ntp32),
         }
     }
@@ -307,8 +306,7 @@ impl Envelope {
     pub fn feedback(handle: RouteHandle) -> Self {
         Self {
             ty: EnvelopeType::Feedback,
-            epoch: handle.epoch,
-            route: handle.route,
+            handle,
             extension: 0,
         }
     }
@@ -316,8 +314,7 @@ impl Envelope {
     pub fn telemetry(handle: RouteHandle) -> Self {
         Self {
             ty: EnvelopeType::Telemetry,
-            epoch: handle.epoch,
-            route: handle.route,
+            handle,
             extension: 0,
         }
     }
@@ -325,8 +322,8 @@ impl Envelope {
     pub fn encode(self) -> [u8; ENVELOPE_LEN] {
         pulsebeam_routing::envelope::Envelope {
             ty: self.ty,
-            epoch: self.epoch,
-            route: to_wire_route(self.route),
+            epoch: self.handle.epoch,
+            route: to_wire_route(self.handle.route),
             extension: self.extension,
         }
         .encode()
@@ -336,8 +333,7 @@ impl Envelope {
         let wire = pulsebeam_routing::envelope::Envelope::decode(buf)?;
         Ok(Self {
             ty: wire.ty,
-            epoch: wire.epoch,
-            route: from_wire_route(wire.route),
+            handle: RouteHandle::new(from_wire_route(wire.route), wire.epoch),
             extension: wire.extension,
         })
     }
@@ -390,11 +386,11 @@ pub(crate) enum RouteAction {
         /// The destination's own fanout handle — a dense index, not a name.
         /// Resolving a route hands dispatch something it can use directly,
         /// rather than a `TrackId` it would have to hash back into a map.
-        local_track: TrackKey,
+        local_track: VideoTrackKey,
     },
     /// One route per audio stream and destination. The track key resolves the
     /// destination's compiled audio plan directly.
-    Audio { track: TrackKey },
+    Audio { track: AudioTrackKey },
     /// One route per (publisher, topic, destination) on the unreliable lane.
     /// The destination installs it whether the local subscription named a
     /// publisher or was a wildcard — wildcards resolve to concrete streams as
@@ -427,7 +423,7 @@ pub(crate) enum ReverseTarget {
         /// The publisher's own fanout handle. Encodings live on the
         /// `TrackRoute` this resolves to, in declared order — a frame names
         /// one by index, so the rid itself never travels.
-        track: TrackKey,
+        track: VideoTrackKey,
     },
     Topic {
         stream: ReliableStreamKey,
@@ -444,7 +440,7 @@ pub(crate) enum ReverseTarget {
 /// therefore cannot live in an immutable image.
 #[derive(Debug)]
 pub(crate) struct RouteRuntimeEntry {
-    pub epoch: u16,
+    pub handle: RouteHandle,
     /// Expands the envelope's middle-32 against this route's own reference.
     pub expander: NtpExpander,
     /// Last `link_seq` seen, for hop-local loss/reorder/duplicate accounting.
@@ -673,7 +669,7 @@ impl RouteRuntime {
             .slots
             .get(idx)
             .and_then(Option::as_ref)
-            .is_none_or(|entry| entry.epoch != handle.epoch);
+            .is_none_or(|entry| entry.handle != handle);
         if stale {
             self.install(handle, ntp_ref);
         }
@@ -699,7 +695,7 @@ impl RouteRuntime {
             return;
         };
         *slot = Some(RouteRuntimeEntry {
-            epoch: handle.epoch,
+            handle,
             expander: NtpExpander::new(ntp_ref),
             last_link_seq: None,
             stats: RouteStats::default(),
@@ -713,7 +709,7 @@ impl RouteRuntime {
             return false;
         };
         match slot {
-            Some(entry) if entry.epoch == handle.epoch => {}
+            Some(entry) if entry.handle == handle => {}
             _ => return false,
         }
         *slot = None;
@@ -723,14 +719,14 @@ impl RouteRuntime {
     #[cfg(test)]
     pub fn entry_mut(&mut self, handle: RouteHandle) -> Option<&mut RouteRuntimeEntry> {
         match self.slots.get_mut(handle.route.index()) {
-            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
+            Some(Some(entry)) if entry.handle == handle => Some(entry),
             _ => None,
         }
     }
 
     pub fn entry(&self, handle: RouteHandle) -> Option<&RouteRuntimeEntry> {
         match self.slots.get(handle.route.index()) {
-            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
+            Some(Some(entry)) if entry.handle == handle => Some(entry),
             _ => None,
         }
     }
@@ -835,8 +831,7 @@ mod tests {
     fn envelope_encodes_big_endian_at_documented_offsets() {
         let env = Envelope {
             ty: EnvelopeType::Media,
-            epoch: 0x1122,
-            route: RouteId::from_raw(0x3344_5566),
+            handle: RouteHandle::new(RouteId::from_raw(0x3344_5566), 0x1122),
             extension: (u64::from(0x7788_99AAu32) << 32) | u64::from(0xBBCC_DDEE_u32),
         };
         let bytes = env.encode();
@@ -925,8 +920,7 @@ mod tests {
     fn envelope_round_trips() {
         let env = Envelope {
             ty: EnvelopeType::Media,
-            epoch: 65_535,
-            route: RouteId::from_raw(u32::MAX),
+            handle: RouteHandle::new(RouteId::from_raw(u32::MAX), 65_535),
             extension: u64::MAX,
         };
         assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
