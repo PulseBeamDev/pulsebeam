@@ -151,6 +151,8 @@ pub(crate) enum TransactionError {
     Busy,
     /// No transaction is staged.
     Idle,
+    /// The generation counter cannot produce a newer view generation.
+    GenerationExhausted,
     Allocation(RouteError),
 }
 
@@ -292,7 +294,10 @@ impl ControlPlaneState {
         if self.pending.is_some() {
             return Err(TransactionError::Busy);
         }
-        let generation = self.generation.saturating_add(1);
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(TransactionError::GenerationExhausted)?;
         self.pending = Some(LifecycleTransaction::new(generation));
         Ok(())
     }
@@ -311,6 +316,7 @@ impl ControlPlaneState {
         shard_id: ShardId,
         now: Instant,
     ) -> Result<TransportHandle, TransactionError> {
+        self.tx_mut()?;
         let (slot, epoch) = self
             .transport
             .allocate(shard_id, now)
@@ -321,7 +327,10 @@ impl ControlPlaneState {
             shard_id,
             "a reserved route must carry the shard it was reserved on"
         );
-        let tx = self.tx_mut()?;
+        let Some(tx) = self.pending.as_mut() else {
+            debug_assert!(false, "transaction disappeared during route reservation");
+            return Err(TransactionError::Idle);
+        };
         tx.reservations.push(RouteReservation {
             shard_id,
             slot,
@@ -337,12 +346,16 @@ impl ControlPlaneState {
         shard_id: ShardId,
         now: Instant,
     ) -> Result<RouteHandle, TransactionError> {
+        self.tx_mut()?;
         let (slot, epoch) = self
             .endpoint
             .allocate(shard_id, now)
             .map_err(TransactionError::Allocation)?;
         let handle = RouteHandle::new(RouteId::new(shard_id, slot), epoch);
-        let tx = self.tx_mut()?;
+        let Some(tx) = self.pending.as_mut() else {
+            debug_assert!(false, "transaction disappeared during route reservation");
+            return Err(TransactionError::Idle);
+        };
         tx.reservations.push(RouteReservation {
             shard_id,
             slot,
@@ -369,9 +382,10 @@ impl ControlPlaneState {
     /// Commit the staged generation after its deltas have been queued.
     pub fn commit(&mut self) -> Result<LifecycleTransaction, TransactionError> {
         let tx = self.pending.take().ok_or(TransactionError::Idle)?;
-        debug_assert_eq!(
-            tx.generation,
-            self.generation.saturating_add(1),
+        debug_assert!(
+            self.generation
+                .checked_add(1)
+                .is_some_and(|generation| generation == tx.generation),
             "generations commit in order"
         );
         self.generation = tx.generation;
@@ -424,6 +438,20 @@ mod tests {
             .reserve_transport(ShardId::new(5), Instant::now())
             .unwrap();
         assert_eq!(handle.shard(), ShardId::new(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reserving_without_a_transaction_does_not_consume_a_slot() {
+        let mut state = ControlPlaneState::new(1);
+        let shard = ShardId::new(0);
+        assert_eq!(
+            state.reserve_transport(shard, Instant::now()),
+            Err(TransactionError::Idle)
+        );
+
+        state.begin().unwrap();
+        let handle = state.reserve_transport(shard, Instant::now()).unwrap();
+        assert_eq!(handle.route.slot(), 0);
     }
 
     #[tokio::test(start_paused = true)]

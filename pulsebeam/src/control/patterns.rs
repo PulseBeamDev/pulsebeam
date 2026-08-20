@@ -21,9 +21,6 @@
 //! always fully concrete, which is the existing "client names its tracks" API
 //! rather than a new restriction.
 #![deny(clippy::arithmetic_side_effects)]
-// Wired in the step that moves audio onto patterns; standalone until then.
-#![allow(dead_code)]
-
 use arrayvec::ArrayVec;
 use indexmap::{IndexMap, IndexSet};
 
@@ -34,6 +31,10 @@ use crate::entity::{ParticipantId, RoomId};
 use crate::id::ShardId;
 use crate::keys::ParticipantKey;
 pub(crate) use crate::view::GroupId;
+
+type AudienceOps = Vec<(ShardId, crate::view::ViewOp)>;
+type Displaced<G> = (GroupId<G>, Departure, ShardId, ParticipantKey);
+type RetiredPattern<G> = (GroupId<G>, Vec<(ParticipantId, ShardId, ParticipantKey)>);
 
 /// A concrete publication: what a publisher actually announced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +90,7 @@ impl<N: Clone + Eq> Pattern<N> {
         }
     }
 
+    #[cfg(test)]
     pub fn matches(&self, subject: &Subject<N>) -> bool {
         self.room == subject.room
             && self
@@ -122,10 +124,10 @@ impl<N: Clone + Eq> Subject<N> {
     /// wildcards are permitted in exactly two positions.
     pub fn candidates(&self) -> [Pattern<N>; 4] {
         [
-            Pattern::exact(self.room.clone(), self.publisher, self.name.clone()),
-            Pattern::any_publisher(self.room.clone(), self.name.clone()),
-            Pattern::any_name(self.room.clone(), self.publisher),
-            Pattern::all(self.room.clone()),
+            Pattern::exact(self.room, self.publisher, self.name.clone()),
+            Pattern::any_publisher(self.room, self.name.clone()),
+            Pattern::any_name(self.room, self.publisher),
+            Pattern::all(self.room),
         ]
     }
 }
@@ -181,25 +183,29 @@ impl<S> Default for Group<S> {
 
 /// Declarations for one kind, and the groups they resolve to.
 #[derive(Debug)]
-pub(crate) struct PatternTable<N, S> {
-    ids: Map<Pattern<N>, GroupId>,
+pub(crate) struct PatternTable<N, S, G = crate::view::AnyAudience> {
+    ids: Map<Pattern<N>, GroupId<G>>,
     groups: Vec<Option<Group<S>>>,
-    free: Vec<GroupId>,
+    free: Vec<GroupId<G>>,
     by_participant: Map<ParticipantId, Set<Pattern<N>>>,
+    matched: Map<GroupId<G>, Set<crate::entity::TrackId>>,
 }
 
-impl<N, S> Default for PatternTable<N, S> {
+impl<N, S, G> Default for PatternTable<N, S, G> {
     fn default() -> Self {
         Self {
             ids: Map::default(),
             groups: Vec::new(),
             free: Vec::new(),
             by_participant: Map::default(),
+            matched: Map::default(),
         }
     }
 }
 
-impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
+impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
+    PatternTable<N, S, G>
+{
     pub fn new() -> Self {
         Self::default()
     }
@@ -215,11 +221,60 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         pattern: Pattern<N>,
         participant: ParticipantId,
         member: Member<S>,
-    ) -> (Membership, Vec<(GroupId, Departure)>) {
-        let held = self.by_participant.entry(participant).or_default();
-        if held.contains(&pattern) {
-            return (Membership::Unchanged, Vec::new());
+    ) -> (Membership, Vec<Displaced<G>>) {
+        let already_held = self
+            .by_participant
+            .get(&participant)
+            .is_some_and(|held| held.contains(&pattern));
+        if already_held {
+            let Some(id) = self.ids.get(&pattern).copied() else {
+                debug_assert!(false, "a held pattern must have a group");
+                return (Membership::Unchanged, Vec::new());
+            };
+            let Some(group) = self.groups.get_mut(id.0 as usize).and_then(Option::as_mut) else {
+                debug_assert!(false, "a held pattern's group must resolve");
+                return (Membership::Unchanged, Vec::new());
+            };
+            let Some(previous) = group.members.get(&participant).copied() else {
+                debug_assert!(false, "a held pattern must have its member");
+                return (Membership::Unchanged, Vec::new());
+            };
+            if previous == member {
+                return (Membership::Unchanged, Vec::new());
+            }
+            let old = previous;
+            let departure = match group.per_shard.get_mut(&old.shard) {
+                Some(count) => {
+                    let Some(next) = count.checked_sub(1) else {
+                        pulsebeam_runtime::fatal!("a pattern shard count cannot underflow");
+                    };
+                    *count = next;
+                    if next == 0 {
+                        group.per_shard.shift_remove(&old.shard);
+                        Departure::LastOnShard
+                    } else {
+                        Departure::Left
+                    }
+                }
+                None => {
+                    debug_assert!(false, "a member's shard must be counted");
+                    Departure::Left
+                }
+            };
+            group.members.insert(participant, member);
+            let count = group.per_shard.entry(member.shard).or_insert(0);
+            let Some(next) = count.checked_add(1) else {
+                pulsebeam_runtime::fatal!("a pattern shard count cannot overflow");
+            };
+            *count = next;
+            let membership = if *count == 1 {
+                Membership::FirstOnShard
+            } else {
+                Membership::Joined
+            };
+            return (membership, vec![(id, departure, old.shard, old.key)]);
         }
+        let held = self.by_participant.entry(participant).or_default();
         if held.iter().any(|existing| existing.subsumes(&pattern)) {
             return (Membership::Unchanged, Vec::new());
         }
@@ -231,8 +286,13 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
 
         let mut displaced = Vec::new();
         for stale in narrowed {
+            let old_member = self.member_key(&stale, &participant);
             if let Some(outcome) = self.retract(&stale, &participant) {
-                displaced.push(outcome);
+                let Some((shard, key)) = old_member else {
+                    debug_assert!(false, "a displaced declaration must have a member");
+                    continue;
+                };
+                displaced.push((outcome.0, outcome.1, shard, key));
             }
         }
 
@@ -249,7 +309,10 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         let shard = member.shard;
         group.members.insert(participant, member);
         let count = group.per_shard.entry(shard).or_insert(0);
-        *count = count.saturating_add(1);
+        let Some(next) = count.checked_add(1) else {
+            pulsebeam_runtime::fatal!("a pattern shard count cannot overflow");
+        };
+        *count = next;
         let membership = if *count == 1 {
             Membership::FirstOnShard
         } else {
@@ -267,7 +330,11 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
     }
 
     /// Drop every declaration a participant held, for when it leaves.
-    pub fn remove_participant(&mut self, participant: &ParticipantId) -> Vec<(GroupId, Departure)> {
+    #[cfg(test)]
+    pub fn remove_participant(
+        &mut self,
+        participant: &ParticipantId,
+    ) -> Vec<(GroupId<G>, Departure)> {
         let Some(held) = self.by_participant.shift_remove(participant) else {
             return Vec::new();
         };
@@ -280,7 +347,7 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         &mut self,
         pattern: &Pattern<N>,
         participant: &ParticipantId,
-    ) -> Option<(GroupId, Departure)> {
+    ) -> Option<(GroupId<G>, Departure)> {
         let held = self.by_participant.get_mut(participant)?;
         if !held.shift_remove(pattern) {
             return None;
@@ -295,7 +362,7 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         &mut self,
         pattern: &Pattern<N>,
         participant: &ParticipantId,
-    ) -> Option<(GroupId, Departure)> {
+    ) -> Option<(GroupId<G>, Departure)> {
         let id = *self.ids.get(pattern)?;
         let group = self
             .groups
@@ -304,8 +371,11 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
         let member = group.members.shift_remove(participant)?;
         let departure = match group.per_shard.get_mut(&member.shard) {
             Some(count) => {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
+                let Some(next) = count.checked_sub(1) else {
+                    pulsebeam_runtime::fatal!("a pattern shard count cannot underflow");
+                };
+                *count = next;
+                if next == 0 {
                     group.per_shard.shift_remove(&member.shard);
                     Departure::LastOnShard
                 } else {
@@ -322,21 +392,24 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
             if let Some(slot) = self.groups.get_mut(id.0 as usize) {
                 *slot = None;
             }
+            self.matched.shift_remove(&id);
             self.free.push(id);
         }
         Some((id, departure))
     }
 
-    fn intern(&mut self, pattern: Pattern<N>) -> GroupId {
+    fn intern(&mut self, pattern: Pattern<N>) -> GroupId<G> {
         if let Some(id) = self.ids.get(&pattern) {
             return *id;
         }
         let id = match self.free.pop() {
             Some(id) => id,
             None => {
-                let next = u32::try_from(self.groups.len()).unwrap_or(u32::MAX);
+                let Ok(next) = u32::try_from(self.groups.len()) else {
+                    pulsebeam_runtime::fatal!("pattern group id space is exhausted");
+                };
                 self.groups.push(None);
-                GroupId(next)
+                GroupId::new(next)
             }
         };
         if let Some(slot) = self.groups.get_mut(id.0 as usize) {
@@ -348,7 +421,7 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
 
     /// The groups a publication must be forwarded to. At most four, because
     /// only four patterns can match a subject.
-    pub fn match_subject(&self, subject: &Subject<N>) -> ArrayVec<GroupId, 4> {
+    pub fn match_subject(&self, subject: &Subject<N>) -> ArrayVec<GroupId<G>, 4> {
         let mut matched = ArrayVec::new();
         for candidate in subject.candidates() {
             if let Some(id) = self.ids.get(&candidate) {
@@ -356,6 +429,40 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
             }
         }
         matched
+    }
+
+    pub fn attach_publication(
+        &mut self,
+        subject: &Subject<N>,
+        publication: crate::entity::TrackId,
+    ) -> ArrayVec<GroupId<G>, 4> {
+        let groups = self.match_subject(subject);
+        for group in groups.iter().copied() {
+            self.matched.entry(group).or_default().insert(publication);
+        }
+        groups
+    }
+
+    pub fn detach_publication(
+        &mut self,
+        subject: &Subject<N>,
+        publication: crate::entity::TrackId,
+    ) {
+        for group in self.match_subject(subject) {
+            if let Some(publications) = self.matched.get_mut(&group) {
+                publications.shift_remove(&publication);
+                if publications.is_empty() {
+                    self.matched.shift_remove(&group);
+                }
+            }
+        }
+    }
+
+    pub fn publications_of(&self, group: GroupId<G>) -> Vec<crate::entity::TrackId> {
+        self.matched
+            .get(&group)
+            .map(|publications| publications.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Where a subscriber sits in a pattern's group, for addressing the op
@@ -374,10 +481,7 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
     /// Drop a pattern outright, returning its group and everyone who was in
     /// it. For a publication going away: its subscribers never unsubscribe, so
     /// without this their declarations would outlive the thing they named.
-    pub fn retire_pattern(
-        &mut self,
-        pattern: &Pattern<N>,
-    ) -> Option<(GroupId, Vec<(ParticipantId, ShardId, ParticipantKey)>)> {
+    pub fn retire_pattern(&mut self, pattern: &Pattern<N>) -> Option<RetiredPattern<G>> {
         let id = self.ids.shift_remove(pattern)?;
         let group = self.groups.get_mut(id.0 as usize).and_then(Option::take)?;
         let members = group
@@ -394,10 +498,11 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
             }
         }
         self.free.push(id);
+        self.matched.shift_remove(&id);
         Some((id, members))
     }
 
-    pub fn group_of(&self, pattern: &Pattern<N>) -> Option<GroupId> {
+    pub fn group_of(&self, pattern: &Pattern<N>) -> Option<GroupId<G>> {
         self.ids.get(pattern).copied()
     }
 
@@ -408,9 +513,10 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
     /// a per-shard arena key: two participants on different shards can hold the
     /// same one, so anything comparing identities across shards has to use the
     /// id.
+    #[cfg(test)]
     pub fn members_on(
         &self,
-        group: GroupId,
+        group: GroupId<G>,
         shard: ShardId,
     ) -> Vec<(ParticipantId, ParticipantKey, S)> {
         self.groups
@@ -427,12 +533,19 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
     }
 
     /// Shards holding at least one member of the group.
-    pub fn shards_of(&self, group: GroupId) -> Vec<ShardId> {
+    pub fn shards_of(&self, group: GroupId<G>) -> impl Iterator<Item = ShardId> + '_ {
         self.groups
             .get(group.0 as usize)
             .and_then(Option::as_ref)
-            .map(|g| g.per_shard.keys().copied().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|g| g.per_shard.keys().copied())
+    }
+
+    pub fn has_shard(&self, group: GroupId<G>, shard: ShardId) -> bool {
+        self.groups
+            .get(group.0 as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|group| group.per_shard.contains_key(&shard))
     }
 
     #[cfg(test)]
@@ -464,57 +577,48 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy> PatternTable<N, S> {
 /// declaration, retract anything the new one subsumes, and tell the
 /// subscriber's shard — so they are one operation here rather than the same
 /// twenty lines at each call site.
-pub(crate) fn declare_audience<N, S>(
-    table: &mut PatternTable<N, S>,
+pub(crate) fn declare_audience<N, S, G>(
+    table: &mut PatternTable<N, S, G>,
     pattern: Pattern<N>,
     participant: ParticipantId,
     member: Member<S>,
-    delivery: crate::view::Delivery,
-    kind: crate::view::AudienceKind,
-) -> (Membership, Vec<(ShardId, crate::view::ViewOp)>)
+) -> (Membership, AudienceOps)
 where
     N: std::hash::Hash + Eq + Clone,
-    S: Copy,
+    S: crate::view::AudienceSpec<G> + PartialEq + std::fmt::Debug,
 {
     let shard = member.shard;
     let key = member.key;
+    let delivery = member.delivery;
     let (membership, displaced) = table.declare(pattern.clone(), participant, member);
     let mut ops: Vec<_> = displaced
         .into_iter()
-        .map(|(group, _)| (shard, crate::view::ViewOp::GroupRemove { group, key, kind }))
+        .map(|(group, _, shard, key)| (shard, S::remove(group, key)))
         .collect();
     if membership != Membership::Unchanged
         && let Some(group) = table.group_of(&pattern)
     {
-        ops.push((
-            shard,
-            crate::view::ViewOp::GroupInsert {
-                group,
-                key,
-                delivery,
-            },
-        ));
+        ops.push((shard, S::insert(group, key, delivery)));
     }
     (membership, ops)
 }
 
 /// The inverse: withdraw one declaration and say so.
-pub(crate) fn retract_audience<N, S>(
-    table: &mut PatternTable<N, S>,
+pub(crate) fn retract_audience<N, S, G>(
+    table: &mut PatternTable<N, S, G>,
     pattern: &Pattern<N>,
     participant: &ParticipantId,
-    kind: crate::view::AudienceKind,
-) -> (Departure, Vec<(ShardId, crate::view::ViewOp)>)
+) -> (Departure, AudienceOps)
 where
     N: std::hash::Hash + Eq + Clone,
-    S: Copy,
+    S: crate::view::AudienceSpec<G> + PartialEq + std::fmt::Debug,
 {
     let placement = table.member_key(pattern, participant);
     let group = table.group_of(pattern);
     let departure = table.undeclare(pattern, participant);
     let ops = match (group, placement) {
         (Some(group), Some((shard, key))) => {
-            vec![(shard, crate::view::ViewOp::GroupRemove { group, key, kind })]
+            vec![(shard, S::remove(group, key))]
         }
         _ => Vec::new(),
     };
@@ -522,23 +626,19 @@ where
 }
 
 /// Withdraw everything a departing participant declared.
-pub(crate) fn retract_participant<N, S>(
-    table: &mut PatternTable<N, S>,
+pub(crate) fn retract_participant<N, S, G>(
+    table: &mut PatternTable<N, S, G>,
     participant: &ParticipantId,
-    kind: crate::view::AudienceKind,
-) -> (
-    Vec<(Pattern<N>, Departure)>,
-    Vec<(ShardId, crate::view::ViewOp)>,
-)
+) -> (Vec<(Pattern<N>, Departure)>, AudienceOps)
 where
     N: std::hash::Hash + Eq + Clone,
-    S: Copy,
+    S: crate::view::AudienceSpec<G> + PartialEq + std::fmt::Debug,
 {
     let held = table.declarations_of(participant);
     let mut departures = Vec::new();
     let mut ops = Vec::new();
     for pattern in held {
-        let (departure, mut pattern_ops) = retract_audience(table, &pattern, participant, kind);
+        let (departure, mut pattern_ops) = retract_audience(table, &pattern, participant);
         departures.push((pattern, departure));
         ops.append(&mut pattern_ops);
     }
@@ -585,13 +685,13 @@ mod tests {
     fn a_subject_is_matched_by_every_form_that_names_it() {
         let mut table = Table::new();
         let r = room("r");
-        let subj = subject(r.clone(), 1, "t");
+        let subj = subject(r, 1, "t");
 
         let forms = [
-            Pattern::exact(r.clone(), pid(1), "t".to_string()),
-            Pattern::any_publisher(r.clone(), "t".to_string()),
-            Pattern::any_name(r.clone(), pid(1)),
-            Pattern::all(r.clone()),
+            Pattern::exact(r, pid(1), "t".to_string()),
+            Pattern::any_publisher(r, "t".to_string()),
+            Pattern::any_name(r, pid(1)),
+            Pattern::all(r),
         ];
         // A distinct participant per form, so normalization does not
         // collapse them into one another.
@@ -611,14 +711,14 @@ mod tests {
     #[test]
     fn a_subject_is_matched_by_nothing_that_names_something_else() {
         let r = room("r");
-        let subj = subject(r.clone(), 1, "t");
+        let subj = subject(r, 1, "t");
 
         let misses = [
             Pattern::all(room("other")),
-            Pattern::exact(r.clone(), pid(2), "t".to_string()),
-            Pattern::exact(r.clone(), pid(1), "u".to_string()),
-            Pattern::any_publisher(r.clone(), "u".to_string()),
-            Pattern::any_name(r.clone(), pid(2)),
+            Pattern::exact(r, pid(2), "t".to_string()),
+            Pattern::exact(r, pid(1), "u".to_string()),
+            Pattern::any_publisher(r, "u".to_string()),
+            Pattern::any_name(r, pid(2)),
         ];
         for (i, miss) in misses.iter().enumerate() {
             assert!(!miss.matches(&subj), "pattern {i} must not match");
@@ -646,8 +746,8 @@ mod tests {
     fn a_broader_declaration_displaces_what_it_covers() {
         let mut table = Table::new();
         let r = room("r");
-        let pin = Pattern::any_publisher(r.clone(), "t".to_string());
-        let auto = Pattern::all(r.clone());
+        let pin = Pattern::any_publisher(r, "t".to_string());
+        let auto = Pattern::all(r);
 
         table.declare(pin, pid(1), member(0));
         assert_eq!(table.live_groups(), 1);
@@ -667,16 +767,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn displacement_removes_the_old_shard_member() {
+        let mut table = Table::new();
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+        let old_key = keys.insert(());
+        let new_key = keys.insert(());
+        let r = room("r");
+        let pin = Pattern::any_publisher(r, "t".to_string());
+        let broad = Pattern::all(room("r"));
+
+        table.declare(
+            pin,
+            pid(1),
+            Member {
+                shard: ShardId::new(1),
+                key: old_key,
+                delivery: 0,
+            },
+        );
+        let (_, displaced) = table.declare(
+            broad,
+            pid(1),
+            Member {
+                shard: ShardId::new(2),
+                key: new_key,
+                delivery: 0,
+            },
+        );
+
+        assert_eq!(displaced[0].2, ShardId::new(1));
+        assert_eq!(displaced[0].3, old_key);
+    }
+
+    #[test]
+    fn a_repeated_declaration_migrates_its_member() {
+        let mut table = Table::new();
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+        let old_key = keys.insert(());
+        let new_key = keys.insert(());
+        let pattern = Pattern::all(room("r"));
+        let participant = pid(1);
+        let (first, _) = table.declare(
+            pattern.clone(),
+            participant,
+            Member {
+                shard: ShardId::new(1),
+                key: old_key,
+                delivery: 0,
+            },
+        );
+        assert_eq!(first, Membership::FirstOnShard);
+        let group = table.group_of(&pattern).unwrap();
+
+        let (membership, displaced) = table.declare(
+            pattern,
+            participant,
+            Member {
+                shard: ShardId::new(2),
+                key: new_key,
+                delivery: 0,
+            },
+        );
+
+        assert_eq!(membership, Membership::FirstOnShard);
+        assert_eq!(
+            displaced,
+            vec![(group, Departure::LastOnShard, ShardId::new(1), old_key)]
+        );
+        assert!(table.members_on(group, ShardId::new(1)).is_empty());
+        assert_eq!(
+            table.members_on(group, ShardId::new(2)),
+            vec![(participant, new_key, 0)]
+        );
+    }
+
     /// The other order: a narrower declaration arriving under a live wildcard
     /// is redundant and must not create a second path to the same participant.
     #[test]
     fn a_narrower_declaration_under_a_wildcard_is_ignored() {
         let mut table = Table::new();
         let r = room("r");
-        table.declare(Pattern::all(r.clone()), pid(1), member(0));
+        table.declare(Pattern::all(r), pid(1), member(0));
 
         let (membership, displaced) = table.declare(
-            Pattern::any_publisher(r.clone(), "t".to_string()),
+            Pattern::any_publisher(r, "t".to_string()),
             pid(1),
             member(0),
         );
@@ -691,10 +866,10 @@ mod tests {
     #[test]
     fn subsumption_orders_the_four_forms() {
         let r = room("r");
-        let exact = Pattern::exact(r.clone(), pid(1), "t".to_string());
-        let by_name = Pattern::any_publisher(r.clone(), "t".to_string());
-        let by_pub = Pattern::any_name(r.clone(), pid(1));
-        let all = Pattern::all(r.clone());
+        let exact = Pattern::exact(r, pid(1), "t".to_string());
+        let by_name = Pattern::any_publisher(r, "t".to_string());
+        let by_pub = Pattern::any_name(r, pid(1));
+        let all = Pattern::all(r);
 
         for narrow in [&exact, &by_name, &by_pub, &all] {
             assert!(all.subsumes(narrow), "the room wildcard covers everything");
@@ -742,7 +917,7 @@ mod tests {
     fn many_listeners_on_one_declaration_share_one_group() {
         let mut table = Table::new();
         let r = room("r");
-        let auto = Pattern::all(r.clone());
+        let auto = Pattern::all(r);
 
         for seed in 0..64u8 {
             table.declare(auto.clone(), pid(seed), member(0));
@@ -771,7 +946,7 @@ mod tests {
         assert_eq!(table.members_on(id, ShardId::new(0)).len(), 2);
         assert_eq!(table.members_on(id, ShardId::new(1)).len(), 1);
         assert_eq!(table.members_on(id, ShardId::new(2)).len(), 0);
-        assert_eq!(table.shards_of(id).len(), 2);
+        assert_eq!(table.shards_of(id).count(), 2);
     }
 
     /// A departure takes every declaration with it, and empties the groups it
@@ -780,8 +955,8 @@ mod tests {
     fn a_departure_retracts_everything_it_declared() {
         let mut table = Table::new();
         let r = room("r");
-        let solo = Pattern::any_publisher(r.clone(), "solo".to_string());
-        let shared = Pattern::any_publisher(r.clone(), "shared".to_string());
+        let solo = Pattern::any_publisher(r, "solo".to_string());
+        let shared = Pattern::any_publisher(r, "shared".to_string());
 
         table.declare(solo.clone(), pid(1), member(0));
         table.declare(shared.clone(), pid(1), member(0));
@@ -804,7 +979,7 @@ mod tests {
     fn a_declaration_made_before_the_publication_matches_it_on_arrival() {
         let mut table = Table::new();
         let r = room("r");
-        let wanted = Pattern::any_publisher(r.clone(), "t".to_string());
+        let wanted = Pattern::any_publisher(r, "t".to_string());
         table.declare(wanted, pid(1), member(0));
 
         let arriving = subject(r, 9, "t");
@@ -822,7 +997,7 @@ mod tests {
     fn a_withdrawn_declaration_does_not_reach_later_publications() {
         let mut table = Table::new();
         let r = room("r");
-        let wanted = Pattern::any_publisher(r.clone(), "t".to_string());
+        let wanted = Pattern::any_publisher(r, "t".to_string());
 
         table.declare(wanted.clone(), pid(1), member(0));
         assert_eq!(table.undeclare(&wanted, &pid(1)), Departure::LastOnShard);
@@ -839,7 +1014,7 @@ mod tests {
     fn group_ids_are_dense_and_recycled() {
         let mut table = Table::new();
         let r = room("r");
-        let first = Pattern::any_publisher(r.clone(), "a".to_string());
+        let first = Pattern::any_publisher(r, "a".to_string());
 
         table.declare(first.clone(), pid(1), member(0));
         let original = table.group_of(&first).unwrap();

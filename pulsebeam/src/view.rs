@@ -2,11 +2,14 @@
 #![deny(clippy::manual_find, clippy::manual_flatten)]
 
 use arrayvec::ArrayVec;
+use std::marker::PhantomData;
 
 use crate::entity::TrackId;
 use crate::id::ShardId;
-use crate::keys::{DownstreamSlotKey, ParticipantKey, TrackKey};
-use crate::route::{RouteAction, RouteId, TransportHandle, TransportRoute};
+use crate::keys::{
+    AudioTrackKey, DownstreamSlotKey, ParticipantKey, TrackKey, TrackRuntimeKey, VideoTrackKey,
+};
+use crate::route::{RouteAction, RouteHandle, TransportHandle};
 use crate::shard::router::{ReliableStreamKey, UnreliableStreamKey};
 use pulsebeam_runtime::mailbox;
 use slotmap::SecondaryMap;
@@ -19,7 +22,56 @@ use str0m::media::Rid;
 /// than by hash. Ids are recycled once a group empties; view ops are ordered
 /// per shard, so a retire always precedes the reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct GroupId(pub u32);
+pub(crate) enum AnyAudience {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum VideoAudience {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum AudioAudience {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum DataAudience {}
+
+#[derive(Debug)]
+pub(crate) struct GroupId<K = AnyAudience>(pub u32, PhantomData<fn() -> K>);
+
+impl<K> GroupId<K> {
+    pub(crate) const fn new(index: u32) -> Self {
+        Self(index, PhantomData)
+    }
+}
+
+impl<K> Copy for GroupId<K> {}
+
+impl<K> Clone for GroupId<K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K> PartialEq for GroupId<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<K> Eq for GroupId<K> {}
+
+impl<K> std::hash::Hash for GroupId<K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<K> PartialOrd for GroupId<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K> Ord for GroupId<K> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
 
 /// Local members of each audience, indexed by [`GroupId`].
 ///
@@ -27,46 +79,50 @@ pub(crate) struct GroupId(pub u32);
 /// which is the point: a participant joining a room is one insert here, not a
 /// rewrite of every plan in it.
 #[derive(Debug)]
-pub(crate) struct GroupImage<D> {
-    members: Vec<Vec<(ParticipantKey, D)>>,
+pub(crate) struct GroupImage<D, K = AnyAudience> {
+    members: Vec<SecondaryMap<ParticipantKey, D>>,
+    marker: PhantomData<fn() -> K>,
 }
 
-impl<D> Default for GroupImage<D> {
+impl<D, K> Default for GroupImage<D, K> {
     fn default() -> Self {
         Self {
             members: Vec::new(),
+            marker: PhantomData,
         }
     }
 }
 
-impl<D> GroupImage<D> {
-    pub fn members(&self, group: GroupId) -> &[(ParticipantKey, D)] {
+impl<D, K> GroupImage<D, K> {
+    pub fn members(&self, group: GroupId<K>) -> impl Iterator<Item = (ParticipantKey, D)> + '_
+    where
+        D: Copy,
+    {
         self.members
             .get(group.0 as usize)
-            .map_or(&[][..], |m| &m[..])
+            .into_iter()
+            .flat_map(|members| members.iter())
+            .map(|(key, delivery)| (key, *delivery))
     }
 
-    fn insert(&mut self, group: GroupId, key: ParticipantKey, delivery: D) {
+    fn insert(&mut self, group: GroupId<K>, key: ParticipantKey, delivery: D) {
         let idx = group.0 as usize;
         if self.members.len() <= idx {
-            self.members.resize_with(idx.saturating_add(1), Vec::new);
+            self.members
+                .resize_with(idx.saturating_add(1), SecondaryMap::new);
         }
         let Some(slot) = self.members.get_mut(idx) else {
             debug_assert!(false, "group slot must exist after resize");
             return;
         };
-        if let Some(held) = slot.iter_mut().find(|(held, _)| *held == key) {
-            held.1 = delivery;
-        } else {
-            slot.push((key, delivery));
-        }
+        let _ = slot.insert(key, delivery);
     }
 
-    fn remove(&mut self, group: GroupId, key: ParticipantKey) {
+    fn remove(&mut self, group: GroupId<K>, key: ParticipantKey) {
         let Some(slot) = self.members.get_mut(group.0 as usize) else {
             return;
         };
-        slot.retain(|(held, _)| *held != key);
+        let _ = slot.remove(key);
     }
 }
 
@@ -76,20 +132,18 @@ pub(crate) struct ShardView {
     pub generation: u64,
     pub routes: RouteImage,
     pub transports: TransportImage,
-    pub tracks: ForwardingImage<TrackKey>,
-    pub audio: ForwardingImage<TrackKey>,
-    pub video_groups: GroupImage<DownstreamSlotKey>,
-    pub audio_groups: GroupImage<()>,
-    pub data_groups: GroupImage<ChannelId>,
-    pub unreliable: ForwardingImage<UnreliableStreamKey>,
-    pub reliable: ForwardingImage<ReliableStreamKey>,
+    pub tracks: ForwardingImage<TrackKey, VideoAudience>,
+    pub audio: ForwardingImage<TrackKey, AudioAudience>,
+    pub video_groups: GroupImage<DownstreamSlotKey, VideoAudience>,
+    pub audio_groups: GroupImage<(), AudioAudience>,
+    pub data_groups: GroupImage<ChannelId, DataAudience>,
+    pub unreliable: ForwardingImage<UnreliableStreamKey, DataAudience>,
+    pub reliable: ForwardingImage<ReliableStreamKey, DataAudience>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RemoteRoutePlan {
-    pub shard_id: ShardId,
-    pub route: RouteId,
-    pub epoch: u16,
+    pub handle: RouteHandle,
 }
 
 /// Where one stream's packets go on one shard.
@@ -105,7 +159,7 @@ pub(crate) struct RemoteRoutePlan {
 /// and its origin; repeating them here made two sources of truth and a
 /// `debug_assert` to catch them diverging.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForwardingPlan {
+pub(crate) struct ForwardingPlan<K = AnyAudience> {
     /// The audiences this stream reaches. Membership lives on the shard, so a
     /// subscriber joining or leaving one does not rewrite this plan. At most
     /// four, because only four patterns can match one subject.
@@ -113,12 +167,12 @@ pub(crate) struct ForwardingPlan {
     /// The delivery key an audience carries — a downstream slot for video, an
     /// SCTP channel for data, nothing for audio — lives in the group image, not
     /// here, so every kind's plan is the same type.
-    pub groups: ArrayVec<GroupId, 4>,
+    pub groups: ArrayVec<GroupId<K>, 4>,
     pub remote_routes: Vec<RemoteRoutePlan>,
     pub reverse_route: Option<RemoteRoutePlan>,
 }
 
-impl Default for ForwardingPlan {
+impl<K> Default for ForwardingPlan<K> {
     fn default() -> Self {
         Self {
             groups: ArrayVec::new(),
@@ -128,9 +182,9 @@ impl Default for ForwardingPlan {
     }
 }
 
-pub(crate) type VideoPlan = ForwardingPlan;
-pub(crate) type AudioPlan = ForwardingPlan;
-pub(crate) type StreamPlan = ForwardingPlan;
+pub(crate) type VideoPlan = ForwardingPlan<VideoAudience>;
+pub(crate) type AudioPlan = ForwardingPlan<AudioAudience>;
+pub(crate) type StreamPlan = ForwardingPlan<DataAudience>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
@@ -140,15 +194,14 @@ pub(crate) struct TrackDescriptor {
     pub encodings: Vec<Option<Rid>>,
     pub states: crate::track::TrackStates,
     pub publication: crate::track::Track,
-    pub audience: Vec<ParticipantKey>,
 }
 
 #[derive(Debug)]
-pub(crate) struct ForwardingImage<K: slotmap::Key> {
-    plans: SecondaryMap<K, ForwardingPlan>,
+pub(crate) struct ForwardingImage<K: slotmap::Key, G = AnyAudience> {
+    plans: SecondaryMap<K, ForwardingPlan<G>>,
 }
 
-impl<K: slotmap::Key> Default for ForwardingImage<K> {
+impl<K: slotmap::Key, G> Default for ForwardingImage<K, G> {
     fn default() -> Self {
         Self {
             plans: SecondaryMap::new(),
@@ -156,12 +209,12 @@ impl<K: slotmap::Key> Default for ForwardingImage<K> {
     }
 }
 
-impl<K: slotmap::Key> ForwardingImage<K> {
-    pub fn resolve(&self, key: K) -> Option<&ForwardingPlan> {
+impl<K: slotmap::Key, G> ForwardingImage<K, G> {
+    pub fn resolve(&self, key: K) -> Option<&ForwardingPlan<G>> {
         self.plans.get(key)
     }
 
-    fn upsert(&mut self, key: K, plan: ForwardingPlan) {
+    fn upsert(&mut self, key: K, plan: ForwardingPlan<G>) {
         let _ = self.plans.insert(key, plan);
     }
 
@@ -177,25 +230,24 @@ pub(crate) struct RouteImage {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RouteBinding {
-    pub epoch: u16,
+    pub handle: RouteHandle,
     pub action: RouteAction,
 }
 
 impl RouteImage {
-    pub fn resolve(&self, route: RouteId, epoch: u16) -> Option<&RouteAction> {
-        self.resolve_binding(route, epoch)
-            .map(|binding| &binding.action)
+    pub fn resolve(&self, handle: RouteHandle) -> Option<&RouteAction> {
+        self.resolve_binding(handle).map(|binding| &binding.action)
     }
 
-    pub fn resolve_binding(&self, route: RouteId, epoch: u16) -> Option<&RouteBinding> {
-        match self.slots.get(route.index()) {
-            Some(Some(binding)) if binding.epoch == epoch => Some(binding),
+    pub fn resolve_binding(&self, handle: RouteHandle) -> Option<&RouteBinding> {
+        match self.slots.get(handle.route.index()) {
+            Some(Some(binding)) if binding.handle == handle => Some(binding),
             _ => None,
         }
     }
 
-    fn install(&mut self, route: RouteId, binding: RouteBinding) {
-        let idx = route.index();
+    fn install(&mut self, binding: RouteBinding) {
+        let idx = binding.handle.route.index();
         if idx >= self.slots.len() {
             self.slots.resize_with(idx.saturating_add(1), || None);
         }
@@ -206,11 +258,14 @@ impl RouteImage {
         *slot = Some(binding);
     }
 
-    fn retire(&mut self, route: RouteId, epoch: u16) {
-        let Some(slot) = self.slots.get_mut(route.index()) else {
+    fn retire(&mut self, handle: RouteHandle) {
+        let Some(slot) = self.slots.get_mut(handle.route.index()) else {
             return;
         };
-        if slot.as_ref().is_some_and(|binding| binding.epoch == epoch) {
+        if slot
+            .as_ref()
+            .is_some_and(|binding| binding.handle == handle)
+        {
             *slot = None;
         }
     }
@@ -223,20 +278,20 @@ pub(crate) struct TransportImage {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportBinding {
-    pub epoch: u16,
+    pub handle: TransportHandle,
     pub participant: ParticipantKey,
 }
 
 impl TransportImage {
     pub fn resolve(&self, handle: TransportHandle) -> Option<ParticipantKey> {
         match self.slots.get(handle.route.index()) {
-            Some(Some(binding)) if binding.epoch == handle.epoch => Some(binding.participant),
+            Some(Some(binding)) if binding.handle == handle => Some(binding.participant),
             _ => None,
         }
     }
 
-    fn install(&mut self, route: TransportRoute, binding: TransportBinding) {
-        let idx = route.index();
+    fn install(&mut self, binding: TransportBinding) {
+        let idx = binding.handle.route.index();
         if idx >= self.slots.len() {
             self.slots.resize_with(idx.saturating_add(1), || None);
         }
@@ -251,7 +306,7 @@ impl TransportImage {
         let Some(slot) = self.slots.get_mut(handle.route.index()) else {
             return;
         };
-        if slot.is_some_and(|binding| binding.epoch == handle.epoch) {
+        if slot.is_some_and(|binding| binding.handle == handle) {
             *slot = None;
         }
     }
@@ -264,64 +319,75 @@ pub(crate) struct ShardViewDelta {
     pub ops: Vec<ViewOp>,
 }
 
-/// Which image a plan belongs to, and the key that names it there.
-///
-/// Video and audio share a key space but not an image, and the two data lanes
-/// have their own arenas, so the target says both.
+#[derive(Debug, Clone)]
+pub(crate) enum PlanUpdate {
+    Video {
+        key: VideoTrackKey,
+        plan: VideoPlan,
+    },
+    Audio {
+        key: AudioTrackKey,
+        plan: AudioPlan,
+    },
+    Unreliable {
+        key: UnreliableStreamKey,
+        plan: StreamPlan,
+    },
+    Reliable {
+        key: ReliableStreamKey,
+        plan: StreamPlan,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlanTarget {
-    Video(TrackKey),
-    Audio(TrackKey),
+pub(crate) enum PlanRemoval {
+    Video(VideoTrackKey),
+    Audio(AudioTrackKey),
     Unreliable(UnreliableStreamKey),
     Reliable(ReliableStreamKey),
-}
-
-/// What a member is served on in the audience it just joined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Delivery {
-    Video(DownstreamSlotKey),
-    Audio,
-    Data(ChannelId),
-}
-
-/// Which audience a membership change is about, for the direction that carries
-/// no delivery key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AudienceKind {
-    Video,
-    Audio,
-    Data,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum ViewOp {
     SetPlan {
-        target: PlanTarget,
-        plan: ForwardingPlan,
+        update: PlanUpdate,
     },
     RemovePlan {
-        target: PlanTarget,
+        target: PlanRemoval,
     },
-    GroupInsert {
-        group: GroupId,
+    InsertVideoMember {
+        group: GroupId<VideoAudience>,
         key: ParticipantKey,
-        delivery: Delivery,
+        slot: DownstreamSlotKey,
     },
-    GroupRemove {
-        group: GroupId,
+    InsertAudioMember {
+        group: GroupId<AudioAudience>,
         key: ParticipantKey,
-        kind: AudienceKind,
+    },
+    InsertDataMember {
+        group: GroupId<DataAudience>,
+        key: ParticipantKey,
+        channel: ChannelId,
+    },
+    RemoveVideoMember {
+        group: GroupId<VideoAudience>,
+        key: ParticipantKey,
+    },
+    RemoveAudioMember {
+        group: GroupId<AudioAudience>,
+        key: ParticipantKey,
+    },
+    RemoveDataMember {
+        group: GroupId<DataAudience>,
+        key: ParticipantKey,
     },
     InstallRoute {
-        route: RouteId,
         binding: RouteBinding,
     },
     RetireRoute {
-        route: RouteId,
-        epoch: u16,
+        handle: RouteHandle,
     },
     InstallTransport {
-        route: TransportRoute,
         binding: TransportBinding,
     },
     RetireTransport {
@@ -334,11 +400,18 @@ pub(crate) enum ViewOp {
         key: ParticipantKey,
     },
     InsertTrackRuntime {
-        key: TrackKey,
+        key: TrackRuntimeKey,
         descriptor: TrackDescriptor,
     },
+    AnnounceTrack {
+        publication: Box<crate::track::Track>,
+    },
+    WithdrawTrack {
+        id: TrackId,
+        room_id: crate::entity::RoomId,
+    },
     RemoveTrackRuntime {
-        key: TrackKey,
+        key: TrackRuntimeKey,
     },
     InsertUnreliableRuntime {
         key: UnreliableStreamKey,
@@ -372,6 +445,45 @@ pub(crate) enum ViewOp {
     },
 }
 
+pub(crate) trait AudienceSpec<K>: Copy {
+    fn insert(group: GroupId<K>, key: ParticipantKey, delivery: Self) -> ViewOp;
+    fn remove(group: GroupId<K>, key: ParticipantKey) -> ViewOp;
+}
+
+impl AudienceSpec<VideoAudience> for DownstreamSlotKey {
+    fn insert(group: GroupId<VideoAudience>, key: ParticipantKey, slot: Self) -> ViewOp {
+        ViewOp::InsertVideoMember { group, key, slot }
+    }
+
+    fn remove(group: GroupId<VideoAudience>, key: ParticipantKey) -> ViewOp {
+        ViewOp::RemoveVideoMember { group, key }
+    }
+}
+
+impl AudienceSpec<AudioAudience> for () {
+    fn insert(group: GroupId<AudioAudience>, key: ParticipantKey, _delivery: Self) -> ViewOp {
+        ViewOp::InsertAudioMember { group, key }
+    }
+
+    fn remove(group: GroupId<AudioAudience>, key: ParticipantKey) -> ViewOp {
+        ViewOp::RemoveAudioMember { group, key }
+    }
+}
+
+impl AudienceSpec<DataAudience> for ChannelId {
+    fn insert(group: GroupId<DataAudience>, key: ParticipantKey, channel: Self) -> ViewOp {
+        ViewOp::InsertDataMember {
+            group,
+            key,
+            channel,
+        }
+    }
+
+    fn remove(group: GroupId<DataAudience>, key: ParticipantKey) -> ViewOp {
+        ViewOp::RemoveDataMember { group, key }
+    }
+}
+
 impl ShardViewDelta {
     pub fn new(shard: ShardId, generation: u64) -> Self {
         Self {
@@ -385,60 +497,91 @@ impl ShardViewDelta {
         self.ops.is_empty()
     }
 
+    pub(crate) fn is_valid_for(&self, shard: ShardId, generation: u64) -> bool {
+        self.shard == shard
+            && self.generation > generation
+            && self.ops.iter().all(|op| op.is_owned_by(shard))
+    }
+
     pub fn apply(self, view: &mut ShardView) {
-        debug_assert_eq!(self.shard, view.shard, "delta applied to its owner");
+        if !self.is_valid_for(view.shard, view.generation) {
+            debug_assert_eq!(self.shard, view.shard, "delta applied to its owner");
+            debug_assert!(
+                self.generation > view.generation,
+                "view generations are monotonic"
+            );
+            debug_assert!(
+                self.ops.iter().all(|op| op.is_owned_by(view.shard)),
+                "a view op must target its owning shard"
+            );
+            return;
+        }
         for op in self.ops {
             match op {
-                ViewOp::InstallRoute { route, binding } => view.routes.install(route, binding),
-                ViewOp::RetireRoute { route, epoch } => view.routes.retire(route, epoch),
-                ViewOp::InstallTransport { route, binding } => {
-                    view.transports.install(route, binding);
+                ViewOp::InstallRoute { binding } => {
+                    debug_assert_eq!(binding.handle.shard(), view.shard);
+                    view.routes.install(binding);
                 }
-                ViewOp::RetireTransport { handle } => view.transports.retire(handle),
+                ViewOp::RetireRoute { handle } => {
+                    debug_assert_eq!(handle.shard(), view.shard);
+                    view.routes.retire(handle);
+                }
+                ViewOp::InstallTransport { binding } => {
+                    debug_assert_eq!(binding.handle.shard(), view.shard);
+                    view.transports.install(binding);
+                }
+                ViewOp::RetireTransport { handle } => {
+                    debug_assert_eq!(handle.shard(), view.shard);
+                    view.transports.retire(handle);
+                }
                 ViewOp::InsertParticipant { key } => {
                     let _ = key;
                 }
                 ViewOp::RemoveParticipant { .. }
                 | ViewOp::InsertTrackRuntime { .. }
                 | ViewOp::RemoveTrackRuntime { .. }
+                | ViewOp::AnnounceTrack { .. }
+                | ViewOp::WithdrawTrack { .. }
                 | ViewOp::InsertUnreliableRuntime { .. }
                 | ViewOp::RemoveUnreliableRuntime { .. }
                 | ViewOp::InsertReliableRuntime { .. }
                 | ViewOp::RemoveReliableRuntime { .. }
                 | ViewOp::BindSubscribedTrack { .. }
                 | ViewOp::UnbindSubscribedTrack { .. } => {}
-                ViewOp::SetPlan { target, plan } => match target {
-                    PlanTarget::Video(key) => view.tracks.upsert(key, plan),
-                    PlanTarget::Audio(key) => view.audio.upsert(key, plan),
-                    PlanTarget::Unreliable(key) => view.unreliable.upsert(key, plan),
-                    PlanTarget::Reliable(key) => view.reliable.upsert(key, plan),
+                ViewOp::SetPlan { update } => match update {
+                    PlanUpdate::Video { key, plan } => view.tracks.upsert(key.raw(), plan),
+                    PlanUpdate::Audio { key, plan } => view.audio.upsert(key.raw(), plan),
+                    PlanUpdate::Unreliable { key, plan } => view.unreliable.upsert(key, plan),
+                    PlanUpdate::Reliable { key, plan } => view.reliable.upsert(key, plan),
                 },
                 ViewOp::RemovePlan { target } => match target {
-                    PlanTarget::Video(key) => view.tracks.remove(key),
-                    PlanTarget::Audio(key) => view.audio.remove(key),
-                    PlanTarget::Unreliable(key) => view.unreliable.remove(key),
-                    PlanTarget::Reliable(key) => view.reliable.remove(key),
+                    PlanRemoval::Video(key) => view.tracks.remove(key.raw()),
+                    PlanRemoval::Audio(key) => view.audio.remove(key.raw()),
+                    PlanRemoval::Unreliable(key) => view.unreliable.remove(key),
+                    PlanRemoval::Reliable(key) => view.reliable.remove(key),
                 },
-                ViewOp::GroupInsert {
+                ViewOp::InsertVideoMember { group, key, slot } => {
+                    view.video_groups.insert(group, key, slot);
+                }
+                ViewOp::InsertAudioMember { group, key } => {
+                    view.audio_groups.insert(group, key, ());
+                }
+                ViewOp::InsertDataMember {
                     group,
                     key,
-                    delivery,
-                } => match delivery {
-                    Delivery::Video(slot) => view.video_groups.insert(group, key, slot),
-                    Delivery::Audio => view.audio_groups.insert(group, key, ()),
-                    Delivery::Data(channel) => view.data_groups.insert(group, key, channel),
-                },
-                ViewOp::GroupRemove { group, key, kind } => match kind {
-                    AudienceKind::Video => view.video_groups.remove(group, key),
-                    AudienceKind::Audio => view.audio_groups.remove(group, key),
-                    AudienceKind::Data => view.data_groups.remove(group, key),
-                },
+                    channel,
+                } => view.data_groups.insert(group, key, channel),
+                ViewOp::RemoveVideoMember { group, key } => {
+                    view.video_groups.remove(group, key);
+                }
+                ViewOp::RemoveAudioMember { group, key } => {
+                    view.audio_groups.remove(group, key);
+                }
+                ViewOp::RemoveDataMember { group, key } => {
+                    view.data_groups.remove(group, key);
+                }
             }
         }
-        debug_assert!(
-            self.generation > view.generation,
-            "view generations are monotonic"
-        );
         view.generation = self.generation;
     }
 }
@@ -448,17 +591,20 @@ pub(crate) struct ShardViewWriter {
     tx: mailbox::Sender<Box<ShardViewDelta>>,
     staged: Option<Box<ShardViewDelta>>,
     backlog: Option<Box<ShardViewDelta>>,
+    closed: bool,
 }
 
 impl ShardViewWriter {
     pub fn stage(&mut self, generation: u64, op: ViewOp) {
+        if !op.is_owned_by(self.shard) {
+            pulsebeam_runtime::fatal!("a view op must target its owning shard");
+        }
         let delta = self
             .staged
             .get_or_insert_with(|| Box::new(ShardViewDelta::new(self.shard, generation)));
-        debug_assert_eq!(
-            delta.generation, generation,
-            "a writer stages one generation"
-        );
+        if delta.generation != generation {
+            pulsebeam_runtime::fatal!("a shard view writer cannot mix lifecycle generations");
+        }
         delta.ops.push(op);
     }
 
@@ -466,13 +612,29 @@ impl ShardViewWriter {
         self.staged = None;
     }
 
+    pub fn has_staged(&self) -> bool {
+        self.staged.as_ref().is_some_and(|delta| !delta.is_empty())
+    }
+
     pub fn publish(&mut self) -> Option<u64> {
+        if self.closed {
+            if let Some(delta) = self.staged.take()
+                && !delta.is_empty()
+            {
+                self.coalesce(delta);
+            }
+            return None;
+        }
         let delta = self.staged.take()?;
         if delta.is_empty() {
             return None;
         }
         let generation = delta.generation;
-        self.flush_backlog();
+        let _ = self.flush_backlog();
+        if self.closed {
+            self.coalesce(delta);
+            return None;
+        }
         if self.backlog.is_some() {
             self.coalesce(delta);
             return Some(generation);
@@ -480,10 +642,14 @@ impl ShardViewWriter {
         match self.tx.try_send(delta) {
             Ok(()) => Some(generation),
             Err(mailbox::TrySendError::Full(delta)) => {
-                self.backlog = Some(Self::bound_backlog(delta));
+                self.backlog = Some(delta);
                 Some(generation)
             }
-            Err(mailbox::TrySendError::Closed(_)) => None,
+            Err(mailbox::TrySendError::Closed(delta)) => {
+                self.backlog = Some(delta);
+                self.closed = true;
+                None
+            }
         }
     }
 
@@ -492,42 +658,60 @@ impl ShardViewWriter {
             debug_assert_eq!(backlog.shard, self.shard);
             backlog.ops.extend(delta.ops);
             backlog.generation = delta.generation;
-            Self::trim_backlog(backlog);
         } else {
-            self.backlog = Some(Self::bound_backlog(delta));
+            self.backlog = Some(delta);
         }
-    }
-
-    fn bound_backlog(mut delta: Box<ShardViewDelta>) -> Box<ShardViewDelta> {
-        Self::trim_backlog(&mut delta);
-        delta
-    }
-
-    fn trim_backlog(delta: &mut ShardViewDelta) {
-        let excess = delta
-            .ops
-            .len()
-            .saturating_sub(crate::shard::worker::SHARD_VIEW_BACKLOG_OP_CAPACITY);
-        if excess == 0 {
-            return;
-        }
-        delta.ops.drain(..excess);
-        metrics::counter!("view_backlog_shed").increment(excess as u64);
-        #[cfg(feature = "sim")]
-        crate::sim_metrics::record_routing_counter("view_backlog_shed");
-        debug_assert!(delta.ops.len() <= crate::shard::worker::SHARD_VIEW_BACKLOG_OP_CAPACITY);
     }
 
     pub fn flush_backlog(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
         let Some(delta) = self.backlog.take() else {
             return true;
         };
         match self.tx.try_send(delta) {
-            Ok(()) | Err(mailbox::TrySendError::Closed(_)) => true,
+            Ok(()) => true,
+            Err(mailbox::TrySendError::Closed(delta)) => {
+                self.backlog = Some(delta);
+                self.closed = true;
+                false
+            }
             Err(mailbox::TrySendError::Full(delta)) => {
                 self.backlog = Some(delta);
                 false
             }
+        }
+    }
+}
+
+impl ViewOp {
+    pub(crate) fn is_owned_by(&self, shard: ShardId) -> bool {
+        match self {
+            Self::InstallRoute { binding } => binding.handle.shard() == shard,
+            Self::RetireRoute { handle } => handle.shard() == shard,
+            Self::InstallTransport { binding } => binding.handle.shard() == shard,
+            Self::RetireTransport { handle } => handle.shard() == shard,
+            Self::SetPlan { .. }
+            | Self::RemovePlan { .. }
+            | Self::InsertVideoMember { .. }
+            | Self::InsertAudioMember { .. }
+            | Self::InsertDataMember { .. }
+            | Self::RemoveVideoMember { .. }
+            | Self::RemoveAudioMember { .. }
+            | Self::RemoveDataMember { .. }
+            | Self::InsertParticipant { .. }
+            | Self::RemoveParticipant { .. }
+            | Self::InsertTrackRuntime { .. }
+            | Self::RemoveTrackRuntime { .. }
+            | Self::AnnounceTrack { .. }
+            | Self::WithdrawTrack { .. }
+            | Self::InsertUnreliableRuntime { .. }
+            | Self::RemoveUnreliableRuntime { .. }
+            | Self::InsertReliableRuntime { .. }
+            | Self::RemoveReliableRuntime { .. }
+            | Self::BindSubscribedTrack { .. }
+            | Self::UnbindSubscribedTrack { .. } => true,
         }
     }
 }
@@ -542,6 +726,7 @@ pub(crate) fn new_shard_view(
             tx,
             staged: None,
             backlog: None,
+            closed: false,
         },
         rx,
     )
@@ -550,6 +735,7 @@ pub(crate) fn new_shard_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::route::RouteId;
 
     #[test]
     fn a_delta_preserves_owner_and_generation() {
@@ -644,29 +830,80 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_view_writer_never_discards_an_undelivered_delta() {
+        let (mut writer, rx) = new_shard_view(ShardId::new(0));
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+        drop(rx);
+
+        for generation in 1..=2 {
+            writer.stage(
+                generation,
+                ViewOp::InsertParticipant {
+                    key: keys.insert(()),
+                },
+            );
+            assert_eq!(writer.publish(), None);
+        }
+
+        assert!(!writer.flush_backlog());
+        assert_eq!(
+            writer.backlog.as_ref().map(|delta| delta.ops.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_full_view_mailbox_preserves_every_control_operation() {
+        let shard = ShardId::new(0);
+        let (mut writer, mut rx) = new_shard_view(shard);
+        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
+        let operation_count = 20_000;
+
+        for generation in 1..=operation_count {
+            writer.stage(
+                generation as u64,
+                ViewOp::InsertParticipant {
+                    key: keys.insert(()),
+                },
+            );
+            assert_eq!(writer.publish(), Some(generation as u64));
+        }
+
+        let mut received = 0;
+        while let Ok(delta) = rx.try_recv() {
+            received += delta.ops.len();
+        }
+        assert!(writer.flush_backlog());
+        while let Ok(delta) = rx.try_recv() {
+            received += delta.ops.len();
+        }
+        assert_eq!(received, operation_count);
+    }
+
+    #[test]
     fn stale_route_epoch_is_rejected_after_slot_reuse() {
         let route = RouteId::new(ShardId::new(0), 7);
         let mut track_keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
         let key = track_keys.insert(());
+        let handle = RouteHandle::new(route, 3);
         let mut image = RouteImage::default();
-        image.install(
-            route,
-            RouteBinding {
-                epoch: 3,
-                action: RouteAction::Video { local_track: key },
+        image.install(RouteBinding {
+            handle,
+            action: RouteAction::Video {
+                local_track: VideoTrackKey::new(key),
             },
-        );
-        image.install(
-            route,
-            RouteBinding {
-                epoch: 4,
-                action: RouteAction::Video { local_track: key },
+        });
+        image.install(RouteBinding {
+            handle: RouteHandle::new(route, 4),
+            action: RouteAction::Video {
+                local_track: VideoTrackKey::new(key),
             },
-        );
+        });
 
-        assert!(image.resolve(route, 3).is_none());
-        assert!(image.resolve(route, 4).is_some());
-        image.retire(route, 3);
-        assert!(image.resolve(route, 4).is_some());
+        assert!(image.resolve(handle).is_none());
+        let current = RouteHandle::new(route, 4);
+        assert!(image.resolve(current).is_some());
+        image.retire(handle);
+        assert!(image.resolve(current).is_some());
     }
 }

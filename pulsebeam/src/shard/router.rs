@@ -5,8 +5,8 @@ use str0m::media::Rid;
 use crate::clock::WallAnchor;
 use crate::entity::{AudioOrigin, ParticipantId, TrackId};
 use crate::id::ShardId;
-use crate::keys::{DownstreamSlotKey, ParticipantKey};
-use crate::route::{Envelope, RouteAction, RouteHandle, RouteRuntime};
+use crate::keys::{AudioTrackKey, DownstreamSlotKey, ParticipantKey, VideoTrackKey};
+use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::Topic;
 
@@ -99,10 +99,11 @@ struct TrackRuntime {
     layer_states: crate::track::TrackStates,
     cache: Option<TrackStreamCache>,
     link_seq: u32,
-    audience: Vec<ParticipantKey>,
 }
 
 struct UnreliableRuntime {
+    id: DataStreamId,
+    publisher: Option<ParticipantKey>,
     link_seq: u32,
 }
 
@@ -117,13 +118,13 @@ pub(crate) struct ReliableRuntime {
 ///
 /// The only thing that varies per kind is `deliver`, and the delivery key it
 /// receives — a downstream slot, an SCTP channel, or nothing at all.
-fn fanout_local<D: Copy>(
-    plan: &crate::view::ForwardingPlan,
-    groups: &crate::view::GroupImage<D>,
+fn fanout_local<D: Copy, G>(
+    plan: &crate::view::ForwardingPlan<G>,
+    groups: &crate::view::GroupImage<D, G>,
     mut deliver: impl FnMut(ParticipantKey, D),
 ) {
     for group in &plan.groups {
-        for &(subscriber, delivery) in groups.members(*group) {
+        for (subscriber, delivery) in groups.members(*group) {
             deliver(subscriber, delivery);
         }
     }
@@ -131,21 +132,17 @@ fn fanout_local<D: Copy>(
 
 /// Forward a packet to the shards a plan routes to, numbering each hop so the
 /// destination can tell loss from reordering.
-fn fanout_remote(
-    plan: &crate::view::ForwardingPlan,
+fn fanout_remote<G>(
+    plan: &crate::view::ForwardingPlan<G>,
     link_seq: &mut u32,
     playout: u32,
     mut payload: impl FnMut() -> MediaPayload,
     ctx: &mut impl ShardTransport,
 ) {
     for remote in &plan.remote_routes {
-        let env = Envelope::media(
-            RouteHandle::new(remote.route, remote.epoch),
-            *link_seq,
-            playout,
-        );
+        let env = Envelope::media(remote.handle, *link_seq, playout);
         *link_seq = link_seq.wrapping_add(1);
-        ctx.send_media(remote.shard_id, env, payload());
+        ctx.send_media(remote.handle.shard(), env, payload());
     }
 }
 
@@ -167,40 +164,60 @@ impl ShardRuntime {
     }
 
     pub(crate) fn retire_track(&mut self, key: TrackKey) {
-        let _ = self.tracks.remove(key);
+        let removed = self.tracks.remove(key);
+        debug_assert!(removed.is_some(), "a track runtime must retire once");
     }
 
     pub(crate) fn track_publication(&self, key: TrackKey) -> Option<&crate::track::Track> {
         self.tracks.get(key).map(|track| &track.publication)
     }
 
-    pub(crate) fn track_audience(&self, key: TrackKey) -> Option<&[ParticipantKey]> {
-        self.tracks.get(key).map(|track| track.audience.as_slice())
-    }
-
     pub(crate) fn retire_data_stream(&mut self, key: UnreliableStreamKey) {
-        let _ = self.unreliable.remove(key);
+        let removed = self.unreliable.remove(key);
+        debug_assert!(removed.is_some(), "an unreliable runtime must retire once");
     }
 
     pub(crate) fn retire_reliable_stream(&mut self, key: ReliableStreamKey) {
-        let _ = self.reliable.remove(key);
+        let removed = self.reliable.remove(key);
+        debug_assert!(removed.is_some(), "a reliable runtime must retire once");
     }
 
     pub(crate) fn apply_view_op(&mut self, op: &crate::view::ViewOp) {
         match op {
-            crate::view::ViewOp::RetireRoute { route, epoch } => {
-                let retired = self.routes.retire(RouteHandle::new(*route, *epoch));
-                debug_assert!(
-                    retired
-                        || self
-                            .routes
-                            .entry(RouteHandle::new(*route, *epoch))
-                            .is_none()
-                );
+            crate::view::ViewOp::RetireRoute { handle } => {
+                let retired = self.routes.retire(*handle);
+                debug_assert!(retired || self.routes.entry(*handle).is_none());
             }
             crate::view::ViewOp::InsertTrackRuntime { key, descriptor } => {
+                if !matches!(
+                    (key, descriptor.id.kind()),
+                    (
+                        crate::keys::TrackRuntimeKey::Video(_),
+                        crate::entity::TrackKind::Video
+                    ) | (
+                        crate::keys::TrackRuntimeKey::Audio(_),
+                        crate::entity::TrackKind::Audio
+                    )
+                ) {
+                    debug_assert!(false, "a track runtime key must match its publication kind");
+                    return;
+                }
+                let key = key.raw();
+                if let Some(previous) = self.tracks.get(key) {
+                    debug_assert_eq!(
+                        previous.id, descriptor.id,
+                        "a runtime key cannot change its logical track"
+                    );
+                    debug_assert_eq!(
+                        previous.origin_key, descriptor.origin_key,
+                        "a runtime key cannot change its publisher binding"
+                    );
+                    if previous.id != descriptor.id {
+                        return;
+                    }
+                }
                 let previous = self.tracks.insert(
-                    *key,
+                    key,
                     TrackRuntime {
                         id: descriptor.id,
                         origin_key: descriptor.origin_key,
@@ -209,32 +226,52 @@ impl ShardRuntime {
                         layer_states: descriptor.states.clone(),
                         cache: None,
                         link_seq: 0,
-                        audience: descriptor.audience.clone(),
                     },
                 );
                 if let Some(previous) = previous {
-                    debug_assert_eq!(
-                        previous.id, descriptor.id,
-                        "a runtime key cannot change its logical track"
-                    );
-                    if previous.id == descriptor.id {
-                        let Some(current) = self.tracks.get_mut(*key) else {
-                            debug_assert!(false, "inserted track runtime must remain addressable");
-                            return;
-                        };
-                        current.cache = previous.cache;
-                        current.link_seq = previous.link_seq;
-                    }
+                    let Some(current) = self.tracks.get_mut(key) else {
+                        debug_assert!(false, "inserted track runtime must remain addressable");
+                        return;
+                    };
+                    current.cache = previous.cache;
+                    current.link_seq = previous.link_seq;
                 }
             }
-            crate::view::ViewOp::RemoveTrackRuntime { key } => self.retire_track(*key),
-            crate::view::ViewOp::InsertUnreliableRuntime { key, .. } => {
-                let _ = self
-                    .unreliable
-                    .insert(*key, UnreliableRuntime { link_seq: 0 });
+            crate::view::ViewOp::RemoveTrackRuntime { key } => self.retire_track(key.raw()),
+            crate::view::ViewOp::InsertUnreliableRuntime { key, id, publisher } => {
+                if let Some(previous) = self.unreliable.get(*key) {
+                    debug_assert_eq!(
+                        previous.id, *id,
+                        "an unreliable runtime key cannot change its logical stream"
+                    );
+                    debug_assert_eq!(
+                        previous.publisher, *publisher,
+                        "an unreliable runtime key cannot change its publisher"
+                    );
+                    return;
+                }
+                let _ = self.unreliable.insert(
+                    *key,
+                    UnreliableRuntime {
+                        id: id.clone(),
+                        publisher: *publisher,
+                        link_seq: 0,
+                    },
+                );
             }
             crate::view::ViewOp::RemoveUnreliableRuntime { key } => self.retire_data_stream(*key),
             crate::view::ViewOp::InsertReliableRuntime { key, id, publisher } => {
+                if let Some(previous) = self.reliable.get(*key) {
+                    debug_assert_eq!(
+                        previous.id, *id,
+                        "a reliable runtime key cannot change its logical stream"
+                    );
+                    debug_assert_eq!(
+                        previous.publisher, *publisher,
+                        "a reliable runtime key cannot change its publisher"
+                    );
+                    return;
+                }
                 let _ = self.reliable.insert(
                     *key,
                     ReliableRuntime {
@@ -252,10 +289,16 @@ impl ShardRuntime {
             | crate::view::ViewOp::RemoveParticipant { .. }
             | crate::view::ViewOp::SetPlan { .. }
             | crate::view::ViewOp::RemovePlan { .. }
-            | crate::view::ViewOp::GroupInsert { .. }
-            | crate::view::ViewOp::GroupRemove { .. }
+            | crate::view::ViewOp::InsertVideoMember { .. }
+            | crate::view::ViewOp::InsertAudioMember { .. }
+            | crate::view::ViewOp::InsertDataMember { .. }
+            | crate::view::ViewOp::RemoveVideoMember { .. }
+            | crate::view::ViewOp::RemoveAudioMember { .. }
+            | crate::view::ViewOp::RemoveDataMember { .. }
             | crate::view::ViewOp::BindSubscribedTrack { .. }
-            | crate::view::ViewOp::UnbindSubscribedTrack { .. } => {}
+            | crate::view::ViewOp::UnbindSubscribedTrack { .. }
+            | crate::view::ViewOp::AnnounceTrack { .. }
+            | crate::view::ViewOp::WithdrawTrack { .. } => {}
         }
     }
 
@@ -263,10 +306,6 @@ impl ShardRuntime {
         self.tracks
             .get(key)
             .map(|track| (track.id, track.encodings.as_slice()))
-    }
-
-    pub(crate) fn track_origin(&self, key: TrackKey) -> Option<ParticipantKey> {
-        self.tracks.get(key).map(|track| track.origin_key)
     }
 
     /// The identity behind a fanout key.
@@ -282,16 +321,20 @@ impl ShardRuntime {
     #[inline]
     pub fn route_video_with_plan(
         &mut self,
-        fanout: TrackKey,
+        fanout: VideoTrackKey,
         pkt: RtpPacket,
         plan: &crate::view::VideoPlan,
-        groups: &crate::view::GroupImage<DownstreamSlotKey>,
+        groups: &crate::view::GroupImage<DownstreamSlotKey, crate::view::VideoAudience>,
         ctx: &mut impl RoutingContext,
     ) {
-        let Some(track) = self.tracks.get_mut(fanout) else {
+        let Some(track) = self.tracks.get_mut(fanout.raw()) else {
             debug_assert!(false, "compiled video key must resolve to runtime state");
             return;
         };
+        if track.id.kind() != crate::entity::TrackKind::Video {
+            debug_assert!(false, "a video key must resolve to a video publication");
+            return;
+        }
         let rid = pkt.ext_vals.rid;
         let seq = pkt.seq_no;
         let track_id = track.id;
@@ -319,14 +362,22 @@ impl ShardRuntime {
 
     pub fn route_audio_with_plan(
         &mut self,
-        track: TrackKey,
+        track: AudioTrackKey,
         origin: Origin,
         event: AudioRtpEvent,
         plan: &crate::view::AudioPlan,
-        groups: &crate::view::GroupImage<()>,
+        groups: &crate::view::GroupImage<(), crate::view::AudioAudience>,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(origin.is_local() || event.origin_key.is_none());
+        let Some(runtime) = self.tracks.get(track.raw()) else {
+            debug_assert!(false, "compiled audio key must resolve to runtime state");
+            return;
+        };
+        if runtime.id.kind() != crate::entity::TrackKind::Audio {
+            debug_assert!(false, "an audio key must resolve to an audio publication");
+            return;
+        }
         // The plan names audiences; membership lives in the group image, so a
         // room's roster is resolved by array index rather than carried in every
         // audio plan. `origin_key` is only `Some` where the publisher is local,
@@ -343,7 +394,7 @@ impl ShardRuntime {
         });
         if origin.is_local() {
             let playout = ctx.wall().to_ntp(event.pkt.playout_time);
-            let Some(runtime) = self.tracks.get_mut(track) else {
+            let Some(runtime) = self.tracks.get_mut(track.raw()) else {
                 debug_assert!(false, "audio key must resolve to runtime state");
                 return;
             };
@@ -363,7 +414,7 @@ impl ShardRuntime {
         origin: Origin,
         packet: Vec<u8>,
         plan: &crate::view::StreamPlan,
-        groups: &crate::view::GroupImage<ChannelId>,
+        groups: &crate::view::GroupImage<ChannelId, crate::view::DataAudience>,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(runtime) = self.unreliable.get_mut(stream) else {
@@ -391,7 +442,7 @@ impl ShardRuntime {
         origin: Origin,
         frame: Vec<u8>,
         plan: &crate::view::StreamPlan,
-        groups: &crate::view::GroupImage<ChannelId>,
+        groups: &crate::view::GroupImage<ChannelId, crate::view::DataAudience>,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(!frame.is_empty());
@@ -429,9 +480,9 @@ impl ShardRuntime {
             return;
         };
         ctx.send_frame(
-            target.shard_id,
+            target.handle.shard(),
             ShardFrame::Reverse {
-                env: Envelope::feedback(RouteHandle::new(target.route, target.epoch)),
+                env: Envelope::feedback(target.handle),
                 body: Reverse::DataAck(bytes),
             },
         );
@@ -439,16 +490,20 @@ impl ShardRuntime {
 
     pub fn apply_stats(
         &mut self,
-        fanout: TrackKey,
+        fanout: VideoTrackKey,
         stats: crate::track::TrackStates,
         plan: &crate::view::VideoPlan,
-        groups: &crate::view::GroupImage<DownstreamSlotKey>,
+        groups: &crate::view::GroupImage<DownstreamSlotKey, crate::view::VideoAudience>,
         ctx: &mut impl RoutingContext,
     ) {
-        let Some(track) = self.tracks.get_mut(fanout) else {
+        let Some(track) = self.tracks.get_mut(fanout.raw()) else {
             debug_assert!(false, "stats key must resolve to runtime state");
             return;
         };
+        if track.id.kind() != crate::entity::TrackKind::Video {
+            debug_assert!(false, "video stats must resolve to a video publication");
+            return;
+        }
         track.layer_states = stats;
         let states = &track.layer_states;
         fanout_local(plan, groups, |subscriber, slot| {
@@ -456,9 +511,9 @@ impl ShardRuntime {
         });
         for remote in &plan.remote_routes {
             ctx.send_frame(
-                remote.shard_id,
+                remote.handle.shard(),
                 ShardFrame::Telemetry {
-                    env: Envelope::telemetry(RouteHandle::new(remote.route, remote.epoch)),
+                    env: Envelope::telemetry(remote.handle),
                     stats: track.layer_states.clone(),
                 },
             );
@@ -478,7 +533,13 @@ impl ShardRuntime {
             return None;
         };
         let origin = match target {
-            crate::route::ReverseTarget::Track { track } => self.track_origin(track),
+            crate::route::ReverseTarget::Track { track } => {
+                let key = track.raw();
+                self.tracks
+                    .get(key)
+                    .filter(|runtime| runtime.id.kind() == crate::entity::TrackKind::Video)
+                    .map(|runtime| runtime.origin_key)
+            }
             crate::route::ReverseTarget::Topic { stream } => self
                 .reliable
                 .get(stream)
@@ -519,7 +580,6 @@ mod tests {
                 layers: Vec::new(),
                 reverse: None,
             },
-            audience: Vec::new(),
         }
     }
 
@@ -535,11 +595,11 @@ mod tests {
             ParticipantId::from_bytes([7; 16]).derive_track_id(TrackKind::Video, "track");
 
         runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
-            key,
+            key: crate::keys::TrackRuntimeKey::Video(VideoTrackKey::new(key)),
             descriptor: descriptor(track_id, origin_key, "q"),
         });
         runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
-            key,
+            key: crate::keys::TrackRuntimeKey::Video(VideoTrackKey::new(key)),
             descriptor: descriptor(track_id, origin_key, "f"),
         });
 
@@ -547,5 +607,31 @@ mod tests {
             runtime.track_descriptor(key).unwrap().1,
             &[Some(Rid::from("f"))]
         );
+    }
+
+    #[test]
+    fn reinserting_a_live_data_runtime_preserves_hop_state() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+        );
+        let stream = DataStreamId::new(
+            room,
+            ParticipantId::from_bytes([8; 16]),
+            Topic::for_test("topic"),
+        );
+        let mut runtime = ShardRuntime::new(ShardId::new(0));
+        let mut keys = SlotMap::<ReliableStreamKey, ()>::with_key();
+        let key = keys.insert(());
+        let op = crate::view::ViewOp::InsertReliableRuntime {
+            key,
+            id: stream,
+            publisher: None,
+        };
+
+        runtime.apply_view_op(&op);
+        runtime.reliable.get_mut(key).unwrap().link_seq = 17;
+        runtime.apply_view_op(&op);
+
+        assert_eq!(runtime.reliable.get(key).unwrap().link_seq, 17);
     }
 }

@@ -1,9 +1,5 @@
 use super::*;
 
-fn should_publish_stream_views(retired: bool, added: bool) -> bool {
-    !retired || added
-}
-
 /// The view ops a stream key implies.
 ///
 /// None of these take a lane: `RuntimeStreamKey`'s variant *is* the lane, and
@@ -24,39 +20,6 @@ pub(super) fn insert_stream_runtime_op(
     }
 }
 
-fn set_stream_plan_op(
-    key: crate::shard::router::RuntimeStreamKey,
-    plan: crate::view::StreamPlan,
-) -> crate::view::ViewOp {
-    match key {
-        crate::shard::router::RuntimeStreamKey::Unreliable(key) => crate::view::ViewOp::SetPlan {
-            target: crate::view::PlanTarget::Unreliable(key),
-            plan,
-        },
-        crate::shard::router::RuntimeStreamKey::Reliable(key) => crate::view::ViewOp::SetPlan {
-            target: crate::view::PlanTarget::Reliable(key),
-            plan,
-        },
-    }
-}
-
-fn remove_stream_ops(key: crate::shard::router::RuntimeStreamKey) -> [crate::view::ViewOp; 2] {
-    match key {
-        crate::shard::router::RuntimeStreamKey::Unreliable(key) => [
-            crate::view::ViewOp::RemovePlan {
-                target: crate::view::PlanTarget::Unreliable(key),
-            },
-            crate::view::ViewOp::RemoveUnreliableRuntime { key },
-        ],
-        crate::shard::router::RuntimeStreamKey::Reliable(key) => [
-            crate::view::ViewOp::RemovePlan {
-                target: crate::view::PlanTarget::Reliable(key),
-            },
-            crate::view::ViewOp::RemoveReliableRuntime { key },
-        ],
-    }
-}
-
 pub(super) fn install_stream_route_op(
     key: crate::shard::router::RuntimeStreamKey,
     route: RouteHandle,
@@ -70,28 +33,16 @@ pub(super) fn install_stream_route_op(
         }
     };
     crate::view::ViewOp::InstallRoute {
-        route: route.route,
         binding: crate::view::RouteBinding {
-            epoch: route.epoch,
+            handle: route,
             action,
         },
     }
 }
 
-fn retire_route_op(route: RouteHandle) -> crate::view::ViewOp {
-    crate::view::ViewOp::RetireRoute {
-        route: route.route,
-        epoch: route.epoch,
-    }
-}
-
 /// The label a data stream is published under.
 fn data_label(topic: &crate::track::Topic, lane: StreamLane) -> String {
-    let lane = match lane {
-        StreamLane::Unreliable => crate::track::DataLane::Realtime,
-        StreamLane::Reliable => crate::track::DataLane::Reliable,
-    };
-    crate::track::publication_label(lane, topic)
+    crate::track::publication_label(lane.into(), topic)
 }
 
 /// The catalog identity of a data stream.
@@ -99,7 +50,7 @@ fn data_label(topic: &crate::track::Topic, lane: StreamLane) -> String {
 /// `StreamLane` is the control plane's name for the lane and `DataLane` the
 /// label grammar's; they are the same two lanes, and this is the one place the
 /// two spellings meet.
-fn data_publication_id(
+pub(super) fn data_publication_id(
     id: &crate::shard::router::DataStreamId,
     lane: StreamLane,
 ) -> crate::entity::TrackId {
@@ -120,7 +71,6 @@ impl ControllerActor {
     ) -> Vec<crate::shard::router::DataStreamId> {
         self.catalog
             .on_label(room, &data_label(topic, lane))
-            .into_iter()
             .filter_map(|id| {
                 let held = self.catalog.get(&id)?;
                 Some(crate::shard::router::DataStreamId::new(
@@ -136,9 +86,23 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         id: crate::shard::router::DataStreamId,
-        key: crate::shard::router::RuntimeStreamKey,
-    ) {
-        let lane = StreamLane::of(key);
+        lane: StreamLane,
+    ) -> bool {
+        let publication_id = data_publication_id(&id, lane);
+        if self.catalog.contains(&publication_id) {
+            let Some(publication) = self.catalog.get(&publication_id) else {
+                debug_assert!(false, "a catalog entry must remain addressable");
+                return false;
+            };
+            if publication.publisher_shard != shard_id {
+                pulsebeam_runtime::fatal!("a data publication cannot move between shards");
+            }
+            return self.reconcile_stream(id, lane).await;
+        }
+        let Some(key) = self.lanes.get(lane).mint(&mut self.state, shard_id, &id) else {
+            return false;
+        };
+        let runtime_key: crate::control::publication::RuntimeKey = key.into();
         let Some(publisher) = self
             .core
             .registry
@@ -146,16 +110,12 @@ impl ControllerActor {
             .and_then(|meta| meta.binding)
         else {
             debug_assert!(false, "a stream publisher must have a participant key");
-            return;
-        };
-        let publication_id = data_publication_id(&id, lane);
-        let existing_reverse = self
-            .catalog
-            .get(&publication_id)
-            .and_then(|held| held.reverse_route);
-        let lane_label = match lane {
-            StreamLane::Unreliable => crate::track::DataLane::Realtime,
-            StreamLane::Reliable => crate::track::DataLane::Reliable,
+            crate::control::controller::lifecycle::remove_runtime_key(
+                &mut self.state,
+                shard_id,
+                runtime_key,
+            );
+            return false;
         };
         self.catalog
             .insert(crate::control::publication::Publication {
@@ -164,26 +124,29 @@ impl ControllerActor {
                 publisher: id.publisher_id,
                 publisher_shard: shard_id,
                 publisher_key: publisher,
-                origin_key: key.into(),
-                reverse_route: existing_reverse,
-                destinations: self
-                    .catalog
-                    .get(&publication_id)
-                    .map(|held| held.destinations.clone())
-                    .unwrap_or_default(),
+                origin_key: runtime_key,
+                reverse_route: None,
+                destinations: indexmap::IndexMap::new(),
                 media: crate::control::publication::Media::Data {
-                    lane: lane_label,
+                    lane: lane.into(),
                     topic: id.topic.clone(),
                 },
             });
+        self.index_publication(publication_id);
 
-        if matches!(lane, StreamLane::Reliable) && existing_reverse.is_none() {
+        if matches!(lane, StreamLane::Reliable) {
             let Some(stream) = (match key {
                 crate::shard::router::RuntimeStreamKey::Reliable(stream) => Some(stream),
                 _ => None,
             }) else {
                 debug_assert!(false, "reliable readiness must carry a reliable key");
-                return;
+                self.catalog.remove(&publication_id);
+                crate::control::controller::lifecycle::remove_runtime_key(
+                    &mut self.state,
+                    shard_id,
+                    runtime_key,
+                );
+                return false;
             };
             let Some(route) = self
                 .grant_route(
@@ -194,16 +157,28 @@ impl ControllerActor {
                 )
                 .await
             else {
-                return;
+                self.catalog.remove(&publication_id);
+                crate::control::controller::lifecycle::remove_runtime_key(
+                    &mut self.state,
+                    shard_id,
+                    runtime_key,
+                );
+                return false;
             };
             let Some(binding) = self.catalog.get_mut(&data_publication_id(&id, lane)) else {
                 debug_assert!(false, "stream binding must survive reverse route install");
-                return;
+                self.release_route(shard_id, route).await;
+                crate::control::controller::lifecycle::remove_runtime_key(
+                    &mut self.state,
+                    shard_id,
+                    runtime_key,
+                );
+                return false;
             };
             binding.reverse_route = Some(route);
         }
 
-        self.reconcile_stream(id, lane).await;
+        self.reconcile_stream(id, lane).await
     }
 
     #[allow(
@@ -238,12 +213,8 @@ impl ControllerActor {
                 key: subscriber_key,
                 delivery: channel,
             },
-            crate::view::Delivery::Data(channel),
-            crate::view::AudienceKind::Data,
         );
-        if !self.publish_ops(membership_ops) {
-            debug_assert!(false, "data group membership must publish");
-        }
+        self.publish_ops(membership_ops);
         // Which streams this reaches is a catalog question now, not something
         // the registry has to remember on the subscriber's behalf.
         let ids: Vec<_> = match publisher {
@@ -252,13 +223,20 @@ impl ControllerActor {
             )],
             None => self.streams_on_topic(room_id, &topic, lane),
         };
+        for id in &ids {
+            let publication_id = data_publication_id(id, lane);
+            if self.catalog.contains(&publication_id) {
+                self.index_publication(publication_id);
+            }
+        }
         for id in ids {
-            self.reconcile_stream(id, lane).await;
+            let _ = self.reconcile_stream(id, lane).await;
         }
     }
 
     pub(super) async fn on_stream_unsubscription(
         &mut self,
+        shard_id: crate::id::ShardId,
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: crate::track::Topic,
@@ -277,11 +255,8 @@ impl ControllerActor {
             &mut self.data_patterns,
             &pattern,
             &subscriber,
-            crate::view::AudienceKind::Data,
         );
-        if !self.publish_ops(membership_ops) {
-            debug_assert!(false, "data group retraction must publish");
-        }
+        self.publish_ops(membership_ops);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::shard::router::DataStreamId::new(
                 room_id, publisher, topic,
@@ -289,7 +264,11 @@ impl ControllerActor {
             None => self.streams_on_topic(room_id, &topic, lane),
         };
         for id in ids {
-            self.reconcile_stream(id, lane).await;
+            let publication_id = data_publication_id(&id, lane);
+            if !self.publication_reaches_shard(publication_id, shard_id) {
+                self.retire_destination(publication_id, shard_id).await;
+            }
+            let _ = self.reconcile_stream(id, lane).await;
         }
     }
 
@@ -298,15 +277,8 @@ impl ControllerActor {
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
     ) -> bool {
-        self.retire_publication(data_publication_id(&id, lane), move |actor, shard, key| {
-            if let Some(key) = key.stream() {
-                actor
-                    .lanes
-                    .get(lane)
-                    .retire_runtime(&mut actor.state, shard, key);
-            }
-        })
-        .await
+        self.retire_publication(data_publication_id(&id, lane))
+            .await
     }
 
     /// Make a stream's destinations match its declarations.
@@ -314,31 +286,34 @@ impl ControllerActor {
         &mut self,
         id: crate::shard::router::DataStreamId,
         lane: StreamLane,
-    ) {
+    ) -> bool {
         let publication_id = data_publication_id(&id, lane);
         let stream = id.clone();
-        self.install_destinations(publication_id, move |actor, destination| {
-            let key = actor
-                .lanes
-                .get(lane)
-                .mint(&mut actor.state, destination, &stream)?;
-            let action = actor.lanes.get(lane).route_action(key)?;
-            Some((key.into(), action))
-        })
-        .await;
-        self.publish_publication(publication_id).await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stream_views_publish_when_topology_changes() {
-        assert!(should_publish_stream_views(false, false));
-        assert!(should_publish_stream_views(false, true));
-        assert!(should_publish_stream_views(true, true));
-        assert!(!should_publish_stream_views(true, false));
+        let complete = self
+            .install_destinations(publication_id, move |actor, destination| {
+                let key = actor
+                    .lanes
+                    .get(lane)
+                    .mint(&mut actor.state, destination, &stream)?;
+                let Some(action) = actor.lanes.get(lane).route_action(key) else {
+                    crate::control::controller::lifecycle::remove_runtime_key(
+                        &mut actor.state,
+                        destination,
+                        key.into(),
+                    );
+                    debug_assert!(false, "a lane must only mint its own route action");
+                    return None;
+                };
+                Some((key.into(), action))
+            })
+            .await;
+        let published = self.publish_publication(publication_id).await;
+        if !complete
+            && published
+            && let Some(shard_id) = self.catalog.get(&publication_id).map(|p| p.publisher_shard)
+        {
+            self.defer_stream(shard_id, id, lane);
+        }
+        complete && published
     }
 }

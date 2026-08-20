@@ -28,24 +28,19 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         action: crate::route::RouteAction,
-        plan: Option<(crate::view::PlanTarget, crate::view::ForwardingPlan)>,
+        plan: Option<crate::view::PlanUpdate>,
     ) -> Option<RouteHandle> {
         self.publish_with_route(shard_id, "endpoint", move |_, handle| {
             let mut ops = vec![(
                 shard_id,
                 crate::view::ViewOp::InstallRoute {
-                    route: handle.route,
                     binding: crate::view::RouteBinding {
-                        epoch: handle.epoch,
+                        handle: *handle,
                         action,
                     },
                 },
             )];
-            ops.extend(
-                plan.map(|(target, plan)| {
-                    (shard_id, crate::view::ViewOp::SetPlan { target, plan })
-                }),
-            );
+            ops.extend(plan.map(|update| (shard_id, crate::view::ViewOp::SetPlan { update })));
             ops
         })
     }
@@ -60,16 +55,9 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
         handle: RouteHandle,
     ) {
-        let retire = vec![(
-            shard_id,
-            crate::view::ViewOp::RetireRoute {
-                route: handle.route,
-                epoch: handle.epoch,
-            },
-        )];
-        if !self.publish_ops(retire) {
-            return;
-        }
+        debug_assert_eq!(handle.shard(), shard_id);
+        let retire = vec![(shard_id, crate::view::ViewOp::RetireRoute { handle })];
+        self.publish_ops(retire);
         self.state
             .release_endpoint(shard_id, handle.route.slot(), tokio::time::Instant::now());
     }
@@ -176,9 +164,8 @@ impl ControllerActor {
         view.stage(
             generation,
             crate::view::ViewOp::InstallTransport {
-                route: handle.route,
                 binding: crate::view::TransportBinding {
-                    epoch: handle.epoch,
+                    handle,
                     participant,
                 },
             },
