@@ -69,14 +69,11 @@ impl Room {
         self.participants.len()
     }
 
-    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
-        self.participants.values().flatten()
+    pub fn participant_ids(&self) -> impl Iterator<Item = &ParticipantId> {
+        self.participants.keys()
     }
 
-    pub fn tracks_published_by(&self, participant_id: &ParticipantId) -> Vec<Track> {
-        self.participants
-            .get(participant_id)
-            .cloned()
-            .unwrap_or_default()
+    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
+        self.participants.values().flatten()
     }
 }

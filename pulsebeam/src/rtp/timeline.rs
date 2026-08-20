@@ -76,7 +76,8 @@ impl Timeline {
     }
 
     /// Create a new timeline whose starting sequence number is drawn from `rng`.
-    pub fn new<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
+    pub fn new(clock_rate: Frequency) -> Self {
+        let rng = &mut pulsebeam_runtime::rand::os_rng();
         let base_seq_no = (rng.next_u32() & 0xFFFF) as u16;
         Self::new_with_base(clock_rate, base_seq_no)
     }

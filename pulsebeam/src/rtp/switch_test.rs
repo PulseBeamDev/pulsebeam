@@ -1,13 +1,13 @@
 //! End-to-end stream-switching tests.
 //!
-//! The harness mirrors production wiring exactly: `ShardRoutingTable::route_video`
+//! The harness mirrors production wiring exactly: the shard runtime's video
+//! forwarding path
 //! pushes every packet into the per-layer `StreamCache` and then hands the packet
 //! plus that cache to each subscriber's `Slot::on_rtp`, which feeds the `Switcher`.
 //! Tests here drive that same pair and assert on what the subscriber's decoder
 //! would actually receive.
 
 use ahash::HashMap;
-use pulsebeam_runtime::rand::seeded_rng;
 use str0m::media::Rid;
 use tokio::time::Instant;
 
@@ -38,13 +38,12 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
-    pub fn new(seed: u64) -> Self {
-        let track =
-            ParticipantId::new(&mut seeded_rng(seed)).derive_track_id(TrackKind::Video, "sw");
+    pub fn new(_seed: u64) -> Self {
+        let track = ParticipantId::new().derive_track_id(TrackKind::Video, "sw");
         Self {
             track,
             cache: TrackStreamCache::new(),
-            switcher: Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(seed)),
+            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             out: Vec::new(),
             bursts: Vec::new(),
         }

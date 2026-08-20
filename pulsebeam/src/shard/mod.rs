@@ -1,12 +1,13 @@
+#![deny(clippy::manual_find, clippy::manual_flatten)]
+
 pub(crate) mod core;
 pub(crate) mod demux;
 mod dirty;
-mod events;
+pub(crate) mod events;
 pub mod metrics;
 pub(crate) mod participants;
-mod reliable;
 pub(crate) mod recorder;
-pub mod router;
+pub(crate) mod router;
 mod timer;
-pub mod worker;
-pub use worker::ShardContext;
+pub(crate) mod worker;
+pub(crate) use worker::ShardContext;

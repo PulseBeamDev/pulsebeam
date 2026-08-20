@@ -72,6 +72,16 @@ pub fn sample_indices<R: RngCore>(rng: &mut R, len: usize, amount: usize) -> Ind
 /// Create an RNG seeded from the OS randomness source.
 ///
 /// Call once at startup and derive all other RNGs from it.
+/// Deterministic under simulation without any special casing here: the
+/// simulator overrides `getrandom(2)` for the whole process
+/// (`pulsebeam-simulator/src/sim_rand.rs`), so every draw is already a function
+/// of the plan seed.
+///
+/// A thread-local seed *here* would be worse than nothing. `os_rng` is called
+/// from the controller task as well as from startup, and those run on different
+/// threads; a thread-local would apply to one of them and silently fall through
+/// to real OS randomness on the others, making a plan's outcome depend on which
+/// thread got there first.
 pub fn os_rng() -> Rng {
     rand::make_rng()
 }

@@ -26,7 +26,7 @@
 
 #[cfg(feature = "sim")]
 mod imp {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     struct State {
@@ -35,6 +35,8 @@ mod imp {
         stream: u64,
         fired: BTreeSet<&'static str>,
         seen: BTreeSet<&'static str>,
+        /// Fires owed to a site regardless of the draw.
+        forced: BTreeMap<&'static str, u32>,
     }
 
     fn state() -> &'static Mutex<State> {
@@ -45,6 +47,7 @@ mod imp {
                 stream: 0,
                 fired: BTreeSet::new(),
                 seen: BTreeSet::new(),
+                forced: BTreeMap::new(),
             })
         })
     }
@@ -58,6 +61,20 @@ mod imp {
         st.stream = seed;
         st.fired.clear();
         st.seen.clear();
+        st.forced.clear();
+    }
+
+    /// Make the next `count` reaches of `site` fire, whatever the draw says.
+    ///
+    /// A probability decides where failures land across a run but not whether
+    /// any land at all: at a low rate and a handful of reaches, some seeds
+    /// inject nothing and a plan degrades into asserting the happy path
+    /// without saying so. Forcing the first one makes the recovery path a
+    /// thing every seed exercises, and it still counts as coverage because it
+    /// goes through the same site.
+    pub fn force(site: &'static str, count: u32) {
+        let mut st = state().lock().expect("buggify state poisoned");
+        st.forced.insert(site, count);
     }
 
     /// Sites reached, and of those the ones that fired.
@@ -76,6 +93,13 @@ mod imp {
         );
         let mut st = state().lock().expect("buggify state poisoned");
         st.seen.insert(site);
+        if let Some(owed) = st.forced.get_mut(site)
+            && *owed > 0
+        {
+            *owed = owed.saturating_sub(1);
+            st.fired.insert(site);
+            return true;
+        }
         if st.permille == 0 {
             return false;
         }
@@ -95,13 +119,17 @@ mod imp {
 }
 
 #[cfg(feature = "sim")]
-pub use imp::{coverage, enable, fires};
+pub use imp::{coverage, enable, fires, force};
 
 #[cfg(not(feature = "sim"))]
 #[inline(always)]
 pub fn fires(_site: &'static str) -> bool {
     false
 }
+
+#[cfg(not(feature = "sim"))]
+#[inline(always)]
+pub fn force(_site: &'static str, _count: u32) {}
 
 /// Declare a point where something plausible could go wrong.
 ///

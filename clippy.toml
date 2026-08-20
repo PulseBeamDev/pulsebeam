@@ -34,6 +34,7 @@ allow-print-in-tests = true
 # The point of the deny is not that these are forbidden. It is that reaching for
 # one has to be a decision somebody wrote down.
 disallowed-types = [
+    { path = "bytes::Bytes", reason = "refcounted payload shared across shard boundaries. Cross-shard data is copied deliberately so allocation and release stay core-local; use Vec<u8> unless an explicit, reviewed exception is required." },
     { path = "std::sync::Arc", reason = "cross-core refcount. Fine when the count is bounded and touched at startup (one per shard); wrong on any path that runs per packet. Prefer Rc, or an owned value the shard holds outright." },
     { path = "std::sync::Mutex", reason = "a shard must never block on another shard. Use a message." },
     { path = "std::sync::RwLock", reason = "as Mutex. A reader still takes a cache line other cores want." },
@@ -66,6 +67,8 @@ disallowed-methods = [
     { path = "std::thread::sleep", reason = "blocks the whole shard. In a test it also blocks the simulated world and waits on real time, which is what makes a plan slow and flaky rather than deterministic. Use tokio::time::sleep or a deterministic tick." },
     { path = "tokio::task::block_in_place", reason = "a shard runs on a current-thread runtime; there is no pool to hand the work to." },
     { path = "futures::executor::block_on", reason = "blocks the shard's own executor. Restricted to runtime startup." },
+    { path = "metrics::set_global_recorder", reason = "a global recorder is shared mutable state on the packet path: its registry locks and its render walk the same cache lines every shard writes, which is what put spikes in the forwarding tail. Shards install their own recorder per tick (shard::recorder) and report by message. The one legitimate global is the Prometheus exporter for control-plane metrics, in node.rs." },
+    { path = "metrics_exporter_prometheus::PrometheusBuilder::install_recorder", reason = "same as metrics::set_global_recorder — this is the call that installs one. Pinned to the single site in node.rs so a second one cannot appear without review." },
 ]
 # Not listed: `tokio::runtime::Runtime::block_on`. `#[tokio::test]` expands to
 # it, so the rule fires on every async test and cannot be satisfied. The two
