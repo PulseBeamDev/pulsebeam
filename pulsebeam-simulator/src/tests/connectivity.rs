@@ -212,6 +212,11 @@ fn steering_stops_cross_shard_forwarding_once_flows_authenticate() {
                 description: "let every flow authenticate",
                 duration: Duration::from_secs(8),
             },
+            Step::CheckRoutingCounterAtLeast {
+                description: "the source shard receives the owner authentication acknowledgment",
+                name: "demux_flow_authenticated",
+                min: 1,
+            },
             Step::CheckRoutingCounterSettles {
                 description: "no packet crosses a shard boundary at steady state",
                 name: "shard_wrong_owner_forward",

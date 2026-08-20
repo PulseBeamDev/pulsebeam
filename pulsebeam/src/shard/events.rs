@@ -78,6 +78,7 @@ pub enum ParticipantLifecycleEvent {
         participant_key: ParticipantKey,
         source: std::net::SocketAddr,
         destination: std::net::SocketAddr,
+        source_shard: crate::id::ShardId,
     },
     Exited {
         participant_id: ParticipantId,
@@ -178,7 +179,12 @@ pub struct PipelineSinkRef<'a> {
 
 impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     #[inline]
-    fn connected(&mut self, source: std::net::SocketAddr, destination: std::net::SocketAddr) {
+    fn connected(
+        &mut self,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        source_shard: crate::id::ShardId,
+    ) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Lifecycle(
@@ -186,6 +192,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                     participant_key: self.key,
                     source,
                     destination,
+                    source_shard,
                 },
             ));
     }

@@ -449,7 +449,7 @@ impl ShardCore {
             crate::sim_metrics::record_routing_counter("shard_wrong_owner_drop");
             return;
         }
-        self.on_owned_udp_batch(batch, handle);
+        self.on_owned_udp_batch(batch, handle, self.shard_id);
     }
 
     pub(crate) fn on_udp_batch_routed(
@@ -474,10 +474,15 @@ impl ShardCore {
             crate::sim_metrics::record_routing_counter("shard_wrong_owner_forward");
             return;
         }
-        self.on_owned_udp_batch(batch, handle);
+        self.on_owned_udp_batch(batch, handle, self.shard_id);
     }
 
-    fn on_owned_udp_batch(&mut self, batch: net::RecvPacketBatch, handle: TransportHandle) {
+    fn on_owned_udp_batch(
+        &mut self,
+        batch: net::RecvPacketBatch,
+        handle: TransportHandle,
+        source_shard: crate::id::ShardId,
+    ) {
         debug_assert_eq!(handle.shard(), self.shard_id);
         let Some(key) = self.view.transports.resolve(handle) else {
             return;
@@ -486,7 +491,7 @@ impl ShardCore {
             record_routing_drop("transport", "runtime", "local");
             return;
         };
-        participant.on_ingress(batch);
+        participant.on_ingress(batch, source_shard);
         self.dirty.mark(key, participant);
     }
 
@@ -636,24 +641,19 @@ impl ShardCore {
                     participant_key,
                     source,
                     destination,
+                    source_shard,
                 }) => {
-                    // Nothing to install: the demuxer cached this address when
-                    // it classified the flow's bootstrap, on whichever shard
-                    // that landed. All this does is tell control the flow is
-                    // real, so it can pin it in the steering map and retire the
-                    // cross-shard hop.
-                    if self
-                        .registry
-                        .authenticated_handle(participant_key)
-                        .is_none()
-                    {
+                    let Some(handle) = self.registry.authenticated_handle(participant_key) else {
                         debug_assert!(false, "authenticated participant must still be registered");
                         continue;
-                    }
+                    };
+                    self.registry.authenticate_addr(source, handle);
                     self.pipeline
                         .push_shard_event(ShardEvent::TransportAuthenticated {
                             source,
                             destination,
+                            source_shard,
+                            handle,
                             shard: self.shard_id,
                         });
                 }
@@ -822,6 +822,12 @@ impl ShardCore {
             ShardCommand::AdoptTcpConnection { .. } => {
                 debug_assert!(false, "TCP handoff is consumed by the worker");
             }
+            ShardCommand::AuthenticateTransport { source, handle } => {
+                self.registry.authenticate_addr(source, handle);
+                metrics::counter!("demux_flow_authenticated").increment(1);
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_counter("demux_flow_authenticated");
+            }
         }
         let _ = router;
         Some(())
@@ -854,7 +860,7 @@ impl ShardCore {
                 if self.view.transports.resolve(handle).is_some() {
                     self.registry.learn_addr(batch.src, handle);
                 }
-                self.on_owned_udp_batch(batch, handle);
+                self.on_owned_udp_batch(batch, handle, source_shard);
             }
             ShardFrame::Media { env, payload } => self.on_media_frame(env, payload, now, router),
             ShardFrame::Reverse { env, body } => self.on_reverse_frame(env, body, router),

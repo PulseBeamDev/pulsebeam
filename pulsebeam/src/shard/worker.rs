@@ -174,6 +174,10 @@ pub(crate) enum ShardCommand {
         stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
         peer_addr: std::net::SocketAddr,
     },
+    AuthenticateTransport {
+        source: std::net::SocketAddr,
+        handle: crate::route::TransportHandle,
+    },
 }
 
 /// What a subscriber sends back to a publisher.
@@ -277,6 +281,8 @@ pub(crate) enum ShardEvent {
     TransportAuthenticated {
         source: std::net::SocketAddr,
         destination: std::net::SocketAddr,
+        source_shard: ShardId,
+        handle: crate::route::TransportHandle,
         shard: ShardId,
     },
     ParticipantClosed {

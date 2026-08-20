@@ -199,15 +199,14 @@ entry for its route while forged entries are touched once at admission. Eviction
 picks the minimum, so a flood evicts its own oldest entry. It churns its own
 ring. A live call keeps its place precisely because it is live.
 
-**Marking entries "authenticated" is unsound, and was tried.** The obvious
-hardening — flag entries once the flow authenticates, and never let an
-unflagged entry evict a flagged one — has no correct place to set the flag.
-`SO_REUSEPORT` picks the *admitting* shard by hashing the 4-tuple, while the
-shard that authenticates is the route's *owner*, and those are usually not the
-same shard. The entry that would need marking is never the one that learns the
-flow is real, so the flag would have to be attributed back across shards to
-mean anything. Least-recently-used already delivers the property the flag was
-reaching for, without needing to know who authenticated what.
+**Authenticated entries are protected after an owner acknowledgment.**
+`SO_REUSEPORT` still picks the *admitting* shard by hashing the 4-tuple, while
+the shard that authenticates is the route's *owner*. The owner reports the
+original source shard through the controller; the controller installs eBPF
+flow affinity to the owner and sends the source shard an explicit
+authentication command. Until that command arrives, the entry remains usable
+for the handshake but is eligible for eviction. Once marked, it is preferred
+over unauthenticated entries during both per-route and global eviction.
 
 The `# Security hardening` comment on the demuxer states the same argument
 beside the code that implements it. If these two ever disagree, the code is
