@@ -65,18 +65,20 @@ impl Room {
             .map(|(shard_id, _)| *shard_id)
     }
 
+    pub fn shard_ids(&self) -> impl Iterator<Item = ShardId> + '_ {
+        self.participant_shards.keys().copied()
+    }
+
     pub fn participant_count(&self) -> usize {
         self.participants.len()
     }
 
-    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
-        self.participants.values().flatten()
+    #[cfg(test)]
+    pub fn participant_ids(&self) -> impl Iterator<Item = &ParticipantId> {
+        self.participants.keys()
     }
 
-    pub fn tracks_published_by(&self, participant_id: &ParticipantId) -> Vec<Track> {
-        self.participants
-            .get(participant_id)
-            .cloned()
-            .unwrap_or_default()
+    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
+        self.participants.values().flatten()
     }
 }

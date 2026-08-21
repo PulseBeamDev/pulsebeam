@@ -526,9 +526,19 @@ impl VideoAllocator {
     }
 
     #[inline]
+    /// Forward one packet into a compiled slot.
+    ///
+    /// `track` is the track the packet and `cache` actually belong to, not the
+    /// slot's target. Deriving it from the target instead spliced two sources
+    /// into one egress stream: while a slot was retargeted, a packet still
+    /// arriving for the outgoing track was announced under the incoming one, so
+    /// the switcher's own per-track gate admitted it and read the wrong cache on
+    /// the active stream's timeline. The subscriber saw a frame cut short and
+    /// the next source's frame continue its sequence number.
     pub fn on_rtp_slot(
         &mut self,
         slot_key: DownstreamSlotKey,
+        track: TrackId,
         pkt: &RtpPacket,
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
@@ -537,10 +547,7 @@ impl VideoAllocator {
             debug_assert!(false, "compiled downstream slot must resolve");
             return false;
         };
-        let Some(track_id) = slot.target().map(|layer| layer.meta.id) else {
-            return false;
-        };
-        slot.on_rtp(track_id, pkt, cache, writer)
+        slot.on_rtp(track, pkt, cache, writer)
     }
 
     pub(crate) fn poll_slow(
@@ -641,8 +648,7 @@ impl VideoAllocator {
             .any(|(route_track, _)| route_track == track_id)
     }
 
-    #[cfg(test)]
-    fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
+    pub(crate) fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
         for (route_track, slot_key) in &self.routes {
             if route_track == track_id {
                 return Some(*slot_key);
@@ -2263,6 +2269,58 @@ mod assignment_tests {
         assert!(desired.as_f64() > 0.0);
         assert!(allocator.current_allocation().as_f64() > 0.0);
         assert!(allocator.current_allocation() <= desired);
+    }
+
+    /// A slot must forward only the track it is serving.
+    ///
+    /// `on_rtp_slot` used to take the track identity from the slot's *target*
+    /// rather than from the packet, so a packet still arriving for an outgoing
+    /// track was announced under the incoming one. The switcher's per-track gate
+    /// then admitted it and walked the wrong cache on the active stream's
+    /// timeline, splicing two sources into one egress sequence: the subscriber
+    /// saw a frame cut short and the next source's frame continue its numbering,
+    /// with nothing to tell it the first was incomplete.
+    #[test]
+    fn a_slot_ignores_a_packet_belonging_to_another_track() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        allocator.rebalance();
+
+        let served = allocator
+            .slots
+            .iter()
+            .find_map(|(key, slot)| slot.target().map(|layer| (key, layer.meta.id)));
+        let Some((slot_key, served_track)) = served else {
+            panic!("rebalance must give the slot a track to serve");
+        };
+        let Some(&foreign) = tracks.ids.iter().find(|id| **id != served_track) else {
+            panic!("two tracks were added");
+        };
+
+        let mut cache = TrackStreamCache::new();
+        let mut writer = StreamWriter::new();
+        let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(
+            1,
+            1000,
+            90_000,
+            tokio::time::Instant::now(),
+        );
+        for pkt in builder.keyframe(4) {
+            cache.push(pkt.clone());
+            allocator.on_rtp_slot(slot_key, foreign, &pkt, Some(&cache), &mut writer);
+        }
+
+        let mut emitted = 0usize;
+        while let Some(write) = writer.pop() {
+            if matches!(write, crate::track::StreamWrite::Video { .. }) {
+                emitted = emitted.saturating_add(1);
+            }
+        }
+        assert_eq!(
+            emitted, 0,
+            "a packet from a track this slot does not serve must not reach its egress stream"
+        );
     }
 
     #[test]

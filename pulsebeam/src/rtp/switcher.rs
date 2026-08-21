@@ -5,7 +5,6 @@
 //! either record a gap of billions or hide a real one, and the switcher would
 //! hold or release a switch on a number that was never true.
 
-use pulsebeam_runtime::rand::RngCore;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use str0m::media::{Frequency, MediaTime};
@@ -123,9 +122,9 @@ pub struct Switcher {
 }
 
 impl Switcher {
-    pub fn new<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
+    pub fn new(clock_rate: Frequency) -> Self {
         Self {
-            timeline: Timeline::new(clock_rate, rng),
+            timeline: Timeline::new(clock_rate),
             selector: DependencyDescriptorSelector::new(),
             active: None,
             active_cursor: None,
@@ -299,7 +298,22 @@ impl Switcher {
                         FrameDecision::Drop => {
                             // Intentional layer shed: renumber around it so the
                             // subscriber sees a contiguous stream, not loss.
-                            self.timeline.drop_input();
+                            //
+                            // Only when the frame before it closed. Renumbering
+                            // past a frame upstream loss left open would splice
+                            // the next frame onto it, and the subscriber would
+                            // decode a truncated frame as a whole one. Leaving
+                            // the gap keeps that damage visible.
+                            if !self.newest_frame_left_open() {
+                                // Renumbering takes the output slot each
+                                // outstanding hole below this point would have
+                                // filled, so those packets can no longer be
+                                // placed contiguously. Forget them, or a late
+                                // arrival is rewritten onto a sequence number
+                                // already emitted.
+                                self.active_input_holes.clear();
+                                self.timeline.drop_input();
+                            }
                         }
                         FrameDecision::Forward => {
                             let mut out = pkt.clone();
@@ -611,13 +625,13 @@ mod test {
     use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
-    use pulsebeam_runtime::rand::seeded_rng;
+
     use str0m::media::Rid;
     use tokio::time::Instant;
 
     /// Two distinct streams (two simulcast layers of one track) to switch between.
     fn two_streams() -> (StreamId, StreamId) {
-        let track = ParticipantId::new(&mut seeded_rng(1)).derive_track_id(TrackKind::Video, "v");
+        let track = ParticipantId::new().derive_track_id(TrackKind::Video, "v");
         ((track, Some(Rid::from("q"))), (track, Some(Rid::from("h"))))
     }
 
@@ -648,7 +662,7 @@ mod test {
     #[test]
     fn initial_subscribe_replays_keyframe_then_follows_live_contiguously() {
         let (q, _) = two_streams();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(7));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
         let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
@@ -677,7 +691,7 @@ mod test {
     #[test]
     fn live_upstream_loss_stays_visible_as_a_gap() {
         let (q, _) = two_streams();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(8));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
         let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
@@ -701,7 +715,7 @@ mod test {
     #[test]
     fn a_burst_packet_is_never_emitted_twice_under_reordering() {
         let (q, _) = two_streams();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(12));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
         let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
@@ -723,7 +737,7 @@ mod test {
     #[test]
     fn switching_layers_stays_contiguous_and_decodable() {
         let (q, h) = two_streams();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(20));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
         let mut cache = TrackStreamCache::new();
         let mut bq = builder(1);
         let mut bh = builder(2);
@@ -761,7 +775,7 @@ mod test {
         // satisfy the egress invariants, including that no frame is cut short while
         // the next follows on a contiguous sequence number.
         let (q, h) = two_streams();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(30));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
         let mut cache = TrackStreamCache::new();
         let mut bq = builder(1);
         let mut bh = builder(2);
@@ -811,7 +825,7 @@ mod test {
         use crate::rtp::frame_selector::DecodeTargetSelection;
 
         let (q, _) = two_streams();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(41));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
         let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
@@ -856,7 +870,7 @@ mod test {
         use crate::rtp::frame_selector::DecodeTargetSelection;
 
         let (q, _) = two_streams();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(42));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
         let mut cache = TrackStreamCache::new();
         let mut b = builder(1);
         let mut out = Vec::new();
@@ -935,7 +949,7 @@ mod test {
             DecodeTargetSelection::Target(1),
         ] {
             let (q, _) = two_streams();
-            let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(51));
+            let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
             let mut cache = TrackStreamCache::new();
             let mut b = builder(1);
             let mut generator = TemporalDdGenerator::new(3);

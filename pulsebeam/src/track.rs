@@ -98,6 +98,7 @@ impl StreamWriter {
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
+    pub room_id: crate::entity::RoomId,
     /// The shard ID that hosts this track's publisher.
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
@@ -391,29 +392,27 @@ pub struct Track {
     /// publisher's shard when it publishes, then carried to every other shard
     /// by the control plane: the compiled reverse plan, so the data plane never
     /// has to name the track to ask for anything.
-    pub reverse: Option<crate::route::ReverseRoute>,
+    pub reverse: Option<crate::route::RouteHandle>,
 }
 
 impl Track {
-    pub fn lowest_quality(&self) -> &TrackLayer {
-        self.layers
-            .iter()
-            .min_by_key(|l| l.quality)
-            .unwrap_or_else(|| {
-                pulsebeam_runtime::fatal!("track {} was published with no layers", self.meta.id)
-            })
+    pub fn lowest_quality(&self) -> Option<&TrackLayer> {
+        self.layers.iter().min_by_key(|l| l.quality)
     }
 
     /// Lowest layer that is currently healthy, falling back to the absolute
     /// lowest when no layer is healthy yet. Prefer this over `lowest_quality`
     /// when staging an initial layer so the slot can actually receive a keyframe
     /// (an inactive layer never produces packets and the slot would stall).
-    pub fn lowest_healthy_quality(&self, is_healthy: impl Fn(&TrackLayer) -> bool) -> &TrackLayer {
+    pub fn lowest_healthy_quality(
+        &self,
+        is_healthy: impl Fn(&TrackLayer) -> bool,
+    ) -> Option<&TrackLayer> {
         self.layers
             .iter()
             .filter(|l| is_healthy(l))
             .min_by_key(|l| l.quality)
-            .unwrap_or_else(|| self.lowest_quality())
+            .or_else(|| self.lowest_quality())
     }
 
     pub fn by_quality(&self, quality: LayerQuality) -> Option<&TrackLayer> {
@@ -591,6 +590,9 @@ pub mod test_utils {
     ) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+            ),
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
@@ -601,6 +603,9 @@ pub mod test_utils {
     pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
         let meta = TrackMeta {
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+            ),
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
@@ -644,7 +649,7 @@ mod data_track {
     /// cross-core traffic, which is the wrong direction.
     ///
     /// The clones are not inherent: they exist only to build lookup keys, and a
-    /// dense key in `RouteAction::Data` removes them the way `LocalTrackKey`
+    /// dense key in `RouteAction::Unreliable` removes them the way `TrackKey`
     /// did for video. Fix the cause, not the symptom.
     pub struct Topic(String);
 
@@ -693,12 +698,26 @@ mod data_track {
     }
 
     impl DataLane {
-        fn as_str(self) -> &'static str {
+        pub fn as_str(self) -> &'static str {
             match self {
                 DataLane::Realtime => "rt",
                 DataLane::Reliable => "rel",
             }
         }
+    }
+
+    /// The canonical label naming a data *publication*: a topic on a lane.
+    ///
+    /// Direction and scope describe a channel, not the thing published on it,
+    /// so they are absent here — a publisher's channel and a subscriber's
+    /// channel for the same topic name one publication between them.
+    ///
+    /// Injective without escaping, which is why this can be plain
+    /// concatenation: `rt` and `rel` are prefix-free after `v1/`, and a topic
+    /// is `[A-Za-z0-9_-]+` by the grammar above, so it can carry no separator.
+    /// That is enforced where a label is parsed, not assumed here.
+    pub fn publication_label(lane: DataLane, topic: &crate::track::Topic) -> String {
+        format!("v1/{}/{}", lane.as_str(), topic)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -980,8 +999,8 @@ mod data_track {
 
         #[test]
         fn test_reliable_subscribe_rejects_publisher_scope() {
-            let mut rng = test_rng();
-            let publisher_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let publisher_id = ParticipantId::new();
             let label = format!("v1/rel/sub/chat/{}", publisher_id.as_str());
             let err = DataTrackIntent::try_from(&rel_cfg(&label)).unwrap_err();
             assert_eq!(
@@ -1020,8 +1039,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_subscribe_valid() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/sub/game-sync/{}", participant_id.as_str());
             let res = DataTrackIntent::try_from(&cfg(&label)).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
@@ -1035,8 +1054,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_publish_rejected() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/pub/game-sync/{}", participant_id.as_str());
             let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
             assert_eq!(err, DataTrackIntentError::ScopeNotAllowedForPublish);
@@ -1051,8 +1070,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_subscribe_trailing_garbage() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/sub/game-sync/{}/trailing", participant_id.as_str());
             let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
             assert!(matches!(err, DataTrackIntentError::InvalidScope(_)));
@@ -1373,7 +1392,7 @@ mod simulcast_pause_tests {
     /// A three-encoding video track and a starting instant.
     fn track() -> (UpstreamTrack, Instant) {
         let now = Instant::now();
-        let participant = ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(7));
+        let participant = ParticipantId::new();
         let (upstream, _) = test_utils::make_video_track(
             participant,
             Mid::from("v"),

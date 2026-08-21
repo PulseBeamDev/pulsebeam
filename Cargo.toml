@@ -30,6 +30,7 @@ bytes = "1.11.1"
 derive_more = { version = "2.1.1", features = ["full"] }
 fastrand = "2.3.0"
 futures-lite = "2.6.1"
+left-right = "0.11.7"
 more-asserts = "0.3.1"
 rand = "0.10.1"
 serde = { version = "1", features = ["derive"] }

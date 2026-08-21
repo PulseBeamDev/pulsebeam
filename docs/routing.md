@@ -1,1987 +1,566 @@
-# PulseBeam Routing Protocol Architecture
-
-> **Implementation status (2026-08):** client `SK_REUSEPORT` steering is
-> loaded at startup on Linux when the eBPF object is available. The attached
-> program is `pulsebeam_client`; the separately compiled `pulsebeam_node`
-> program is not attached by the current node startup path.
->
-> The client program
-> performs only an authenticated-flow lookup in `FLOWS`; a miss falls through
-> to the socket group's tuple hash and never drops a packet. The control plane
-> installs `FLOWS` entries after str0m reports ICE authentication, and removes
-> no per-flow state on teardown because the bounded kernel map is self-healing.
-> Userspace remains authoritative: it decodes and validates the ufrag, caches
-> only authenticated source addresses, and forwards a resolved packet to the
-> owning shard when the reuseport hash selected another worker. Multi-worker
-> operation therefore remains correct while the object is absent, with eBPF
-> reducing steady-state mailbox forwarding once attached.
->
-> The loader looks for `PULSEBEAM_EBPF_OBJECT`, then
-> `target/bpfel-unknown-none/release/pulsebeam-ebpf` relative to the process
-> working directory. A missing object is reported and uses the userspace
-> forwarding path; an object that exists but cannot load or attach fails node
-> startup. Build it with `make build-ebpf` before starting a production node.
-
-The sections below describe the wire format and the historical design
-constraints. Where they say that the kernel directly decodes a route or that
-client packets cannot cross the shard mailbox, the implementation-status block
-above is authoritative: client steering is now flow lookup plus userspace
-bootstrap forwarding.
-
-The current implementation follows the ownership and data-plane constraints
-in the routing and thread-per-core design documents. This document is the
-implementation guide for shard views, control-minted runtime keys, and
-compiled fanout routes.
-
-## Status
-
-This document defines the routing architecture for PulseBeam's distributed WebRTC SFU.
-
-It focuses specifically on:
-
-- the routing key model,
-- ICE ufrag routing,
-- inter-node routing,
-- eBPF / `SO_REUSEPORT` steering,
-- route allocation and stale-route protection,
-- and the fixed inter-node Envelope format.
-
-The central idea is:
-
-> **PulseBeam routes packets using compact compiled addresses, not stable application identities.**
-
-The routing key is designed to be cheap enough for both userspace and eBPF to interpret directly.
+# Routing
+
+## Overview
+
+Think of the controller as a compiler and each shard as a small packet
+executor. The controller turns room state into a concrete forwarding plan once;
+the shard then executes that plan for every packet without scanning the room or
+asking another shard what to do.
+
+```text
+                         CONTROL PLANE (slow path)
+
+  rooms, participants, tracks, subscriptions
+                         │
+                         ▼
+                    controller
+             chooses owners and recipients
+                         │
+                         ▼
+               compiled forwarding plan
+              published as one coherent view
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+       shard 0        shard 1        shard 2
+       owns ...       owns ...       owns ...
+
+
+                          DATA PLANE (fast path)
+
+  client ── UDP / ICE-TCP ──► classifier
+                              eBPF, userspace or simulator
+                                      │
+                         route = shard + slot + epoch
+                                      │
+                ┌─────────────────────┴─────────────────────┐
+                │                                           │
+          first packet                               media / data
+                │                                           │
+                ▼                                           ▼
+       admitting shard ──► transport owner           publisher shard
+                │              │                           │
+                │              └─ authenticate             │ read plan
+                │                    │                     │
+                │                    ▼                ┌────┴────┐
+                │               controller            │         │
+                │                    │             local      remote
+                └── demux auth ◄─────┘                │         │
+                                                     ▼         ▼
+                                                direct     envelope(route)
+                                                                  │
+                                                                  ▼
+                                                           recipient shard
+                                                                  │
+                                                    validate epoch, find key
+                                                                  │
+                                                                  ▼
+                                                         execute media/data
+```
+
+### The data structures behind the picture
+
+The controller starts with names that are useful for room logic. A
+`ParticipantId`, `TrackId`, `RoomId` or data `Topic` can be looked up and
+compared, but none of them belongs in the packet path. The controller compiles
+those names into this shape:
+
+```text
+  controller state                         shard-owned published view
+  ────────────────                         ──────────────────────────
+
+  Publication {                             ShardView {
+    id: TrackId                                generation
+    publisher: ParticipantId                   transports: slot -> binding
+    publisher_shard                            routes:     slot -> binding
+    origin_key                                 video plans: local track key -> plan
+    destinations:                              audio plans: local track key -> plan
+      shard -> Destination                     data plans:  local stream key -> plan
+    reverse_route                              }
+  }
+
+  Destination {
+    Discovery { video_key }
+    or
+    Forwarding {
+      key: shard-local runtime key
+      route: RouteHandle
+    }
+  }
+
+  ForwardingPlan<D> {
+    recipients:   [(ParticipantKey, D)]
+    remote_routes: [RouteHandle]
+    reverse_route: Option<RouteHandle>
+  }
+```
+
+`Publication` is the controller's catalog record. It knows the semantic
+identity of a publication and, for each receiving shard, the local runtime key
+and, when forwarding is installed, its route. A video destination can briefly
+be `Discovery` while the shard learns about a track; the controller replaces it
+with `Forwarding` before packets are sent. `Destination` is one record instead
+of separate maps for audio, video and data, which keeps the shard identity and
+the local key together.
 
----
-
-# 1. Core routing model
-
-PulseBeam has two distinct routing domains:
-
-1. **Client transport routing**
-2. **Distributed data-plane endpoint routing**
-
-They use different semantic key types, but they share the same packed physical routing primitive.
-
-```text
-                         PackedRoute(u32)
-                         ShardId | Slot
-                         /          \
-                        /            \
-                       ▼              ▼
-             TransportRoute         RouteId
-             client transport    distributed endpoint
-```
-
-The important distinction is semantic:
-
-- `TransportRoute` routes a WebRTC transport / ICE association.
-- `RouteId` routes a distributed endpoint such as a media stream or SCTP endpoint.
-
-They may share the same 32-bit wire layout without being interchangeable types.
-
----
-
-# 2. Shard ownership model
-
-Today, `ShardId` maps directly to the physical shard worker.
-
-```text
-ShardId 0 → Worker 0
-ShardId 1 → Worker 1
-ShardId 2 → Worker 2
-...
-```
-
-A shard is the unit of:
-
-- WebRTC state ownership,
-- `str0m` execution,
-- RTP/RTCP processing,
-- SCTP/DataChannel processing,
-- timers,
-- pacing,
-- UDP socket ownership,
-- and established ICE-TCP connection ownership.
-
-The route format encodes the `ShardId` so userspace can identify the owning
-worker after ufrag validation. An attached kernel program handles only known
-5-tuples; the bootstrap packet and any tuple miss are resolved in userspace and
-may cross the in-process shard mailbox once.
-
----
-
-# 3. Why encode ShardId in the route
-
-The route must be usable by the userspace demuxer before shard-local state is
-consulted. The kernel fast path has a smaller responsibility: retain affinity
-for an authenticated 5-tuple.
-
-For UDP, PulseBeam prefers the kernel to steer an authenticated flow directly
-to the worker that owns the destination. The fallback is deliberately part of
-the design, because a new ICE candidate has no flow-map entry yet.
-
-For established flows:
-
-```text
-5-tuple
-   ↓
-FLOWS map: FlowKey → ShardId
-   ↓
-socket
-```
-
-For bootstrap and map misses, PulseBeam uses:
-
-```text
-raw UDP
-   ↓
-userspace ufrag validation
-   ↓
-owner-shard mailbox forwarding when needed
-```
-
-The route therefore acts as a compact compiled execution address.
-
-This avoids maintaining a dynamic eBPF routing map for every individual route.
-The control plane allocates the transport route before returning ICE
-credentials, then installs a tuple entry only after authentication. Before that
-point, the receiving shard resolves the ufrag and forwards the datagram if the
-route belongs elsewhere.
-
----
-
-# 4. Packed route layout
-
-The recommended packed route is:
-
-```text
-Route: u32
-
-31                    20 19                    0
-+-----------------------+-----------------------+
-| ShardId               | Slot                  |
-| 12 bits               | 20 bits               |
-+-----------------------+-----------------------+
-```
-
-This provides:
-
-```text
-4096 shard IDs
-1,048,576 slots per shard
-```
-
-The packed value can be decoded with:
-
-```rust
-const SLOT_BITS: u32 = 20;
-const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
-
-shard = route >> SLOT_BITS;
-slot = route & SLOT_MASK;
-```
-
-The exact constants should be centralized in one routing primitive.
-
----
-
-# 5. Why keep 12 bits for ShardId
-
-PulseBeam does not currently need anywhere near 4096 physical shards.
-
-The current execution model is expected to use a much smaller number of workers, typically related to the available CPU cores.
-
-The 12-bit allocation is retained deliberately as protocol headroom.
-
-The wire format should not need to change merely because future PulseBeam versions use a larger shard namespace or introduce a different execution topology.
-
-Today, however, the semantics are simple:
-
-> **`ShardId` identifies the actual shard worker that owns the route.**
-
-No virtual-shard abstraction is required by this specification.
-
----
-
-# 6. Common packed primitive
-
-The packed representation can be shared internally:
-
-```rust
-pub struct PackedRoute(u32);
-```
-
-Conceptually:
-
-```rust
-impl PackedRoute {
-    pub fn shard(self) -> ShardId;
-    pub fn slot(self) -> u32;
-}
-```
-
-Semantic wrappers should remain distinct:
-
-```rust
-pub struct TransportRoute(PackedRoute);
-pub struct RouteId(PackedRoute);
-```
-
-This gives both benefits:
-
-- eBPF sees one consistent bit layout,
-- Rust does not let transport and stream routes get confused accidentally.
-
----
-
-# 7. ShardId
-
-Recommended semantic type:
-
-```rust
-pub struct ShardId(u16);
-```
-
-Only 12 bits are valid on the wire.
-
-Today:
-
-```text
-ShardId == physical shard worker
-```
-
-The routing protocol does not define any additional abstraction above that.
-
----
-
-# 8. Route epoch
-
-Every packed route is qualified by an epoch.
-
-The safe route handle is:
-
-```text
-(epoch, route)
-```
-
-not the 32-bit route alone.
-
-For example:
-
-```text
-old route:
-    epoch = 41
-    route = shard 7 | slot 100
-
-destroy route
-
-new route:
-    epoch = 42
-    route = shard 7 | slot 100
-```
-
-A delayed packet containing:
-
-```text
-epoch = 41
-route = same packed value
-```
-
-must be rejected as stale.
-
-This allows dense slot reuse.
-
----
-
-# 9. Two semantic route types
-
-## `TransportRoute`
-
-Purpose:
-
-> Route a client WebRTC transport to the shard that owns its `str0m` / PeerConnection state.
-
-Lifetime:
-
-```text
-approximately one ICE / WebRTC transport incarnation
-```
-
-Wire use:
-
-```text
-ICE ufrag
-```
-
-The packed slot refers to transport/participant-side state.
-
----
-
-## `RouteId`
-
-Purpose:
-
-> Route a distributed PulseBeam data-plane message to a typed endpoint.
-
-Lifetime:
-
-```text
-approximately one routed endpoint incarnation
-```
-
-Wire use:
-
-```text
-inter-node Envelope
-```
-
-For media, a route is typically per stream/track.
-
-For SCTP, the route may target participant-level SCTP state.
-
----
-
-# 10. Stable identity is separate
-
-The routing protocol does not encode:
-
-```text
-RoomId
-ParticipantId
-TrackId
-```
-
-Those are control-plane identities.
-
-Example:
-
-```text
-TrackId("alice-camera")
-      ↓ control-plane compilation
-RouteHandle {
-    epoch: 9,
-    route: Shard 17 | Slot 45
-}
-```
-
-The route says where the endpoint is now.
-
-The `TrackId` says what the endpoint logically represents.
-
----
-
-# 11. ICE ufrag routing
-
-The ICE ufrag bootstraps client transport routing.
-
-A STUN Binding Request contains the negotiated ICE username.
-
-PulseBeam encodes the physical transport route directly into the server ufrag.
-
-This allows the packet path to derive:
-
-```text
-cluster
-node
-ShardId
-transport slot
-epoch
-```
-
-without looking up a `ParticipantId`.
-
----
-
-# 12. ICE ufrag wire layout
-
-The ufrag contains exactly 80 bits / 10 raw bytes.
-
-It encodes to exactly 16 Crockford Base32 characters.
-
-```text
-80 bits / 5 = 16 characters
-```
-
-Wire layout:
-
-```text
- byte 0        byte 1       bytes 2-3       bytes 4-7          bytes 8-9
-┌────────────┬────────────┬───────────────┬──────────────────┬────────────┐
-│ ver(4)     │ cluster_lo │ node_id       │ transport_route  │ epoch      │
-│ clust_hi(4)│            │               │                  │            │
-└────────────┴────────────┴───────────────┴──────────────────┴────────────┘
-```
-
-Bit allocation:
-
-```text
-version             4 bits
-cluster_id         12 bits
-node_id            16 bits
-transport_route    32 bits
-epoch              16 bits
---------------------------
-total              80 bits
-```
-
----
-
-# 13. Ufrag field semantics
-
-## version
-
-```text
-4 bits
-```
-
-Identifies the ufrag layout version.
-
-A version bump is only needed when the 80-bit layout changes incompatibly.
-
----
-
-## cluster_id
-
-```text
-12 bits
-0..4095
-```
-
-Identifies the PulseBeam cluster.
-
-Single-cluster deployments can use:
-
-```text
-cluster_id = 0
-```
-
----
-
-## node_id
-
-```text
-16 bits
-0..65535
-```
-
-Identifies the destination node within the cluster.
-
-Single-node deployments can use:
-
-```text
-node_id = 0
-```
-
----
-
-## transport_route
-
-```text
-32 bits
-```
-
-Packed as:
-
-```text
-ShardId(12) | transport slot(20)
-```
-
-This tells the destination node which shard owns the transport.
-
----
-
-## epoch
-
-```text
-16 bits
-```
-
-Qualifies the transport route incarnation.
-
-The pair:
-
-```text
-(epoch, TransportRoute)
-```
-
-is the valid transport address.
-
----
-
-# 14. Recommended ufrag Rust type
-
-```rust
-pub struct IceUfrag {
-    pub cluster_id: u16,
-    pub node_id: u16,
-    pub transport: TransportRoute,
-    pub epoch: u16,
-}
-```
-
-This avoids conflating the transport route with the inter-node `RouteId`.
-
----
-
-# 15. ICE ufrag encoding
-
-The 10-byte raw representation is:
-
-```text
-raw[0]:
-    high nibble = version
-    low nibble  = cluster_id[11:8]
-
-raw[1]:
-    cluster_id[7:0]
-
-raw[2..4]:
-    node_id big endian
-
-raw[4..8]:
-    packed TransportRoute big endian
-
-raw[8..10]:
-    epoch big endian
-```
-
-Then:
-
-```text
-raw bytes
-   ↓
-Crockford Base32
-   ↓
-16-character ICE ufrag
-```
-
----
-
-# 16. Client UDP routing with eBPF
-
-> **Current implementation:** this section's historical STUN/ufrag eBPF
-> classifier is not attached. The production client program only looks up an
-> authenticated 5-tuple in `FLOWS`; userspace performs bootstrap classification
-> and forwards packets that land on the wrong shard. See the status block at
-> the top of this document.
-
-The eBPF routing model has two phases.
-
-## Bootstrap traffic
-
-Initial STUN carries the ufrag.
-
-Conceptually:
-
-```text
-UDP packet
-   ↓
-SK_REUSEPORT eBPF
-   ↓
-is STUN?
-   ↓
-find USERNAME attribute
-   ↓
-extract PulseBeam ufrag
-   ↓
-decode transport_route
-   ↓
-ShardId
-   ↓
-select shard's SO_REUSEPORT socket
-   ↓
-shard worker
-```
-
-This allows the first transport packet to reach the correct owner.
-
-There is no `Ingress` packet message in the shard mailbox protocol. A client
-UDP packet that reaches the node is steered to the socket owned by the route's
-shard before PulseBeam userspace receives it.
-
----
-
-# 17. Established UDP flow routing
-
-DTLS/SRTP/RTP packets do not carry the ICE ufrag.
-
-Therefore bootstrap parsing alone is insufficient.
-
-Once STUN establishes the transport flow, eBPF can maintain a small flow-affinity table:
-
-```text
-5-tuple / connection flow
-      ↓
-ShardId
-```
-
-Then:
-
-```text
-non-STUN UDP
-     ↓
-flow lookup
-     ↓
-shard socket
-```
-
-This state is fundamentally different from a full route table.
-
-The kernel does **not** need:
-
-```text
-RouteId → ShardId
-```
-
-for every track/endpoint.
-
-It needs only the flow affinity required for client transport delivery.
-
-The flow-affinity table is kernel steering state. It does not replace the
-transport route, route epoch, or shard-local transport table.
-
----
-
-# 18. NAT rebinding
-
-If the client's tuple changes, ICE connectivity checks provide the bootstrap information again.
-
-Conceptually:
-
-```text
-new tuple
-   ↓
-STUN with ufrag
-   ↓
-decode TransportRoute
-   ↓
-recover ShardId
-   ↓
-install/update flow affinity
-```
-
-The routing metadata therefore naturally participates in rebinding recovery.
-
----
-
-# 19. ICE-TCP
-
-TCP should not be forced through the same packet-level steering model.
-
-The ICE routing key still applies, but transport ownership is transferred once.
-
-```text
-TCP accept
-   ↓
-read initial RFC4571-framed STUN
-   ↓
-extract/decode IceUfrag
-   ↓
-TransportRoute
-   ↓
-ShardId
-   ↓
-handoff TCP connection
-   ↓
-shard owns it permanently
-```
-
-After handoff, no repeated routing lookup is necessary.
-
-ICE-TCP may use one reliable control handoff carrying the accepted connection
-to the owning shard. It does not require forwarding individual UDP packet
-batches through the shard mesh.
-
----
-
-# 20. Why ICE-TCP remains consistent with the model
-
-UDP and TCP use different mechanics:
-
-```text
-UDP:
-    packet steering
-
-TCP:
-    one-time connection ownership transfer
-```
-
-but share the same ownership rule:
-
-> **The transport route identifies the shard that owns the WebRTC transport.**
-
----
-
-# 21. Inter-node protocol
-
-Inter-node traffic is raw UDP with a fixed PulseBeam Envelope.
-
-Every inter-node message uses the same framing protocol.
-
-There are not separate framing protocols for:
-
-```text
-media
-feedback
-SCTP
-telemetry
-control
-```
-
-Instead, the Envelope has a first-class `type`.
-
----
-
-# 22. Fixed inter-node Envelope
-
-The envelope is the data-plane wire contract. Lifecycle state is maintained
-separately by the controller and delivered to each shard as a `ShardViewDelta`;
-the current same-node implementation carries `ShardFrame` values through the
-shard mesh, while the fixed envelope remains the boundary for node-to-node
-transport. No lifecycle command, reply channel, or generation acknowledgement
-is encoded in this envelope.
-
-The common Envelope header is exactly 16 bytes.
-
-Wire layout:
-
-```text
-0               1               2                               4
-+---------------+---------------+-------------------------------+
-| version       | type          | epoch                         |
-+---------------+---------------+-------------------------------+
-| route                                                         |
-+---------------------------------------------------------------+
-| extension                                                     |
-|                                                               |
-+---------------------------------------------------------------+
-
-                              16 bytes
-```
-
-Field sizes:
-
-```text
-version       u8      1 byte
-type          u8      1 byte
-epoch         u16     2 bytes
-route         u32     4 bytes
-extension     u64     8 bytes
-----------------------------
-total                 16 bytes
-```
-
----
-
-# 23. Envelope wire struct
-
-Conceptually:
-
-```rust
-#[repr(C)]
-struct EnvelopeWire {
-    version: u8,
-    kind: u8,
-    epoch: zerocopy::big_endian::U16,
-    route: zerocopy::big_endian::U32,
-    extension: zerocopy::big_endian::U64,
-}
-```
-
-The fixed size should be compiler-checked:
-
-```rust
-const _: () = assert!(size_of::<EnvelopeWire>() == 16);
-```
-
----
-
-# 24. Envelope version
-
-`version` describes the base Envelope framing.
-
-A version change is for incompatible changes to:
-
-- the 16-byte layout,
-- field widths,
-- route semantics,
-- or extension interpretation rules.
-
-Adding a new message type should not require a version bump.
-
----
-
-# 25. Envelope type
-
-`type` identifies the payload family.
-
-Conceptual registry:
-
-```text
-Media
-Feedback
-Sctp
-Telemetry
-Control
-...
-```
-
-The exact numeric values should be centralized in the protocol specification.
-
-The semantic split is:
-
-```text
-type
-    = what is this message?
-
-route
-    = where does it go?
-
-extension
-    = compact per-message metadata
-```
-
----
-
-# 26. Envelope route
-
-The `route` field is a packed `RouteId`.
-
-Layout:
-
-```text
-ShardId(12) | endpoint slot(20)
-```
-
-This means eBPF can determine the destination shard directly from the fixed-offset Envelope header.
-
-No userspace route-table lookup is required merely to decide which shard socket should receive the UDP datagram.
-
----
-
-# 27. Inter-node UDP eBPF steering
-
-> **Current implementation:** inter-node steering is still a separate,
-> envelope-based path. The client-side flow-lookup program does not steer these
-> frames; the status block at the top of this document is authoritative for
-> what is attached in production.
-
-The inter-node path is particularly simple because PulseBeam controls the packet format.
-
-```text
-remote node
-    ↓
-UDP
-    ↓
-SO_REUSEPORT
-    ↓
-SK_REUSEPORT eBPF
-    ↓
-read Envelope.route at fixed offset
-    ↓
-shard = route >> 20
-    ↓
-select shard reuseport socket
-    ↓
-shard worker
-```
-
-This is the primary reason the shard belongs in the packed route.
-
-The datagram is delivered directly to the selected shard socket. A client
-ingress-style mailbox message is not a fallback when the kernel has already
-selected the owner.
-
----
-
-# 28. Why not use an eBPF map per RouteId
-
-An opaque route would require:
-
-```text
-RouteId
-   ↓
-BPF map:
-RouteId → ShardId
-```
-
-Every route creation, deletion, and reuse would then require synchronized kernel routing state.
-
-With the packed layout, eBPF needs no per-route mapping.
-
-The wire route itself already says which shard owns the destination.
-
----
-
-# 29. Inter-node shard-local lookup
-
-After eBPF selects the shard, userspace decodes the same route:
-
-```text
-RouteId
-   ↓
-ShardId + Slot
-```
-
-The shard checks the encoded owner before dispatching. A packet that reaches a
-different reuseport socket is a normal wrong-owner arrival: it is counted and
-dropped, never forwarded back through the shard mesh.
-
-Therefore the hot-path lookup becomes approximately:
-
-```text
-slot
-  ↓
-endpoint table
-```
-
-The shard does not need another global `RouteId → shard` lookup.
-
----
-
-# 30. Shard-local storage
-
-Conceptually:
-
-```text
-Shard 3
- ├── transport slots[]
- └── endpoint slots[]
-```
-
-A route:
-
-```text
-Shard 3 | Slot 17
-```
-
-resolves to:
-
-```text
-shard 3
-   ↓
-endpoint_slots[17]
-```
-
-The current storage uses shard-owned `SecondaryMap`s keyed by control-minted
-`TrackKey`, `DataStreamKey`, and `ReliableStreamKey`; stable participant and
-publisher identities are carried alongside the compiled view entries. The
-wire protocol does not depend on the Rust container.
-
----
-
-# 31. Route allocation
-
-A route allocator chooses:
-
-```text
-ShardId
-Slot
-Epoch
-```
-
-The shard is already known from control-plane placement.
-
-Conceptually:
-
-```text
-new track
-   ↓
-owning ShardId already known
-   ↓
-allocate slot
-   ↓
-allocate/current epoch
-   ↓
-RouteHandle {
-    epoch,
-    route = shard | slot
-}
-```
-
-The control plane is the route allocator. It chooses the destination shard,
-allocates a slot and epoch in that shard's namespace, and publishes a delta
-that installs the compiled endpoint. The route handle is advertised after the
-delta is queued; the owning shard applies it on its next tick.
-
-The owning shard remains the authority for live endpoint state and validates
-the route epoch on receipt. Allocation authority and endpoint state ownership
-are separate:
-
-```text
-control plane:
-    choose shard
-    allocate (route, epoch)
-    compile and queue a ShardViewDelta
-    commit the lifecycle generation
-
-owning shard:
-    apply the queued delta
-    process packets
-    retire endpoint on command
-```
-
-A packet racing the delta can be dropped before the view is applied. These
-transitions are deliberately non-blocking; the drop is observable through the
-corresponding `*_before_plan`/`*_before_runtime` counters.
-
-Transport routes and distributed endpoint routes use separate allocator
-namespaces even though they share the packed representation.
-
----
-
-# 32. RouteHandle
-
-A route reference is:
-
-```rust
-pub struct RouteHandle {
-    pub epoch: u16,
-    pub route: RouteId,
-}
-```
-
-The Envelope transmits these fields directly.
-
-For client transport routing, the equivalent is:
-
-```text
-TransportHandle {
-    epoch,
-    transport_route
-}
-```
-
-The two handles share the same safety model.
-
----
-
-# 33. Per-track RouteId
-
-Media routes should generally be per routed stream/track.
-
-Example:
-
-```text
-Alice
- ├─ microphone → RouteId A
- ├─ camera     → RouteId B
- └─ screen     → RouteId C
-```
-
-This matches the SFU data plane because each stream can have independent:
-
-- fanout,
-- subscribers,
-- inter-node forwarding,
-- feedback,
-- recording,
-- lifecycle,
-- and policy.
-
----
-
-# 34. RouteId is not limited to RTP
-
-`RouteId` should be defined broadly:
-
-> **A packed address for a typed distributed data-plane endpoint on a shard.**
-
-Examples:
-
-```text
-Media endpoint
-SCTP endpoint
-Feedback endpoint
-Recording endpoint
-Telemetry endpoint
-```
-
-The Envelope `type` determines how the payload should be interpreted.
-
-The route determines where it should go.
-
----
-
-# 35. Envelope extension
-
-The final 64 bits are:
-
-```text
-extension: u64
-```
-
-This field exists to provide fixed-cost extensibility without dynamic TLV parsing.
-
-There is:
-
-- no dynamic header length,
-- no extension length,
-- no speculative reserved bytes,
-- no universal flags field,
-- no universal sequence field.
-
-The header always remains 16 bytes.
-
----
-
-# 36. Extension interpretation
-
-The extension can be interpreted as:
-
-```text
-tag + inline value
-```
-
-or by the Envelope type itself.
-
-For example:
-
-```text
-Media:
-    extension = link/timing metadata
-
-SCTP:
-    extension = SCTP-specific metadata or zero
-
-Feedback:
-    extension = request metadata
-```
-
-The exact tag/value partition should be chosen only once real extension requirements are enumerated.
-
----
-
-# 37. Media extension example
-
-The current media metadata is:
-
-```text
-link_seq       u32
-playout_ntp32  u32
-```
-
-Together:
-
-```text
-64 bits
-```
-
-So the media Envelope can naturally use:
-
-```text
-extension[63:32] = link_seq
-extension[31:0]  = playout_ntp32
-```
-
-Wire:
-
-```text
-+---------------+---------------+-------------------------------+
-| version       | Media         | epoch                         |
-+---------------+---------------+-------------------------------+
-| RouteId                                                       |
-+---------------------------------------------------------------+
-| link_seq                      | playout_ntp32                  |
-+---------------------------------------------------------------+
-| media payload ...                                            |
-+---------------------------------------------------------------+
-```
-
-This preserves the current 16-byte media overhead while using one unified protocol.
-
----
-
-# 38. Feedback example
-
-A reverse request can use:
-
-```text
-type = Feedback
-route = publisher-side RouteId
-extension = request metadata or zero
-payload = typed feedback body
-```
-
-There is no separate `RouteEnvelope`.
-
-The route itself does not need a direction bit.
-
-The control plane provides the appropriate destination route handle.
-
----
-
-# 39. SCTP example
-
-SCTP/DataChannel forwarding uses the same framing:
-
-```text
-Envelope {
-    type = Sctp,
-    epoch,
-    route,
-    extension,
-}
-+ SCTP/data-channel payload
-```
-
-The route points to the compiled data or reliable stream runtime. The payload
-uses reference-counted `Bytes`, so forwarding to several remote shards does
-not clone the application's byte buffer.
-
-The common packed route layout still applies.
-
----
-
-# 40. Inter-node packet receive path
-
-The complete receive path is:
-
-```text
-UDP datagram
-   ↓
-eBPF reads fixed Envelope.route
-   ↓
-extract ShardId
-   ↓
-select shard socket
-   ↓
-shard receives datagram
-   ↓
-parse 16-byte Envelope (at the node boundary)
-   ↓
-validate version
-   ↓
-validate epoch
-   ↓
-extract slot
-   ↓
-lookup the shard-local compiled endpoint
-   ↓
-dispatch by Envelope.type
-```
-
-The important point is that **kernel steering and userspace endpoint lookup use the same packed route**.
-
-There is no intermediate `route.shard()` forwarding step in userspace. The
-shard selected by eBPF is already the route owner. Userspace resolves only the
-slot and validates the epoch.
-
----
-
-# 41. Ufrag and Envelope symmetry
-
-The routing architecture deliberately uses the same packed addressing concept in both ingress protocols.
-
-## Client transport
-
-```text
-IceUfrag
-    ↓
-TransportRoute
-    ↓
-ShardId | transport slot
-    ↓
-shard
-```
-
-## Inter-node
-
-```text
-Envelope
-    ↓
-RouteId
-    ↓
-ShardId | endpoint slot
-    ↓
-shard
-```
-
-Same primitive.
-
-Different semantic address spaces.
-
----
-
-# 42. Why keep separate Rust types
-
-Even though both are:
-
-```text
-ShardId | Slot
-```
-
-they route different objects.
-
-Using the same Rust type would allow invalid operations such as:
-
-```text
-using a media RouteId as an ICE transport route
-```
-
-Therefore:
-
-```rust
-struct TransportRoute(PackedRoute);
-struct RouteId(PackedRoute);
-```
-
-is preferable to:
-
-```rust
-type TransportRoute = RouteId;
-```
-
----
-
-# 43. Node and cluster routing
-
-The packed route only handles routing **inside a node**.
-
-The complete physical route is layered.
-
-For client ICE:
-
-```text
-ClusterId
-NodeId
-TransportRoute
-Epoch
-```
-
-For inter-node:
-
-```text
-network destination / peer node
-RouteId
-Epoch
-```
-
-The Envelope does not need to repeat `NodeId`, because the UDP destination already selects the target node.
-
----
-
-# 44. Why Envelope has no node_id
-
-Inter-node links already know the destination node.
-
-Adding `node_id` to every packet would duplicate information already represented by the network destination.
-
-Therefore:
-
-```text
-IP/UDP destination
-    = node selection
-
-Envelope.route
-    = shard + endpoint selection
-```
-
----
-
-# 45. Why Envelope has no cluster_id
-
-Inter-node links operate inside a known cluster/security domain.
-
-Cluster identity belongs to:
-
-- discovery,
-- connection setup,
-- configuration,
-- or outer infrastructure.
-
-It does not need to be repeated in every hot-path packet.
-
----
-
-# 46. Why ufrag does include node_id and cluster_id
-
-The ICE ufrag is bootstrap metadata.
-
-The initial client packet may arrive at routing infrastructure that still needs to determine the correct PulseBeam placement.
-
-Therefore the ufrag carries more physical information:
-
-```text
-cluster
-node
-transport route
-epoch
-```
-
-The Envelope is already inside the cluster data plane and can therefore be smaller.
-
----
-
-# 47. eBPF as part of the routing architecture
-
-> **Current implementation:** eBPF is attached only for client-side
-> authenticated-flow lookup when the object is available. The kernel does not
-> decode routes or ufrags, and a flow miss falls through to the normal socket
-> hash. The status block at the top of this document supersedes the historical
-> design language below.
-
-eBPF should be treated as a first-class design constraint, not merely a future optimization.
-
-The packed route exists partly so the kernel can steer traffic efficiently.
-
-The protocol therefore intentionally exposes:
-
-```text
-ShardId
-```
-
-in a cheap-to-decode position.
-
-This applies to:
-
-- client UDP bootstrap via encoded transport route,
-- established client UDP flow affinity,
-- and especially inter-node UDP, where the route is directly visible at a fixed Envelope offset.
-
----
-
-# 48. eBPF routing state
-
-The desired kernel routing state is small.
-
-## Inter-node
-
-No per-route map is required.
-
-```text
-RouteId
-   ↓
-extract ShardId
-   ↓
-select socket
-```
-
-## Client UDP
-
-A flow-affinity map is useful after ICE bootstrap:
-
-```text
-flow tuple → ShardId
-```
-
-The kernel does not need to mirror every PulseBeam endpoint route.
-
----
-
-# 49. Route placement
-
-The shard can be chosen using placement logic such as:
-
-```text
-load
-room affinity
-participant affinity
-rendezvous hashing
-power-of-two choices
-```
+`ShardView` is the compiled input to the data plane. Its route and transport
+tables are indexed by the route's slot. Its forwarding images are indexed by
+the local arena keys. A `ForwardingPlan<D>` says exactly what to do for one
+published stream: deliver to these local participants, send one copy to these
+remote shards, and use this reverse route for feedback. It does not contain a
+track name or subscription pattern.
 
-The specific placement algorithm is not encoded into the protocol.
+The generic `D` is the one detail that differs by payload:
 
-Once chosen:
-
 ```text
-ShardId
-    becomes part of the packed route
+  video              D = DownstreamSlotKey
+  audio              D = ()                    (the audio plan selects the slot)
+  unreliable data    D = ChannelId
+  reliable data      D = ChannelId
 ```
-
-and remains stable for that route incarnation.
 
-If an endpoint moves to another shard, it receives a new route.
+The data lanes still have separate stream-key arenas and separate plan images.
+The type and the arena therefore say which lane a packet belongs to; there is
+no second mutable `lane` flag that could disagree with its destination key.
 
----
-
-# 50. Example: media track
+The route table makes the last step just as explicit:
 
-Suppose:
-
 ```text
-Alice camera
-ShardId = 17
-Slot = 42
-Epoch = 9
-```
+  routes[route.slot] = RouteBinding {
+    handle: RouteHandle,
+    action: RouteAction,
+  }
 
-Then:
-
-```text
-RouteId =
-    (17 << 20) | 42
+  RouteAction =
+      Video       { local_track }
+    | Audio       { track }
+    | Unreliable  { stream }
+    | Reliable    { stream }
+    | Reverse     { target }
 ```
 
-Inter-node Envelope:
-
-```text
-version   = 0
-type      = Media
-epoch     = 9
-route     = packed RouteId
-extension = media metadata
-```
+The route handle checks that the slot and epoch are still the expected
+incarnation. The action already contains the shard-local key, so successful
+resolution is the final lookup: there is no `TrackId` or topic map after it.
+Mutable packet history, such as the last link sequence and loss counters, is
+kept separately in shard-local route runtime state. The published view is the
+decision; the runtime entry is only the accounting needed while executing it.
 
-eBPF extracts:
+On the wire, the two route families are deliberately different types even
+though they use the same packed layout:
 
 ```text
-ShardId 17
-```
+  PackedRoute:       [ shard: 12 bits | slot: 20 bits ]
 
-and selects shard 17's socket.
+  TransportHandle:   TransportRoute + epoch
+                     client ICE / DTLS / SRTP state
 
-The shard extracts:
+  RouteHandle:       RouteId + epoch
+                     inter-shard or inter-node endpoint state
 
-```text
-slot 42
+  Envelope:          version | type | epoch | route | extension
 ```
-
-and reaches the track endpoint.
 
----
-
-# 51. Example: transport routing
+The shard bits tell the classifier where to send the packet. The slot is a
+dense local index, and the epoch identifies which occupant of that slot the
+packet was meant for. A delayed packet for an old occupant therefore fails
+closed instead of reaching a newly connected participant. Keeping
+`TransportRoute` and `RouteId` as distinct types prevents a client transport
+address from being accidentally used as an endpoint address.
 
-Suppose Alice's PeerConnection uses:
+The first packet is special because there is no established flow affinity yet.
+The ICE ufrag carries the transport route. The packet may initially arrive at
+an admitting shard selected by the socket hash; the route identifies the
+transport owner that performs the WebRTC authentication. When authentication
+succeeds, the owner reports it through the controller. The controller marks
+the demux entry on the admitting shard and installs affinity for subsequent
+packets. The authentication signal therefore returns to the shard that owns
+the demux entry instead of being recorded only where authentication happened.
 
-```text
-ShardId = 17
-transport slot = 12
-epoch = 3
-```
+After that, the fast path is deliberately boring. The publisher's shard reads
+the already-compiled plan. A local recipient is called directly. A remote
+recipient gets a fixed envelope containing its route, so the same classifier
+can steer it to the destination shard. That shard checks the route's epoch,
+turns the route into a small local table index, and executes the selected
+video, audio, unreliable-data, reliable-data or feedback action. Packets never
+carry participant or track names, and the controller never compiles the
+publisher as its own recipient.
 
-Then the ufrag contains:
+When room state changes, only the control path gets complicated: the controller
+recomputes affected plans, publishes a new generation, and sends the resulting
+deltas to the shards. A packet racing an unapplied or retired route is dropped
+instead of making the data path wait. Moving a destination creates a new route
+rather than changing the shard encoded in a live one, so stale packets remain
+harmless.
 
-```text
-cluster_id
-node_id
-TransportRoute(Shard 17 | Slot 12)
-epoch 3
-```
+How a packet finds the code that owns it.
 
-Initial STUN can therefore be steered directly to shard 17.
+This document is the *model*: the invariants, the reasoning, and the wire
+contract. It deliberately does not describe types, function names, or module
+layout — those move, and a document that tracks them is wrong within a release.
+Where you need the current shape, the code is named at the end.
 
 ---
-
-# 52. Transport-route vs media-route slot spaces
-
-The slot value should not be assumed to refer to one universal node table.
 
-For example:
+## The problem
 
-```text
-TransportRoute:
-    ShardId + transport-slot namespace
-
-RouteId:
-    ShardId + endpoint-slot namespace
-```
+A shard owns its state and reaches other shards only by message
+(`docs/thread-per-core.md`). So every packet has to arrive at exactly one
+shard — the one holding the state for it — and the decision has to be cheap
+enough to make in three places that cannot coordinate:
 
-The semantic wrapper determines which table the slot addresses.
+- **the kernel**, in an eBPF program with no allocation and bounded loops;
+- **userspace**, when eBPF is unavailable or the kernel guessed wrong;
+- **the simulator**, which must reach the same answer or it is testing fiction.
 
-This prevents accidental cross-domain interpretation.
-
----
+Three implementations of one decision is normally how you get three behaviours.
+Avoiding that is what most of this design is for.
 
-# 53. Stale-route handling
+## The one idea
 
-Every receive path validates epoch before using the local slot.
+> **Routes are compiled addresses, not names.**
 
-Conceptually:
+`ParticipantId`, `TrackId`, `RoomId`, `Topic` — the identities the application
+reasons about — never appear on the wire in the packet path. What travels is a
+fixed-width integer that says *where to deliver*, chosen so that reading it
+requires no parsing, no hashing, and no table.
 
-```text
-decode route
-   ↓
-extract ShardId
-   ↓
-reach shard
-   ↓
-extract slot
-   ↓
-local slot entry
-   ↓
-compare epoch
-```
+Names are for humans and the control plane. Addresses are for packets.
 
-If:
+Everything below follows from that, plus one ownership rule:
 
-```text
-packet_epoch != slot_epoch
-```
+> **A route's slot is allocated by the shard that will resolve it, and the
+> address carries which shard that is.**
 
-the packet is stale and must be dropped.
+The slot indexes the destination's own table, so resolution is an array index.
+The shard bits mean anyone holding the address knows where to send it without
+consulting anything.
 
 ---
 
-# 54. Route reuse
+## Two routing domains
 
-A slot may be reused after teardown.
+They share a representation and must not share a namespace.
 
-Example:
-
-```text
-Shard 17
-Slot 42
-Epoch 9
-```
-
-is destroyed.
-
-Later:
-
-```text
-Shard 17
-Slot 42
-Epoch 10
-```
+**Client transport.** Identifies which shard owns a client's WebRTC transport
+— its ICE, DTLS and SRTP state. One per connection.
 
-is created.
+**Endpoint routes.** Identify a destination *within* the node: a forwarded
+track, an audio stream, a data-lane stream, a feedback path. Many per
+connection.
 
-An old packet with epoch 9 cannot reach the new endpoint.
+They are separate allocator namespaces even though the packed layout is
+identical, and separate types in code so one can never be passed where the
+other is meant. Same bits, different meaning — a distinction the type system
+should carry, not a comment.
 
 ---
 
-# 55. Envelope compatibility model
+## The address
 
-The inter-node protocol evolves through:
-
 ```text
-version
-type
-extension
+ 31                    20 19                     0
++------------------------+------------------------+
+| shard                  | slot                   |
+| 12 bits                | 20 bits                |
++------------------------+------------------------+
 ```
-
-Each serves a different purpose.
-
-## version
-
-Base framing compatibility.
-
-## type
-
-Payload family.
-
-## extension
-
-Compact per-message semantics.
 
-This avoids changing the base header for ordinary feature evolution.
+4096 shards, ~1M slots each.
 
----
-
-# 56. No flags field
+**Why the shard is in the address.** `SO_REUSEPORT` picks a receiving socket by
+hashing the 4-tuple, which knows nothing about where a route lives. Landing on
+the wrong shard is therefore *ordinary*, not an error, and happens constantly.
+Redirecting has to be cheap: read 12 bits at a fixed offset. The alternative —
+looking a name up in a shared map — reintroduces exactly the cross-shard shared
+state the architecture exists to avoid, and does it on the hot path.
 
-The Envelope should not contain a speculative flags bitmap.
+**Why 12 bits when nobody runs 4096 shards.** Protocol headroom. The wire
+format should not have to change because the execution model grows a level or
+the core count doubles. Today one shard field means one worker; nothing depends
+on that staying true.
 
-There is no currently required universal flag semantic.
+**Why 20 bits of slot.** Large enough that a table can be preallocated and
+addressed densely, so resolving is an index rather than a lookup. It also has
+to absorb slot *quarantine* (below) under a reconnect storm, which is what
+actually sets the floor.
 
-The type and extension namespaces already provide structured extensibility.
+**Why one layout for both domains.** Because the kernel reads the shard field
+without knowing which domain it is looking at. One layout means one extraction,
+shared by the eBPF program, the userspace demuxer and the simulator. That
+sharing is the point: it is the mechanism that keeps three implementations
+honest, and it is worth more than the flexibility of two formats.
 
-A flags field can be added only in a future incompatible header revision if a real need appears.
-
 ---
-
-# 57. No dynamic extension length
-
-The extension is always:
-
-```text
-u64
-```
 
-The payload always begins at:
+## Epochs: why a recycled slot is safe
 
-```text
-byte offset 16
-```
-
-There is no need for:
-
-```text
-extension_len
-header_len
-TLV traversal
-```
-
-This keeps both userspace and eBPF parsing simple.
-
----
-
-# 58. No universal sequence field
+Slots are reused. A datagram delayed in the network can arrive after its slot
+was retired and handed to something else, and it would then be delivered to the
+wrong destination — with a valid-looking address.
 
-A sequence number is not useful for every payload type.
+Two defences, in order of importance:
 
-Media may need link sequencing.
+**The epoch.** Every route reference is `(address, epoch)`, and the destination
+rejects a mismatch on arrival. The epoch increments each time a slot is reused,
+so a stale packet fails the check rather than being misdelivered. This is the
+real guard.
 
-SCTP already has sequencing semantics.
+**Quarantine.** A retired slot waits before it can be reissued. This is the
+second line, and it exists to make the epoch's guarantee trivially true rather
+than merely probable: a slot cannot complete a full epoch wrap within any
+plausible packet lifetime.
 
-Control requests may use different retry/request semantics.
+The quarantine window is a derived number, not a taste. Long quarantine is not
+free: slot consumption under a reconnect storm is
+`concurrent + installs_per_sec × quarantine`, so past a certain point it is the
+*quarantine*, not the traffic, that exhausts the table. The chosen value keeps
+three orders of magnitude of margin against a maximum segment lifetime while
+costing far less of the working set than the intuitive answer would.
 
-Therefore sequence data belongs in type-specific extension semantics, not the common header.
+**A route never moves.** If a destination migrates to another shard, a new
+route is minted and the old one retired. Rewriting a live route's shard field
+would make in-flight packets undeliverable and the epoch meaningless.
 
 ---
-
-# 59. Wire-format summary
-
-## Packed route
 
-```text
-32 bits
-
-31                    20 19                    0
-+-----------------------+-----------------------+
-| ShardId               | Slot                  |
-| 12 bits               | 20 bits               |
-+-----------------------+-----------------------+
-```
+## Who allocates, who owns
 
----
+These are different jobs and belong to different components.
 
-## ICE ufrag
+**The control plane allocates.** It sees every subscribe and unsubscribe,
+already knows which shard each participant is on, and is the only thing
+permitted to mint a route. So it chooses the destination, allocates the slot
+and epoch, and publishes a delta that installs the compiled endpoint.
 
-```text
-80 bits raw
-16 Crockford Base32 characters
-
-┌───────────┬────────────┬────────────┬────────────────────┬───────────┐
-│ version   │ cluster    │ node       │ TransportRoute     │ epoch     │
-│ 4 bits    │ 12 bits    │ 16 bits    │ 32 bits            │ 16 bits   │
-└───────────┴────────────┴────────────┴────────────────────┴───────────┘
-```
+**The shard owns and executes.** It applies the delta on its next tick,
+validates the epoch on every arrival, and holds the live state. It does not
+allocate, and it does not decide who receives what.
 
----
+The important consequence is what this **removes**. When a shard owned that
+decision, it counted its own subscribers, concluded it needed a route, and —
+being unable to mint one — had to *ask*. That request needed an id, a pending
+map, and a completion handler, and every one of those was scaffolding around a
+decision sitting on the wrong side of a boundary. Moving the decision deleted
+the protocol.
 
-## Inter-node Envelope
+Shards learn by **reading a published view**, not by receiving an answer.
+Changes are staged against a generation and published atomically, so a shard
+never observes half a decision.
 
-```text
-16-byte fixed header
-
-┌────────────┬────────────┬────────────┬────────────────────┬────────────────────┐
-│ version    │ type       │ epoch      │ RouteId            │ extension          │
-│ 8 bits     │ 8 bits     │ 16 bits    │ 32 bits            │ 64 bits            │
-└────────────┴────────────┴────────────┴────────────────────┴────────────────────┘
-```
+**Deltas race packets, and that is allowed.** A packet naming a route whose
+delta has not been applied is dropped, deliberately, rather than queued or
+waited on. Blocking the data path on control-plane progress would couple them;
+the drop is observable through counters instead.
 
 ---
 
-# 60. Routing pipeline summary
+## Getting in: two paths, chosen by whether it is STUN
 
-## Client UDP
+**Bootstrap.** The first packet of a connection has no prior state to be
+steered by, so it carries its own destination: the ICE ufrag encodes the
+cluster, the node, the transport route, and its epoch. The classifier decodes
+it and steers on that alone.
 
-```text
-STUN
-  ↓
-ufrag
-  ↓
-TransportRoute
-  ↓
-ShardId
-  ↓
-eBPF selects shard socket
-  ↓
-transport slot
-```
+This is why the ufrag carries cluster and node while the inter-node envelope
+does not — the ufrag is the one place with no context, and it is chosen by us,
+so it is free to carry what is needed.
 
-No client UDP packet is wrapped in a shard-to-shard mailbox message. The shard
-mesh carries control-plane commands and explicitly message-based coordination,
-not a second ingress path for client datagrams.
+**Established.** Anything that is not STUN belongs to a flow that already
+exists, and steering comes from flow affinity — a bounded cache keyed by
+source address.
 
-Established flow:
-
-```text
-5-tuple
-  ↓
-eBPF flow-affinity map
-  ↓
-ShardId
-```
+### The ufrag is a hint, not a credential
 
----
+Written out in full because it reads like a hole and keeps being re-litigated.
+Anyone can forge a ufrag: it is unauthenticated, it names a route directly, and
+a bootstrap packet carrying one **does** put an entry in the address cache
+before anything has been verified. Three properties make that harmless, and they
+have to be read together.
 
-## ICE-TCP
+**Admission grants nothing.** Steering decides which shard looks at a packet,
+not whether the packet is honoured. The owning shard still resolves the route in
+its published view, and str0m still runs ICE, DTLS and SRTP over it. A forged
+ufrag buys parser work and a cache slot; it cannot deliver a byte, create a
+participant, or reach anyone else's media.
 
-```text
-accept
-  ↓
-initial STUN
-  ↓
-ufrag
-  ↓
-TransportRoute
-  ↓
-ShardId
-  ↓
-one-time connection handoff
-```
+**A flood cannot displace a live flow.** The cache **evicts rather than
+refuses** — refusing when full would let an attacker lock out new legitimate
+flows — and it evicts least-recently-used. Every cache *hit* refreshes the
+entry's timestamp, so a participant sending media holds the most recently used
+entry for its route while forged entries are touched once at admission. Eviction
+picks the minimum, so a flood evicts its own oldest entry. It churns its own
+ring. A live call keeps its place precisely because it is live.
 
----
+**Authenticated entries are protected after an owner acknowledgment.**
+`SO_REUSEPORT` still picks the *admitting* shard by hashing the 4-tuple, while
+the shard that authenticates is the route's *owner*. The owner reports the
+original source shard through the controller; the controller installs eBPF
+flow affinity to the owner and sends the source shard an explicit
+authentication command. Until that command arrives, the entry remains usable
+for the handshake but is eligible for eviction. Once marked, it is preferred
+over unauthenticated entries during both per-route and global eviction.
 
-## Inter-node UDP
+The `# Security hardening` comment on the demuxer states the same argument
+beside the code that implements it. If these two ever disagree, the code is
+right and one of the documents has a bug.
 
-```text
-Envelope.route
-  ↓
-ShardId
-  ↓
-eBPF selects shard socket
-  ↓
-slot
-  ↓
-typed endpoint
-```
+**NAT rebinding needs no special case.** A changed tuple produces fresh ICE
+connectivity checks, which are STUN, which carry the ufrag, which re-derives
+the route. Recovery is the bootstrap path, not a mechanism of its own.
 
-The datagram is delivered directly to the selected shard socket. A client
-ingress-style `Ingress` mailbox message is not part of this path.
+**ICE-TCP transfers ownership once.** The same ufrag identifies the owning
+shard, but a TCP connection is handed over whole rather than steered per
+packet. Different mechanics, same ownership rule: *the transport route names
+the shard that owns the transport.*
 
 ---
-
-# 61. Terminology
 
-## `PackedRoute`
+## Getting across: the envelope
 
-The common 32-bit physical routing representation:
+Inter-node and cross-shard traffic is prefixed with a fixed 16-byte header:
 
 ```text
-ShardId | Slot
+version (1) | type (1) | epoch (2) | route (4) | extension (8)
 ```
 
----
+Fixed size and fixed offsets are the whole design. The route sits at a constant
+offset so a steering program can read it with a bounds-checked load and no
+parsing — which is what makes the same extraction usable from eBPF, userspace
+and the simulator.
 
-## `ShardId`
+- **version** gates format evolution.
+- **type** selects the payload family, which determines how the extension is
+  interpreted. The set is small and lives in one place in code; treat that as
+  the registry.
+- **route** is the address above.
+- **extension** is 64 bits of payload-specific metadata — for media, the link
+  sequence and a compact playout timestamp.
 
-The actual PulseBeam shard/worker identifier.
+**Why the envelope has no node or cluster id.** By the time a packet is in this
+format it has already been delivered to the right node; carrying that again
+would be bytes on every packet to restate something already decided. The ufrag
+carries them precisely because bootstrap has not made that decision yet.
 
-Encoded in the route.
+**Why the extension is fixed-width.** A length-prefixed or optional field means
+a parse, a bounds check, and a branch on the steering path. Eight bytes that
+are sometimes unused is cheaper than a variable header, and it keeps the offset
+of everything before it constant.
 
-Currently maps 1:1 to the shard worker.
+**Why there is no flags field and no universal sequence number.** Both would be
+speculative. Flags accrete meanings that belong in `type`; a universal sequence
+number imposes a sequencing model on payload families that do not want one.
+Sequencing lives in the extension for the families that need it.
 
 ---
-
-## `TransportRoute`
-
-Typed wrapper around `PackedRoute`.
-
-Routes client WebRTC transports.
 
-Used in the ICE ufrag.
+## Arriving: what a route resolves to
 
----
+This is the half that justifies the rest. Resolution yields **an action
+carrying a dense key**, not a name to be looked up:
 
-## `RouteId`
+- forwarded video, naming the destination's own fanout handle;
+- audio, naming the destination's compiled audio plan;
+- a realtime data stream, and separately a reliable one;
+- a reverse path, for feedback travelling back toward a publisher.
 
-Typed wrapper around `PackedRoute`.
+The keys are indexes into the destination's own tables. Dispatch uses them
+directly. Had the route carried a `TrackId`, resolution would end in a hash
+lookup on every packet — which is the cost the address model exists to avoid,
+reintroduced at the last step.
 
-Routes distributed data-plane endpoints.
+**The two data lanes are distinct actions, not one action with a lane field.**
+They resolve through different arenas, so the variant *is* the lane; a lane
+field would be a second source of truth that could disagree with the key.
 
-Used in the inter-node Envelope.
+**The reverse path is shared, not per-sender.** One reverse route exists per
+published stream, used by every subscribing shard, unlike media routes which
+are per destination. Traffic on it is idempotent requests — a sender repeats
+them if it still needs them — so there is no per-link bookkeeping that a
+per-sender route would protect. And the arithmetic matters: `streams × shards`
+would make the reverse path the largest consumer of a 32-bit address space, to
+buy nothing.
 
 ---
-
-## `RouteHandle`
 
-```text
-epoch + RouteId
-```
+## What is deliberately excluded
 
-Generation-safe distributed route.
+- **Stable identities in the packet path.** No `ParticipantId`, `TrackId`,
+  `RoomId` or `Topic` on the wire. They are variable-width, meaningful, and
+  would require a lookup.
+- **A per-route kernel map.** Steering derives the shard arithmetically from
+  the packet. A map would need updating on every route change, from the control
+  plane, in lockstep with the data path.
+- **Client ingress through the shard mesh.** Packets are steered before
+  userspace. Forwarding client UDP between shards over the mailbox mesh would
+  make the mesh a data path.
+- **Virtual shards.** One shard field means one worker. The headroom exists if
+  that changes; the indirection does not exist until it is needed.
+- **Blocking on control-plane progress.** See the delta race above.
 
 ---
 
-## `IceUfrag`
+## Invariants
 
-Bootstrap-routing token:
+A change that breaks one of these is a protocol break, not a refactor.
 
-```text
-cluster + node + TransportRoute + epoch
-```
+1. The address encodes the shard that owns the destination.
+2. A slot is allocated by the shard that resolves it.
+3. Steering derives the shard from the packet alone — no lookup, no allocation,
+   bounded work.
+4. One packed layout, one extraction, shared by kernel, userspace and simulator.
+5. Transport and endpoint routes never share an allocator namespace.
+6. Every route reference carries an epoch, and the destination validates it.
+7. A retired slot is quarantined before reuse.
+8. A route never changes shard; migration mints a new one.
+9. Stable application identities never appear in the packet path.
+10. The control plane allocates; the owning shard installs, validates and
+    executes.
+11. Resolution yields a dense key, not a name.
+12. Every inter-node message uses the same fixed-size envelope with the route
+    at a constant offset.
 
 ---
 
-## `Envelope`
+## The shape, end to end
 
-Single inter-node packet framing protocol:
-
 ```text
-version + type + epoch + RouteId + extension
+  names                          addresses
+  ─────                          ─────────
+  ParticipantId  ─┐
+  TrackId         ├── control plane ──► allocate (shard, slot, epoch)
+  RoomId / Topic ─┘        │                        │
+                           │                        ├─► transport route ──► ICE ufrag
+                           │                        └─► endpoint route  ──► envelope
+                           │                                                   │
+                           ▼                                                   ▼
+                    published view                                     steering: read
+                    (staged, atomic)                                   shard from packet
+                           │                                                   │
+                           └──────────────► owning shard ◄─────────────────────┘
+                                                 │
+                                      validate epoch, index slot
+                                                 │
+                                                 ▼
+                                      action + dense key ──► dispatch
 ```
-
----
-
-# 62. Final design principles
-
-The routing architecture should follow these rules.
-
-1. **The route encodes the actual `ShardId` that owns the destination.**
 
-2. **eBPF should derive `ShardId` directly from the packet.**
-
-3. **No per-route eBPF map should be required for inter-node routing.**
-
-4. **Client transport routing and distributed endpoint routing share the same packed representation but use distinct semantic types.**
-
-5. **The ICE ufrag carries physical bootstrap information: cluster, node, transport route, and epoch.**
-
-6. **Every inter-node message uses the same fixed 16-byte Envelope.**
-
-7. **The Envelope route is `ShardId(12) | Slot(20)`.**
-
-8. **The Envelope `type` determines payload semantics.**
-
-9. **The 64-bit extension field handles compact type-specific metadata.**
-
-10. **Epoch protects route reuse.**
-
-11. **The 12-bit shard field is protocol headroom; it does not imply 4096 current worker threads.**
-
-12. **If a route moves to another shard, a new route is minted.**
-
-13. **Stable identities such as `ParticipantId` and `TrackId` never appear in the packet hot-path routing format.**
-
-14. **The control plane allocates route handles; the owning shard installs and executes them.**
-
-15. **eBPF performs packet steering before userspace; the shard mailbox mesh does not carry client UDP ingress packets.**
-
 ---
 
-# 63. Final conceptual diagram
-
-```text
-                         CONTROL / PLACEMENT
-
-                    ParticipantId / TrackId / RoomId
-                               │
-                               │ compile placement
-                               ▼
-                            ShardId
-                               │
-                  ┌────────────┴────────────┐
-                  │                         │
-                  ▼                         ▼
-
-          TransportRoute                  RouteId
-             Shard | Slot              Shard | Slot
-                  │                         │
-                  ▼                         ▼
-              ICE ufrag                 Envelope
-                  │                         │
-                  └────────────┬────────────┘
-                               ▼
-                              eBPF
-                               │
-                         extract ShardId
-                               │
-                               ▼
-                         shard worker/socket
-                               │
-                               ▼
-                         shard-owned state
-```
+## Where this lives
 
-The key architectural statement is:
+Named so you can find it, not so this document tracks it:
 
-> **PulseBeam's wire routes are compiled shard-local addresses. The shard bits let eBPF steer packets directly to the owning worker, while the slot bits let that worker resolve the destination without a global lookup.**
+- the packed layout, epoch and quarantine rules, and the envelope encoder are
+  in the routing crate shared with the eBPF program — that crate is the
+  authority for anything on the wire;
+- the classifier that decides bootstrap-vs-established is there too, and is
+  called by the kernel program, the userspace demuxer, and the simulator's
+  steering adapter;
+- route allocation, the lifecycle transaction and the published view belong to
+  the control plane;
+- resolution, epoch validation and dispatch belong to the shard.
 
-The 12-bit `ShardId` allocation is retained as future protocol headroom, but the current architecture remains deliberately simple: one `ShardId` maps directly to one shard worker.
+If this document and the code disagree about a number, the code is right and
+this file has a bug — but if they disagree about an *invariant*, stop, because
+one of them is a defect.

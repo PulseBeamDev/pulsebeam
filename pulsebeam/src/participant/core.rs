@@ -5,6 +5,7 @@ use metrics::{counter, histogram};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::reliable::{RelControl, rel_control};
 use pulsebeam_runtime::net::{self, RecvPacketBatch, Transport};
+use slotmap::SecondaryMap;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
@@ -18,7 +19,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::entity::{self, TrackId};
+use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 #[cfg(debug_assertions)]
 use crate::log::plog_error;
@@ -33,7 +34,7 @@ use crate::participant::{
     upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamAllocator},
 };
 use crate::rtp::RtpPacket;
-use crate::shard::router::{DataStreamKey, ReliableStreamKey, TrackKey};
+use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
     KEYFRAME_DEBOUNCE, MAX_DATA_TOPIC_CHANNELS, StreamId, StreamWrite, StreamWriter, Topic, Track,
@@ -248,6 +249,7 @@ pub struct ParticipantCore {
     pending_fanout: VecDeque<PendingFanout>,
     pending_rtc_mutations: VecDeque<PendingRtcMutation>,
     last_ingress: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    last_ingress_shard: Option<crate::id::ShardId>,
     rtc_deadline: Option<Instant>,
     rtc_clock: Instant,
     rtc_needs_drain: bool,
@@ -269,11 +271,16 @@ pub struct ParticipantCore {
     /// packet.
     published_track_fanouts: HashMap<TrackId, TrackKey>,
     subscribed_track_fanouts: HashMap<TrackId, TrackKey>,
-    data_pub_streams: HashMap<ChannelId, DataStreamKey>,
+    forwarding_track_routes: SecondaryMap<TrackKey, (TrackId, crate::keys::DownstreamSlotKey)>,
+    forwarding_data_channels: SecondaryMap<UnreliableStreamKey, ChannelId>,
+    forwarding_reliable_channels: SecondaryMap<ReliableStreamKey, ChannelId>,
+    data_pub_streams: HashMap<ChannelId, UnreliableStreamKey>,
     reliable_pub_streams: HashMap<ChannelId, ReliableStreamKey>,
     reliable_sub_streams: HashMap<ChannelId, ReliableStreamKey>,
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
     reliable_channels: ReliableChannels,
+    pending_data_pub_streams: HashMap<Topic, UnreliableStreamKey>,
+    pending_reliable_pub_streams: HashMap<Topic, ReliableStreamKey>,
 
     /// Attributes str0m's own logs to this participant, for the simulator only.
     ///
@@ -311,12 +318,38 @@ impl ParticipantCore {
 
     pub(crate) fn bind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
         self.subscribed_track_fanouts.insert(track_id, fanout);
+        let Some(slot) = self.downstream.slot_for_track(&track_id) else {
+            debug_assert!(
+                false,
+                "a forwarding plan cannot name an unassigned receiver"
+            );
+            return;
+        };
+        self.forwarding_track_routes
+            .insert(fanout, (track_id, slot));
     }
 
     pub(crate) fn unbind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
         if self.subscribed_track_fanouts.get(&track_id) == Some(&fanout) {
             self.subscribed_track_fanouts.remove(&track_id);
         }
+        self.forwarding_track_routes.remove(fanout);
+    }
+
+    pub(crate) fn bind_subscribed_data_stream(
+        &mut self,
+        stream: UnreliableStreamKey,
+        channel: ChannelId,
+    ) {
+        self.forwarding_data_channels.insert(stream, channel);
+    }
+
+    pub(crate) fn bind_subscribed_reliable_stream(
+        &mut self,
+        stream: ReliableStreamKey,
+        channel: ChannelId,
+    ) {
+        self.forwarding_reliable_channels.insert(stream, channel);
     }
 
     fn track_fanout(&self, track_id: TrackId) -> Option<TrackKey> {
@@ -333,11 +366,16 @@ impl ParticipantCore {
     /// frame on that channel falls back to a room-scoped lookup; afterwards
     /// the key rides on the event and nothing on the packet path hashes a
     /// name.
-    pub(crate) fn bind_published_data_stream(&mut self, topic: &Topic, stream: DataStreamKey) {
-        let Some(&channel) = self.data_pub_channels.get(topic) else {
-            return;
-        };
-        self.data_pub_streams.insert(channel, stream);
+    pub(crate) fn bind_published_data_stream(
+        &mut self,
+        topic: &Topic,
+        stream: UnreliableStreamKey,
+    ) {
+        if let Some(&channel) = self.data_pub_channels.get(topic) {
+            self.data_pub_streams.insert(channel, stream);
+        } else {
+            self.pending_data_pub_streams.insert(topic.clone(), stream);
+        }
     }
 
     pub(crate) fn bind_published_reliable_stream(
@@ -345,10 +383,12 @@ impl ParticipantCore {
         topic: &Topic,
         stream: ReliableStreamKey,
     ) {
-        let Some(channel) = self.reliable_channels.publisher_channel(topic) else {
-            return;
-        };
-        self.reliable_pub_streams.insert(channel, stream);
+        if let Some(channel) = self.reliable_channels.publisher_channel(topic) {
+            self.reliable_pub_streams.insert(channel, stream);
+        } else {
+            self.pending_reliable_pub_streams
+                .insert(topic.clone(), stream);
+        }
     }
 
     pub fn new(
@@ -373,6 +413,7 @@ impl ParticipantCore {
             pending_fanout: VecDeque::new(),
             pending_rtc_mutations: VecDeque::new(),
             last_ingress: None,
+            last_ingress_shard: None,
             rtc_deadline: None,
             rtc_clock: now,
             rtc_needs_drain: true,
@@ -400,12 +441,17 @@ impl ParticipantCore {
             data_topic_channels: HashMap::new(),
             published_track_fanouts: HashMap::new(),
             subscribed_track_fanouts: HashMap::new(),
+            forwarding_track_routes: SecondaryMap::new(),
+            forwarding_data_channels: SecondaryMap::new(),
+            forwarding_reliable_channels: SecondaryMap::new(),
             data_pub_streams: HashMap::new(),
             reliable_pub_streams: HashMap::new(),
             reliable_sub_streams: HashMap::new(),
             data_pub_channels: HashMap::new(),
             data_sub_channels: HashMap::new(),
             reliable_channels: ReliableChannels::new(),
+            pending_data_pub_streams: HashMap::new(),
+            pending_reliable_pub_streams: HashMap::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -421,8 +467,9 @@ impl ParticipantCore {
         }
     }
 
-    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
+    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch, source_shard: crate::id::ShardId) {
         self.last_ingress = Some((batch.src, batch.dst));
+        self.last_ingress_shard = Some(source_shard);
         if self.pending_ingress.len() >= MAX_PENDING_INGRESS {
             let _ = self.pending_ingress.pop_front();
             metrics::counter!("participant_ingress_shed").increment(1);
@@ -447,6 +494,7 @@ impl ParticipantCore {
     pub fn on_forward_rtp(
         &mut self,
         slot: crate::keys::DownstreamSlotKey,
+        track: crate::entity::TrackId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
     ) {
@@ -460,10 +508,28 @@ impl ParticipantCore {
         );
         let promoted =
             self.downstream
-                .on_forward_rtp_slot(slot, pkt, cache, &mut self.stream_writer);
+                .on_forward_rtp_slot(slot, track, pkt, cache, &mut self.stream_writer);
         if promoted {
             self.signaling.mark_assignments_dirty();
         }
+    }
+
+    pub fn on_forward_rtp_fanout(
+        &mut self,
+        fanout: TrackKey,
+        track: TrackId,
+        pkt: &RtpPacket,
+        cache: Option<&crate::rtp::cache::TrackStreamCache>,
+    ) {
+        let Some(&(bound_track, slot)) = self.forwarding_track_routes.get(fanout) else {
+            debug_assert!(false, "a forwarding plan must have a receiver binding");
+            return;
+        };
+        debug_assert_eq!(
+            bound_track, track,
+            "a track route cannot change its identity"
+        );
+        self.on_forward_rtp(slot, track, pkt, cache);
     }
 
     #[inline]
@@ -475,6 +541,18 @@ impl ParticipantCore {
         }
     }
 
+    pub fn update_layer_states_fanout(
+        &mut self,
+        fanout: TrackKey,
+        states: &crate::track::TrackStates,
+    ) {
+        let Some(&(_, slot)) = self.forwarding_track_routes.get(fanout) else {
+            debug_assert!(false, "a forwarding plan must have a receiver binding");
+            return;
+        };
+        self.update_layer_states(slot, states);
+    }
+
     #[inline]
     pub fn on_forward_sctp(&mut self, channel: ChannelId, pkt: &[u8]) {
         self.enqueue_fanout(PendingFanout::Sctp {
@@ -483,11 +561,30 @@ impl ParticipantCore {
         });
     }
 
+    pub fn on_forward_sctp_stream(&mut self, stream: UnreliableStreamKey, pkt: &[u8]) {
+        let Some(&channel) = self.forwarding_data_channels.get(stream) else {
+            debug_assert!(false, "a data forwarding plan must have a receiver binding");
+            return;
+        };
+        self.on_forward_sctp(channel, pkt);
+    }
+
     pub fn on_forward_reliable_sctp(&mut self, channel: ChannelId, frame: &[u8]) {
         self.enqueue_fanout(PendingFanout::ReliableSctp {
             channel,
             frame: frame.to_vec(),
         });
+    }
+
+    pub fn on_forward_reliable_sctp_stream(&mut self, stream: ReliableStreamKey, frame: &[u8]) {
+        let Some(&channel) = self.forwarding_reliable_channels.get(stream) else {
+            debug_assert!(
+                false,
+                "a reliable forwarding plan must have a receiver binding"
+            );
+            return;
+        };
+        self.on_forward_reliable_sctp(channel, frame);
     }
 
     pub fn on_deliver_reliable_control(&mut self, topic: &Topic, bytes: &[u8]) {
@@ -600,6 +697,9 @@ impl ParticipantCore {
     /// flips activity and health per packet and the allocator acts on those.
     fn publish_changed_stats(&mut self, events: &mut impl ParticipantSink) {
         for (track_id, states) in self.upstream.take_changed_stats() {
+            if track_id.kind() != TrackKind::Video {
+                continue;
+            }
             events.publish_track_stats(
                 track_id,
                 self.published_track_fanouts.get(&track_id).copied(),
@@ -1049,8 +1149,10 @@ impl ParticipantCore {
             // below. Falls through to the catch-all with every other event this
             // participant does not act on.
             Event::IceConnectionStateChange(state) if state.is_connected() => {
-                if let Some((source, destination)) = self.last_ingress {
-                    events.connected(source, destination);
+                if let (Some((source, destination)), Some(source_shard)) =
+                    (self.last_ingress, self.last_ingress_shard)
+                {
+                    events.connected(source, destination, source_shard);
                 }
             }
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
@@ -1119,6 +1221,12 @@ impl ParticipantCore {
                                 self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
                                 return;
                             }
+                            if e.direction == DataTrackDirection::Publish
+                                && let Some(stream) =
+                                    self.pending_reliable_pub_streams.remove(&e.topic)
+                            {
+                                self.reliable_pub_streams.insert(cid, stream);
+                            }
                             self.data_topic_channels.insert(cid, e);
                             return;
                         }
@@ -1154,6 +1262,10 @@ impl ParticipantCore {
                         match e.direction {
                             DataTrackDirection::Publish => {
                                 self.data_pub_channels.insert(e.topic.clone(), cid);
+                                if let Some(stream) = self.pending_data_pub_streams.remove(&e.topic)
+                                {
+                                    self.data_pub_streams.insert(cid, stream);
+                                }
                                 events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
@@ -1464,6 +1576,8 @@ impl ParticipantCore {
         self.data_pub_channels.clear();
         self.data_sub_channels.clear();
         self.reliable_channels.clear();
+        self.pending_data_pub_streams.clear();
+        self.pending_reliable_pub_streams.clear();
         self.reliable_pub_streams.clear();
         self.reliable_sub_streams.clear();
     }
@@ -1477,12 +1591,17 @@ impl ParticipantCore {
         if ch.lane == DataLane::Reliable {
             self.reliable_pub_streams.remove(&cid);
             self.reliable_sub_streams.remove(&cid);
+            if ch.direction == DataTrackDirection::Publish {
+                self.pending_reliable_pub_streams.remove(&ch.topic);
+            }
             self.reliable_channels.close(ch, events);
             return;
         }
 
         match ch.direction {
             DataTrackDirection::Publish => {
+                self.data_pub_streams.remove(&cid);
+                self.pending_data_pub_streams.remove(&ch.topic);
                 self.data_pub_channels.remove(&ch.topic);
                 events.unpublish_data_topic(ch.topic);
             }

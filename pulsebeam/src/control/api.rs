@@ -25,7 +25,6 @@ use crate::{
     control::controller::{ControllerHandle, ParticipantState},
     entity::{ExternalRoomId, IdValidationError, ParticipantId, RoomId},
 };
-use pulsebeam_runtime::rand::os_rng;
 pub enum HeaderExt {
     ParticipantId,
 }
@@ -108,6 +107,9 @@ impl IntoResponse for ApiError {
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::JoinError(controller::ControllerError::StaleConnection) => {
+                StatusCode::PRECONDITION_FAILED
+            }
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ApiError::JoinError(controller::ControllerError::Unknown(_))
             | ApiError::JoinError(controller::ControllerError::IOError(_))
@@ -201,10 +203,7 @@ async fn create_participant(
     let room_id = RoomId::from_external(&external_room_id);
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
-    let (participant_id, connection_id) = {
-        let mut rng = os_rng();
-        (ParticipantId::new(&mut rng), ConnectionId::new(&mut rng))
-    };
+    let (participant_id, connection_id) = (ParticipantId::new(), ConnectionId::new());
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let state = ParticipantState {
@@ -342,11 +341,8 @@ async fn patch_participant(
         "/rooms/{}/participants/{}",
         &external_room_id, &participant_id
     );
-    // ConnectionId is a capability token — derive from fresh OS entropy.
-    let connection_id = {
-        let mut rng = os_rng();
-        ConnectionId::new(&mut rng)
-    };
+    // ConnectionId is a capability token — derives from fresh OS entropy.
+    let connection_id = ConnectionId::new();
     let state = ParticipantState {
         manual_sub: query.manual_sub,
         room_id,
