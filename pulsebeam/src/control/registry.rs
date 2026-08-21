@@ -52,12 +52,6 @@ impl RoomRegistry {
         self.rooms.get(room_id)
     }
 
-    pub fn get_or_create_room(&mut self, room_id: RoomId) -> &Room {
-        self.rooms
-            .entry(room_id)
-            .or_insert_with(|| Room::new(room_id))
-    }
-
     pub fn room_mut_for(&mut self, participant_id: &ParticipantId) -> Option<&mut Room> {
         let meta = self.participants.get(participant_id).or_else(|| {
             tracing::warn!(%participant_id, "participant not found in reigstry, dropping");
@@ -239,12 +233,12 @@ impl RoomRegistry {
     }
 
     pub fn add_track(&mut self, track: Track) -> Option<(RoomId, Vec<ShardId>)> {
-        let origin = self.participants.get(&track.meta.origin)?;
+        let origin = self.participants.get(&track.meta().origin)?;
         if !origin.connected {
             return None;
         }
         let origin_shard = origin.shard_id;
-        let room = self.room_mut_for(&track.meta.origin)?;
+        let room = self.room_mut_for(&track.meta().origin)?;
         room.add_track(track.clone());
         let ids = room.recipient_shard_ids(origin_shard).collect();
         let room_id = room.room_id;
@@ -308,23 +302,6 @@ mod tests {
 
     fn participant_id() -> ParticipantId {
         ParticipantId::new()
-    }
-
-    #[test]
-    fn get_or_create_room_creates_new_room() {
-        let mut reg = RoomRegistry::new();
-        let rid = room_id("test-room");
-        reg.get_or_create_room(rid);
-        reg.get_room(&rid).unwrap();
-    }
-
-    #[test]
-    fn get_or_create_room_is_idempotent() {
-        let mut reg = RoomRegistry::new();
-        let rid = room_id("test-room");
-        reg.get_or_create_room(rid);
-        reg.get_or_create_room(rid);
-        assert_eq!(reg.rooms.len(), 1);
     }
 
     #[test]

@@ -1,23 +1,17 @@
 use crate::entity::{ParticipantId, TrackKind};
-use crate::keys::TrackKey;
-use crate::track::Track;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum TrackRole {
-    Published,
-    Subscribed,
-}
+use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
+use crate::track::{Topic, Track};
+use str0m::channel::ChannelId;
 
 #[derive(Debug, Clone)]
 pub struct CompiledTrack {
     pub key: TrackKey,
-    pub role: TrackRole,
     pub track: Track,
 }
 
 impl CompiledTrack {
     pub fn kind(&self) -> TrackKind {
-        self.track.meta.id.kind()
+        self.track.kind()
     }
 }
 
@@ -28,9 +22,21 @@ pub enum ParticipantEffect {
         removed: Vec<ParticipantId>,
     },
     TrackInstalled(CompiledTrack),
-    TrackRemoved {
-        key: TrackKey,
-        role: TrackRole,
-        kind: TrackKind,
+    TrackRemoved(TrackKey),
+    DataPublished {
+        topic: Topic,
+        stream: UnreliableStreamKey,
+    },
+    ReliableDataPublished {
+        topic: Topic,
+        stream: ReliableStreamKey,
+    },
+    DataSubscribed {
+        stream: UnreliableStreamKey,
+        channel: ChannelId,
+    },
+    ReliableDataSubscribed {
+        stream: ReliableStreamKey,
+        channel: ChannelId,
     },
 }

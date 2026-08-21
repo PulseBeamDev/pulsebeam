@@ -2,14 +2,14 @@ use slotmap::SecondaryMap;
 use str0m::media::Rid;
 
 use crate::clock::WallAnchor;
-use crate::entity::{AudioOrigin, ParticipantId, TrackId};
+use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
 use crate::keys::{AudioTrackKey, ParticipantKey, VideoTrackKey};
+use crate::participant::{ParticipantInput, TrackPacket};
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::Topic;
 
-use super::events::AudioRtpEvent;
 use super::worker::{MediaPayload, Reverse, ShardFrame};
 
 pub(crate) use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
@@ -54,48 +54,17 @@ pub(crate) trait ShardTransport {
     fn send_frame(&self, dst: ShardId, frame: ShardFrame);
 }
 
-pub(crate) trait RoutingContext: ShardTransport {
-    fn forward_video_rtp(
-        &mut self,
-        subscriber: ParticipantKey,
-        fanout: TrackKey,
-        track: TrackId,
-        pkt: &RtpPacket,
-        cache: Option<&TrackStreamCache>,
-    );
-    fn update_layer_states(
-        &mut self,
-        subscriber: ParticipantKey,
-        fanout: TrackKey,
-        states: &crate::track::TrackStates,
-    );
-    fn forward_audio_rtp(
-        &mut self,
-        subscriber: ParticipantKey,
-        origin: AudioOrigin,
-        pkt: &RtpPacket,
-    );
-    fn forward_unreliable_sctp(
-        &mut self,
-        subscriber: ParticipantKey,
-        stream: UnreliableStreamKey,
-        pkt: &[u8],
-    );
-    fn wall(&self) -> &WallAnchor;
-    fn forward_reliable_sctp(
-        &mut self,
-        subscriber: ParticipantKey,
-        stream: ReliableStreamKey,
-        frame: &[u8],
-    );
+pub(crate) struct ForwardingContext<'a, R> {
+    pub registry: &'a mut super::participants::ParticipantRegistry,
+    pub dirty: &'a mut super::dirty::DirtyTracker,
+    pub wall: &'a WallAnchor,
+    pub router: &'a R,
 }
 
 struct TrackRuntime {
     id: TrackId,
     origin_key: ParticipantKey,
-    publication: crate::track::Track,
     encodings: Vec<Option<Rid>>,
-    layer_states: crate::track::TrackStates,
     cache: Option<TrackStreamCache>,
     link_seq: u32,
 }
@@ -127,13 +96,65 @@ fn fanout_remote(
     link_seq: &mut u32,
     playout: u32,
     mut payload: impl FnMut() -> MediaPayload,
-    ctx: &mut impl ShardTransport,
+    ctx: &impl ShardTransport,
 ) {
     for remote in plan.remote.values() {
         let env = Envelope::media(*remote, *link_seq, playout);
         *link_seq = link_seq.wrapping_add(1);
         ctx.send_media(remote.shard(), env, payload());
     }
+}
+
+fn forward_track(
+    ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+    subscriber: ParticipantKey,
+    fanout: TrackKey,
+    pkt: &RtpPacket,
+    cache: Option<&TrackStreamCache>,
+) {
+    let Some(participant) = ctx.registry.resolve_mut(subscriber) else {
+        debug_assert!(false, "a track plan must name a live participant");
+        return;
+    };
+    participant.input(ParticipantInput::Track {
+        key: fanout,
+        packet: pkt,
+        cache,
+    });
+    ctx.dirty.mark(subscriber, participant);
+}
+
+fn forward_unreliable(
+    registry: &mut super::participants::ParticipantRegistry,
+    dirty: &mut super::dirty::DirtyTracker,
+    subscriber: ParticipantKey,
+    stream: UnreliableStreamKey,
+    pkt: &[u8],
+) {
+    let Some(participant) = registry.resolve_mut(subscriber) else {
+        debug_assert!(false, "a data plan must name a live participant");
+        return;
+    };
+    participant.input(ParticipantInput::Data {
+        stream,
+        packet: pkt,
+    });
+    dirty.mark(subscriber, participant);
+}
+
+fn forward_reliable(
+    registry: &mut super::participants::ParticipantRegistry,
+    dirty: &mut super::dirty::DirtyTracker,
+    subscriber: ParticipantKey,
+    stream: ReliableStreamKey,
+    frame: &[u8],
+) {
+    let Some(participant) = registry.resolve_mut(subscriber) else {
+        debug_assert!(false, "a reliable data plan must name a live participant");
+        return;
+    };
+    participant.input(ParticipantInput::ReliableData { stream, frame });
+    dirty.mark(subscriber, participant);
 }
 
 pub(crate) struct ShardRuntime {
@@ -209,9 +230,7 @@ impl ShardRuntime {
                     TrackRuntime {
                         id: descriptor.id,
                         origin_key: descriptor.origin_key,
-                        publication: descriptor.publication.clone(),
                         encodings: descriptor.encodings.clone(),
-                        layer_states: descriptor.states.clone(),
                         cache: None,
                         link_seq: 0,
                     },
@@ -286,23 +305,13 @@ impl ShardRuntime {
             .map(|track| (track.id, track.encodings.as_slice()))
     }
 
-    /// The identity behind a fanout key.
-    ///
-    /// Forwarding plans carry no identity, so this arena is the only place a
-    /// key's track and publisher are recorded.
-    pub(crate) fn track_identity(&self, key: TrackKey) -> Option<(TrackId, ParticipantId)> {
-        self.tracks
-            .get(key)
-            .map(|track| (track.id, track.publication.meta.origin))
-    }
-
     #[inline]
     pub fn route_video_with_plan(
         &mut self,
         fanout: VideoTrackKey,
         pkt: RtpPacket,
         plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut impl RoutingContext,
+        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         let Some(track) = self.tracks.get_mut(fanout.raw()) else {
             debug_assert!(false, "compiled video key must resolve to runtime state");
@@ -314,7 +323,6 @@ impl ShardRuntime {
         }
         let rid = pkt.ext_vals.rid;
         let seq = pkt.seq_no;
-        let track_id = track.id;
         let cache = track.cache.get_or_insert_with(TrackStreamCache::new);
         let too_old = cache.push(pkt);
         let Some(packet) = too_old
@@ -325,25 +333,30 @@ impl ShardRuntime {
             return;
         };
         fanout_local(plan, |subscriber| {
-            ctx.forward_video_rtp(subscriber, fanout.raw(), track_id, packet, Some(cache));
+            forward_track(ctx, subscriber, fanout.raw(), packet, Some(cache));
         });
-        let playout = ctx.wall().to_ntp(packet.playout_time);
+        let playout = ctx.wall.to_ntp(packet.playout_time);
         fanout_remote(
             plan,
             &mut track.link_seq,
             playout.middle32(),
-            || MediaPayload::Video(Box::new(packet.to_transit())),
-            ctx,
+            || {
+                MediaPayload::Track(TrackPacket {
+                    key: fanout.raw(),
+                    packet: Box::new(packet.to_transit()),
+                })
+            },
+            ctx.router,
         );
     }
 
-    pub fn route_audio_with_plan(
+    fn route_audio_with_plan(
         &mut self,
         track: AudioTrackKey,
         origin: Origin,
-        event: AudioRtpEvent,
+        pkt: RtpPacket,
         plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut impl RoutingContext,
+        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         let Some(runtime) = self.tracks.get(track.raw()) else {
             debug_assert!(false, "compiled audio key must resolve to runtime state");
@@ -353,15 +366,11 @@ impl ShardRuntime {
             debug_assert!(false, "an audio key must resolve to an audio publication");
             return;
         }
-        let audio_origin = AudioOrigin {
-            participant: event.origin,
-            track: event.stream_id.0,
-        };
         fanout_local(plan, |subscriber| {
-            ctx.forward_audio_rtp(subscriber, audio_origin, &event.pkt);
+            forward_track(ctx, subscriber, track.raw(), &pkt, None);
         });
         if origin.is_local() {
-            let playout = ctx.wall().to_ntp(event.pkt.playout_time);
+            let playout = ctx.wall.to_ntp(pkt.playout_time);
             let Some(runtime) = self.tracks.get_mut(track.raw()) else {
                 debug_assert!(false, "audio key must resolve to runtime state");
                 return;
@@ -370,9 +379,39 @@ impl ShardRuntime {
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
-                || MediaPayload::Audio(Box::new(event.pkt.to_transit())),
-                ctx,
+                || {
+                    MediaPayload::Track(TrackPacket {
+                        key: track.raw(),
+                        packet: Box::new(pkt.to_transit()),
+                    })
+                },
+                ctx.router,
             );
+        }
+    }
+
+    pub fn route_rtp_with_plan(
+        &mut self,
+        key: TrackKey,
+        origin: Origin,
+        pkt: RtpPacket,
+        plan: &crate::plan::FlatTrackPlan,
+        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+    ) {
+        let Some(kind) = self.tracks.get(key).map(|runtime| runtime.id.kind()) else {
+            debug_assert!(false, "an RTP packet must resolve to a live track");
+            return;
+        };
+        match kind {
+            crate::entity::TrackKind::Video => {
+                self.route_video_with_plan(VideoTrackKey::new(key), pkt, plan, ctx);
+            }
+            crate::entity::TrackKind::Audio => {
+                self.route_audio_with_plan(AudioTrackKey::new(key), origin, pkt, plan, ctx);
+            }
+            crate::entity::TrackKind::Data => {
+                debug_assert!(false, "a data track cannot carry RTP");
+            }
         }
     }
 
@@ -382,23 +421,23 @@ impl ShardRuntime {
         origin: Origin,
         packet: Vec<u8>,
         plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut impl RoutingContext,
+        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         let Some(runtime) = self.unreliable.get_mut(stream) else {
             debug_assert!(false, "data key must resolve to runtime state");
             return;
         };
         fanout_local(plan, |subscriber| {
-            ctx.forward_unreliable_sctp(subscriber, stream, &packet);
+            forward_unreliable(ctx.registry, ctx.dirty, subscriber, stream, &packet);
         });
         if origin.is_local() {
-            let playout = ctx.wall().ntp();
+            let playout = ctx.wall.ntp();
             fanout_remote(
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
                 || MediaPayload::Data(packet.clone()),
-                ctx,
+                ctx.router,
             );
         }
     }
@@ -409,7 +448,7 @@ impl ShardRuntime {
         origin: Origin,
         frame: Vec<u8>,
         plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut impl RoutingContext,
+        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         debug_assert!(!frame.is_empty());
         let Some(_runtime) = self.reliable.get(stream) else {
@@ -417,10 +456,10 @@ impl ShardRuntime {
             return;
         };
         fanout_local(plan, |subscriber| {
-            ctx.forward_reliable_sctp(subscriber, stream, &frame);
+            forward_reliable(ctx.registry, ctx.dirty, subscriber, stream, &frame);
         });
         if origin.is_local() {
-            let playout = ctx.wall().ntp();
+            let playout = ctx.wall.ntp();
             let Some(runtime) = self.reliable.get_mut(stream) else {
                 debug_assert!(false, "reliable key must remain live during dispatch");
                 return;
@@ -430,7 +469,7 @@ impl ShardRuntime {
                 &mut runtime.link_seq,
                 playout.middle32(),
                 || MediaPayload::Data(frame.clone()),
-                ctx,
+                ctx.router,
             );
         }
     }
@@ -439,50 +478,19 @@ impl ShardRuntime {
         &self,
         bytes: Vec<u8>,
         plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut impl RoutingContext,
+        router: &impl ShardTransport,
     ) {
         let Some(target) = plan.reverse_route else {
             debug_assert!(false, "reliable control has no compiled reverse route");
             return;
         };
-        ctx.send_frame(
+        router.send_frame(
             target.shard(),
             ShardFrame::Reverse {
                 env: Envelope::feedback(target),
                 body: Reverse::DataAck(bytes),
             },
         );
-    }
-
-    pub fn apply_stats(
-        &mut self,
-        fanout: VideoTrackKey,
-        stats: crate::track::TrackStates,
-        plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut impl RoutingContext,
-    ) {
-        let Some(track) = self.tracks.get_mut(fanout.raw()) else {
-            debug_assert!(false, "stats key must resolve to runtime state");
-            return;
-        };
-        if track.id.kind() != crate::entity::TrackKind::Video {
-            debug_assert!(false, "video stats must resolve to a video publication");
-            return;
-        }
-        track.layer_states = stats;
-        let states = &track.layer_states;
-        fanout_local(plan, |subscriber| {
-            ctx.update_layer_states(subscriber, fanout.raw(), states);
-        });
-        for remote in plan.remote.values() {
-            ctx.send_frame(
-                remote.shard(),
-                ShardFrame::Telemetry {
-                    env: Envelope::telemetry(*remote),
-                    stats: track.layer_states.clone(),
-                },
-            );
-        }
     }
 
     pub(crate) fn reliable_topic(&self, key: ReliableStreamKey) -> Option<&Topic> {
@@ -532,9 +540,8 @@ mod tests {
             origin_key,
             participant: None,
             encodings: vec![Some(Rid::from(rid))],
-            states: Vec::new(),
-            publication: Track {
-                meta: TrackMeta {
+            publication: Track::audio(
+                TrackMeta {
                     room_id: crate::entity::RoomId::from_external(
                         &crate::entity::ExternalRoomId::new("test-room").unwrap(),
                     ),
@@ -542,9 +549,8 @@ mod tests {
                     id,
                     origin: ParticipantId::from_bytes([7; 16]),
                 },
-                layers: Vec::new(),
-                reverse: None,
-            },
+                None,
+            ),
         }
     }
 

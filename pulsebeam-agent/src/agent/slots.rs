@@ -1,5 +1,5 @@
 use pulsebeam_proto::signaling::Publication;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use str0m::media::Mid;
 
 pub type TrackId = String;
@@ -118,12 +118,28 @@ impl SlotManager {
         speakers
     }
 
-    pub fn sync(&mut self, state: pulsebeam_proto::signaling::ServerState) -> SyncOutcome {
+    pub fn sync(&mut self, mut state: pulsebeam_proto::signaling::ServerState) -> SyncOutcome {
         let mut new_assignments: Vec<(Mid, Publication)> = Vec::new();
         let mut audio_arrivals: Vec<(Mid, Publication)> = Vec::new();
         let mut speakers_changed = false;
         let mut pause_changes: Vec<(TrackId, bool)> = Vec::new();
         let mut newly_discovered_tracks = Vec::new();
+        if state.snapshot {
+            let present: HashSet<_> = state
+                .publications_added
+                .iter()
+                .map(|publication| publication.track_id.as_str())
+                .collect();
+            state.publications_removed.extend(
+                self.pending_tracks
+                    .keys()
+                    .chain(self.active_tracks.keys())
+                    .filter(|track_id| !present.contains(track_id.as_str()))
+                    .cloned(),
+            );
+            state.publications_removed.sort_unstable();
+            state.publications_removed.dedup();
+        }
         let removed_tracks = state.publications_removed.clone();
 
         for id in state.publications_removed {
@@ -315,6 +331,7 @@ mod tests {
             publications_removed: Vec::new(),
             video: Some(VideoBindings { items: video }),
             audio: None,
+            snapshot: false,
         }
     }
 
@@ -326,6 +343,7 @@ mod tests {
             publications_removed: Vec::new(),
             video: None,
             audio: Some(AudioBindings { items: audio }),
+            snapshot: false,
         }
     }
 
@@ -394,6 +412,25 @@ mod tests {
         let resumed = slots.sync(update(vec![assignment("v0", "t1", false)], Vec::new()));
         assert_eq!(resumed.pause_changes, vec![("t1".to_owned(), false)]);
         assert!(!slots.is_paused("t1"));
+    }
+
+    #[test]
+    fn an_empty_snapshot_withdraws_tracks_missing_from_the_roster() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("v0"));
+        slots.sync(update(
+            vec![assignment("v0", "t1", false)],
+            vec![track("t1")],
+        ));
+        assert!(slots.known("t1").is_some());
+
+        let mut snapshot = update(Vec::new(), Vec::new());
+        snapshot.snapshot = true;
+        let outcome = slots.sync(snapshot);
+
+        assert_eq!(outcome.removed_tracks, vec!["t1"]);
+        assert!(slots.known("t1").is_none());
+        assert!(slots.assigned("t1").is_none());
     }
 
     /// An audio slot binds its track the same way a video slot does, so the media has somewhere

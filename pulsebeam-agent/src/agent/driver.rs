@@ -338,6 +338,7 @@ pub(crate) enum AgentEvent {
     ParticipantsChanged {
         added: Vec<ParticipantId>,
         removed: Vec<ParticipantId>,
+        snapshot: bool,
     },
     RemoteTrackDiscovered(Track),
     RemoteTrackRemoved(String),
@@ -1426,9 +1427,14 @@ impl AgentDriver {
                     .map(|participant| participant.participant_id.clone())
                     .collect();
                 let removed = update.participants_removed.clone();
+                let snapshot = update.snapshot;
                 let sync = self.slot_manager.sync(update);
-                if !added.is_empty() || !removed.is_empty() {
-                    self.emit(AgentEvent::ParticipantsChanged { added, removed });
+                if snapshot || !added.is_empty() || !removed.is_empty() {
+                    self.emit(AgentEvent::ParticipantsChanged {
+                        added,
+                        removed,
+                        snapshot,
+                    });
                 }
                 let (assignments, discovered, removed) = (
                     sync.new_assignments,

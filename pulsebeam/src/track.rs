@@ -1,5 +1,12 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "Track distributes immutable publisher snapshots through ArcSwap"
+)]
+
+use arc_swap::ArcSwap;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::entity::TrackId;
@@ -253,6 +260,7 @@ pub struct UpstreamTrack {
     /// activity, aggregate demand), while each encoding keeps its own
     /// `StreamStats` so the downstream allocator still sees per-layer metadata.
     pub monitor: TrackMonitor,
+    stats: Option<VideoStats>,
 }
 
 impl PartialEq for UpstreamTrack {
@@ -282,11 +290,9 @@ impl UpstreamTrack {
 
     pub fn poll_stats(&mut self, now: Instant) {
         self.monitor.poll(now);
-    }
-
-    /// This track's measurement handles, to hand along the media path.
-    pub fn layer_states(&self) -> TrackStates {
-        self.monitor.layer_states()
+        if let Some(stats) = &self.stats {
+            stats.update(&self.monitor);
+        }
     }
 }
 
@@ -349,6 +355,12 @@ impl TrackMonitor {
             .collect()
     }
 
+    fn snapshot(&self) -> VideoStatsSnapshot {
+        VideoStatsSnapshot {
+            layers: self.layer_states(),
+        }
+    }
+
     pub fn poll(&mut self, now: Instant) {
         // Derive the sibling gate from packet arrivals, never from the encodings'
         // published `inactive` flags: those flags are what this loop writes, so
@@ -384,20 +396,173 @@ impl TrackMonitor {
 }
 
 #[derive(Debug, Clone)]
-pub struct Track {
+pub enum Track {
+    Audio(AudioTrack),
+    Video(VideoTrack),
+    Data(DataTrack),
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioTrack {
     pub meta: TrackMeta,
-    pub layers: Vec<TrackLayer>,
-    /// Where subscribing shards send everything that flows back toward this
-    /// track's publisher — keyframe requests today, NACKs later. Stamped by the
-    /// publisher's shard when it publishes, then carried to every other shard
-    /// by the control plane: the compiled reverse plan, so the data plane never
-    /// has to name the track to ask for anything.
     pub reverse: Option<crate::route::RouteHandle>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoTrack {
+    pub meta: TrackMeta,
+    pub layers: Vec<TrackLayer>,
+    stats: VideoStats,
+    pub reverse: Option<crate::route::RouteHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataTrack {
+    pub meta: TrackMeta,
+    pub reverse: Option<crate::route::RouteHandle>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VideoStatsSnapshot {
+    layers: Vec<(Option<Rid>, StreamStats)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoStats(Arc<ArcSwap<VideoStatsSnapshot>>);
+
+impl VideoStats {
+    fn new(layers: &[TrackLayer]) -> Self {
+        let snapshot = VideoStatsSnapshot {
+            layers: layers
+                .iter()
+                .map(|layer| {
+                    (
+                        layer.rid,
+                        StreamStats::new(
+                            false,
+                            layer.quality.seed_bitrate_bps(),
+                            layer.quality.fallback_height(),
+                        ),
+                    )
+                })
+                .collect(),
+        };
+        Self(Arc::new(ArcSwap::from_pointee(snapshot)))
+    }
+
+    fn update(&self, monitor: &TrackMonitor) {
+        let previous = self.0.load_full();
+        let mut snapshot = monitor.snapshot();
+        for (rid, current) in &mut snapshot.layers {
+            if !current.inactive {
+                continue;
+            }
+            let Some((_, old)) = previous.layers.iter().find(|(old_rid, _)| old_rid == rid) else {
+                continue;
+            };
+            current.bitrate_bps = old.bitrate_bps;
+            current.stable_bitrate_bps = old.stable_bitrate_bps;
+            current.decode_targets = old.decode_targets;
+            current.decode_target_kbps = old.decode_target_kbps;
+            current.full_fps = old.full_fps;
+        }
+        self.0.store(Arc::new(snapshot));
+    }
+
+    pub(crate) fn layer_states(&self) -> TrackStates {
+        self.0.load().layers.clone()
+    }
+}
+
 impl Track {
+    pub fn audio(meta: TrackMeta, reverse: Option<crate::route::RouteHandle>) -> Self {
+        Self::Audio(AudioTrack { meta, reverse })
+    }
+
+    pub fn video_track(
+        meta: TrackMeta,
+        layers: Vec<TrackLayer>,
+        reverse: Option<crate::route::RouteHandle>,
+    ) -> Self {
+        Self::Video(VideoTrack {
+            meta,
+            stats: VideoStats::new(&layers),
+            layers,
+            reverse,
+        })
+    }
+
+    pub fn data(meta: TrackMeta, reverse: Option<crate::route::RouteHandle>) -> Self {
+        Self::Data(DataTrack { meta, reverse })
+    }
+
+    pub fn meta(&self) -> &TrackMeta {
+        match self {
+            Self::Audio(track) => &track.meta,
+            Self::Video(track) => &track.meta,
+            Self::Data(track) => &track.meta,
+        }
+    }
+
+    pub fn meta_mut(&mut self) -> &mut TrackMeta {
+        match self {
+            Self::Audio(track) => &mut track.meta,
+            Self::Video(track) => &mut track.meta,
+            Self::Data(track) => &mut track.meta,
+        }
+    }
+
+    pub fn id(&self) -> TrackId {
+        self.meta().id
+    }
+
+    pub fn kind(&self) -> TrackKind {
+        self.id().kind()
+    }
+
+    pub fn reverse(&self) -> Option<crate::route::RouteHandle> {
+        match self {
+            Self::Audio(track) => track.reverse,
+            Self::Video(track) => track.reverse,
+            Self::Data(track) => track.reverse,
+        }
+    }
+
+    pub fn set_reverse(&mut self, reverse: Option<crate::route::RouteHandle>) {
+        match self {
+            Self::Audio(track) => track.reverse = reverse,
+            Self::Video(track) => track.reverse = reverse,
+            Self::Data(track) => track.reverse = reverse,
+        }
+    }
+
+    pub fn layers(&self) -> &[TrackLayer] {
+        match self {
+            Self::Video(track) => &track.layers,
+            Self::Audio(_) | Self::Data(_) => &[],
+        }
+    }
+
+    pub fn video(&self) -> Option<&VideoTrack> {
+        match self {
+            Self::Video(track) => Some(track),
+            Self::Audio(_) | Self::Data(_) => None,
+        }
+    }
+
+    pub fn video_mut(&mut self) -> Option<&mut VideoTrack> {
+        match self {
+            Self::Video(track) => Some(track),
+            Self::Audio(_) | Self::Data(_) => None,
+        }
+    }
+
+    pub(crate) fn stats(&self) -> Option<VideoStats> {
+        self.video().map(|track| track.stats.clone())
+    }
+
     pub fn lowest_quality(&self) -> Option<&TrackLayer> {
-        self.layers.iter().min_by_key(|l| l.quality)
+        self.layers().iter().min_by_key(|l| l.quality)
     }
 
     /// Lowest layer that is currently healthy, falling back to the absolute
@@ -408,7 +573,7 @@ impl Track {
         &self,
         is_healthy: impl Fn(&TrackLayer) -> bool,
     ) -> Option<&TrackLayer> {
-        self.layers
+        self.layers()
             .iter()
             .filter(|l| is_healthy(l))
             .min_by_key(|l| l.quality)
@@ -416,18 +581,18 @@ impl Track {
     }
 
     pub fn by_quality(&self, quality: LayerQuality) -> Option<&TrackLayer> {
-        self.layers.iter().find(|l| l.quality == quality)
+        self.layers().iter().find(|l| l.quality == quality)
     }
 
     pub fn higher_quality(&self, current: LayerQuality) -> Option<&TrackLayer> {
-        self.layers
+        self.layers()
             .iter()
             .filter(|l| l.quality > current)
             .min_by_key(|l| l.quality)
     }
 
     pub fn lower_quality(&self, current: LayerQuality) -> Option<&TrackLayer> {
-        self.layers
+        self.layers()
             .iter()
             .filter(|l| l.quality < current)
             .max_by_key(|l| l.quality)
@@ -496,15 +661,9 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             normalizer: StreamNormalizer::new(mid, None),
             monitor,
         }]),
+        stats: None,
     };
-    (
-        sender,
-        Track {
-            meta,
-            layers: Vec::with_capacity(MAX_SIMULCAST_LAYERS),
-            reverse: None,
-        },
-    )
+    (sender, Track::audio(meta, None))
 }
 
 /// Construct a new video track sender and its per-layer descriptors.
@@ -561,17 +720,20 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     layers.sort_by_key(|e| std::cmp::Reverse(e.quality));
 
     tracing::info!(track_id = ?meta.id, layers = ?layers.len(), "discovered video layers mapping");
-    let track = Track {
+    let stats = VideoStats::new(&layers);
+    let track = Track::Video(VideoTrack {
         meta: meta.clone(),
         layers,
+        stats: stats.clone(),
         reverse: None,
-    };
+    });
 
     (
         UpstreamTrack {
             meta,
             synchronizer: TrackSynchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor: TrackMonitor::new(senders),
+            stats: Some(stats),
         },
         track,
     )

@@ -23,6 +23,7 @@ repository = "https://github.com/PulseBeamDev/pulsebeam"
 license = "AGPL-3.0"
 
 [workspace.dependencies]
+arc-swap = "1.7.1"
 anyhow = "1"
 aya = "0.14.0"
 aya-ebpf = "0.2.1"

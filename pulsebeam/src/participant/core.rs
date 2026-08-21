@@ -24,17 +24,17 @@ use crate::id::ShardId;
 #[cfg(debug_assertions)]
 use crate::log::plog_error;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
+use crate::participant::data::DataState;
 use crate::participant::downstream::SlotConfig;
-use crate::participant::effect::{CompiledTrack, ParticipantEffect, TrackRole};
+use crate::participant::effect::{CompiledTrack, ParticipantEffect};
 use crate::participant::event::ParticipantSink;
-use crate::participant::reliable::ReliableChannels;
 use crate::participant::signaling;
 use crate::participant::{
     batcher::{AppendStatus, Batcher, NetworkEgress, OwnedPacketQueue},
     downstream::DownstreamAllocator,
     upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamAllocator},
 };
-use crate::rtp::RtpPacket;
+use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
@@ -64,9 +64,8 @@ struct IncomingRtpRoute {
     upstream_slot: usize,
     track_id: TrackId,
     /// The track's compiled fanout, resolved once when this route is cached
-    /// rather than per packet. `None` until the shard has bound one — see
-    /// [`ParticipantCore::bind_published_track`], which patches the cache so
-    /// the miss does not become permanent.
+    /// rather than per packet. `None` until the controller installs the track
+    /// image on this participant.
     fanout: Option<TrackKey>,
 }
 
@@ -170,11 +169,12 @@ pub struct TrackMapping {
     pub kind: MediaKind,
 }
 
-#[derive(Clone, Copy)]
-struct TrackBinding {
+struct TrackCatalogEntry {
+    participant_id: entity::ParticipantId,
     track_id: TrackId,
-    role: TrackRole,
 }
+
+type TrackCatalog = SecondaryMap<TrackKey, TrackCatalogEntry>;
 
 /// Routing is not allowed to mutate an `Rtc`; it only queues work for the
 /// participant's mutate-then-drain loop.
@@ -250,15 +250,35 @@ pub struct ParticipantConfig {
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
-    pub available_tracks: Vec<Track>,
 }
 
-pub enum ParticipantInput {
+pub enum ParticipantInput<'a> {
     Network {
         batch: net::RecvPacketBatch,
         source_shard: crate::id::ShardId,
     },
     Timeout(Instant),
+    Track {
+        key: TrackKey,
+        packet: &'a RtpPacket,
+        cache: Option<&'a TrackStreamCache>,
+    },
+    Data {
+        stream: UnreliableStreamKey,
+        packet: &'a [u8],
+    },
+    ReliableData {
+        stream: ReliableStreamKey,
+        frame: &'a [u8],
+    },
+    ReliableControl {
+        topic: &'a Topic,
+        bytes: &'a [u8],
+    },
+    Keyframe {
+        stream_id: StreamId,
+        kind: KeyframeRequestKind,
+    },
 }
 
 impl ParticipantConfig {
@@ -270,10 +290,10 @@ impl ParticipantConfig {
 
 pub struct ParticipantCore {
     // Hot: touched on every packet
-    pub rtc: Rtc,
-    pub udp_packets: OwnedPacketQueue,
-    pub tcp_batcher: Batcher,
-    pub downstream: DownstreamAllocator,
+    rtc: Rtc,
+    udp_packets: OwnedPacketQueue,
+    tcp_batcher: Batcher,
+    downstream: DownstreamAllocator,
     incoming_rtp_routes: UpstreamRouteTable,
     stream_writer: StreamWriter,
     pending_ingress: VecDeque<RecvPacketBatch>,
@@ -290,29 +310,18 @@ pub struct ParticipantCore {
     egress_guard: crate::rtp::egress_guard::EgressGuard,
 
     // Warm: touched per poll cycle
-    pub upstream: UpstreamAllocator,
-    pub participant_id: entity::ParticipantId,
+    upstream: UpstreamAllocator,
+    pub(crate) participant_id: entity::ParticipantId,
     last_keyframe_request: HashMap<StreamId, Instant>,
 
-    data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
-    data_pub_channels: HashMap<Topic, ChannelId>,
     /// The compiled stream a published channel forwards into, recorded by the
     /// shard once it has minted one. Keyed by channel so an arriving SCTP
     /// frame reaches its fanout without hashing a room, a publisher or a
     /// topic — the identity it would otherwise have to reassemble on every
     /// packet.
-    published_track_fanouts: HashMap<TrackId, TrackKey>,
-    subscribed_track_fanouts: HashMap<TrackId, TrackKey>,
-    compiled_tracks: SecondaryMap<TrackKey, TrackBinding>,
-    forwarding_data_channels: SecondaryMap<UnreliableStreamKey, ChannelId>,
-    forwarding_reliable_channels: SecondaryMap<ReliableStreamKey, ChannelId>,
-    data_pub_streams: HashMap<ChannelId, UnreliableStreamKey>,
-    reliable_pub_streams: HashMap<ChannelId, ReliableStreamKey>,
-    reliable_sub_streams: HashMap<ChannelId, ReliableStreamKey>,
-    data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
-    reliable_channels: ReliableChannels,
-    pending_data_pub_streams: HashMap<Topic, UnreliableStreamKey>,
-    pending_reliable_pub_streams: HashMap<Topic, ReliableStreamKey>,
+    track_keys: HashMap<TrackId, TrackKey>,
+    catalog: TrackCatalog,
+    data: DataState,
 
     /// Attributes str0m's own logs to this participant, for the simulator only.
     ///
@@ -333,8 +342,8 @@ pub struct ParticipantCore {
     disconnect_reason: Option<DisconnectReason>,
     signaling: Signaling,
     last_slow_poll: Instant,
-    pub room_id: entity::RoomId,
-    pub shard_id: ShardId,
+    pub(crate) room_id: entity::RoomId,
+    pub(crate) shard_id: ShardId,
 }
 
 impl ParticipantCore {
@@ -343,32 +352,8 @@ impl ParticipantCore {
     /// Patches the per-SSRC route cache as well as the index: a route cached
     /// before the shard minted the fanout would otherwise keep reporting
     /// `None` for the life of the stream, and the miss would never heal.
-    pub(crate) fn bind_published_track(&mut self, track_id: TrackId, fanout: TrackKey) {
-        self.published_track_fanouts.insert(track_id, fanout);
-        self.incoming_rtp_routes.bind_fanout(track_id, fanout);
-    }
-
-    pub(crate) fn bind_subscribed_data_stream(
-        &mut self,
-        stream: UnreliableStreamKey,
-        channel: ChannelId,
-    ) {
-        self.forwarding_data_channels.insert(stream, channel);
-    }
-
-    pub(crate) fn bind_subscribed_reliable_stream(
-        &mut self,
-        stream: ReliableStreamKey,
-        channel: ChannelId,
-    ) {
-        self.forwarding_reliable_channels.insert(stream, channel);
-    }
-
     fn track_fanout(&self, track_id: TrackId) -> Option<TrackKey> {
-        self.published_track_fanouts
-            .get(&track_id)
-            .or_else(|| self.subscribed_track_fanouts.get(&track_id))
-            .copied()
+        self.track_keys.get(&track_id).copied()
     }
 
     /// Record the stream a published data topic forwards into.
@@ -378,27 +363,22 @@ impl ParticipantCore {
     /// frame on that channel falls back to a room-scoped lookup; afterwards
     /// the key rides on the event and nothing on the packet path hashes a
     /// name.
-    pub(crate) fn bind_published_data_stream(
-        &mut self,
-        topic: &Topic,
-        stream: UnreliableStreamKey,
-    ) {
-        if let Some(&channel) = self.data_pub_channels.get(topic) {
-            self.data_pub_streams.insert(channel, stream);
+    fn bind_published_data_stream(&mut self, topic: &Topic, stream: UnreliableStreamKey) {
+        if let Some(&channel) = self.data.published_channels.get(topic) {
+            self.data.published_streams.insert(channel, stream);
         } else {
-            self.pending_data_pub_streams.insert(topic.clone(), stream);
+            self.data
+                .pending_published_streams
+                .insert(topic.clone(), stream);
         }
     }
 
-    pub(crate) fn bind_published_reliable_stream(
-        &mut self,
-        topic: &Topic,
-        stream: ReliableStreamKey,
-    ) {
-        if let Some(channel) = self.reliable_channels.publisher_channel(topic) {
-            self.reliable_pub_streams.insert(channel, stream);
+    fn bind_published_reliable_stream(&mut self, topic: &Topic, stream: ReliableStreamKey) {
+        if let Some(channel) = self.data.reliable.publisher_channel(topic) {
+            self.data.reliable_published_streams.insert(channel, stream);
         } else {
-            self.pending_reliable_pub_streams
+            self.data
+                .pending_reliable_streams
                 .insert(topic.clone(), stream);
         }
     }
@@ -419,7 +399,7 @@ impl ParticipantCore {
         let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
         let now = Instant::now();
-        let mut p = Self {
+        Self {
             pending_ingress: VecDeque::new(),
             pending_timeout: None,
             pending_fanout: VecDeque::new(),
@@ -450,29 +430,15 @@ impl ParticipantCore {
             signaling,
             last_slow_poll: now,
             last_keyframe_request: HashMap::new(),
-            data_topic_channels: HashMap::new(),
-            published_track_fanouts: HashMap::new(),
-            subscribed_track_fanouts: HashMap::new(),
-            compiled_tracks: SecondaryMap::new(),
-            forwarding_data_channels: SecondaryMap::new(),
-            forwarding_reliable_channels: SecondaryMap::new(),
-            data_pub_streams: HashMap::new(),
-            reliable_pub_streams: HashMap::new(),
-            reliable_sub_streams: HashMap::new(),
-            data_pub_channels: HashMap::new(),
-            data_sub_channels: HashMap::new(),
-            reliable_channels: ReliableChannels::new(),
-            pending_data_pub_streams: HashMap::new(),
-            pending_reliable_pub_streams: HashMap::new(),
+            track_keys: HashMap::new(),
+            catalog: SecondaryMap::new(),
+            data: DataState::new(),
             room_id: cfg.room_id,
             shard_id,
-        };
-
-        p.on_tracks_published(&cfg.available_tracks);
-        p
+        }
     }
 
-    pub(crate) fn log_ctx(&self) -> LogCtx {
+    fn log_ctx(&self) -> LogCtx {
         LogCtx {
             room_id: self.room_id,
             participant_id: self.participant_id,
@@ -485,71 +451,159 @@ impl ParticipantCore {
                 self.signaling.apply_participants(added, removed);
             }
             ParticipantEffect::TrackInstalled(compiled) => self.install_track(compiled),
-            ParticipantEffect::TrackRemoved { key, role, kind } => {
-                self.remove_compiled_track(key, role, kind);
+            ParticipantEffect::TrackRemoved(key) => self.remove_compiled_track(key),
+            ParticipantEffect::DataPublished { topic, stream } => {
+                self.bind_published_data_stream(&topic, stream);
+            }
+            ParticipantEffect::ReliableDataPublished { topic, stream } => {
+                self.bind_published_reliable_stream(&topic, stream);
+            }
+            ParticipantEffect::DataSubscribed { stream, channel } => {
+                self.data.forwarding.insert(stream, channel);
+            }
+            ParticipantEffect::ReliableDataSubscribed { stream, channel } => {
+                self.data.reliable_forwarding.insert(stream, channel);
             }
         }
     }
 
     fn install_track(&mut self, compiled: CompiledTrack) {
-        let track_id = compiled.track.meta.id;
+        let track_id = compiled.track.id();
+        let participant_id = compiled.track.meta().origin;
+        let key = compiled.key;
         debug_assert_eq!(track_id.kind(), compiled.kind());
-        if let Some(previous) = self.compiled_tracks.get(compiled.key).copied() {
+        if let Some(previous) = self.catalog.get(key) {
             debug_assert_eq!(previous.track_id, track_id);
-            debug_assert_eq!(previous.role, compiled.role);
+            debug_assert_eq!(previous.participant_id, participant_id);
             return;
         }
-        let previous = self.compiled_tracks.insert(
-            compiled.key,
-            TrackBinding {
+        let previous = self.catalog.insert(
+            key,
+            TrackCatalogEntry {
+                participant_id,
                 track_id,
-                role: compiled.role,
             },
         );
         debug_assert!(previous.is_none(), "a TrackKey must be installed once");
-        match compiled.role {
-            TrackRole::Published => {
-                self.published_track_fanouts.insert(track_id, compiled.key);
-                self.incoming_rtp_routes.bind_fanout(track_id, compiled.key);
-            }
-            TrackRole::Subscribed => {
-                self.subscribed_track_fanouts.insert(track_id, compiled.key);
-                if track_id.kind() != TrackKind::Data {
-                    self.on_tracks_published(std::slice::from_ref(&compiled.track));
-                }
-            }
+        let previous = self.track_keys.insert(track_id, key);
+        debug_assert!(previous.is_none() || previous == Some(key));
+        if participant_id == self.participant_id {
+            self.incoming_rtp_routes.bind_fanout(track_id, key);
+        } else if track_id.kind() != TrackKind::Data {
+            self.on_track_published(key, compiled.track);
         }
     }
 
-    fn remove_compiled_track(&mut self, key: TrackKey, role: TrackRole, kind: TrackKind) {
-        let Some(binding) = self.compiled_tracks.remove(key) else {
+    fn remove_compiled_track(&mut self, key: TrackKey) {
+        let Some(binding) = self.catalog.remove(key) else {
             return;
         };
-        debug_assert_eq!(binding.role, role);
-        debug_assert_eq!(binding.track_id.kind(), kind);
-        match role {
-            TrackRole::Published => {
-                self.published_track_fanouts.remove(&binding.track_id);
-                self.incoming_rtp_routes.remove_track(binding.track_id);
-            }
-            TrackRole::Subscribed => {
-                if self.subscribed_track_fanouts.get(&binding.track_id) == Some(&key) {
-                    self.subscribed_track_fanouts.remove(&binding.track_id);
-                }
-                if kind != TrackKind::Data {
-                    let _ = self.on_tracks_unpublished(std::slice::from_ref(&binding.track_id));
-                }
-            }
+        if self.track_keys.get(&binding.track_id) == Some(&key) {
+            let _ = self.track_keys.remove(&binding.track_id);
+        }
+        if binding.participant_id == self.participant_id {
+            self.incoming_rtp_routes.remove_track(binding.track_id);
+        } else if binding.track_id.kind() != TrackKind::Data {
+            let _ = self.on_tracks_unpublished(std::slice::from_ref(&binding.track_id));
         }
     }
 
-    pub fn input(&mut self, input: ParticipantInput) {
+    pub fn input<'a>(&mut self, input: ParticipantInput<'a>) {
         match input {
             ParticipantInput::Network {
                 batch,
                 source_shard,
             } => self.on_ingress(batch, source_shard),
             ParticipantInput::Timeout(now) => self.on_timeout(now),
+            ParticipantInput::Track { key, packet, cache } => {
+                self.on_track_packet(key, packet, cache);
+            }
+            ParticipantInput::Data { stream, packet } => {
+                let Some(&channel) = self.data.forwarding.get(stream) else {
+                    debug_assert!(false, "a data forwarding plan must have a receiver binding");
+                    return;
+                };
+                self.enqueue_fanout(PendingFanout::Sctp {
+                    channel,
+                    pkt: packet.to_vec(),
+                });
+            }
+            ParticipantInput::ReliableData { stream, frame } => {
+                let Some(&channel) = self.data.reliable_forwarding.get(stream) else {
+                    debug_assert!(
+                        false,
+                        "a reliable forwarding plan must have a receiver binding"
+                    );
+                    return;
+                };
+                self.enqueue_fanout(PendingFanout::ReliableSctp {
+                    channel,
+                    frame: frame.to_vec(),
+                });
+            }
+            ParticipantInput::ReliableControl { topic, bytes } => {
+                self.enqueue_fanout(PendingFanout::ReliableControl {
+                    topic: topic.clone(),
+                    bytes: bytes.to_vec(),
+                });
+            }
+            ParticipantInput::Keyframe { stream_id, kind } => {
+                self.enqueue_fanout(PendingFanout::Keyframe { stream_id, kind });
+            }
+        }
+    }
+
+    fn on_track_packet(
+        &mut self,
+        key: TrackKey,
+        packet: &RtpPacket,
+        cache: Option<&TrackStreamCache>,
+    ) {
+        let Some(entry) = self.catalog.get(key) else {
+            debug_assert!(false, "a TrackPacket must target an installed track");
+            return;
+        };
+        if entry.participant_id == self.participant_id {
+            debug_assert!(false, "a forwarding plan must target a remote track");
+            return;
+        }
+        if entry.participant_id == self.participant_id {
+            debug_assert!(false, "a participant must never receive its own track");
+            return;
+        }
+        let kind = entry.track_id.kind();
+        let participant_id = entry.participant_id;
+        let track_id = entry.track_id;
+        match kind {
+            TrackKind::Video => {
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_forwarded_media_for(
+                    self.participant_id,
+                    packet.payload.len() as u64,
+                );
+                let promoted = self.downstream.on_forward_rtp(
+                    key,
+                    packet.arrival_ts,
+                    cache,
+                    &mut self.stream_writer,
+                );
+                if promoted {
+                    self.signaling.mark_assignments_dirty();
+                }
+            }
+            TrackKind::Audio => {
+                debug_assert!(cache.is_none(), "audio forwarding has no video cache");
+                let origin = crate::entity::AudioOrigin {
+                    participant: participant_id,
+                    track: track_id,
+                };
+                self.downstream
+                    .on_forward_audio_rtp(origin, packet, &mut self.stream_writer);
+                if self.downstream.take_audio_speakers_changed() {
+                    self.signaling.mark_assignments_dirty();
+                }
+            }
+            TrackKind::Data => debug_assert!(false, "data tracks carry bytes, not RTP"),
         }
     }
 
@@ -584,155 +638,24 @@ impl ParticipantCore {
         self.pending_timeout = Some(now);
     }
 
-    #[inline]
-    /// A track's latest measurements, pushed by the shard when they change.
-    pub fn update_layer_states(
-        &mut self,
-        slot: crate::keys::DownstreamSlotKey,
-        states: &crate::track::TrackStates,
-    ) {
-        self.downstream.update_layer_states_slot(slot, states);
-    }
-
-    pub fn on_forward_rtp(
-        &mut self,
-        slot: crate::keys::DownstreamSlotKey,
-        track: crate::entity::TrackId,
-        pkt: &RtpPacket,
-        cache: Option<&crate::rtp::cache::TrackStreamCache>,
-    ) {
-        // Observation for the simulator: media payload actually forwarded to this subscriber,
-        // to compare against what it received (i.e. how much of the link was video vs overhead).
-        // Compiles out without the `sim` feature.
-        #[cfg(feature = "sim")]
-        crate::sim_metrics::record_forwarded_media_for(
-            self.participant_id,
-            pkt.payload.len() as u64,
+    fn on_track_published(&mut self, key: TrackKey, track: Track) {
+        if track.meta().origin == self.participant_id {
+            debug_assert!(false, "the controller must not install a loopback track");
+            return;
+        }
+        plog_info!(
+            self.log_ctx(),
+            track = %track.id(),
+            origin = %track.meta().origin,
+            "participant received published track"
         );
-        let promoted =
-            self.downstream
-                .on_forward_rtp_slot(slot, track, pkt, cache, &mut self.stream_writer);
-        if promoted {
-            self.signaling.mark_assignments_dirty();
-        }
-    }
-
-    pub fn on_forward_rtp_fanout(
-        &mut self,
-        fanout: TrackKey,
-        track: TrackId,
-        pkt: &RtpPacket,
-        cache: Option<&crate::rtp::cache::TrackStreamCache>,
-    ) {
-        let Some(binding) = self.compiled_tracks.get(fanout).copied() else {
-            debug_assert!(false, "a forwarding plan must have a receiver binding");
-            return;
-        };
-        debug_assert_eq!(
-            binding.track_id, track,
-            "a track route cannot change its identity"
-        );
-        debug_assert_eq!(binding.role, TrackRole::Subscribed);
-        let Some(slot) = self.downstream.slot_for_track(&track) else {
-            debug_assert!(
-                false,
-                "a forwarding plan must have an assigned receiver slot"
-            );
-            return;
-        };
-        self.on_forward_rtp(slot, track, pkt, cache);
-    }
-
-    #[inline]
-    pub fn on_forward_audio_rtp(&mut self, origin: crate::entity::AudioOrigin, pkt: &RtpPacket) {
-        self.downstream
-            .on_forward_audio_rtp(origin, pkt, &mut self.stream_writer);
-        if self.downstream.take_audio_speakers_changed() {
-            self.signaling.mark_assignments_dirty();
-        }
-    }
-
-    pub fn update_layer_states_fanout(
-        &mut self,
-        fanout: TrackKey,
-        states: &crate::track::TrackStates,
-    ) {
-        let Some(binding) = self.compiled_tracks.get(fanout).copied() else {
-            debug_assert!(false, "a forwarding plan must have a receiver binding");
-            return;
-        };
-        debug_assert_eq!(binding.role, TrackRole::Subscribed);
-        let Some(slot) = self.downstream.slot_for_track(&binding.track_id) else {
-            debug_assert!(
-                false,
-                "a forwarding plan must have an assigned receiver slot"
-            );
-            return;
-        };
-        self.update_layer_states(slot, states);
-    }
-
-    #[inline]
-    pub fn on_forward_sctp(&mut self, channel: ChannelId, pkt: &[u8]) {
-        self.enqueue_fanout(PendingFanout::Sctp {
-            channel,
-            pkt: pkt.to_vec(),
-        });
-    }
-
-    pub fn on_forward_sctp_stream(&mut self, stream: UnreliableStreamKey, pkt: &[u8]) {
-        let Some(&channel) = self.forwarding_data_channels.get(stream) else {
-            debug_assert!(false, "a data forwarding plan must have a receiver binding");
-            return;
-        };
-        self.on_forward_sctp(channel, pkt);
-    }
-
-    pub fn on_forward_reliable_sctp(&mut self, channel: ChannelId, frame: &[u8]) {
-        self.enqueue_fanout(PendingFanout::ReliableSctp {
-            channel,
-            frame: frame.to_vec(),
-        });
-    }
-
-    pub fn on_forward_reliable_sctp_stream(&mut self, stream: ReliableStreamKey, frame: &[u8]) {
-        let Some(&channel) = self.forwarding_reliable_channels.get(stream) else {
-            debug_assert!(
-                false,
-                "a reliable forwarding plan must have a receiver binding"
-            );
-            return;
-        };
-        self.on_forward_reliable_sctp(channel, frame);
-    }
-
-    pub fn on_deliver_reliable_control(&mut self, topic: &Topic, bytes: &[u8]) {
-        self.enqueue_fanout(PendingFanout::ReliableControl {
-            topic: topic.clone(),
-            bytes: bytes.to_vec(),
-        });
-    }
-
-    pub fn on_tracks_published(&mut self, tracks: &[Track]) {
-        for track in tracks {
-            if track.meta.origin == self.participant_id {
-                continue;
-            }
-
-            plog_info!(
-                self.log_ctx(),
-                track = %track.meta.id,
-                origin = %track.meta.origin,
-                "participant received published track"
-            );
-            self.downstream.add_track(track.clone());
-        }
+        self.downstream.install_track(key, track);
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
         self.signaling.reconcile(&mut self.downstream);
     }
 
-    pub fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
+    fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
         let mut removed = false;
         for track_id in tracks {
             removed |= self.downstream.remove_track(track_id);
@@ -745,14 +668,6 @@ impl ParticipantCore {
         removed
     }
 
-    pub fn ufrag(&mut self) -> String {
-        self.rtc.direct_api().local_ice_credentials().ufrag
-    }
-
-    pub fn disconnect_reason(&self) -> Option<&DisconnectReason> {
-        self.disconnect_reason.as_ref()
-    }
-
     fn handle_keyframe_request_now(&mut self, key: KeyframeRequest) {
         let ctx = self.log_ctx();
         let mut api = self.rtc.direct_api();
@@ -762,14 +677,6 @@ impl ParticipantCore {
         } else {
             plog_warn!(ctx, ?key, "stream not found for keyframe request");
         }
-    }
-
-    pub fn handle_remote_keyframe_request(
-        &mut self,
-        stream_id: StreamId,
-        kind: KeyframeRequestKind,
-    ) {
-        self.enqueue_fanout(PendingFanout::Keyframe { stream_id, kind });
     }
 
     fn enqueue_fanout(&mut self, work: PendingFanout) {
@@ -810,34 +717,11 @@ impl ParticipantCore {
         });
     }
 
-    /// Hand the shard any measurement that has moved.
-    ///
-    /// On the fast path as well as the slow poll, because `process_packet`
-    /// flips activity and health per packet and the allocator acts on those.
-    fn publish_changed_stats(&mut self, events: &mut impl ParticipantSink) {
-        for (track_id, states) in self.upstream.take_changed_stats() {
-            if track_id.kind() != TrackKind::Video {
-                continue;
-            }
-            events.publish_track_stats(
-                track_id,
-                self.published_track_fanouts.get(&track_id).copied(),
-                states,
-            );
-        }
-    }
-
     fn poll_slow(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         // Measure before allocating: the monitors produce this tick's numbers,
         // and running the allocator first would decide against last tick's.
         self.upstream.poll_slow(now);
-        self.publish_changed_stats(events);
-        let assignments_changed = self.downstream.poll_slow(
-            now,
-            &mut self.rtc.bwe(),
-            events,
-            &self.subscribed_track_fanouts,
-        );
+        let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         if assignments_changed {
             self.signaling.mark_assignments_dirty();
         }
@@ -892,7 +776,7 @@ impl ParticipantCore {
                 self.write_to_data_channel(channel, &frame);
             }
             PendingRtcMutation::ReliableControl { topic, bytes } => {
-                if let Some(cid) = self.reliable_channels.publisher_channel(&topic) {
+                if let Some(cid) = self.data.reliable.publisher_channel(&topic) {
                     self.write_to_data_channel(cid, &bytes);
                 }
             }
@@ -907,7 +791,8 @@ impl ParticipantCore {
     fn write_to_data_channel(&mut self, cid: ChannelId, pkt: &[u8]) {
         let ctx = self.log_ctx();
         let topic = self
-            .data_topic_channels
+            .data
+            .topic_channels
             .get(&cid)
             .map(|channel| channel.topic.clone());
         let Some(mut ch) = self.rtc.channel(cid) else {
@@ -1019,11 +904,7 @@ impl ParticipantCore {
         stream.write_rtp(rtp);
     }
 
-    pub(crate) fn poll(
-        &mut self,
-        now: Instant,
-        events: &mut impl ParticipantSink,
-    ) -> Option<Instant> {
+    pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
         // A disconnect can be observed while work for this participant is still
         // queued, so poll can be re-entered after it has already exited.
         if self.exited {
@@ -1074,8 +955,6 @@ impl ParticipantCore {
                 self.rtc_needs_drain = true;
                 continue;
             }
-
-            self.publish_changed_stats(events);
 
             if now.saturating_duration_since(self.last_slow_poll) >= SLOW_POLL_INTERVAL {
                 self.poll_slow(now, events);
@@ -1136,8 +1015,7 @@ impl ParticipantCore {
                 if assignments_changed {
                     self.signaling.mark_assignments_dirty();
                 }
-                self.downstream
-                    .reconcile_routes(now, events, &self.subscribed_track_fanouts);
+                self.downstream.reconcile_routes(now, events);
                 self.rtc_needs_drain = true;
                 continue;
             }
@@ -1326,38 +1204,40 @@ impl ParticipantCore {
 
                     DataTrackIntent::UserTopic(e) => {
                         plog_info!(self.log_ctx(), "{} is opened", e);
-                        if let Some(previous) = self.data_topic_channels.remove(&cid) {
+                        if let Some(previous) = self.data.topic_channels.remove(&cid) {
                             self.release_data_topic_channel(cid, previous, events);
                         }
 
-                        if self.data_topic_channels.len() >= MAX_DATA_TOPIC_CHANNELS {
+                        if self.data.topic_channels.len() >= MAX_DATA_TOPIC_CHANNELS {
                             self.disconnect(DisconnectReason::TooManyDataTopicChannels);
                             return;
                         }
 
                         if e.lane == DataLane::Reliable {
-                            if self.reliable_channels.open(cid, &e, events).is_err() {
+                            if self.data.reliable.open(cid, &e, events).is_err() {
                                 self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
                                 return;
                             }
                             if e.direction == DataTrackDirection::Publish
                                 && let Some(stream) =
-                                    self.pending_reliable_pub_streams.remove(&e.topic)
+                                    self.data.pending_reliable_streams.remove(&e.topic)
                             {
-                                self.reliable_pub_streams.insert(cid, stream);
+                                self.data.reliable_published_streams.insert(cid, stream);
                             }
-                            self.data_topic_channels.insert(cid, e);
+                            self.data.topic_channels.insert(cid, e);
                             return;
                         }
 
                         let duplicate = match e.direction {
                             DataTrackDirection::Publish => self
-                                .data_pub_channels
+                                .data
+                                .published_channels
                                 .get(&e.topic)
                                 .copied()
                                 .filter(|existing| *existing != cid),
                             DataTrackDirection::Subscribe => self
-                                .data_sub_channels
+                                .data
+                                .subscribed_channels
                                 .get(&(e.topic.clone(), e.scope))
                                 .copied()
                                 .filter(|existing| *existing != cid),
@@ -1365,10 +1245,12 @@ impl ParticipantCore {
                         let conflicting_subscribe = e.direction == DataTrackDirection::Subscribe
                             && match e.scope {
                                 Some(_) => self
-                                    .data_sub_channels
+                                    .data
+                                    .subscribed_channels
                                     .contains_key(&(e.topic.clone(), None)),
                                 None => self
-                                    .data_sub_channels
+                                    .data
+                                    .subscribed_channels
                                     .keys()
                                     .any(|(topic, _)| *topic == e.topic),
                             };
@@ -1377,18 +1259,20 @@ impl ParticipantCore {
                             return;
                         }
 
-                        self.data_topic_channels.insert(cid, e.clone());
+                        self.data.topic_channels.insert(cid, e.clone());
                         match e.direction {
                             DataTrackDirection::Publish => {
-                                self.data_pub_channels.insert(e.topic.clone(), cid);
-                                if let Some(stream) = self.pending_data_pub_streams.remove(&e.topic)
+                                self.data.published_channels.insert(e.topic.clone(), cid);
+                                if let Some(stream) =
+                                    self.data.pending_published_streams.remove(&e.topic)
                                 {
-                                    self.data_pub_streams.insert(cid, stream);
+                                    self.data.published_streams.insert(cid, stream);
                                 }
                                 events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
-                                self.data_sub_channels
+                                self.data
+                                    .subscribed_channels
                                     .insert((e.topic.clone(), e.scope), cid);
                                 events.subscribe_data_topic(e.topic, e.scope, cid);
                             }
@@ -1397,7 +1281,7 @@ impl ParticipantCore {
                 }
             }
             Event::ChannelClose(cid) => {
-                let Some(ch) = self.data_topic_channels.remove(&cid) else {
+                let Some(ch) = self.data.topic_channels.remove(&cid) else {
                     return;
                 };
                 plog_info!(self.log_ctx(), "{} is closed", ch.topic);
@@ -1418,21 +1302,21 @@ impl ParticipantCore {
                     return;
                 }
 
-                if let Some(ch) = self.data_topic_channels.get(&data.id)
+                if let Some(ch) = self.data.topic_channels.get(&data.id)
                     && data.binary
                 {
                     match (ch.lane, ch.direction) {
                         (DataLane::Realtime, DataTrackDirection::Publish) => {
                             events.publish_sctp(
                                 ch.topic.clone(),
-                                self.data_pub_streams.get(&data.id).copied(),
+                                self.data.published_streams.get(&data.id).copied(),
                                 data.data.to_vec(),
                             );
                         }
                         (DataLane::Reliable, DataTrackDirection::Publish) => {
                             events.publish_reliable_sctp(
                                 ch.topic.clone(),
-                                self.reliable_pub_streams.get(&data.id).copied(),
+                                self.data.reliable_published_streams.get(&data.id).copied(),
                                 data.data.to_vec(),
                             );
                         }
@@ -1451,7 +1335,7 @@ impl ParticipantCore {
                             events.forward_reliable_control(
                                 publisher,
                                 ch.topic.clone(),
-                                self.reliable_sub_streams.get(&data.id).copied(),
+                                self.data.reliable_subscribed_streams.get(&data.id).copied(),
                                 data.data.to_vec(),
                             );
                         }
@@ -1495,8 +1379,7 @@ impl ParticipantCore {
             }
             let track = descriptor.clone();
             *in_topology = true;
-            let states = self.upstream.layer_states_for(track.meta.id);
-            events.publish_track(track, states);
+            events.publish_track(track);
             return;
         }
 
@@ -1506,7 +1389,7 @@ impl ParticipantCore {
         if !*in_topology {
             return;
         }
-        let track_id = descriptor.meta.id;
+        let track_id = descriptor.id();
         *in_topology = false;
         events.unpublish_track(track_id);
     }
@@ -1657,7 +1540,7 @@ impl ParticipantCore {
                 rid,
                 upstream_slot,
                 track_id,
-                fanout: self.published_track_fanouts.get(&track_id).copied(),
+                fanout: self.track_keys.get(&track_id).copied(),
             };
             self.incoming_rtp_routes.insert(route);
             route
@@ -1678,27 +1561,26 @@ impl ParticipantCore {
             &mut rtp,
             sr,
         ) {
-            let stream_id: StreamId = (route.track_id, route.rid);
-            events.publish_rtp(stream_id, route.fanout, rtp);
+            events.publish_rtp(route.fanout, rtp);
         } else {
             self.incoming_rtp_routes.remove(ssrc);
         }
     }
 
     fn cleanup_data_topics(&mut self, events: &mut impl ParticipantSink) {
-        let channels: Vec<_> = self.data_topic_channels.drain().collect();
+        let channels: Vec<_> = self.data.topic_channels.drain().collect();
 
         for (cid, ch) in channels {
             self.release_data_topic_channel(cid, ch, events);
         }
 
-        self.data_pub_channels.clear();
-        self.data_sub_channels.clear();
-        self.reliable_channels.clear();
-        self.pending_data_pub_streams.clear();
-        self.pending_reliable_pub_streams.clear();
-        self.reliable_pub_streams.clear();
-        self.reliable_sub_streams.clear();
+        self.data.published_channels.clear();
+        self.data.subscribed_channels.clear();
+        self.data.reliable.clear();
+        self.data.pending_published_streams.clear();
+        self.data.pending_reliable_streams.clear();
+        self.data.reliable_published_streams.clear();
+        self.data.reliable_subscribed_streams.clear();
     }
 
     fn release_data_topic_channel(
@@ -1708,31 +1590,34 @@ impl ParticipantCore {
         events: &mut impl ParticipantSink,
     ) {
         if ch.lane == DataLane::Reliable {
-            self.reliable_pub_streams.remove(&cid);
-            self.reliable_sub_streams.remove(&cid);
+            self.data.reliable_published_streams.remove(&cid);
+            self.data.reliable_subscribed_streams.remove(&cid);
             if ch.direction == DataTrackDirection::Publish {
-                self.pending_reliable_pub_streams.remove(&ch.topic);
+                self.data.pending_reliable_streams.remove(&ch.topic);
             }
-            self.reliable_channels.close(ch, events);
+            self.data.reliable.close(ch, events);
             return;
         }
 
         match ch.direction {
             DataTrackDirection::Publish => {
-                self.data_pub_streams.remove(&cid);
-                self.pending_data_pub_streams.remove(&ch.topic);
-                self.data_pub_channels.remove(&ch.topic);
+                self.data.published_streams.remove(&cid);
+                self.data.pending_published_streams.remove(&ch.topic);
+                self.data.published_channels.remove(&ch.topic);
                 events.unpublish_data_topic(ch.topic);
             }
             DataTrackDirection::Subscribe => {
-                let removed = self.data_sub_channels.remove(&(ch.topic.clone(), ch.scope));
+                let removed = self
+                    .data
+                    .subscribed_channels
+                    .remove(&(ch.topic.clone(), ch.scope));
                 debug_assert!(removed.is_some());
                 events.unsubscribe_data_topic(ch.topic, ch.scope, cid);
             }
         }
     }
 
-    pub fn disconnect(&mut self, reason: DisconnectReason) {
+    fn disconnect(&mut self, reason: DisconnectReason) {
         if self.disconnect_reason.is_some() {
             return;
         }

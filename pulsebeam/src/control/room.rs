@@ -8,7 +8,7 @@ use crate::track::Track;
 
 pub struct Room {
     pub room_id: RoomId,
-    participants: IndexMap<ParticipantId, Vec<Track>>,
+    participants: IndexMap<ParticipantId, IndexMap<TrackId, Track>>,
     participants_by_shard: HashMap<ShardId, IndexSet<ParticipantId>>,
 }
 
@@ -22,7 +22,7 @@ impl Room {
     }
 
     pub fn add_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
-        let previous = self.participants.insert(*participant_id, Vec::new());
+        let previous = self.participants.insert(*participant_id, IndexMap::new());
         debug_assert!(
             previous.is_none(),
             "a room cannot contain a participant twice"
@@ -51,11 +51,13 @@ impl Room {
     }
 
     pub(super) fn add_track(&mut self, track: Track) {
-        let tracks = self.participants.entry(track.meta.origin).or_default();
-
-        if !tracks.iter().any(|t| t.meta.id == track.meta.id) {
-            tracks.push(track);
-        }
+        let tracks = self.participants.entry(track.meta().origin).or_default();
+        let track_id = track.id();
+        let previous = tracks.insert(track_id, track);
+        debug_assert!(
+            previous.is_none(),
+            "a participant cannot publish a track twice"
+        );
     }
 
     pub(super) fn remove_track(&mut self, origin: &ParticipantId, track_id: &TrackId) -> bool {
@@ -63,9 +65,7 @@ impl Room {
             return false;
         };
 
-        let before = tracks.len();
-        tracks.retain(|t| t.meta.id != *track_id);
-        before != tracks.len()
+        tracks.shift_remove(track_id).is_some()
     }
 
     pub fn recipient_shard_ids(
@@ -104,9 +104,5 @@ impl Room {
             .get(&shard_id)
             .into_iter()
             .flat_map(IndexSet::iter)
-    }
-
-    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
-        self.participants.values().flatten()
     }
 }

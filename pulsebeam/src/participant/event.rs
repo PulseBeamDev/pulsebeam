@@ -1,11 +1,13 @@
 use crate::entity::{ParticipantId, TrackId};
 use crate::keys::DownstreamSlotKey;
+use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::rtp::RtpPacket;
-use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
-use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
+#[cfg(test)]
+use crate::track::StreamId;
+use crate::track::{Topic, Track, TrackLayer, TrackMeta};
 use str0m::channel::ChannelId;
 
-pub(crate) trait ParticipantSink {
+pub trait ParticipantSink {
     fn connected(
         &mut self,
         source: std::net::SocketAddr,
@@ -14,14 +16,7 @@ pub(crate) trait ParticipantSink {
     );
     fn subscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey);
     fn unsubscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey);
-    fn publish_track(&mut self, track: Track, states: crate::track::TrackStates);
-    /// A published track's latest measurements. Sent, not shared.
-    fn publish_track_stats(
-        &mut self,
-        track_id: crate::entity::TrackId,
-        fanout: Option<TrackKey>,
-        states: crate::track::TrackStates,
-    );
+    fn publish_track(&mut self, track: Track);
     fn unpublish_track(&mut self, track_id: TrackId);
     fn subscribe_data_topic(
         &mut self,
@@ -40,7 +35,7 @@ pub(crate) trait ParticipantSink {
     fn request_keyframe(&mut self, layer: &TrackLayer, fanout: Option<TrackKey>);
     fn exit(&mut self);
 
-    fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<TrackKey>, pkt: RtpPacket);
+    fn publish_rtp(&mut self, fanout: Option<TrackKey>, pkt: RtpPacket);
     fn publish_sctp(&mut self, topic: Topic, stream: Option<UnreliableStreamKey>, pkt: Vec<u8>);
 
     fn publish_reliable_data_topic(&mut self, topic: Topic);
@@ -80,7 +75,7 @@ pub mod test_utils {
         pub unpublish_data_topic_calls: Vec<Topic>,
         pub request_keyframe_calls: Vec<(StreamId, crate::entity::ParticipantId)>,
         pub exit_count: usize,
-        pub publish_rtp_calls: Vec<StreamId>,
+        pub publish_rtp_calls: Vec<TrackKey>,
         pub publish_sctp_calls: Vec<Topic>,
     }
 
@@ -111,16 +106,8 @@ pub mod test_utils {
             self.unsubscribe_calls.push((track, slot));
         }
 
-        fn publish_track_stats(
-            &mut self,
-            _track_id: crate::entity::TrackId,
-            _fanout: Option<TrackKey>,
-            _states: crate::track::TrackStates,
-        ) {
-        }
-
-        fn publish_track(&mut self, track: Track, _states: crate::track::TrackStates) {
-            self.publish_track_calls.push(track.meta.id);
+        fn publish_track(&mut self, track: Track) {
+            self.publish_track_calls.push(track.id());
         }
 
         fn unpublish_track(&mut self, track_id: TrackId) {
@@ -162,8 +149,10 @@ pub mod test_utils {
             self.exit_count = self.exit_count.saturating_add(1);
         }
 
-        fn publish_rtp(&mut self, stream_id: StreamId, _fanout: Option<TrackKey>, _pkt: RtpPacket) {
-            self.publish_rtp_calls.push(stream_id);
+        fn publish_rtp(&mut self, fanout: Option<TrackKey>, _pkt: RtpPacket) {
+            if let Some(key) = fanout {
+                self.publish_rtp_calls.push(key);
+            }
         }
 
         fn publish_sctp(

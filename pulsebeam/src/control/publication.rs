@@ -93,7 +93,6 @@ pub(crate) enum Media {
     Video {
         publication: crate::track::Track,
         encodings: Vec<Option<str0m::media::Rid>>,
-        states: crate::track::TrackStates,
     },
     Audio,
     Data {

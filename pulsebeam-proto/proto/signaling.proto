@@ -110,12 +110,9 @@ message AudioBindings { repeated AudioBinding items = 1; }
 
 // The room as this subscriber sees it.
 //
-// The roster is a log: a participant or publication enters once and leaves once,
-// so it is carried as added/removed rather than resent. The bindings are bounded
-// by the subscriber's negotiated slot count, so they are sent whole and there is
-// nothing to reconcile — no sequence number, no snapshot flag, no removal list,
-// and no resync request. The signaling channel is reliable and ordered, so gaps
-// cannot happen and detecting them was never earning its keep.
+// Ordinary updates carry additions/removals. A full snapshot sets snapshot=true
+// and includes the complete current roster and publication set so a receiver can
+// recover from a lost update without a request or acknowledgment.
 message ServerState {
   repeated Participant participants_added = 1;
   repeated string participants_removed = 2;   // participant ids
@@ -123,6 +120,7 @@ message ServerState {
   repeated string publications_removed = 4;   // track ids
   optional VideoBindings video = 5;
   optional AudioBindings audio = 6;
+  bool snapshot = 7;
 }
 
 // ========================================================================

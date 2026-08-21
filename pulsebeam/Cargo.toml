@@ -18,6 +18,7 @@ workspace = true
 
 
 [dependencies]
+arc-swap = { workspace = true }
 ahash = "0.8.12"
 aya = { workspace = true }
 anyhow = { workspace = true }

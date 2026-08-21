@@ -953,10 +953,18 @@ impl AgentRunner {
                     self.stats
                         .send_replace(Arc::new(self.driver.stats().clone()));
                 }
-                AgentEvent::ParticipantsChanged { added, removed } => {
-                    self.participant_state.extend(added);
-                    for participant in removed {
-                        self.participant_state.remove(&participant);
+                AgentEvent::ParticipantsChanged {
+                    added,
+                    removed,
+                    snapshot,
+                } => {
+                    if snapshot {
+                        self.participant_state = added.into_iter().collect();
+                    } else {
+                        self.participant_state.extend(added);
+                        for participant in removed {
+                            self.participant_state.remove(&participant);
+                        }
                     }
                     self.participants
                         .send_replace(Arc::new(self.participant_state.clone()));

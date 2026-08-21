@@ -16,7 +16,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct MembershipDelta<K> {
     pub added: Vec<K>,
-    pub removed: Vec<K>,
+    pub removed: Vec<(K, usize)>,
 }
 
 impl<K> Default for MembershipDelta<K> {
@@ -57,8 +57,8 @@ impl PlanChange {
 
     pub(crate) fn between(
         key: PlanKey,
-        old: Option<&FlatTrackPlan>,
-        new: Option<&FlatTrackPlan>,
+        old: Option<&ControlPlan>,
+        new: Option<&ControlPlan>,
     ) -> Self {
         let Some(new) = new else {
             return Self {
@@ -71,7 +71,7 @@ impl PlanChange {
             };
         };
         let create = old.is_none();
-        let empty = FlatTrackPlan::default();
+        let empty = ControlPlan::default();
         let old = old.unwrap_or(&empty);
         Self {
             key,
@@ -107,67 +107,60 @@ impl PlanBatch {
 #[derive(Debug, Clone)]
 pub(crate) struct DenseMembership<K> {
     values: Vec<K>,
-    positions: HashMap<K, usize>,
 }
 
 impl<K> Default for DenseMembership<K> {
     fn default() -> Self {
-        Self {
-            values: Vec::new(),
-            positions: HashMap::new(),
-        }
+        Self { values: Vec::new() }
     }
 }
 
 impl<K> DenseMembership<K>
 where
-    K: Copy + Eq + std::hash::Hash,
+    K: Copy + Eq + std::hash::Hash + std::fmt::Debug,
 {
     pub(crate) fn from_values(values: impl IntoIterator<Item = K>) -> Self {
         let mut membership = Self::default();
         for value in values {
-            membership.insert(value);
+            if membership.values.contains(&value) {
+                debug_assert!(false, "a compiled membership cannot contain duplicates");
+                continue;
+            }
+            membership.values.push(value);
         }
         membership
     }
 
     pub(crate) fn insert(&mut self, value: K) {
-        if self.positions.contains_key(&value) {
-            debug_assert!(false, "a compiled membership cannot contain duplicates");
-            return;
-        }
-        let index = self.values.len();
         self.values.push(value);
-        let previous = self.positions.insert(value, index);
-        debug_assert!(previous.is_none(), "the dense membership index is unique");
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, value: K) {
-        let Some(index) = self.positions.remove(&value) else {
+        let Some(index) = self.values.iter().position(|candidate| *candidate == value) else {
             debug_assert!(false, "a compiled membership removal must name a member");
             return;
         };
-        let Some(last) = self.values.pop() else {
-            debug_assert!(false, "the dense membership index cannot outlive its value");
+        self.values.swap_remove(index);
+    }
+
+    fn remove_at(&mut self, value: K, index: usize) {
+        debug_assert_eq!(
+            self.values.get(index).copied(),
+            Some(value),
+            "membership index mismatch: index={index} len={} values={:?}",
+            self.values.len(),
+            self.values,
+        );
+        if self.values.get(index).copied() != Some(value) {
             return;
-        };
-        if index < self.values.len() {
-            let Some(slot) = self.values.get_mut(index) else {
-                debug_assert!(false, "the dense membership index must be in bounds");
-                return;
-            };
-            *slot = last;
-            let previous = self.positions.insert(last, index);
-            debug_assert_eq!(previous, Some(self.values.len()));
-        } else {
-            debug_assert_eq!(index, self.values.len());
-            debug_assert!(last == value);
         }
+        self.values.swap_remove(index);
     }
 
     pub(crate) fn apply(&mut self, delta: &MembershipDelta<K>, touched: &mut usize) {
-        for &value in &delta.removed {
-            self.remove(value);
+        for &(value, index) in &delta.removed {
+            self.remove_at(value, index);
             *touched = touched.saturating_add(1);
         }
         for &value in &delta.added {
@@ -180,14 +173,94 @@ where
         &self.values
     }
 
-    fn delta_to(&self, next: &Self) -> MembershipDelta<K> {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControlMembership<K> {
+    values: Vec<K>,
+    positions: HashMap<K, usize>,
+}
+
+impl<K> Default for ControlMembership<K> {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            positions: HashMap::new(),
+        }
+    }
+}
+
+impl<K> ControlMembership<K>
+where
+    K: Copy + Eq + std::hash::Hash + std::fmt::Debug,
+{
+    fn from_dense(dense: &DenseMembership<K>) -> Self {
+        let values = dense.values.clone();
+        let positions = values
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, value)| (value, index))
+            .collect();
+        Self { values, positions }
+    }
+
+    fn from_target(previous: &Self, target: &DenseMembership<K>) -> Self {
+        let target_values: HashMap<K, ()> = target
+            .values
+            .iter()
+            .copied()
+            .map(|value| (value, ()))
+            .collect();
+        let mut values = previous.values.clone();
+        let mut positions = previous.positions.clone();
+        let mut removals: Vec<_> = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (!target_values.contains_key(value)).then_some(index))
+            .collect();
+        removals.sort_unstable_by_key(|index| std::cmp::Reverse(*index));
+        for index in removals {
+            let value = values.swap_remove(index);
+            debug_assert_eq!(positions.get(&value).copied(), Some(index));
+            positions.remove(&value);
+            if let Some(moved) = values.get(index).copied() {
+                positions.insert(moved, index);
+            }
+        }
+        for value in target.values.iter().copied() {
+            if positions.contains_key(&value) {
+                continue;
+            }
+            positions.insert(value, values.len());
+            values.push(value);
+        }
+        Self { values, positions }
+    }
+
+    fn delta_to(&self, next: &ControlMembership<K>) -> MembershipDelta<K> {
+        let mut removed: Vec<_> = self
+            .values
+            .iter()
+            .copied()
+            .filter_map(|value| {
+                if next.positions.contains_key(&value) {
+                    return None;
+                }
+                let Some(&index) = self.positions.get(&value) else {
+                    debug_assert!(false, "control membership must index every value");
+                    return None;
+                };
+                Some((value, index))
+            })
+            .collect();
+        removed.sort_unstable_by_key(|(_, index)| std::cmp::Reverse(*index));
         MembershipDelta {
-            removed: self
-                .values
-                .iter()
-                .copied()
-                .filter(|value| !next.positions.contains_key(value))
-                .collect(),
+            removed,
             added: next
                 .values
                 .iter()
@@ -196,10 +269,30 @@ where
                 .collect(),
         }
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.values.len()
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ControlPlan {
+    local: ControlMembership<ParticipantKey>,
+    remote: ControlMembership<RouteHandle>,
+    reverse_route: Option<RouteHandle>,
+}
+
+impl ControlPlan {
+    pub(crate) fn from_flat(plan: &FlatTrackPlan) -> Self {
+        Self {
+            local: ControlMembership::from_dense(&plan.local),
+            remote: ControlMembership::from_dense(&plan.remote),
+            reverse_route: plan.reverse_route,
+        }
+    }
+
+    pub(crate) fn from_target(previous: &Self, plan: &FlatTrackPlan) -> Self {
+        Self {
+            local: ControlMembership::from_target(&previous.local, &plan.local),
+            remote: ControlMembership::from_target(&previous.remote, &plan.remote),
+            reverse_route: plan.reverse_route,
+        }
     }
 }
 
@@ -283,6 +376,17 @@ impl FlatPlans {
             debug_assert!(false, "a plan change must name a live plan");
             return;
         };
+        debug_assert!(
+            change
+                .remote
+                .removed
+                .iter()
+                .all(|(value, index)| { plan.remote.values.get(*index).copied() == Some(*value) }),
+            "remote membership delta does not match plan {:?}: values={:?} removed={:?}",
+            change.key,
+            plan.remote.values,
+            change.remote.removed,
+        );
         plan.local.apply(&change.local, touched);
         plan.remote.apply(&change.remote, touched);
         match change.reverse {
@@ -405,7 +509,7 @@ mod tests {
             remove: false,
             local: MembershipDelta {
                 added: Vec::new(),
-                removed: vec![second],
+                removed: vec![(second, 1)],
             },
             remote: MembershipDelta::default(),
             reverse: ReverseRouteChange::Unchanged,
@@ -448,7 +552,7 @@ mod tests {
             remove: false,
             local: MembershipDelta {
                 added: vec![ParticipantKey::default()],
-                removed: vec![keys[0]],
+                removed: vec![(keys[0], 0)],
             },
             remote: MembershipDelta::default(),
             reverse: ReverseRouteChange::Unchanged,
@@ -457,5 +561,72 @@ mod tests {
         plans.apply_batch(&update, &mut touched);
         assert_eq!(touched, 2);
         assert_eq!(plans.get(key).unwrap().local.len(), keys.len());
+    }
+
+    #[test]
+    fn control_indexes_compile_swap_remove_positions() {
+        let [first, second, third] = participant_keys(3).try_into().unwrap();
+        let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
+        let track = keys.insert(());
+        let key = PlanKey::Track(track);
+        let old = FlatTrackPlan {
+            local: DenseMembership::from_values([first, second, third]),
+            remote: DenseMembership::default(),
+            reverse_route: None,
+        };
+        let next = FlatTrackPlan {
+            local: DenseMembership::from_values([first, third]),
+            remote: DenseMembership::default(),
+            reverse_route: None,
+        };
+        let change = PlanChange::between(
+            key,
+            Some(&ControlPlan::from_flat(&old)),
+            Some(&ControlPlan::from_flat(&next)),
+        );
+        assert_eq!(change.local.removed, vec![(second, 1)]);
+
+        let mut plans = FlatPlans::default();
+        let mut touched = 0;
+        plans.insert(key, old);
+        plans.apply(&change, &mut touched);
+        assert_eq!(plans.get(key).unwrap().local.values(), &[first, third]);
+        assert_eq!(touched, 1);
+    }
+
+    #[test]
+    fn control_membership_keeps_positions_valid_when_targets_reorder() {
+        let [first, second, third] = participant_keys(3).try_into().unwrap();
+        let old = ControlPlan::from_flat(&FlatTrackPlan {
+            local: DenseMembership::from_values([first, second, third]),
+            remote: DenseMembership::default(),
+            reverse_route: None,
+        });
+        let reordered = ControlPlan::from_target(
+            &old,
+            &FlatTrackPlan {
+                local: DenseMembership::from_values([third, first]),
+                remote: DenseMembership::default(),
+                reverse_route: None,
+            },
+        );
+        let next = ControlPlan::from_target(
+            &reordered,
+            &FlatTrackPlan {
+                local: DenseMembership::from_values([first]),
+                remote: DenseMembership::default(),
+                reverse_route: None,
+            },
+        );
+        let change = PlanChange::between(
+            PlanKey::Track(slotmap::SlotMap::<TrackKey, ()>::with_key().insert(())),
+            Some(&reordered),
+            Some(&next),
+        );
+        let mut dense = DenseMembership::from_values([first, third]);
+        let mut touched = 0;
+        dense.apply(&change.local, &mut touched);
+        assert_eq!(dense.values(), &[first]);
+        assert_eq!(touched, 1);
     }
 }

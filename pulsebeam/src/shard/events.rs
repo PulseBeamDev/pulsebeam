@@ -5,30 +5,13 @@ use str0m::channel::ChannelId;
 use str0m::media::KeyframeRequestKind;
 
 use super::worker::ShardEvent;
-use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
+use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
+use crate::participant::TrackPacket;
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
 use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
-use crate::track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackLayer, TrackMeta};
-
-pub struct AudioRtpEvent {
-    pub stream_id: StreamId,
-    pub pkt: RtpPacket,
-    /// The semantic origin, which subscribers need in order to attribute the
-    /// audio. Read once per delivery, never hashed.
-    pub origin: ParticipantId,
-    /// The publisher's compiled fanout — see [`VideoRtpEvent::fanout`].
-    pub fanout: Option<TrackKey>,
-}
-
-pub struct VideoRtpEvent {
-    pub stream_id: StreamId,
-    pub pkt: RtpPacket,
-    /// The publisher's compiled fanout, resolved once per SSRC rather than
-    /// hashed per packet. `None` only until the shard binds one.
-    pub fanout: Option<TrackKey>,
-}
+use crate::track::{GlobalKeyframeRequest, Topic, Track, TrackLayer, TrackMeta};
 
 pub struct SctpEvent<K> {
     pub pkt: Vec<u8>,
@@ -82,11 +65,6 @@ pub enum ParticipantLifecycleEvent {
 }
 
 pub enum ShardInternalEvent {
-    TrackStatsUpdated {
-        track_id: TrackId,
-        fanout: Option<TrackKey>,
-        states: crate::track::TrackStates,
-    },
     KeyframeRequested {
         request: GlobalKeyframeRequest,
         fanout: Option<TrackKey>,
@@ -99,8 +77,7 @@ pub enum ShardInternalEvent {
 
 pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
-    audio_queue: VecDeque<AudioRtpEvent>,
-    video_queue: VecDeque<VideoRtpEvent>,
+    track_queue: VecDeque<TrackPacket>,
     data_queue: VecDeque<SctpEvent<UnreliableStreamKey>>,
     reliable_data_queue: VecDeque<SctpEvent<ReliableStreamKey>>,
     shard_events: VecDeque<ShardEvent>,
@@ -110,8 +87,7 @@ impl EventPipeline {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             participant_events: VecDeque::with_capacity(cap),
-            audio_queue: VecDeque::with_capacity(cap),
-            video_queue: VecDeque::with_capacity(cap),
+            track_queue: VecDeque::with_capacity(cap),
             data_queue: VecDeque::with_capacity(cap),
             reliable_data_queue: VecDeque::with_capacity(cap),
             shard_events: VecDeque::with_capacity(cap),
@@ -131,12 +107,8 @@ impl EventPipeline {
         self.participant_events.pop_front()
     }
 
-    pub fn pop_audio_rtp(&mut self) -> Option<AudioRtpEvent> {
-        self.audio_queue.pop_front()
-    }
-
-    pub fn pop_video_rtp(&mut self) -> Option<VideoRtpEvent> {
-        self.video_queue.pop_front()
+    pub fn pop_track(&mut self) -> Option<TrackPacket> {
+        self.track_queue.pop_front()
     }
 
     pub fn push_shard_event(&mut self, ev: ShardEvent) {
@@ -157,8 +129,7 @@ impl EventPipeline {
 
     pub fn has_pending(&self) -> bool {
         !self.participant_events.is_empty()
-            || !self.audio_queue.is_empty()
-            || !self.video_queue.is_empty()
+            || !self.track_queue.is_empty()
             || !self.data_queue.is_empty()
             || !self.reliable_data_queue.is_empty()
             || !self.shard_events.is_empty()
@@ -220,31 +191,13 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_track_stats(
-        &mut self,
-        track_id: TrackId,
-        fanout: Option<TrackKey>,
-        states: crate::track::TrackStates,
-    ) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Internal(
-                ShardInternalEvent::TrackStatsUpdated {
-                    track_id,
-                    fanout,
-                    states,
-                },
-            ));
-    }
-
-    fn publish_track(&mut self, track: Track, states: crate::track::TrackStates) {
+    fn publish_track(&mut self, track: Track) {
         let mut track = track;
-        track.reverse = None;
+        track.set_reverse(None);
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(ShardEvent::TrackPublished {
                 track: Box::new(track),
-                states,
             }));
     }
 
@@ -351,21 +304,14 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_rtp(&mut self, stream_id: StreamId, fanout: Option<TrackKey>, pkt: RtpPacket) {
-        match stream_id.0.kind() {
-            TrackKind::Audio => self.pipeline.audio_queue.push_back(AudioRtpEvent {
-                stream_id,
-                pkt,
-                origin: self.id,
-                fanout,
-            }),
-            TrackKind::Video => self.pipeline.video_queue.push_back(VideoRtpEvent {
-                stream_id,
-                pkt,
-                fanout,
-            }),
-            TrackKind::Data => {}
-        }
+    fn publish_rtp(&mut self, fanout: Option<TrackKey>, pkt: RtpPacket) {
+        let Some(key) = fanout else {
+            return;
+        };
+        self.pipeline.track_queue.push_back(TrackPacket {
+            key,
+            packet: Box::new(pkt),
+        });
     }
 
     #[inline]
@@ -468,7 +414,7 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
-    use crate::entity::{ExternalRoomId, TrackKind};
+    use crate::entity::ExternalRoomId;
 
     fn identity() -> SinkIdentity {
         let room = ExternalRoomId::new("room").unwrap();
@@ -479,75 +425,35 @@ mod tests {
         }
     }
 
-    fn stream(kind: TrackKind) -> StreamId {
-        (ParticipantId::new().derive_track_id(kind, "t"), None)
-    }
-
-    /// Each kind of event lands in its own queue, and only its own.
-    ///
-    /// Everything a participant produces fans out through this one sink, and the shard drains the
-    /// queues separately at different rates - audio per packet, lifecycle per tick. A misfiled
-    /// event is not dropped, it is delivered to the wrong loop, which is far harder to see than a
-    /// loss: the media keeps flowing and the wrong thing acts on it.
+    /// RTP from every track kind uses the same queue and carries only its TrackKey.
     #[test]
     fn every_event_lands_in_its_own_queue() {
         let mut pipeline = EventPipeline::with_capacity(4);
         let who = identity();
 
         let mut sink = pipeline.participant_sink(who);
-        sink.publish_rtp(stream(TrackKind::Audio), None, RtpPacket::default());
-        sink.publish_rtp(stream(TrackKind::Video), None, RtpPacket::default());
+        sink.publish_rtp(Some(TrackKey::default()), RtpPacket::default());
+        sink.publish_rtp(Some(TrackKey::default()), RtpPacket::default());
         sink.publish_sctp(Topic::for_test("t"), None, vec![1]);
         sink.exit();
 
-        assert!(pipeline.pop_audio_rtp().is_some(), "audio went to audio");
-        assert!(pipeline.pop_video_rtp().is_some(), "video went to video");
+        assert!(
+            pipeline.pop_track().is_some(),
+            "RTP went to the track queue"
+        );
+        assert!(
+            pipeline.pop_track().is_some(),
+            "RTP stayed in the track queue"
+        );
         assert!(pipeline.pop_data_sctp().is_some(), "data went to data");
         assert!(
             pipeline.pop_participant_event().is_some(),
             "lifecycle went to participant events"
         );
 
-        assert!(pipeline.pop_audio_rtp().is_none(), "and nothing crossed");
-        assert!(pipeline.pop_video_rtp().is_none());
+        assert!(pipeline.pop_track().is_none(), "and nothing crossed");
         assert!(pipeline.pop_data_sctp().is_none());
         assert!(pipeline.pop_reliable_data_sctp().is_none());
-    }
-
-    /// Data has no RTP form, so a data-kind stream must not become a media packet.
-    #[test]
-    fn a_data_track_is_not_forwarded_as_media() {
-        let mut pipeline = EventPipeline::with_capacity(2);
-        let who = identity();
-        pipeline.participant_sink(who).publish_rtp(
-            stream(TrackKind::Data),
-            None,
-            RtpPacket::default(),
-        );
-
-        assert!(pipeline.pop_audio_rtp().is_none());
-        assert!(pipeline.pop_video_rtp().is_none());
-        assert!(!pipeline.has_pending(), "and it queued nothing at all");
-    }
-
-    /// Audio carries who spoke; video does not need to.
-    ///
-    /// Audio slots are shared and stolen, so the subscriber cannot tell from the media who it is
-    /// hearing - the origin has to travel with the packet. Video arrives on a slot bound to one
-    /// track, so it is already unambiguous.
-    #[test]
-    fn audio_carries_its_origin() {
-        let mut pipeline = EventPipeline::with_capacity(2);
-        let who = identity();
-        let expected = who.id;
-        pipeline.participant_sink(who).publish_rtp(
-            stream(TrackKind::Audio),
-            None,
-            RtpPacket::default(),
-        );
-
-        let event = pipeline.pop_audio_rtp().expect("audio was queued");
-        assert_eq!(event.origin, expected);
     }
 
     /// Queues drain in the order they were filled. Media is a sequence, and reordering it here
@@ -584,13 +490,11 @@ mod tests {
         assert!(pipeline.pop_shard_event().is_some());
         assert!(!pipeline.has_pending());
 
-        pipeline.participant_sink(who).publish_rtp(
-            stream(TrackKind::Video),
-            None,
-            RtpPacket::default(),
-        );
-        assert!(pipeline.has_pending(), "so is a video packet");
-        assert!(pipeline.pop_video_rtp().is_some());
+        pipeline
+            .participant_sink(who)
+            .publish_rtp(Some(TrackKey::default()), RtpPacket::default());
+        assert!(pipeline.has_pending(), "so is a track packet");
+        assert!(pipeline.pop_track().is_some());
         assert!(!pipeline.has_pending(), "and draining it clears the flag");
     }
 }

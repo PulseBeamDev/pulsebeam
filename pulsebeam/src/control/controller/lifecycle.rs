@@ -183,11 +183,7 @@ impl ControllerActor {
             generation_ops = generation_ops.participant_effect(
                 publisher_shard,
                 publisher_key,
-                crate::participant::ParticipantEffect::TrackRemoved {
-                    key: track_key,
-                    role: crate::participant::TrackRole::Published,
-                    kind,
-                },
+                crate::participant::ParticipantEffect::TrackRemoved(track_key),
             );
         }
         generation_ops
@@ -403,7 +399,6 @@ impl ControllerActor {
                             crate::participant::ParticipantEffect::TrackInstalled(
                                 crate::participant::CompiledTrack {
                                     key: fanout.raw(),
-                                    role: crate::participant::TrackRole::Subscribed,
                                     track: descriptor.publication.clone(),
                                 },
                             ),
@@ -418,7 +413,6 @@ impl ControllerActor {
                             crate::participant::ParticipantEffect::TrackInstalled(
                                 crate::participant::CompiledTrack {
                                     key: fanout.raw(),
-                                    role: crate::participant::TrackRole::Published,
                                     track: descriptor.publication.clone(),
                                 },
                             ),
@@ -434,7 +428,6 @@ impl ControllerActor {
                             crate::participant::ParticipantEffect::TrackInstalled(
                                 crate::participant::CompiledTrack {
                                     key: fanout.raw(),
-                                    role: crate::participant::TrackRole::Subscribed,
                                     track: descriptor.publication.clone(),
                                 },
                             ),
@@ -462,7 +455,6 @@ impl ControllerActor {
                         crate::participant::ParticipantEffect::TrackInstalled(
                             crate::participant::CompiledTrack {
                                 key: fanout.raw(),
-                                role: crate::participant::TrackRole::Published,
                                 track: descriptor.publication.clone(),
                             },
                         ),
@@ -478,7 +470,6 @@ impl ControllerActor {
                         crate::participant::ParticipantEffect::TrackInstalled(
                             crate::participant::CompiledTrack {
                                 key: fanout.raw(),
-                                role: crate::participant::TrackRole::Subscribed,
                                 track: descriptor.publication.clone(),
                             },
                         ),
@@ -616,11 +607,7 @@ impl ControllerActor {
                 ops.push_participant_effect(
                     destination,
                     participant,
-                    crate::participant::ParticipantEffect::TrackRemoved {
-                        key: track_key,
-                        role: crate::participant::TrackRole::Subscribed,
-                        kind: id.kind(),
-                    },
+                    crate::participant::ParticipantEffect::TrackRemoved(track_key),
                 );
             }
         }
@@ -655,7 +642,7 @@ impl ControllerActor {
     /// carried the same hazard.
     pub(super) fn stage_destination_retirement(
         &mut self,
-        id: crate::entity::TrackId,
+        _id: crate::entity::TrackId,
         room_id: crate::entity::RoomId,
         destinations: &indexmap::IndexMap<
             crate::id::ShardId,
@@ -672,11 +659,7 @@ impl ControllerActor {
                             generation_ops.push_participant_effect(
                                 *destination,
                                 participant,
-                                crate::participant::ParticipantEffect::TrackRemoved {
-                                    key: track_key,
-                                    role: crate::participant::TrackRole::Subscribed,
-                                    kind: id.kind(),
-                                },
+                                crate::participant::ParticipantEffect::TrackRemoved(track_key),
                             );
                         }
                     }
@@ -687,11 +670,7 @@ impl ControllerActor {
                             generation_ops.push_participant_effect(
                                 *destination,
                                 participant,
-                                crate::participant::ParticipantEffect::TrackRemoved {
-                                    key: track_key,
-                                    role: crate::participant::TrackRole::Subscribed,
-                                    kind: id.kind(),
-                                },
+                                crate::participant::ParticipantEffect::TrackRemoved(track_key),
                             );
                         }
                     }

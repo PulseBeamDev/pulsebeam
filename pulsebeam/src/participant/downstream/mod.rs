@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::entity::AudioOrigin;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
+use crate::keys::TrackKey;
 use crate::log::LogCtx;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::START_BANDWIDTH;
@@ -61,6 +62,8 @@ const ESTIMATE_MOVED_SHARE: f64 = 0.02;
 /// read as starvation on its own.
 const MEASURED_SHARE_OF_ESTIMATE: f64 = 0.25;
 
+const ALLOCATION_RESERVE_FRACTION: f64 = 0.10;
+
 /// A starvation episode being timed, and the estimate it started from.
 #[derive(Clone, Copy, Debug)]
 struct StarvationWatch {
@@ -113,8 +116,7 @@ fn starvation_reset_target(
         estimate,
     });
 
-    let moved = (estimate.as_f64() - started.estimate.as_f64()).abs()
-        > started.estimate.as_f64() * ESTIMATE_MOVED_SHARE;
+    let moved = estimate.as_f64() > started.estimate.as_f64() * (1.0 + ESTIMATE_MOVED_SHARE);
     if moved {
         *watch = Some(StarvationWatch {
             since: now,
@@ -137,7 +139,10 @@ fn starvation_reset_target(
     // it is meant to break. `unfunded` is a layer's cost, and another slot may
     // already have spent most of the budget, so it is not bounded below by the
     // estimate on its own.
-    let target = unfunded.unwrap_or(desired).min(desired).max(estimate);
+    let probe = unfunded.unwrap_or(desired).as_f64() / (1.0 - ALLOCATION_RESERVE_FRACTION);
+    let target = Bitrate::from(crate::bitrate::saturating_bps(probe))
+        .min(desired)
+        .max(estimate);
     *watch = Some(StarvationWatch {
         since: now,
         estimate: target,
@@ -299,15 +304,16 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn add_track(&mut self, track: Track) {
-        if track.meta.id.kind() == TrackKind::Video {
-            self.video.add_track(track);
+    pub(crate) fn install_track(&mut self, key: TrackKey, track: Track) {
+        if track.kind() == TrackKind::Video {
+            self.video.install_track(key, track);
             self.dirty_allocation = true;
             return;
         }
         // The allocator claims audio slots dynamically, so this registration is
         // purely so the roster can name the track before anyone hears it.
-        self.audio_tracks.insert(track.meta.id, track.meta);
+        let id = track.id();
+        self.audio_tracks.insert(id, track.meta().clone());
     }
 
     /// Apply the client's audio selection policy.
@@ -421,14 +427,9 @@ impl DownstreamAllocator {
         self.available_bandwidth = BweFilter::new(target);
     }
 
-    pub(crate) fn reconcile_routes(
-        &mut self,
-        now: Instant,
-        events: &mut impl ParticipantSink,
-        fanouts: &ahash::HashMap<TrackId, crate::shard::router::TrackKey>,
-    ) {
+    pub(crate) fn reconcile_routes(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         self.video
-            .poll_slow(now, self.available_bandwidth.current(), events, fanouts);
+            .poll_slow(now, self.available_bandwidth.current(), events);
     }
 
     pub(crate) fn poll_slow(
@@ -436,50 +437,21 @@ impl DownstreamAllocator {
         now: Instant,
         bwe: &mut Bwe,
         events: &mut impl ParticipantSink,
-        fanouts: &ahash::HashMap<TrackId, crate::shard::router::TrackKey>,
     ) -> bool {
         let assignments_changed = self.update_allocations(now, bwe);
         self.video
-            .poll_slow(now, self.available_bandwidth.current(), events, fanouts);
+            .poll_slow(now, self.available_bandwidth.current(), events);
         assignments_changed
-    }
-
-    #[inline]
-    pub fn update_layer_states(&mut self, track_id: TrackId, states: &crate::track::TrackStates) {
-        self.video.update_layer_states(track_id, states);
-    }
-
-    pub fn update_layer_states_slot(
-        &mut self,
-        slot: crate::keys::DownstreamSlotKey,
-        states: &crate::track::TrackStates,
-    ) {
-        self.video.update_layer_states_slot(slot, states);
-    }
-
-    pub(crate) fn slot_for_track(&self, track: &TrackId) -> Option<crate::keys::DownstreamSlotKey> {
-        self.video.route_slot(track)
     }
 
     pub fn on_forward_rtp(
         &mut self,
-        track_id: TrackId,
-        pkt: &RtpPacket,
+        track_key: TrackKey,
+        arrival_ts: Instant,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        self.video.on_rtp(track_id, pkt, cache, writer)
-    }
-
-    pub fn on_forward_rtp_slot(
-        &mut self,
-        slot: crate::keys::DownstreamSlotKey,
-        track: crate::entity::TrackId,
-        pkt: &RtpPacket,
-        cache: Option<&crate::rtp::cache::TrackStreamCache>,
-        writer: &mut StreamWriter,
-    ) -> bool {
-        self.video.on_rtp_slot(slot, track, pkt, cache, writer)
+        self.video.on_rtp(track_key, arrival_ts, cache, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.

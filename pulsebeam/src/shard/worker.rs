@@ -22,8 +22,7 @@ use tokio::time::{Instant, Sleep};
 use crate::{
     entity::{ParticipantId, TrackId},
     id::ShardId,
-    participant::ParticipantConfig,
-    rtp::RtpPacket,
+    participant::{ParticipantConfig, TrackPacket},
     shard::metrics::ShardMetrics,
     shard::recorder::{ShardRecorder, ShardStatsReport},
     track::Track,
@@ -210,8 +209,7 @@ pub(crate) enum Reverse {
 /// Payload carried under an [`Envelope`]. Still typed this pass; byte
 /// serialization arrives with the UDP transport.
 pub(crate) enum MediaPayload {
-    Video(Box<RtpPacket>),
-    Audio(Box<RtpPacket>),
+    Track(TrackPacket),
     /// SCTP bytes for a client data channel. Which lane the client asked for is
     /// in the destination's route entry, not here — the destination already
     /// knows it, and it describes the client's channel, not this hop.
@@ -245,21 +243,6 @@ pub(crate) enum ShardFrame {
     /// contract: every one is an idempotent request the sender repeats if it
     /// still needs it, so losing one costs a round trip and nothing else.
     Reverse { env: Envelope, body: Reverse },
-    /// Forward telemetry: what a publisher's encodings currently measure,
-    /// addressed by the destination's own route.
-    ///
-    /// A value, not a handle. Measurements used to be an `Arc` of atomics the
-    /// subscriber's shard read directly, which shared a refcount across cores
-    /// and — worse — never gave a coherent view, since eight independent atomic
-    /// reads can straddle a writer. One message is one consistent snapshot, and
-    /// it is the only shape that works when the destination is another node.
-    ///
-    /// Latest-wins: losing one costs a slightly stale allocation and nothing
-    /// else, so it belongs on the best-effort lane.
-    Telemetry {
-        env: Envelope,
-        stats: crate::track::TrackStates,
-    },
 }
 
 pub(crate) type ShardEventMessage = (ShardId, ShardEvent);
@@ -292,7 +275,6 @@ pub(crate) enum ShardEvent {
     },
     TrackPublished {
         track: Box<Track>,
-        states: crate::track::TrackStates,
     },
     TrackUnpublished {
         origin: ParticipantId,

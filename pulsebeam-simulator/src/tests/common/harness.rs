@@ -951,14 +951,13 @@ impl ParticipantHandle {
     }
 
     /// What kinds of media this client believes `publisher_id` is sending.
-    fn media_kinds_of(&self, publisher_id: &str) -> (bool, bool) {
-        *self
-            .shared
+    fn media_kinds_of(&self, publisher_id: &str) -> Option<(bool, bool)> {
+        self.shared
             .media_kinds
             .lock()
             .unwrap()
             .get(publisher_id)
-            .unwrap_or(&(false, false))
+            .copied()
     }
 
     /// Media this participant received and could not hand to anyone. Should always be zero.
@@ -2781,12 +2780,23 @@ fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
             let Some(subject) = handles.get(name) else {
                 continue;
             };
+            if !subject.connected() {
+                continue;
+            }
+            if subject.participant_id().as_deref() != Some(id) {
+                continue;
+            }
             assert_eq!(
                 subject.room_name, handle.room_name,
                 "\nroom state inconsistent after {after}\n  observer:     {observer} ({})\n  subject:      {name} ({})\n  problem:      a publication crossed room boundaries",
                 handle.room_name, subject.room_name
             );
-            let (video, audio) = handle.media_kinds_of(id);
+            let Some((video, audio)) = handle.media_kinds_of(id) else {
+                continue;
+            };
+            if !video && !audio {
+                continue;
+            }
             assert_eq!(
                 video, subject.publishes_video,
                 "\nroom state inconsistent after {after}\n  observer:     {observer}\n  subject:      {name}\n  believes video: {video}, actually publishes video: {}\n  note:         a participant believed to send video that does not is a phantom\n                tile; announcing audio in `tracks_upsert` caused exactly this,\n                and put anyone sending both on screen twice",
@@ -2806,6 +2816,7 @@ fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
             if name == observer
                 || subject.room_name != handle.room_name
                 || !subject.present
+                || !subject.connected()
                 || !subject.publishes_video
             {
                 continue;

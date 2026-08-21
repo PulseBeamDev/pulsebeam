@@ -27,7 +27,6 @@ pub(crate) struct TrackDescriptor {
     pub origin_key: ParticipantKey,
     pub participant: Option<ParticipantKey>,
     pub encodings: Vec<Option<Rid>>,
-    pub states: crate::track::TrackStates,
     pub publication: crate::track::Track,
 }
 

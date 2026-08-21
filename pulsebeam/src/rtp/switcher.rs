@@ -5,6 +5,7 @@
 //! either record a gap of billions or hide a real one, and the switcher would
 //! hold or release a switch on a number that was never true.
 
+use ahash::HashMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use str0m::media::{Frequency, MediaTime};
@@ -17,8 +18,11 @@ use crate::rtp::cache::{StreamCache, TrackStreamCache};
 use crate::rtp::frame_selector::{
     DecodeTargetSelection, DependencyDescriptorSelector, FrameDecision, FrameSelector,
 };
+use crate::rtp::monitor::StreamStats;
 use crate::rtp::timeline::Timeline;
 use crate::track::StreamId;
+
+pub(crate) type LayerStates = HashMap<StreamId, StreamStats>;
 
 /// How long after a switch the abandoned stream may still complete frames the
 /// subscriber has already been given part of.

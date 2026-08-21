@@ -98,11 +98,11 @@ impl ControllerActor {
         mut track: crate::track::Track,
         fanout: crate::shard::router::TrackKey,
     ) -> Option<crate::track::Track> {
-        if track.meta.id.kind() == crate::entity::TrackKind::Data {
+        if track.kind() == crate::entity::TrackKind::Data {
             debug_assert!(false, "data does not publish through the track path");
             return None;
         }
-        if track.meta.id.kind() == crate::entity::TrackKind::Video {
+        if track.kind() == crate::entity::TrackKind::Video {
             let handle = self
                 .grant_route(
                     shard_id,
@@ -113,9 +113,9 @@ impl ControllerActor {
                     },
                 )
                 .await?;
-            track.reverse = Some(handle);
+            track.set_reverse(Some(handle));
         } else {
-            track.reverse = None;
+            track.set_reverse(None);
         }
         Some(track)
     }
@@ -448,22 +448,17 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
     ) -> Option<crate::view::TrackDescriptor> {
         let binding = self.catalog.get(&track_id)?;
-        // Only video carries encodings and layer states; audio's descriptor is
-        // the same shape with none of them.
-        let (encodings, states, publication) = match &binding.media {
+        let (encodings, publication) = match &binding.media {
             crate::control::publication::Media::Video {
                 publication,
                 encodings,
-                states,
-            } => (encodings.clone(), states.clone(), publication.clone()),
+            } => (encodings.clone(), publication.clone()),
             _ => (
                 Vec::new(),
-                crate::track::TrackStates::default(),
-                crate::track::Track {
+                crate::track::Track::Audio(crate::track::AudioTrack {
                     meta: binding.meta(),
-                    layers: Vec::new(),
                     reverse: binding.reverse_route,
-                },
+                }),
             ),
         };
         Some(crate::view::TrackDescriptor {
@@ -471,7 +466,6 @@ impl ControllerActor {
             origin_key: binding.publisher_key,
             participant: (shard_id == binding.publisher_shard).then_some(binding.publisher_key),
             encodings,
-            states,
             publication,
         })
     }
@@ -517,7 +511,6 @@ impl ControllerActor {
                     crate::participant::ParticipantEffect::TrackInstalled(
                         crate::participant::CompiledTrack {
                             key: fanout,
-                            role: crate::participant::TrackRole::Subscribed,
                             track: publication.clone(),
                         },
                     ),

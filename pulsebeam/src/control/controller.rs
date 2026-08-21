@@ -230,7 +230,7 @@ pub struct ControllerActor {
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
     views: Vec<crate::view::ShardViewWriter>,
-    compiled_plans: Vec<HashMap<crate::plan::PlanKey, crate::plan::FlatTrackPlan>>,
+    compiled_plans: Vec<HashMap<crate::plan::PlanKey, crate::plan::ControlPlan>>,
     /// Every publication on this node, whatever kind.
     catalog: crate::control::publication::Catalog,
     /// Data and reliable stream routing. One type per lane rather than three
@@ -671,7 +671,7 @@ impl ControllerActor {
         }
         let mut staged_plans: HashMap<
             (crate::id::ShardId, crate::plan::PlanKey),
-            Option<crate::plan::FlatTrackPlan>,
+            Option<crate::plan::ControlPlan>,
         > = HashMap::new();
         let mut batches = (0..self.views.len())
             .map(|_| crate::plan::PlanBatch::default())
@@ -687,7 +687,11 @@ impl ControllerActor {
                 Some(None) => None,
                 None => shard_plans.get(&request.key),
             };
-            let change = crate::plan::PlanChange::between(request.key, old, request.plan.as_ref());
+            let next = request.plan.as_ref().map(|plan| match old {
+                Some(old) => crate::plan::ControlPlan::from_target(old, plan),
+                None => crate::plan::ControlPlan::from_flat(plan),
+            });
+            let change = crate::plan::PlanChange::between(request.key, old, next.as_ref());
             if change.remove && old.is_none() {
                 debug_assert!(false, "a plan cannot be removed before it exists");
                 continue;
@@ -700,7 +704,7 @@ impl ControllerActor {
                 };
                 batch.push(change);
             }
-            staged_plans.insert((request.shard, request.key), request.plan);
+            staged_plans.insert((request.shard, request.key), next);
         }
         for (index, batch) in batches.into_iter().enumerate() {
             if !batch.is_empty() {
@@ -1117,8 +1121,8 @@ impl ControllerActor {
                 }
                 Some((shard_id, ShardEvent::TrackUnpublished { origin, track_id }))
             }
-            ShardEvent::TrackPublished { track, states } => {
-                let track_id = track.meta.id;
+            ShardEvent::TrackPublished { track } => {
+                let track_id = track.id();
                 if self.catalog.contains(&track_id) {
                     debug_assert!(false, "a publication must be announced once");
                     return None;
@@ -1126,14 +1130,14 @@ impl ControllerActor {
                 let Some(publisher_key) = self
                     .core
                     .registry
-                    .get_participant(&track.meta.origin)
+                    .get_participant(&track.meta().origin)
                     .and_then(|meta| meta.binding)
                 else {
                     debug_assert!(false, "a published track must have a participant key");
                     return None;
                 };
-                let fanout = self.prepare_track_key(shard_id, track_id, track.meta.origin)?;
-                let track_id = track.meta.id;
+                let fanout = self.prepare_track_key(shard_id, track_id, track.meta().origin)?;
+                let track_id = track.id();
                 let origin_key = match track_id.kind() {
                     crate::entity::TrackKind::Video => {
                         crate::control::publication::RuntimeKey::Video(
@@ -1154,8 +1158,8 @@ impl ControllerActor {
                 self.catalog
                     .insert(crate::control::publication::Publication {
                         id: track_id,
-                        room: track.meta.room_id,
-                        publisher: track.meta.origin,
+                        room: track.meta().room_id,
+                        publisher: track.meta().origin,
                         publisher_shard: shard_id,
                         publisher_key,
                         origin_key,
@@ -1167,8 +1171,7 @@ impl ControllerActor {
                             }
                             _ => crate::control::publication::Media::Video {
                                 publication: track.as_ref().clone(),
-                                encodings: track.layers.iter().map(|layer| layer.rid).collect(),
-                                states,
+                                encodings: track.layers().iter().map(|layer| layer.rid).collect(),
                             },
                         },
                     });
@@ -1176,7 +1179,7 @@ impl ControllerActor {
                 let announced = self.on_track_published(shard_id, *track, fanout).await;
                 if let Some(track) = &announced {
                     if let Some(publication) = self.catalog.get_mut(&track_id) {
-                        publication.reverse_route = track.reverse;
+                        publication.reverse_route = track.reverse();
                         if let crate::control::publication::Media::Video {
                             publication: held, ..
                         } = &mut publication.media
@@ -1220,7 +1223,6 @@ impl ControllerActor {
                         shard_id,
                         ShardEvent::TrackPublished {
                             track: Box::new(track),
-                            states: Vec::new(),
                         },
                     )
                 })

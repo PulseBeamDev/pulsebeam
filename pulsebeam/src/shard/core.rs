@@ -2,30 +2,28 @@ use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
 };
+use std::collections::VecDeque;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
 use crate::route::{Envelope, TransportHandle};
 use crate::shard::events::{
-    AudioRtpEvent, ParticipantEvent, ParticipantLifecycleEvent, ParticipantSubscriptionEvent,
+    ParticipantEvent, ParticipantLifecycleEvent, ParticipantSubscriptionEvent,
 };
 use crate::{
-    entity::{TrackId, TrackKind},
     keys::ParticipantKey,
     participant::{
         ParticipantConfig,
         batcher::{AppendStatus, Batcher, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
     },
-    rtp::RtpPacket,
     shard::{
         dirty::DirtyTracker,
         events::EventPipeline,
         participants::ParticipantRegistry,
-        router::{Origin, RoutingContext, ShardRuntime},
+        router::{Origin, ShardRuntime},
         timer::TimerWheel,
     },
 };
-use str0m::media::Rid;
 
 pub(crate) use super::router::ShardTransport;
 use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame};
@@ -42,13 +40,6 @@ fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static
     .increment(1);
     #[cfg(feature = "sim")]
     crate::sim_metrics::record_routing_drop(lane, stage, origin);
-}
-
-struct DispatchCtx<'a, R: ShardTransport> {
-    registry: &'a mut ParticipantRegistry,
-    dirty: &'a mut DirtyTracker,
-    router: &'a R,
-    wall: &'a WallAnchor,
 }
 
 struct ShardNetworkEgress<'a> {
@@ -89,125 +80,12 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
     }
 }
 
-impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
-    fn send_media(&self, dst: crate::id::ShardId, env: Envelope, payload: MediaPayload) {
-        self.router.send_media(dst, env, payload);
-    }
-
-    fn send_frame(&self, dst: crate::id::ShardId, frame: ShardFrame) {
-        self.router.send_frame(dst, frame);
-    }
-}
-
-impl<'a, R: ShardTransport> DispatchCtx<'a, R> {
-    fn notify_keyframe_request(
-        &mut self,
-        participant: ParticipantKey,
-        track_id: TrackId,
-        rid: Option<Rid>,
-        kind: str0m::media::KeyframeRequestKind,
-    ) {
-        if let Some(meta) = self.registry.resolve_mut(participant) {
-            meta.handle_remote_keyframe_request((track_id, rid), kind);
-            self.dirty.mark(participant, meta);
-        }
-    }
-
-    fn deliver_reliable_control(
-        &mut self,
-        publisher: ParticipantKey,
-        topic: &crate::track::Topic,
-        bytes: &[u8],
-    ) {
-        if let Some(meta) = self.registry.resolve_mut(publisher) {
-            meta.on_deliver_reliable_control(topic, bytes);
-            self.dirty.mark(publisher, meta);
-        }
-    }
-}
-
-impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
-    fn forward_video_rtp(
-        &mut self,
-        subscriber: ParticipantKey,
-        fanout: crate::keys::TrackKey,
-        track: TrackId,
-        pkt: &RtpPacket,
-        cache: Option<&crate::rtp::cache::TrackStreamCache>,
-    ) {
-        let Some(participant) = self.registry.resolve_mut(subscriber) else {
-            debug_assert!(false, "a video plan must name a live participant");
-            return;
-        };
-        participant.on_forward_rtp_fanout(fanout, track, pkt, cache);
-        self.dirty.mark(subscriber, participant);
-    }
-
-    fn update_layer_states(
-        &mut self,
-        subscriber: ParticipantKey,
-        fanout: crate::keys::TrackKey,
-        states: &crate::track::TrackStates,
-    ) {
-        let Some(participant) = self.registry.resolve_mut(subscriber) else {
-            debug_assert!(false, "a video plan must name a live participant");
-            return;
-        };
-        participant.update_layer_states_fanout(fanout, states);
-    }
-
-    fn forward_audio_rtp(
-        &mut self,
-        subscriber: ParticipantKey,
-        origin: crate::entity::AudioOrigin,
-        pkt: &RtpPacket,
-    ) {
-        let Some(participant) = self.registry.resolve_mut(subscriber) else {
-            debug_assert!(false, "an audio plan must name a live participant");
-            return;
-        };
-        participant.on_forward_audio_rtp(origin, pkt);
-        self.dirty.mark(subscriber, participant);
-    }
-
-    fn forward_unreliable_sctp(
-        &mut self,
-        subscriber: ParticipantKey,
-        stream: crate::keys::UnreliableStreamKey,
-        pkt: &[u8],
-    ) {
-        let Some(participant) = self.registry.resolve_mut(subscriber) else {
-            debug_assert!(false, "a data plan must name a live participant");
-            return;
-        };
-        participant.on_forward_sctp_stream(stream, pkt);
-        self.dirty.mark(subscriber, participant);
-    }
-
-    fn wall(&self) -> &WallAnchor {
-        self.wall
-    }
-
-    fn forward_reliable_sctp(
-        &mut self,
-        subscriber: ParticipantKey,
-        stream: crate::keys::ReliableStreamKey,
-        frame: &[u8],
-    ) {
-        let Some(participant) = self.registry.resolve_mut(subscriber) else {
-            debug_assert!(false, "a reliable data plan must name a live participant");
-            return;
-        };
-        participant.on_forward_reliable_sctp_stream(stream, frame);
-        self.dirty.mark(subscriber, participant);
-    }
-}
-
 pub(crate) struct ShardCore {
     pub(crate) shard_id: crate::id::ShardId,
     view: crate::view::ShardView,
     view_rx: mailbox::Receiver<Box<crate::view::GenerationCommit>>,
     pending_view_delta: Option<Box<crate::view::GenerationCommit>>,
+    pending_participant_effects: VecDeque<(ParticipantKey, crate::participant::ParticipantEffect)>,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
     plans: crate::plan::FlatPlanPublisher,
@@ -260,6 +138,7 @@ impl ShardCore {
             view,
             view_rx,
             pending_view_delta: None,
+            pending_participant_effects: VecDeque::new(),
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             runtime,
             plans,
@@ -303,9 +182,11 @@ impl ShardCore {
             {
                 self.apply_lifecycle_op(op);
             }
+            self.apply_pending_participant_effects();
             for (participant, effect) in &delta.participant_effects {
                 let Some(meta) = self.registry.resolve_mut(*participant) else {
-                    debug_assert!(false, "a participant effect must target a live participant");
+                    self.pending_participant_effects
+                        .push_back((*participant, effect.clone()));
                     continue;
                 };
                 meta.apply(effect.clone());
@@ -321,9 +202,22 @@ impl ShardCore {
                 self.apply_lifecycle_op(op);
             }
             self.view.generation = delta.generation;
+            self.apply_pending_participant_effects();
             applied = applied.saturating_add(1);
         }
         applied
+    }
+
+    fn apply_pending_participant_effects(&mut self) {
+        let pending = std::mem::take(&mut self.pending_participant_effects);
+        for (participant, effect) in pending {
+            let Some(meta) = self.registry.resolve_mut(participant) else {
+                self.pending_participant_effects
+                    .push_back((participant, effect));
+                continue;
+            };
+            meta.apply(effect);
+        }
     }
 
     fn drain_participant_network(
@@ -364,16 +258,11 @@ impl ShardCore {
             crate::view::ViewOp::RemoveParticipant { key } => {
                 self.timers.cancel(*key);
                 let _ = self.registry.remove_key(*key);
+                self.pending_participant_effects
+                    .retain(|(participant, _)| *participant != *key);
             }
-            crate::view::ViewOp::InsertTrackRuntime { key, descriptor } => {
+            crate::view::ViewOp::InsertTrackRuntime { .. } => {
                 self.runtime.apply_view_op(op);
-                if let Some(participant) = descriptor.participant {
-                    let Some(meta) = self.registry.resolve_mut(participant) else {
-                        debug_assert!(false, "a publishing participant must be live");
-                        return;
-                    };
-                    meta.bind_published_track(descriptor.id, key.raw());
-                }
             }
             crate::view::ViewOp::RemoveTrackRuntime { .. }
             | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
@@ -389,7 +278,10 @@ impl ShardCore {
                         );
                         return;
                     };
-                    meta.bind_published_data_stream(&id.topic, *key);
+                    meta.apply(crate::participant::ParticipantEffect::DataPublished {
+                        topic: id.topic.clone(),
+                        stream: *key,
+                    });
                 }
             }
             crate::view::ViewOp::InsertReliableRuntime { publisher, key, id } => {
@@ -403,7 +295,12 @@ impl ShardCore {
                         );
                         return;
                     };
-                    meta.bind_published_reliable_stream(&id.topic, *key);
+                    meta.apply(
+                        crate::participant::ParticipantEffect::ReliableDataPublished {
+                            topic: id.topic.clone(),
+                            stream: *key,
+                        },
+                    );
                 }
             }
             crate::view::ViewOp::BindSubscribedData {
@@ -415,7 +312,10 @@ impl ShardCore {
                     debug_assert!(false, "a data binding must name a live participant");
                     return;
                 };
-                meta.bind_subscribed_data_stream(*stream, *channel);
+                meta.apply(crate::participant::ParticipantEffect::DataSubscribed {
+                    stream: *stream,
+                    channel: *channel,
+                });
             }
             crate::view::ViewOp::BindSubscribedReliable {
                 participant,
@@ -429,7 +329,12 @@ impl ShardCore {
                     );
                     return;
                 };
-                meta.bind_subscribed_reliable_stream(*stream, *channel);
+                meta.apply(
+                    crate::participant::ParticipantEffect::ReliableDataSubscribed {
+                        stream: *stream,
+                        channel: *channel,
+                    },
+                );
             }
         }
     }
@@ -467,65 +372,46 @@ impl ShardCore {
         };
 
         match (action, payload) {
-            (crate::route::RouteAction::Video { local_track }, MediaPayload::Video(mut pkt)) => {
-                let Some(plan) = plans.get(crate::plan::PlanKey::Track(local_track.raw())) else {
-                    record_routing_drop("video", "plan", "remote");
+            (
+                action @ (crate::route::RouteAction::Video { .. }
+                | crate::route::RouteAction::Audio { .. }),
+                MediaPayload::Track(packet),
+            ) => {
+                let key = match action {
+                    crate::route::RouteAction::Video { local_track } => local_track.raw(),
+                    crate::route::RouteAction::Audio { track } => track.raw(),
+                    _ => {
+                        debug_assert!(false, "a media route must carry a track action");
+                        return;
+                    }
+                };
+                let mut pkt = packet.packet;
+                let Some(plan) = plans.get(crate::plan::PlanKey::Track(key)) else {
+                    record_routing_drop("track", "plan", "remote");
                     return;
                 };
                 pkt.playout_time = self.wall.to_instant(playout);
                 pkt.arrival_ts = now;
                 pkt.rehome_extensions();
-                let mut ctx = DispatchCtx {
+                let mut ctx = crate::shard::router::ForwardingContext {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    router,
                     wall: &self.wall,
+                    router,
                 };
                 self.runtime
-                    .route_video_with_plan(local_track, *pkt, plan, &mut ctx);
-            }
-            (crate::route::RouteAction::Audio { track }, MediaPayload::Audio(mut pkt)) => {
-                let Some(plan) = plans.get(crate::plan::PlanKey::Track(track.raw())) else {
-                    record_routing_drop("audio", "plan", "remote");
-                    return;
-                };
-                let Some((track_id, track_origin)) = self.runtime.track_identity(track.raw())
-                else {
-                    record_routing_drop("audio", "runtime", "remote");
-                    return;
-                };
-                pkt.playout_time = self.wall.to_instant(playout);
-                pkt.arrival_ts = now;
-                pkt.rehome_extensions();
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                    wall: &self.wall,
-                };
-                self.runtime.route_audio_with_plan(
-                    track,
-                    Origin::Remote,
-                    AudioRtpEvent {
-                        stream_id: (track_id, None),
-                        pkt: *pkt,
-                        origin: track_origin,
-                        fanout: Some(track.raw()),
-                    },
-                    plan,
-                    &mut ctx,
-                );
+                    .route_rtp_with_plan(key, Origin::Remote, *pkt, plan, &mut ctx);
             }
             (crate::route::RouteAction::Unreliable { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = plans.get(crate::plan::PlanKey::Unreliable(stream)) else {
                     record_routing_drop("data", "plan", "remote");
                     return;
                 };
-                let mut ctx = DispatchCtx {
+                let mut ctx = crate::shard::router::ForwardingContext {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    router,
                     wall: &self.wall,
+                    router,
                 };
                 self.runtime.route_unreliable_with_plan(
                     stream,
@@ -540,11 +426,11 @@ impl ShardCore {
                     record_routing_drop("reliable", "plan", "remote");
                     return;
                 };
-                let mut ctx = DispatchCtx {
+                let mut ctx = crate::shard::router::ForwardingContext {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    router,
                     wall: &self.wall,
+                    router,
                 };
                 self.runtime.route_reliable_with_plan(
                     stream,
@@ -633,54 +519,23 @@ impl ShardCore {
             return 0;
         };
         let mut processed = 0;
-        let mut ctx = DispatchCtx {
-            registry: &mut self.registry,
-            dirty: &mut self.dirty,
-            router,
-            wall: &self.wall,
-        };
         while processed < budget {
-            let Some(ev) = self.pipeline.pop_audio_rtp() else {
+            let Some(ev) = self.pipeline.pop_track() else {
                 break;
             };
             processed = processed.saturating_add(1);
-            debug_assert_eq!(ev.stream_id.0.kind(), TrackKind::Audio);
-            let Some(track) = ev.fanout else {
-                record_routing_drop("audio", "runtime", "local");
+            let Some(plan) = plans.get(crate::plan::PlanKey::Track(ev.key)) else {
+                record_routing_drop("track", "plan", "local");
                 continue;
             };
-            let Some(plan) = plans.get(crate::plan::PlanKey::Track(track)) else {
-                record_routing_drop("audio", "plan", "local");
-                continue;
+            let mut ctx = crate::shard::router::ForwardingContext {
+                registry: &mut self.registry,
+                dirty: &mut self.dirty,
+                wall: &self.wall,
+                router,
             };
-            self.runtime.route_audio_with_plan(
-                crate::keys::AudioTrackKey::new(track),
-                Origin::Local,
-                ev,
-                plan,
-                &mut ctx,
-            );
-        }
-        while processed < budget {
-            let Some(ev) = self.pipeline.pop_video_rtp() else {
-                break;
-            };
-            processed = processed.saturating_add(1);
-            debug_assert_eq!(ev.stream_id.0.kind(), TrackKind::Video);
-            let Some(fanout) = ev.fanout else {
-                record_routing_drop("video", "runtime", "local");
-                continue;
-            };
-            let Some(plan) = plans.get(crate::plan::PlanKey::Track(fanout)) else {
-                record_routing_drop("video", "plan", "local");
-                continue;
-            };
-            self.runtime.route_video_with_plan(
-                crate::keys::VideoTrackKey::new(fanout),
-                ev.pkt,
-                plan,
-                &mut ctx,
-            );
+            self.runtime
+                .route_rtp_with_plan(ev.key, Origin::Local, *ev.packet, plan, &mut ctx);
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_data_sctp() else {
@@ -694,6 +549,12 @@ impl ShardCore {
             let Some(plan) = plans.get(crate::plan::PlanKey::Unreliable(stream)) else {
                 record_routing_drop("data", "plan", "local");
                 continue;
+            };
+            let mut ctx = crate::shard::router::ForwardingContext {
+                registry: &mut self.registry,
+                dirty: &mut self.dirty,
+                wall: &self.wall,
+                router,
             };
             self.runtime
                 .route_unreliable_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
@@ -710,6 +571,12 @@ impl ShardCore {
             let Some(plan) = plans.get(crate::plan::PlanKey::Reliable(stream)) else {
                 record_routing_drop("reliable", "plan", "local");
                 continue;
+            };
+            let mut ctx = crate::shard::router::ForwardingContext {
+                registry: &mut self.registry,
+                dirty: &mut self.dirty,
+                wall: &self.wall,
+                router,
             };
             self.runtime
                 .route_reliable_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
@@ -789,13 +656,6 @@ impl ShardCore {
                     self.pipeline.push_shard_event(ev);
                 }
                 ParticipantEvent::Internal(ev) => match ev {
-                    crate::shard::events::ShardInternalEvent::TrackStatsUpdated {
-                        track_id,
-                        fanout,
-                        states,
-                    } => {
-                        self.apply_local_track_stats(fanout, track_id, states, router);
-                    }
                     crate::shard::events::ShardInternalEvent::KeyframeRequested {
                         request,
                         fanout,
@@ -818,13 +678,7 @@ impl ShardCore {
                             debug_assert!(false, "reliable control has no compiled plan");
                             continue;
                         };
-                        let mut ctx = DispatchCtx {
-                            registry: &mut self.registry,
-                            dirty: &mut self.dirty,
-                            router,
-                            wall: &self.wall,
-                        };
-                        self.runtime.route_reliable_control(bytes, plan, &mut ctx);
+                        self.runtime.route_reliable_control(bytes, plan, router);
                     }
                 },
             }
@@ -838,45 +692,6 @@ impl ShardCore {
 
     pub(crate) fn pop_shard_event(&mut self) -> Option<ShardEvent> {
         self.pipeline.pop_shard_event()
-    }
-
-    fn apply_local_track_stats(
-        &mut self,
-        fanout: Option<crate::shard::router::TrackKey>,
-        track_id: crate::entity::TrackId,
-        states: crate::track::TrackStates,
-        router: &impl ShardTransport,
-    ) {
-        let Some(fanout) = fanout else {
-            record_routing_drop("stats", "runtime", "local");
-            return;
-        };
-        let Some((runtime_track_id, _)) = self.runtime.track_descriptor(fanout) else {
-            record_routing_drop("stats", "descriptor", "local");
-            return;
-        };
-        debug_assert_eq!(runtime_track_id, track_id);
-        let plan_reader = self.plan_reader.clone();
-        let Some(plans) = plan_reader.enter() else {
-            record_routing_drop("stats", "plan", "local");
-            return;
-        };
-        let Some(plan) = plans.get(crate::plan::PlanKey::Track(fanout)) else {
-            record_routing_drop("stats", "plan", "local");
-            return;
-        };
-        let mut ctx = DispatchCtx {
-            registry: &mut self.registry,
-            dirty: &mut self.dirty,
-            router,
-            wall: &self.wall,
-        };
-        self.runtime.apply_stats(
-            crate::keys::VideoTrackKey::new(fanout),
-            states,
-            plan,
-            &mut ctx,
-        );
     }
 
     fn send_keyframe_request(
@@ -1016,42 +831,17 @@ impl ShardCore {
             ShardFrame::Media { env, payload } => {
                 self.on_media_frame(env, payload, now, plans, router);
             }
-            ShardFrame::Reverse { env, body } => self.on_reverse_frame(env, body, router),
-            ShardFrame::Telemetry { env, stats } => {
-                let view = &self.view;
-                let Some(crate::route::RouteAction::Video { local_track }) =
-                    view.routes.resolve(env.handle).copied()
-                else {
-                    return;
-                };
-                let Some(plan) = plans.get(crate::plan::PlanKey::Track(local_track.raw())) else {
-                    record_routing_drop("stats", "plan", "remote");
-                    return;
-                };
-                let mut ctx = DispatchCtx {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    router,
-                    wall: &self.wall,
-                };
-                self.runtime.apply_stats(local_track, stats, plan, &mut ctx);
-            }
+            ShardFrame::Reverse { env, body } => self.on_reverse_frame(env, body),
         }
     }
 
-    fn on_reverse_frame(&mut self, env: Envelope, body: Reverse, router: &impl ShardTransport) {
+    fn on_reverse_frame(&mut self, env: Envelope, body: Reverse) {
         debug_assert_eq!(env.ty, crate::route::EnvelopeType::Feedback);
         let Some(action) = self.view.routes.resolve(env.handle).copied() else {
             return;
         };
         let Some((origin, target)) = self.runtime.resolve_reverse(action) else {
             return;
-        };
-        let mut ctx = DispatchCtx {
-            registry: &mut self.registry,
-            dirty: &mut self.dirty,
-            router,
-            wall: &self.wall,
         };
         match (target, body) {
             (crate::route::ReverseTarget::Track { track }, Reverse::Keyframe { layer, kind }) => {
@@ -1063,13 +853,25 @@ impl ShardCore {
                     record_routing_drop("reverse", "encoding", "remote");
                     return;
                 };
-                ctx.notify_keyframe_request(origin, track_id, rid, kind);
+                if let Some(meta) = self.registry.resolve_mut(origin) {
+                    meta.input(crate::participant::ParticipantInput::Keyframe {
+                        stream_id: (track_id, rid),
+                        kind,
+                    });
+                    self.dirty.mark(origin, meta);
+                }
             }
             (crate::route::ReverseTarget::Topic { stream }, Reverse::DataAck(bytes)) => {
                 let Some(topic) = self.runtime.reliable_topic(stream).cloned() else {
                     return;
                 };
-                ctx.deliver_reliable_control(origin, &topic, &bytes);
+                if let Some(meta) = self.registry.resolve_mut(origin) {
+                    meta.input(crate::participant::ParticipantInput::ReliableControl {
+                        topic: &topic,
+                        bytes: &bytes,
+                    });
+                    self.dirty.mark(origin, meta);
+                }
             }
             _ => {}
         }
@@ -1088,6 +890,7 @@ impl ShardCore {
         if let Some(participant) = self.registry.resolve_mut(key) {
             self.dirty.mark(key, participant);
         }
+        self.apply_pending_participant_effects();
         true
     }
 

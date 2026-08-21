@@ -52,6 +52,7 @@ pub struct Signaling {
     // Batch updates and only serialize when something moved.
     dirty_roster: bool,
     dirty_bindings: bool,
+    full_state_retries: u8,
 
     /// What the client has been told. The roster is carried as a diff because it
     /// is the large set; the bindings are bounded by the subscriber's slots and
@@ -73,6 +74,7 @@ impl Signaling {
             cid: None,
             dirty_roster: true,
             dirty_bindings: true,
+            full_state_retries: 0,
             previous_participants: HashSet::new(),
             participants: HashSet::new(),
             previous_publications: HashSet::new(),
@@ -88,6 +90,9 @@ impl Signaling {
 
     pub fn set_cid(&mut self, cid: ChannelId) {
         self.cid = Some(cid);
+        self.dirty_roster = true;
+        self.dirty_bindings = true;
+        self.full_state_retries = 2;
     }
 
     pub fn set_slot_count(&mut self, slot_count: usize) {
@@ -224,6 +229,7 @@ impl Signaling {
 
     pub fn mark_tracks_dirty(&mut self) {
         self.dirty_roster = true;
+        self.full_state_retries = 2;
     }
 
     pub fn mark_assignments_dirty(&mut self) {
@@ -242,6 +248,7 @@ impl Signaling {
             self.participants.remove(&participant.as_str());
         }
         self.dirty_roster = true;
+        self.full_state_retries = 2;
     }
 
     pub fn poll(&mut self, rtc: &mut Rtc, downstream: &DownstreamAllocator) -> bool {
@@ -285,9 +292,10 @@ impl Signaling {
             .collect();
         debug_assert_eq!(current_publication_ids.len(), publications.len());
 
+        let force_full = self.full_state_retries != 0;
         let participants_added: Vec<signaling::Participant> = participants
             .iter()
-            .filter(|id| !self.previous_participants.contains(*id))
+            .filter(|id| force_full || !self.previous_participants.contains(*id))
             .map(|id| signaling::Participant {
                 participant_id: id.clone(),
             })
@@ -299,7 +307,9 @@ impl Signaling {
             .collect();
         let publications_added: Vec<signaling::Publication> = publications
             .into_iter()
-            .filter(|publication| !self.previous_publications.contains(&publication.track_id))
+            .filter(|publication| {
+                force_full || !self.previous_publications.contains(&publication.track_id)
+            })
             .collect();
         let publications_removed: Vec<String> = self
             .previous_publications
@@ -330,14 +340,14 @@ impl Signaling {
             .collect();
         let current_audio_shape = audio_shape(&current_audio);
 
-        let video_changed = current_video != self.previous_video;
-        let audio_changed = current_audio_shape != self.previous_audio;
+        let video_changed = force_full || current_video != self.previous_video;
+        let audio_changed = force_full || current_audio_shape != self.previous_audio;
 
         let roster_changed = !participants_added.is_empty()
             || !participants_removed.is_empty()
             || !publications_added.is_empty()
             || !publications_removed.is_empty();
-        if !roster_changed && !video_changed && !audio_changed {
+        if !force_full && !roster_changed && !video_changed && !audio_changed {
             self.dirty_roster = false;
             self.dirty_bindings = false;
             return false;
@@ -354,6 +364,7 @@ impl Signaling {
             audio: audio_changed.then_some(signaling::AudioBindings {
                 items: current_audio,
             }),
+            snapshot: force_full,
         };
 
         let msg = signaling::ServerMessage {
@@ -377,8 +388,11 @@ impl Signaling {
         if audio_changed {
             self.previous_audio = current_audio_shape;
         }
-        self.dirty_roster = false;
-        self.dirty_bindings = false;
+        if force_full {
+            self.full_state_retries = self.full_state_retries.saturating_sub(1);
+        }
+        self.dirty_roster = self.full_state_retries != 0;
+        self.dirty_bindings = self.full_state_retries != 0;
         true
     }
 }

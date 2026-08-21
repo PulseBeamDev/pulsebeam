@@ -85,12 +85,6 @@ impl ControllerCore {
         shard_id: ShardId,
         transport: Option<crate::route::TransportHandle>,
     ) -> ParticipantConfig {
-        let tracks = self
-            .registry
-            .get_or_create_room(state.room_id)
-            .tracks()
-            .cloned()
-            .collect();
         self.registry
             .add_participant(state.participant_id, state.room_id, shard_id, transport);
         self.registry
@@ -100,7 +94,6 @@ impl ControllerCore {
             room_id: state.room_id,
             participant_id: state.participant_id,
             rtc,
-            available_tracks: tracks,
         }
     }
 

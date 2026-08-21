@@ -1,10 +1,12 @@
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
+use crate::rtp;
+#[cfg(test)]
+use crate::rtp::RtpPacket;
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
-use crate::rtp::switcher::Switcher;
-use crate::rtp::{self, RtpPacket};
+use crate::rtp::switcher::{LayerStates, Switcher};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indexmap::IndexSet;
 use slotmap::{SecondaryMap, SlotMap};
@@ -16,10 +18,8 @@ use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::keys::DownstreamSlotKey;
+use crate::keys::{DownstreamSlotKey, TrackKey};
 use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
-use crate::rtp::monitor::StreamStats;
-use crate::shard::router::TrackKey;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Video slots preallocated per participant.
@@ -100,17 +100,21 @@ pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 pub struct VideoAllocator {
-    routes: HashMap<TrackId, DownstreamSlotKey>,
+    routes: SecondaryMap<TrackKey, DownstreamSlotKey>,
     slots: SlotMap<DownstreamSlotKey, Slot>,
 
     // Cold
     ctx: LogCtx,
     manual_sub: bool,
-    tracks: Vec<Track>,
-    layer_states: LayerStates,
-    last_reconciled: HashSet<(TrackId, DownstreamSlotKey)>,
+    tracks: SecondaryMap<TrackKey, Track>,
+    track_keys: HashMap<TrackId, TrackKey>,
+    last_reconciled: HashSet<(TrackKey, DownstreamSlotKey)>,
     desired_ctrl: BitrateController,
     current_allocation: Bitrate,
+    #[cfg(test)]
+    test_keys: SlotMap<TrackKey, ()>,
+    #[cfg(test)]
+    test_layer_states: LayerStates,
 }
 
 impl VideoAllocator {
@@ -123,35 +127,45 @@ impl VideoAllocator {
         }
         .build();
         Self {
-            layer_states: LayerStates::new(),
             ctx,
             manual_sub,
-            tracks: Vec::new(),
+            tracks: SecondaryMap::new(),
+            track_keys: HashMap::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
-            routes: HashMap::new(),
+            routes: SecondaryMap::new(),
             last_reconciled: HashSet::new(),
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
+            #[cfg(test)]
+            test_keys: SlotMap::with_key(),
+            #[cfg(test)]
+            test_layer_states: LayerStates::new(),
         }
     }
 
-    pub fn add_track(&mut self, track: Track) {
-        for existing in &self.tracks {
-            if existing.meta.id == track.meta.id {
-                return;
-            }
+    pub(crate) fn install_track(&mut self, key: TrackKey, track: Track) {
+        if self.track_keys.insert(track.id(), key).is_some() {
+            debug_assert!(false, "a TrackId must have one installed TrackKey");
+            return;
         }
-        plog_info!(self.ctx, track = %track.meta.id, "video track added");
-        self.tracks.push(track);
+        plog_info!(self.ctx, track = %track.meta().id, "video track added");
+        let previous = self.tracks.insert(key, track);
+        debug_assert!(previous.is_none(), "a TrackKey must be installed once");
         self.rebalance();
     }
 
+    #[cfg(test)]
+    pub(crate) fn add_track(&mut self, track: Track) {
+        let key = self.test_keys.insert(());
+        self.install_track(key, track);
+    }
+
     pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
-        let old_len = self.tracks.len();
-        self.tracks.retain(|track| track.meta.id != *track_id);
-        if old_len == self.tracks.len() {
+        let Some(key) = self.track_keys.remove(track_id) else {
             return false;
-        }
+        };
+        let removed = self.tracks.remove(key);
+        debug_assert!(removed.is_some(), "track index must resolve to catalog");
         plog_info!(self.ctx, track = %track_id, "video track removed");
         // Stop any slot currently targeting the removed track so reconcile_routes
         // fires StreamUnsubscribed and cleans up the routing table.
@@ -164,37 +178,10 @@ impl VideoAllocator {
         true
     }
 
-    /// Replace a track's measurements with the shard's latest snapshot.
-    ///
-    /// Pushed by the shard when the publisher's numbers move, not carried on
-    /// packets: an allocation pass landing between a new snapshot and the next
-    /// arriving packet would otherwise decide against the previous one.
-    pub fn update_layer_states(&mut self, track_id: TrackId, states: &crate::track::TrackStates) {
-        for (rid, stats) in states {
-            self.layer_states.insert((track_id, *rid), *stats);
-        }
-    }
-
-    pub fn update_layer_states_slot(
-        &mut self,
-        slot_key: DownstreamSlotKey,
-        states: &crate::track::TrackStates,
-    ) {
-        let Some(slot) = self.slots.get(slot_key) else {
-            debug_assert!(false, "compiled downstream slot must resolve");
-            return;
-        };
-        let Some(track_id) = slot.target().map(|layer| layer.meta.id) else {
-            return;
-        };
-        self.update_layer_states(track_id, states);
-    }
-
     /// Seed measurements directly, standing in for media already flowing.
     #[cfg(test)]
     pub(crate) fn seed_layer_states(&mut self, states: &LayerStates) {
-        self.layer_states
-            .extend(states.iter().map(|(k, v)| (*k, *v)));
+        self.test_layer_states = states.clone();
     }
 
     pub fn slot_count(&self) -> usize {
@@ -202,13 +189,14 @@ impl VideoAllocator {
     }
 
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
-        let layer_states = &self.layer_states;
-        for (_key, slot) in &mut self.slots {
-            let tracks = &mut self.tracks;
+        let slots = &mut self.slots;
+        let tracks = &self.tracks;
+        let track_keys = &self.track_keys;
+        for (_key, slot) in slots {
             if let Some(intent) = intents.get(&slot.mid) {
-                Self::configure_slot(tracks, layer_states, slot, Some(intent));
+                Self::configure_slot(tracks, track_keys, slot, Some(intent));
             } else {
-                Self::configure_slot(tracks, layer_states, slot, None);
+                Self::configure_slot(tracks, track_keys, slot, None);
             }
         }
     }
@@ -216,8 +204,8 @@ impl VideoAllocator {
     /// Routes this slot to the given track at the specified QoS, or stops
     /// routing if `track_id` is `None` or `intent.max_height` is 0.
     fn configure_slot(
-        tracks: &mut [Track],
-        layer_states: &LayerStates,
+        tracks: &SecondaryMap<TrackKey, Track>,
+        track_keys: &HashMap<TrackId, TrackKey>,
         slot: &mut Slot,
         intent: Option<&Intent>,
     ) -> Option<()> {
@@ -225,9 +213,14 @@ impl VideoAllocator {
             && intent.target_height > 0
         {
             let track_id = &intent.track_id;
-            let Some(track_state) = Self::track_mut_in(tracks, track_id) else {
+            let Some(&track_key) = track_keys.get(track_id) else {
                 plog_warn!(slot.ctx, track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
                 slot.max_height = 0;
+                slot.stop();
+                return None;
+            };
+            let Some(track_state) = tracks.get(track_key) else {
+                debug_assert!(false, "track index must resolve to catalog");
                 slot.stop();
                 return None;
             };
@@ -235,12 +228,13 @@ impl VideoAllocator {
             // Keep current layer if slot already targets this track to avoid
             // unnecessary PLI requests; otherwise start at lowest quality.
             let layer = if let Some(target) = slot.target()
-                && target.meta.id == track_state.meta.id
+                && target.meta.id == track_state.id()
             {
                 target
             } else {
+                let states = track_states(track_state);
                 let Some(layer) = track_state.lowest_healthy_quality(|l| {
-                    layer_states
+                    states
                         .get(&l.stream_id())
                         .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
                 }) else {
@@ -268,7 +262,7 @@ impl VideoAllocator {
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {
-        self.tracks.iter().map(|track| &track.meta)
+        self.tracks.values().map(Track::meta)
     }
 
     pub fn slots(&self) -> impl Iterator<Item = SlotAssignment> + '_ {
@@ -278,7 +272,7 @@ impl VideoAllocator {
                 paused: s.paused || matches!(s.state(), SlotState::Idle | SlotState::Starting),
                 track: {
                     let layer = s.target()?;
-                    self.track(&layer.meta.id)?.meta.clone()
+                    self.track(&layer.meta.id)?.meta().clone()
                 },
             })
         })
@@ -321,8 +315,8 @@ impl VideoAllocator {
 
         let mut pending_tracks = self
             .tracks
-            .iter()
-            .filter(|track| !already_assigned.contains(&track.meta.id));
+            .values()
+            .filter(|track| !already_assigned.contains(&track.meta().id));
 
         let idle_slot_count = self
             .slots
@@ -346,7 +340,7 @@ impl VideoAllocator {
             .filter(|s| s.state() == SlotState::Idle)
         {
             if let Some(track_state) = pending_tracks.next() {
-                let states = &self.layer_states;
+                let states = track_states(track_state);
                 let Some(layer) = track_state.lowest_healthy_quality(|l| {
                     states
                         .get(&l.stream_id())
@@ -393,7 +387,8 @@ impl VideoAllocator {
             .iter()
             .filter_map(|(key, s)| {
                 let current = s.target()?;
-                let track = Self::track_in(&self.tracks, &current.meta.id)?;
+                let track_key = *self.track_keys.get(&current.meta.id)?;
+                let track = self.tracks.get(track_key)?;
                 let current_quality = current.quality;
                 Some(SlotView {
                     key,
@@ -413,7 +408,8 @@ impl VideoAllocator {
 
         // Snapshot all layer atomics once so the entire allocation pass is
         // deterministic — no re-reads from concurrent StreamMonitor::poll() writes.
-        let engine = AllocationEngine::new(&views, &self.layer_states);
+        let states = self.snapshot_states();
+        let engine = AllocationEngine::new(&views, &states);
         let decisions = engine.run_compute(available_bandwidth, &views);
         let desired_raw = engine.run_desired(&views);
         self.current_allocation = AllocationEngine::used_bitrate(&decisions);
@@ -441,7 +437,7 @@ impl VideoAllocator {
                     ) => Some(layer.quality as u8),
                     _ => None,
                 };
-                crate::sim_metrics::record_forwarded_quality_for(view.track.meta.origin, quality);
+                crate::sim_metrics::record_forwarded_quality_for(view.track.meta().origin, quality);
             }
         }
 
@@ -496,8 +492,8 @@ impl VideoAllocator {
     #[inline]
     pub fn on_rtp(
         &mut self,
-        track_id: TrackId,
-        pkt: &RtpPacket,
+        track_key: TrackKey,
+        arrival_ts: Instant,
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
@@ -508,39 +504,19 @@ impl VideoAllocator {
         // monitor, so caching the first one was enough — the values behind it
         // kept moving. They are values now, so a first-write-wins cache would
         // freeze the allocator on whatever it happened to see first.
-        let Some(&slot_key) = self.routes.get(&track_id) else {
+        let Some(&slot_key) = self.routes.get(track_key) else {
             return false;
         };
+        let Some(track) = self.tracks.get(track_key) else {
+            debug_assert!(false, "route key must resolve to an installed track");
+            return false;
+        };
+        let track_id = track.id();
         let Some(slot) = self.slots.get_mut(slot_key) else {
-            plog_warn!(self.ctx, "no slot found for track {:?}", track_id);
+            plog_warn!(self.ctx, "no slot found for track {:?}", track_key);
             return false;
         };
-        slot.on_rtp(track_id, pkt, cache, writer)
-    }
-
-    #[inline]
-    /// Forward one packet into a compiled slot.
-    ///
-    /// `track` is the track the packet and `cache` actually belong to, not the
-    /// slot's target. Deriving it from the target instead spliced two sources
-    /// into one egress stream: while a slot was retargeted, a packet still
-    /// arriving for the outgoing track was announced under the incoming one, so
-    /// the switcher's own per-track gate admitted it and read the wrong cache on
-    /// the active stream's timeline. The subscriber saw a frame cut short and
-    /// the next source's frame continue its sequence number.
-    pub fn on_rtp_slot(
-        &mut self,
-        slot_key: DownstreamSlotKey,
-        track: TrackId,
-        pkt: &RtpPacket,
-        cache: Option<&TrackStreamCache>,
-        writer: &mut StreamWriter,
-    ) -> bool {
-        let Some(slot) = self.slots.get_mut(slot_key) else {
-            debug_assert!(false, "compiled downstream slot must resolve");
-            return false;
-        };
-        slot.on_rtp(track, pkt, cache, writer)
+        slot.on_rtp(track_id, arrival_ts, cache, writer)
     }
 
     pub(crate) fn poll_slow(
@@ -548,20 +524,15 @@ impl VideoAllocator {
         now: Instant,
         _bandwidth: Bitrate,
         events: &mut impl ParticipantSink,
-        fanouts: &HashMap<TrackId, TrackKey>,
     ) {
         self.reconcile_routes(events);
-        self.retry_keyframe_requests(now, events, fanouts);
+        self.retry_keyframe_requests(now, events);
     }
 
-    fn retry_keyframe_requests(
-        &mut self,
-        now: Instant,
-        events: &mut impl ParticipantSink,
-        fanouts: &HashMap<TrackId, TrackKey>,
-    ) {
+    fn retry_keyframe_requests(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        let track_keys = &self.track_keys;
         for (_, slot) in &mut self.slots {
-            slot.pli_retry(now, events, fanouts);
+            slot.pli_retry(now, events, |track_id| track_keys.get(&track_id).copied());
         }
     }
 
@@ -580,10 +551,15 @@ impl VideoAllocator {
             .into_iter()
             .flatten()
             {
-                current.insert((stream.0, slot_key));
+                let Some(&track_key) = self.track_keys.get(&stream.0) else {
+                    continue;
+                };
+                current.insert((track_key, slot_key));
             }
-            if let Some(desired) = slot.desired.as_ref() {
-                current.insert((desired.meta.id, slot_key));
+            if let Some(desired) = slot.desired.as_ref()
+                && let Some(&track_key) = self.track_keys.get(&desired.meta.id)
+            {
+                current.insert((track_key, slot_key));
             }
         }
 
@@ -597,19 +573,19 @@ impl VideoAllocator {
             }
         }
 
-        for (track_id, slot_key) in removed {
-            if self.last_reconciled.contains(&(track_id, slot_key))
-                && let Some(track) = self.track(&track_id)
+        for (track_key, slot_key) in removed {
+            if self.last_reconciled.contains(&(track_key, slot_key))
+                && let Some(track) = self.tracks.get(track_key)
             {
-                events.unsubscribe(track.meta.clone(), slot_key);
+                events.unsubscribe(track.meta().clone(), slot_key);
             }
         }
 
-        for (track_id, slot_key) in &current {
-            if self.routes.get(track_id) != Some(slot_key) {
-                self.routes.insert(*track_id, *slot_key);
-                if let Some(track) = self.track(track_id) {
-                    events.subscribe(track.meta.clone(), *slot_key);
+        for (track_key, slot_key) in &current {
+            if self.routes.get(*track_key) != Some(slot_key) {
+                self.routes.insert(*track_key, *slot_key);
+                if let Some(track) = self.tracks.get(*track_key) {
+                    events.subscribe(track.meta().clone(), *slot_key);
                 }
             }
         }
@@ -623,25 +599,48 @@ impl VideoAllocator {
     }
 
     fn routes_consistent(&self) -> bool {
-        self.routes.iter().all(|(sid, slot_key)| {
-            self.slots
-                .get(*slot_key)
-                .is_some_and(|slot| slot.matches_track_id(sid))
+        self.routes.iter().all(|(track_key, slot_key)| {
+            self.slots.get(*slot_key).is_some_and(|slot| {
+                self.tracks
+                    .get(track_key)
+                    .is_some_and(|track| slot.matches_track_id(&track.id()))
+            })
         })
     }
 
     #[cfg(test)]
     fn has_route(&self, track_id: &TrackId) -> bool {
-        self.routes.contains_key(track_id)
-    }
-
-    pub(crate) fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
-        self.routes.get(track_id).copied()
+        self.track_keys
+            .get(track_id)
+            .is_some_and(|key| self.routes.contains_key(*key))
     }
 
     #[cfg(test)]
     fn set_route(&mut self, track_id: TrackId, slot_key: DownstreamSlotKey) {
-        self.routes.insert(track_id, slot_key);
+        let key = *self.track_keys.get(&track_id).unwrap();
+        self.routes.insert(key, slot_key);
+    }
+
+    #[cfg(test)]
+    fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
+        self.track_keys
+            .get(track_id)
+            .and_then(|key| self.routes.get(*key).copied())
+    }
+
+    #[cfg(test)]
+    fn on_rtp_slot(
+        &mut self,
+        _slot: DownstreamSlotKey,
+        track_id: TrackId,
+        pkt: &RtpPacket,
+        cache: Option<&TrackStreamCache>,
+        writer: &mut StreamWriter,
+    ) -> bool {
+        let Some(&key) = self.track_keys.get(&track_id) else {
+            return false;
+        };
+        self.on_rtp(key, pkt.arrival_ts, cache, writer)
     }
 
     /// Returns `true` if every track ID appears in at most one slot's
@@ -682,34 +681,47 @@ impl VideoAllocator {
     }
 
     fn track(&self, track_id: &TrackId) -> Option<&Track> {
-        Self::track_in(&self.tracks, track_id)
+        self.track_keys
+            .get(track_id)
+            .and_then(|key| self.tracks.get(*key))
     }
 
-    #[allow(
-        clippy::manual_find,
-        reason = "the routing guard keeps stable-id discovery out of the forwarding path"
-    )]
-    fn track_in<'a>(tracks: &'a [Track], track_id: &TrackId) -> Option<&'a Track> {
-        for track in tracks {
-            if track.meta.id == *track_id {
-                return Some(track);
-            }
+    fn snapshot_states(&self) -> LayerStates {
+        let mut states = LayerStates::new();
+        for track in self.tracks.values() {
+            states.extend(track_states(track));
         }
-        None
+        #[cfg(test)]
+        states.extend(
+            self.test_layer_states
+                .iter()
+                .map(|(key, value)| (*key, *value)),
+        );
+        states
     }
+}
 
-    #[allow(
-        clippy::manual_find,
-        reason = "the routing guard keeps stable-id discovery out of the forwarding path"
-    )]
-    fn track_mut_in<'a>(tracks: &'a mut [Track], track_id: &TrackId) -> Option<&'a mut Track> {
-        for track in tracks {
-            if track.meta.id == *track_id {
-                return Some(track);
-            }
-        }
-        None
-    }
+fn track_states(track: &Track) -> LayerStates {
+    let Some(stats) = track.stats() else {
+        return LayerStates::new();
+    };
+    let states = stats.layer_states();
+    debug_assert_eq!(
+        states.len(),
+        track.layers().len(),
+        "a video track snapshot must cover every layer"
+    );
+    states
+        .iter()
+        .zip(track.layers())
+        .map(|((rid, stats), layer)| {
+            debug_assert_eq!(
+                *rid, layer.rid,
+                "a video layer snapshot must retain its RID"
+            );
+            (layer.stream_id(), *stats)
+        })
+        .collect()
 }
 
 #[derive(PartialEq)]
@@ -800,7 +812,7 @@ impl Slot {
         &mut self,
         now: Instant,
         events: &mut impl ParticipantSink,
-        fanouts: &HashMap<TrackId, TrackKey>,
+        fanout_for: impl Fn(TrackId) -> Option<TrackKey>,
     ) {
         if self.paused {
             return;
@@ -824,7 +836,7 @@ impl Slot {
         // Media dropped in that same window is fine and self-heals, because more
         // of it is always coming. A keyframe request is one-shot; losing it
         // costs the whole stream.
-        let Some(fanout) = fanouts.get(&staging.stream_id().0).copied() else {
+        let Some(fanout) = fanout_for(staging.stream_id().0) else {
             return;
         };
 
@@ -962,7 +974,7 @@ impl Slot {
     fn on_rtp(
         &mut self,
         track_id: TrackId,
-        pkt: &RtpPacket,
+        arrival_ts: Instant,
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
@@ -979,10 +991,9 @@ impl Slot {
         // change in the active stream means a switch was promoted this tick.
         let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
-        self.switcher
-            .feed(track_id, cache, pkt.arrival_ts, &mut |out| {
-                writer.write_video_owned(out, mid, rid, ssrc, pt);
-            });
+        self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
+            writer.write_video_owned(out, mid, rid, ssrc, pt);
+        });
         self.switcher.active_stream() != before
     }
 
@@ -1134,8 +1145,6 @@ pub struct AllocationEngine {
 /// Measurement handles for the encodings this participant can see, cached from
 /// the forward path. The publisher's shard owns the originals; the controller
 /// never sees them.
-pub type LayerStates = HashMap<StreamId, StreamStats>;
-
 impl AllocationEngine {
     /// Capture a point-in-time snapshot of every layer reachable from `slots`.
     /// A layer with no handle yet — nothing has been forwarded on it — falls
@@ -1146,9 +1155,9 @@ impl AllocationEngine {
         // participant, and letting it grow from empty rehashes the whole thing
         // two or three times on the way — work proportional to the layer count,
         // repeated 10 times a second per participant, for nothing.
-        let layer_count = slots.iter().map(|s| s.track.layers.len()).sum();
+        let layer_count = slots.iter().map(|s| s.track.layers().len()).sum();
         let mut snaps = HashMap::with_capacity_and_hasher(layer_count, Default::default());
-        snaps.extend(slots.iter().flat_map(|s| s.track.layers.iter()).map(|l| {
+        snaps.extend(slots.iter().flat_map(|s| s.track.layers().iter()).map(|l| {
             let stream_id = l.stream_id();
             let snap = match states.get(&stream_id) {
                 Some(state) => {
@@ -1331,7 +1340,7 @@ impl AllocationEngine {
     /// shorter to fall back to.
     fn min_track_height(&self, track: &Track) -> u32 {
         track
-            .layers
+            .layers()
             .iter()
             .map(|l| self.height(l))
             .min()
@@ -1349,7 +1358,7 @@ impl AllocationEngine {
         let request = slot.max_height.max(self.min_track_height(slot.track));
         let ceiling = slot
             .track
-            .layers
+            .layers()
             .iter()
             .map(|l| self.height(l))
             .filter(|&h| h >= request)
@@ -1380,7 +1389,7 @@ impl AllocationEngine {
     /// client requests a height that only "q" would satisfy).
     fn closest_healthy<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
-            .layers
+            .layers()
             .iter()
             .filter(|layer| self.snap(layer).healthy && self.cost(layer) > 0.0)
             .min_by_key(|l| l.quality)
@@ -1390,7 +1399,7 @@ impl AllocationEngine {
     /// uplink is in trouble, as distinct from the subscriber's downlink being
     /// short of budget or an encoding simply carrying no bytes.
     fn nothing_healthy(&self, slot: &SlotView<'_>) -> bool {
-        !slot.track.layers.iter().any(|l| self.snap(l).healthy)
+        !slot.track.layers().iter().any(|l| self.snap(l).healthy)
     }
 
     /// The bottom rung of the ladder the client's spatial request allows,
@@ -1399,11 +1408,11 @@ impl AllocationEngine {
     /// them.
     fn lowest_ladder<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
-            .layers
+            .layers()
             .iter()
             .filter(|layer| self.spatially_allowed(slot, layer))
             .min_by_key(|layer| layer.quality)
-            .or_else(|| slot.track.layers.iter().min_by_key(|layer| layer.quality))
+            .or_else(|| slot.track.layers().iter().min_by_key(|layer| layer.quality))
     }
 
     /// A legal layer to retain as the pause target even when no layer is
@@ -1412,7 +1421,7 @@ impl AllocationEngine {
     fn pause_target<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         let target = slot
             .track
-            .layers
+            .layers()
             .iter()
             .filter(|layer| self.eligible(slot, layer))
             .min_by_key(|layer| layer.quality)
@@ -1434,7 +1443,7 @@ impl AllocationEngine {
     /// asked for it to be off". Only the first is starvation.
     fn eligible_but_unfunded(&self, slot: &SlotView<'_>) -> bool {
         slot.track
-            .layers
+            .layers()
             .iter()
             .any(|layer| self.eligible(slot, layer))
     }
@@ -1450,7 +1459,7 @@ impl AllocationEngine {
         current: Option<&'a TrackLayer>,
     ) -> Option<&'a TrackLayer> {
         slot.track
-            .layers
+            .layers()
             .iter()
             .filter(|layer| self.eligible(slot, layer))
             .filter(|layer| current.is_none_or(|current| layer.quality > current.quality))
@@ -1481,7 +1490,7 @@ impl AllocationEngine {
     /// budget can currently afford. Feeds the BWE-facing desired bitrate.
     fn best_healthy<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
-            .layers
+            .layers()
             .iter()
             .filter(|layer| self.eligible(slot, layer))
             .max_by(|a, b| self.cost(a).total_cmp(&self.cost(b)))
@@ -1541,7 +1550,12 @@ impl AllocationEngine {
         if slot.min_height == 0 {
             return None;
         }
-        let eligible = || slot.track.layers.iter().filter(|l| self.eligible(slot, l));
+        let eligible = || {
+            slot.track
+                .layers()
+                .iter()
+                .filter(|l| self.eligible(slot, l))
+        };
         eligible()
             .filter(|l| self.height(l) >= slot.min_height)
             .min_by_key(|l| l.quality)
@@ -1731,6 +1745,7 @@ mod alloc_test_support {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::ParticipantId;
+    use crate::rtp::monitor::StreamStats;
     use crate::track::UpstreamTrack;
     use crate::track::test_utils::make_video_track;
     use str0m::media::SimulcastLayer;
@@ -1740,7 +1755,7 @@ mod alloc_test_support {
     /// loops did.
     pub(super) fn states_for(track: &Track) -> LayerStates {
         track
-            .layers
+            .layers()
             .iter()
             .map(|l| {
                 (
@@ -1828,11 +1843,7 @@ mod assignment_tests {
 
             ids.push(meta.id);
             allocator.seed_layer_states(&states);
-            allocator.add_track(Track {
-                meta,
-                layers: track.layers,
-                reverse: None,
-            });
+            allocator.add_track(Track::video_track(meta, track.layers().to_vec(), None));
             senders.push(tx);
         }
 
@@ -1856,11 +1867,7 @@ mod assignment_tests {
             Mid::from("v0"),
             vec![SimulcastLayer::new("q"), SimulcastLayer::new("h")],
         );
-        let track = Track {
-            meta: tx.meta,
-            layers: built.layers,
-            reverse: None,
-        };
+        let track = Track::video_track(tx.meta, built.layers().to_vec(), None);
 
         // The "h" encoding advertises three decode targets (L1T3); "q", none.
         let scalable = track.by_quality(LayerQuality::Medium).unwrap();
@@ -1999,14 +2006,6 @@ mod assignment_tests {
     ///
     /// Tests that exercise retry cadence need this: an empty map means the
     /// binding has not arrived yet, and no request may be issued in that state.
-    fn bound_fanouts(allocator: &VideoAllocator) -> HashMap<TrackId, TrackKey> {
-        let mut keys: SlotMap<TrackKey, ()> = SlotMap::with_key();
-        allocator
-            .tracks()
-            .map(|meta| (meta.id, keys.insert(())))
-            .collect()
-    }
-
     #[test]
     fn route_subscription_initializes_keyframe_retry_state() {
         let mut allocator = setup_allocator();
@@ -2031,9 +2030,8 @@ mod assignment_tests {
             "reconcile_routes no longer emits an immediate keyframe request"
         );
 
-        let fanouts = bound_fanouts(&allocator);
         let mut queue = MockParticipantSink::new();
-        allocator.retry_keyframe_requests(now, &mut queue, &fanouts);
+        allocator.retry_keyframe_requests(now, &mut queue);
         assert_eq!(
             queue.request_keyframe_calls.len(),
             1,
@@ -2059,7 +2057,8 @@ mod assignment_tests {
         slot.set_roles_for_test(None, Some(&low));
         slot.paused = false;
         fresh.reconcile_routes(&mut unbound);
-        fresh.retry_keyframe_requests(now, &mut unbound, &HashMap::new());
+        fresh.track_keys.clear();
+        fresh.retry_keyframe_requests(now, &mut unbound);
         assert_eq!(
             unbound.request_keyframe_calls.len(),
             0,
@@ -2081,11 +2080,7 @@ mod assignment_tests {
         let (tx, track, states) = video_track_with_states(pid, mid, track_layers);
         let track_id = tx.meta.id;
         allocator.seed_layer_states(&states);
-        allocator.add_track(Track {
-            meta: tx.meta,
-            layers: track.layers,
-            reverse: None,
-        });
+        allocator.add_track(Track::video_track(tx.meta, track.layers().to_vec(), None));
         add_slots(&mut allocator, 1);
 
         let track = allocator.track(&track_id).unwrap();
@@ -2134,9 +2129,8 @@ mod assignment_tests {
             .stream_id();
         let slot_key = allocator.slots.keys().next().unwrap();
         allocator.set_route(old_stream_id.0, slot_key);
-        allocator
-            .last_reconciled
-            .insert((old_stream_id.0, slot_key));
+        let old_key = *allocator.track_keys.get(&old_stream_id.0).unwrap();
+        allocator.last_reconciled.insert((old_key, slot_key));
 
         let slot = allocator.slots.values_mut().next().unwrap();
         slot.set_roles_for_test(None, None);
@@ -2189,11 +2183,11 @@ mod assignment_tests {
             vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
         );
         allocator.seed_layer_states(&states);
-        allocator.add_track(Track {
-            meta: tx.meta.clone(),
-            layers: track.layers,
-            reverse: None,
-        });
+        allocator.add_track(Track::video_track(
+            tx.meta.clone(),
+            track.layers().to_vec(),
+            None,
+        ));
         add_slots(&mut allocator, 1);
 
         let track = allocator.track(&tx.meta.id).unwrap();
@@ -2211,7 +2205,7 @@ mod assignment_tests {
         };
 
         let mut writer = crate::track::StreamWriter::new();
-        slot.on_rtp(high.meta.id, &pkt, None, &mut writer);
+        slot.on_rtp(high.meta.id, pkt.arrival_ts, None, &mut writer);
 
         assert_eq!(
             slot.test_active(),
@@ -2342,8 +2336,7 @@ mod assignment_tests {
                 SimulcastLayer::new("f"),
             ],
         );
-        let mut track = track;
-        for layer in &mut track.layers {
+        for layer in track.layers() {
             state_of_mut(&mut states, layer).set_inactive(false);
         }
 
@@ -2374,8 +2367,7 @@ mod assignment_tests {
                 SimulcastLayer::new("f"),
             ],
         );
-        let mut track = track;
-        for layer in &mut track.layers {
+        for layer in track.layers() {
             state_of_mut(&mut states, layer).set_inactive(false);
         }
 
@@ -2407,8 +2399,7 @@ mod assignment_tests {
                 SimulcastLayer::new("f"),
             ],
         );
-        let mut track = track;
-        for layer in &mut track.layers {
+        for layer in track.layers() {
             state_of_mut(&mut states, layer).set_inactive(false);
         }
 
@@ -2522,11 +2513,7 @@ mod assignment_tests {
         let pid = ParticipantId::new();
         let (tx, track, states) = video_track_with_states(pid, Mid::from("late"), vec![]);
         allocator.seed_layer_states(&states);
-        allocator.add_track(Track {
-            meta: tx.meta,
-            layers: track.layers,
-            reverse: None,
-        });
+        allocator.add_track(Track::video_track(tx.meta, track.layers().to_vec(), None));
 
         assert!(
             allocator.no_duplicate_slot_assignments(),
@@ -2555,11 +2542,7 @@ mod assignment_tests {
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
         allocator.seed_layer_states(&states);
-        allocator.add_track(Track {
-            meta,
-            layers: track.layers,
-            reverse: None,
-        });
+        allocator.add_track(Track::video_track(meta, track.layers().to_vec(), None));
         assert_eq!(allocator.slots().count(), 3);
     }
 
@@ -2579,11 +2562,7 @@ mod assignment_tests {
 
         allocator.seed_layer_states(&states);
 
-        allocator.add_track(Track {
-            meta: tx.meta,
-            layers: track.layers.clone(),
-            reverse: None,
-        });
+        allocator.add_track(Track::video_track(tx.meta, track.layers().to_vec(), None));
         add_slots(&mut allocator, 1);
 
         allocator.rebalance();
@@ -2647,11 +2626,7 @@ mod allocation_tests {
             ],
         );
         (
-            Track {
-                meta: tx.meta,
-                layers: track.layers,
-                reverse: None,
-            },
+            Track::video_track(tx.meta, track.layers().to_vec(), None),
             states,
         )
     }
@@ -3210,7 +3185,7 @@ mod allocation_tests {
 
     fn track_with_every_layer_bad() -> (Track, LayerStates) {
         let (t, mut states) = healthy_track();
-        for layer in &t.layers {
+        for layer in t.layers() {
             state_of_mut(&mut states, layer).set_quality(StreamQuality::Bad);
         }
         (t, states)
@@ -3293,7 +3268,7 @@ mod allocation_tests {
     #[test]
     fn healthy_zero_bitrate_layer_is_never_forwarded() {
         let (t, mut states) = healthy_track();
-        for layer in &t.layers {
+        for layer in t.layers() {
             state_of_mut(&mut states, layer).bitrate(0);
         }
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
@@ -3407,7 +3382,7 @@ mod allocation_tests {
         ];
 
         let expected_per_slot = t
-            .layers
+            .layers()
             .iter()
             .filter(|l| state_of(&states, l).is_healthy())
             .map(|l| state_of(&states, l).bitrate_bps())
@@ -3883,9 +3858,12 @@ mod slot_switch_tests {
             let mut pkt = pkt.clone();
             pkt.ext_vals.rid = layer.rid;
             self.cache.push(pkt.clone());
-            let promoted = self
-                .slot
-                .on_rtp(track_id, &pkt, Some(&self.cache), &mut self.writer);
+            let promoted = self.slot.on_rtp(
+                track_id,
+                pkt.arrival_ts,
+                Some(&self.cache),
+                &mut self.writer,
+            );
             while let Some(w) = self.writer.pop() {
                 if let StreamWrite::Video { pkt, .. } = w {
                     self.emitted.push(pkt);
@@ -3994,7 +3972,9 @@ mod slot_switch_tests {
         let mut keys: SlotMap<TrackKey, ()> = SlotMap::with_key();
         let fanouts: HashMap<TrackId, TrackKey> =
             [(low.stream_id().0, keys.insert(()))].into_iter().collect();
-        fx.slot.pli_retry(Instant::now(), &mut sink, &fanouts);
+        fx.slot.pli_retry(Instant::now(), &mut sink, |track_id| {
+            fanouts.get(&track_id).copied()
+        });
         assert_eq!(
             sink.request_keyframe_calls.first().map(|c| c.0),
             Some(low.stream_id()),
