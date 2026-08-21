@@ -1,11 +1,10 @@
 use slotmap::SecondaryMap;
-use str0m::channel::ChannelId;
 use str0m::media::Rid;
 
 use crate::clock::WallAnchor;
 use crate::entity::{AudioOrigin, ParticipantId, TrackId};
 use crate::id::ShardId;
-use crate::keys::{AudioTrackKey, DownstreamSlotKey, ParticipantKey, VideoTrackKey};
+use crate::keys::{AudioTrackKey, ParticipantKey, VideoTrackKey};
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::Topic;
@@ -59,7 +58,7 @@ pub(crate) trait RoutingContext: ShardTransport {
     fn forward_video_rtp(
         &mut self,
         subscriber: ParticipantKey,
-        slot: DownstreamSlotKey,
+        fanout: TrackKey,
         track: TrackId,
         pkt: &RtpPacket,
         cache: Option<&TrackStreamCache>,
@@ -67,7 +66,7 @@ pub(crate) trait RoutingContext: ShardTransport {
     fn update_layer_states(
         &mut self,
         subscriber: ParticipantKey,
-        slot: DownstreamSlotKey,
+        fanout: TrackKey,
         states: &crate::track::TrackStates,
     );
     fn forward_audio_rtp(
@@ -79,14 +78,14 @@ pub(crate) trait RoutingContext: ShardTransport {
     fn forward_unreliable_sctp(
         &mut self,
         subscriber: ParticipantKey,
-        channel: ChannelId,
+        stream: UnreliableStreamKey,
         pkt: &[u8],
     );
     fn wall(&self) -> &WallAnchor;
     fn forward_reliable_sctp(
         &mut self,
         subscriber: ParticipantKey,
-        channel: ChannelId,
+        stream: ReliableStreamKey,
         frame: &[u8],
     );
 }
@@ -115,25 +114,22 @@ pub(crate) struct ReliableRuntime {
 }
 
 /// Hand a packet to every destination-local recipient in a compiled plan.
-fn fanout_local<D: Copy>(
-    plan: &crate::view::ForwardingPlan<D>,
-    mut deliver: impl FnMut(ParticipantKey, D),
-) {
-    for &(subscriber, delivery) in &plan.recipients {
-        deliver(subscriber, delivery);
+fn fanout_local(plan: &crate::plan::FlatTrackPlan, mut deliver: impl FnMut(ParticipantKey)) {
+    for &subscriber in plan.local.values() {
+        deliver(subscriber);
     }
 }
 
 /// Forward a packet to the shards a plan routes to, numbering each hop so the
 /// destination can tell loss from reordering.
-fn fanout_remote<G>(
-    plan: &crate::view::ForwardingPlan<G>,
+fn fanout_remote(
+    plan: &crate::plan::FlatTrackPlan,
     link_seq: &mut u32,
     playout: u32,
     mut payload: impl FnMut() -> MediaPayload,
     ctx: &mut impl ShardTransport,
 ) {
-    for remote in &plan.remote_routes {
+    for remote in plan.remote.values() {
         let env = Envelope::media(remote.handle, *link_seq, playout);
         *link_seq = link_seq.wrapping_add(1);
         ctx.send_media(remote.handle.shard(), env, payload());
@@ -282,9 +278,12 @@ impl ShardRuntime {
             | crate::view::ViewOp::InsertParticipant { .. }
             | crate::view::ViewOp::RemoveParticipant { .. }
             | crate::view::ViewOp::SetPlan { .. }
+            | crate::view::ViewOp::ApplyPlan { .. }
             | crate::view::ViewOp::RemovePlan { .. }
             | crate::view::ViewOp::BindSubscribedTrack { .. }
             | crate::view::ViewOp::UnbindSubscribedTrack { .. }
+            | crate::view::ViewOp::BindSubscribedData { .. }
+            | crate::view::ViewOp::BindSubscribedReliable { .. }
             | crate::view::ViewOp::AnnounceTrack { .. }
             | crate::view::ViewOp::WithdrawTrack { .. } => {}
         }
@@ -311,7 +310,7 @@ impl ShardRuntime {
         &mut self,
         fanout: VideoTrackKey,
         pkt: RtpPacket,
-        plan: &crate::view::VideoPlan,
+        plan: &crate::plan::FlatTrackPlan,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(track) = self.tracks.get_mut(fanout.raw()) else {
@@ -334,8 +333,8 @@ impl ShardRuntime {
             debug_assert!(false, "a cached packet must be readable");
             return;
         };
-        fanout_local(plan, |subscriber, slot| {
-            ctx.forward_video_rtp(subscriber, slot, track_id, packet, Some(cache));
+        fanout_local(plan, |subscriber| {
+            ctx.forward_video_rtp(subscriber, fanout.raw(), track_id, packet, Some(cache));
         });
         let playout = ctx.wall().to_ntp(packet.playout_time);
         fanout_remote(
@@ -352,7 +351,7 @@ impl ShardRuntime {
         track: AudioTrackKey,
         origin: Origin,
         event: AudioRtpEvent,
-        plan: &crate::view::AudioPlan,
+        plan: &crate::plan::FlatTrackPlan,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(runtime) = self.tracks.get(track.raw()) else {
@@ -367,7 +366,7 @@ impl ShardRuntime {
             participant: event.origin,
             track: event.stream_id.0,
         };
-        fanout_local(plan, |subscriber, ()| {
+        fanout_local(plan, |subscriber| {
             ctx.forward_audio_rtp(subscriber, audio_origin, &event.pkt);
         });
         if origin.is_local() {
@@ -391,15 +390,15 @@ impl ShardRuntime {
         stream: UnreliableStreamKey,
         origin: Origin,
         packet: Vec<u8>,
-        plan: &crate::view::StreamPlan,
+        plan: &crate::plan::FlatTrackPlan,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(runtime) = self.unreliable.get_mut(stream) else {
             debug_assert!(false, "data key must resolve to runtime state");
             return;
         };
-        fanout_local(plan, |subscriber, channel| {
-            ctx.forward_unreliable_sctp(subscriber, channel, &packet);
+        fanout_local(plan, |subscriber| {
+            ctx.forward_unreliable_sctp(subscriber, stream, &packet);
         });
         if origin.is_local() {
             let playout = ctx.wall().ntp();
@@ -418,7 +417,7 @@ impl ShardRuntime {
         stream: ReliableStreamKey,
         origin: Origin,
         frame: Vec<u8>,
-        plan: &crate::view::StreamPlan,
+        plan: &crate::plan::FlatTrackPlan,
         ctx: &mut impl RoutingContext,
     ) {
         debug_assert!(!frame.is_empty());
@@ -426,8 +425,8 @@ impl ShardRuntime {
             debug_assert!(false, "reliable key must resolve to runtime state");
             return;
         };
-        fanout_local(plan, |subscriber, channel| {
-            ctx.forward_reliable_sctp(subscriber, channel, &frame);
+        fanout_local(plan, |subscriber| {
+            ctx.forward_reliable_sctp(subscriber, stream, &frame);
         });
         if origin.is_local() {
             let playout = ctx.wall().ntp();
@@ -448,7 +447,7 @@ impl ShardRuntime {
     pub fn route_reliable_control(
         &self,
         bytes: Vec<u8>,
-        plan: &crate::view::StreamPlan,
+        plan: &crate::plan::FlatTrackPlan,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(target) = plan.reverse_route else {
@@ -468,7 +467,7 @@ impl ShardRuntime {
         &mut self,
         fanout: VideoTrackKey,
         stats: crate::track::TrackStates,
-        plan: &crate::view::VideoPlan,
+        plan: &crate::plan::FlatTrackPlan,
         ctx: &mut impl RoutingContext,
     ) {
         let Some(track) = self.tracks.get_mut(fanout.raw()) else {
@@ -481,10 +480,10 @@ impl ShardRuntime {
         }
         track.layer_states = stats;
         let states = &track.layer_states;
-        fanout_local(plan, |subscriber, slot| {
-            ctx.update_layer_states(subscriber, slot, states);
+        fanout_local(plan, |subscriber| {
+            ctx.update_layer_states(subscriber, fanout.raw(), states);
         });
-        for remote in &plan.remote_routes {
+        for remote in plan.remote.values() {
             ctx.send_frame(
                 remote.handle.shard(),
                 ShardFrame::Telemetry {

@@ -5,6 +5,7 @@ use metrics::{counter, histogram};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::reliable::{RelControl, rel_control};
 use pulsebeam_runtime::net::{self, RecvPacketBatch, Transport};
+use slotmap::SecondaryMap;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
@@ -18,7 +19,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::entity::{self, TrackId};
+use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 #[cfg(debug_assertions)]
 use crate::log::plog_error;
@@ -270,6 +271,9 @@ pub struct ParticipantCore {
     /// packet.
     published_track_fanouts: HashMap<TrackId, TrackKey>,
     subscribed_track_fanouts: HashMap<TrackId, TrackKey>,
+    forwarding_track_routes: SecondaryMap<TrackKey, (TrackId, crate::keys::DownstreamSlotKey)>,
+    forwarding_data_channels: SecondaryMap<UnreliableStreamKey, ChannelId>,
+    forwarding_reliable_channels: SecondaryMap<ReliableStreamKey, ChannelId>,
     data_pub_streams: HashMap<ChannelId, UnreliableStreamKey>,
     reliable_pub_streams: HashMap<ChannelId, ReliableStreamKey>,
     reliable_sub_streams: HashMap<ChannelId, ReliableStreamKey>,
@@ -314,12 +318,38 @@ impl ParticipantCore {
 
     pub(crate) fn bind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
         self.subscribed_track_fanouts.insert(track_id, fanout);
+        let Some(slot) = self.downstream.slot_for_track(&track_id) else {
+            debug_assert!(
+                false,
+                "a forwarding plan cannot name an unassigned receiver"
+            );
+            return;
+        };
+        self.forwarding_track_routes
+            .insert(fanout, (track_id, slot));
     }
 
     pub(crate) fn unbind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
         if self.subscribed_track_fanouts.get(&track_id) == Some(&fanout) {
             self.subscribed_track_fanouts.remove(&track_id);
         }
+        self.forwarding_track_routes.remove(fanout);
+    }
+
+    pub(crate) fn bind_subscribed_data_stream(
+        &mut self,
+        stream: UnreliableStreamKey,
+        channel: ChannelId,
+    ) {
+        self.forwarding_data_channels.insert(stream, channel);
+    }
+
+    pub(crate) fn bind_subscribed_reliable_stream(
+        &mut self,
+        stream: ReliableStreamKey,
+        channel: ChannelId,
+    ) {
+        self.forwarding_reliable_channels.insert(stream, channel);
     }
 
     fn track_fanout(&self, track_id: TrackId) -> Option<TrackKey> {
@@ -411,6 +441,9 @@ impl ParticipantCore {
             data_topic_channels: HashMap::new(),
             published_track_fanouts: HashMap::new(),
             subscribed_track_fanouts: HashMap::new(),
+            forwarding_track_routes: SecondaryMap::new(),
+            forwarding_data_channels: SecondaryMap::new(),
+            forwarding_reliable_channels: SecondaryMap::new(),
             data_pub_streams: HashMap::new(),
             reliable_pub_streams: HashMap::new(),
             reliable_sub_streams: HashMap::new(),
@@ -481,6 +514,24 @@ impl ParticipantCore {
         }
     }
 
+    pub fn on_forward_rtp_fanout(
+        &mut self,
+        fanout: TrackKey,
+        track: TrackId,
+        pkt: &RtpPacket,
+        cache: Option<&crate::rtp::cache::TrackStreamCache>,
+    ) {
+        let Some(&(bound_track, slot)) = self.forwarding_track_routes.get(fanout) else {
+            debug_assert!(false, "a forwarding plan must have a receiver binding");
+            return;
+        };
+        debug_assert_eq!(
+            bound_track, track,
+            "a track route cannot change its identity"
+        );
+        self.on_forward_rtp(slot, track, pkt, cache);
+    }
+
     #[inline]
     pub fn on_forward_audio_rtp(&mut self, origin: crate::entity::AudioOrigin, pkt: &RtpPacket) {
         self.downstream
@@ -488,6 +539,18 @@ impl ParticipantCore {
         if self.downstream.take_audio_speakers_changed() {
             self.signaling.mark_assignments_dirty();
         }
+    }
+
+    pub fn update_layer_states_fanout(
+        &mut self,
+        fanout: TrackKey,
+        states: &crate::track::TrackStates,
+    ) {
+        let Some(&(_, slot)) = self.forwarding_track_routes.get(fanout) else {
+            debug_assert!(false, "a forwarding plan must have a receiver binding");
+            return;
+        };
+        self.update_layer_states(slot, states);
     }
 
     #[inline]
@@ -498,11 +561,30 @@ impl ParticipantCore {
         });
     }
 
+    pub fn on_forward_sctp_stream(&mut self, stream: UnreliableStreamKey, pkt: &[u8]) {
+        let Some(&channel) = self.forwarding_data_channels.get(stream) else {
+            debug_assert!(false, "a data forwarding plan must have a receiver binding");
+            return;
+        };
+        self.on_forward_sctp(channel, pkt);
+    }
+
     pub fn on_forward_reliable_sctp(&mut self, channel: ChannelId, frame: &[u8]) {
         self.enqueue_fanout(PendingFanout::ReliableSctp {
             channel,
             frame: frame.to_vec(),
         });
+    }
+
+    pub fn on_forward_reliable_sctp_stream(&mut self, stream: ReliableStreamKey, frame: &[u8]) {
+        let Some(&channel) = self.forwarding_reliable_channels.get(stream) else {
+            debug_assert!(
+                false,
+                "a reliable forwarding plan must have a receiver binding"
+            );
+            return;
+        };
+        self.on_forward_reliable_sctp(channel, frame);
     }
 
     pub fn on_deliver_reliable_control(&mut self, topic: &Topic, bytes: &[u8]) {
@@ -615,6 +697,9 @@ impl ParticipantCore {
     /// flips activity and health per packet and the allocator acts on those.
     fn publish_changed_stats(&mut self, events: &mut impl ParticipantSink) {
         for (track_id, states) in self.upstream.take_changed_stats() {
+            if track_id.kind() != TrackKind::Video {
+                continue;
+            }
             events.publish_track_stats(
                 track_id,
                 self.published_track_fanouts.get(&track_id).copied(),

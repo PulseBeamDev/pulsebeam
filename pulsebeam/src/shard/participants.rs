@@ -134,9 +134,11 @@ impl ParticipantRegistry {
         track_id: crate::entity::TrackId,
         fanout: crate::shard::router::TrackKey,
     ) {
-        if let Some(participant) = self.resolve_mut(participant) {
-            participant.bind_subscribed_track(track_id, fanout);
-        }
+        let Some(participant_meta) = self.resolve_mut(participant) else {
+            debug_assert!(false, "a subscribed track must bind to a live participant");
+            return;
+        };
+        participant_meta.bind_subscribed_track(track_id, fanout);
     }
 
     pub fn unbind_subscribed_track(
@@ -145,9 +147,14 @@ impl ParticipantRegistry {
         track_id: crate::entity::TrackId,
         fanout: crate::shard::router::TrackKey,
     ) {
-        if let Some(participant) = self.resolve_mut(participant) {
-            participant.unbind_subscribed_track(track_id, fanout);
-        }
+        let Some(participant_meta) = self.resolve_mut(participant) else {
+            debug_assert!(
+                false,
+                "a subscribed track must unbind from a live participant"
+            );
+            return;
+        };
+        participant_meta.unbind_subscribed_track(track_id, fanout);
     }
 
     pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<TransportHandle> {

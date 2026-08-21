@@ -404,6 +404,7 @@ pub(crate) struct ShardWorker {
     event_tx: mailbox::Sender<ShardEventMessage>,
     shard_event_backlog: VecDeque<ShardEvent>,
     frame_rx: mailbox::Receiver<ShardFrame>,
+    frame_batch: Vec<ShardFrame>,
     router: ChannelTransport,
     #[allow(
         clippy::disallowed_types,
@@ -467,6 +468,7 @@ impl ShardWorker {
             event_tx,
             shard_event_backlog: VecDeque::new(),
             frame_rx,
+            frame_batch: Vec::with_capacity(SHARD_FRAME_BUDGET),
             router,
             metrics,
             recorder: {
@@ -634,13 +636,16 @@ impl ShardWorker {
             self.tick_budget_hit("commands");
         }
         let mut frames: usize = 0;
+        self.frame_batch.clear();
         for _ in 0..SHARD_FRAME_BUDGET {
             let Ok(ev) = self.frame_rx.try_recv() else {
                 break;
             };
             frames = frames.saturating_add(1);
-            self.core.on_shard_frame(ev, now, &self.router);
+            self.frame_batch.push(ev);
         }
+        self.core
+            .on_shard_frames(self.frame_batch.drain(..), now, &self.router);
         if frames == SHARD_FRAME_BUDGET {
             self.tick_budget_hit("frames");
         }

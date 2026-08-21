@@ -457,6 +457,10 @@ impl DownstreamAllocator {
         self.video.update_layer_states_slot(slot, states);
     }
 
+    pub(crate) fn slot_for_track(&self, track: &TrackId) -> Option<crate::keys::DownstreamSlotKey> {
+        self.video.route_slot(track)
+    }
+
     pub fn on_forward_rtp(
         &mut self,
         track_id: TrackId,

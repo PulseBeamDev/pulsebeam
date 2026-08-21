@@ -31,6 +31,7 @@ derive_more = { workspace = true }
 futures-lite = { workspace = true }
 hyper = "1.10.1"
 indexmap = "2.14.0"
+left-right = { workspace = true }
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 mimalloc = "0.1.52"

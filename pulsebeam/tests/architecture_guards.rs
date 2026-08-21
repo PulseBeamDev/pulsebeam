@@ -37,15 +37,35 @@ fn deleted_types_stay_deleted() {
             continue;
         }
         let text = fs::read_to_string(&file).unwrap();
-        for name in [
-            "ClusterCommand",
-            "AckGeneration",
-            "left_right",
-            "ShardEventWrapper",
-        ] {
+        for name in ["ClusterCommand", "AckGeneration", "ShardEventWrapper"] {
             assert!(
                 !text.contains(name),
                 "legacy routing type {name} in {file:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn left_right_stays_in_the_plan_publication_module() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_owned();
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    for file in files {
+        if file
+            .components()
+            .any(|component| component.as_os_str() == "tests")
+        {
+            continue;
+        }
+        let text = fs::read_to_string(&file).unwrap();
+        if text.contains("left_right") {
+            assert!(
+                file.ends_with(Path::new("pulsebeam/src/plan.rs")),
+                "left-right publication must stay isolated: {file:?}"
             );
         }
     }

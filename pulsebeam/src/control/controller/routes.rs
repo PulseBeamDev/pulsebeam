@@ -28,7 +28,7 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         action: crate::route::RouteAction,
-        plan: Option<crate::view::PlanUpdate>,
+        plan: Option<(crate::plan::PlanKey, crate::plan::FlatTrackPlan)>,
     ) -> Option<RouteHandle> {
         self.publish_with_route(shard_id, "endpoint", move |_, handle| {
             let mut ops = vec![(
@@ -40,7 +40,9 @@ impl ControllerActor {
                     },
                 },
             )];
-            ops.extend(plan.map(|update| (shard_id, crate::view::ViewOp::SetPlan { update })));
+            ops.extend(
+                plan.map(|(key, plan)| (shard_id, crate::view::ViewOp::SetPlan { key, plan })),
+            );
             ops
         })
     }

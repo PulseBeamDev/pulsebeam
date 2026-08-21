@@ -151,13 +151,14 @@ impl Publication {
 /// Remote routes only appear on the publisher's own plan: every other shard
 /// receives over a route rather than forwarding onward, so listing them
 /// elsewhere would invite a second hop.
-pub(crate) fn forwarding_plan<D>(
+pub(crate) fn forwarding_plan(
     destinations: &IndexMap<ShardId, Destination>,
     publisher_shard: ShardId,
+    publisher_key: ParticipantKey,
     reverse_route: Option<RouteHandle>,
-    recipients: Vec<(ParticipantKey, D)>,
+    recipients: Vec<ParticipantKey>,
     shard: ShardId,
-) -> crate::view::ForwardingPlan<D> {
+) -> crate::plan::FlatTrackPlan {
     let remote_routes = if shard == publisher_shard {
         destinations
             .iter()
@@ -167,7 +168,7 @@ pub(crate) fn forwarding_plan<D>(
                 }
                 match held {
                     Destination::Forwarding { route, .. } => {
-                        Some(crate::view::RemoteRoutePlan { handle: *route })
+                        Some(crate::plan::RemoteRoutePlan { handle: *route })
                     }
                     Destination::Discovery { .. } => None,
                 }
@@ -176,11 +177,18 @@ pub(crate) fn forwarding_plan<D>(
     } else {
         Vec::new()
     };
-    crate::view::ForwardingPlan {
-        recipients,
-        remote_routes,
-        reverse_route: reverse_route.map(|handle| crate::view::RemoteRoutePlan { handle }),
-    }
+    let mut plan = crate::plan::FlatTrackPlan::default();
+    plan.local = crate::plan::DenseMembership::from_values(recipients.into_iter().filter(|key| {
+        let loopback = shard == publisher_shard && *key == publisher_key;
+        debug_assert!(
+            !loopback,
+            "the control plane must never compile loopback forwarding"
+        );
+        !loopback
+    }));
+    plan.remote = crate::plan::DenseMembership::from_values(remote_routes);
+    plan.reverse_route = reverse_route.map(|handle| crate::plan::RemoteRoutePlan { handle });
+    plan
 }
 
 /// Every publication on the node, with the indexes a declaration needs to find

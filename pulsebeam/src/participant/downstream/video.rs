@@ -648,8 +648,7 @@ impl VideoAllocator {
             .any(|(route_track, _)| route_track == track_id)
     }
 
-    #[cfg(test)]
-    fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
+    pub(crate) fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
         for (route_track, slot_key) in &self.routes {
             if route_track == track_id {
                 return Some(*slot_key);

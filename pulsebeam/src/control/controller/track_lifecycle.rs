@@ -270,30 +270,14 @@ impl ControllerActor {
             },
         );
         self.index_publication(track.id);
-        let mut membership_ops = Vec::new();
-        membership_ops.push((
+        let membership_ops = vec![(
             shard_id,
             crate::view::ViewOp::BindSubscribedTrack {
                 participant: subscriber_key,
                 track: track.id,
                 fanout,
             },
-        ));
-        if let Some((previous_shard, previous_key)) = previous_member
-            && (previous_shard != shard_id || previous_key != subscriber_key)
-        {
-            let Some(previous_fanout) = self.track_fanout(track.id, previous_shard) else {
-                pulsebeam_runtime::fatal!("a previous video subscription must have a fanout");
-            };
-            membership_ops.push((
-                previous_shard,
-                crate::view::ViewOp::UnbindSubscribedTrack {
-                    participant: previous_key,
-                    track: track.id,
-                    fanout: previous_fanout,
-                },
-            ));
-        }
+        )];
         self.publish_ops(membership_ops);
 
         let needs_remote_route = self
@@ -362,11 +346,16 @@ impl ControllerActor {
             else {
                 pulsebeam_runtime::fatal!("a subscribed video must belong to a publication");
             };
-            if !self.publish_plan_to(track.id, shard_id) {
+            let mut plans_ready = self.publish_plan_to(track.id, shard_id);
+            if !plans_ready {
                 debug_assert!(false, "a changed video audience must publish its plan");
             }
             if publisher_shard != shard_id && !self.publish_plan_to(track.id, publisher_shard) {
                 debug_assert!(false, "a changed video audience must publish its plan");
+                plans_ready = false;
+            }
+            if !plans_ready {
+                return;
             }
         }
         for (_, departure, previous_shard, _) in displaced {
@@ -392,10 +381,27 @@ impl ControllerActor {
                     .await
                 {
                     debug_assert!(false, "a displaced video route must retire");
+                    return;
                 }
             } else if !self.publish_plan_to(track.id, previous_shard) {
                 debug_assert!(false, "a displaced video audience must publish its plan");
+                return;
             }
+        }
+        if let Some((previous_shard, previous_key)) = previous_member
+            && (previous_shard != shard_id || previous_key != subscriber_key)
+        {
+            let Some(previous_fanout) = self.track_fanout(track.id, previous_shard) else {
+                pulsebeam_runtime::fatal!("a previous video subscription must have a fanout");
+            };
+            self.publish_ops(vec![(
+                previous_shard,
+                crate::view::ViewOp::UnbindSubscribedTrack {
+                    participant: previous_key,
+                    track: track.id,
+                    fanout: previous_fanout,
+                },
+            )]);
         }
     }
 
@@ -418,20 +424,26 @@ impl ControllerActor {
             &pattern,
             &subscriber,
         );
-        let mut membership_ops = Vec::new();
-        if let (Some(key), Some(fanout)) = (subscriber_key, self.track_fanout(track.id, shard_id)) {
-            membership_ops.push((
-                shard_id,
-                crate::view::ViewOp::UnbindSubscribedTrack {
-                    participant: key,
-                    track: track.id,
-                    fanout,
-                },
-            ));
-        }
-        self.publish_ops(membership_ops);
+        let unbind = subscriber_key
+            .zip(self.track_fanout(track.id, shard_id))
+            .map(|(key, fanout)| {
+                (
+                    shard_id,
+                    crate::view::ViewOp::UnbindSubscribedTrack {
+                        participant: key,
+                        track: track.id,
+                        fanout,
+                    },
+                )
+            });
         if departure != crate::control::patterns::Departure::LastOnShard {
-            let _ = self.publish_publication(track.id).await;
+            if !self.publish_publication(track.id).await {
+                debug_assert!(false, "a changed video audience must publish its plan");
+                return;
+            }
+            if let Some(unbind) = unbind {
+                self.publish_ops(vec![unbind]);
+            }
             return;
         }
         let Some(route) = self.catalog.get(&track.id).and_then(|binding| {
@@ -445,11 +457,21 @@ impl ControllerActor {
                     crate::control::publication::Destination::Discovery { .. } => None,
                 })
         }) else {
-            let _ = self.publish_publication(track.id).await;
+            if !self.publish_publication(track.id).await {
+                debug_assert!(false, "a changed video audience must publish its plan");
+                return;
+            }
+            if let Some(unbind) = unbind {
+                self.publish_ops(vec![unbind]);
+            }
             return;
         };
         if !self.retire_video_route(shard_id, route, track.id).await {
             debug_assert!(false, "track route retirement must complete");
+            return;
+        }
+        if let Some(unbind) = unbind {
+            self.publish_ops(vec![unbind]);
         }
     }
 
@@ -512,7 +534,7 @@ impl ControllerActor {
         track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
         fanout: crate::shard::router::TrackKey,
-        plan: crate::view::VideoPlan,
+        plan: crate::plan::FlatTrackPlan,
     ) -> Option<RouteHandle> {
         let descriptor = self.track_descriptor(track_id, shard_id)?;
         self.publish_with_route(shard_id, "video", move |_, handle| {
@@ -540,10 +562,8 @@ impl ControllerActor {
                 (
                     shard_id,
                     crate::view::ViewOp::SetPlan {
-                        update: crate::view::PlanUpdate::Video {
-                            key: crate::keys::VideoTrackKey::new(fanout),
-                            plan,
-                        },
+                        key: crate::plan::PlanKey::Track(fanout),
+                        plan,
                     },
                 ),
             ]
@@ -588,10 +608,8 @@ impl ControllerActor {
                 ops.push((
                     target,
                     crate::view::ViewOp::SetPlan {
-                        update: crate::view::PlanUpdate::Video {
-                            key: crate::keys::VideoTrackKey::new(key),
-                            plan,
-                        },
+                        key: crate::plan::PlanKey::Track(key),
+                        plan,
                     },
                 ));
             }
