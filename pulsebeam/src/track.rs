@@ -141,7 +141,6 @@ impl UpstreamTrackLayer {
         if let Some(count) = facts.decode_targets {
             self.monitor.set_decode_target_count(count);
         }
-        // audio will only be filtered at the centralized audio_selector
         true
     }
 

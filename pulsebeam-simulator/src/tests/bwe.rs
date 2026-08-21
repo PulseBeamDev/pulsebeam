@@ -840,6 +840,18 @@ fn late_joiner_receives_earlier_participant_in_both_directions_test() {
                 property: Property::VideoDecodes,
             },
         ]);
+
+    // A keyframe request that cannot be addressed is dropped by the shard, and
+    // unlike media it never comes round again - the subscriber stays black until
+    // something else happens to ask. The fanout key that addresses it arrives
+    // asynchronously, in the view delta that installs the subscription, so the
+    // window is real and only some seeds land a request inside it. Asserting the
+    // counter catches it at every seed rather than at the one that happened to.
+    assert_eq!(
+        pulsebeam::sim_metrics::routing_drop("keyframe", "runtime", "local"),
+        0,
+        "a keyframe request was issued before its fanout binding existed"
+    );
 }
 
 /// The same call over home Wi-Fi: 8-16ms jitter and 0.2% loss.

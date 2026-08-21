@@ -9,7 +9,7 @@
 use crate::RtpPacket;
 use crate::agent::mailbox;
 use crate::manager::VideoSubscription;
-use pulsebeam_proto::signaling::Track;
+use pulsebeam_proto::signaling::Publication as Track;
 use str0m::channel::ChannelId;
 use str0m::media::{Mid, Rid};
 
@@ -25,6 +25,7 @@ pub(crate) enum OutgoingCommand {
     /// is as large as its largest.
     SendMedia(Box<SendMedia>),
     SetPlayoutDelay(Option<(u32, u32)>),
+    SetAudioIntent(super::AudioIntent),
     Publish {
         kind: str0m::media::MediaKind,
         response: tokio::sync::oneshot::Sender<Result<super::LocalTrack, super::AgentError>>,
@@ -286,7 +287,7 @@ pub(crate) struct Publication {
 
 impl Publication {
     pub(crate) fn from_signaling(track: Track) -> Self {
-        debug_assert!(!track.id.is_empty());
+        debug_assert!(!track.track_id.is_empty());
         debug_assert!(!track.participant_id.is_empty());
         let kind = match track.kind {
             1 => Some(str0m::media::MediaKind::Video),
@@ -294,7 +295,7 @@ impl Publication {
             _ => None,
         };
         Self {
-            id: track.id,
+            id: track.track_id,
             publisher_id: track.participant_id,
             kind,
             paused: false,

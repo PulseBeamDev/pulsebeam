@@ -45,6 +45,7 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[test]
@@ -398,6 +399,13 @@ enum Budget {
     /// them nearly vacuous: with capacity at several times demand nothing has to be given up, so
     /// an allocator that starves a co-tenant the moment budget is tight would pass.
     Tight,
+    /// Not enough for everything, so something has to be given up.
+    ///
+    /// `Tight` cannot force that: it admits only capacities at or above demand, so the allocator
+    /// can serve every stream and merely lowers quality. A property about *shedding* needs a link
+    /// that cannot carry the whole demand, or its precondition is never met and the run is spent
+    /// simulating cases it then discards.
+    Starved,
 }
 
 impl Budget {
@@ -406,6 +414,11 @@ impl Budget {
             Budget::Ample => capacity_bps >= demand_bps.saturating_mul(2),
             Budget::Tight => {
                 capacity_bps >= demand_bps && capacity_bps < demand_bps.saturating_mul(3) / 2
+            }
+            // Below demand, but not so far below that nothing can be served at all - a link that
+            // carries no stream tests the floor, not the choice of what to drop.
+            Budget::Starved => {
+                capacity_bps < demand_bps && capacity_bps.saturating_mul(4) >= demand_bps
             }
         }
     }
@@ -700,6 +713,17 @@ fn config(cases: u32) -> ProptestConfig {
         // this many is a real sample of it.
         cases,
         max_shrink_iters: 8,
+        // Every case here is a full simulation, and these properties `prop_assume!` *after*
+        // running one, so a rejected case costs as much as an accepted one. proptest's default of
+        // 1024 therefore lets a precondition that has stopped being reachable spend half an hour
+        // before saying so - which reads as a hung suite rather than a failing one, and did.
+        //
+        // The assumes left here only ask that a case produced data at all, which should hold
+        // almost always, so this is a backstop rather than a working budget: the two properties
+        // that rejected selectively now skip or starve by construction instead. Sixteen per wanted
+        // case leaves room for a genuinely unlucky run while keeping an unreachable precondition
+        // distinguishable from a hang.
+        max_global_rejects: cases.saturating_mul(16),
         failure_persistence: Some(Box::new(
             proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
         )),
@@ -930,13 +954,19 @@ fn a_stream_with_layers_to_shed_keeps_moving() {
 /// the media alone the two are identical - a paused stream and a dead connection are both an
 /// absence of packets - so the client can only draw the right thing if it was told.
 ///
-/// The generator runs tight links so the allocator has to shed something. Whenever it does, the
-/// viewer must have heard about it.
+/// The generator runs *starved* links, so the allocator genuinely cannot carry everything and has
+/// to drop something. Whenever it does, the viewer must have heard about it.
+///
+/// It ran `Budget::Tight` until a keyframe defect was fixed, and that was never right: `Tight`
+/// admits only capacities at or above demand, so nothing has to be shed and the allocator merely
+/// lowers quality. The cases it was accepting were streams stuck at quality 0 because they had
+/// never received a keyframe - broken, not shed - so the property was being fed by the bug rather
+/// than by the behaviour it describes.
 #[test]
 fn a_stream_the_sfu_sheds_is_signalled_not_just_silent() {
     check(
         SATURATED,
-        scenarios(Demand::contended(), Budget::Tight, NO_FAULT),
+        scenarios(Demand::contended(), Budget::Starved, NO_FAULT),
         |scenario| {
             let report = scenario.run("pause_signalled");
             prop_assume!(report.samples > 0);
@@ -1157,6 +1187,14 @@ fn an_underused_link_is_not_driven_into_loss() {
 /// entirely is not one of them.
 #[test]
 fn a_cheap_co_tenant_is_not_starved() {
+    // Counted rather than assumed. The condition below is a runtime outcome, so it cannot be moved
+    // into the generator, and rejecting on it after the fact throws away a whole simulation -
+    // which made this the slowest and least predictable property here, its cost set by how often
+    // the estimate happened to land above demand. Skipping the assertion instead keeps the case,
+    // and the tally makes the one risk of doing so visible: a property that silently stopped
+    // asserting anything would otherwise still be green.
+    let exercised = AtomicUsize::new(0);
+
     check(
         SATURATED,
         scenarios(Demand::contended(), Budget::Tight, ANY_FAULT),
@@ -1168,7 +1206,10 @@ fn a_cheap_co_tenant_is_not_starved() {
             // spend what it is given, so a starved co-tenant on a healthy link with a low estimate
             // is a bandwidth-estimation failure and belongs to the property above - conflating the
             // two here would leave neither diagnosable.
-            prop_assume!(report.estimate_last_bps > report.demand_last_bps);
+            if report.estimate_last_bps <= report.demand_last_bps {
+                return Ok(());
+            }
+            exercised.fetch_add(1, Ordering::Relaxed);
 
             let quality = report.forwarded_quality.get("cotenant").copied();
             prop_assert!(
@@ -1184,6 +1225,12 @@ fn a_cheap_co_tenant_is_not_starved() {
             );
             Ok(())
         },
+    );
+
+    assert!(
+        exercised.load(Ordering::Relaxed) > 0,
+        "no generated case reached the assertion: every one ended with the estimate at or below \
+         demand, so this property asserted nothing and passed vacuously"
     );
 }
 
