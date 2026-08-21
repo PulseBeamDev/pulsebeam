@@ -19,10 +19,9 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Maximum RFC 4571 payload length accepted during the initial frame peek.
-/// Mirrors `MAX_FRAME_SIZE` below — kept as a separate constant so the method
-/// can be used before the rest of the transport is constructed.
-const MAX_PEEK_FRAME_SIZE: usize = 1_500;
+/// RFC 4571 carries a 16-bit unsigned payload length. TCP does not inherit
+/// UDP's MTU boundary, so a valid frame may be larger than one datagram.
+const MAX_PEEK_FRAME_SIZE: usize = u16::MAX as usize;
 
 /// A TCP stream wrapper that replays bytes already read from the socket before
 /// delegating further reads to the kernel.
@@ -120,11 +119,12 @@ impl BufferedTcpStream {
 }
 
 /// Maximum RFC 4571 payload length accepted on a TCP passive connection.
-const MAX_FRAME_SIZE: usize = 1_500;
+const MAX_FRAME_SIZE: usize = u16::MAX as usize;
 const MAX_CONNECTIONS: usize = 10_000;
 const MAX_CONNS_PER_IP: usize = 20;
 /// Overflow guard: `recv_buf` holds at most one partial RFC 4571 frame.
 const MAX_RECV_BUF: usize = MAX_FRAME_SIZE + 2 + 64;
+const MAX_TCP_WRITE_BUF: usize = 256 * 1024;
 /// How long a connection may be idle before the read task reaps it.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Channel capacity for TCP events (frames + close notifications).
@@ -142,6 +142,9 @@ enum TcpEvent {
 struct TcpConn {
     /// Write half — `try_write` is `&self` so no locking needed.
     write: TcpWriteHalf,
+    /// Bytes already framed but not yet accepted by the kernel. A partial TCP
+    /// write must be resumed before a later frame can be sent.
+    pending: BytesMut,
     /// Cancels the associated read task when the connection is removed.
     cancel: CancellationToken,
 }
@@ -267,7 +270,6 @@ pub struct TcpTransport {
     event_rx: mailbox::Receiver<TcpEvent>,
     /// One event stashed by `readable()` so `try_recv_batch` can always find it.
     peeked: Option<TcpEvent>,
-    drop_count: usize,
 }
 
 impl TcpTransport {
@@ -280,7 +282,6 @@ impl TcpTransport {
             event_tx,
             event_rx,
             peeked: None,
-            drop_count: 0,
         }
     }
 
@@ -348,8 +349,7 @@ impl TcpTransport {
         // are immediately visible to try_recv_batch, without needing the task
         // to execute first.
         if !pending.is_empty() {
-            let mut pos = BytesMut::from(pending.as_ref());
-            pending.clear();
+            let mut pos = pending;
             loop {
                 let Some(len) = frame_len_at(&pos, 0) else {
                     break;
@@ -365,6 +365,7 @@ impl TcpTransport {
                     payload,
                 });
             }
+            pending = pos;
         }
 
         let (read, write) = split_tcp(raw);
@@ -375,12 +376,19 @@ impl TcpTransport {
         tokio::task::spawn(tcp_read_task(
             peer_addr,
             read,
-            pending, // empty at this point
+            pending,
             self.event_tx.clone(),
             cancel.clone(),
         ));
 
-        self.conns.insert(peer_addr, TcpConn { write, cancel });
+        self.conns.insert(
+            peer_addr,
+            TcpConn {
+                write,
+                pending: BytesMut::new(),
+                cancel,
+            },
+        );
         tracing::debug!(%peer_addr, "TCP connection added to shard");
         Ok(())
     }
@@ -480,11 +488,9 @@ impl TcpTransport {
 
     /// Frame `batch` per RFC 4571 and write to the peer's stream.
     ///
-    /// Frame `batch` per RFC 4571 and write to the peer's stream.
-    ///
-    /// **Lossy**: if the kernel send buffer is full (`WouldBlock`) the batch is
-    /// dropped rather than queued.  This keeps memory bounded and ensures the
-    /// caller's batch queue is always drained to empty on every tick.
+    /// **Lossy**: a new batch is dropped when a previous partial frame is still
+    /// waiting or the kernel send buffer is full. A partial frame itself is
+    /// retained so later frames cannot corrupt RFC 4571 alignment.
     pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<usize> {
         for group in batch.packets {
             self.try_send_group(group)?;
@@ -494,9 +500,9 @@ impl TcpTransport {
 
     pub fn try_send_group(&mut self, batch: &SendPacket) -> io::Result<bool> {
         debug_assert!(batch.segment_size != 0);
-        let Some(conn) = self.conns.get_mut(&batch.dst) else {
+        if !self.conns.contains_key(&batch.dst) {
             return Ok(true); // peer gone — treat as sent
-        };
+        }
 
         // Frame all segments into a local buffer (not stored on the connection).
         let mut buf = BytesMut::new();
@@ -518,32 +524,68 @@ impl TcpTransport {
             offset = end;
         }
 
-        // Drain to kernel; whatever doesn't fit is dropped (lossy).
-        while !buf.is_empty() {
-            match conn.write.try_write(&buf) {
-                Ok(0) => {
-                    self.remove_conn(&batch.dst);
-                    return Ok(true);
-                }
-                Ok(n) => buf.advance(n),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let dropped = count_rfc4571_frames(&buf);
-                    if dropped > 0 {
-                        // metrics::counter!("tcp_egress_packets_dropped_total").increment(dropped);
-                        if self.drop_count.is_multiple_of(100) {
-                            tracing::warn!("udp dropped a packet due to full socket");
+        let outcome = (|| -> io::Result<bool> {
+            let Some(conn) = self.conns.get_mut(&batch.dst) else {
+                return Ok(true);
+            };
+
+            while !conn.pending.is_empty() {
+                match conn.write.try_write(&conn.pending) {
+                    Ok(0) => return Ok(false),
+                    Ok(n) => {
+                        debug_assert!(n <= conn.pending.len());
+                        if n > conn.pending.len() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "TCP write returned more bytes than supplied",
+                            ));
                         }
-                        self.drop_count = self
-                            .drop_count
-                            .saturating_add(usize::try_from(dropped).unwrap_or(usize::MAX));
+                        conn.pending.advance(n);
                     }
-                    break;
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                    Err(e) => return Err(e),
                 }
-                Err(e) => {
-                    tracing::warn!(peer_addr = %batch.dst, error = ?e, "TCP write error");
-                    self.remove_conn(&batch.dst);
-                    return Ok(true);
+            }
+
+            if buf.len() > MAX_TCP_WRITE_BUF {
+                tracing::debug!(
+                    peer_addr = %batch.dst,
+                    bytes = buf.len(),
+                    "TCP batch exceeds bounded write buffer"
+                );
+                return Ok(true);
+            }
+
+            while !buf.is_empty() {
+                match conn.write.try_write(&buf) {
+                    Ok(0) => return Ok(false),
+                    Ok(n) => {
+                        debug_assert!(n <= buf.len());
+                        if n > buf.len() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "TCP write returned more bytes than supplied",
+                            ));
+                        }
+                        buf.advance(n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        conn.pending.extend_from_slice(&buf);
+                        debug_assert!(conn.pending.len() <= MAX_TCP_WRITE_BUF);
+                        return Ok(true);
+                    }
+                    Err(e) => return Err(e),
                 }
+            }
+            Ok(true)
+        })();
+
+        match outcome {
+            Ok(true) => {}
+            Ok(false) => self.remove_conn(&batch.dst),
+            Err(error) => {
+                tracing::warn!(peer_addr = %batch.dst, %error, "TCP write error");
+                self.remove_conn(&batch.dst);
             }
         }
         Ok(true)
@@ -564,6 +606,7 @@ fn frame_len_at(buf: &[u8], offset: usize) -> Option<usize> {
 /// did not happen. The early exits `return` rather than `break`: they have
 /// already counted the frame they stopped on, and falling through to the
 /// trailing-remainder check counted it a second time.
+#[cfg(test)]
 fn count_rfc4571_frames(buf: &[u8]) -> u64 {
     let mut count = 0u64;
     let mut offset = 0usize;
@@ -817,8 +860,8 @@ mod tests {
         });
     }
 
-    /// A peer that claims a frame length > MAX_FRAME_SIZE should be disconnected.
-    /// We use 0xFFFF (65535) as the length prefix which always exceeds MAX_FRAME_SIZE.
+    /// A zero-length RFC 4571 frame is not an RTP/RTCP datagram and must not
+    /// leave the decoder waiting forever for a payload that cannot arrive.
     #[test]
     fn test_recv_buf_overflow_drops_connection() {
         run_local(async {
@@ -832,9 +875,7 @@ mod tests {
             sock.add_connection(BufferedTcpStream::new(server_stream), peer_addr)
                 .unwrap();
 
-            // Send a 2-byte header claiming a 65535-byte payload — always > MAX_FRAME_SIZE.
-            // The connection must be dropped the moment we decode the length prefix.
-            let junk = vec![0xFF, 0xFF];
+            let junk = vec![0x00, 0x00];
             client.write_all(&junk).await.unwrap();
             // Follow with body bytes so the kernel buffer has data to read.
             let filler = vec![0u8; 256];
@@ -852,8 +893,28 @@ mod tests {
             assert_eq!(
                 sock.active_connections(),
                 0,
-                "malicious connection should be dropped"
+                "zero-length connection should be dropped"
             );
+        });
+    }
+
+    #[test]
+    fn a_valid_large_rfc4571_frame_is_not_rejected_as_an_invalid_length() {
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
+                .await
+                .unwrap();
+            let (mut client, server_stream, _) = make_pair(&listener).await;
+            let payload = vec![0x5a; 5_635];
+            let len = u16::try_from(payload.len()).unwrap();
+            client.write_all(&len.to_be_bytes()).await.unwrap();
+            client.write_all(&payload).await.unwrap();
+
+            let (_, decoded) =
+                BufferedTcpStream::read_first_frame(server_stream, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            assert_eq!(decoded, payload);
         });
     }
 

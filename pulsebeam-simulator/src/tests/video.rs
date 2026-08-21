@@ -11,7 +11,6 @@ fn cross_shard_video_room() -> super::common::Room {
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
 fn cross_shard_stats_reach_the_subscriber_allocator() {
     super::common::LocalNodeSim::new()
-        .with_shards(2)
         .with_room(cross_shard_video_room())
         .run(vec![
             super::common::Step::Run {
@@ -30,7 +29,6 @@ fn cross_shard_stats_reach_the_subscriber_allocator() {
 #[test]
 fn cross_shard_keyframe_reaches_the_publisher() {
     super::common::LocalNodeSim::new()
-        .with_shards(2)
         .with_room(
             super::common::Room::new("cross-shard-keyframe")
                 .with_participant(super::common::Participant::publisher(
@@ -424,7 +422,6 @@ fn simulcast_stream_stability_test() {
 #[test]
 fn cross_shard_stream_survives_congestion_test() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
@@ -474,7 +471,6 @@ fn cross_shard_stream_survives_congestion_test() {
 #[test]
 fn cross_shard_simulcast_switching_stays_decodable_test() {
     LocalNodeSim::new()
-        .with_shards(2)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["f", "h", "q"]))

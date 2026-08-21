@@ -16,9 +16,9 @@
 //! }
 //! ```
 //!
-//! Off by default even under `sim`, so the existing suite stays deterministic and green; a plan
-//! that wants chaos calls [`enable`]. Without the `sim` feature the call is a `const false` and
-//! the branch is compiled out, so production carries nothing.
+//! The simulator arms a deterministic baseline rate for every plan and named recovery plans may
+//! override it with [`enable`]. Without the `sim` feature the call is a `const false` and the
+//! branch is compiled out, so production carries nothing.
 //!
 //! Each site is labelled, and [`fired_sites`] reports which ones actually triggered. A site that
 //! never fires across a sweep is a failure path still untested — that list is the point as much as

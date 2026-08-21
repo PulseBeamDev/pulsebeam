@@ -1,18 +1,15 @@
 use crate::TransceiverDirection;
-use crate::agent::driver::{AgentDriver, AgentError, DriverInit};
+use crate::agent::driver::{AgentDriver, AgentError, DriverInit, MediaTemplate, RtcTemplate};
 use crate::agent::{Agent, AgentRunner};
 use crate::api::{CreateParticipantRequest, HttpApiClient};
 use crate::tcp::TcpSession;
 use pulsebeam_core::net::UdpSocket;
-use pulsebeam_proto::namespace;
 use pulsebeam_proto::rtp_extensions;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use str0m::bwe::Bitrate;
-use str0m::channel::{ChannelConfig, Reliability};
-use str0m::media::{Direction, MediaAdded, MediaKind, Simulcast, SimulcastLayer};
+use str0m::media::{Direction, MediaKind, Simulcast, SimulcastLayer};
 use str0m::{Candidate, Rtc, net::TcpType};
-use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
 struct TrackRequest {
@@ -179,15 +176,16 @@ impl AgentBuilder {
         //     pt += 2;
         // }
 
-        let mut rtc = rtc_builder.build(Instant::now().into());
+        let rtc_config = rtc_builder.clone();
         let mut candidate_count = 0usize;
         let mut maybe_addr = None;
+        let mut candidates = Vec::new();
         for ip in &self.local_ips {
             let addr = SocketAddr::new(*ip, port);
             let Ok(candidate) = Candidate::builder().udp().host(addr).build() else {
                 continue;
             };
-            rtc.add_local_candidate(candidate);
+            candidates.push(candidate);
             maybe_addr = Some(addr);
             candidate_count = candidate_count.saturating_add(1);
         }
@@ -212,7 +210,7 @@ impl AgentBuilder {
                             .tcptype(TcpType::Active)
                             .build()
                         {
-                            rtc.add_local_candidate(c);
+                            candidates.push(c);
                             candidate_count = candidate_count.saturating_add(1);
                             if maybe_addr.is_none() {
                                 maybe_addr = Some(tcp_candidate_addr);
@@ -234,47 +232,35 @@ impl AgentBuilder {
             return Err(AgentError::NoCandidates);
         };
 
-        let mut sdp = rtc.sdp_api();
-
-        let signaling_cfg = ChannelConfig {
-            label: namespace::Signaling::Reliable.as_str().to_string(),
-            ordered: true,
-            reliability: Reliability::Reliable,
-            negotiated: None,
-            protocol: "".to_string(),
-        };
-        let signaling_cid = sdp.add_channel_with_config(signaling_cfg);
-
-        let mut medias = Vec::new();
-        for track in self.tracks.clone() {
-            let (dir, simulcast) = match track.direction {
-                TransceiverDirection::SendOnly => (
-                    Direction::SendOnly,
-                    track.simulcast_layers.map(|layers| Simulcast {
-                        send: layers,
-                        recv: Vec::new(),
-                    }),
-                ),
-                TransceiverDirection::RecvOnly => (
-                    Direction::RecvOnly,
-                    track.simulcast_layers.map(|layers| Simulcast {
-                        send: Vec::new(),
-                        recv: layers,
-                    }),
-                ),
-            };
-            let mid = sdp.add_media(track.kind, dir, None, None, simulcast.clone());
-            medias.push(MediaAdded {
-                mid,
-                kind: track.kind,
-                direction: dir,
-                simulcast,
-            });
-        }
-
-        let (offer, pending) = sdp
-            .apply()
-            .ok_or_else(|| AgentError::Protocol("SDP apply produced no offer".into()))?;
+        let media_templates = self
+            .tracks
+            .iter()
+            .map(|track| {
+                let (direction, simulcast) = match track.direction {
+                    TransceiverDirection::SendOnly => (
+                        Direction::SendOnly,
+                        track.simulcast_layers.clone().map(|layers| Simulcast {
+                            send: layers,
+                            recv: Vec::new(),
+                        }),
+                    ),
+                    TransceiverDirection::RecvOnly => (
+                        Direction::RecvOnly,
+                        track.simulcast_layers.clone().map(|layers| Simulcast {
+                            send: Vec::new(),
+                            recv: layers,
+                        }),
+                    ),
+                };
+                MediaTemplate {
+                    kind: track.kind,
+                    direction,
+                    simulcast,
+                }
+            })
+            .collect();
+        let rtc_template = RtcTemplate::new(rtc_config, candidates, media_templates);
+        let (mut rtc, signaling_cid, medias, offer, pending) = rtc_template.build()?;
 
         let resp = self
             .api
@@ -306,6 +292,7 @@ impl AgentBuilder {
             room_id: room_id.to_string(),
             participant_id: resp.participant_id,
             medias,
+            rtc_template,
         };
 
         Ok(AgentRunner::new(AgentDriver::new(init)))

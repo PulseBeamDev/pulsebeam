@@ -23,11 +23,18 @@ const UNROUTED_CAPACITY: usize = 128;
 
 /// How long a packet may wait to be routed before it is stale.
 ///
-/// The assignment travels over the data channel, so the wait is a round trip at worst. Anything
-/// older belongs to a stream that has gone, and handing it over late is worse than dropping it:
-/// the receiver has moved on, and a packet from behind its sequence frontier reads as a gap it
-/// must wait out.
-const UNROUTED_MAX_WAIT: Duration = Duration::from_millis(500);
+/// Not a round trip. The assignment rides the data channel, whose lane is the last to come up —
+/// SCTP on top of DTLS — and on a lossy link its first messages are retransmitted like anything
+/// else; measured at 1.5-2s from first media to first assignment on a cellular profile. Sized for
+/// a round trip, this dropped the opening of every stream on exactly the links least able to
+/// spare it.
+///
+/// The objection to holding longer — that a late packet reads as a gap the receiver must wait out
+/// — applies to a stream that has moved on. A slot with no target has delivered nothing, so there
+/// is no frontier to arrive behind, and this only ever holds slots in that state. Memory is
+/// bounded by [`UNROUTED_CAPACITY`], which is the real limit; this is the backstop for a slot that
+/// never becomes routable at all.
+const UNROUTED_MAX_WAIT: Duration = Duration::from_secs(3);
 
 use pulsebeam_proto::signaling::Publication as Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};
@@ -37,11 +44,12 @@ use std::pin::Pin;
 use std::time::Duration;
 use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
+use str0m::change::{SdpOffer, SdpPendingOffer};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
-use str0m::media::{Direction, MediaAdded, MediaKind, Mid, Rid};
+use str0m::media::{Direction, KeyframeRequestKind, MediaAdded, MediaKind, Mid, Rid, Simulcast};
 use str0m::rtp::{RtpWrite, Ssrc};
 use str0m::{
-    Event, Input, Output, Rtc,
+    Candidate, Event, Input, Output, Rtc, RtcConfig,
     net::{Protocol, Receive},
 };
 use tokio::time::Instant;
@@ -51,6 +59,101 @@ const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
 const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
 
 pub type ParticipantId = String;
+
+#[derive(Clone)]
+pub(crate) struct MediaTemplate {
+    pub kind: MediaKind,
+    pub direction: Direction,
+    pub simulcast: Option<Simulcast>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RtcTemplate {
+    config: RtcConfig,
+    candidates: Vec<Candidate>,
+    medias: Vec<MediaTemplate>,
+}
+
+impl RtcTemplate {
+    pub(crate) fn new(
+        config: RtcConfig,
+        candidates: Vec<Candidate>,
+        medias: Vec<MediaTemplate>,
+    ) -> Self {
+        debug_assert!(!candidates.is_empty());
+        Self {
+            config,
+            candidates,
+            medias,
+        }
+    }
+
+    pub(crate) fn build(
+        &self,
+    ) -> Result<(Rtc, ChannelId, Vec<MediaAdded>, SdpOffer, SdpPendingOffer), AgentError> {
+        let (rtc, signaling_cid, medias, _, offer, pending) =
+            self.build_with_channels(Vec::new())?;
+        Ok((rtc, signaling_cid, medias, offer, pending))
+    }
+
+    pub(crate) fn build_with_channels(
+        &self,
+        channels: Vec<ChannelConfig>,
+    ) -> Result<
+        (
+            Rtc,
+            ChannelId,
+            Vec<MediaAdded>,
+            Vec<ChannelId>,
+            SdpOffer,
+            SdpPendingOffer,
+        ),
+        AgentError,
+    > {
+        let mut rtc = self.config.clone().build(Instant::now().into());
+        for candidate in &self.candidates {
+            let _ = rtc.add_local_candidate(candidate.clone());
+        }
+
+        let mut sdp = rtc.sdp_api();
+        let signaling_cid = sdp.add_channel_with_config(ChannelConfig {
+            label: namespace::Signaling::Reliable.as_str().to_string(),
+            ordered: true,
+            reliability: Reliability::Reliable,
+            negotiated: None,
+            protocol: String::new(),
+        });
+        let channel_ids = channels
+            .into_iter()
+            .map(|config| sdp.add_channel_with_config(config))
+            .collect();
+        let medias = self
+            .medias
+            .iter()
+            .map(|media| {
+                let mid = sdp.add_media(
+                    media.kind,
+                    media.direction,
+                    None,
+                    None,
+                    media.simulcast.clone(),
+                );
+                MediaAdded {
+                    mid,
+                    kind: media.kind,
+                    direction: media.direction,
+                    simulcast: media.simulcast.clone(),
+                }
+            })
+            .collect();
+        let Some((offer, pending)) = sdp.apply() else {
+            return Err(AgentError::Protocol(
+                "an RTC template must produce its initial SDP offer".into(),
+            ));
+        };
+        Ok((rtc, signaling_cid, medias, channel_ids, offer, pending))
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct StatisticsSnapshot {
@@ -260,6 +363,7 @@ pub(crate) struct DriverInit {
     pub room_id: String,
     pub participant_id: String,
     pub medias: Vec<MediaAdded>,
+    pub rtc_template: RtcTemplate,
 }
 
 struct NetworkSubsystem {
@@ -275,10 +379,52 @@ struct DataSubsystem {
     data_pub_topics: HashMap<String, ChannelId>,
     data_sub_topics: HashMap<(String, Option<String>), ChannelId>,
     data_targets: HashMap<(String, Option<String>), mailbox::Sender<Vec<u8>>>,
+    channel_remap: HashMap<ChannelId, ChannelId>,
+}
+
+impl DataSubsystem {
+    fn channel_templates(&self) -> Vec<(ChannelId, ChannelConfig)> {
+        self.data_pub_topics
+            .iter()
+            .map(|(topic, channel_id)| {
+                (
+                    *channel_id,
+                    ChannelConfig {
+                        label: data_track_label(DataTrackDirection::Publish, topic, None),
+                        ordered: false,
+                        reliability: Reliability::MaxRetransmits { retransmits: 0 },
+                        negotiated: None,
+                        protocol: String::new(),
+                    },
+                )
+            })
+            .chain(
+                self.data_sub_topics
+                    .iter()
+                    .map(|((topic, scope), channel_id)| {
+                        (
+                            *channel_id,
+                            ChannelConfig {
+                                label: data_track_label(
+                                    DataTrackDirection::Subscribe,
+                                    topic,
+                                    scope.as_deref(),
+                                ),
+                                ordered: false,
+                                reliability: Reliability::MaxRetransmits { retransmits: 0 },
+                                negotiated: None,
+                                protocol: String::new(),
+                            },
+                        )
+                    }),
+            )
+            .collect()
+    }
 }
 
 struct MediaSubsystem {
     media_targets: HashMap<Mid, mailbox::Sender<RtpPacket>>,
+    publication_sources: HashMap<String, Track>,
     /// Packets that arrived before the assignment saying which track their slot carries.
     ///
     /// Media and signalling travel separately, and the SFU starts forwarding as soon as it has a
@@ -286,11 +432,26 @@ struct MediaSubsystem {
     /// are the keyframe the stream opens with, and dropping them costs the viewer the picture
     /// until the next one, which on a settled stream can be seconds away.
     unrouted: VecDeque<(Mid, Option<Instant>, RtpPacket)>,
+    /// Slots that lost held media before their assignment arrived.
+    ///
+    /// A dropped packet is usually part of the keyframe the stream opens with,
+    /// and losing any of it costs the whole frame. The SFU will not send
+    /// another unprompted: it requested one when it switched the slot, saw it
+    /// answered, and from its side the switch is complete — so waiting is
+    /// waiting for the publisher's next periodic keyframe, which on a settled
+    /// stream is seconds away or never.
+    ///
+    /// Asking once, when the assignment finally lands, is the recovery that
+    /// does not depend on media and signalling beating each other across a
+    /// boundary that does not order them.
+    lost_before_routing: HashMap<Mid, Option<Rid>>,
     /// Cache of which (mid, rid) each incoming SSRC belongs to. `Event::RtpPacket`
     /// carries only the SSRC, so the mapping is resolved once via the DirectApi and
     /// reused. Mirrors the SFU's `incoming_rtp_routes`.
     incoming_rtp_routes: HashMap<Ssrc, (Mid, Option<Rid>)>,
+    media_targets_by_track: HashMap<String, mailbox::Sender<RtpPacket>>,
     upstream_slots: HashMap<Mid, UpstreamSlot>,
+    upstream_order: Vec<Mid>,
     pending_media_subscriptions:
         HashMap<String, tokio::sync::oneshot::Sender<Result<RemoteTrack, AgentError>>>,
     /// Mailboxes handed to a subscriber before the SFU assigned the track a slot.
@@ -311,6 +472,7 @@ struct UpstreamSlot {
     generation: u64,
     active: bool,
     encodings: Vec<(Option<Rid>, KeyframeReceiver)>,
+    keyframe_notifiers: Vec<KeyframeNotifier>,
 }
 
 impl UpstreamSlot {
@@ -343,6 +505,8 @@ impl UpstreamSlot {
 struct SubscriptionSubsystem {
     sub_manager: SubscriptionManager,
     desired_subscriptions: HashMap<String, VideoSubscription>,
+    parked_subscriptions: HashMap<String, VideoSubscription>,
+    parked_publications: HashMap<String, Track>,
     pending_deadline: Option<Instant>,
     /// (min, max) receiver playout delay in ms; `None` = adaptive default.
     playout_delay_ms: Option<(u32, u32)>,
@@ -365,6 +529,7 @@ struct SessionSubsystem {
     retry_count: u32,
     is_reconnecting: bool,
     reconnect_deadline: Option<Instant>,
+    rtc_failed: bool,
 }
 
 struct TimerSubsystem {
@@ -376,6 +541,8 @@ struct TimerSubsystem {
 
 pub(crate) struct AgentDriver {
     rtc: Rtc,
+    rtc_template: RtcTemplate,
+    upstream_mid_remap: HashMap<Mid, Mid>,
     stats: StatisticsSnapshot,
     pending_events: VecDeque<AgentEvent>,
     shutdown_responses: Vec<tokio::sync::oneshot::Sender<()>>,
@@ -405,6 +572,8 @@ impl AgentDriver {
 
         let mut driver = Self {
             rtc,
+            rtc_template: init.rtc_template,
+            upstream_mid_remap: HashMap::new(),
             stats: StatisticsSnapshot::default(),
             pending_events: VecDeque::new(),
             shutdown_responses: Vec::new(),
@@ -425,15 +594,20 @@ impl AgentDriver {
                 data_pub_topics: HashMap::new(),
                 data_sub_topics: HashMap::new(),
                 data_targets: HashMap::new(),
+                channel_remap: HashMap::new(),
             },
             ordered_topics: OrderedTopics::new(),
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
+                publication_sources: HashMap::new(),
                 incoming_rtp_routes: HashMap::new(),
+                media_targets_by_track: HashMap::new(),
                 upstream_slots: HashMap::new(),
+                upstream_order: Vec::new(),
                 pending_media_subscriptions: HashMap::new(),
                 pending_media_targets: HashMap::new(),
                 unrouted: VecDeque::new(),
+                lost_before_routing: HashMap::new(),
                 audio_sink: None,
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
@@ -448,6 +622,8 @@ impl AgentDriver {
                         .collect(),
                 ),
                 desired_subscriptions: HashMap::new(),
+                parked_subscriptions: HashMap::new(),
+                parked_publications: HashMap::new(),
                 pending_deadline: None,
                 playout_delay_ms: None,
                 upstream_active: HashMap::new(),
@@ -464,6 +640,7 @@ impl AgentDriver {
                 retry_count: 0,
                 is_reconnecting: false,
                 reconnect_deadline: None,
+                rtc_failed: false,
             },
             timers: TimerSubsystem {
                 notifier: tokio::sync::Notify::new(),
@@ -557,27 +734,36 @@ impl AgentDriver {
         &mut self,
         kind: MediaKind,
     ) -> Result<super::session::LocalTrack, AgentError> {
-        let Some((&mid, slot)) = self
+        let Some(&physical_mid) = self
             .media
             .upstream_slots
-            .iter_mut()
+            .iter()
             .find(|(_, slot)| slot.kind == kind && !slot.active)
+            .map(|(mid, _)| mid)
         else {
             return Err(AgentError::MediaCapacity(kind));
         };
-        let lease = slot.activate(mid);
+        let logical_mid = self.logical_upstream_mid(physical_mid);
+        let Some(slot) = self.media.upstream_slots.get_mut(&physical_mid) else {
+            return Err(AgentError::MediaCapacity(kind));
+        };
+        let physical_lease = slot.activate(physical_mid);
+        let lease = PublicationLease {
+            mid: logical_mid,
+            generation: physical_lease.generation,
+        };
         let encodings = slot
             .encodings
             .iter()
             .map(|(rid, keyframe_rx)| LocalEncoding {
-                mid,
+                mid: logical_mid,
                 rid: *rid,
                 lease,
                 keyframe_rx: keyframe_rx.clone(),
                 tx: self.outgoing_tx.clone(),
             })
             .collect();
-        self.set_upstream_active(mid, true);
+        self.set_upstream_active(logical_mid, true);
         Ok(super::session::LocalTrack::new(
             kind,
             lease,
@@ -587,7 +773,8 @@ impl AgentDriver {
     }
 
     fn unpublish_local_track(&mut self, lease: PublicationLease) {
-        let Some(slot) = self.media.upstream_slots.get_mut(&lease.mid) else {
+        let physical_mid = self.physical_upstream_mid(lease.mid);
+        let Some(slot) = self.media.upstream_slots.get_mut(&physical_mid) else {
             debug_assert!(
                 false,
                 "publication lease references an unknown upstream slot"
@@ -623,6 +810,20 @@ impl AgentDriver {
         self.subscriptions.upstream_dirty = true;
         self.subscriptions.pending_deadline = Some(self.now);
         self.timers.notifier.notify_one();
+    }
+
+    fn physical_upstream_mid(&self, logical_mid: Mid) -> Mid {
+        self.upstream_mid_remap
+            .get(&logical_mid)
+            .copied()
+            .unwrap_or(logical_mid)
+    }
+
+    fn logical_upstream_mid(&self, physical_mid: Mid) -> Mid {
+        self.upstream_mid_remap
+            .iter()
+            .find_map(|(logical, physical)| (*physical == physical_mid).then_some(*logical))
+            .unwrap_or(physical_mid)
     }
 
     pub async fn shutdown(&mut self) {
@@ -793,18 +994,29 @@ impl AgentDriver {
     fn handle_outgoing_command(&mut self, cmd: OutgoingCommand) {
         match cmd {
             OutgoingCommand::SendData(e) => {
-                if let Err(payload) =
-                    self.ordered_topics
-                        .send(&mut self.rtc, e.channel_id, e.payload)
+                let channel_id = self
+                    .data
+                    .channel_remap
+                    .get(&e.channel_id)
+                    .copied()
+                    .unwrap_or(e.channel_id);
+                if let Err(payload) = self
+                    .ordered_topics
+                    .send(&mut self.rtc, channel_id, e.payload)
                 {
-                    let Some(mut channel) = self.rtc.channel(e.channel_id) else {
+                    let Some(mut channel) = self.rtc.channel(channel_id) else {
                         return;
                     };
                     let _ = channel.write(true, &payload);
                 }
             }
             OutgoingCommand::SendMedia(e) => {
-                let Some(slot) = self.media.upstream_slots.get(&e.lease.mid) else {
+                let mid = self
+                    .upstream_mid_remap
+                    .get(&e.lease.mid)
+                    .copied()
+                    .unwrap_or(e.lease.mid);
+                let Some(slot) = self.media.upstream_slots.get(&mid) else {
                     return;
                 };
                 if !slot.accepts(e.lease) {
@@ -815,7 +1027,6 @@ impl AgentDriver {
                 if !encoding_exists {
                     return;
                 }
-                let mid = e.lease.mid;
                 let paused = self.media.layer_ctrl.is_paused(mid, e.rid);
                 self.media.layer_ctrl.record_frame(
                     mid,
@@ -884,8 +1095,14 @@ impl AgentDriver {
                 if let Some((mid, track)) = self.slot_manager.assigned(&track_id) {
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
+                    if let Some(tx) = self.media.media_targets.get(&mid).cloned() {
+                        self.media
+                            .media_targets_by_track
+                            .insert(track_id.clone(), tx);
+                    }
                     let _ = response.send(Ok(RemoteTrack::new(track, rx)));
                     self.deliver_unrouted();
+                    self.subscriptions.parked_subscriptions.remove(&track_id);
                     self.subscriptions
                         .desired_subscriptions
                         .insert(track_id, subscription);
@@ -919,6 +1136,9 @@ impl AgentDriver {
                 if let Some(track) = self.slot_manager.known(&track_id) {
                     let (tx, rx) = mailbox::bounded(256);
                     self.media
+                        .media_targets_by_track
+                        .insert(track_id.clone(), tx.clone());
+                    self.media
                         .pending_media_targets
                         .insert(track_id.clone(), tx);
                     let _ = response.send(Ok(RemoteTrack::new(track, rx)));
@@ -927,6 +1147,7 @@ impl AgentDriver {
                         .pending_media_subscriptions
                         .insert(track_id.clone(), response);
                 }
+                self.subscriptions.parked_subscriptions.remove(&track_id);
                 self.subscriptions
                     .desired_subscriptions
                     .insert(track_id, subscription);
@@ -971,6 +1192,15 @@ impl AgentDriver {
     }
 
     fn poll_rtc(&mut self) -> Option<Instant> {
+        if self.session.rtc_failed {
+            let now = Instant::now();
+            return Some(
+                self.session
+                    .reconnect_deadline
+                    .unwrap_or_else(|| now.checked_add(MIN_QUANTA).unwrap_or(now)),
+            );
+        }
+
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(tx)) => match tx.proto {
@@ -1042,7 +1272,11 @@ impl AgentDriver {
                                     let deadline = self.now.checked_add(UNROUTED_MAX_WAIT);
                                     self.media.unrouted.push_back((mid, deadline, packet));
                                     while self.media.unrouted.len() > UNROUTED_CAPACITY {
-                                        self.media.unrouted.pop_front();
+                                        if let Some((lost, _, packet)) =
+                                            self.media.unrouted.pop_front()
+                                        {
+                                            self.media.lost_before_routing.insert(lost, packet.rid);
+                                        }
                                         self.stats.unroutable_media_dropped =
                                             self.stats.unroutable_media_dropped.wrapping_add(1);
                                     }
@@ -1052,6 +1286,13 @@ impl AgentDriver {
                     }
                     Event::IceConnectionStateChange(state) => {
                         if state == IceConnectionState::Disconnected {
+                            if self.session.disconnected_reason.is_none() {
+                                self.session.disconnected_reason =
+                                    Some("ICE connection disconnected".into());
+                                self.emit(AgentEvent::Disconnected(
+                                    "ICE connection disconnected".into(),
+                                ));
+                            }
                             self.schedule_reconnect(Instant::now());
                         }
                     }
@@ -1090,7 +1331,15 @@ impl AgentDriver {
                 Err(e) => {
                     self.session.disconnected_reason = Some(format!("RTC Error: {e:?}"));
                     self.rtc.disconnect();
-                    return None;
+                    self.session.rtc_failed = true;
+                    self.emit(AgentEvent::Disconnected(format!("RTC Error: {e:?}")));
+                    self.schedule_reconnect(Instant::now());
+                    let now = Instant::now();
+                    return Some(
+                        self.session
+                            .reconnect_deadline
+                            .unwrap_or_else(|| now.checked_add(MIN_QUANTA).unwrap_or(now)),
+                    );
                 }
             }
         }
@@ -1112,6 +1361,9 @@ impl AgentDriver {
         self.stats.tracks.entry(mid).or_default().kind = Some(media.kind);
         match media.direction {
             Direction::SendOnly => {
+                if self.media.upstream_slots.contains_key(&mid) {
+                    return;
+                }
                 let rids = if let Some(layers) = media.simulcast {
                     layers.send.iter().map(|s| Some(s.rid)).collect()
                 } else {
@@ -1119,13 +1371,18 @@ impl AgentDriver {
                 };
 
                 let mut encodings = Vec::with_capacity(rids.len());
+                let mut keyframe_notifiers = Vec::with_capacity(rids.len());
                 for rid in rids {
                     let (kf_notifier, kf_rx) = KeyframeNotifier::pair();
                     if media.kind.is_video() {
-                        self.media.layer_ctrl.register(mid, rid, kf_notifier);
+                        self.media
+                            .layer_ctrl
+                            .register(mid, rid, kf_notifier.clone());
                     }
+                    keyframe_notifiers.push(kf_notifier);
                     encodings.push((rid, kf_rx));
                 }
+                self.media.upstream_order.push(mid);
                 let previous = self.media.upstream_slots.insert(
                     mid,
                     UpstreamSlot {
@@ -1133,6 +1390,7 @@ impl AgentDriver {
                         generation: 0,
                         active: false,
                         encodings,
+                        keyframe_notifiers,
                     },
                 );
                 debug_assert!(previous.is_none());
@@ -1172,10 +1430,15 @@ impl AgentDriver {
                     });
                 }
                 for track in discovered {
+                    self.restore_parked_subscription(&track);
+                    self.media
+                        .publication_sources
+                        .insert(track.track_id.clone(), track.clone());
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
                 }
                 for track_id in &removed {
-                    self.forget_track(track_id);
+                    let source = self.media.publication_sources.remove(track_id);
+                    self.forget_track(track_id, source);
                 }
                 if !removed.is_empty() {
                     self.subscriptions.pending_deadline = Some(self.now);
@@ -1203,10 +1466,22 @@ impl AgentDriver {
                     // before this assignment existed. Wire its sender to the slot rather than
                     // replacing it, or the handle it is holding would never receive anything.
                     if let Some(tx) = self.media.pending_media_targets.remove(&track_id) {
+                        self.media
+                            .media_targets_by_track
+                            .insert(track_id.clone(), tx.clone());
                         self.media.media_targets.insert(mid, tx);
+                        self.deliver_unrouted();
+                        continue;
+                    }
+                    if let Some(tx) = self.media.media_targets_by_track.get(&track_id).cloned() {
+                        self.media.media_targets.insert(mid, tx);
+                        self.deliver_unrouted();
                         continue;
                     }
                     let (tx, rx) = mailbox::bounded(256);
+                    self.media
+                        .media_targets_by_track
+                        .insert(track_id.clone(), tx.clone());
                     self.media.media_targets.insert(mid, tx);
                     let remote_track = RemoteTrack::new(track, rx);
                     if let Some(response) = self.media.pending_media_subscriptions.remove(&track_id)
@@ -1230,9 +1505,77 @@ impl AgentDriver {
     /// Clearing only the derived half looks like it works until the next subscription rebuilds
     /// `desired` from a map that still holds the departed track, puts it back, and has the client
     /// asking the SFU for a publisher who left.
-    fn forget_track(&mut self, track_id: &str) {
-        self.subscriptions.desired_subscriptions.remove(track_id);
+    fn forget_track(&mut self, track_id: &str, source: Option<Track>) {
+        if let Some(subscription) = self.subscriptions.desired_subscriptions.remove(track_id) {
+            const MAX_PARKED_SUBSCRIPTIONS: usize = 64;
+            if self.subscriptions.parked_subscriptions.len() >= MAX_PARKED_SUBSCRIPTIONS
+                && !self
+                    .subscriptions
+                    .parked_subscriptions
+                    .contains_key(track_id)
+                && let Some(oldest) = self
+                    .subscriptions
+                    .parked_subscriptions
+                    .keys()
+                    .next()
+                    .cloned()
+            {
+                self.subscriptions.parked_subscriptions.remove(&oldest);
+            }
+            self.subscriptions
+                .parked_subscriptions
+                .insert(track_id.to_owned(), subscription);
+            if let Some(source) = source {
+                self.subscriptions
+                    .parked_publications
+                    .insert(track_id.to_owned(), source);
+            }
+        }
         self.subscriptions.sub_manager.remove_track(track_id);
+    }
+
+    fn restore_parked_subscription(&mut self, track: &Track) {
+        let parked_id = if self
+            .subscriptions
+            .parked_subscriptions
+            .contains_key(&track.track_id)
+        {
+            Some(track.track_id.clone())
+        } else {
+            self.subscriptions
+                .parked_publications
+                .iter()
+                .find(|(_, old)| {
+                    old.participant_id == track.participant_id && old.kind == track.kind
+                })
+                .map(|(track_id, _)| track_id.clone())
+        };
+        let Some(parked_id) = parked_id else {
+            return;
+        };
+        let Some(mut subscription) = self.subscriptions.parked_subscriptions.remove(&parked_id)
+        else {
+            return;
+        };
+        self.subscriptions.parked_publications.remove(&parked_id);
+        subscription.track_id.clone_from(&track.track_id);
+        self.subscriptions
+            .desired_subscriptions
+            .insert(track.track_id.clone(), subscription);
+        if let Some(target) = self.media.media_targets_by_track.remove(&parked_id) {
+            self.media
+                .media_targets_by_track
+                .insert(track.track_id.clone(), target);
+        }
+        let desired = self
+            .subscriptions
+            .desired_subscriptions
+            .values()
+            .cloned()
+            .collect();
+        self.subscriptions.sub_manager.set_desired(desired);
+        self.subscriptions.pending_deadline = Some(self.now);
+        self.timers.notifier.notify_one();
     }
 
     /// Hand over packets that were waiting for the assignment naming their slot.
@@ -1247,6 +1590,7 @@ impl AgentDriver {
         let mut still_waiting = VecDeque::with_capacity(self.media.unrouted.len());
         while let Some((mid, deadline, packet)) = self.media.unrouted.pop_front() {
             if deadline.is_none_or(|deadline| now > deadline) {
+                self.media.lost_before_routing.insert(mid, packet.rid);
                 self.stats.unroutable_media_dropped =
                     self.stats.unroutable_media_dropped.wrapping_add(1);
                 continue;
@@ -1261,6 +1605,34 @@ impl AgentDriver {
             }
         }
         self.media.unrouted = still_waiting;
+        self.recover_lost_keyframes();
+    }
+
+    /// Ask the SFU for a keyframe on every routable slot that lost held media.
+    ///
+    /// Once, per loss: the request travels to the publisher and comes back as a
+    /// keyframe, and asking again before that round trip completes only costs
+    /// bandwidth. If this one is lost too the slot goes on receiving
+    /// undecodable frames, which is the same place it was — but it is no longer
+    /// the only outcome.
+    fn recover_lost_keyframes(&mut self) {
+        if self.media.lost_before_routing.is_empty() {
+            return;
+        }
+        let mut api = self.rtc.direct_api();
+        self.media.lost_before_routing.retain(|mid, rid| {
+            if !self.media.media_targets.contains_key(mid) {
+                // Still unassigned. Hold the request until it can be answered
+                // by a stream this client can actually route.
+                return true;
+            }
+            let Some(stream) = api.stream_rx_by_mid(*mid, *rid) else {
+                return false;
+            };
+            stream.request_keyframe(KeyframeRequestKind::Pli);
+            tracing::debug!(?mid, ?rid, "requesting a keyframe after losing held media");
+            false
+        });
     }
 
     fn emit(&mut self, event: AgentEvent) {
@@ -1268,11 +1640,11 @@ impl AgentDriver {
     }
 
     fn flush_pending_state(&mut self) {
-        let Some(mut ch) = self.rtc.channel(self.data.signaling_cid) else {
+        if self.rtc.channel(self.data.signaling_cid).is_none() {
             self.subscriptions.pending_deadline =
                 Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
             return;
-        };
+        }
 
         let (downstream_dirty, requests) = self.subscriptions.sub_manager.reconcile();
         if !downstream_dirty && !self.subscriptions.upstream_dirty {
@@ -1288,7 +1660,7 @@ impl AgentDriver {
                         .upstream_active
                         .iter()
                         .map(|(mid, active)| signaling::PublishIntent {
-                            mid: mid.to_string(),
+                            mid: self.physical_upstream_mid(*mid).to_string(),
                             active: *active,
                         })
                         .collect(),
@@ -1301,6 +1673,11 @@ impl AgentDriver {
                     }),
                 },
             )),
+        };
+        let Some(mut ch) = self.rtc.channel(self.data.signaling_cid) else {
+            self.subscriptions.pending_deadline =
+                Some(self.now.checked_add(STATE_DEBOUNCE).unwrap_or(self.now));
+            return;
         };
         let encoded = msg.encode_to_vec();
         if let Err(err) = ch.write(true, encoded.as_slice()) {
@@ -1338,11 +1715,13 @@ impl AgentDriver {
 
         match self.try_reconnect().await {
             Ok(_) => {
+                self.session.rtc_failed = false;
                 self.session.is_reconnecting = false;
                 self.session.retry_count = 0;
                 self.emit(AgentEvent::Connected);
             }
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(?error, "participant reconnect attempt failed");
                 self.session.is_reconnecting = false;
                 self.schedule_reconnect(Instant::now());
             }
@@ -1350,20 +1729,18 @@ impl AgentDriver {
     }
 
     async fn try_reconnect(&mut self) -> Result<(), AgentError> {
-        self.renegotiate().await
-    }
-
-    async fn renegotiate(&mut self) -> Result<(), AgentError> {
-        let (offer, pending) = {
-            let sdp_api = self.rtc.sdp_api();
-            match sdp_api.apply() {
-                Some(pair) => pair,
-                None => {
-                    return Ok(());
-                }
-            }
-        };
-
+        let channel_templates = self
+            .data
+            .channel_templates()
+            .into_iter()
+            .chain(self.ordered_topics.channel_templates())
+            .collect::<Vec<_>>();
+        let channel_configs = channel_templates
+            .iter()
+            .map(|(_, config)| config.clone())
+            .collect();
+        let (mut rtc, signaling_cid, medias, channel_ids, offer, pending) =
+            self.rtc_template.build_with_channels(channel_configs)?;
         let resp = self
             .session
             .api
@@ -1375,17 +1752,136 @@ impl AgentDriver {
                 },
             )
             .await?;
-
-        // The generation moves on with every successful reconnect; the next one has to quote the
-        // new value or the server will refuse it.
         self.session.etag = resp.etag;
-
-        self.rtc
-            .sdp_api()
+        rtc.sdp_api()
             .accept_answer(pending, resp.answer)
             .map_err(AgentError::Rtc)?;
 
+        self.rebind_channels(signaling_cid, &channel_templates, &channel_ids);
+        self.rebind_media(medias)?;
+        self.rtc = rtc;
+        self.rtc.bwe().set_current_bitrate(Bitrate::ZERO);
+        self.network.tcp = self.reconnect_tcp().await?;
+        self.media.incoming_rtp_routes.clear();
+        self.subscriptions.sub_manager.reset_active_assignments();
+        self.subscriptions.upstream_dirty = true;
+        self.subscriptions.pending_deadline = Some(Instant::now());
+        self.session.disconnected_reason = None;
+        self.timers.notifier.notify_one();
         Ok(())
+    }
+
+    fn rebind_channels(
+        &mut self,
+        signaling_cid: ChannelId,
+        templates: &[(ChannelId, ChannelConfig)],
+        channel_ids: &[ChannelId],
+    ) {
+        debug_assert_eq!(templates.len(), channel_ids.len());
+        let mut remap = HashMap::with_capacity(templates.len());
+        for ((old_id, config), new_id) in templates.iter().zip(channel_ids.iter().copied()) {
+            debug_assert_ne!(*old_id, new_id);
+            remap.insert(*old_id, new_id);
+            if let Some(binding) = self.data.data_channels.get(old_id).cloned() {
+                self.data.data_channels.insert(new_id, binding);
+            } else if let Some((_direction, topic, scope)) = parse_data_track_label(&config.label) {
+                self.data
+                    .data_channels
+                    .insert(new_id, DataTrackBinding { topic, scope });
+            }
+        }
+        self.data.signaling_cid = signaling_cid;
+        self.data.channel_remap.clone_from(&remap);
+        self.ordered_topics.rebind_channels(&remap);
+    }
+
+    fn rebind_media(&mut self, medias: Vec<MediaAdded>) -> Result<(), AgentError> {
+        let new_upstream: Vec<_> = medias
+            .iter()
+            .filter(|media| media.direction == Direction::SendOnly)
+            .collect();
+        let old_order = std::mem::take(&mut self.media.upstream_order);
+        if old_order.len() != new_upstream.len() {
+            return Err(AgentError::Protocol(format!(
+                "reconnect changed upstream media capacity from {} to {}",
+                old_order.len(),
+                new_upstream.len()
+            )));
+        }
+
+        let mut old_slots = std::mem::take(&mut self.media.upstream_slots);
+        let mut new_slots = HashMap::with_capacity(new_upstream.len());
+        let mut remap = HashMap::with_capacity(new_upstream.len());
+        let mut new_order = Vec::with_capacity(new_upstream.len());
+        for (old_mid, new_media) in old_order.into_iter().zip(new_upstream) {
+            let new_mid = new_media.mid;
+            let Some(old_slot) = old_slots.remove(&old_mid) else {
+                return Err(AgentError::Protocol(format!(
+                    "reconnect lost upstream media slot {old_mid}"
+                )));
+            };
+            if old_slot.kind != new_media.kind {
+                return Err(AgentError::Protocol(
+                    "reconnect changed upstream media kind".into(),
+                ));
+            }
+            if old_mid != new_mid && old_slot.kind.is_video() {
+                self.media.layer_ctrl.rebind(old_mid, new_mid);
+            }
+            let encodings = old_slot
+                .encodings
+                .iter()
+                .zip(old_slot.keyframe_notifiers.iter())
+                .map(|((rid, _), notifier)| (*rid, notifier.receiver()))
+                .collect::<Vec<_>>();
+            if encodings.len() != old_slot.encodings.len() {
+                return Err(AgentError::Protocol(
+                    "reconnect lost a keyframe notifier".into(),
+                ));
+            }
+            let new_slot = UpstreamSlot {
+                kind: old_slot.kind,
+                generation: old_slot.generation,
+                active: old_slot.active,
+                encodings,
+                keyframe_notifiers: old_slot.keyframe_notifiers,
+            };
+            remap.insert(old_mid, new_mid);
+            new_order.push(new_mid);
+            new_slots.insert(new_mid, new_slot);
+        }
+        if !old_slots.is_empty() {
+            return Err(AgentError::Protocol(
+                "reconnect left an upstream media slot unmapped".into(),
+            ));
+        }
+
+        let recv_mids = medias
+            .iter()
+            .filter(|media| media.direction == Direction::RecvOnly)
+            .map(|media| media.mid)
+            .collect::<Vec<_>>();
+        self.media.upstream_slots = new_slots;
+        self.media.upstream_order = new_order;
+        self.upstream_mid_remap = remap;
+        self.media.media_targets.clear();
+        self.media.incoming_rtp_routes.clear();
+        self.media.unrouted.clear();
+        self.media.lost_before_routing.clear();
+        self.slot_manager.replace_slots(recv_mids.clone());
+        self.subscriptions.sub_manager.replace_slots(recv_mids);
+        Ok(())
+    }
+
+    async fn reconnect_tcp(&mut self) -> Result<TcpSession, AgentError> {
+        let Some(server_addr) = self.network.tcp.server_addr() else {
+            return Ok(TcpSession::inactive());
+        };
+        self.network.tcp.close();
+        let stream = pulsebeam_core::net::TcpStream::connect(server_addr).await?;
+        let _ = stream.set_nodelay(true);
+        let local_addr = stream.local_addr().ok();
+        Ok(TcpSession::new(stream, local_addr, server_addr))
     }
 
     fn ensure_data_topic(
@@ -1445,6 +1941,7 @@ mod tests {
             generation: 0,
             active: false,
             encodings: Vec::new(),
+            keyframe_notifiers: Vec::new(),
         };
 
         let camera = slot.activate(mid);
