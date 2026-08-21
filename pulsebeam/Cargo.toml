@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 ahash = "0.8.12"
+aya = { workspace = true }
 anyhow = { workspace = true }
 arrayvec = { version = "0.7.6", features = ["serde"] }
 axum = { version = "0.8.9", features = ["macros"] }
@@ -40,6 +41,7 @@ pprof = { version = "0.15.0", features = [
 ] }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m"] }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
+pulsebeam-routing = { path = "../pulsebeam-routing" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 rand = { workspace = true }
 rustix = { version = "1.1.4", features = ["param", "process", "thread"] }
@@ -66,6 +68,7 @@ url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
+zerocopy = { version = "0.8.56", features = ["derive"] }
 
 [dev-dependencies]
 pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m", "test-utils"] }
