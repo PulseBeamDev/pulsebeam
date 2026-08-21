@@ -56,6 +56,120 @@ fn data_channel_pubsub_forwarding_test() {
         ]);
 }
 
+#[test]
+fn data_channel_does_not_loop_back_to_publisher_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room-data-no-loopback")
+                .with_participant(Participant::data_participant("publisher"))
+                .with_participant(Participant::data_participant("subscriber")),
+        )
+        .run(vec![
+            Step::DeclarePublishTopic {
+                description: "Publisher declares the topic",
+                participant: "publisher",
+                topic: "no_loopback",
+            },
+            Step::DeclareSubscribeTopic {
+                description: "Publisher opens a receive subscription to the same topic",
+                participant: "publisher",
+                topic: "no_loopback",
+                scoped_to: None,
+            },
+            Step::DeclareSubscribeTopic {
+                description: "A second participant subscribes to the topic",
+                participant: "subscriber",
+                topic: "no_loopback",
+                scoped_to: None,
+            },
+            Step::Run {
+                description: "Install both subscriptions",
+                duration: Duration::from_secs(2),
+            },
+            Step::PublishData {
+                description: "Publisher sends one payload",
+                participant: "publisher",
+                topic: "no_loopback",
+                data: b"must-not-return",
+            },
+            Step::Run {
+                description: "Deliver the payload",
+                duration: Duration::from_millis(500),
+            },
+            Step::CheckDataReceived {
+                description: "The other participant receives the payload",
+                participant: "subscriber",
+                topic: "no_loopback",
+                expected: b"must-not-return",
+            },
+            Step::CheckDataCount {
+                description: "The publisher receives no looped-back payload",
+                participant: "publisher",
+                topic: "no_loopback",
+                expected: 0,
+            },
+            Step::CheckDataCount {
+                description: "The subscriber receives exactly one payload",
+                participant: "subscriber",
+                topic: "no_loopback",
+                expected: 1,
+            },
+        ]);
+}
+
+#[test]
+fn ordered_data_channel_does_not_loop_back_to_publisher_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room-ordered-data-no-loopback")
+                .with_participant(Participant::data_participant("publisher"))
+                .with_participant(Participant::data_participant("subscriber")),
+        )
+        .run(vec![
+            Step::DeclareOrderedPublisher {
+                description: "Publisher declares the ordered topic",
+                participant: "publisher",
+                topic: "ordered_no_loopback",
+            },
+            Step::DeclareOrderedSubscriber {
+                description: "Publisher opens an ordered receive subscription to itself",
+                participant: "publisher",
+                topic: "ordered_no_loopback",
+            },
+            Step::DeclareOrderedSubscriber {
+                description: "A second participant subscribes to the ordered topic",
+                participant: "subscriber",
+                topic: "ordered_no_loopback",
+            },
+            Step::Run {
+                description: "Install both ordered subscriptions",
+                duration: Duration::from_secs(2),
+            },
+            Step::PublishOrdered {
+                description: "Publisher sends one ordered payload",
+                participant: "publisher",
+                topic: "ordered_no_loopback",
+                data: b"ordered-must-not-return",
+            },
+            Step::Run {
+                description: "Deliver the ordered payload",
+                duration: Duration::from_millis(500),
+            },
+            Step::CheckDataCount {
+                description: "The publisher receives no ordered loopback",
+                participant: "publisher",
+                topic: "ordered_no_loopback",
+                expected: 0,
+            },
+            Step::CheckDataSequence {
+                description: "The subscriber receives the ordered payload",
+                participant: "subscriber",
+                topic: "ordered_no_loopback",
+                expected: &[b"ordered-must-not-return"],
+            },
+        ]);
+}
+
 /// Validates scoped subscriptions: a subscriber scoped to publisher A receives
 /// only A's payloads, never B's, and an unscoped aggregate subscriber sees both.
 #[test]

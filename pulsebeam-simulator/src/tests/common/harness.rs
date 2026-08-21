@@ -512,6 +512,12 @@ pub enum Step {
         participant: &'static str,
         quality: VideoQuality,
     },
+    /// Assert this participant received no video frames from the named publisher.
+    CheckVideoNotReceivedFrom {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+    },
     /// This participant is still the same participant it was - it reconnected, it did not rejoin.
     ///
     /// A reconnect keeps the participant id and changes only the connection generation. If the
@@ -1413,6 +1419,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::PublishOrdered { .. } => "PublishOrdered",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
+        Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
         Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
@@ -2005,6 +2012,31 @@ async fn execute_plan(
                     quality.min_frames,
                     stats.frames,
                     stats.keyframes,
+                );
+            }
+
+            Step::CheckVideoNotReceivedFrom {
+                description,
+                participant,
+                publisher,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
+                );
+                let publisher_id = handles
+                    .get(publisher)
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
+                    .participant_id()
+                    .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "step \"{description}\": publisher {publisher} has no runtime participant id"
+                    )
+                })?;
+                let handle = get_handle(handles, participant, description)?;
+                let actual = handle.video_rx().frames_from(&publisher_id);
+                assert_eq!(
+                    actual, 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher}): expected no frames from participant_id {publisher_id}, got {actual}"
                 );
             }
 

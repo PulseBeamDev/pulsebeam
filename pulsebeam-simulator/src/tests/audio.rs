@@ -36,6 +36,36 @@ fn audio_reaches_the_room_test() {
         ]);
 }
 
+#[test]
+fn audio_does_not_loop_back_to_speaker_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("audio-no-loopback")
+                .with_participant(
+                    Participant::data_participant("speaker")
+                        .speaking_at(-30)
+                        .hearing(1),
+                )
+                .with_participant(Participant::data_participant("listener").hearing(1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Speaker talks to the room",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckHeardFrom {
+                description: "Listener hears the speaker",
+                participant: "listener",
+                expected: &["speaker"],
+            },
+            Step::CheckHeardFrom {
+                description: "Speaker does not hear its own audio",
+                participant: "speaker",
+                expected: &[],
+            },
+        ]);
+}
+
 /// The loudest speakers are the ones forwarded.
 ///
 /// The SFU forwards a fixed number of speakers at a time, so a room with more voices than slots
