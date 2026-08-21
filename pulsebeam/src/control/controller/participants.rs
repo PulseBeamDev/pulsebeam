@@ -10,6 +10,33 @@ impl ControllerActor {
     /// nobody there receives, and the slot never returns to the allocator.
     pub(super) async fn retire_participant_streams(&mut self, participant_id: &ParticipantId) {
         self.pending_streams.remove_participant(*participant_id);
+        let published: Vec<_> = self
+            .catalog
+            .published_by_participant(*participant_id)
+            .filter_map(|id| {
+                let publication = self.catalog.get(&id)?;
+                let crate::control::publication::Media::Data { lane, topic } = &publication.media
+                else {
+                    return None;
+                };
+                Some((
+                    crate::shard::router::DataStreamId::new(
+                        publication.room,
+                        publication.publisher,
+                        topic.clone(),
+                    ),
+                    *lane,
+                ))
+            })
+            .collect();
+        for (id, lane) in published {
+            if !self.retire_stream_binding(id, lane.into()).await {
+                debug_assert!(
+                    false,
+                    "a published data stream must retire with its publisher"
+                );
+            }
+        }
         let departures =
             crate::control::patterns::retract_participant(&mut self.data_patterns, participant_id);
         let mut affected = indexmap::IndexSet::new();
@@ -120,12 +147,18 @@ impl ControllerActor {
         let Some((shard_id, handle)) = self.core.registry.transport_of(participant_id) else {
             return;
         };
+        let Some(meta) = self.core.registry.get_participant(participant_id) else {
+            debug_assert!(false, "a transport must have a participant registry entry");
+            return;
+        };
+        let room_id = meta.room_id;
         let key = self
             .core
             .registry
             .get_participant(participant_id)
             .and_then(|meta| meta.binding);
-        self.retire_transport(shard_id, handle, key).await;
+        self.retire_transport(shard_id, handle, key, Some((room_id, *participant_id)))
+            .await;
         if let Some(key) = key {
             self.state.remove_participant(shard_id, key);
         }
@@ -138,24 +171,57 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
         handle: TransportHandle,
         key: Option<crate::shard::participants::ParticipantKey>,
+        departing: Option<(RoomId, ParticipantId)>,
     ) {
         let now = tokio::time::Instant::now();
         if self.state.begin().is_err() {
             return;
         }
         let generation = self.state.pending().map(|tx| tx.generation);
-        let published = generation.and_then(|generation| {
-            let view = self.view_mut(shard_id)?;
+        let Some(generation) = generation else {
+            self.abort_transaction(now);
+            return;
+        };
+        {
+            let Some(view) = self.view_mut(shard_id) else {
+                debug_assert!(false, "a transport must target a live shard view");
+                self.abort_transaction(now);
+                return;
+            };
             view.stage(generation, crate::view::ViewOp::RetireTransport { handle });
             if let Some(key) = key {
                 view.stage(generation, crate::view::ViewOp::RemoveParticipant { key });
             }
-            view.publish()
-        });
-        let Some(_) = published else {
+        }
+        if let Some((room_id, participant_id)) = departing {
+            let remaining: Vec<_> = self
+                .core
+                .registry
+                .participants_in_room(&room_id)
+                .into_iter()
+                .filter(|(id, _, _)| *id != participant_id)
+                .filter_map(|(_, shard, key)| key.map(|key| (shard, key)))
+                .collect();
+            for (shard, key) in remaining {
+                let Some(view) = self.view_mut(shard) else {
+                    debug_assert!(false, "a room participant must have a live shard view");
+                    self.abort_transaction(now);
+                    return;
+                };
+                view.stage_participant_effect(
+                    generation,
+                    key,
+                    crate::participant::ParticipantEffect::ParticipantsChanged {
+                        added: Vec::new(),
+                        removed: vec![participant_id],
+                    },
+                );
+            }
+        }
+        if !self.publish_staged_views() {
             self.abort_transaction(now);
             return;
-        };
+        }
         let _ = self.state.commit();
         self.state
             .release_transport(shard_id, handle.route.slot(), now);

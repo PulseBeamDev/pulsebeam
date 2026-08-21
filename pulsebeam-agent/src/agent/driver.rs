@@ -335,6 +335,10 @@ fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Op
 
 pub(crate) enum AgentEvent {
     StatsUpdated,
+    ParticipantsChanged {
+        added: Vec<ParticipantId>,
+        removed: Vec<ParticipantId>,
+    },
     RemoteTrackDiscovered(Track),
     RemoteTrackRemoved(String),
     /// Who the SFU is forwarding audio for, loudest first, whenever that changes.
@@ -1416,7 +1420,16 @@ impl AgentDriver {
 
         match payload {
             signaling::server_message::Payload::State(update) => {
+                let added: Vec<ParticipantId> = update
+                    .participants_added
+                    .iter()
+                    .map(|participant| participant.participant_id.clone())
+                    .collect();
+                let removed = update.participants_removed.clone();
                 let sync = self.slot_manager.sync(update);
+                if !added.is_empty() || !removed.is_empty() {
+                    self.emit(AgentEvent::ParticipantsChanged { added, removed });
+                }
                 let (assignments, discovered, removed) = (
                     sync.new_assignments,
                     sync.newly_discovered_tracks,

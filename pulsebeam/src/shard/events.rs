@@ -302,6 +302,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Control(ShardEvent::DataTopicPublished {
                 room_id: self.room_id,
                 publisher: self.id,
+                publisher_key: self.key,
                 topic,
             }));
     }
@@ -314,6 +315,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 ShardEvent::DataTopicUnpublished {
                     room_id: self.room_id,
                     publisher: self.id,
+                    publisher_key: self.key,
                     topic,
                 },
             ));
@@ -381,6 +383,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 ShardEvent::ReliableDataTopicPublished {
                     room_id: self.room_id,
                     publisher: self.id,
+                    publisher_key: self.key,
                     topic,
                 },
             ));
@@ -394,6 +397,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 ShardEvent::ReliableDataTopicUnpublished {
                     room_id: self.room_id,
                     publisher: self.id,
+                    publisher_key: self.key,
                     topic,
                 },
             ));

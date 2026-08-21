@@ -25,11 +25,12 @@ use crate::id::ShardId;
 use crate::log::plog_error;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::downstream::SlotConfig;
+use crate::participant::effect::{CompiledTrack, ParticipantEffect, TrackRole};
 use crate::participant::event::ParticipantSink;
 use crate::participant::reliable::ReliableChannels;
 use crate::participant::signaling;
 use crate::participant::{
-    batcher::{Batcher, OwnedPacketQueue},
+    batcher::{AppendStatus, Batcher, NetworkEgress, OwnedPacketQueue},
     downstream::DownstreamAllocator,
     upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamAllocator},
 };
@@ -133,6 +134,23 @@ impl UpstreamRouteTable {
         self.routes.clear();
     }
 
+    fn remove_track(&mut self, track_id: TrackId) {
+        let mut index = 0;
+        while index < self.routes.len() {
+            let matches = self
+                .routes
+                .get(index)
+                .is_some_and(|route| route.track_id == track_id);
+            if matches {
+                self.ssrcs.swap_remove(index);
+                self.routes.swap_remove(index);
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+        debug_assert_eq!(self.ssrcs.len(), self.routes.len());
+    }
+
     /// Fill in the fanout for every stream of `track_id`.
     ///
     /// A method rather than an `iter_mut`, so the SSRC a route is filed under
@@ -150,6 +168,12 @@ pub struct TrackMapping {
     pub mid: Mid,
     pub track_id: TrackId,
     pub kind: MediaKind,
+}
+
+#[derive(Clone, Copy)]
+struct TrackBinding {
+    track_id: TrackId,
+    role: TrackRole,
 }
 
 /// Routing is not allowed to mutate an `Rtc`; it only queues work for the
@@ -229,6 +253,14 @@ pub struct ParticipantConfig {
     pub available_tracks: Vec<Track>,
 }
 
+pub enum ParticipantInput {
+    Network {
+        batch: net::RecvPacketBatch,
+        source_shard: crate::id::ShardId,
+    },
+    Timeout(Instant),
+}
+
 impl ParticipantConfig {
     // TODO: wrap rtc instead
     pub fn ufrag(&mut self) -> String {
@@ -271,7 +303,7 @@ pub struct ParticipantCore {
     /// packet.
     published_track_fanouts: HashMap<TrackId, TrackKey>,
     subscribed_track_fanouts: HashMap<TrackId, TrackKey>,
-    forwarding_track_routes: SecondaryMap<TrackKey, (TrackId, crate::keys::DownstreamSlotKey)>,
+    compiled_tracks: SecondaryMap<TrackKey, TrackBinding>,
     forwarding_data_channels: SecondaryMap<UnreliableStreamKey, ChannelId>,
     forwarding_reliable_channels: SecondaryMap<ReliableStreamKey, ChannelId>,
     data_pub_streams: HashMap<ChannelId, UnreliableStreamKey>,
@@ -314,26 +346,6 @@ impl ParticipantCore {
     pub(crate) fn bind_published_track(&mut self, track_id: TrackId, fanout: TrackKey) {
         self.published_track_fanouts.insert(track_id, fanout);
         self.incoming_rtp_routes.bind_fanout(track_id, fanout);
-    }
-
-    pub(crate) fn bind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
-        self.subscribed_track_fanouts.insert(track_id, fanout);
-        let Some(slot) = self.downstream.slot_for_track(&track_id) else {
-            debug_assert!(
-                false,
-                "a forwarding plan cannot name an unassigned receiver"
-            );
-            return;
-        };
-        self.forwarding_track_routes
-            .insert(fanout, (track_id, slot));
-    }
-
-    pub(crate) fn unbind_subscribed_track(&mut self, track_id: TrackId, fanout: TrackKey) {
-        if self.subscribed_track_fanouts.get(&track_id) == Some(&fanout) {
-            self.subscribed_track_fanouts.remove(&track_id);
-        }
-        self.forwarding_track_routes.remove(fanout);
     }
 
     pub(crate) fn bind_subscribed_data_stream(
@@ -441,7 +453,7 @@ impl ParticipantCore {
             data_topic_channels: HashMap::new(),
             published_track_fanouts: HashMap::new(),
             subscribed_track_fanouts: HashMap::new(),
-            forwarding_track_routes: SecondaryMap::new(),
+            compiled_tracks: SecondaryMap::new(),
             forwarding_data_channels: SecondaryMap::new(),
             forwarding_reliable_channels: SecondaryMap::new(),
             data_pub_streams: HashMap::new(),
@@ -467,7 +479,81 @@ impl ParticipantCore {
         }
     }
 
-    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch, source_shard: crate::id::ShardId) {
+    pub fn apply(&mut self, effect: ParticipantEffect) {
+        match effect {
+            ParticipantEffect::ParticipantsChanged { added, removed } => {
+                self.signaling.apply_participants(added, removed);
+            }
+            ParticipantEffect::TrackInstalled(compiled) => self.install_track(compiled),
+            ParticipantEffect::TrackRemoved { key, role, kind } => {
+                self.remove_compiled_track(key, role, kind);
+            }
+        }
+    }
+
+    fn install_track(&mut self, compiled: CompiledTrack) {
+        let track_id = compiled.track.meta.id;
+        debug_assert_eq!(track_id.kind(), compiled.kind());
+        if let Some(previous) = self.compiled_tracks.get(compiled.key).copied() {
+            debug_assert_eq!(previous.track_id, track_id);
+            debug_assert_eq!(previous.role, compiled.role);
+            return;
+        }
+        let previous = self.compiled_tracks.insert(
+            compiled.key,
+            TrackBinding {
+                track_id,
+                role: compiled.role,
+            },
+        );
+        debug_assert!(previous.is_none(), "a TrackKey must be installed once");
+        match compiled.role {
+            TrackRole::Published => {
+                self.published_track_fanouts.insert(track_id, compiled.key);
+                self.incoming_rtp_routes.bind_fanout(track_id, compiled.key);
+            }
+            TrackRole::Subscribed => {
+                self.subscribed_track_fanouts.insert(track_id, compiled.key);
+                if track_id.kind() != TrackKind::Data {
+                    self.on_tracks_published(std::slice::from_ref(&compiled.track));
+                }
+            }
+        }
+    }
+
+    fn remove_compiled_track(&mut self, key: TrackKey, role: TrackRole, kind: TrackKind) {
+        let Some(binding) = self.compiled_tracks.remove(key) else {
+            return;
+        };
+        debug_assert_eq!(binding.role, role);
+        debug_assert_eq!(binding.track_id.kind(), kind);
+        match role {
+            TrackRole::Published => {
+                self.published_track_fanouts.remove(&binding.track_id);
+                self.incoming_rtp_routes.remove_track(binding.track_id);
+            }
+            TrackRole::Subscribed => {
+                if self.subscribed_track_fanouts.get(&binding.track_id) == Some(&key) {
+                    self.subscribed_track_fanouts.remove(&binding.track_id);
+                }
+                if kind != TrackKind::Data {
+                    let _ = self.on_tracks_unpublished(std::slice::from_ref(&binding.track_id));
+                }
+            }
+        }
+    }
+
+    pub fn input(&mut self, input: ParticipantInput) {
+        match input {
+            ParticipantInput::Network {
+                batch,
+                source_shard,
+            } => self.on_ingress(batch, source_shard),
+            ParticipantInput::Timeout(now) => self.on_timeout(now),
+        }
+    }
+
+    fn on_ingress(&mut self, batch: net::RecvPacketBatch, source_shard: crate::id::ShardId) {
         self.last_ingress = Some((batch.src, batch.dst));
         self.last_ingress_shard = Some(source_shard);
         if self.pending_ingress.len() >= MAX_PENDING_INGRESS {
@@ -477,7 +563,24 @@ impl ParticipantCore {
         self.pending_ingress.push_back(batch);
     }
 
-    pub fn on_timeout(&mut self, now: Instant) {
+    pub fn drain_network(&mut self, egress: &mut impl NetworkEgress) {
+        loop {
+            match egress.append_udp(&mut self.udp_packets) {
+                AppendStatus::Drained => break,
+                AppendStatus::Full if !egress.flush() => break,
+                AppendStatus::Full => {}
+            }
+        }
+        loop {
+            match egress.append_tcp(&mut self.tcp_batcher) {
+                AppendStatus::Drained => break,
+                AppendStatus::Full if !egress.flush() => break,
+                AppendStatus::Full => {}
+            }
+        }
+    }
+
+    fn on_timeout(&mut self, now: Instant) {
         self.pending_timeout = Some(now);
     }
 
@@ -521,14 +624,22 @@ impl ParticipantCore {
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
     ) {
-        let Some(&(bound_track, slot)) = self.forwarding_track_routes.get(fanout) else {
+        let Some(binding) = self.compiled_tracks.get(fanout).copied() else {
             debug_assert!(false, "a forwarding plan must have a receiver binding");
             return;
         };
         debug_assert_eq!(
-            bound_track, track,
+            binding.track_id, track,
             "a track route cannot change its identity"
         );
+        debug_assert_eq!(binding.role, TrackRole::Subscribed);
+        let Some(slot) = self.downstream.slot_for_track(&track) else {
+            debug_assert!(
+                false,
+                "a forwarding plan must have an assigned receiver slot"
+            );
+            return;
+        };
         self.on_forward_rtp(slot, track, pkt, cache);
     }
 
@@ -546,8 +657,16 @@ impl ParticipantCore {
         fanout: TrackKey,
         states: &crate::track::TrackStates,
     ) {
-        let Some(&(_, slot)) = self.forwarding_track_routes.get(fanout) else {
+        let Some(binding) = self.compiled_tracks.get(fanout).copied() else {
             debug_assert!(false, "a forwarding plan must have a receiver binding");
+            return;
+        };
+        debug_assert_eq!(binding.role, TrackRole::Subscribed);
+        let Some(slot) = self.downstream.slot_for_track(&binding.track_id) else {
+            debug_assert!(
+                false,
+                "a forwarding plan must have an assigned receiver slot"
+            );
             return;
         };
         self.update_layer_states(slot, states);

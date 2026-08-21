@@ -108,55 +108,6 @@ impl ParticipantRegistry {
         self.participants.get_mut(key).map(Box::as_mut)
     }
 
-    pub fn publish_track(&mut self, track: &crate::track::Track) {
-        for participant in self.participants.values_mut() {
-            if participant.room_id == track.meta.room_id {
-                participant.on_tracks_published(std::slice::from_ref(track));
-            }
-        }
-    }
-
-    pub fn unpublish_track(
-        &mut self,
-        track_id: &crate::entity::TrackId,
-        room_id: crate::entity::RoomId,
-    ) {
-        for participant in self.participants.values_mut() {
-            if participant.room_id == room_id {
-                participant.on_tracks_unpublished(std::slice::from_ref(track_id));
-            }
-        }
-    }
-
-    pub fn bind_subscribed_track(
-        &mut self,
-        participant: ParticipantKey,
-        track_id: crate::entity::TrackId,
-        fanout: crate::shard::router::TrackKey,
-    ) {
-        let Some(participant_meta) = self.resolve_mut(participant) else {
-            debug_assert!(false, "a subscribed track must bind to a live participant");
-            return;
-        };
-        participant_meta.bind_subscribed_track(track_id, fanout);
-    }
-
-    pub fn unbind_subscribed_track(
-        &mut self,
-        participant: ParticipantKey,
-        track_id: crate::entity::TrackId,
-        fanout: crate::shard::router::TrackKey,
-    ) {
-        let Some(participant_meta) = self.resolve_mut(participant) else {
-            debug_assert!(
-                false,
-                "a subscribed track must unbind from a live participant"
-            );
-            return;
-        };
-        participant_meta.unbind_subscribed_track(track_id, fanout);
-    }
-
     pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<TransportHandle> {
         self.demuxer.demux(batch)
     }

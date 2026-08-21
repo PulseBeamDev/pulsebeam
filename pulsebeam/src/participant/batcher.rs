@@ -19,6 +19,17 @@ pub struct OwnedPacketQueue {
     packets: VecDeque<OwnedPacket>,
 }
 
+pub enum AppendStatus {
+    Drained,
+    Full,
+}
+
+pub trait NetworkEgress {
+    fn append_udp(&mut self, packets: &mut OwnedPacketQueue) -> AppendStatus;
+    fn append_tcp(&mut self, batcher: &mut Batcher) -> AppendStatus;
+    fn flush(&mut self) -> bool;
+}
+
 struct OwnedPacket {
     dst: SocketAddr,
     contents: Vec<u8>,
@@ -36,10 +47,14 @@ impl OwnedPacketQueue {
     pub fn push_back(&mut self, dst: SocketAddr, contents: Vec<u8>) {
         debug_assert!(!contents.is_empty(), "Pushed content must not be empty");
         debug_assert!(
-            contents.len() <= net::MAX_UDP_PAYLOAD_SIZE,
-            "Packet exceeds maximum supported MTU"
+            contents.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE,
+            "Packet exceeds the maximum framed payload"
         );
         self.packets.push_back(OwnedPacket { dst, contents });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
     }
 }
 
@@ -78,7 +93,10 @@ impl GsoSendBatch {
             return false;
         };
         debug_assert!(!first.contents.is_empty());
-        debug_assert!(first.contents.len() <= net::MAX_UDP_PAYLOAD_SIZE);
+        if first.contents.len() > net::MAX_UDP_PAYLOAD_SIZE {
+            debug_assert!(false, "UDP packets must fit the configured MTU");
+            return false;
+        }
 
         let dst = first.dst;
         let segment_size = first.contents.len();
@@ -87,7 +105,10 @@ impl GsoSendBatch {
 
         while let Some(packet) = queue.packets.front() {
             debug_assert!(!packet.contents.is_empty());
-            debug_assert!(packet.contents.len() <= net::MAX_UDP_PAYLOAD_SIZE);
+            if packet.contents.len() > net::MAX_UDP_PAYLOAD_SIZE {
+                debug_assert!(false, "UDP packets must fit the configured MTU");
+                break;
+            }
             debug_assert!(segment_count <= queue.max_segments);
             debug_assert!(self.arena.len().saturating_sub(start) <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
 
@@ -126,9 +147,9 @@ impl GsoSendBatch {
         true
     }
 
-    pub fn flush(&mut self, socket: &mut net::UnifiedSocket) {
+    pub fn flush(&mut self, socket: &mut net::UnifiedSocket) -> bool {
         if self.packets.is_empty() {
-            return;
+            return false;
         }
         debug_assert!(self.packets.len() <= net::BATCH_SIZE);
         let mut packets = ArrayVec::<net::SendPacket<'_>, { net::BATCH_SIZE }>::new();
@@ -146,14 +167,25 @@ impl GsoSendBatch {
                 segment_size: packet.segment_size,
             });
         }
-        let batch = net::SendPacketBatch { packets: &packets };
-        if let Err(err) = socket.try_send_batch(&batch) {
-            tracing::trace!(error = ?err, "error writing UDP egress batch");
-        }
+        let result = {
+            let batch = net::SendPacketBatch { packets: &packets };
+            socket.try_send_batch(&batch)
+        };
         drop(packets);
-        self.packets.clear();
-        self.arena.clear();
-        debug_assert!(self.arena.capacity() >= net::BATCH_SIZE * net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        match result {
+            Ok(sent) => {
+                debug_assert!(sent <= self.packets.len());
+                self.packets.clear();
+                self.arena.clear();
+                sent != 0
+            }
+            Err(err) => {
+                tracing::trace!(error = ?err, "error writing UDP egress batch");
+                self.packets.clear();
+                self.arena.clear();
+                false
+            }
+        }
     }
 }
 
@@ -177,7 +209,6 @@ impl Batcher {
         }
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.active_states.is_empty()
     }
@@ -187,12 +218,17 @@ impl Batcher {
     /// It attempts to find an existing batch for the same destination that is not yet sealed.
     /// If no suitable batch is found, it takes one from the free pool or allocates a new one.
     pub fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
+        let accepted = self.try_push_back(dst, content);
+        debug_assert!(accepted, "content is larger than the batcher's capacity");
+    }
+
+    fn try_push_back(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
         debug_assert!(!content.is_empty(), "Pushed content must not be empty");
 
         if let Some(state) = self.active_states.back_mut()
             && state.try_push(dst, content)
         {
-            return;
+            return true;
         }
 
         let mut new_state = match self.free_states.pop() {
@@ -204,13 +240,31 @@ impl Batcher {
 
         if new_state.try_push(dst, content) {
             self.active_states.push_back(new_state);
+            true
         } else {
             self.free_states.push(new_state);
-            debug_assert!(
-                false,
-                "Content is larger than the batcher's configured capacity"
-            );
+            false
         }
+    }
+
+    pub fn append_from(&mut self, queue: &mut OwnedPacketQueue) -> bool {
+        while let Some(packet) = queue.packets.front() {
+            let before = self.active_states.len();
+            if !self.try_push_back(packet.dst, &packet.contents) {
+                return false;
+            }
+            let Some(_) = queue.packets.pop_front() else {
+                debug_assert!(false, "a queued packet must be removed after append");
+                return false;
+            };
+            debug_assert!(self.active_states.len() >= before);
+        }
+        queue.packets.is_empty()
+    }
+
+    pub fn append_batcher(&mut self, other: &mut Batcher) {
+        self.active_states.append(&mut other.active_states);
+        debug_assert!(other.active_states.is_empty());
     }
 
     /// Pops a single batch from the front of the queue.
@@ -229,28 +283,8 @@ impl Batcher {
         }
     }
 
-    /// Exposes every completed GSO datagram without copying its payload.
-    /// The shard gathers these from all dirty participants into one
-    /// `sendmmsg()` submission, then calls `discard_all()` after the
-    /// lossy egress decision has been made.
-    pub fn packets(&self) -> impl Iterator<Item = net::SendPacket<'_>> + '_ {
-        self.active_states.iter().map(|state| net::SendPacket {
-            dst: state.dst,
-            buf: &state.buf,
-            segment_size: state.segment_size,
-        })
-    }
-
-    /// Releases every queued packet after the output phase.  UDP/TCP egress
-    /// is deliberately lossy, so a short send or `WouldBlock` also drains the
-    /// queue instead of retaining latency-inducing backlog.
-    pub fn discard_all(&mut self) {
-        while let Some(state) = self.pop_front() {
-            self.reclaim(state);
-        }
-    }
-
-    pub fn flush_tcp(&mut self, socket: &mut net::tcp::TcpTransport) {
+    pub fn flush(&mut self, socket: &mut net::tcp::TcpTransport) -> bool {
+        let mut progressed = false;
         while let Some(state) = self.front() {
             debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
             debug_assert!(
@@ -258,7 +292,10 @@ impl Batcher {
                 "BatcherState must have a nonzero segment_size before flush"
             );
             debug_assert!(
-                state.buf.len() <= state.max_segments.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE),
+                state.buf.len()
+                    <= state
+                        .max_segments
+                        .saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE),
                 "Batch exceeds configured TCP batch capacity"
             );
             let packet = [net::SendPacket {
@@ -266,16 +303,28 @@ impl Batcher {
                 buf: &state.buf,
                 segment_size: state.segment_size,
             }];
-            if let Err(err) = socket.try_send_batch(&net::SendPacketBatch { packets: &packet }) {
-                tracing::trace!("error on writing to TCP socket: {:?}", err);
+            match socket.try_send_batch(&net::SendPacketBatch { packets: &packet }) {
+                Ok(_) => {
+                    let Some(state) = self.pop_front() else {
+                        debug_assert!(false, "a flushed batch must remain queued");
+                        break;
+                    };
+                    self.reclaim(state);
+                    progressed = true;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    tracing::trace!("error on writing to TCP socket: {:?}", err);
+                    let Some(state) = self.pop_front() else {
+                        debug_assert!(false, "a failed batch must remain queued");
+                        break;
+                    };
+                    self.reclaim(state);
+                    progressed = true;
+                }
             }
-            // Reclaimed either way: a failed write drops the batch rather than
-            // retrying it, so leaving it queued would spin this loop forever.
-            let Some(state) = self.pop_front() else {
-                break;
-            };
-            self.reclaim(state);
         }
+        progressed
     }
 }
 
@@ -306,7 +355,7 @@ impl BatcherState {
             // it, so any capacity above ~43 segments would reserve more than
             // the batch can ever hold.
             buf: Vec::with_capacity(
-                cap.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE)
+                cap.saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE)
                     .min(net::MAX_UDP_GSO_PAYLOAD_SIZE),
             ),
         }
@@ -316,8 +365,8 @@ impl BatcherState {
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
         debug_assert!(!content.is_empty(), "Segment content must not be empty");
         debug_assert!(
-            content.len() <= net::MAX_UDP_PAYLOAD_SIZE,
-            "Segment content exceeds maximum supported MTU"
+            content.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE,
+            "Segment content exceeds maximum framed payload"
         );
         debug_assert_eq!(self.buf.is_empty(), self.segment_count == 0);
         debug_assert_eq!(self.segment_size == 0, self.segment_count == 0);
@@ -347,7 +396,9 @@ impl BatcherState {
         if content.len() == self.segment_size {
             debug_assert!(
                 self.buf.len().saturating_add(content.len())
-                    <= self.max_segments.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE)
+                    <= self
+                        .max_segments
+                        .saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE)
             );
             self.buf.extend_from_slice(content);
             self.segment_count = self.segment_count.saturating_add(1);
@@ -357,7 +408,9 @@ impl BatcherState {
         } else if content.len() < self.segment_size {
             debug_assert!(
                 self.buf.len().saturating_add(content.len())
-                    <= self.max_segments.saturating_mul(net::MAX_UDP_PAYLOAD_SIZE)
+                    <= self
+                        .max_segments
+                        .saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE)
             );
             self.buf.extend_from_slice(content);
             self.segment_count = self.segment_count.saturating_add(1);
@@ -558,6 +611,19 @@ mod tests {
         assert_eq!(&batch.arena[500..1100], &[2; 600]);
         assert_eq!(&batch.arena[1100..1700], &[3; 600]);
         assert_eq!(batch.packets[2].dst, other);
+    }
+
+    #[test]
+    fn tcp_queue_accepts_the_full_rfc4571_payload_range() {
+        let addr = create_test_addr();
+        let mut packets = OwnedPacketQueue::with_capacity(64);
+        packets.push_back(addr, vec![7; net::MAX_UDP_GSO_PAYLOAD_SIZE]);
+        let mut batcher = Batcher::with_capacity(64);
+
+        assert!(batcher.append_from(&mut packets));
+        let batch = batcher.front().expect("the frame must remain queued");
+        assert_eq!(batch.buf.len(), net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        assert_eq!(batch.segment_count, 1);
     }
 
     #[test]

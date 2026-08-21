@@ -100,7 +100,7 @@ pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 pub struct VideoAllocator {
-    routes: Vec<(TrackId, DownstreamSlotKey)>,
+    routes: HashMap<TrackId, DownstreamSlotKey>,
     slots: SlotMap<DownstreamSlotKey, Slot>,
 
     // Cold
@@ -128,7 +128,7 @@ impl VideoAllocator {
             manual_sub,
             tracks: Vec::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
-            routes: Vec::new(),
+            routes: HashMap::new(),
             last_reconciled: HashSet::new(),
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
@@ -508,14 +508,7 @@ impl VideoAllocator {
         // monitor, so caching the first one was enough — the values behind it
         // kept moving. They are values now, so a first-write-wins cache would
         // freeze the allocator on whatever it happened to see first.
-        let mut slot_key = None;
-        for (route_track, route_slot) in &self.routes {
-            if *route_track == track_id {
-                slot_key = Some(*route_slot);
-                break;
-            }
-        }
-        let Some(slot_key) = slot_key else {
+        let Some(&slot_key) = self.routes.get(&track_id) else {
             return false;
         };
         let Some(slot) = self.slots.get_mut(slot_key) else {
@@ -594,15 +587,15 @@ impl VideoAllocator {
             }
         }
 
+        let old_routes = std::mem::take(&mut self.routes);
         let mut removed = Vec::new();
-        self.routes.retain(|route| {
-            if current.contains(route) {
-                true
+        for (track_id, slot_key) in old_routes {
+            if current.contains(&(track_id, slot_key)) {
+                self.routes.insert(track_id, slot_key);
             } else {
-                removed.push(*route);
-                false
+                removed.push((track_id, slot_key));
             }
-        });
+        }
 
         for (track_id, slot_key) in removed {
             if self.last_reconciled.contains(&(track_id, slot_key))
@@ -613,12 +606,8 @@ impl VideoAllocator {
         }
 
         for (track_id, slot_key) in &current {
-            if self
-                .routes
-                .iter()
-                .all(|route| route != &(*track_id, *slot_key))
-            {
-                self.routes.push((*track_id, *slot_key));
+            if self.routes.get(track_id) != Some(slot_key) {
+                self.routes.insert(*track_id, *slot_key);
                 if let Some(track) = self.track(track_id) {
                     events.subscribe(track.meta.clone(), *slot_key);
                 }
@@ -643,25 +632,16 @@ impl VideoAllocator {
 
     #[cfg(test)]
     fn has_route(&self, track_id: &TrackId) -> bool {
-        self.routes
-            .iter()
-            .any(|(route_track, _)| route_track == track_id)
+        self.routes.contains_key(track_id)
     }
 
     pub(crate) fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
-        for (route_track, slot_key) in &self.routes {
-            if route_track == track_id {
-                return Some(*slot_key);
-            }
-        }
-        None
+        self.routes.get(track_id).copied()
     }
 
     #[cfg(test)]
     fn set_route(&mut self, track_id: TrackId, slot_key: DownstreamSlotKey) {
-        self.routes
-            .retain(|(route_track, _)| *route_track != track_id);
-        self.routes.push((track_id, slot_key));
+        self.routes.insert(track_id, slot_key);
     }
 
     /// Returns `true` if every track ID appears in at most one slot's

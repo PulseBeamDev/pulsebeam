@@ -152,6 +152,14 @@ impl ShardRouter {
         self.get_mut(shard_id).try_send(cmd).map_err(Box::new)
     }
 
+    pub async fn send(
+        &self,
+        shard_id: ShardId,
+        cmd: ShardCommand,
+    ) -> Result<(), mailbox::SendError<ShardCommand>> {
+        self.get(shard_id).send(cmd).await
+    }
+
     fn get_mut(&mut self, shard_id: ShardId) -> &mut mailbox::Sender<ShardCommand> {
         let Some(ctx) = self.shard_contexts.get_mut(shard_id.index()) else {
             pulsebeam_runtime::fatal!(
@@ -160,6 +168,16 @@ impl ShardRouter {
             )
         };
         &mut ctx.command_tx
+    }
+
+    fn get(&self, shard_id: ShardId) -> &mailbox::Sender<ShardCommand> {
+        let Some(ctx) = self.shard_contexts.get(shard_id.index()) else {
+            pulsebeam_runtime::fatal!(
+                "shard {} is not in this node's shard table",
+                shard_id.index()
+            )
+        };
+        &ctx.command_tx
     }
 }
 

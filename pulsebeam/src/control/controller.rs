@@ -1,5 +1,5 @@
-use std::io;
 use std::time::Duration;
+use std::{collections::HashMap, io};
 
 use crate::control::state::ControlPlaneState;
 use crate::{
@@ -104,6 +104,95 @@ pub enum ControllerError {
 
 const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+struct PlanRequest {
+    shard: crate::id::ShardId,
+    key: crate::plan::PlanKey,
+    plan: Option<crate::plan::FlatTrackPlan>,
+}
+
+struct GenerationOps {
+    participant_effects: Vec<(
+        crate::id::ShardId,
+        crate::shard::participants::ParticipantKey,
+        crate::participant::ParticipantEffect,
+    )>,
+    lifecycle: Vec<(crate::id::ShardId, crate::view::ViewOp)>,
+    plans: Vec<PlanRequest>,
+}
+
+impl GenerationOps {
+    fn lifecycle(ops: Vec<(crate::id::ShardId, crate::view::ViewOp)>) -> Self {
+        Self {
+            participant_effects: Vec::new(),
+            lifecycle: ops,
+            plans: Vec::new(),
+        }
+    }
+
+    fn participant_effect(
+        mut self,
+        shard: crate::id::ShardId,
+        participant: crate::shard::participants::ParticipantKey,
+        effect: crate::participant::ParticipantEffect,
+    ) -> Self {
+        self.participant_effects.push((shard, participant, effect));
+        self
+    }
+
+    fn push_participant_effect(
+        &mut self,
+        shard: crate::id::ShardId,
+        participant: crate::shard::participants::ParticipantKey,
+        effect: crate::participant::ParticipantEffect,
+    ) {
+        self.participant_effects.push((shard, participant, effect));
+    }
+
+    fn plan(
+        mut self,
+        shard: crate::id::ShardId,
+        key: crate::plan::PlanKey,
+        plan: crate::plan::FlatTrackPlan,
+    ) -> Self {
+        self.plans.push(PlanRequest {
+            shard,
+            key,
+            plan: Some(plan),
+        });
+        self
+    }
+
+    fn remove_plan(mut self, shard: crate::id::ShardId, key: crate::plan::PlanKey) -> Self {
+        self.plans.push(PlanRequest {
+            shard,
+            key,
+            plan: None,
+        });
+        self
+    }
+
+    fn push_remove_plan(&mut self, shard: crate::id::ShardId, key: crate::plan::PlanKey) {
+        self.plans.push(PlanRequest {
+            shard,
+            key,
+            plan: None,
+        });
+    }
+
+    fn extend_lifecycle(
+        &mut self,
+        ops: impl IntoIterator<Item = (crate::id::ShardId, crate::view::ViewOp)>,
+    ) {
+        self.lifecycle.extend(ops);
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.participant_effects.extend(other.participant_effects);
+        self.lifecycle.extend(other.lifecycle);
+        self.plans.extend(other.plans);
+    }
+}
+
 fn source_authentication_command(
     source_shard: crate::id::ShardId,
     source: std::net::SocketAddr,
@@ -141,6 +230,7 @@ pub struct ControllerActor {
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
     views: Vec<crate::view::ShardViewWriter>,
+    compiled_plans: Vec<HashMap<crate::plan::PlanKey, crate::plan::FlatTrackPlan>>,
     /// Every publication on this node, whatever kind.
     catalog: crate::control::publication::Catalog,
     /// Data and reliable stream routing. One type per lane rather than three
@@ -200,6 +290,7 @@ impl ControllerActor {
             state: ControlPlaneState::new(shard_count),
             video_patterns: crate::control::patterns::PatternTable::new(),
             views,
+            compiled_plans: (0..shard_count).map(|_| HashMap::new()).collect(),
             catalog: crate::control::publication::Catalog::new(),
             lanes: Lanes::new(),
             pending: PendingSubscriptions::default(),
@@ -269,6 +360,28 @@ impl ControllerActor {
         shard_id: crate::id::ShardId,
     ) -> Option<&mut crate::view::ShardViewWriter> {
         self.views.get_mut(shard_id.index())
+    }
+
+    fn room_recipients(
+        &self,
+        room_id: crate::entity::RoomId,
+        shard_id: crate::id::ShardId,
+    ) -> Vec<crate::shard::participants::ParticipantKey> {
+        self.core
+            .registry
+            .participant_keys_in_room(&room_id, shard_id)
+    }
+
+    fn is_current_binding(
+        &self,
+        participant: &ParticipantId,
+        shard: crate::id::ShardId,
+        binding: crate::shard::participants::ParticipantKey,
+    ) -> bool {
+        self.core
+            .registry
+            .get_participant(participant)
+            .is_some_and(|meta| meta.shard_id == shard && meta.binding == Some(binding))
     }
 
     fn publish_staged_views(&mut self) -> bool {
@@ -521,7 +634,7 @@ impl ControllerActor {
     fn transact<T>(
         &mut self,
         reserve: impl FnOnce(&mut Self, tokio::time::Instant) -> Option<T>,
-        ops: impl FnOnce(&Self, &T) -> Vec<(crate::id::ShardId, crate::view::ViewOp)>,
+        ops: impl FnOnce(&Self, &T) -> GenerationOps,
     ) -> Option<T> {
         let now = tokio::time::Instant::now();
         if self.state.begin().is_err() {
@@ -536,7 +649,15 @@ impl ControllerActor {
             self.abort_transaction(now);
             return None;
         };
-        for (shard_id, op) in ops(self, &reserved) {
+        let generation_ops = ops(self, &reserved);
+        for (shard_id, participant, effect) in generation_ops.participant_effects {
+            let Some(view) = self.view_mut(shard_id) else {
+                self.abort_transaction(now);
+                return None;
+            };
+            view.stage_participant_effect(generation, participant, effect);
+        }
+        for (shard_id, op) in generation_ops.lifecycle {
             if !op.is_owned_by(shard_id) {
                 debug_assert!(false, "a view op must target its owning shard");
                 self.abort_transaction(now);
@@ -547,6 +668,49 @@ impl ControllerActor {
                 return None;
             };
             view.stage(generation, op);
+        }
+        let mut staged_plans: HashMap<
+            (crate::id::ShardId, crate::plan::PlanKey),
+            Option<crate::plan::FlatTrackPlan>,
+        > = HashMap::new();
+        let mut batches = (0..self.views.len())
+            .map(|_| crate::plan::PlanBatch::default())
+            .collect::<Vec<_>>();
+        for request in generation_ops.plans {
+            let Some(shard_plans) = self.compiled_plans.get(request.shard.index()) else {
+                debug_assert!(false, "a plan request must target a live shard");
+                self.abort_transaction(now);
+                return None;
+            };
+            let old = match staged_plans.get(&(request.shard, request.key)) {
+                Some(Some(plan)) => Some(plan),
+                Some(None) => None,
+                None => shard_plans.get(&request.key),
+            };
+            let change = crate::plan::PlanChange::between(request.key, old, request.plan.as_ref());
+            if change.remove && old.is_none() {
+                debug_assert!(false, "a plan cannot be removed before it exists");
+                continue;
+            }
+            if !change.is_empty() {
+                let Some(batch) = batches.get_mut(request.shard.index()) else {
+                    debug_assert!(false, "a plan request must target a live shard");
+                    self.abort_transaction(now);
+                    return None;
+                };
+                batch.push(change);
+            }
+            staged_plans.insert((request.shard, request.key), request.plan);
+        }
+        for (index, batch) in batches.into_iter().enumerate() {
+            if !batch.is_empty() {
+                let Some(view) = self.views.get_mut(index) else {
+                    debug_assert!(false, "a compiled plan must target a live view");
+                    self.abort_transaction(now);
+                    return None;
+                };
+                view.stage_plans(generation, batch);
+            }
         }
         // A shard this generation staged ops for must accept them. An empty
         // delta cannot happen there, so a publish that yields nothing means the
@@ -560,6 +724,20 @@ impl ControllerActor {
             self.abort_transaction(now);
             return None;
         }
+        for ((shard, key), plan) in staged_plans {
+            let Some(shard_plans) = self.compiled_plans.get_mut(shard.index()) else {
+                debug_assert!(false, "a committed plan must target a live shard");
+                continue;
+            };
+            match plan {
+                Some(plan) => {
+                    shard_plans.insert(key, plan);
+                }
+                None => {
+                    debug_assert!(shard_plans.remove(&key).is_some());
+                }
+            }
+        }
         Some(reserved)
     }
 
@@ -568,7 +746,20 @@ impl ControllerActor {
         if ops.is_empty() {
             return;
         }
-        if self.transact(|_, _| Some(()), move |_, ()| ops).is_none() {
+        self.publish_generation(GenerationOps::lifecycle(ops));
+    }
+
+    fn publish_generation(&mut self, generation_ops: GenerationOps) {
+        if generation_ops.participant_effects.is_empty()
+            && generation_ops.lifecycle.is_empty()
+            && generation_ops.plans.is_empty()
+        {
+            return;
+        }
+        if self
+            .transact(|_, _| Some(()), move |_, ()| generation_ops)
+            .is_none()
+        {
             pulsebeam_runtime::fatal!(
                 "a control-plane view update could not be accepted by every owning shard"
             );
@@ -580,7 +771,7 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         family: &'static str,
-        ops: impl FnOnce(&Self, &RouteHandle) -> Vec<(crate::id::ShardId, crate::view::ViewOp)>,
+        ops: impl FnOnce(&Self, &RouteHandle) -> GenerationOps,
     ) -> Option<RouteHandle> {
         self.transact(
             move |actor, now| actor.reserve_endpoint_retrying(shard_id, now, family),
@@ -734,8 +925,12 @@ impl ControllerActor {
             ShardEvent::DataTopicPublished {
                 room_id,
                 publisher,
+                publisher_key,
                 topic,
             } => {
+                if !self.is_current_binding(&publisher, shard_id, publisher_key) {
+                    return None;
+                }
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
                 if !self
                     .on_stream_ready(shard_id, id.clone(), StreamLane::Unreliable)
@@ -748,8 +943,12 @@ impl ControllerActor {
             ShardEvent::ReliableDataTopicPublished {
                 room_id,
                 publisher,
+                publisher_key,
                 topic,
             } => {
+                if !self.is_current_binding(&publisher, shard_id, publisher_key) {
+                    return None;
+                }
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
                 if !self
                     .on_stream_ready(shard_id, id.clone(), StreamLane::Reliable)
@@ -850,8 +1049,12 @@ impl ControllerActor {
             ShardEvent::DataTopicUnpublished {
                 room_id,
                 publisher,
+                publisher_key,
                 topic,
             } => {
+                if !self.is_current_binding(&publisher, shard_id, publisher_key) {
+                    return None;
+                }
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
                 self.pending_streams.remove(&id, StreamLane::Unreliable);
                 if !self.retire_stream_binding(id, StreamLane::Unreliable).await {
@@ -862,8 +1065,12 @@ impl ControllerActor {
             ShardEvent::ReliableDataTopicUnpublished {
                 room_id,
                 publisher,
+                publisher_key,
                 topic,
             } => {
+                if !self.is_current_binding(&publisher, shard_id, publisher_key) {
+                    return None;
+                }
                 let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
                 self.pending_streams.remove(&id, StreamLane::Reliable);
                 if !self.retire_stream_binding(id, StreamLane::Reliable).await {
@@ -1027,6 +1234,7 @@ impl ControllerActor {
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         let room_id = state.room_id;
+        let participant_id = state.participant_id;
         // Determine shard first so we can encode it into the ICE ufrag.
         let (slot, placement) = self.core.room_slot(&state.room_id);
         let shard_id = match placement {
@@ -1041,7 +1249,9 @@ impl ControllerActor {
 
         // The transport route is allocated and its view delta is queued before
         // negotiation. The shard applies it independently on its next tick.
-        let Some((handle, binding)) = self.stage_transport(shard_id, state.participant_id).await
+        let Some((handle, binding)) = self
+            .stage_transport(shard_id, state.participant_id, state.room_id)
+            .await
         else {
             return Err(ControllerError::ServiceUnavailable);
         };
@@ -1064,7 +1274,13 @@ impl ControllerActor {
                 // before its slot can go back to the allocator — and the
                 // shard still holds the key it reserved, so both have to be
                 // unwound, not just one.
-                self.retire_transport(shard_id, handle, Some(binding)).await;
+                self.retire_transport(
+                    shard_id,
+                    handle,
+                    Some(binding),
+                    Some((room_id, participant_id)),
+                )
+                .await;
                 self.state.remove_participant(shard_id, binding);
                 return Err(err.into());
             }
@@ -1086,6 +1302,55 @@ impl ControllerActor {
             },
         );
 
+        let (materialized_tx, materialized_rx) = oneshot::channel();
+        if self
+            .router
+            .send(
+                shard_id,
+                ShardCommand::MaterializeParticipant {
+                    key: binding,
+                    transport: handle,
+                    config: Box::new(cfg),
+                    ack: materialized_tx,
+                },
+            )
+            .await
+            .is_err()
+        {
+            let _ = crate::control::patterns::retract_participant(
+                &mut self.audio_patterns,
+                &participant_id,
+            );
+            self.retire_transport(
+                shard_id,
+                handle,
+                Some(binding),
+                Some((room_id, participant_id)),
+            )
+            .await;
+            self.core.registry.remove_participant(&participant_id);
+            self.state.remove_participant(shard_id, binding);
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        if !materialized_rx.await.unwrap_or(false) {
+            let _ = crate::control::patterns::retract_participant(
+                &mut self.audio_patterns,
+                &participant_id,
+            );
+            self.retire_transport(
+                shard_id,
+                handle,
+                Some(binding),
+                Some((room_id, participant_id)),
+            )
+            .await;
+            self.core.registry.remove_participant(&participant_id);
+            self.state.remove_participant(shard_id, binding);
+            return Ok(answer);
+        }
+
+        self.publish_participant_roster(room_id, participant_id, binding);
+
         let audio_tracks: Vec<_> = self
             .catalog
             .in_room(room_id, crate::entity::TrackKind::Audio)
@@ -1098,14 +1363,6 @@ impl ControllerActor {
 
         self.reconcile_room_tracks(room_id, shard_id).await;
 
-        self.eq.send(
-            shard_id,
-            ShardCommand::MaterializeParticipant {
-                key: binding,
-                transport: handle,
-                config: Box::new(cfg),
-            },
-        );
         Ok(answer)
     }
 

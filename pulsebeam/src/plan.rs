@@ -13,9 +13,95 @@ use crate::{
     route::RouteHandle,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RemoteRoutePlan {
-    pub handle: RouteHandle,
+#[derive(Debug, Clone)]
+pub(crate) struct MembershipDelta<K> {
+    pub added: Vec<K>,
+    pub removed: Vec<K>,
+}
+
+impl<K> Default for MembershipDelta<K> {
+    fn default() -> Self {
+        Self {
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReverseRouteChange {
+    Unchanged,
+    Set(Option<RouteHandle>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlanChange {
+    pub key: PlanKey,
+    pub create: bool,
+    pub remove: bool,
+    pub local: MembershipDelta<ParticipantKey>,
+    pub remote: MembershipDelta<RouteHandle>,
+    pub reverse: ReverseRouteChange,
+}
+
+impl PlanChange {
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.create
+            && !self.remove
+            && self.local.added.is_empty()
+            && self.local.removed.is_empty()
+            && self.remote.added.is_empty()
+            && self.remote.removed.is_empty()
+            && matches!(self.reverse, ReverseRouteChange::Unchanged)
+    }
+
+    pub(crate) fn between(
+        key: PlanKey,
+        old: Option<&FlatTrackPlan>,
+        new: Option<&FlatTrackPlan>,
+    ) -> Self {
+        let Some(new) = new else {
+            return Self {
+                key,
+                create: false,
+                remove: true,
+                local: MembershipDelta::default(),
+                remote: MembershipDelta::default(),
+                reverse: ReverseRouteChange::Unchanged,
+            };
+        };
+        let create = old.is_none();
+        let empty = FlatTrackPlan::default();
+        let old = old.unwrap_or(&empty);
+        Self {
+            key,
+            create,
+            remove: false,
+            local: old.local.delta_to(&new.local),
+            remote: old.remote.delta_to(&new.remote),
+            reverse: if old.reverse_route != new.reverse_route {
+                ReverseRouteChange::Set(new.reverse_route)
+            } else {
+                ReverseRouteChange::Unchanged
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlanBatch {
+    pub changes: Vec<PlanChange>,
+}
+
+impl PlanBatch {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub(crate) fn push(&mut self, change: PlanChange) {
+        debug_assert!(!(change.create && change.remove));
+        self.changes.push(change);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +133,7 @@ where
 
     pub(crate) fn insert(&mut self, value: K) {
         if self.positions.contains_key(&value) {
+            debug_assert!(false, "a compiled membership cannot contain duplicates");
             return;
         }
         let index = self.values.len();
@@ -57,6 +144,7 @@ where
 
     pub(crate) fn remove(&mut self, value: K) {
         let Some(index) = self.positions.remove(&value) else {
+            debug_assert!(false, "a compiled membership removal must name a member");
             return;
         };
         let Some(last) = self.values.pop() else {
@@ -64,11 +152,11 @@ where
             return;
         };
         if index < self.values.len() {
-            let Some(value) = self.values.get_mut(index) else {
+            let Some(slot) = self.values.get_mut(index) else {
                 debug_assert!(false, "the dense membership index must be in bounds");
                 return;
             };
-            *value = last;
+            *slot = last;
             let previous = self.positions.insert(last, index);
             debug_assert_eq!(previous, Some(self.values.len()));
         } else {
@@ -77,17 +165,41 @@ where
         }
     }
 
+    pub(crate) fn apply(&mut self, delta: &MembershipDelta<K>, touched: &mut usize) {
+        for &value in &delta.removed {
+            self.remove(value);
+            *touched = touched.saturating_add(1);
+        }
+        for &value in &delta.added {
+            self.insert(value);
+            *touched = touched.saturating_add(1);
+        }
+    }
+
     pub(crate) fn values(&self) -> &[K] {
         &self.values
+    }
+
+    fn delta_to(&self, next: &Self) -> MembershipDelta<K> {
+        MembershipDelta {
+            removed: self
+                .values
+                .iter()
+                .copied()
+                .filter(|value| !next.positions.contains_key(value))
+                .collect(),
+            added: next
+                .values
+                .iter()
+                .copied()
+                .filter(|value| !self.positions.contains_key(value))
+                .collect(),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.values.len()
-    }
-
-    pub(crate) fn contains(&self, value: K) -> bool {
-        self.positions.contains_key(&value)
     }
 }
 
@@ -101,8 +213,8 @@ pub(crate) enum PlanKey {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FlatTrackPlan {
     pub local: DenseMembership<ParticipantKey>,
-    pub remote: DenseMembership<RemoteRoutePlan>,
-    pub reverse_route: Option<RemoteRoutePlan>,
+    pub remote: DenseMembership<RouteHandle>,
+    pub reverse_route: Option<RouteHandle>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,149 +244,76 @@ impl FlatPlans {
     fn insert(&mut self, key: PlanKey, plan: FlatTrackPlan) {
         match key {
             PlanKey::Track(key) => {
-                let _ = self.tracks.insert(key, plan);
+                let previous = self.tracks.insert(key, plan);
+                debug_assert!(previous.is_none());
             }
             PlanKey::Unreliable(key) => {
-                let _ = self.unreliable.insert(key, plan);
+                let previous = self.unreliable.insert(key, plan);
+                debug_assert!(previous.is_none());
             }
             PlanKey::Reliable(key) => {
-                let _ = self.reliable.insert(key, plan);
+                let previous = self.reliable.insert(key, plan);
+                debug_assert!(previous.is_none());
             }
         }
     }
 
     fn remove(&mut self, key: PlanKey) {
         match key {
-            PlanKey::Track(key) => {
-                let _ = self.tracks.remove(key);
-            }
-            PlanKey::Unreliable(key) => {
-                let _ = self.unreliable.remove(key);
-            }
-            PlanKey::Reliable(key) => {
-                let _ = self.reliable.remove(key);
-            }
+            PlanKey::Track(key) => debug_assert!(self.tracks.remove(key).is_some()),
+            PlanKey::Unreliable(key) => debug_assert!(self.unreliable.remove(key).is_some()),
+            PlanKey::Reliable(key) => debug_assert!(self.reliable.remove(key).is_some()),
         }
     }
-}
 
-pub(crate) fn diff(
-    key: PlanKey,
-    old: Option<&FlatTrackPlan>,
-    new: Option<&FlatTrackPlan>,
-) -> Vec<FlatPlanOp> {
-    let Some(new) = new else {
-        return old
-            .is_some()
-            .then_some(vec![FlatPlanOp::RemovePlan(key)])
-            .unwrap_or_default();
-    };
-    let mut operations = Vec::new();
-    if old.is_none() {
-        operations.push(FlatPlanOp::CreatePlan(key));
-    }
-    let empty = FlatTrackPlan::default();
-    let old = old.unwrap_or(&empty);
-    for &participant in old.local.values() {
-        if !new.local.contains(participant) {
-            operations.push(FlatPlanOp::RemoveLocal { key, participant });
-        }
-    }
-    for &participant in new.local.values() {
-        if !old.local.contains(participant) {
-            operations.push(FlatPlanOp::AddLocal { key, participant });
-        }
-    }
-    for &route in old.remote.values() {
-        if !new.remote.contains(route) {
-            operations.push(FlatPlanOp::RemoveRemote { key, route });
-        }
-    }
-    for &route in new.remote.values() {
-        if !old.remote.contains(route) {
-            operations.push(FlatPlanOp::AddRemote { key, route });
-        }
-    }
-    if old.reverse_route != new.reverse_route {
-        operations.push(FlatPlanOp::SetReverse {
-            key,
-            route: new.reverse_route,
-        });
-    }
-    operations
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlatPlanOp {
-    CreatePlan(PlanKey),
-    AddLocal {
-        key: PlanKey,
-        participant: ParticipantKey,
-    },
-    RemoveLocal {
-        key: PlanKey,
-        participant: ParticipantKey,
-    },
-    AddRemote {
-        key: PlanKey,
-        route: RemoteRoutePlan,
-    },
-    RemoveRemote {
-        key: PlanKey,
-        route: RemoteRoutePlan,
-    },
-    SetReverse {
-        key: PlanKey,
-        route: Option<RemoteRoutePlan>,
-    },
-    RemovePlan(PlanKey),
-}
-
-impl FlatPlans {
-    fn apply(&mut self, op: FlatPlanOp) {
-        let key = match op {
-            FlatPlanOp::AddLocal { key, .. }
-            | FlatPlanOp::RemoveLocal { key, .. }
-            | FlatPlanOp::AddRemote { key, .. }
-            | FlatPlanOp::RemoveRemote { key, .. }
-            | FlatPlanOp::SetReverse { key, .. }
-            | FlatPlanOp::CreatePlan(key)
-            | FlatPlanOp::RemovePlan(key) => key,
-        };
-        if let FlatPlanOp::CreatePlan(key) = op {
-            if self.get(key).is_none() {
-                self.insert(key, FlatTrackPlan::default());
-            }
+    fn apply(&mut self, change: &PlanChange, touched: &mut usize) {
+        if change.remove {
+            debug_assert!(!change.create);
+            debug_assert!(self.get(change.key).is_some());
+            self.remove(change.key);
+            *touched = touched.saturating_add(1);
             return;
         }
-        if matches!(op, FlatPlanOp::RemovePlan(_)) {
-            self.remove(key);
-            return;
+        if change.create {
+            debug_assert!(self.get(change.key).is_none());
+            self.insert(change.key, FlatTrackPlan::default());
+            *touched = touched.saturating_add(1);
         }
-        let Some(plan) = self.get_mut(key) else {
-            debug_assert!(false, "a plan mutation must follow plan creation");
+        let Some(plan) = self.get_mut(change.key) else {
+            debug_assert!(false, "a plan change must name a live plan");
             return;
         };
-        match op {
-            FlatPlanOp::AddLocal { participant, .. } => plan.local.insert(participant),
-            FlatPlanOp::RemoveLocal { participant, .. } => plan.local.remove(participant),
-            FlatPlanOp::AddRemote { route, .. } => plan.remote.insert(route),
-            FlatPlanOp::RemoveRemote { route, .. } => plan.remote.remove(route),
-            FlatPlanOp::SetReverse { route, .. } => plan.reverse_route = route,
-            FlatPlanOp::CreatePlan(_) | FlatPlanOp::RemovePlan(_) => {
-                debug_assert!(false, "plan lifecycle operations are handled above");
+        plan.local.apply(&change.local, touched);
+        plan.remote.apply(&change.remote, touched);
+        match change.reverse {
+            ReverseRouteChange::Unchanged => {}
+            ReverseRouteChange::Set(route) => {
+                plan.reverse_route = route;
+                *touched = touched.saturating_add(1);
             }
+        }
+    }
+
+    pub(crate) fn apply_batch(&mut self, batch: &PlanBatch, touched: &mut usize) {
+        for change in &batch.changes {
+            self.apply(change, touched);
         }
     }
 }
 
-impl Absorb<FlatPlanOp> for FlatPlans {
-    fn absorb_first(&mut self, operation: &mut FlatPlanOp, _: &Self) {
-        self.apply(*operation);
+impl Absorb<PlanBatch> for FlatPlans {
+    fn absorb_first(&mut self, operation: &mut PlanBatch, _: &Self) {
+        let mut touched = 0;
+        self.apply_batch(operation, &mut touched);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_work("plan_entries_touched", touched);
     }
 
-    fn absorb_second(&mut self, operation: FlatPlanOp, _: &Self) {
-        self.apply(operation);
+    fn absorb_second(&mut self, operation: PlanBatch, _: &Self) {
+        let mut touched = 0;
+        self.apply_batch(&operation, &mut touched);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_work("plan_entries_touched", touched);
     }
 
     fn sync_with(&mut self, first: &Self) {
@@ -283,10 +322,8 @@ impl Absorb<FlatPlanOp> for FlatPlans {
 }
 
 pub(crate) struct FlatPlanPublisher {
-    writer: left_right::WriteHandle<FlatPlans, FlatPlanOp>,
+    writer: left_right::WriteHandle<FlatPlans, PlanBatch>,
     reader: PlanReader,
-    #[cfg(test)]
-    desired: FlatPlans,
 }
 
 pub(crate) type PlanReader = left_right::ReadHandle<FlatPlans>;
@@ -294,24 +331,13 @@ pub(crate) type PlanReader = left_right::ReadHandle<FlatPlans>;
 impl FlatPlanPublisher {
     pub(crate) fn new() -> Self {
         let (writer, reader) = left_right::new_from_empty(FlatPlans::default());
-        Self {
-            writer,
-            reader,
-            #[cfg(test)]
-            desired: FlatPlans::default(),
-        }
+        Self { writer, reader }
     }
 
-    pub(crate) fn append(&mut self, op: FlatPlanOp) {
-        self.writer.append(op);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set(&mut self, key: PlanKey, plan: FlatTrackPlan) {
-        for op in diff(key, self.desired.get(key), Some(&plan)) {
-            self.append(op);
+    pub(crate) fn append(&mut self, batch: PlanBatch) {
+        if !batch.is_empty() {
+            self.writer.append(batch);
         }
-        self.desired.insert(key, plan);
     }
 
     pub(crate) fn publish(&mut self) {
@@ -344,53 +370,92 @@ mod tests {
         members.insert(first);
         members.insert(second);
         members.insert(third);
-        assert_eq!(members.len(), 3);
-        assert!(members.contains(second));
-
         members.remove(second);
-
         assert_eq!(members.len(), 2);
-        assert!(!members.contains(second));
-        assert!(members.contains(first));
-        assert!(members.contains(third));
+        assert!(!members.values().contains(&second));
+        assert!(members.values().contains(&first));
+        assert!(members.values().contains(&third));
     }
 
     #[test]
-    fn duplicate_membership_is_not_added() {
-        let [key] = participant_keys(1).try_into().unwrap();
-        let mut members = DenseMembership::default();
-        members.insert(key);
-        members.insert(key);
-        assert_eq!(members.values(), &[key]);
-    }
-
-    #[test]
-    fn left_right_publishes_incremental_membership_without_copying_the_hot_loop() {
-        let [first, second] = participant_keys(2).try_into().unwrap();
-        let mut tracks = slotmap::SlotMap::<TrackKey, ()>::with_key();
-        let track = tracks.insert(());
+    fn a_plan_batch_touches_only_changed_members() {
+        let [first, second, third] = participant_keys(3).try_into().unwrap();
+        let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
+        let track = keys.insert(());
         let key = PlanKey::Track(track);
         let mut publisher = FlatPlanPublisher::new();
-
-        let mut plan = FlatTrackPlan::default();
-        plan.local.insert(first);
-        publisher.set(key, plan);
+        let mut initial = PlanBatch::default();
+        initial.push(PlanChange {
+            key,
+            create: true,
+            remove: false,
+            local: MembershipDelta {
+                added: vec![first, second, third],
+                removed: Vec::new(),
+            },
+            remote: MembershipDelta::default(),
+            reverse: ReverseRouteChange::Unchanged,
+        });
+        publisher.append(initial);
         publisher.publish();
-        {
-            let plans = publisher.read().expect("the reader is alive");
-            let plan = plans.get(key).expect("the track plan is published");
-            assert_eq!(plan.local.values(), &[first]);
-        }
-
-        let mut plan = FlatTrackPlan::default();
-        plan.local.insert(first);
-        plan.local.insert(second);
-        publisher.set(key, plan);
+        let mut update = PlanBatch::default();
+        update.push(PlanChange {
+            key,
+            create: false,
+            remove: false,
+            local: MembershipDelta {
+                added: Vec::new(),
+                removed: vec![second],
+            },
+            remote: MembershipDelta::default(),
+            reverse: ReverseRouteChange::Unchanged,
+        });
+        publisher.append(update);
         publisher.publish();
-        let plans = publisher.read().expect("the reader is alive");
-        let plan = plans.get(key).expect("the track plan remains published");
-        assert_eq!(plan.local.values().len(), 2);
-        assert!(plan.local.contains(first));
-        assert!(plan.local.contains(second));
+        let plans = publisher.read().unwrap();
+        let plan = plans.get(key).unwrap();
+        assert_eq!(plan.local.len(), 2);
+        assert!(!plan.local.values().contains(&second));
+    }
+
+    #[test]
+    fn applying_a_single_membership_change_does_not_scan_the_plan() {
+        let keys = participant_keys(1024);
+        let mut slots = slotmap::SlotMap::<TrackKey, ()>::with_key();
+        let track = slots.insert(());
+        let key = PlanKey::Track(track);
+        let mut plans = FlatPlans::default();
+        let mut initial = PlanBatch::default();
+        initial.push(PlanChange {
+            key,
+            create: true,
+            remove: false,
+            local: MembershipDelta {
+                added: keys.clone(),
+                removed: Vec::new(),
+            },
+            remote: MembershipDelta::default(),
+            reverse: ReverseRouteChange::Unchanged,
+        });
+        let mut touched = 0;
+        plans.apply_batch(&initial, &mut touched);
+        assert_eq!(touched, keys.len() + 1);
+
+        let mut update = PlanBatch::default();
+        update.push(PlanChange {
+            key,
+            create: false,
+            remove: false,
+            local: MembershipDelta {
+                added: vec![ParticipantKey::default()],
+                removed: vec![keys[0]],
+            },
+            remote: MembershipDelta::default(),
+            reverse: ReverseRouteChange::Unchanged,
+        });
+        touched = 0;
+        plans.apply_batch(&update, &mut touched);
+        assert_eq!(touched, 2);
+        assert_eq!(plans.get(key).unwrap().local.len(), keys.len());
     }
 }

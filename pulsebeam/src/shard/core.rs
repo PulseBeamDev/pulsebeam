@@ -12,7 +12,10 @@ use crate::shard::events::{
 use crate::{
     entity::{TrackId, TrackKind},
     keys::ParticipantKey,
-    participant::{ParticipantConfig, batcher::GsoSendBatch},
+    participant::{
+        ParticipantConfig,
+        batcher::{AppendStatus, Batcher, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
+    },
     rtp::RtpPacket,
     shard::{
         dirty::DirtyTracker,
@@ -46,6 +49,44 @@ struct DispatchCtx<'a, R: ShardTransport> {
     dirty: &'a mut DirtyTracker,
     router: &'a R,
     wall: &'a WallAnchor,
+}
+
+struct ShardNetworkEgress<'a> {
+    udp: &'a mut GsoSendBatch,
+    tcp: &'a mut Batcher,
+    udp_socket: &'a mut UnifiedSocket,
+    tcp_socket: &'a mut net::tcp::TcpTransport,
+}
+
+impl NetworkEgress for ShardNetworkEgress<'_> {
+    fn append_udp(&mut self, packets: &mut OwnedPacketQueue) -> AppendStatus {
+        if packets.is_empty() {
+            return AppendStatus::Drained;
+        }
+        if self.udp.is_full() {
+            return AppendStatus::Full;
+        }
+        let _ = self.udp.append_from(packets);
+        if packets.is_empty() {
+            AppendStatus::Drained
+        } else {
+            AppendStatus::Full
+        }
+    }
+
+    fn append_tcp(&mut self, batcher: &mut Batcher) -> AppendStatus {
+        if batcher.is_empty() {
+            return AppendStatus::Drained;
+        }
+        self.tcp.append_batcher(batcher);
+        AppendStatus::Drained
+    }
+
+    fn flush(&mut self) -> bool {
+        let udp_progress = self.udp.flush(self.udp_socket);
+        let tcp_progress = self.tcp.flush(self.tcp_socket);
+        udp_progress || tcp_progress
+    }
 }
 
 impl<'a, R: ShardTransport> ShardTransport for DispatchCtx<'a, R> {
@@ -165,8 +206,8 @@ impl<'a, R: ShardTransport> RoutingContext for DispatchCtx<'a, R> {
 pub(crate) struct ShardCore {
     pub(crate) shard_id: crate::id::ShardId,
     view: crate::view::ShardView,
-    view_rx: mailbox::Receiver<Box<crate::view::ShardViewDelta>>,
-    pending_view_delta: Option<Box<crate::view::ShardViewDelta>>,
+    view_rx: mailbox::Receiver<Box<crate::view::GenerationCommit>>,
+    pending_view_delta: Option<Box<crate::view::GenerationCommit>>,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
     plans: crate::plan::FlatPlanPublisher,
@@ -174,8 +215,21 @@ pub(crate) struct ShardCore {
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
+    tcp_send_batcher: Batcher,
     pipeline: EventPipeline,
     wall: WallAnchor,
+}
+
+fn is_retire(op: &crate::view::ViewOp) -> bool {
+    matches!(
+        op,
+        crate::view::ViewOp::RetireRoute { .. }
+            | crate::view::ViewOp::RetireTransport { .. }
+            | crate::view::ViewOp::RemoveParticipant { .. }
+            | crate::view::ViewOp::RemoveTrackRuntime { .. }
+            | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
+            | crate::view::ViewOp::RemoveReliableRuntime { .. }
+    )
 }
 
 impl ShardCore {
@@ -184,7 +238,7 @@ impl ShardCore {
         max_gso_segments: usize,
         shard_count: usize,
         wall: WallAnchor,
-        view_rx: mailbox::Receiver<Box<crate::view::ShardViewDelta>>,
+        view_rx: mailbox::Receiver<Box<crate::view::GenerationCommit>>,
     ) -> Self {
         let shard_id = shard_id.into();
         debug_assert!(shard_count > 0);
@@ -213,6 +267,7 @@ impl ShardCore {
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
+            tcp_send_batcher: Batcher::with_capacity(max_gso_segments),
             pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
             wall,
         }
@@ -220,6 +275,7 @@ impl ShardCore {
 
     pub(crate) fn apply_view_deltas(&mut self, budget: usize) -> usize {
         debug_assert!(budget > 0);
+        debug_assert_eq!(self.view.shard, self.shard_id);
         let mut applied = 0;
         while applied < budget {
             if self.pending_view_delta.is_none() {
@@ -232,128 +288,150 @@ impl ShardCore {
                 debug_assert!(false, "a readable view delta must be retained");
                 break;
             };
-            if !delta.is_valid_for(self.shard_id, self.view.generation) {
+            if delta.shard != self.shard_id || delta.generation <= self.view.generation {
                 debug_assert_eq!(delta.shard, self.shard_id);
                 debug_assert!(
                     delta.generation > self.view.generation,
                     "view generations arrive strictly newer"
                 );
-                debug_assert!(
-                    delta.ops.iter().all(|op| op.is_owned_by(self.shard_id)),
-                    "a view op must target its owning shard"
-                );
                 continue;
             }
-            let count = delta.ops.len();
-            let mut plans_changed = false;
-            for op in &delta.ops {
-                if let crate::view::ViewOp::RemoveTrackRuntime { key } = op
-                    && let Some(track) = self.runtime.track_publication(key.raw())
-                {
-                    self.registry
-                        .unpublish_track(&track.meta.id, track.meta.room_id);
-                }
-                self.runtime.apply_view_op(op);
-                match op {
-                    crate::view::ViewOp::ApplyPlan { op } => {
-                        self.plans.append(*op);
-                        plans_changed = true;
-                    }
-                    crate::view::ViewOp::AnnounceTrack { publication } => {
-                        self.registry.publish_track(publication);
-                    }
-                    crate::view::ViewOp::WithdrawTrack { id, room_id } => {
-                        self.registry.unpublish_track(id, *room_id);
-                    }
-                    crate::view::ViewOp::InsertTrackRuntime { key, descriptor } => {
-                        self.registry.publish_track(&descriptor.publication);
-                        if let Some(participant) = descriptor.participant
-                            && let Some(meta) = self.registry.resolve_mut(participant)
-                        {
-                            meta.bind_published_track(descriptor.id, key.raw());
-                        }
-                    }
-                    crate::view::ViewOp::InsertUnreliableRuntime { publisher, key, id } => {
-                        if let Some(publisher) = publisher
-                            && let Some(meta) = self.registry.resolve_mut(*publisher)
-                        {
-                            meta.bind_published_data_stream(&id.topic, *key);
-                        }
-                    }
-                    crate::view::ViewOp::InsertReliableRuntime { publisher, key, id } => {
-                        if let Some(publisher) = publisher
-                            && let Some(meta) = self.registry.resolve_mut(*publisher)
-                        {
-                            meta.bind_published_reliable_stream(&id.topic, *key);
-                        }
-                    }
-                    crate::view::ViewOp::BindSubscribedTrack {
-                        participant,
-                        track,
-                        fanout,
-                    } => {
-                        self.registry
-                            .bind_subscribed_track(*participant, *track, *fanout);
-                    }
-                    crate::view::ViewOp::UnbindSubscribedTrack {
-                        participant,
-                        track,
-                        fanout,
-                    } => {
-                        self.registry
-                            .unbind_subscribed_track(*participant, *track, *fanout);
-                    }
-                    crate::view::ViewOp::BindSubscribedData {
-                        participant,
-                        stream,
-                        channel,
-                    } => {
-                        let Some(meta) = self.registry.resolve_mut(*participant) else {
-                            debug_assert!(false, "a data binding must name a live participant");
-                            continue;
-                        };
-                        meta.bind_subscribed_data_stream(*stream, *channel);
-                    }
-                    crate::view::ViewOp::BindSubscribedReliable {
-                        participant,
-                        stream,
-                        channel,
-                    } => {
-                        let Some(meta) = self.registry.resolve_mut(*participant) else {
-                            debug_assert!(
-                                false,
-                                "a reliable data binding must name a live participant"
-                            );
-                            continue;
-                        };
-                        meta.bind_subscribed_reliable_stream(*stream, *channel);
-                    }
-                    crate::view::ViewOp::InstallRoute { .. }
-                    | crate::view::ViewOp::RetireRoute { .. }
-                    | crate::view::ViewOp::InstallTransport { .. }
-                    | crate::view::ViewOp::RetireTransport { .. }
-                    | crate::view::ViewOp::InsertParticipant { .. }
-                    | crate::view::ViewOp::RemoveParticipant { .. }
-                    | crate::view::ViewOp::RemoveTrackRuntime { .. }
-                    | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
-                    | crate::view::ViewOp::RemoveReliableRuntime { .. } => {}
-                    crate::view::ViewOp::SetPlan { .. }
-                    | crate::view::ViewOp::RemovePlan { .. } => {
-                        debug_assert!(false, "plan replacements must be expanded by the writer");
-                    }
-                }
-                if let crate::view::ViewOp::RemoveParticipant { key } = op {
-                    self.timers.cancel(*key);
-                    let _ = self.registry.remove_key(*key);
-                }
+            for op in delta
+                .lifecycle
+                .iter()
+                .filter(|op| matches!(op, crate::view::ViewOp::InsertParticipant))
+            {
+                self.apply_lifecycle_op(op);
             }
-            delta.apply(&mut self.view);
-            if plans_changed {
-                self.plans.publish();
+            for (participant, effect) in &delta.participant_effects {
+                let Some(meta) = self.registry.resolve_mut(*participant) else {
+                    debug_assert!(false, "a participant effect must target a live participant");
+                    continue;
+                };
+                meta.apply(effect.clone());
             }
-            applied = applied.saturating_add(count.max(1));
+            for op in delta.lifecycle.iter().filter(|op| {
+                !is_retire(op) && !matches!(op, crate::view::ViewOp::InsertParticipant)
+            }) {
+                self.apply_lifecycle_op(op);
+            }
+            self.plans.append(delta.plans);
+            self.plans.publish();
+            for op in delta.lifecycle.iter().filter(|op| is_retire(op)) {
+                self.apply_lifecycle_op(op);
+            }
+            self.view.generation = delta.generation;
+            applied = applied.saturating_add(1);
         }
         applied
+    }
+
+    fn drain_participant_network(
+        &mut self,
+        key: ParticipantKey,
+        udp_socket: &mut UnifiedSocket,
+        tcp_socket: &mut net::tcp::TcpTransport,
+    ) {
+        let registry = &mut self.registry;
+        let udp = &mut self.udp_send_batch;
+        let tcp = &mut self.tcp_send_batcher;
+        let Some(participant) = registry.resolve_mut(key) else {
+            return;
+        };
+        let mut egress = ShardNetworkEgress {
+            udp,
+            tcp,
+            udp_socket,
+            tcp_socket,
+        };
+        participant.drain_network(&mut egress);
+    }
+
+    fn apply_lifecycle_op(&mut self, op: &crate::view::ViewOp) {
+        debug_assert!(op.is_owned_by(self.shard_id));
+        match op {
+            crate::view::ViewOp::InstallRoute { binding } => {
+                self.view.routes.install(binding.clone());
+            }
+            crate::view::ViewOp::RetireRoute { handle } => self.view.routes.retire(*handle),
+            crate::view::ViewOp::InstallTransport { binding } => {
+                self.view.transports.install(*binding);
+            }
+            crate::view::ViewOp::RetireTransport { handle } => {
+                self.view.transports.retire(*handle);
+            }
+            crate::view::ViewOp::InsertParticipant => {}
+            crate::view::ViewOp::RemoveParticipant { key } => {
+                self.timers.cancel(*key);
+                let _ = self.registry.remove_key(*key);
+            }
+            crate::view::ViewOp::InsertTrackRuntime { key, descriptor } => {
+                self.runtime.apply_view_op(op);
+                if let Some(participant) = descriptor.participant {
+                    let Some(meta) = self.registry.resolve_mut(participant) else {
+                        debug_assert!(false, "a publishing participant must be live");
+                        return;
+                    };
+                    meta.bind_published_track(descriptor.id, key.raw());
+                }
+            }
+            crate::view::ViewOp::RemoveTrackRuntime { .. }
+            | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
+            | crate::view::ViewOp::RemoveReliableRuntime { .. } => self.runtime.apply_view_op(op),
+            crate::view::ViewOp::InsertUnreliableRuntime { publisher, key, id } => {
+                self.runtime.apply_view_op(op);
+                if let Some(publisher) = publisher {
+                    let Some(meta) = self.registry.resolve_mut(*publisher) else {
+                        debug_assert!(
+                            false,
+                            "a data publisher must be live shard={} key={:?} stream={:?}",
+                            self.shard_id, publisher, id
+                        );
+                        return;
+                    };
+                    meta.bind_published_data_stream(&id.topic, *key);
+                }
+            }
+            crate::view::ViewOp::InsertReliableRuntime { publisher, key, id } => {
+                self.runtime.apply_view_op(op);
+                if let Some(publisher) = publisher {
+                    let Some(meta) = self.registry.resolve_mut(*publisher) else {
+                        debug_assert!(
+                            false,
+                            "a reliable data publisher must be live shard={} key={:?} stream={:?}",
+                            self.shard_id, publisher, id
+                        );
+                        return;
+                    };
+                    meta.bind_published_reliable_stream(&id.topic, *key);
+                }
+            }
+            crate::view::ViewOp::BindSubscribedData {
+                participant,
+                stream,
+                channel,
+            } => {
+                let Some(meta) = self.registry.resolve_mut(*participant) else {
+                    debug_assert!(false, "a data binding must name a live participant");
+                    return;
+                };
+                meta.bind_subscribed_data_stream(*stream, *channel);
+            }
+            crate::view::ViewOp::BindSubscribedReliable {
+                participant,
+                stream,
+                channel,
+            } => {
+                let Some(meta) = self.registry.resolve_mut(*participant) else {
+                    debug_assert!(
+                        false,
+                        "a reliable data binding must name a live participant"
+                    );
+                    return;
+                };
+                meta.bind_subscribed_reliable_stream(*stream, *channel);
+            }
+        }
     }
 
     pub(crate) async fn view_readable(&mut self) -> Option<()> {
@@ -537,7 +615,10 @@ impl ShardCore {
             record_routing_drop("transport", "runtime", "local");
             return;
         };
-        participant.on_ingress(batch, source_shard);
+        participant.input(crate::participant::ParticipantInput::Network {
+            batch,
+            source_shard,
+        });
         self.dirty.mark(key, participant);
     }
 
@@ -698,7 +779,6 @@ impl ShardCore {
                     participant_id,
                     participant_key,
                 }) => {
-                    self.remove_participant(participant_key);
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantClosed {
                             participant: participant_id,
@@ -842,9 +922,9 @@ impl ShardCore {
             return;
         };
         router.send_frame(
-            reverse.handle.shard(),
+            reverse.shard(),
             ShardFrame::Reverse {
-                env: Envelope::feedback(reverse.handle),
+                env: Envelope::feedback(reverse),
                 body: Reverse::Keyframe {
                     layer,
                     kind: req.kind,
@@ -863,18 +943,16 @@ impl ShardCore {
                 key,
                 transport,
                 config,
+                ack,
             } => {
                 #[cfg(feature = "sim")]
                 if crate::sim_metrics::take_materialization_failure() {
                     crate::sim_metrics::record_routing_counter("materialization_failed");
-                    self.pipeline
-                        .push_shard_event(ShardEvent::ParticipantClosed {
-                            participant: config.participant_id,
-                            key,
-                        });
+                    let _ = ack.send(false);
                     return Some(());
                 }
-                self.add_participant(key, transport, *config);
+                let materialized = self.add_participant(key, transport, *config);
+                let _ = ack.send(materialized);
             }
             ShardCommand::AdoptTcpConnection { .. } => {
                 debug_assert!(false, "TCP handoff is consumed by the worker");
@@ -1002,20 +1080,15 @@ impl ShardCore {
         key: ParticipantKey,
         transport: crate::route::TransportHandle,
         cfg: ParticipantConfig,
-    ) {
+    ) -> bool {
         debug_assert_eq!(transport.shard(), self.shard_id);
         if !self.registry.insert(key, cfg, transport) {
-            return;
+            return false;
         }
         if let Some(participant) = self.registry.resolve_mut(key) {
             self.dirty.mark(key, participant);
         }
-    }
-
-    fn remove_participant(&mut self, key: ParticipantKey) -> Option<()> {
-        self.timers.cancel(key);
-        self.registry.remove_key(key)?;
-        Some(())
+        true
     }
 
     pub(crate) fn participant_count(&self) -> usize {
@@ -1031,7 +1104,7 @@ impl ShardCore {
         let dirty = &mut self.dirty;
         self.timers.drain_expired(now, |key| {
             if let Some(participant) = registry.resolve_mut(key) {
-                participant.on_timeout(now);
+                participant.input(crate::participant::ParticipantInput::Timeout(now));
                 dirty.mark(key, participant);
             }
         });
@@ -1066,15 +1139,7 @@ impl ShardCore {
             if let Some(deadline) = participant.poll(now, &mut sink) {
                 self.timers.schedule(key, deadline);
             }
-            while self
-                .udp_send_batch
-                .append_from(&mut participant.udp_packets)
-            {
-                if self.udp_send_batch.is_full() {
-                    self.udp_send_batch.flush(udp_socket);
-                }
-            }
-            participant.tcp_batcher.flush_tcp(tcp_socket);
+            self.drain_participant_network(key, udp_socket, tcp_socket);
         }
         if !self.dirty.exhausted() {
             self.dirty.finish_partial();
@@ -1082,6 +1147,7 @@ impl ShardCore {
             self.dirty.finish_phase();
         }
         self.udp_send_batch.flush(udp_socket);
+        self.tcp_send_batcher.flush(tcp_socket);
         processed
     }
 
@@ -1240,16 +1306,19 @@ mod wrong_owner_tests {
                 },
             },
         );
-        writer.stage(
-            1,
-            crate::view::ViewOp::SetPlan {
-                key: crate::plan::PlanKey::Track(track),
-                plan: crate::plan::FlatTrackPlan::default(),
-            },
-        );
+        let mut plans = crate::plan::PlanBatch::default();
+        plans.push(crate::plan::PlanChange {
+            key: crate::plan::PlanKey::Track(track),
+            create: true,
+            remove: false,
+            local: crate::plan::MembershipDelta::default(),
+            remote: crate::plan::MembershipDelta::default(),
+            reverse: crate::plan::ReverseRouteChange::Unchanged,
+        });
+        writer.stage_plans(1, plans);
         assert_eq!(writer.publish(), Some(1));
 
-        assert_eq!(core.apply_view_deltas(1), 2);
+        assert_eq!(core.apply_view_deltas(1), 1);
         assert!(core.view.routes.resolve(route).is_some());
         let plan_reader = core.plan_reader.clone();
         let plans = plan_reader.enter().expect("the plan reader is alive");

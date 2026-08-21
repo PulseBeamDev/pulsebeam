@@ -1,10 +1,12 @@
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::manual_find, clippy::manual_flatten)]
 
+use std::collections::VecDeque;
+
 use crate::entity::TrackId;
 use crate::id::ShardId;
-use crate::keys::{ParticipantKey, TrackKey, TrackRuntimeKey};
-use crate::plan::{self, FlatPlanOp, FlatTrackPlan, PlanKey};
+use crate::keys::{ParticipantKey, TrackRuntimeKey};
+use crate::plan::PlanBatch;
 use crate::route::{RouteAction, RouteHandle, TransportHandle};
 use crate::shard::router::{ReliableStreamKey, UnreliableStreamKey};
 use pulsebeam_runtime::mailbox;
@@ -52,7 +54,7 @@ impl RouteImage {
         }
     }
 
-    fn install(&mut self, binding: RouteBinding) {
+    pub(crate) fn install(&mut self, binding: RouteBinding) {
         let idx = binding.handle.route.index();
         if idx >= self.slots.len() {
             self.slots.resize_with(idx.saturating_add(1), || None);
@@ -64,7 +66,7 @@ impl RouteImage {
         *slot = Some(binding);
     }
 
-    fn retire(&mut self, handle: RouteHandle) {
+    pub(crate) fn retire(&mut self, handle: RouteHandle) {
         let Some(slot) = self.slots.get_mut(handle.route.index()) else {
             return;
         };
@@ -96,7 +98,7 @@ impl TransportImage {
         }
     }
 
-    fn install(&mut self, binding: TransportBinding) {
+    pub(crate) fn install(&mut self, binding: TransportBinding) {
         let idx = binding.handle.route.index();
         if idx >= self.slots.len() {
             self.slots.resize_with(idx.saturating_add(1), || None);
@@ -108,7 +110,7 @@ impl TransportImage {
         *slot = Some(binding);
     }
 
-    fn retire(&mut self, handle: TransportHandle) {
+    pub(crate) fn retire(&mut self, handle: TransportHandle) {
         let Some(slot) = self.slots.get_mut(handle.route.index()) else {
             return;
         };
@@ -118,25 +120,8 @@ impl TransportImage {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ShardViewDelta {
-    pub shard: ShardId,
-    pub generation: u64,
-    pub ops: Vec<ViewOp>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) enum ViewOp {
-    SetPlan {
-        key: PlanKey,
-        plan: FlatTrackPlan,
-    },
-    ApplyPlan {
-        op: FlatPlanOp,
-    },
-    RemovePlan {
-        key: PlanKey,
-    },
     InstallRoute {
         binding: RouteBinding,
     },
@@ -149,22 +134,13 @@ pub(crate) enum ViewOp {
     RetireTransport {
         handle: TransportHandle,
     },
-    InsertParticipant {
-        key: ParticipantKey,
-    },
+    InsertParticipant,
     RemoveParticipant {
         key: ParticipantKey,
     },
     InsertTrackRuntime {
         key: TrackRuntimeKey,
         descriptor: TrackDescriptor,
-    },
-    AnnounceTrack {
-        publication: Box<crate::track::Track>,
-    },
-    WithdrawTrack {
-        id: TrackId,
-        room_id: crate::entity::RoomId,
     },
     RemoveTrackRuntime {
         key: TrackRuntimeKey,
@@ -185,18 +161,6 @@ pub(crate) enum ViewOp {
     RemoveReliableRuntime {
         key: ReliableStreamKey,
     },
-    /// A participant now consumes this track here. Stated by the control plane
-    /// rather than inferred by the shard from successive plan replacements.
-    BindSubscribedTrack {
-        participant: ParticipantKey,
-        track: TrackId,
-        fanout: TrackKey,
-    },
-    UnbindSubscribedTrack {
-        participant: ParticipantKey,
-        track: TrackId,
-        fanout: TrackKey,
-    },
     BindSubscribedData {
         participant: ParticipantKey,
         stream: UnreliableStreamKey,
@@ -209,227 +173,109 @@ pub(crate) enum ViewOp {
     },
 }
 
-impl ShardViewDelta {
-    pub fn new(shard: ShardId, generation: u64) -> Self {
+#[derive(Debug)]
+pub(crate) struct GenerationCommit {
+    pub shard: ShardId,
+    pub generation: u64,
+    pub participant_effects: Vec<(ParticipantKey, crate::participant::ParticipantEffect)>,
+    pub lifecycle: Vec<ViewOp>,
+    pub plans: PlanBatch,
+}
+
+impl GenerationCommit {
+    fn new(shard: ShardId, generation: u64) -> Self {
         Self {
             shard,
             generation,
-            ops: Vec::new(),
+            participant_effects: Vec::new(),
+            lifecycle: Vec::new(),
+            plans: PlanBatch::default(),
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
-    }
-
-    pub(crate) fn is_valid_for(&self, shard: ShardId, generation: u64) -> bool {
-        self.shard == shard
-            && self.generation > generation
-            && self.ops.iter().all(|op| op.is_owned_by(shard))
-    }
-
-    pub fn apply(self, view: &mut ShardView) {
-        if !self.is_valid_for(view.shard, view.generation) {
-            debug_assert_eq!(self.shard, view.shard, "delta applied to its owner");
-            debug_assert!(
-                self.generation > view.generation,
-                "view generations are monotonic"
-            );
-            debug_assert!(
-                self.ops.iter().all(|op| op.is_owned_by(view.shard)),
-                "a view op must target its owning shard"
-            );
-            return;
-        }
-        for op in self.ops {
-            match op {
-                ViewOp::InstallRoute { binding } => {
-                    debug_assert_eq!(binding.handle.shard(), view.shard);
-                    view.routes.install(binding);
-                }
-                ViewOp::RetireRoute { handle } => {
-                    debug_assert_eq!(handle.shard(), view.shard);
-                    view.routes.retire(handle);
-                }
-                ViewOp::InstallTransport { binding } => {
-                    debug_assert_eq!(binding.handle.shard(), view.shard);
-                    view.transports.install(binding);
-                }
-                ViewOp::RetireTransport { handle } => {
-                    debug_assert_eq!(handle.shard(), view.shard);
-                    view.transports.retire(handle);
-                }
-                ViewOp::InsertParticipant { key } => {
-                    let _ = key;
-                }
-                ViewOp::RemoveParticipant { .. }
-                | ViewOp::InsertTrackRuntime { .. }
-                | ViewOp::RemoveTrackRuntime { .. }
-                | ViewOp::AnnounceTrack { .. }
-                | ViewOp::WithdrawTrack { .. }
-                | ViewOp::InsertUnreliableRuntime { .. }
-                | ViewOp::RemoveUnreliableRuntime { .. }
-                | ViewOp::InsertReliableRuntime { .. }
-                | ViewOp::RemoveReliableRuntime { .. }
-                | ViewOp::BindSubscribedTrack { .. }
-                | ViewOp::UnbindSubscribedTrack { .. }
-                | ViewOp::BindSubscribedData { .. }
-                | ViewOp::BindSubscribedReliable { .. }
-                | ViewOp::SetPlan { .. }
-                | ViewOp::ApplyPlan { .. }
-                | ViewOp::RemovePlan { .. } => {}
-            }
-        }
-        view.generation = self.generation;
+    fn is_empty(&self) -> bool {
+        self.participant_effects.is_empty() && self.lifecycle.is_empty() && self.plans.is_empty()
     }
 }
 
 pub(crate) struct ShardViewWriter {
     shard: ShardId,
-    tx: mailbox::Sender<Box<ShardViewDelta>>,
-    staged: Option<Box<ShardViewDelta>>,
-    backlog: Option<Box<ShardViewDelta>>,
-    plans: std::collections::HashMap<PlanKey, FlatTrackPlan>,
-    staged_plans: std::collections::HashMap<PlanKey, Option<FlatTrackPlan>>,
+    tx: mailbox::Sender<Box<GenerationCommit>>,
+    staged: Option<Box<GenerationCommit>>,
+    backlog: VecDeque<Box<GenerationCommit>>,
     closed: bool,
 }
 
 impl ShardViewWriter {
     pub fn stage(&mut self, generation: u64, op: ViewOp) {
-        if let ViewOp::SetPlan { key, plan } = op {
-            self.stage_plan(generation, key, plan);
-            return;
-        }
-        if let ViewOp::RemovePlan { key } = op {
-            self.stage_plan_removal(generation, key);
-            return;
-        }
-        if !op.is_owned_by(self.shard) {
-            pulsebeam_runtime::fatal!("a view op must target its owning shard");
-        }
-        let delta = self
+        let commit = self
             .staged
-            .get_or_insert_with(|| Box::new(ShardViewDelta::new(self.shard, generation)));
-        if delta.generation != generation {
-            pulsebeam_runtime::fatal!("a shard view writer cannot mix lifecycle generations");
+            .get_or_insert_with(|| Box::new(GenerationCommit::new(self.shard, generation)));
+        if commit.generation != generation {
+            pulsebeam_runtime::fatal!("a shard generation cannot mix lifecycle generations");
         }
-        delta.ops.push(op);
+        commit.lifecycle.push(op);
     }
 
-    fn stage_plan(&mut self, generation: u64, key: PlanKey, plan: FlatTrackPlan) {
-        let old = self.current_plan(key);
-        let operations = plan::diff(key, old, Some(&plan));
-        if operations.is_empty() {
+    pub fn stage_participant_effect(
+        &mut self,
+        generation: u64,
+        participant: ParticipantKey,
+        effect: crate::participant::ParticipantEffect,
+    ) {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(GenerationCommit::new(self.shard, generation)));
+        if commit.generation != generation {
+            pulsebeam_runtime::fatal!("a shard generation cannot mix participant effects");
+        }
+        commit.participant_effects.push((participant, effect));
+    }
+
+    pub fn stage_plans(&mut self, generation: u64, plans: PlanBatch) {
+        if plans.is_empty() {
             return;
         }
-        self.staged_plans.insert(key, Some(plan));
-        for op in operations {
-            self.push(generation, ViewOp::ApplyPlan { op });
-        }
-    }
-
-    fn stage_plan_removal(&mut self, generation: u64, key: PlanKey) {
-        let old = self.current_plan(key);
-        if !plan::diff(key, old, None).is_empty() {
-            self.staged_plans.insert(key, None);
-            self.push(
-                generation,
-                ViewOp::ApplyPlan {
-                    op: FlatPlanOp::RemovePlan(key),
-                },
-            );
-        }
-    }
-
-    fn current_plan(&self, key: PlanKey) -> Option<&FlatTrackPlan> {
-        match self.staged_plans.get(&key) {
-            Some(Some(plan)) => Some(plan),
-            Some(None) => None,
-            None => self.plans.get(&key),
-        }
-    }
-
-    fn push(&mut self, generation: u64, op: ViewOp) {
-        let delta = self
+        let commit = self
             .staged
-            .get_or_insert_with(|| Box::new(ShardViewDelta::new(self.shard, generation)));
-        if delta.generation != generation {
-            pulsebeam_runtime::fatal!("a shard view writer cannot mix lifecycle generations");
+            .get_or_insert_with(|| Box::new(GenerationCommit::new(self.shard, generation)));
+        if commit.generation != generation {
+            pulsebeam_runtime::fatal!("a shard generation cannot mix plan generations");
         }
-        delta.ops.push(op);
+        commit.plans.changes.extend(plans.changes);
     }
 
     pub fn abort(&mut self) {
         self.staged = None;
-        self.staged_plans.clear();
     }
 
     pub fn has_staged(&self) -> bool {
-        self.staged.as_ref().is_some_and(|delta| !delta.is_empty())
+        self.staged
+            .as_ref()
+            .is_some_and(|commit| !commit.is_empty())
     }
 
     pub fn publish(&mut self) -> Option<u64> {
-        if self.closed {
-            if let Some(delta) = self.staged.take()
-                && !delta.is_empty()
-            {
-                self.coalesce(delta);
-            }
+        let commit = self.staged.take()?;
+        if commit.is_empty() {
             return None;
         }
-        let delta = self.staged.take()?;
-        if delta.is_empty() {
+        let generation = commit.generation;
+        if self.closed || !self.flush_backlog() {
+            self.backlog.push_back(commit);
             return None;
         }
-        let generation = delta.generation;
-        let _ = self.flush_backlog();
-        if self.closed {
-            self.coalesce(delta);
-            return None;
-        }
-        if self.backlog.is_some() {
-            self.coalesce(delta);
-            self.commit_staged_plans();
-            return Some(generation);
-        }
-        match self.tx.try_send(delta) {
-            Ok(()) => {
-                self.commit_staged_plans();
+        match self.tx.try_send(commit) {
+            Ok(()) => Some(generation),
+            Err(mailbox::TrySendError::Full(commit)) => {
+                self.backlog.push_back(commit);
                 Some(generation)
             }
-            Err(mailbox::TrySendError::Full(delta)) => {
-                self.backlog = Some(delta);
-                self.commit_staged_plans();
-                Some(generation)
-            }
-            Err(mailbox::TrySendError::Closed(delta)) => {
-                self.backlog = Some(delta);
+            Err(mailbox::TrySendError::Closed(commit)) => {
+                self.backlog.push_back(commit);
                 self.closed = true;
                 None
             }
-        }
-    }
-
-    fn commit_staged_plans(&mut self) {
-        for (key, plan) in self.staged_plans.drain() {
-            match plan {
-                Some(plan) => {
-                    self.plans.insert(key, plan);
-                }
-                None => {
-                    self.plans.remove(&key);
-                }
-            }
-        }
-    }
-
-    fn coalesce(&mut self, delta: Box<ShardViewDelta>) {
-        if let Some(backlog) = self.backlog.as_mut() {
-            debug_assert_eq!(backlog.shard, self.shard);
-            backlog.ops.extend(delta.ops);
-            backlog.generation = delta.generation;
-        } else {
-            self.backlog = Some(delta);
         }
     }
 
@@ -437,22 +283,38 @@ impl ShardViewWriter {
         if self.closed {
             return false;
         }
-        let Some(delta) = self.backlog.take() else {
-            return true;
-        };
-        match self.tx.try_send(delta) {
-            Ok(()) => true,
-            Err(mailbox::TrySendError::Closed(delta)) => {
-                self.backlog = Some(delta);
-                self.closed = true;
-                false
-            }
-            Err(mailbox::TrySendError::Full(delta)) => {
-                self.backlog = Some(delta);
-                false
+        while let Some(commit) = self.backlog.pop_front() {
+            match self.tx.try_send(commit) {
+                Ok(()) => {}
+                Err(mailbox::TrySendError::Full(commit)) => {
+                    self.backlog.push_front(commit);
+                    return false;
+                }
+                Err(mailbox::TrySendError::Closed(commit)) => {
+                    self.backlog.push_front(commit);
+                    self.closed = true;
+                    return false;
+                }
             }
         }
+        true
     }
+}
+
+pub(crate) fn new_shard_view(
+    shard: ShardId,
+) -> (ShardViewWriter, mailbox::Receiver<Box<GenerationCommit>>) {
+    let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_VIEW_CAPACITY);
+    (
+        ShardViewWriter {
+            shard,
+            tx,
+            staged: None,
+            backlog: VecDeque::new(),
+            closed: false,
+        },
+        rx,
+    )
 }
 
 impl ViewOp {
@@ -462,265 +324,71 @@ impl ViewOp {
             Self::RetireRoute { handle } => handle.shard() == shard,
             Self::InstallTransport { binding } => binding.handle.shard() == shard,
             Self::RetireTransport { handle } => handle.shard() == shard,
-            Self::SetPlan { .. }
-            | Self::ApplyPlan { .. }
-            | Self::RemovePlan { .. }
-            | Self::InsertParticipant { .. }
+            Self::InsertParticipant { .. }
             | Self::RemoveParticipant { .. }
             | Self::InsertTrackRuntime { .. }
             | Self::RemoveTrackRuntime { .. }
-            | Self::AnnounceTrack { .. }
-            | Self::WithdrawTrack { .. }
             | Self::InsertUnreliableRuntime { .. }
             | Self::RemoveUnreliableRuntime { .. }
             | Self::InsertReliableRuntime { .. }
             | Self::RemoveReliableRuntime { .. }
-            | Self::BindSubscribedTrack { .. }
-            | Self::UnbindSubscribedTrack { .. }
             | Self::BindSubscribedData { .. }
             | Self::BindSubscribedReliable { .. } => true,
         }
     }
 }
 
-pub(crate) fn new_shard_view(
-    shard: ShardId,
-) -> (ShardViewWriter, mailbox::Receiver<Box<ShardViewDelta>>) {
-    let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_VIEW_CAPACITY);
-    (
-        ShardViewWriter {
-            shard,
-            tx,
-            staged: None,
-            backlog: None,
-            plans: std::collections::HashMap::new(),
-            staged_plans: std::collections::HashMap::new(),
-            closed: false,
-        },
-        rx,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::route::RouteId;
+    use crate::keys::TrackKey;
 
-    #[test]
-    fn a_delta_preserves_owner_and_generation() {
-        let shard = ShardId::new(2);
-        let delta = ShardViewDelta::new(shard, 1);
-        assert_eq!(delta.shard, shard);
-        assert_eq!(delta.generation, 1);
+    fn track_plan() -> (crate::plan::PlanKey, PlanBatch) {
+        let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
+        let key = crate::plan::PlanKey::Track(keys.insert(()));
+        let mut batch = PlanBatch::default();
+        batch.push(crate::plan::PlanChange {
+            key,
+            create: true,
+            remove: false,
+            local: crate::plan::MembershipDelta::default(),
+            remote: crate::plan::MembershipDelta::default(),
+            reverse: crate::plan::ReverseRouteChange::Unchanged,
+        });
+        (key, batch)
     }
 
     #[test]
-    fn an_empty_generation_is_not_published() {
-        let shard = ShardId::new(0);
-        let (mut writer, _rx) = new_shard_view(shard);
-        assert_eq!(writer.publish(), None);
-    }
-
-    /// Aborting a generation must leave nothing behind for the next one to publish.
-    ///
-    /// `transact` unwinds by calling `abort` on every writer, so a staged op that survived would
-    /// be published by whichever generation committed next - carrying a route the allocator has
-    /// already taken back.
-    #[test]
-    fn aborting_a_generation_discards_what_it_staged() {
-        let shard = ShardId::new(0);
+    fn lifecycle_and_plan_are_one_ordered_generation_without_shared_interpretation() {
+        let shard = ShardId::new(1);
         let (mut writer, mut rx) = new_shard_view(shard);
-        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
-
-        writer.stage(
-            1,
-            ViewOp::InsertParticipant {
-                key: keys.insert(()),
-            },
-        );
-        writer.abort();
-
-        assert_eq!(
-            writer.publish(),
-            None,
-            "an aborted generation has nothing to publish"
-        );
-        assert!(rx.try_recv().is_err(), "and nothing reached the shard");
-    }
-
-    /// A published generation arrives whole, tagged with the generation that produced it.
-    #[test]
-    fn a_published_generation_reaches_the_shard_intact() {
-        let shard = ShardId::new(3);
-        let (mut writer, mut rx) = new_shard_view(shard);
-        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
-
-        writer.stage(
-            7,
-            ViewOp::InsertParticipant {
-                key: keys.insert(()),
-            },
-        );
-        writer.stage(
-            7,
-            ViewOp::InsertParticipant {
-                key: keys.insert(()),
-            },
-        );
+        let (_, plans) = track_plan();
+        writer.stage(7, ViewOp::InsertParticipant);
+        writer.stage_plans(7, plans);
         assert_eq!(writer.publish(), Some(7));
 
-        let delta = rx.try_recv().expect("the delta was sent");
-        assert_eq!(delta.shard, shard, "and to its own shard");
-        assert_eq!(delta.generation, 7);
-        assert_eq!(delta.ops.len(), 2, "with both staged ops");
-    }
-
-    /// A shard that has gone away yields no generation, which is what `transact` aborts on.
-    ///
-    /// Committing anyway would retire the slot of a route the surviving shards still believe in.
-    #[test]
-    fn publishing_to_a_departed_shard_yields_no_generation() {
-        let (mut writer, rx) = new_shard_view(ShardId::new(0));
-        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
-        drop(rx);
-
-        writer.stage(
-            1,
-            ViewOp::InsertParticipant {
-                key: keys.insert(()),
-            },
-        );
-        assert_eq!(
-            writer.publish(),
-            None,
-            "a closed receiver is indistinguishable from an empty generation to the caller, and \
-             both mean the same thing: this generation did not land"
-        );
+        let commit = rx.try_recv().unwrap();
+        assert_eq!(commit.shard, shard);
+        assert_eq!(commit.generation, 7);
+        assert_eq!(commit.lifecycle.len(), 1);
+        assert_eq!(commit.plans.changes.len(), 1);
     }
 
     #[test]
-    fn a_closed_view_writer_never_discards_an_undelivered_delta() {
-        let (mut writer, rx) = new_shard_view(ShardId::new(0));
-        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
-        drop(rx);
-
-        for generation in 1..=2 {
-            writer.stage(
-                generation,
-                ViewOp::InsertParticipant {
-                    key: keys.insert(()),
-                },
-            );
-            assert_eq!(writer.publish(), None);
-        }
-
-        assert!(!writer.flush_backlog());
-        assert_eq!(
-            writer.backlog.as_ref().map(|delta| delta.ops.len()),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn a_full_view_mailbox_preserves_every_control_operation() {
+    fn queued_generations_remain_in_order() {
         let shard = ShardId::new(0);
         let (mut writer, mut rx) = new_shard_view(shard);
-        let mut keys = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
-        let operation_count = 20_000;
-
-        for generation in 1..=operation_count {
-            writer.stage(
-                generation as u64,
-                ViewOp::InsertParticipant {
-                    key: keys.insert(()),
-                },
-            );
-            assert_eq!(writer.publish(), Some(generation as u64));
+        for generation in 1..=(crate::shard::worker::SHARD_VIEW_CAPACITY + 1) as u64 {
+            writer.stage(generation, ViewOp::InsertParticipant);
+            assert_eq!(writer.publish(), Some(generation));
         }
-
-        let mut received = 0;
-        while let Ok(delta) = rx.try_recv() {
-            received += delta.ops.len();
+        for expected in 1..=crate::shard::worker::SHARD_VIEW_CAPACITY as u64 {
+            assert_eq!(rx.try_recv().unwrap().generation, expected);
         }
         assert!(writer.flush_backlog());
-        while let Ok(delta) = rx.try_recv() {
-            received += delta.ops.len();
-        }
-        assert_eq!(received, operation_count);
-    }
-
-    #[test]
-    fn a_plan_removed_and_recreated_in_one_generation_stays_ordered() {
-        let (mut writer, mut rx) = new_shard_view(ShardId::new(0));
-        let mut tracks = slotmap::SlotMap::<TrackKey, ()>::with_key();
-        let key = crate::keys::VideoTrackKey::new(tracks.insert(()));
-        let mut first = FlatTrackPlan::default();
-        let mut participants = slotmap::SlotMap::<ParticipantKey, ()>::with_key();
-        first.local.insert(participants.insert(()));
-        writer.stage(
-            1,
-            ViewOp::SetPlan {
-                key: PlanKey::Track(key.raw()),
-                plan: first,
-            },
+        assert_eq!(
+            rx.try_recv().unwrap().generation,
+            (crate::shard::worker::SHARD_VIEW_CAPACITY + 1) as u64
         );
-        assert_eq!(writer.publish(), Some(1));
-        let _ = rx.try_recv();
-
-        writer.stage(
-            2,
-            ViewOp::RemovePlan {
-                key: PlanKey::Track(key.raw()),
-            },
-        );
-        let mut second = FlatTrackPlan::default();
-        second.local.insert(participants.insert(()));
-        writer.stage(
-            2,
-            ViewOp::SetPlan {
-                key: PlanKey::Track(key.raw()),
-                plan: second,
-            },
-        );
-        assert_eq!(writer.publish(), Some(2));
-
-        let delta = rx
-            .try_recv()
-            .expect("the replacement generation is published");
-        assert!(delta.ops.iter().any(|op| {
-            matches!(
-                op,
-                ViewOp::ApplyPlan {
-                    op: FlatPlanOp::CreatePlan(PlanKey::Track(_))
-                }
-            )
-        }));
-    }
-
-    #[test]
-    fn stale_route_epoch_is_rejected_after_slot_reuse() {
-        let route = RouteId::new(ShardId::new(0), 7);
-        let mut track_keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
-        let key = track_keys.insert(());
-        let handle = RouteHandle::new(route, 3);
-        let mut image = RouteImage::default();
-        image.install(RouteBinding {
-            handle,
-            action: RouteAction::Video {
-                local_track: crate::keys::VideoTrackKey::new(key),
-            },
-        });
-        image.install(RouteBinding {
-            handle: RouteHandle::new(route, 4),
-            action: RouteAction::Video {
-                local_track: crate::keys::VideoTrackKey::new(key),
-            },
-        });
-
-        assert!(image.resolve(handle).is_none());
-        let current = RouteHandle::new(route, 4);
-        assert!(image.resolve(current).is_some());
-        image.retire(handle);
-        assert!(image.resolve(current).is_some());
     }
 }

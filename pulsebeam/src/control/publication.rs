@@ -167,9 +167,7 @@ pub(crate) fn forwarding_plan(
                     return None;
                 }
                 match held {
-                    Destination::Forwarding { route, .. } => {
-                        Some(crate::plan::RemoteRoutePlan { handle: *route })
-                    }
+                    Destination::Forwarding { route, .. } => Some(*route),
                     Destination::Discovery { .. } => None,
                 }
             })
@@ -187,7 +185,7 @@ pub(crate) fn forwarding_plan(
         !loopback
     }));
     plan.remote = crate::plan::DenseMembership::from_values(remote_routes);
-    plan.reverse_route = reverse_route.map(|handle| crate::plan::RemoteRoutePlan { handle });
+    plan.reverse_route = reverse_route;
     plan
 }
 

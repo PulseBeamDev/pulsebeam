@@ -158,6 +158,7 @@ pub(crate) enum ShardCommand {
         key: crate::shard::participants::ParticipantKey,
         transport: crate::route::TransportHandle,
         config: Box<ParticipantConfig>,
+        ack: tokio::sync::oneshot::Sender<bool>,
     },
     AdoptTcpConnection {
         stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
@@ -300,11 +301,13 @@ pub(crate) enum ShardEvent {
     DataTopicPublished {
         room_id: crate::entity::RoomId,
         publisher: ParticipantId,
+        publisher_key: crate::shard::participants::ParticipantKey,
         topic: crate::track::Topic,
     },
     DataTopicUnpublished {
         room_id: crate::entity::RoomId,
         publisher: ParticipantId,
+        publisher_key: crate::shard::participants::ParticipantKey,
         topic: crate::track::Topic,
     },
     DataTopicSubscribed {
@@ -323,11 +326,13 @@ pub(crate) enum ShardEvent {
     ReliableDataTopicPublished {
         room_id: crate::entity::RoomId,
         publisher: ParticipantId,
+        publisher_key: crate::shard::participants::ParticipantKey,
         topic: crate::track::Topic,
     },
     ReliableDataTopicUnpublished {
         room_id: crate::entity::RoomId,
         publisher: ParticipantId,
+        publisher_key: crate::shard::participants::ParticipantKey,
         topic: crate::track::Topic,
     },
     ReliableDataTopicSubscribed {
@@ -438,7 +443,7 @@ impl ShardWorker {
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
         command_rx: mailbox::Receiver<ShardCommand>,
-        view_rx: mailbox::Receiver<Box<crate::view::ShardViewDelta>>,
+        view_rx: mailbox::Receiver<Box<crate::view::GenerationCommit>>,
         event_tx: mailbox::Sender<ShardEventMessage>,
         frame_rx: mailbox::Receiver<ShardFrame>,
         frame_txs: Vec<mailbox::Sender<ShardFrame>>,
@@ -611,9 +616,6 @@ impl ShardWorker {
     }
 
     fn tick(&mut self, now: Instant) {
-        if self.core.apply_view_deltas(SHARD_VIEW_OP_BUDGET) >= SHARD_VIEW_OP_BUDGET {
-            self.tick_budget_hit("view");
-        }
         // phase 1: input
         let mut commands: usize = 0;
         for _ in 0..SHARD_COMMAND_BUDGET {
@@ -634,6 +636,9 @@ impl ShardWorker {
         }
         if commands == SHARD_COMMAND_BUDGET {
             self.tick_budget_hit("commands");
+        }
+        if self.core.apply_view_deltas(SHARD_VIEW_OP_BUDGET) >= SHARD_VIEW_OP_BUDGET {
+            self.tick_budget_hit("view");
         }
         let mut frames: usize = 0;
         self.frame_batch.clear();

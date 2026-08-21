@@ -111,6 +111,34 @@ impl RoomRegistry {
         self.participants.get(participant_id)
     }
 
+    pub fn participant_keys_in_room(
+        &self,
+        room_id: &RoomId,
+        shard_id: ShardId,
+    ) -> Vec<ParticipantKey> {
+        let Some(room) = self.rooms.get(room_id) else {
+            return Vec::new();
+        };
+        room.participant_ids_on_shard(shard_id)
+            .filter_map(|participant| {
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_work("participants_examined", 1);
+                let meta = self.participants.get(participant)?;
+                debug_assert_eq!(meta.shard_id, shard_id);
+                meta.binding
+            })
+            .collect()
+    }
+
+    pub fn participant_ids_in_room(&self, room_id: &RoomId) -> Vec<ParticipantId> {
+        self.rooms
+            .get(room_id)
+            .into_iter()
+            .flat_map(Room::participant_ids)
+            .copied()
+            .collect()
+    }
+
     pub fn set_connection_id(
         &mut self,
         participant_id: &ParticipantId,
@@ -126,7 +154,6 @@ impl RoomRegistry {
         meta.connection_id = Some(connection_id);
     }
 
-    #[cfg(test)]
     pub fn participants_in_room(
         &self,
         room_id: &RoomId,

@@ -270,16 +270,6 @@ impl ControllerActor {
             },
         );
         self.index_publication(track.id);
-        let membership_ops = vec![(
-            shard_id,
-            crate::view::ViewOp::BindSubscribedTrack {
-                participant: subscriber_key,
-                track: track.id,
-                fanout,
-            },
-        )];
-        self.publish_ops(membership_ops);
-
         let needs_remote_route = self
             .catalog
             .get(&track.id)
@@ -301,15 +291,6 @@ impl ControllerActor {
                     &pattern,
                     &subscriber,
                 );
-                let rollback = vec![(
-                    shard_id,
-                    crate::view::ViewOp::UnbindSubscribedTrack {
-                        participant: subscriber_key,
-                        track: track.id,
-                        fanout,
-                    },
-                )];
-                self.publish_ops(rollback);
                 if new_destination {
                     if let Some(binding) = self.catalog.get_mut(&track.id) {
                         binding.destinations.shift_remove(&shard_id);
@@ -391,17 +372,9 @@ impl ControllerActor {
         if let Some((previous_shard, previous_key)) = previous_member
             && (previous_shard != shard_id || previous_key != subscriber_key)
         {
-            let Some(previous_fanout) = self.track_fanout(track.id, previous_shard) else {
+            let Some(_previous_fanout) = self.track_fanout(track.id, previous_shard) else {
                 pulsebeam_runtime::fatal!("a previous video subscription must have a fanout");
             };
-            self.publish_ops(vec![(
-                previous_shard,
-                crate::view::ViewOp::UnbindSubscribedTrack {
-                    participant: previous_key,
-                    track: track.id,
-                    fanout: previous_fanout,
-                },
-            )]);
         }
     }
 
@@ -415,34 +388,15 @@ impl ControllerActor {
     ) {
         let pattern =
             crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
-        let subscriber_key = self
-            .video_patterns
-            .member_key(&pattern, &subscriber)
-            .map(|(_, key)| key);
         let departure = crate::control::patterns::retract_audience(
             &mut self.video_patterns,
             &pattern,
             &subscriber,
         );
-        let unbind = subscriber_key
-            .zip(self.track_fanout(track.id, shard_id))
-            .map(|(key, fanout)| {
-                (
-                    shard_id,
-                    crate::view::ViewOp::UnbindSubscribedTrack {
-                        participant: key,
-                        track: track.id,
-                        fanout,
-                    },
-                )
-            });
         if departure != crate::control::patterns::Departure::LastOnShard {
             if !self.publish_publication(track.id).await {
                 debug_assert!(false, "a changed video audience must publish its plan");
                 return;
-            }
-            if let Some(unbind) = unbind {
-                self.publish_ops(vec![unbind]);
             }
             return;
         }
@@ -461,17 +415,10 @@ impl ControllerActor {
                 debug_assert!(false, "a changed video audience must publish its plan");
                 return;
             }
-            if let Some(unbind) = unbind {
-                self.publish_ops(vec![unbind]);
-            }
             return;
         };
         if !self.retire_video_route(shard_id, route, track.id).await {
             debug_assert!(false, "track route retirement must complete");
-            return;
-        }
-        if let Some(unbind) = unbind {
-            self.publish_ops(vec![unbind]);
         }
     }
 
@@ -537,8 +484,10 @@ impl ControllerActor {
         plan: crate::plan::FlatTrackPlan,
     ) -> Option<RouteHandle> {
         let descriptor = self.track_descriptor(track_id, shard_id)?;
+        let recipients = plan.local.values().to_vec();
+        let publication = descriptor.publication.clone();
         self.publish_with_route(shard_id, "video", move |_, handle| {
-            vec![
+            let lifecycle = vec![
                 (
                     shard_id,
                     crate::view::ViewOp::InsertTrackRuntime {
@@ -559,14 +508,22 @@ impl ControllerActor {
                         },
                     },
                 ),
-                (
+            ];
+            let mut ops = super::GenerationOps::lifecycle(lifecycle);
+            for participant in recipients {
+                ops = ops.participant_effect(
                     shard_id,
-                    crate::view::ViewOp::SetPlan {
-                        key: crate::plan::PlanKey::Track(fanout),
-                        plan,
-                    },
-                ),
-            ]
+                    participant,
+                    crate::participant::ParticipantEffect::TrackInstalled(
+                        crate::participant::CompiledTrack {
+                            key: fanout,
+                            role: crate::participant::TrackRole::Subscribed,
+                            track: publication.clone(),
+                        },
+                    ),
+                );
+            }
+            ops.plan(shard_id, crate::plan::PlanKey::Track(fanout), plan)
         })
     }
 
@@ -598,23 +555,20 @@ impl ControllerActor {
         };
         debug_assert_eq!(current, handle);
         *destination = crate::control::publication::Destination::Discovery { key };
-        let mut ops = vec![(shard_id, crate::view::ViewOp::RetireRoute { handle })];
+        let mut ops = super::GenerationOps::lifecycle(vec![(
+            shard_id,
+            crate::view::ViewOp::RetireRoute { handle },
+        )]);
         for index in 0..self.views.len() {
             let target = crate::id::ShardId::new(index);
             if let (Some(key), Some(plan)) = (
                 self.track_fanout(track_id, target),
                 self.video_plan_for(track_id, target),
             ) {
-                ops.push((
-                    target,
-                    crate::view::ViewOp::SetPlan {
-                        key: crate::plan::PlanKey::Track(key),
-                        plan,
-                    },
-                ));
+                ops = ops.plan(target, crate::plan::PlanKey::Track(key), plan);
             }
         }
-        self.publish_ops(ops);
+        self.publish_generation(ops);
         self.state
             .release_endpoint(shard_id, handle.route.slot(), tokio::time::Instant::now());
         true

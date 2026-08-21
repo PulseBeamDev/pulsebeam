@@ -130,9 +130,9 @@ fn fanout_remote(
     ctx: &mut impl ShardTransport,
 ) {
     for remote in plan.remote.values() {
-        let env = Envelope::media(remote.handle, *link_seq, playout);
+        let env = Envelope::media(*remote, *link_seq, playout);
         *link_seq = link_seq.wrapping_add(1);
-        ctx.send_media(remote.handle.shard(), env, payload());
+        ctx.send_media(remote.shard(), env, payload());
     }
 }
 
@@ -158,10 +158,6 @@ impl ShardRuntime {
         debug_assert!(removed.is_some(), "a track runtime must retire once");
     }
 
-    pub(crate) fn track_publication(&self, key: TrackKey) -> Option<&crate::track::Track> {
-        self.tracks.get(key).map(|track| &track.publication)
-    }
-
     pub(crate) fn retire_data_stream(&mut self, key: UnreliableStreamKey) {
         let removed = self.unreliable.remove(key);
         debug_assert!(removed.is_some(), "an unreliable runtime must retire once");
@@ -178,7 +174,9 @@ impl ShardRuntime {
                 let retired = self.routes.retire(*handle);
                 debug_assert!(retired || self.routes.entry(*handle).is_none());
             }
-            crate::view::ViewOp::InsertTrackRuntime { key, descriptor } => {
+            crate::view::ViewOp::InsertTrackRuntime {
+                key, descriptor, ..
+            } => {
                 if !matches!(
                     (key, descriptor.id.kind()),
                     (
@@ -227,7 +225,7 @@ impl ShardRuntime {
                     current.link_seq = previous.link_seq;
                 }
             }
-            crate::view::ViewOp::RemoveTrackRuntime { key } => self.retire_track(key.raw()),
+            crate::view::ViewOp::RemoveTrackRuntime { key, .. } => self.retire_track(key.raw()),
             crate::view::ViewOp::InsertUnreliableRuntime { key, id, publisher } => {
                 if let Some(previous) = self.unreliable.get(*key) {
                     debug_assert_eq!(
@@ -275,17 +273,10 @@ impl ShardRuntime {
             crate::view::ViewOp::InstallRoute { .. }
             | crate::view::ViewOp::InstallTransport { .. }
             | crate::view::ViewOp::RetireTransport { .. }
-            | crate::view::ViewOp::InsertParticipant { .. }
+            | crate::view::ViewOp::InsertParticipant
             | crate::view::ViewOp::RemoveParticipant { .. }
-            | crate::view::ViewOp::SetPlan { .. }
-            | crate::view::ViewOp::ApplyPlan { .. }
-            | crate::view::ViewOp::RemovePlan { .. }
-            | crate::view::ViewOp::BindSubscribedTrack { .. }
-            | crate::view::ViewOp::UnbindSubscribedTrack { .. }
             | crate::view::ViewOp::BindSubscribedData { .. }
-            | crate::view::ViewOp::BindSubscribedReliable { .. }
-            | crate::view::ViewOp::AnnounceTrack { .. }
-            | crate::view::ViewOp::WithdrawTrack { .. } => {}
+            | crate::view::ViewOp::BindSubscribedReliable { .. } => {}
         }
     }
 
@@ -455,9 +446,9 @@ impl ShardRuntime {
             return;
         };
         ctx.send_frame(
-            target.handle.shard(),
+            target.shard(),
             ShardFrame::Reverse {
-                env: Envelope::feedback(target.handle),
+                env: Envelope::feedback(target),
                 body: Reverse::DataAck(bytes),
             },
         );
@@ -485,9 +476,9 @@ impl ShardRuntime {
         });
         for remote in plan.remote.values() {
             ctx.send_frame(
-                remote.handle.shard(),
+                remote.shard(),
                 ShardFrame::Telemetry {
-                    env: Envelope::telemetry(remote.handle),
+                    env: Envelope::telemetry(*remote),
                     stats: track.layer_states.clone(),
                 },
             );

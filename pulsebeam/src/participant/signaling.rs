@@ -57,6 +57,7 @@ pub struct Signaling {
     /// is the large set; the bindings are bounded by the subscriber's slots and
     /// are sent whole, so only their shape is kept, to skip an unchanged group.
     previous_participants: HashSet<String>,
+    participants: HashSet<String>,
     previous_publications: HashSet<String>,
     previous_video: Vec<signaling::VideoBinding>,
     previous_audio: Vec<(String, String)>,
@@ -73,6 +74,7 @@ impl Signaling {
             dirty_roster: true,
             dirty_bindings: true,
             previous_participants: HashSet::new(),
+            participants: HashSet::new(),
             previous_publications: HashSet::new(),
             previous_video: Vec::new(),
             previous_audio: Vec::new(),
@@ -228,6 +230,20 @@ impl Signaling {
         self.dirty_bindings = true;
     }
 
+    pub fn apply_participants(
+        &mut self,
+        added: impl IntoIterator<Item = crate::entity::ParticipantId>,
+        removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
+    ) {
+        for participant in added {
+            self.participants.insert(participant.as_str());
+        }
+        for participant in removed {
+            self.participants.remove(&participant.as_str());
+        }
+        self.dirty_roster = true;
+    }
+
     pub fn poll(&mut self, rtc: &mut Rtc, downstream: &DownstreamAllocator) -> bool {
         if !self.dirty_roster && !self.dirty_bindings {
             return false;
@@ -246,12 +262,9 @@ impl Signaling {
         // name an audio track before anybody has heard it.
         let mut publications = Vec::new();
         let mut participants = Vec::new();
-        let mut seen_participants = HashSet::new();
+        let seen_participants = self.participants.clone();
         for meta in downstream.video.tracks().chain(downstream.audio_tracks()) {
             let participant_id = meta.origin.as_str();
-            if seen_participants.insert(participant_id.clone()) {
-                participants.push(participant_id.clone());
-            }
             publications.push(signaling::Publication {
                 track_id: meta.id.as_str(),
                 participant_id,
@@ -264,6 +277,7 @@ impl Signaling {
                 .into(),
             });
         }
+        participants.extend(seen_participants.iter().cloned());
 
         let current_publication_ids: HashSet<String> = publications
             .iter()

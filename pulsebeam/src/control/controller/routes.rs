@@ -31,7 +31,7 @@ impl ControllerActor {
         plan: Option<(crate::plan::PlanKey, crate::plan::FlatTrackPlan)>,
     ) -> Option<RouteHandle> {
         self.publish_with_route(shard_id, "endpoint", move |_, handle| {
-            let mut ops = vec![(
+            let lifecycle = vec![(
                 shard_id,
                 crate::view::ViewOp::InstallRoute {
                     binding: crate::view::RouteBinding {
@@ -40,9 +40,10 @@ impl ControllerActor {
                     },
                 },
             )];
-            ops.extend(
-                plan.map(|(key, plan)| (shard_id, crate::view::ViewOp::SetPlan { key, plan })),
-            );
+            let mut ops = super::GenerationOps::lifecycle(lifecycle);
+            if let Some((key, plan)) = plan {
+                ops = ops.plan(shard_id, key, plan);
+            }
             ops
         })
     }
@@ -81,6 +82,7 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         participant_id: ParticipantId,
+        room_id: crate::entity::RoomId,
     ) -> Option<(TransportHandle, crate::shard::participants::ParticipantKey)> {
         self.drain_core_events().await;
 
@@ -125,7 +127,9 @@ impl ControllerActor {
             return None;
         };
 
-        let Some(_) = self.publish_pending(shard_id, handle, participant_key) else {
+        let Some(_) =
+            self.publish_pending(shard_id, participant_id, room_id, handle, participant_key)
+        else {
             self.abort_transaction(now);
             return None;
         };
@@ -154,24 +158,81 @@ impl ControllerActor {
     pub(super) fn publish_pending(
         &mut self,
         shard_id: crate::id::ShardId,
+        participant_id: ParticipantId,
+        room_id: crate::entity::RoomId,
         handle: TransportHandle,
         participant: crate::shard::participants::ParticipantKey,
     ) -> Option<u64> {
         let generation = self.state.pending().map(|tx| tx.generation)?;
-        let view = self.view_mut(shard_id)?;
-        view.stage(
-            generation,
-            crate::view::ViewOp::InsertParticipant { key: participant },
-        );
-        view.stage(
-            generation,
-            crate::view::ViewOp::InstallTransport {
-                binding: crate::view::TransportBinding {
-                    handle,
-                    participant,
+        let existing = self.core.registry.participants_in_room(&room_id);
+        {
+            let view = self.view_mut(shard_id)?;
+            view.stage(generation, crate::view::ViewOp::InsertParticipant);
+            view.stage(
+                generation,
+                crate::view::ViewOp::InstallTransport {
+                    binding: crate::view::TransportBinding {
+                        handle,
+                        participant,
+                    },
                 },
+            );
+        }
+        for (existing_id, existing_shard, existing_key) in existing {
+            let Some(existing_key) = existing_key else {
+                debug_assert!(false, "a registered participant must have a binding");
+                return None;
+            };
+            let Some(existing_view) = self.view_mut(existing_shard) else {
+                debug_assert!(false, "a room participant must have a live shard view");
+                return None;
+            };
+            existing_view.stage_participant_effect(
+                generation,
+                existing_key,
+                crate::participant::ParticipantEffect::ParticipantsChanged {
+                    added: vec![participant_id],
+                    removed: Vec::new(),
+                },
+            );
+            debug_assert_ne!(existing_id, participant_id);
+        }
+        if !self.publish_staged_views() {
+            return None;
+        }
+        Some(generation)
+    }
+
+    pub(super) fn publish_participant_roster(
+        &mut self,
+        room_id: crate::entity::RoomId,
+        participant_id: ParticipantId,
+        participant: crate::shard::participants::ParticipantKey,
+    ) {
+        let Some(shard_id) = self
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .map(|meta| meta.shard_id)
+        else {
+            debug_assert!(false, "a materialized participant must be registered");
+            return;
+        };
+        let participant_ids = self
+            .core
+            .registry
+            .participant_ids_in_room(&room_id)
+            .into_iter()
+            .filter(|id| *id != participant_id)
+            .collect();
+        let ops = super::GenerationOps::lifecycle(Vec::new()).participant_effect(
+            shard_id,
+            participant,
+            crate::participant::ParticipantEffect::ParticipantsChanged {
+                added: participant_ids,
+                removed: Vec::new(),
             },
         );
-        view.publish()
+        self.publish_generation(ops);
     }
 }
