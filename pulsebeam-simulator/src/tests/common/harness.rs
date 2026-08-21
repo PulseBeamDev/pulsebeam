@@ -328,6 +328,25 @@ pub enum Step {
         description: &'static str,
         duration: Duration,
     },
+    StallController {
+        duration: Duration,
+    },
+    SendToWrongShard {
+        description: &'static str,
+        participant: &'static str,
+    },
+    /// Force the next `count` reaches of a buggify site to fire.
+    ///
+    /// The probability decides where failures land, not whether any do; this
+    /// guarantees the plan exercises the recovery path at every seed.
+    ForceFailure {
+        description: &'static str,
+        site: &'static str,
+        count: u32,
+    },
+    FailNextMaterialization {
+        description: &'static str,
+    },
 
     // ── Network ───────────────────────────────────────────────────────────
     Partition {
@@ -501,6 +520,33 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         max: u64,
+    },
+    /// Assert the publisher received at least `min` keyframe requests.
+    CheckKeyframeRequestsAtLeast {
+        description: &'static str,
+        participant: &'static str,
+        min: u64,
+    },
+    CheckRoutingCounter {
+        description: &'static str,
+        name: &'static str,
+        exact: u64,
+    },
+    CheckRoutingCounterAtLeast {
+        description: &'static str,
+        name: &'static str,
+        min: u64,
+    },
+    /// Assert a routing counter stops climbing over `over`.
+    ///
+    /// Steering is a cache, so cross-shard forwarding is expected while a flow
+    /// bootstraps and expected to stop once the flow is pinned. A rate that
+    /// never reaches zero means the map is not being populated, which no
+    /// total-count assertion can distinguish from ordinary bootstrap traffic.
+    CheckRoutingCounterSettles {
+        description: &'static str,
+        name: &'static str,
+        over: Duration,
     },
     /// Assert the participant has an active peer connection.
     CheckConnected {
@@ -1283,6 +1329,10 @@ async fn run_participant(
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Run { .. } => "Run",
+        Step::StallController { .. } => "StallController",
+        Step::SendToWrongShard { .. } => "SendToWrongShard",
+        Step::FailNextMaterialization { .. } => "FailNextMaterialization",
+        Step::ForceFailure { .. } => "ForceFailure",
         Step::Partition { .. } => "Partition",
         Step::Repair { .. } => "Repair",
         Step::Hold { .. } => "Hold",
@@ -1304,6 +1354,10 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
+        Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
+        Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
+        Step::CheckRoutingCounterAtLeast { .. } => "CheckRoutingCounterAtLeast",
+        Step::CheckRoutingCounterSettles { .. } => "CheckRoutingCounterSettles",
         Step::CheckMediaRouted { .. } => "CheckMediaRouted",
         Step::CheckParticipantsKnown { .. } => "CheckParticipantsKnown",
         Step::CheckIdentityStable { .. } => "CheckIdentityStable",
@@ -1334,10 +1388,13 @@ fn step_name(step: &Step) -> &'static str {
     }
 }
 
+type PlanHandles = BTreeMap<&'static str, ParticipantHandle>;
+type PlanIps = BTreeMap<&'static str, IpAddr>;
+
 async fn execute_plan(
     plan: Vec<Step>,
-    handles: &mut HashMap<&'static str, ParticipantHandle>,
-    name_to_ip: &HashMap<&'static str, IpAddr>,
+    handles: &mut PlanHandles,
+    name_to_ip: &PlanIps,
     reports: &Mutex<HashMap<&'static str, LinkReport>>,
 ) -> anyhow::Result<()> {
     let total = plan.len();
@@ -1369,6 +1426,41 @@ async fn execute_plan(
                 if *duration >= ROOM_SETTLE_FLOOR {
                     assert_room_state_consistent(handles, description);
                 }
+            }
+
+            Step::StallController { duration } => {
+                tracing::info!("[step {n}/{total}: {kind}] controller stalled for {duration:?}");
+                pulsebeam::sim_metrics::request_controller_stall(*duration);
+                tokio::time::sleep(*duration).await;
+            }
+
+            Step::SendToWrongShard {
+                description,
+                participant,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let _ = get_handle(handles, participant, description)?;
+                let source = resolve(name_to_ip, participant, description)?;
+                pulsebeam_runtime::net::set_wrong_owner_injection(source);
+                handles
+                    .get(participant)
+                    .expect("participant was resolved above")
+                    .send_command(ParticipantCmd::Reconnect);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            Step::ForceFailure {
+                description,
+                site,
+                count,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({site} x{count})");
+                pulsebeam_runtime::buggify::force(site, *count);
+            }
+
+            Step::FailNextMaterialization { description } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\"");
+                pulsebeam::sim_metrics::fail_next_materialization();
             }
 
             Step::Report {
@@ -1923,6 +2015,65 @@ async fn execute_plan(
                 );
             }
 
+            Step::CheckKeyframeRequestsAtLeast {
+                description,
+                participant,
+                min,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, min {min})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let actual = handle.keyframe_requests();
+                assert!(
+                    actual >= *min,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {min} keyframe (PLI) requests\n  actual:       {actual}"
+                );
+            }
+
+            Step::CheckRoutingCounter {
+                description,
+                name,
+                exact,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name})");
+                let actual = pulsebeam::sim_metrics::routing_counter(name);
+                assert_eq!(
+                    actual, *exact,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     exactly {exact}\n  actual:       {actual}"
+                );
+            }
+
+            Step::CheckRoutingCounterAtLeast {
+                description,
+                name,
+                min,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name})");
+                let actual = pulsebeam::sim_metrics::routing_counter(name);
+                assert!(
+                    actual >= *min,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     at least {min}\n  actual:       {actual}"
+                );
+            }
+
+            Step::CheckRoutingCounterSettles {
+                description,
+                name,
+                over,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name}, {over:?})");
+                let before = pulsebeam::sim_metrics::routing_counter(name);
+                tokio::time::sleep(*over).await;
+                let after = pulsebeam::sim_metrics::routing_counter(name);
+                assert_eq!(
+                    before,
+                    after,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     no change over {over:?}\n  actual:       climbed by {}",
+                    after.saturating_sub(before)
+                );
+            }
+
             Step::CheckRxBytes {
                 description,
                 participant,
@@ -2335,18 +2486,14 @@ async fn execute_plan(
     Ok(())
 }
 
-fn resolve(
-    map: &HashMap<&'static str, IpAddr>,
-    name: &str,
-    step_desc: &str,
-) -> anyhow::Result<IpAddr> {
+fn resolve(map: &PlanIps, name: &str, step_desc: &str) -> anyhow::Result<IpAddr> {
     map.get(name).copied().ok_or_else(|| {
         anyhow::anyhow!("step \"{step_desc}\": unknown participant/endpoint name \"{name}\"")
     })
 }
 
 fn get_handle<'a>(
-    handles: &'a mut HashMap<&'static str, ParticipantHandle>,
+    handles: &'a mut PlanHandles,
     name: &str,
     step_desc: &str,
 ) -> anyhow::Result<&'a mut ParticipantHandle> {
@@ -2366,7 +2513,7 @@ fn get_handle<'a>(
 /// Deliberately only the *safety* half. "Everyone who should be known is known" is liveness and
 /// depends on discovery timing, which would make this flake; what it asserts is that nothing is
 /// known that should not be, and that whatever is known is described correctly.
-fn assert_room_state_consistent(handles: &HashMap<&'static str, ParticipantHandle>, after: &str) {
+fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
     // Every participant id the plan has ever created, and what it means now.
     #[derive(Clone, Copy)]
     enum Identity {
@@ -3046,7 +3193,7 @@ fn check_property(
     handle: &ParticipantHandle,
     ip: IpAddr,
     window: Duration,
-    handles: &HashMap<&'static str, ParticipantHandle>,
+    handles: &PlanHandles,
 ) -> Result<(), String> {
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
@@ -3416,7 +3563,17 @@ pub struct LinkProfile {
     /// return path clean, which is the right choice only when a plan is deliberately isolating
     /// the forward direction.
     pub feedback: Option<FeedbackProfile>,
+    /// How long the receiver may coalesce same-source datagrams into one GRO
+    /// batch.
+    ///
+    /// A NAPI poll interval, so it belongs to the NIC rather than to the shard
+    /// scheduler — pinning it to the timer quantum only looked right while the
+    /// two happened to share a value.
+    pub gro_window: Duration,
 }
+
+/// See [`LinkProfile::gro_window`].
+pub const GRO_WINDOW: Duration = Duration::from_micros(100);
 
 /// Impairment on the path carrying transport feedback back to the SFU.
 #[derive(Clone, Copy, Debug, Default)]
@@ -3455,6 +3612,7 @@ impl LinkProfile {
             reorder: Reorder::NONE,
             duplicate: 0.0,
             feedback: None,
+            gro_window: GRO_WINDOW,
         }
     }
 
@@ -3469,6 +3627,7 @@ impl LinkProfile {
             reorder: Reorder::occasional(),
             duplicate: 0.0005,
             feedback: Some(FeedbackProfile::wifi()),
+            gro_window: GRO_WINDOW,
         }
     }
 
@@ -3484,6 +3643,7 @@ impl LinkProfile {
             reorder: Reorder::occasional(),
             duplicate: 0.001,
             feedback: Some(FeedbackProfile::cellular()),
+            gro_window: GRO_WINDOW,
         }
     }
 }
@@ -3524,7 +3684,7 @@ impl LocalNodeSim {
     pub fn new() -> Self {
         Self {
             rooms: Vec::new(),
-            tick_duration: Duration::from_millis(1),
+            tick_duration: pulsebeam_runtime::SHARD_TIMER_QUANTUM,
             rng_seed: super::sim_seed(),
             subnet: None,
             tcp_only: false,
@@ -3625,6 +3785,7 @@ impl LocalNodeSim {
         // real clock is back in force before the runtime tears down.
         let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
         crate::sim_rand::set_thread_rng(self.rng_seed);
+        fastrand::seed(self.rng_seed);
         // Loss, reordering and duplication come from the shaper's own stream, not
         // from turmoil's RNG, so it has to be seeded too or a sweep replays one
         // impairment pattern under every seed.
@@ -3671,9 +3832,10 @@ impl LocalNodeSim {
                 .map_err(Into::into)
         });
 
-        let mut handles: HashMap<&'static str, ParticipantHandle> = HashMap::new();
-        let mut name_to_ip: HashMap<&'static str, IpAddr> = HashMap::new();
+        let mut handles = PlanHandles::new();
+        let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
+        pulsebeam_runtime::net::shaper::set_gro_window(server_ip, self.link.gro_window);
 
         // Impairment is keyed by destination, so configuring the SFU's address is what degrades
         // the client-to-SFU direction - the one carrying transport feedback. Leaving it clean
@@ -3692,6 +3854,7 @@ impl LocalNodeSim {
                 ip_counter += 1;
 
                 name_to_ip.insert(participant.name, ip);
+                pulsebeam_runtime::net::shaper::set_gro_window(ip, self.link.gro_window);
                 // The runtime shaper sits on the SFU's egress socket, so this models loss and
                 // bandwidth on the path to the participant. Client UDP sockets bypass it; do not
                 // configure a misleading "server" destination here.

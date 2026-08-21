@@ -47,6 +47,31 @@ use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+#[test]
+/// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
+fn sharding_differential_preserves_the_media_contract() {
+    for shards in [1, 2, 4, 8] {
+        LocalNodeSim::new()
+            .with_shards(shards)
+            .with_room(
+                Room::new("sharding-differential")
+                    .with_participant(Participant::single_publisher("publisher"))
+                    .with_participant(Participant::subscriber("subscriber")),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "establish the same media contract",
+                    duration: Duration::from_secs(8),
+                },
+                Step::CheckRxBytes {
+                    description: "the subscriber is served at every shard count",
+                    participant: "subscriber",
+                    min_bytes: 1,
+                },
+            ]);
+    }
+}
+
 /// The simulcast ladder every plan here publishes, and the single-layer screen share rate.
 const LADDER_Q_BPS: u64 = 150_000;
 const LADDER_H_BPS: u64 = 400_000;

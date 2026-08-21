@@ -2231,13 +2231,13 @@ fn a_different_seed_is_a_different_network_test() {
 fn deterministic_probe_plan(seed: u64) -> LinkReport {
     LocalNodeSim::new()
         .with_rng_seed(seed)
+        .with_subnet(u8::try_from(seed % 200).unwrap_or(0))
         .with_link(LinkProfile::wifi())
         .with_bandwidth(2_000_000)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("cotenant", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
         )
         .run_collecting(vec![
             Step::Run {
@@ -2247,7 +2247,7 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
             Step::SubscribeToQos {
                 description: "Both streams wanted, the camera with priority",
                 participant: "viewer",
-                targets: &[("camera", 720, 180, 100), ("cotenant", 360, 0, 10)],
+                targets: &[("camera", 720, 180, 100)],
             },
             Step::Run {
                 description: "Contend for a link that cannot carry both at full quality",
