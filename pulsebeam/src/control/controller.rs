@@ -1037,6 +1037,9 @@ impl ControllerActor {
             if identity.kind() == TrackKind::Data && member.subscriber == identity.publisher {
                 continue;
             }
+            if identity.kind() != TrackKind::Data && member.subscriber == identity.publisher {
+                continue;
+            }
             let Some(meta) = self.core.registry.get_participant(&member.subscriber) else {
                 continue;
             };
@@ -1058,11 +1061,32 @@ impl ControllerActor {
             );
         }
         if identity.kind() != TrackKind::Data {
+            if let Some(meta) = self.core.registry.get_participant(&identity.publisher)
+                && let Some(participant) = meta.binding
+                && let Some(source_key) = self
+                    .track_allocations
+                    .get(&(identity, meta.shard_id))
+                    .map(|allocation| allocation.key)
+                    .or_else(|| self.track_keys.get(&identity).copied())
+            {
+                self.stage_participant_at(
+                    meta.shard_id,
+                    generation,
+                    participant,
+                    crate::participant::ParticipantEffect::TrackSourceUnbound {
+                        key: source_key,
+                        track_id: identity.id,
+                    },
+                );
+            }
             for participant in self
                 .core
                 .registry
                 .participant_ids_in_room(&identity.room_id)
             {
+                if participant == identity.publisher {
+                    continue;
+                }
                 if !removed.insert(participant) {
                     continue;
                 }

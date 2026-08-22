@@ -17,6 +17,10 @@ pub enum ParticipantEffect {
         key: TrackKey,
         track_id: crate::entity::TrackId,
     },
+    TrackSourceUnbound {
+        key: TrackKey,
+        track_id: crate::entity::TrackId,
+    },
     TrackRemoved(TrackKey),
     TrackPublished {
         topic: Topic,

@@ -451,6 +451,12 @@ impl ParticipantCore {
                 self.track_keys.insert(track_id, key);
                 self.incoming_rtp_routes.bind_fanout(track_id, key);
             }
+            ParticipantEffect::TrackSourceUnbound { key, track_id } => {
+                if self.track_keys.get(&track_id) == Some(&key) {
+                    let _ = self.track_keys.remove(&track_id);
+                    self.incoming_rtp_routes.remove_track(track_id);
+                }
+            }
             ParticipantEffect::TrackRemoved(key) => self.remove_compiled_track(key),
             ParticipantEffect::TrackPublished { topic, key, lane } => match lane {
                 DataLane::Realtime => self.bind_published_data_stream(&topic, key),
