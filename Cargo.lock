@@ -2966,7 +2966,13 @@ dependencies = [
 name = "pulsebeam-agent-web"
 version = "0.3.2"
 dependencies = [
+ "futures-lite",
+ "js-sys",
  "pulsebeam-agent-core",
+ "pulsebeam-proto",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
