@@ -234,6 +234,7 @@ impl ShardCore {
                         continue;
                     };
                     meta.apply(effect.clone());
+                    self.dirty.mark(*participant, meta);
                 }
                 for op in delta.lifecycle.iter().filter(|op| {
                     !is_retire(op)
@@ -284,6 +285,7 @@ impl ShardCore {
                 continue;
             };
             meta.apply(effect);
+            self.dirty.mark(participant, meta);
         }
     }
 

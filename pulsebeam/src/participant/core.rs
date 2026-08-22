@@ -480,6 +480,9 @@ impl ParticipantCore {
         if let Some(previous) = self.catalog.get(key) {
             debug_assert_eq!(previous.track_id, track_id);
             debug_assert_eq!(previous.participant_id, participant_id);
+            if participant_id != self.participant_id && track_id.kind() != TrackKind::Data {
+                self.signaling.mark_assignments_dirty();
+            }
             return;
         }
         let previous = self.catalog.insert(

@@ -978,7 +978,7 @@ impl ControllerActor {
             .registry
             .participant_ids_in_room(&room_id)
             .into_iter()
-            .filter(|participant| Some(*participant) != removed)
+            .filter(|participant| Some(*participant) != added && Some(*participant) != removed)
             .collect();
         for participant in participants {
             let Some(meta) = self.core.registry.get_participant(&participant) else {
@@ -1277,7 +1277,13 @@ impl ControllerActor {
         if let Some(meta) = self.core.registry.get_participant(&participant_id)
             && let Some(key) = meta.binding
         {
-            let participants = self.core.registry.participant_ids_in_room(&room_id);
+            let participants = self
+                .core
+                .registry
+                .participant_ids_in_room(&room_id)
+                .into_iter()
+                .filter(|participant| *participant != participant_id)
+                .collect();
             self.stage_participant_at(
                 meta.shard_id,
                 generation,
