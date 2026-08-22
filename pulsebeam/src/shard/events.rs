@@ -5,7 +5,7 @@ use str0m::channel::ChannelId;
 use str0m::media::KeyframeRequestKind;
 
 use super::worker::ShardEvent;
-use crate::entity::{ParticipantId, RoomId, TrackId};
+use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::participant::RoutedTrackPacket;
 use crate::participant::event::ParticipantSink;
@@ -304,14 +304,29 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_rtp(&mut self, fanout: Option<TrackKey>, pkt: RtpPacket) {
+    fn publish_rtp(&mut self, fanout: Option<TrackKey>, kind: TrackKind, pkt: RtpPacket) {
         let Some(key) = fanout else {
             return;
         };
-        self.pipeline.track_queue.push_back(RoutedTrackPacket {
-            key,
-            packet: Box::new(pkt),
-        });
+        let packet = match kind {
+            TrackKind::Audio => {
+                crate::participant::TrackPacket::Audio(crate::participant::AudioPacket {
+                    packet: Box::new(pkt),
+                })
+            }
+            TrackKind::Video => {
+                crate::participant::TrackPacket::Video(crate::participant::VideoPacket {
+                    packet: Box::new(pkt),
+                })
+            }
+            TrackKind::Data => {
+                debug_assert!(false, "data tracks must use a data packet path");
+                return;
+            }
+        };
+        self.pipeline
+            .track_queue
+            .push_back(RoutedTrackPacket { key, packet });
     }
 
     #[inline]
@@ -432,8 +447,16 @@ mod tests {
         let who = identity();
 
         let mut sink = pipeline.participant_sink(who);
-        sink.publish_rtp(Some(TrackKey::default()), RtpPacket::default());
-        sink.publish_rtp(Some(TrackKey::default()), RtpPacket::default());
+        sink.publish_rtp(
+            Some(TrackKey::default()),
+            TrackKind::Video,
+            RtpPacket::default(),
+        );
+        sink.publish_rtp(
+            Some(TrackKey::default()),
+            TrackKind::Video,
+            RtpPacket::default(),
+        );
         sink.publish_sctp(Topic::for_test("t"), None, vec![1]);
         sink.exit();
 
@@ -490,9 +513,11 @@ mod tests {
         assert!(pipeline.pop_shard_event().is_some());
         assert!(!pipeline.has_pending());
 
-        pipeline
-            .participant_sink(who)
-            .publish_rtp(Some(TrackKey::default()), RtpPacket::default());
+        pipeline.participant_sink(who).publish_rtp(
+            Some(TrackKey::default()),
+            TrackKind::Video,
+            RtpPacket::default(),
+        );
         assert!(pipeline.has_pending(), "so is a track packet");
         assert!(pipeline.pop_track().is_some());
         assert!(!pipeline.has_pending(), "and draining it clears the flag");

@@ -1,4 +1,4 @@
-use crate::entity::{ParticipantId, TrackId};
+use crate::entity::{ParticipantId, TrackId, TrackKind};
 use crate::keys::DownstreamSlotKey;
 use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::rtp::RtpPacket;
@@ -35,7 +35,7 @@ pub trait ParticipantSink {
     fn request_keyframe(&mut self, layer: &TrackLayer, fanout: Option<TrackKey>);
     fn exit(&mut self);
 
-    fn publish_rtp(&mut self, fanout: Option<TrackKey>, pkt: RtpPacket);
+    fn publish_rtp(&mut self, fanout: Option<TrackKey>, kind: TrackKind, pkt: RtpPacket);
     fn publish_sctp(&mut self, topic: Topic, stream: Option<UnreliableStreamKey>, pkt: Vec<u8>);
 
     fn publish_reliable_data_topic(&mut self, topic: Topic);
@@ -149,7 +149,7 @@ pub mod test_utils {
             self.exit_count = self.exit_count.saturating_add(1);
         }
 
-        fn publish_rtp(&mut self, fanout: Option<TrackKey>, _pkt: RtpPacket) {
+        fn publish_rtp(&mut self, fanout: Option<TrackKey>, _kind: TrackKind, _pkt: RtpPacket) {
             if let Some(key) = fanout {
                 self.publish_rtp_calls.push(key);
             }

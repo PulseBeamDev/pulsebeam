@@ -1561,7 +1561,11 @@ impl ParticipantCore {
             &mut rtp,
             sr,
         ) {
-            events.publish_rtp(route.fanout, rtp);
+            let kind = match media.kind() {
+                MediaKind::Audio => TrackKind::Audio,
+                MediaKind::Video => TrackKind::Video,
+            };
+            events.publish_rtp(route.fanout, kind, rtp);
         } else {
             self.incoming_rtp_routes.remove(ssrc);
         }

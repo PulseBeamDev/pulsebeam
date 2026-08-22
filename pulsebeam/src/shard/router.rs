@@ -5,7 +5,9 @@ use crate::clock::WallAnchor;
 use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
 use crate::keys::{AudioTrackKey, ParticipantKey, VideoTrackKey};
-use crate::participant::{ParticipantInput, RoutedTrackPacket};
+use crate::participant::{
+    AudioPacket, ParticipantInput, RoutedTrackPacket, TrackPacket, VideoPacket,
+};
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use crate::track::Topic;
@@ -343,7 +345,9 @@ impl ShardRuntime {
             || {
                 MediaPayload::Track(RoutedTrackPacket {
                     key: fanout.raw(),
-                    packet: Box::new(packet.to_transit()),
+                    packet: TrackPacket::Video(VideoPacket {
+                        packet: Box::new(packet.to_transit()),
+                    }),
                 })
             },
             ctx.router,
@@ -382,7 +386,9 @@ impl ShardRuntime {
                 || {
                     MediaPayload::Track(RoutedTrackPacket {
                         key: track.raw(),
-                        packet: Box::new(pkt.to_transit()),
+                        packet: TrackPacket::Audio(AudioPacket {
+                            packet: Box::new(pkt.to_transit()),
+                        }),
                     })
                 },
                 ctx.router,

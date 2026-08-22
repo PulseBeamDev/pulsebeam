@@ -26,5 +26,18 @@ pub struct VideoPacket {
 #[derive(Debug, Clone)]
 pub struct RoutedTrackPacket {
     pub key: TrackKey,
-    pub packet: Box<RtpPacket>,
+    pub packet: TrackPacket,
+}
+
+impl RoutedTrackPacket {
+    pub fn into_rtp(self) -> Option<Box<RtpPacket>> {
+        match self.packet {
+            TrackPacket::Audio(packet) => Some(packet.packet),
+            TrackPacket::Video(packet) => Some(packet.packet),
+            TrackPacket::Data(_) => {
+                debug_assert!(false, "a routed data packet cannot enter the RTP path");
+                None
+            }
+        }
+    }
 }

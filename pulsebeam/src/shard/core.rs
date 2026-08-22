@@ -385,7 +385,9 @@ impl ShardCore {
                         return;
                     }
                 };
-                let mut pkt = packet.packet;
+                let Some(mut pkt) = packet.into_rtp() else {
+                    return;
+                };
                 let Some(plan) = plans.get(crate::plan::PlanKey::Track(key)) else {
                     record_routing_drop("track", "plan", "remote");
                     return;
@@ -534,8 +536,12 @@ impl ShardCore {
                 wall: &self.wall,
                 router,
             };
+            let key = ev.key;
+            let Some(packet) = ev.into_rtp() else {
+                continue;
+            };
             self.runtime
-                .route_rtp_with_plan(ev.key, Origin::Local, *ev.packet, plan, &mut ctx);
+                .route_rtp_with_plan(key, Origin::Local, *packet, plan, &mut ctx);
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_data_sctp() else {
