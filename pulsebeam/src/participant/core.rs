@@ -493,6 +493,8 @@ impl ParticipantCore {
         let Some(binding) = self.catalog.remove(key) else {
             return;
         };
+        self.data.forwarding.remove(key);
+        self.data.reliable_forwarding.remove(key);
         if self.track_keys.get(&binding.track_id) == Some(&key) {
             let _ = self.track_keys.remove(&binding.track_id);
         }

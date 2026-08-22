@@ -35,7 +35,7 @@ impl TrackIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TrackSelector {
     Exact(TrackIdentity),
     RoomKind {
@@ -47,47 +47,101 @@ pub(crate) enum TrackSelector {
         publisher: ParticipantId,
         kind: TrackKind,
     },
+    DataTopic {
+        room_id: RoomId,
+        publisher: Option<ParticipantId>,
+        label: String,
+    },
 }
 
 impl TrackSelector {
-    fn matches(self, track: TrackIdentity) -> bool {
+    fn matches(&self, track: TrackIdentity, data_label: Option<&str>) -> bool {
         match self {
-            Self::Exact(identity) => identity == track,
-            Self::RoomKind { room_id, kind } => track.room_id == room_id && track.kind() == kind,
+            Self::Exact(identity) => *identity == track,
+            Self::RoomKind { room_id, kind } => track.room_id == *room_id && track.kind() == *kind,
             Self::PublisherKind {
                 room_id,
                 publisher,
                 kind,
-            } => track.room_id == room_id && track.publisher == publisher && track.kind() == kind,
+            } => {
+                track.room_id == *room_id && track.publisher == *publisher && track.kind() == *kind
+            }
+            Self::DataTopic {
+                room_id,
+                publisher,
+                label,
+            } => {
+                track.room_id == *room_id
+                    && track.kind() == TrackKind::Data
+                    && publisher.is_none_or(|expected| track.publisher == expected)
+                    && data_label == Some(label.as_str())
+            }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Subscription {
     pub id: SubscriptionId,
     pub subscriber: ParticipantId,
     pub selector: TrackSelector,
+    pub data: Option<DataSubscription>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataSubscription {
+    pub channel: str0m::channel::ChannelId,
+    pub lane: crate::track::DataLane,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct TrackTopology {
     tracks: HashMap<TrackIdentity, Track>,
+    data_labels: HashMap<TrackIdentity, String>,
+    data_publications: HashMap<TrackIdentity, (crate::track::Topic, crate::track::DataLane)>,
     subscriptions: SlotMap<SubscriptionId, Subscription>,
     by_room_kind: HashMap<(RoomId, TrackKind), HashSet<SubscriptionId>>,
+    by_publisher_kind: HashMap<(RoomId, ParticipantId, TrackKind), HashSet<SubscriptionId>>,
+    by_identity: HashMap<TrackIdentity, HashSet<SubscriptionId>>,
+    by_data_label: HashMap<(RoomId, String), HashSet<SubscriptionId>>,
 }
 
 impl TrackTopology {
     pub(crate) fn publish(&mut self, track: Track) -> Option<TrackIdentity> {
+        self.publish_with_label(track, None)
+    }
+
+    pub(crate) fn publish_with_label(
+        &mut self,
+        track: Track,
+        data_label: Option<String>,
+    ) -> Option<TrackIdentity> {
         let identity = TrackIdentity::from_track(&track);
         if self.tracks.insert(identity, track).is_some() {
             debug_assert!(false, "a track identity must be published once");
             return None;
         }
+        if let Some(label) = data_label {
+            self.data_labels.insert(identity, label);
+        }
+        Some(identity)
+    }
+
+    pub(crate) fn publish_data(
+        &mut self,
+        track: Track,
+        topic: crate::track::Topic,
+        lane: crate::track::DataLane,
+    ) -> Option<TrackIdentity> {
+        let label = crate::track::publication_label(lane, &topic);
+        let identity = self.publish_with_label(track, Some(label))?;
+        self.data_publications.insert(identity, (topic, lane));
         Some(identity)
     }
 
     pub(crate) fn unpublish(&mut self, identity: TrackIdentity) -> Option<Track> {
+        self.data_labels.remove(&identity);
+        self.data_publications.remove(&identity);
         self.tracks.remove(&identity)
     }
 
@@ -99,27 +153,81 @@ impl TrackTopology {
         self.tracks.get_mut(&identity)
     }
 
+    pub(crate) fn data_publication(
+        &self,
+        identity: TrackIdentity,
+    ) -> Option<&(crate::track::Topic, crate::track::DataLane)> {
+        self.data_publications.get(&identity)
+    }
+
     pub(crate) fn subscribe(
         &mut self,
         subscriber: ParticipantId,
         selector: TrackSelector,
     ) -> SubscriptionId {
+        self.subscribe_with_data(subscriber, selector, None)
+    }
+
+    pub(crate) fn subscribe_data(
+        &mut self,
+        subscriber: ParticipantId,
+        selector: TrackSelector,
+        channel: str0m::channel::ChannelId,
+        lane: crate::track::DataLane,
+    ) -> SubscriptionId {
+        self.subscribe_with_data(
+            subscriber,
+            selector,
+            Some(DataSubscription { channel, lane }),
+        )
+    }
+
+    fn subscribe_with_data(
+        &mut self,
+        subscriber: ParticipantId,
+        selector: TrackSelector,
+        data: Option<DataSubscription>,
+    ) -> SubscriptionId {
         let id = self.subscriptions.insert_with_key(|id| Subscription {
             id,
             subscriber,
-            selector,
+            selector: selector.clone(),
+            data,
         });
-        let (room_id, kind) = match selector {
-            TrackSelector::Exact(identity) => (identity.room_id, identity.kind()),
-            TrackSelector::RoomKind { room_id, kind }
-            | TrackSelector::PublisherKind { room_id, kind, .. } => (room_id, kind),
-        };
-        let inserted = self
-            .by_room_kind
-            .entry((room_id, kind))
-            .or_default()
-            .insert(id);
-        debug_assert!(inserted);
+        match &selector {
+            TrackSelector::Exact(identity) => {
+                let inserted = self.by_identity.entry(*identity).or_default().insert(id);
+                debug_assert!(inserted);
+            }
+            TrackSelector::RoomKind { room_id, kind } => {
+                let inserted = self
+                    .by_room_kind
+                    .entry((*room_id, *kind))
+                    .or_default()
+                    .insert(id);
+                debug_assert!(inserted);
+            }
+            TrackSelector::PublisherKind {
+                room_id,
+                publisher,
+                kind,
+            } => {
+                let inserted = self
+                    .by_publisher_kind
+                    .entry((*room_id, *publisher, *kind))
+                    .or_default()
+                    .insert(id);
+                debug_assert!(inserted);
+            }
+            TrackSelector::DataTopic { room_id, label, .. } => {
+                let inserted = self
+                    .by_data_label
+                    .entry((*room_id, label.clone()))
+                    .or_default()
+                    .insert(id);
+                debug_assert!(inserted);
+            }
+        }
         id
     }
 
@@ -128,63 +236,100 @@ impl TrackTopology {
         subscriber: ParticipantId,
         selector: TrackSelector,
     ) -> bool {
+        self.remove_matching(subscriber, selector).is_some()
+    }
+
+    pub(crate) fn remove_matching(
+        &mut self,
+        subscriber: ParticipantId,
+        selector: TrackSelector,
+    ) -> Option<Subscription> {
         let id = self.subscriptions.iter().find_map(|(id, subscription)| {
             (subscription.subscriber == subscriber && subscription.selector == selector)
                 .then_some(id)
         });
-        let Some(id) = id else { return false };
-        self.remove_subscription(id)
-    }
-
-    fn remove_subscription(&mut self, id: SubscriptionId) -> bool {
-        let Some(subscription) = self.subscriptions.remove(id) else {
-            debug_assert!(false, "subscription index must contain its slot");
-            return false;
-        };
-        let (room_id, kind) = match subscription.selector {
-            TrackSelector::Exact(identity) => (identity.room_id, identity.kind()),
-            TrackSelector::RoomKind { room_id, kind }
-            | TrackSelector::PublisherKind { room_id, kind, .. } => (room_id, kind),
-        };
-        if let Some(ids) = self.by_room_kind.get_mut(&(room_id, kind)) {
-            let removed = ids.remove(&id);
-            debug_assert!(removed);
-            if ids.is_empty() {
-                self.by_room_kind.remove(&(room_id, kind));
-            }
-        }
-        true
+        let id = id?;
+        let subscription = self.subscriptions.remove(id)?;
+        self.unindex(&subscription.selector, id);
+        Some(subscription)
     }
 
     pub(crate) fn unsubscribe(&mut self, id: SubscriptionId) -> Option<Subscription> {
         let subscription = self.subscriptions.remove(id)?;
-        let (room_id, kind) = match subscription.selector {
-            TrackSelector::Exact(identity) => (identity.room_id, identity.kind()),
-            TrackSelector::RoomKind { room_id, kind }
-            | TrackSelector::PublisherKind { room_id, kind, .. } => (room_id, kind),
-        };
-        let Some(index) = self.by_room_kind.get_mut(&(room_id, kind)) else {
-            debug_assert!(false, "subscription index must contain every subscription");
-            return Some(subscription);
-        };
-        debug_assert!(index.remove(&id));
-        if index.is_empty() {
-            self.by_room_kind.remove(&(room_id, kind));
-        }
+        self.unindex(&subscription.selector, id);
         Some(subscription)
+    }
+
+    fn unindex(&mut self, selector: &TrackSelector, id: SubscriptionId) {
+        let removed = match selector {
+            TrackSelector::Exact(identity) => {
+                Self::remove_indexed(&mut self.by_identity, *identity, id)
+            }
+            TrackSelector::RoomKind { room_id, kind } => {
+                Self::remove_indexed(&mut self.by_room_kind, (*room_id, *kind), id)
+            }
+            TrackSelector::PublisherKind {
+                room_id,
+                publisher,
+                kind,
+            } => Self::remove_indexed(
+                &mut self.by_publisher_kind,
+                (*room_id, *publisher, *kind),
+                id,
+            ),
+            TrackSelector::DataTopic { room_id, label, .. } => {
+                Self::remove_indexed(&mut self.by_data_label, (*room_id, label.clone()), id)
+            }
+        };
+        debug_assert!(
+            removed,
+            "subscription index must contain every subscription"
+        );
+    }
+
+    fn remove_indexed<K: Eq + std::hash::Hash>(
+        index: &mut HashMap<K, HashSet<SubscriptionId>>,
+        key: K,
+        id: SubscriptionId,
+    ) -> bool {
+        let Some(ids) = index.get_mut(&key) else {
+            return false;
+        };
+        let removed = ids.remove(&id);
+        if ids.is_empty() {
+            index.remove(&key);
+        }
+        removed
     }
 
     pub(crate) fn matches(
         &self,
         identity: TrackIdentity,
     ) -> impl Iterator<Item = Subscription> + '_ {
-        self.by_room_kind
-            .get(&(identity.room_id, identity.kind()))
+        let mut candidates = HashSet::new();
+        if let Some(ids) = self.by_room_kind.get(&(identity.room_id, identity.kind())) {
+            candidates.extend(ids.iter().copied());
+        }
+        if let Some(ids) =
+            self.by_publisher_kind
+                .get(&(identity.room_id, identity.publisher, identity.kind()))
+        {
+            candidates.extend(ids.iter().copied());
+        }
+        if let Some(ids) = self.by_identity.get(&identity) {
+            candidates.extend(ids.iter().copied());
+        }
+        if let Some(label) = self.data_labels.get(&identity)
+            && let Some(ids) = self.by_data_label.get(&(identity.room_id, label.clone()))
+        {
+            candidates.extend(ids.iter().copied());
+        }
+        let data_label = self.data_labels.get(&identity).map(String::as_str);
+        candidates
             .into_iter()
-            .flat_map(|ids| ids.iter())
-            .filter_map(|id| self.subscriptions.get(*id))
-            .copied()
-            .filter(move |subscription| subscription.selector.matches(identity))
+            .filter_map(|id| self.subscriptions.get(id))
+            .cloned()
+            .filter(move |subscription| subscription.selector.matches(identity, data_label))
     }
 
     pub(crate) fn contains(&self, identity: TrackIdentity) -> bool {
@@ -216,6 +361,10 @@ impl TrackTopology {
             let _ = self.unsubscribe(id);
         }
         self.tracks
+            .retain(|identity, _| identity.publisher != participant);
+        self.data_labels
+            .retain(|identity, _| identity.publisher != participant);
+        self.data_publications
             .retain(|identity, _| identity.publisher != participant);
     }
 }
@@ -338,15 +487,54 @@ mod tests {
     }
 
     #[test]
+    fn data_topic_selectors_preserve_topic_and_lane_identity() {
+        let mut topology = TrackTopology::default();
+        let publisher = participant(1);
+        let realtime = Track::data(
+            crate::track::TrackMeta {
+                room_id: room(),
+                shard_id: ShardId::new(0),
+                id: publisher.derive_track_id(TrackKind::Data, "v1/rt/chat"),
+                origin: publisher,
+            },
+            None,
+        );
+        let reliable = Track::data(
+            crate::track::TrackMeta {
+                room_id: room(),
+                shard_id: ShardId::new(0),
+                id: publisher.derive_track_id(TrackKind::Data, "v1/rel/chat"),
+                origin: publisher,
+            },
+            None,
+        );
+        let realtime_identity = topology
+            .publish_with_label(realtime, Some("v1/rt/chat".to_string()))
+            .unwrap();
+        let reliable_identity = topology
+            .publish_with_label(reliable, Some("v1/rel/chat".to_string()))
+            .unwrap();
+        let selector = TrackSelector::DataTopic {
+            room_id: room(),
+            publisher: None,
+            label: "v1/rt/chat".to_string(),
+        };
+        let _ = topology.subscribe(participant(3), selector);
+
+        assert_eq!(topology.matches(realtime_identity).count(), 1);
+        assert_eq!(topology.matches(reliable_identity).count(), 0);
+    }
+
+    #[test]
     fn unsubscribe_removes_only_the_matching_subscription() {
         let mut topology = TrackTopology::default();
         let track = identity(TrackKind::Audio, 1);
         let subscriber = participant(3);
         let selector = TrackSelector::Exact(track);
-        let _ = topology.subscribe(subscriber, selector);
-        let _ = topology.subscribe(participant(4), selector);
+        let _ = topology.subscribe(subscriber, selector.clone());
+        let _ = topology.subscribe(participant(4), selector.clone());
 
-        assert!(topology.unsubscribe_matching(subscriber, selector));
+        assert!(topology.unsubscribe_matching(subscriber, selector.clone()));
         assert_eq!(topology.matches(track).count(), 1);
         assert!(!topology.unsubscribe_matching(subscriber, selector));
     }
