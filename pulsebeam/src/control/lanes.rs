@@ -10,10 +10,9 @@
 //! else.
 
 use crate::{
-    control::state::ControlPlaneState,
+    control::state::{ControlPlaneState, DataStreamId, RuntimeStreamKey},
     id::ShardId,
     route::RouteAction,
-    shard::router::{DataStreamId, RuntimeStreamKey},
 };
 
 /// How a data stream is delivered.
@@ -61,10 +60,14 @@ impl LaneRegistry {
     pub(crate) fn route_action(&self, key: RuntimeStreamKey) -> Option<RouteAction> {
         match (self.lane, key) {
             (StreamLane::Unreliable, RuntimeStreamKey::Unreliable(stream)) => {
-                Some(RouteAction::Unreliable { stream })
+                Some(RouteAction::Forward {
+                    target: crate::route::RouteTarget::Unreliable(stream),
+                })
             }
             (StreamLane::Reliable, RuntimeStreamKey::Reliable(stream)) => {
-                Some(RouteAction::Reliable { stream })
+                Some(RouteAction::Forward {
+                    target: crate::route::RouteTarget::Reliable(stream),
+                })
             }
             _ => None,
         }

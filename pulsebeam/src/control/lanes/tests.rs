@@ -18,11 +18,11 @@ fn each_lane_mints_and_actions_only_its_own_key() {
 
     assert!(matches!(
         data.route_action(data_key),
-        Some(RouteAction::Unreliable { .. })
+        Some(RouteAction::Forward { .. })
     ));
     assert!(matches!(
         reliable.route_action(reliable_key),
-        Some(RouteAction::Reliable { .. })
+        Some(RouteAction::Forward { .. })
     ));
     assert!(
         data.route_action(reliable_key).is_none(),

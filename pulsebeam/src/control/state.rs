@@ -14,10 +14,35 @@
 use slotmap::SlotMap;
 use tokio::time::Instant;
 
+use crate::entity::{ParticipantId, RoomId};
 use crate::id::ShardId;
 use crate::route::{
     PackedRoute, RouteError, RouteHandle, RouteId, SlotAllocator, TransportHandle, TransportRoute,
 };
+use crate::track::Topic;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DataStreamId {
+    pub room_id: RoomId,
+    pub publisher_id: ParticipantId,
+    pub topic: Topic,
+}
+
+impl DataStreamId {
+    pub(crate) fn new(room_id: RoomId, publisher_id: ParticipantId, topic: Topic) -> Self {
+        Self {
+            room_id,
+            publisher_id,
+            topic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeStreamKey {
+    Unreliable(crate::keys::UnreliableStreamKey),
+    Reliable(crate::keys::ReliableStreamKey),
+}
 
 /// One shard's slot namespace for one route family.
 ///
@@ -87,7 +112,7 @@ pub(crate) struct TrackRecord {
 
 #[derive(Debug)]
 pub(crate) struct StreamRecord {
-    pub id: crate::shard::router::DataStreamId,
+    pub id: DataStreamId,
 }
 
 #[derive(Debug)]
@@ -215,7 +240,7 @@ impl ControlPlaneState {
     pub fn mint_data(
         &mut self,
         shard: ShardId,
-        id: crate::shard::router::DataStreamId,
+        id: DataStreamId,
     ) -> Option<crate::keys::UnreliableStreamKey> {
         let key = self
             .arenas
@@ -230,7 +255,7 @@ impl ControlPlaneState {
     pub fn mint_reliable(
         &mut self,
         shard: ShardId,
-        id: crate::shard::router::DataStreamId,
+        id: DataStreamId,
     ) -> Option<crate::keys::ReliableStreamKey> {
         let key = self
             .arenas
@@ -507,7 +532,7 @@ mod tests {
                 participant_id,
             )
             .unwrap();
-        let stream = crate::shard::router::DataStreamId::new(
+        let stream = DataStreamId::new(
             crate::entity::RoomId::from_external(
                 &crate::entity::ExternalRoomId::new("room").unwrap(),
             ),

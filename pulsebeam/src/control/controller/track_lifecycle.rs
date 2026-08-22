@@ -107,9 +107,7 @@ impl ControllerActor {
                 .grant_route(
                     shard_id,
                     crate::route::RouteAction::Reverse {
-                        target: crate::route::ReverseTarget::Track {
-                            track: crate::keys::VideoTrackKey::new(fanout),
-                        },
+                        target: crate::route::ReverseTarget::Track(fanout),
                     },
                 )
                 .await?;
@@ -156,8 +154,8 @@ impl ControllerActor {
         let key = self.prepare_track_key(destination, id, origin)?;
         Some((
             crate::control::publication::RuntimeKey::Audio(crate::keys::AudioTrackKey::new(key)),
-            RouteAction::Audio {
-                track: crate::keys::AudioTrackKey::new(key),
+            RouteAction::Forward {
+                target: crate::route::RouteTarget::Track(key),
             },
         ))
     }
@@ -485,9 +483,7 @@ impl ControllerActor {
                 (
                     shard_id,
                     crate::view::ViewOp::InsertTrackRuntime {
-                        key: crate::keys::TrackRuntimeKey::Video(crate::keys::VideoTrackKey::new(
-                            fanout,
-                        )),
+                        key: fanout,
                         descriptor,
                     },
                 ),
@@ -496,8 +492,8 @@ impl ControllerActor {
                     crate::view::ViewOp::InstallRoute {
                         binding: crate::view::RouteBinding {
                             handle: *handle,
-                            action: crate::route::RouteAction::Video {
-                                local_track: crate::keys::VideoTrackKey::new(fanout),
+                            action: crate::route::RouteAction::Forward {
+                                target: crate::route::RouteTarget::Track(fanout),
                             },
                         },
                     },

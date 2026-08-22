@@ -20,7 +20,7 @@ impl ControllerActor {
                     return None;
                 };
                 Some((
-                    crate::shard::router::DataStreamId::new(
+                    crate::control::state::DataStreamId::new(
                         publication.room,
                         publication.publisher,
                         topic.clone(),
@@ -46,7 +46,7 @@ impl ControllerActor {
                 continue;
             };
             let ids = match pattern.publisher {
-                Some(publisher) => vec![crate::shard::router::DataStreamId::new(
+                Some(publisher) => vec![crate::control::state::DataStreamId::new(
                     pattern.room,
                     publisher,
                     topic,

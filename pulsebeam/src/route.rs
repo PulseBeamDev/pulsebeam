@@ -22,8 +22,6 @@ use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
 use crate::id::ShardId;
-use crate::keys::{AudioTrackKey, VideoTrackKey};
-use crate::shard::router::{ReliableStreamKey, UnreliableStreamKey};
 
 /// How long a retired slot waits before it can be handed out again.
 ///
@@ -382,24 +380,9 @@ fn from_wire_route(route: pulsebeam_routing::RouteId) -> RouteId {
 /// local object and leaves the route untouched.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RouteAction {
-    Video {
-        /// The destination's own fanout handle — a dense index, not a name.
-        /// Resolving a route hands dispatch something it can use directly,
-        /// rather than a `TrackId` it would have to hash back into a map.
-        local_track: VideoTrackKey,
+    Forward {
+        target: RouteTarget,
     },
-    /// One route per audio stream and destination. The track key resolves the
-    /// destination's compiled audio plan directly.
-    Audio { track: AudioTrackKey },
-    /// One route per (publisher, topic, destination) on the unreliable lane.
-    /// The destination installs it whether the local subscription named a
-    /// publisher or was a wildcard — wildcards resolve to concrete streams as
-    /// publishers are announced.
-    Unreliable { stream: UnreliableStreamKey },
-    /// The same, delivered reliably. A separate variant rather than a lane
-    /// field, because the two resolve through different arenas — the variant
-    /// *is* the lane.
-    Reliable { stream: ReliableStreamKey },
     /// The reverse path for one published stream, resolving at the shard that
     /// owns the publisher.
     ///
@@ -412,22 +395,24 @@ pub(crate) enum RouteAction {
     ///
     /// No `origin` field: `ReverseTarget::Track` and `::Topic` both resolve to
     /// an arena entry that already knows its own publisher.
-    Reverse { target: ReverseTarget },
+    Reverse {
+        target: ReverseTarget,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteTarget {
+    Track(crate::keys::TrackKey),
+    Unreliable(crate::keys::UnreliableStreamKey),
+    Reliable(crate::keys::ReliableStreamKey),
 }
 
 /// What a reverse route points at, holding everything the destination needs to
 /// act on a frame that names nothing but the route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReverseTarget {
-    Track {
-        /// The publisher's own fanout handle. Encodings live on the
-        /// `TrackRoute` this resolves to, in declared order — a frame names
-        /// one by index, so the rid itself never travels.
-        track: VideoTrackKey,
-    },
-    Topic {
-        stream: ReliableStreamKey,
-    },
+    Track(crate::keys::TrackKey),
+    Reliable(crate::keys::ReliableStreamKey),
 }
 
 /// The shard-owned half of a route: the accounting a packet mutates as it

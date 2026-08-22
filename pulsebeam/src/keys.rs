@@ -31,18 +31,3 @@ impl AudioTrackKey {
         self.0
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrackRuntimeKey {
-    Video(VideoTrackKey),
-    Audio(AudioTrackKey),
-}
-
-impl TrackRuntimeKey {
-    pub(crate) const fn raw(self) -> TrackKey {
-        match self {
-            Self::Video(key) => key.raw(),
-            Self::Audio(key) => key.raw(),
-        }
-    }
-}

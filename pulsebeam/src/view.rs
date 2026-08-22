@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use crate::entity::TrackId;
 use crate::id::ShardId;
-use crate::keys::{ParticipantKey, TrackRuntimeKey};
+use crate::keys::{ParticipantKey, TrackKey};
 use crate::plan::PlanBatch;
 use crate::route::{RouteAction, RouteHandle, TransportHandle};
 use crate::shard::router::{ReliableStreamKey, UnreliableStreamKey};
@@ -138,24 +138,24 @@ pub(crate) enum ViewOp {
         key: ParticipantKey,
     },
     InsertTrackRuntime {
-        key: TrackRuntimeKey,
+        key: TrackKey,
         descriptor: TrackDescriptor,
     },
     RemoveTrackRuntime {
-        key: TrackRuntimeKey,
+        key: TrackKey,
     },
     InsertUnreliableRuntime {
         key: UnreliableStreamKey,
-        id: crate::shard::router::DataStreamId,
         publisher: Option<ParticipantKey>,
+        publisher_effect: Option<crate::participant::ParticipantEffect>,
     },
     RemoveUnreliableRuntime {
         key: UnreliableStreamKey,
     },
     InsertReliableRuntime {
         key: ReliableStreamKey,
-        id: crate::shard::router::DataStreamId,
         publisher: Option<ParticipantKey>,
+        publisher_effect: Option<crate::participant::ParticipantEffect>,
     },
     RemoveReliableRuntime {
         key: ReliableStreamKey,

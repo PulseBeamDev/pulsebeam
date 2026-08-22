@@ -6,31 +6,49 @@ use super::*;
 /// passing one alongside meant every call site carried a second source of truth
 /// plus a `debug_assert` to catch the two disagreeing.
 pub(super) fn insert_stream_runtime_op(
-    key: crate::shard::router::RuntimeStreamKey,
-    id: crate::shard::router::DataStreamId,
+    key: crate::control::state::RuntimeStreamKey,
+    id: crate::control::state::DataStreamId,
     publisher: Option<crate::shard::participants::ParticipantKey>,
 ) -> crate::view::ViewOp {
     match key {
-        crate::shard::router::RuntimeStreamKey::Unreliable(key) => {
-            crate::view::ViewOp::InsertUnreliableRuntime { key, id, publisher }
+        crate::control::state::RuntimeStreamKey::Unreliable(key) => {
+            crate::view::ViewOp::InsertUnreliableRuntime {
+                key,
+                publisher,
+                publisher_effect: publisher.map(|_| {
+                    crate::participant::ParticipantEffect::DataPublished {
+                        topic: id.topic.clone(),
+                        stream: key,
+                    }
+                }),
+            }
         }
-        crate::shard::router::RuntimeStreamKey::Reliable(key) => {
-            crate::view::ViewOp::InsertReliableRuntime { key, id, publisher }
+        crate::control::state::RuntimeStreamKey::Reliable(key) => {
+            crate::view::ViewOp::InsertReliableRuntime {
+                key,
+                publisher,
+                publisher_effect: publisher.map(|_| {
+                    crate::participant::ParticipantEffect::ReliableDataPublished {
+                        topic: id.topic.clone(),
+                        stream: key,
+                    }
+                }),
+            }
         }
     }
 }
 
 pub(super) fn install_stream_route_op(
-    key: crate::shard::router::RuntimeStreamKey,
+    key: crate::control::state::RuntimeStreamKey,
     route: RouteHandle,
 ) -> crate::view::ViewOp {
     let action = match key {
-        crate::shard::router::RuntimeStreamKey::Unreliable(stream) => {
-            RouteAction::Unreliable { stream }
-        }
-        crate::shard::router::RuntimeStreamKey::Reliable(stream) => {
-            RouteAction::Reliable { stream }
-        }
+        crate::control::state::RuntimeStreamKey::Unreliable(stream) => RouteAction::Forward {
+            target: crate::route::RouteTarget::Unreliable(stream),
+        },
+        crate::control::state::RuntimeStreamKey::Reliable(stream) => RouteAction::Forward {
+            target: crate::route::RouteTarget::Reliable(stream),
+        },
     };
     crate::view::ViewOp::InstallRoute {
         binding: crate::view::RouteBinding {
@@ -51,7 +69,7 @@ fn data_label(topic: &crate::track::Topic, lane: StreamLane) -> String {
 /// label grammar's; they are the same two lanes, and this is the one place the
 /// two spellings meet.
 pub(super) fn data_publication_id(
-    id: &crate::shard::router::DataStreamId,
+    id: &crate::control::state::DataStreamId,
     lane: StreamLane,
 ) -> crate::entity::TrackId {
     let label = data_label(&id.topic, lane);
@@ -68,12 +86,12 @@ impl ControllerActor {
         room: crate::entity::RoomId,
         topic: &crate::track::Topic,
         lane: StreamLane,
-    ) -> Vec<crate::shard::router::DataStreamId> {
+    ) -> Vec<crate::control::state::DataStreamId> {
         self.catalog
             .on_label(room, &data_label(topic, lane))
             .filter_map(|id| {
                 let held = self.catalog.get(&id)?;
-                Some(crate::shard::router::DataStreamId::new(
+                Some(crate::control::state::DataStreamId::new(
                     held.room,
                     held.publisher,
                     topic.clone(),
@@ -85,7 +103,7 @@ impl ControllerActor {
     pub(super) async fn on_stream_ready(
         &mut self,
         shard_id: crate::id::ShardId,
-        id: crate::shard::router::DataStreamId,
+        id: crate::control::state::DataStreamId,
         lane: StreamLane,
     ) -> bool {
         let publication_id = data_publication_id(&id, lane);
@@ -136,7 +154,7 @@ impl ControllerActor {
 
         if matches!(lane, StreamLane::Reliable) {
             let Some(stream) = (match key {
-                crate::shard::router::RuntimeStreamKey::Reliable(stream) => Some(stream),
+                crate::control::state::RuntimeStreamKey::Reliable(stream) => Some(stream),
                 _ => None,
             }) else {
                 debug_assert!(false, "reliable readiness must carry a reliable key");
@@ -152,7 +170,7 @@ impl ControllerActor {
                 .grant_route(
                     shard_id,
                     RouteAction::Reverse {
-                        target: ReverseTarget::Topic { stream },
+                        target: ReverseTarget::Reliable(stream),
                     },
                 )
                 .await
@@ -224,7 +242,7 @@ impl ControllerActor {
         // Which streams this reaches is a catalog question now, not something
         // the registry has to remember on the subscriber's behalf.
         let mut ids: indexmap::IndexSet<_> = match publisher {
-            Some(publisher) => [crate::shard::router::DataStreamId::new(
+            Some(publisher) => [crate::control::state::DataStreamId::new(
                 room_id,
                 publisher,
                 topic.clone(),
@@ -238,7 +256,7 @@ impl ControllerActor {
         };
         for publication_id in displaced_ids {
             if let Some(publication) = self.catalog.get(&publication_id) {
-                ids.insert(crate::shard::router::DataStreamId::new(
+                ids.insert(crate::control::state::DataStreamId::new(
                     publication.room,
                     publication.publisher,
                     topic.clone(),
@@ -278,7 +296,7 @@ impl ControllerActor {
             &subscriber,
         );
         let ids: Vec<_> = match publisher {
-            Some(publisher) => vec![crate::shard::router::DataStreamId::new(
+            Some(publisher) => vec![crate::control::state::DataStreamId::new(
                 room_id, publisher, topic,
             )],
             None => self.streams_on_topic(room_id, &topic, lane),
@@ -290,7 +308,7 @@ impl ControllerActor {
 
     pub(super) async fn retire_stream_binding(
         &mut self,
-        id: crate::shard::router::DataStreamId,
+        id: crate::control::state::DataStreamId,
         lane: StreamLane,
     ) -> bool {
         self.retire_publication(data_publication_id(&id, lane))
@@ -300,7 +318,7 @@ impl ControllerActor {
     /// Make a stream's destinations match its declarations.
     pub(super) async fn reconcile_stream(
         &mut self,
-        id: crate::shard::router::DataStreamId,
+        id: crate::control::state::DataStreamId,
         lane: StreamLane,
     ) -> bool {
         let publication_id = data_publication_id(&id, lane);

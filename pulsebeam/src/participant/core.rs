@@ -273,7 +273,7 @@ pub enum ParticipantInput<'a> {
         frame: &'a [u8],
     },
     ReliableControl {
-        topic: &'a Topic,
+        stream: ReliableStreamKey,
         bytes: &'a [u8],
     },
     Keyframe {
@@ -375,6 +375,9 @@ impl ParticipantCore {
     }
 
     fn bind_published_reliable_stream(&mut self, topic: &Topic, stream: ReliableStreamKey) {
+        self.data
+            .reliable_stream_topics
+            .insert(stream, topic.clone());
         if let Some(channel) = self.data.reliable.publisher_channel(topic) {
             self.data.reliable_published_streams.insert(channel, stream);
         } else {
@@ -542,7 +545,11 @@ impl ParticipantCore {
                     frame: frame.to_vec(),
                 });
             }
-            ParticipantInput::ReliableControl { topic, bytes } => {
+            ParticipantInput::ReliableControl { stream, bytes } => {
+                let Some(topic) = self.data.reliable_stream_topics.get(stream) else {
+                    debug_assert!(false, "a reliable control stream must have a topic");
+                    return;
+                };
                 self.enqueue_fanout(PendingFanout::ReliableControl {
                     topic: topic.clone(),
                     bytes: bytes.to_vec(),

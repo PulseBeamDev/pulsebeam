@@ -2,10 +2,10 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::{
     control::lanes::StreamLane,
+    control::state::DataStreamId,
     entity::{ParticipantId, TrackId},
     id::ShardId,
     keys::{DownstreamSlotKey, ParticipantKey},
-    shard::router::DataStreamId,
     track::TrackMeta,
 };
 

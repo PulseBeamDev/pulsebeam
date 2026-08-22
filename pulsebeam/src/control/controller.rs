@@ -822,7 +822,7 @@ impl ControllerActor {
     fn defer_stream(
         &mut self,
         shard_id: crate::id::ShardId,
-        id: crate::shard::router::DataStreamId,
+        id: crate::control::state::DataStreamId,
         lane: StreamLane,
     ) {
         self.pending_streams
@@ -935,7 +935,7 @@ impl ControllerActor {
                 if !self.is_current_binding(&publisher, shard_id, publisher_key) {
                     return None;
                 }
-                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                let id = crate::control::state::DataStreamId::new(room_id, publisher, topic);
                 if !self
                     .on_stream_ready(shard_id, id.clone(), StreamLane::Unreliable)
                     .await
@@ -953,7 +953,7 @@ impl ControllerActor {
                 if !self.is_current_binding(&publisher, shard_id, publisher_key) {
                     return None;
                 }
-                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                let id = crate::control::state::DataStreamId::new(room_id, publisher, topic);
                 if !self
                     .on_stream_ready(shard_id, id.clone(), StreamLane::Reliable)
                     .await
@@ -1059,7 +1059,7 @@ impl ControllerActor {
                 if !self.is_current_binding(&publisher, shard_id, publisher_key) {
                     return None;
                 }
-                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                let id = crate::control::state::DataStreamId::new(room_id, publisher, topic);
                 self.pending_streams.remove(&id, StreamLane::Unreliable);
                 if !self.retire_stream_binding(id, StreamLane::Unreliable).await {
                     debug_assert!(false, "data stream retirement must complete");
@@ -1075,7 +1075,7 @@ impl ControllerActor {
                 if !self.is_current_binding(&publisher, shard_id, publisher_key) {
                     return None;
                 }
-                let id = crate::shard::router::DataStreamId::new(room_id, publisher, topic);
+                let id = crate::control::state::DataStreamId::new(room_id, publisher, topic);
                 self.pending_streams.remove(&id, StreamLane::Reliable);
                 if !self.retire_stream_binding(id, StreamLane::Reliable).await {
                     debug_assert!(false, "reliable stream retirement must complete");

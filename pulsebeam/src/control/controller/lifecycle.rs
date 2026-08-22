@@ -23,12 +23,8 @@ pub(super) fn runtime_removal_op(
 ) -> crate::view::ViewOp {
     use crate::control::publication::RuntimeKey;
     match key {
-        RuntimeKey::Video(key) => crate::view::ViewOp::RemoveTrackRuntime {
-            key: crate::keys::TrackRuntimeKey::Video(key),
-        },
-        RuntimeKey::Audio(key) => crate::view::ViewOp::RemoveTrackRuntime {
-            key: crate::keys::TrackRuntimeKey::Audio(key),
-        },
+        RuntimeKey::Video(key) => crate::view::ViewOp::RemoveTrackRuntime { key: key.raw() },
+        RuntimeKey::Audio(key) => crate::view::ViewOp::RemoveTrackRuntime { key: key.raw() },
         RuntimeKey::Unreliable(key) => crate::view::ViewOp::RemoveUnreliableRuntime { key },
         RuntimeKey::Reliable(key) => crate::view::ViewOp::RemoveReliableRuntime { key },
     }
@@ -315,7 +311,7 @@ impl ControllerActor {
             publication.publisher,
         );
         match key.stream() {
-            Some(crate::shard::router::RuntimeStreamKey::Unreliable(stream)) => members
+            Some(crate::control::state::RuntimeStreamKey::Unreliable(stream)) => members
                 .into_iter()
                 .map(|(participant, channel)| {
                     (
@@ -328,7 +324,7 @@ impl ControllerActor {
                     )
                 })
                 .collect(),
-            Some(crate::shard::router::RuntimeStreamKey::Reliable(stream)) => members
+            Some(crate::control::state::RuntimeStreamKey::Reliable(stream)) => members
                 .into_iter()
                 .map(|(participant, channel)| {
                     (
@@ -363,7 +359,7 @@ impl ControllerActor {
                 | crate::control::publication::RuntimeKey::Reliable(_),
             ) => {
                 let stream = key.stream()?;
-                let stream_id = crate::shard::router::DataStreamId::new(
+                let stream_id = crate::control::state::DataStreamId::new(
                     publication.room,
                     publication.publisher,
                     topic.clone(),
@@ -436,7 +432,7 @@ impl ControllerActor {
                     ops.lifecycle.push((
                         shard,
                         crate::view::ViewOp::InsertTrackRuntime {
-                            key: crate::keys::TrackRuntimeKey::Video(fanout),
+                            key: fanout.raw(),
                             descriptor,
                         },
                     ));
@@ -478,7 +474,7 @@ impl ControllerActor {
                 ops.lifecycle.push((
                     shard,
                     crate::view::ViewOp::InsertTrackRuntime {
-                        key: crate::keys::TrackRuntimeKey::Audio(fanout),
+                        key: fanout.raw(),
                         descriptor,
                     },
                 ));

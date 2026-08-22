@@ -2,7 +2,7 @@ use slotmap::SecondaryMap;
 use str0m::media::Rid;
 
 use crate::clock::WallAnchor;
-use crate::entity::{ParticipantId, TrackId};
+use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::{AudioTrackKey, ParticipantKey, VideoTrackKey};
 use crate::participant::{
@@ -10,34 +10,10 @@ use crate::participant::{
 };
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
-use crate::track::Topic;
 
 use super::worker::{MediaPayload, Reverse, ShardFrame};
 
 pub(crate) use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct DataStreamId {
-    pub room_id: crate::entity::RoomId,
-    pub publisher_id: ParticipantId,
-    pub topic: Topic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RuntimeStreamKey {
-    Unreliable(UnreliableStreamKey),
-    Reliable(ReliableStreamKey),
-}
-
-impl DataStreamId {
-    pub fn new(room_id: crate::entity::RoomId, publisher_id: ParticipantId, topic: Topic) -> Self {
-        Self {
-            room_id,
-            publisher_id,
-            topic,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
@@ -72,14 +48,12 @@ struct TrackRuntime {
 }
 
 struct UnreliableRuntime {
-    id: DataStreamId,
     publisher: Option<ParticipantKey>,
     link_seq: u32,
 }
 
 /// The same stream, plus what the feedback path needs to address its publisher.
 pub(crate) struct ReliableRuntime {
-    id: DataStreamId,
     publisher: Option<ParticipantKey>,
     link_seq: u32,
 }
@@ -200,20 +174,11 @@ impl ShardRuntime {
             crate::view::ViewOp::InsertTrackRuntime {
                 key, descriptor, ..
             } => {
-                if !matches!(
-                    (key, descriptor.id.kind()),
-                    (
-                        crate::keys::TrackRuntimeKey::Video(_),
-                        crate::entity::TrackKind::Video
-                    ) | (
-                        crate::keys::TrackRuntimeKey::Audio(_),
-                        crate::entity::TrackKind::Audio
-                    )
-                ) {
+                if matches!(descriptor.id.kind(), crate::entity::TrackKind::Data) {
                     debug_assert!(false, "a track runtime key must match its publication kind");
                     return;
                 }
-                let key = key.raw();
+                let key = *key;
                 if let Some(previous) = self.tracks.get(key) {
                     debug_assert_eq!(
                         previous.id, descriptor.id,
@@ -246,13 +211,9 @@ impl ShardRuntime {
                     current.link_seq = previous.link_seq;
                 }
             }
-            crate::view::ViewOp::RemoveTrackRuntime { key, .. } => self.retire_track(key.raw()),
-            crate::view::ViewOp::InsertUnreliableRuntime { key, id, publisher } => {
+            crate::view::ViewOp::RemoveTrackRuntime { key, .. } => self.retire_track(*key),
+            crate::view::ViewOp::InsertUnreliableRuntime { key, publisher, .. } => {
                 if let Some(previous) = self.unreliable.get(*key) {
-                    debug_assert_eq!(
-                        previous.id, *id,
-                        "an unreliable runtime key cannot change its logical stream"
-                    );
                     debug_assert_eq!(
                         previous.publisher, *publisher,
                         "an unreliable runtime key cannot change its publisher"
@@ -262,19 +223,14 @@ impl ShardRuntime {
                 let _ = self.unreliable.insert(
                     *key,
                     UnreliableRuntime {
-                        id: id.clone(),
                         publisher: *publisher,
                         link_seq: 0,
                     },
                 );
             }
             crate::view::ViewOp::RemoveUnreliableRuntime { key } => self.retire_data_stream(*key),
-            crate::view::ViewOp::InsertReliableRuntime { key, id, publisher } => {
+            crate::view::ViewOp::InsertReliableRuntime { key, publisher, .. } => {
                 if let Some(previous) = self.reliable.get(*key) {
-                    debug_assert_eq!(
-                        previous.id, *id,
-                        "a reliable runtime key cannot change its logical stream"
-                    );
                     debug_assert_eq!(
                         previous.publisher, *publisher,
                         "a reliable runtime key cannot change its publisher"
@@ -284,7 +240,6 @@ impl ShardRuntime {
                 let _ = self.reliable.insert(
                     *key,
                     ReliableRuntime {
-                        id: id.clone(),
                         publisher: *publisher,
                         link_seq: 0,
                     },
@@ -505,10 +460,6 @@ impl ShardRuntime {
         );
     }
 
-    pub(crate) fn reliable_topic(&self, key: ReliableStreamKey) -> Option<&Topic> {
-        self.reliable.get(key).map(|runtime| &runtime.id.topic)
-    }
-
     pub fn resolve_reverse(
         &self,
         action: RouteAction,
@@ -518,14 +469,12 @@ impl ShardRuntime {
             return None;
         };
         let origin = match target {
-            crate::route::ReverseTarget::Track { track } => {
-                let key = track.raw();
-                self.tracks
-                    .get(key)
-                    .filter(|runtime| runtime.id.kind() == crate::entity::TrackKind::Video)
-                    .map(|runtime| runtime.origin_key)
-            }
-            crate::route::ReverseTarget::Topic { stream } => self
+            crate::route::ReverseTarget::Track(key) => self
+                .tracks
+                .get(key)
+                .filter(|runtime| runtime.id.kind() == crate::entity::TrackKind::Video)
+                .map(|runtime| runtime.origin_key),
+            crate::route::ReverseTarget::Reliable(stream) => self
                 .reliable
                 .get(stream)
                 .and_then(|runtime| runtime.publisher),
@@ -578,11 +527,11 @@ mod tests {
             ParticipantId::from_bytes([7; 16]).derive_track_id(TrackKind::Video, "track");
 
         runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
-            key: crate::keys::TrackRuntimeKey::Video(VideoTrackKey::new(key)),
+            key,
             descriptor: descriptor(track_id, origin_key, "q"),
         });
         runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
-            key: crate::keys::TrackRuntimeKey::Video(VideoTrackKey::new(key)),
+            key,
             descriptor: descriptor(track_id, origin_key, "f"),
         });
 
@@ -594,21 +543,13 @@ mod tests {
 
     #[test]
     fn reinserting_a_live_data_runtime_preserves_hop_state() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::ExternalRoomId::new("test-room").unwrap(),
-        );
-        let stream = DataStreamId::new(
-            room,
-            ParticipantId::from_bytes([8; 16]),
-            Topic::for_test("topic"),
-        );
         let mut runtime = ShardRuntime::new(ShardId::new(0));
         let mut keys = SlotMap::<ReliableStreamKey, ()>::with_key();
         let key = keys.insert(());
         let op = crate::view::ViewOp::InsertReliableRuntime {
             key,
-            id: stream,
             publisher: None,
+            publisher_effect: None,
         };
 
         runtime.apply_view_op(&op);
