@@ -1,0 +1,4 @@
+{
+  "minimal_browser_wasm_bytes": 51200,
+  "production_gzipped_wasm_js_bytes": 102400
+}

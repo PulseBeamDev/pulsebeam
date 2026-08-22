@@ -102,7 +102,6 @@ pub enum IntentError {
     InvalidHeightRange { min_height: u32, height: u32 },
     DuplicateAudioPin(TrackId),
     UnknownTrack(TrackId),
-    NoLayerMeetsFloor(TrackId),
     Latency(LatencyLockError),
 }
 
@@ -121,9 +120,6 @@ impl fmt::Display for IntentError {
                 write!(formatter, "duplicate audio pin {track_id}")
             }
             Self::UnknownTrack(track_id) => write!(formatter, "no layers for track {track_id}"),
-            Self::NoLayerMeetsFloor(track_id) => {
-                write!(formatter, "no layer meets the floor for track {track_id}")
-            }
             Self::Latency(error) => write!(formatter, "latency lock: {error}"),
         }
     }
@@ -211,6 +207,7 @@ pub struct LayerOption {
     pub id: u8,
     pub height: u32,
     pub bitrate_bps: u64,
+    pub fps: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,29 +242,49 @@ impl StickyAllocator {
             right
                 .priority
                 .cmp(&left.priority)
+                .then_with(|| (right.min_height > 0).cmp(&(left.min_height > 0)))
                 .then_with(|| left.mid.cmp(&right.mid))
         });
         let mut available = budget_bps;
         let mut allocations = Vec::with_capacity(ordered.len());
         for intent in &ordered {
+            if intent.height == 0 {
+                allocations.push(StickyAllocation {
+                    mid: intent.mid.clone(),
+                    track_id: intent.track_id.clone(),
+                    layer: None,
+                    height: 0,
+                    bitrate_bps: 0,
+                    paused: true,
+                });
+                continue;
+            }
             let options = layers
                 .get(&intent.track_id)
                 .ok_or_else(|| IntentError::UnknownTrack(intent.track_id.clone()))?;
             let mut options = options.clone();
+            options.retain(|option| {
+                option.height <= intent.height && option.fps.is_none_or(|fps| fps >= intent.min_fps)
+            });
             options.sort_by_key(|option| (option.height, option.id));
-            let base = floor_option(intent, &options)?;
-            let selected = if base.bitrate_bps <= available {
-                available = available.saturating_sub(base.bitrate_bps);
-                base
-            } else if intent.min_height == 0 {
-                LayerOption {
+            let selected = floor_option(intent, &options)
+                .filter(|option| option.bitrate_bps <= available)
+                .or_else(|| {
+                    options
+                        .iter()
+                        .filter(|option| {
+                            option.height >= intent.min_height && option.bitrate_bps <= available
+                        })
+                        .max_by_key(|option| (option.height, option.id))
+                        .copied()
+                })
+                .unwrap_or(LayerOption {
                     id: 0,
                     height: 0,
                     bitrate_bps: 0,
-                }
-            } else {
-                return Err(IntentError::NoLayerMeetsFloor(intent.track_id.clone()));
-            };
+                    fps: None,
+                });
+            available = available.saturating_sub(selected.bitrate_bps);
             allocations.push(StickyAllocation {
                 mid: intent.mid.clone(),
                 track_id: intent.track_id.clone(),
@@ -282,16 +299,28 @@ impl StickyAllocator {
                 debug_assert!(false, "allocation must have a matching intent");
                 continue;
             };
+            if allocation.paused {
+                continue;
+            }
             let Some(options) = layers.get(&allocation.track_id) else {
                 debug_assert!(false, "allocation track must have layers");
                 continue;
             };
             let mut options = options.clone();
+            options.retain(|option| {
+                option.height <= intent.height && option.fps.is_none_or(|fps| fps >= intent.min_fps)
+            });
             options.sort_by_key(|option| (option.height, option.id));
+            if options.is_empty() {
+                continue;
+            }
             let current_index = options
                 .iter()
                 .position(|option| Some(option.id) == allocation.layer)
-                .unwrap_or(0);
+                .unwrap_or_else(|| {
+                    debug_assert!(false, "active allocation must name an eligible layer");
+                    0
+                });
             let sticky_index = self
                 .previous
                 .get(&allocation.mid)
@@ -352,9 +381,11 @@ impl Default for StickyAllocator {
     }
 }
 
-fn floor_option(intent: &VideoIntent, options: &[LayerOption]) -> Result<LayerOption, IntentError> {
-    debug_assert!(!options.is_empty());
-    let Some(option) = options
+fn floor_option(intent: &VideoIntent, options: &[LayerOption]) -> Option<LayerOption> {
+    if options.is_empty() {
+        return None;
+    }
+    options
         .iter()
         .filter(|option| option.height >= intent.min_height && option.height <= intent.height)
         .min_by(|left, right| {
@@ -363,10 +394,13 @@ fn floor_option(intent: &VideoIntent, options: &[LayerOption]) -> Result<LayerOp
                 .then_with(|| left.id.cmp(&right.id))
         })
         .copied()
-    else {
-        return Err(IntentError::NoLayerMeetsFloor(intent.track_id.clone()));
-    };
-    Ok(option)
+        .or_else(|| {
+            options
+                .iter()
+                .filter(|option| option.height <= intent.height)
+                .max_by_key(|option| (option.height, option.id))
+                .copied()
+        })
 }
 
 #[cfg(test)]
@@ -390,11 +424,13 @@ mod tests {
                         id: 1,
                         height: 180,
                         bitrate_bps: 100,
+                        fps: None,
                     },
                     LayerOption {
                         id: 2,
                         height: 720,
                         bitrate_bps: 400,
+                        fps: None,
                     },
                 ],
             ),
@@ -405,11 +441,13 @@ mod tests {
                         id: 1,
                         height: 180,
                         bitrate_bps: 100,
+                        fps: None,
                     },
                     LayerOption {
                         id: 2,
                         height: 720,
                         bitrate_bps: 400,
+                        fps: None,
                     },
                 ],
             ),
@@ -433,5 +471,66 @@ mod tests {
         state.set_video(intent("0", "track", 1));
         state.clear_video("0");
         assert!(state.to_proto(None).video.is_empty());
+    }
+
+    #[test]
+    fn hidden_intents_pause_without_a_layer_catalogue() {
+        let mut allocator = StickyAllocator::new();
+        let hidden = VideoIntent::new("0", TrackId::from("missing"), 0, 0, 0, 1).unwrap();
+        let allocations = allocator.allocate(&[hidden], &BTreeMap::new(), 0).unwrap();
+        assert_eq!(allocations[0].height, 0);
+        assert!(allocations[0].paused);
+    }
+
+    #[test]
+    fn minimum_fps_filters_layers_before_allocation() {
+        let mut allocator = StickyAllocator::new();
+        let intent = VideoIntent::new("0", TrackId::from("track"), 720, 180, 30, 1).unwrap();
+        let layers = BTreeMap::from([(
+            TrackId::from("track"),
+            vec![
+                LayerOption {
+                    id: 1,
+                    height: 180,
+                    bitrate_bps: 100,
+                    fps: Some(15),
+                },
+                LayerOption {
+                    id: 2,
+                    height: 360,
+                    bitrate_bps: 200,
+                    fps: Some(30),
+                },
+            ],
+        )]);
+        let allocations = allocator.allocate(&[intent], &layers, 200).unwrap();
+        assert_eq!(allocations[0].layer, Some(2));
+        assert_eq!(allocations[0].height, 360);
+    }
+
+    #[test]
+    fn unaffordable_minimum_floor_pauses_instead_of_dropping_below_it() {
+        let mut allocator = StickyAllocator::new();
+        let intent = VideoIntent::new("0", TrackId::from("track"), 720, 360, 0, 1).unwrap();
+        let layers = BTreeMap::from([(
+            TrackId::from("track"),
+            vec![
+                LayerOption {
+                    id: 1,
+                    height: 180,
+                    bitrate_bps: 50,
+                    fps: None,
+                },
+                LayerOption {
+                    id: 2,
+                    height: 360,
+                    bitrate_bps: 100,
+                    fps: None,
+                },
+            ],
+        )]);
+        let allocations = allocator.allocate(&[intent], &layers, 75).unwrap();
+        assert!(allocations[0].paused);
+        assert_eq!(allocations[0].height, 0);
     }
 }

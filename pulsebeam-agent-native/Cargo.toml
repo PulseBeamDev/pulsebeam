@@ -12,6 +12,12 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["protocol"]
+protocol = ["pulsebeam-agent-core/protocol"]
+e2ee = ["protocol", "pulsebeam-agent-core/e2ee"]
+sim = ["pulsebeam-core/sim"]
+
 [dependencies]
 pulsebeam-agent-core = { path = "../pulsebeam-agent-core" }
 bytes = { workspace = true }

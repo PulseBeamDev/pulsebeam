@@ -9,7 +9,7 @@ TARGET = pulsebeam
 TEST =
 
 .PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing \
-	test test-unit test-sim test-sim-seed agent-check agent-test agent-conformance agent-wasm agent-browser-test protected-paths
+	test test-unit test-sim test-sim-seed test-sim-agent-native agent-check agent-test agent-conformance agent-wasm agent-wasm-size agent-browser-test protected-paths
 all: build
 
 dev:
@@ -30,22 +30,36 @@ run-profile: profile
 test: test-unit test-sim
 
 agent-check:
-	$(CARGO_CMD) check -p pulsebeam-agent-core -p pulsebeam-agent-native -p pulsebeam-agent-web
+	$(CARGO_CMD) check -p pulsebeam-agent-core --no-default-features
+	$(CARGO_CMD) check -p pulsebeam-agent-core --all-features
+	$(CARGO_CMD) check -p pulsebeam-agent-native --all-features
+	$(CARGO_CMD) check -p pulsebeam-agent-web --no-default-features
+	$(CARGO_CMD) check -p pulsebeam-agent-web --all-features
 
 agent-test:
 	$(CARGO_CMD) test -p pulsebeam-agent-core --all-targets
 	$(CARGO_CMD) test -p pulsebeam-agent-native --all-targets
-	$(CARGO_CMD) test -p pulsebeam-agent-web --all-targets
+	$(CARGO_CMD) test -p pulsebeam-agent-web --no-default-features --all-targets
+	$(CARGO_CMD) test -p pulsebeam-agent-web --all-features --all-targets
 
 agent-conformance:
 	$(CARGO_CMD) test -p pulsebeam-agent-core --test conformance
 	$(CARGO_CMD) test -p pulsebeam-agent-native --test conformance
-	$(CARGO_CMD) test -p pulsebeam-agent-web --test conformance
+	$(CARGO_CMD) test -p pulsebeam-agent-web --features protocol --test conformance
 
 agent-wasm:
 	rustup target add wasm32-unknown-unknown
-	$(CARGO_CMD) check -p pulsebeam-agent-core --target wasm32-unknown-unknown
-	$(CARGO_CMD) check -p pulsebeam-agent-web --target wasm32-unknown-unknown
+	$(CARGO_CMD) check -p pulsebeam-agent-core --no-default-features --target wasm32-unknown-unknown
+	$(CARGO_CMD) check -p pulsebeam-agent-core --all-features --target wasm32-unknown-unknown
+	$(CARGO_CMD) check -p pulsebeam-agent-web --no-default-features --target wasm32-unknown-unknown
+	$(CARGO_CMD) check -p pulsebeam-agent-web --no-default-features --features protocol --target wasm32-unknown-unknown
+	$(CARGO_CMD) check -p pulsebeam-agent-web --all-features --target wasm32-unknown-unknown
+
+agent-wasm-size:
+	scripts/check-agent-wasm-size.sh
+
+test-sim-agent-native:
+	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-fail-fast agent_native::
 
 agent-browser-test:
 	$(CARGO_CMD) test -p pulsebeam-agent-web --target wasm32-unknown-unknown --test browser

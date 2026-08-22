@@ -151,7 +151,17 @@ impl ReconnectPolicy {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreConfig {
     pub reconnect_policy: ReconnectPolicy,
+    pub connect_timeout: Duration,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            reconnect_policy: ReconnectPolicy::default(),
+            connect_timeout: Duration::from_secs(10),
+        }
+    }
 }

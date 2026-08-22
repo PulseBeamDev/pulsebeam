@@ -1,4 +1,7 @@
-use pulsebeam_agent_core::{E2eeError, E2eeKey, E2eeSession};
+use pulsebeam_agent_core::{
+    E2eeDirection, E2eeDomain, E2eeEncryptor, E2eeEpoch, E2eeError, E2eeKeyRing, E2eeMasterKey,
+    E2eeReceiver,
+};
 
 #[cfg(target_arch = "wasm32")]
 use crate::interop::WebError;
@@ -10,8 +13,8 @@ pub enum TransformDirection {
 }
 
 struct E2eeState {
-    sender: E2eeSession,
-    receiver: E2eeSession,
+    sender: E2eeEncryptor,
+    receiver: E2eeReceiver,
 }
 
 pub struct E2eeContext {
@@ -19,11 +22,22 @@ pub struct E2eeContext {
 }
 
 impl E2eeContext {
-    pub fn new(key: E2eeKey) -> Result<Self, E2eeError> {
+    pub fn new(
+        key: E2eeMasterKey,
+        epoch: E2eeEpoch,
+        sender: impl Into<String>,
+        stream: impl Into<String>,
+    ) -> Result<Self, E2eeError> {
+        let key_id = key.key_id;
+        let sender = sender.into();
+        let stream = stream.into();
+        let send_domain = E2eeDomain::new(&sender, &stream, E2eeDirection::Send)?;
+        let mut ring = E2eeKeyRing::new(2)?;
+        ring.install(key, epoch, send_domain.clone())?;
         Ok(Self {
             state: std::rc::Rc::new(std::cell::RefCell::new(E2eeState {
-                sender: E2eeSession::new(key.clone())?,
-                receiver: E2eeSession::new(key)?,
+                sender: ring.encryptor(key_id, epoch, &send_domain)?,
+                receiver: ring.receiver(key_id, epoch, &send_domain)?,
             })),
         })
     }
@@ -51,7 +65,7 @@ pub struct EncodedTransform {
     worker: web_sys::Worker,
     port: web_sys::MessagePort,
     object_url: String,
-    callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>,
+    _callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -70,7 +84,8 @@ impl EncodedTransform {
         let object_url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js_error)?;
         let worker = web_sys::Worker::new(&object_url).map_err(js_error)?;
         let channel = web_sys::MessageChannel::new().map_err(js_error)?;
-        let port = channel.port_1();
+        let port = channel.port1();
+        let reply_port = port.clone();
         let callback = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
             let id = Reflect::get(&data, &JsValue::from_str("id"))
@@ -89,14 +104,15 @@ impl EncodedTransform {
                     TransformDirection::Encrypt => context.sender.encrypt(&input).ok(),
                     TransformDirection::Decrypt => context.receiver.decrypt(&input).ok(),
                 });
-            let Some(output) = output else {
-                return;
-            };
             let message = Object::new();
-            let bytes = js_sys::Uint8Array::from(output.as_slice());
             let _ = Reflect::set(&message, &JsValue::from_str("id"), &id.into());
-            let _ = Reflect::set(&message, &JsValue::from_str("data"), &bytes);
-            let _ = port.post_message(&message);
+            if let Some(output) = output {
+                let bytes = js_sys::Uint8Array::from(output.as_slice());
+                let _ = Reflect::set(&message, &JsValue::from_str("data"), &bytes);
+            } else {
+                let _ = Reflect::set(&message, &JsValue::from_str("error"), &true.into());
+            }
+            let _ = reply_port.post_message(&message);
         }) as Box<dyn FnMut(web_sys::MessageEvent)>);
         port.set_onmessage(Some(callback.as_ref().unchecked_ref()));
         port.start();
@@ -111,7 +127,7 @@ impl EncodedTransform {
             }),
         )
         .map_err(js_error)?;
-        Reflect::set(&options, &JsValue::from_str("port"), &channel.port_2()).map_err(js_error)?;
+        Reflect::set(&options, &JsValue::from_str("port"), &channel.port2()).map_err(js_error)?;
         let constructor = Reflect::get(
             &js_sys::global(),
             &JsValue::from_str("RTCRtpScriptTransform"),
@@ -126,7 +142,7 @@ impl EncodedTransform {
             worker,
             port,
             object_url,
-            callback,
+            _callback: callback,
         })
     }
 }
@@ -148,15 +164,21 @@ fn worker_source() -> &'static str {
   const pending = new Map();
   let nextId = 0;
   port.onmessage = message => {
-    const resolve = pending.get(message.data.id);
-    if (!resolve) return;
+    const request = pending.get(message.data.id);
+    if (!request) return;
     pending.delete(message.data.id);
-    resolve(message.data.data);
+    clearTimeout(request.timer);
+    if (message.data.error) request.reject(new Error("frame transform failed"));
+    else request.resolve(message.data.data);
   };
   port.start();
-  const process = data => new Promise(resolve => {
+  const process = data => new Promise((resolve, reject) => {
     const id = nextId++;
-    pending.set(id, resolve);
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error("frame transform timed out"));
+    }, 5000);
+    pending.set(id, { resolve, reject, timer });
     port.postMessage({ id, data });
   });
   transformer.readable.pipeThrough(new TransformStream({
@@ -185,9 +207,10 @@ mod tests {
 
     #[test]
     fn rust_e2ee_context_owns_frame_crypto() {
-        let key = E2eeKey::new(9, [7; 32]);
-        let mut sender = E2eeContext::new(key.clone()).unwrap();
-        let mut receiver = E2eeContext::new(key).unwrap();
+        let key = E2eeMasterKey::new(9, [7; 32]);
+        let epoch = E2eeEpoch::new([3; 16]).unwrap();
+        let mut sender = E2eeContext::new(key.clone(), epoch, "sender", "stream").unwrap();
+        let mut receiver = E2eeContext::new(key, epoch, "sender", "stream").unwrap();
         let frame = sender.encrypt_frame(b"frame").unwrap();
         assert_eq!(receiver.decrypt_frame(&frame).unwrap(), b"frame");
     }

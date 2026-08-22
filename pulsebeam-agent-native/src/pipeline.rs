@@ -91,8 +91,13 @@ impl Default for JitterBuffer {
 pub struct MediaPipeline {
     mtu: usize,
     next_sequence: u16,
-    assemblies: BTreeMap<u32, Vec<u8>>,
+    assemblies: BTreeMap<(TrackId, u32), FrameAssembly>,
     pending: VecDeque<MediaFrame>,
+}
+
+struct FrameAssembly {
+    packets: BTreeMap<u16, Vec<u8>>,
+    marker: Option<u16>,
 }
 
 impl MediaPipeline {
@@ -128,10 +133,52 @@ impl MediaPipeline {
     }
 
     pub fn ingest(&mut self, packet: RtpPacket, track_id: TrackId, now: MonotonicTime) {
-        let data = self.assemblies.entry(packet.timestamp).or_default();
-        data.extend_from_slice(&packet.payload);
-        if packet.marker
-            && let Some(data) = self.assemblies.remove(&packet.timestamp)
+        let key = (track_id.clone(), packet.timestamp);
+        let assembly = self
+            .assemblies
+            .entry(key.clone())
+            .or_insert_with(|| FrameAssembly {
+                packets: BTreeMap::new(),
+                marker: None,
+            });
+        assembly
+            .packets
+            .entry(packet.sequence)
+            .or_insert(packet.payload);
+        if packet.marker {
+            assembly.marker = Some(packet.sequence);
+        }
+        let Some(assembly) = self.assemblies.get(&key) else {
+            debug_assert!(false, "inserted frame assembly must remain addressable");
+            return;
+        };
+        let Some(marker) = assembly.marker else {
+            self.trim_assemblies();
+            return;
+        };
+        let Some(first) = assembly.packets.keys().next().copied() else {
+            debug_assert!(false, "marked assembly must contain at least one packet");
+            return;
+        };
+        let mut sequence = first;
+        let mut data = Vec::new();
+        loop {
+            let Some(payload) = assembly.packets.get(&sequence) else {
+                self.trim_assemblies();
+                return;
+            };
+            data.extend_from_slice(payload);
+            if sequence == marker {
+                break;
+            }
+            sequence = sequence.wrapping_add(1);
+            if sequence == first {
+                debug_assert!(false, "RTP frame assembly must terminate");
+                self.trim_assemblies();
+                return;
+            }
+        }
+        self.assemblies.remove(&key);
         {
             self.pending.push_back(MediaFrame {
                 track_id,
@@ -141,8 +188,12 @@ impl MediaPipeline {
                 data,
             });
         }
+        self.trim_assemblies();
+    }
+
+    fn trim_assemblies(&mut self) {
         while self.assemblies.len() > 128 {
-            let Some(oldest) = self.assemblies.keys().next().copied() else {
+            let Some(oldest) = self.assemblies.keys().next().cloned() else {
                 break;
             };
             self.assemblies.remove(&oldest);

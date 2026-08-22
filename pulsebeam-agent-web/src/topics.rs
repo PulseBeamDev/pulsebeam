@@ -71,6 +71,9 @@ impl TopicRegistry {
     ) -> Result<DataChannelConfig, TopicError> {
         let topic = topic.into();
         let publisher_id = publisher_id.into();
+        if publisher_id.is_empty() {
+            return Err(TopicError::EmptyPublisherId);
+        }
         let channel = topic_label(true, true, &topic, None);
         let config = DataChannelConfig::reliable(channel.clone());
         self.ordered_publishers.insert(
@@ -125,9 +128,7 @@ impl TopicRegistry {
         let message = publisher.publisher.publish(payload)?;
         Ok(TopicAction {
             channel: topic_label(true, true, topic, None),
-            payload: publisher
-                .publisher
-                .encode_delivery(&publisher.publisher_id, &message),
+            payload: TopicPublisher::encode_delivery(&publisher.publisher_id, &message),
         })
     }
 
@@ -174,6 +175,23 @@ impl TopicRegistry {
                 actions,
             ));
         }
+        if let Some(topic) = channel.strip_prefix("v1/rel/pub/") {
+            let topic = topic.split('/').next().unwrap_or(topic);
+            let publisher = self.ordered_publishers.get(topic).ok_or_else(|| {
+                TopicError::Decode("ordered publisher is not registered".to_owned())
+            })?;
+            let publisher_id = publisher.publisher_id.clone();
+            let actions = publisher
+                .publisher
+                .accept_control(payload)?
+                .into_iter()
+                .map(|message| TopicAction {
+                    channel: channel.to_owned(),
+                    payload: TopicPublisher::encode_delivery(&publisher_id, &message),
+                })
+                .collect();
+            return Ok((Vec::new(), actions));
+        }
         Err(TopicError::Decode("unknown data channel label".to_owned()))
     }
 }
@@ -185,6 +203,7 @@ impl Default for TopicRegistry {
 }
 
 #[cfg(test)]
+#[cfg(feature = "protocol")]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -215,5 +234,57 @@ mod tests {
             Some(TopicEvent::Ordered(OrderedEvent::Message { seq: 0, .. }))
         ));
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn ordered_publish_and_retransmit_preserve_delivery_identity() {
+        let mut publisher = TopicRegistry::new();
+        publisher
+            .register_ordered_publisher("chat", "alice", 7)
+            .unwrap();
+        let first = publisher.publish_ordered("chat", vec![1]).unwrap();
+        let second = publisher.publish_ordered("chat", vec![2]).unwrap();
+        let third = publisher.publish_ordered("chat", vec![3]).unwrap();
+
+        let mut subscriber = TopicRegistry::new();
+        subscriber.register_ordered_subscriber("chat");
+        let (events, actions) = subscriber
+            .receive("v1/rel/sub/chat", &first.payload)
+            .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(TopicEvent::Ordered(OrderedEvent::Message { seq: 0, .. }))
+        ));
+        assert!(actions.is_empty());
+
+        let (events, actions) = subscriber
+            .receive("v1/rel/sub/chat", &third.payload)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TopicEvent::Ordered(OrderedEvent::Nack(nack)) if nack.from_seq == 1
+        )));
+        assert_eq!(actions.len(), 1);
+
+        let (events, actions) = publisher
+            .receive("v1/rel/pub/chat", &actions[0].payload)
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(actions.len(), 2);
+        let (events, actions) = subscriber
+            .receive("v1/rel/sub/chat", &actions[0].payload)
+            .unwrap();
+        assert!(actions.is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TopicEvent::Ordered(OrderedEvent::Message { seq: 1, payload, .. })
+                if payload == &[2]
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TopicEvent::Ordered(OrderedEvent::Message { seq: 2, payload, .. })
+                if payload == &[3]
+        )));
+        let _ = second;
     }
 }

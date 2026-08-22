@@ -1,3 +1,5 @@
+#![cfg(feature = "protocol")]
+
 use pulsebeam_agent_core::{ConnectionState, CoreConfig, MediaKind, TrackId, TransportGeneration};
 use pulsebeam_agent_web::interop::{DataChannelConfig, PeerConfig};
 use pulsebeam_agent_web::{GenerationEvent, WebParticipant, WebTransport};

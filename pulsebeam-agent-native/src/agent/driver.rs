@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use pulsebeam_agent_core::{
     AgentCore, CoreConfig, CoreEffect, CoreError, CoreInput, MonotonicTime, SessionError,
     TransportGeneration,
 };
+use str0m::net::{Protocol, Receive};
+use str0m::{Event, Input, Output};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::clock::ClockAnchor;
@@ -44,6 +47,7 @@ pub struct AgentDriver {
     keyframes: KeyframeController,
     bandwidth: BandwidthController,
     rtc: Option<str0m::Rtc>,
+    rtc_deadline: Option<Instant>,
     active_generation: Option<TransportGeneration>,
     events: VecDeque<AgentEvent>,
     clock: ClockAnchor,
@@ -59,6 +63,7 @@ impl AgentDriver {
             keyframes: KeyframeController::default(),
             bandwidth: BandwidthController::default(),
             rtc: None,
+            rtc_deadline: None,
             active_generation: None,
             events: VecDeque::new(),
             clock: ClockAnchor::default(),
@@ -93,6 +98,19 @@ impl AgentDriver {
         self.core.next_deadline()
     }
 
+    fn next_wakeup(&self) -> Option<Instant> {
+        let core_deadline = self
+            .core
+            .next_deadline()
+            .map(|deadline| self.clock.at(deadline));
+        match (core_deadline, self.rtc_deadline) {
+            (Some(core), Some(rtc)) => Some(core.min(rtc)),
+            (Some(core), None) => Some(core),
+            (None, Some(rtc)) => Some(rtc),
+            (None, None) => None,
+        }
+    }
+
     pub async fn handle(&mut self, now: MonotonicTime, input: CoreInput) -> Result<(), AgentError> {
         if let Err(error) = self.core.handle(now, input) {
             self.events.push_back(AgentEvent::Error(error.clone()));
@@ -100,7 +118,7 @@ impl AgentDriver {
         }
         self.drain_core_events();
         while let Some(effect) = self.core.poll_effect() {
-            self.execute_effect(effect).await?;
+            self.execute_effect(now, effect).await?;
         }
         Ok(())
     }
@@ -137,10 +155,10 @@ impl AgentDriver {
         generation: TransportGeneration,
         buffer: &mut [u8],
     ) -> Result<Option<Vec<u8>>, AgentError> {
-        let bytes = match &mut self.transport {
+        let received = match &mut self.transport {
             NativeTransport::None => None,
             NativeTransport::Udp { socket, .. } => {
-                let (length, _) = socket
+                let (length, source) = socket
                     .recv_from(buffer)
                     .await
                     .map_err(|error| AgentError::Io(error.to_string()))?;
@@ -149,16 +167,52 @@ impl AgentDriver {
                     debug_assert!(false, "UDP receive length must fit its buffer");
                     return Err(AgentError::Io("UDP receive exceeded its buffer".to_owned()));
                 };
-                Some(contents.to_vec())
+                let destination = socket
+                    .local_addr()
+                    .map_err(|error| AgentError::Io(error.to_string()))?;
+                Some((contents.to_vec(), Some((source, destination))))
             }
-            NativeTransport::Tcp(session) => session.read_frame().await.map_err(AgentError::Tcp)?,
+            NativeTransport::Tcp(session) => session
+                .read_frame()
+                .await
+                .map_err(AgentError::Tcp)?
+                .map(|bytes| (bytes, None)),
         };
-        let Some(bytes) = bytes else {
+        let Some((bytes, addresses)) = received else {
             return Ok(None);
         };
-        self.record_received(bytes.len(), self.clock.now());
+        let now = self.clock.now();
+        self.record_received(bytes.len(), now);
         self.dispatch_datagram(generation, bytes.clone())?;
+        if self.rtc.is_some()
+            && let Some((source, destination)) = addresses
+        {
+            self.handle_rtc_datagram(generation, now, source, destination, &bytes)
+                .await?;
+        }
         Ok(Some(bytes))
+    }
+
+    pub async fn handle_rtc_datagram(
+        &mut self,
+        generation: TransportGeneration,
+        now: MonotonicTime,
+        source: SocketAddr,
+        destination: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), AgentError> {
+        self.require_generation(generation)?;
+        debug_assert!(!bytes.is_empty());
+        let receive = Receive::new(Protocol::Udp, source, destination, bytes)
+            .map_err(|error| AgentError::Rtc(error.to_string()))?;
+        let input = Input::Receive(self.clock.at(now), receive);
+        let rtc = self
+            .rtc
+            .as_mut()
+            .ok_or_else(|| AgentError::Rtc("RTC is not configured".to_owned()))?;
+        rtc.handle_input(input)
+            .map_err(|error| AgentError::Rtc(format!("{error:?}")))?;
+        self.drive_rtc(now, generation).await
     }
 
     pub fn poll_event(&mut self) -> Option<AgentEvent> {
@@ -171,11 +225,23 @@ impl AgentDriver {
         }
     }
 
-    async fn execute_effect(&mut self, effect: CoreEffect) -> Result<(), AgentError> {
+    async fn execute_effect(
+        &mut self,
+        now: MonotonicTime,
+        effect: CoreEffect,
+    ) -> Result<(), AgentError> {
         match effect {
             CoreEffect::Connect { generation } => {
                 self.active_generation = Some(generation);
                 self.events.push_back(AgentEvent::EffectExecuted);
+                if self.rtc.is_some() {
+                    self.drive_rtc(now, generation).await?;
+                } else {
+                    self.core
+                        .handle(now, CoreInput::TransportConnected { generation })
+                        .map_err(AgentError::Core)?;
+                    self.drain_core_events();
+                }
             }
             CoreEffect::Send {
                 generation,
@@ -202,6 +268,107 @@ impl AgentDriver {
             }
         }
         Ok(())
+    }
+
+    async fn drive_rtc(
+        &mut self,
+        now: MonotonicTime,
+        generation: TransportGeneration,
+    ) -> Result<(), AgentError> {
+        self.rtc_deadline = None;
+        loop {
+            let output = {
+                let Some(rtc) = self.rtc.as_mut() else {
+                    return Ok(());
+                };
+                rtc.poll_output()
+                    .map_err(|error| AgentError::Rtc(format!("{error:?}")))?
+            };
+            match output {
+                Output::Timeout(deadline) => {
+                    self.rtc_deadline = Some(deadline);
+                    return Ok(());
+                }
+                Output::Transmit(transmit) => {
+                    self.send_transport(transmit.destination, transmit.contents.into())
+                        .await?;
+                }
+                Output::Event(event) => match event {
+                    Event::Connected => {
+                        self.core
+                            .handle(now, CoreInput::TransportConnected { generation })
+                            .map_err(AgentError::Core)?;
+                        self.drain_core_events();
+                    }
+                    Event::IceConnectionStateChange(str0m::IceConnectionState::Disconnected)
+                    | Event::Closed => {
+                        self.rtc_deadline = None;
+                        self.core
+                            .handle(now, CoreInput::TransportClosed { generation })
+                            .map_err(AgentError::Core)?;
+                        self.drain_core_events();
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    async fn handle_rtc_timeout(&mut self, now: MonotonicTime) -> Result<(), AgentError> {
+        let Some(deadline) = self.rtc_deadline else {
+            return Ok(());
+        };
+        let current = self.clock.instant_now();
+        if current < deadline {
+            return Ok(());
+        }
+        self.rtc_deadline = None;
+        let generation = self
+            .active_generation
+            .unwrap_or_else(|| self.core.generation());
+        let rtc = self
+            .rtc
+            .as_mut()
+            .ok_or_else(|| AgentError::Rtc("RTC is not configured".to_owned()))?;
+        rtc.handle_input(Input::Timeout(current))
+            .map_err(|error| AgentError::Rtc(format!("{error:?}")))?;
+        self.drive_rtc(now, generation).await
+    }
+
+    async fn handle_due_timers(&mut self) -> Result<(), AgentError> {
+        let now = self.clock.now();
+        if self
+            .rtc_deadline
+            .is_some_and(|deadline| self.clock.instant_now() >= deadline)
+        {
+            self.handle_rtc_timeout(now).await?;
+        }
+        if self
+            .core
+            .next_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.handle(now, CoreInput::Timer).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_transport(
+        &mut self,
+        destination: SocketAddr,
+        payload: Vec<u8>,
+    ) -> Result<(), AgentError> {
+        match &mut self.transport {
+            NativeTransport::None => Ok(()),
+            NativeTransport::Udp { socket, .. } => socket
+                .send_to(&payload, destination)
+                .await
+                .map(|_| ())
+                .map_err(|error| AgentError::Io(error.to_string())),
+            NativeTransport::Tcp(session) => {
+                session.write_frame(&payload).await.map_err(AgentError::Tcp)
+            }
+        }
     }
 
     fn require_generation(&self, generation: TransportGeneration) -> Result<(), AgentError> {
@@ -239,11 +406,11 @@ impl AgentRunner {
 
     pub async fn run(mut self) -> Result<(), AgentError> {
         loop {
-            let command = if let Some(deadline) = self.driver.next_deadline() {
+            let command = if let Some(deadline) = self.driver.next_wakeup() {
                 tokio::select! {
                     command = self.commands.recv() => Some(command),
-                    _ = tokio::time::sleep_until(self.driver.clock.at(deadline)) => {
-                        self.driver.handle(self.driver.clock.now(), CoreInput::Timer).await?;
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        self.driver.handle_due_timers().await?;
                         None
                     }
                 }
@@ -268,6 +435,7 @@ pub enum AgentError {
     Tcp(TcpError),
     Media(MediaError),
     Session(SessionError),
+    Rtc(String),
 }
 
 impl std::fmt::Display for AgentError {
@@ -278,6 +446,7 @@ impl std::fmt::Display for AgentError {
             Self::Tcp(error) => write!(formatter, "TCP: {error}"),
             Self::Media(error) => write!(formatter, "media: {error}"),
             Self::Session(error) => write!(formatter, "session: {error}"),
+            Self::Rtc(error) => write!(formatter, "RTC: {error}"),
         }
     }
 }
@@ -310,6 +479,21 @@ mod tests {
             result,
             Err(AgentError::Core(CoreError::StaleGeneration { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn rtc_connect_waits_for_rtc_readiness_and_keeps_deadline() {
+        let mut driver = AgentDriver::new(CoreConfig::default(), NativeTransport::None);
+        driver.set_rtc(str0m::Rtc::new(Instant::now()));
+        driver
+            .handle(MonotonicTime::ZERO, CoreInput::Start)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.core().state(),
+            pulsebeam_agent_core::ConnectionState::Connecting
+        );
+        assert!(driver.rtc_deadline.is_some());
     }
 
     #[tokio::test]
@@ -354,6 +538,13 @@ mod tests {
             driver.poll_event(),
             Some(AgentEvent::EffectExecuted)
         ));
+        assert!(matches!(
+            driver.poll_event(),
+            Some(AgentEvent::Core(CoreEvent::StateChanged {
+                state: pulsebeam_agent_core::ConnectionState::Connected,
+                ..
+            }))
+        ));
         assert_eq!(
             driver.poll_event(),
             Some(AgentEvent::DatagramReceived {
@@ -394,6 +585,13 @@ mod tests {
         assert!(matches!(
             driver.poll_event(),
             Some(AgentEvent::EffectExecuted)
+        ));
+        assert!(matches!(
+            driver.poll_event(),
+            Some(AgentEvent::Core(CoreEvent::StateChanged {
+                state: pulsebeam_agent_core::ConnectionState::Connected,
+                ..
+            }))
         ));
         assert_eq!(
             driver.poll_event(),

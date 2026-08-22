@@ -12,6 +12,13 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+protocol = ["dep:pulsebeam-proto"]
+e2ee = ["dep:aes-gcm", "dep:hkdf", "dep:sha2"]
+
 [dependencies]
-aws-lc-rs = "1.16.3"
-pulsebeam-proto = { path = "../pulsebeam-proto" }
+aes-gcm = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+pulsebeam-proto = { path = "../pulsebeam-proto", optional = true }
+sha2 = { workspace = true, optional = true }

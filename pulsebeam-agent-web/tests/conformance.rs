@@ -1,6 +1,6 @@
-use pulsebeam_agent_core::{CoreConfig, MonotonicTime, TransportGeneration};
+use pulsebeam_agent_core::TransportGeneration;
 use pulsebeam_agent_web::interop::{DataChannelConfig, PeerConfig, SIGNALING_LABEL, SenderPreset};
-use pulsebeam_agent_web::{SenderUpdateQueue, WebParticipant, WebTransport};
+use pulsebeam_agent_web::{SenderUpdateQueue, WebTransport};
 
 #[test]
 fn web_transport_keeps_browser_contract_value_owned() {
@@ -27,8 +27,12 @@ fn web_transport_keeps_browser_contract_value_owned() {
     assert!(updates.is_empty());
 }
 
+#[cfg(feature = "protocol")]
 #[test]
 fn web_participant_uses_core_for_initial_state() {
+    use pulsebeam_agent_core::{CoreConfig, MonotonicTime};
+    use pulsebeam_agent_web::WebParticipant;
+
     let participant = WebParticipant::new(CoreConfig::default(), PeerConfig::default())
         .expect("participant is constructible without browser services");
     assert_eq!(

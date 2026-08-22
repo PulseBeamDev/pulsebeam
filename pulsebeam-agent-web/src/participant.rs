@@ -356,17 +356,18 @@ fn topic_error(error: pulsebeam_agent_core::topic::TopicError) -> WebError {
     WebError::Topic(error.to_string())
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn browser_or_mock_fetch() -> FetchClient {
     FetchClient::browser()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
 fn browser_or_mock_fetch() -> FetchClient {
     FetchClient::mock()
 }
 
 #[cfg(test)]
+#[cfg(feature = "protocol")]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
