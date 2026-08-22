@@ -653,7 +653,6 @@ impl ControllerActor {
             None => {
                 let Ok(allocation) = self.track_allocator.allocate(origin_shard, identity, now)
                 else {
-                    debug_assert!(false, "the publisher shard must accept a track allocation");
                     return;
                 };
                 self.track_allocations
@@ -667,39 +666,7 @@ impl ControllerActor {
                 track.set_reverse(Some(origin_allocation.route));
             }
         }
-
-        let mut desired = effect_members
-            .keys()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        desired.insert(origin_shard);
         let generation = self.next_generation();
-        let current: Vec<_> = self
-            .track_allocations
-            .keys()
-            .filter_map(|(held, shard)| (*held == identity).then_some(*shard))
-            .collect();
-        for destination in current {
-            if destination != origin_shard && !desired.contains(&destination) {
-                if let Some(allocation) = self.track_allocations.remove(&(identity, destination)) {
-                    self.stage_update_at(
-                        destination,
-                        generation,
-                        crate::shard_update::ShardUpdateOp::RetireRoute {
-                            handle: allocation.route,
-                        },
-                    );
-                    self.stage_update_at(
-                        destination,
-                        generation,
-                        crate::shard_update::ShardUpdateOp::RemoveTrackRuntime {
-                            key: allocation.key,
-                        },
-                    );
-                    self.track_allocator.release(allocation, now);
-                }
-            }
-        }
 
         let stage_plan = |actor: &mut Self,
                           shard: ShardId,
@@ -757,11 +724,55 @@ impl ControllerActor {
             {
                 let Ok(allocation) = self.track_allocator.allocate(destination, identity, now)
                 else {
-                    debug_assert!(false, "an audience shard must accept a track allocation");
                     continue;
                 };
                 self.track_allocations
                     .insert((identity, destination), allocation);
+            }
+        }
+        let unavailable: Vec<_> = effect_members
+            .keys()
+            .copied()
+            .filter(|destination| {
+                *destination != origin_shard
+                    && !self
+                        .track_allocations
+                        .contains_key(&(identity, *destination))
+            })
+            .collect();
+        for destination in unavailable {
+            effect_members.remove(&destination);
+            members.remove(&destination);
+        }
+        let mut desired = effect_members
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        desired.insert(origin_shard);
+        let current: Vec<_> = self
+            .track_allocations
+            .keys()
+            .filter_map(|(held, shard)| (*held == identity).then_some(*shard))
+            .collect();
+        for destination in current {
+            if destination != origin_shard && !desired.contains(&destination) {
+                if let Some(allocation) = self.track_allocations.remove(&(identity, destination)) {
+                    self.stage_update_at(
+                        destination,
+                        generation,
+                        crate::shard_update::ShardUpdateOp::RetireRoute {
+                            handle: allocation.route,
+                        },
+                    );
+                    self.stage_update_at(
+                        destination,
+                        generation,
+                        crate::shard_update::ShardUpdateOp::RemoveTrackRuntime {
+                            key: allocation.key,
+                        },
+                    );
+                    self.track_allocator.release(allocation, now);
+                }
             }
         }
         let remote_routes: Vec<_> = members
@@ -900,17 +911,19 @@ impl ControllerActor {
                 let Some(participant) = meta.binding else {
                     continue;
                 };
-                let key = self
+                let Some(allocation) = self
                     .track_allocations
                     .get(&(identity, meta.shard_id))
-                    .map(|allocation| allocation.key)
-                    .unwrap_or(origin_allocation.key);
+                    .copied()
+                else {
+                    continue;
+                };
                 self.stage_participant_at(
                     meta.shard_id,
                     generation,
                     participant,
                     crate::participant::ParticipantEffect::TrackSubscribed {
-                        key,
+                        key: allocation.key,
                         channel: data.channel,
                         lane: data.lane,
                     },
