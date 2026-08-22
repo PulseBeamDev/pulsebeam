@@ -346,7 +346,7 @@ impl ShardRuntime {
                 MediaPayload::Track(RoutedTrackPacket {
                     key: fanout.raw(),
                     packet: TrackPacket::Video(VideoPacket {
-                        packet: Box::new(packet.to_transit()),
+                        packet: packet.to_transit(),
                     }),
                 })
             },
@@ -387,7 +387,7 @@ impl ShardRuntime {
                     MediaPayload::Track(RoutedTrackPacket {
                         key: track.raw(),
                         packet: TrackPacket::Audio(AudioPacket {
-                            packet: Box::new(pkt.to_transit()),
+                            packet: pkt.to_transit(),
                         }),
                     })
                 },

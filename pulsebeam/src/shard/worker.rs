@@ -223,7 +223,7 @@ pub(crate) enum MediaPayload {
 /// the control plane ([`ShardCommand`] / [`ShardEvent`]) and never this way.
 #[allow(
     clippy::large_enum_variant,
-    reason = "the payload enum carries boxed RTP packets and owned SCTP bytes so cross-shard payloads remain core-local"
+    reason = "the payload enum carries materialized TrackPacket values and owned SCTP bytes so cross-shard payloads remain core-local"
 )]
 pub(crate) enum ShardFrame {
     Ingress {
@@ -772,7 +772,9 @@ mod reverse_tests {
 
     #[test]
     fn media_payload_stays_compact() {
-        const _: () = assert!(std::mem::size_of::<MediaPayload>() <= 64);
+        const _: () = assert!(
+            std::mem::size_of::<MediaPayload>() <= std::mem::size_of::<RoutedTrackPacket>() + 16
+        );
         let payload = MediaPayload::Data(b"payload".to_vec());
         let MediaPayload::Data(bytes) = payload else {
             unreachable!();

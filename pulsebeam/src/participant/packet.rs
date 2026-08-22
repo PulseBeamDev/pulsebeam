@@ -15,12 +15,12 @@ pub struct DataPacket {
 
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
-    pub packet: Box<RtpPacket>,
+    pub packet: RtpPacket,
 }
 
 #[derive(Debug, Clone)]
 pub struct VideoPacket {
-    pub packet: Box<RtpPacket>,
+    pub packet: RtpPacket,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +30,7 @@ pub struct RoutedTrackPacket {
 }
 
 impl RoutedTrackPacket {
-    pub fn into_rtp(self) -> Option<Box<RtpPacket>> {
+    pub fn into_rtp(self) -> Option<RtpPacket> {
         match self.packet {
             TrackPacket::Audio(packet) => Some(packet.packet),
             TrackPacket::Video(packet) => Some(packet.packet),

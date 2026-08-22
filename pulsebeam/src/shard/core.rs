@@ -402,7 +402,7 @@ impl ShardCore {
                     router,
                 };
                 self.runtime
-                    .route_rtp_with_plan(key, Origin::Remote, *pkt, plan, &mut ctx);
+                    .route_rtp_with_plan(key, Origin::Remote, pkt, plan, &mut ctx);
             }
             (crate::route::RouteAction::Unreliable { stream }, MediaPayload::Data(bytes)) => {
                 let Some(plan) = plans.get(crate::plan::PlanKey::Unreliable(stream)) else {
@@ -541,7 +541,7 @@ impl ShardCore {
                 continue;
             };
             self.runtime
-                .route_rtp_with_plan(key, Origin::Local, *packet, plan, &mut ctx);
+                .route_rtp_with_plan(key, Origin::Local, packet, plan, &mut ctx);
         }
         while processed < budget {
             let Some(ev) = self.pipeline.pop_data_sctp() else {

@@ -29,6 +29,7 @@ use crate::participant::downstream::SlotConfig;
 use crate::participant::effect::{CompiledTrack, ParticipantEffect};
 use crate::participant::event::ParticipantSink;
 use crate::participant::signaling;
+use crate::participant::{AudioPacket, TrackPacket, VideoPacket};
 use crate::participant::{
     batcher::{AppendStatus, Batcher, NetworkEgress, OwnedPacketQueue},
     downstream::DownstreamAllocator,
@@ -1561,11 +1562,11 @@ impl ParticipantCore {
             &mut rtp,
             sr,
         ) {
-            let kind = match media.kind() {
-                MediaKind::Audio => TrackKind::Audio,
-                MediaKind::Video => TrackKind::Video,
+            let packet = match media.kind() {
+                MediaKind::Audio => TrackPacket::Audio(AudioPacket { packet: rtp }),
+                MediaKind::Video => TrackPacket::Video(VideoPacket { packet: rtp }),
             };
-            events.publish_rtp(route.fanout, kind, rtp);
+            events.publish_track_packet(route.fanout, packet);
         } else {
             self.incoming_rtp_routes.remove(ssrc);
         }
