@@ -160,6 +160,22 @@ impl RoomRegistry {
         Some(meta.shard_id)
     }
 
+    pub fn disconnect_participant(
+        &mut self,
+        participant_id: &ParticipantId,
+    ) -> Option<(ShardId, Option<TransportHandle>, Option<ParticipantKey>)> {
+        let meta = self.participants.get_mut(participant_id)?;
+        let result = (meta.shard_id, meta.transport.take(), meta.binding.take());
+        meta.connected = false;
+        if let Some(room) = self.rooms.get_mut(&meta.room_id) {
+            room.remove_participant(participant_id, meta.shard_id);
+            if room.participant_count() == 0 {
+                self.sweeper.insert(meta.room_id, EMPTY_ROOM_TIMEOUT);
+            }
+        }
+        Some(result)
+    }
+
     pub async fn next_expired(&mut self) {
         // DelayQueue returns Poll::Ready(None) immediately when empty, which
         // would cause the select! caller to spin at 100% CPU. Park forever

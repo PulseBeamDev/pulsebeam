@@ -1077,16 +1077,25 @@ async fn run_participant(
         let auto_subscribe =
             config.auto_subscribe && (matches!(config.role, Role::Subscriber) || config.subscribes);
         let shared_clone = shared.clone();
-        let mut client = builder
+        let mut client = match builder
             .with_paused_publishers(shared.paused_publishers.clone())
             .with_audio_rx(shared.audio_rx.clone())
             .with_video_rx(shared.video_rx.clone())
             .connect(room_name)
-            .await?;
+            .await
+        {
+            Ok(client) => client,
+            Err(error) if config.starts_disconnected => {
+                *shared.connected.lock().unwrap() = false;
+                tracing::debug!(%error, "participant materialization failed");
+                match cmd_rx.recv().await {
+                    Some(ParticipantCmd::Reconnect) => continue,
+                    _ => break,
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
 
-        // A reconnect makes a *new* participant, with a new id, and the plan needs both facts:
-        // which identity is live now, and which ones are dead. A client still holding a dead one
-        // is a ghost, and that is invisible if the harness only remembers the first.
         {
             let id = client.ctx.agent.participant_id().clone();
             *shared.participant_id.lock().unwrap() = Some(id.clone());

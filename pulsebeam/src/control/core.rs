@@ -158,13 +158,27 @@ impl ControllerCore {
 
     pub fn delete_participant(&mut self, participant: &ParticipantId) -> Option<ParticipantMeta> {
         let meta = self.registry.get_participant(participant)?;
-        let result = ParticipantMeta {
+        let result = self.participant_meta(meta);
+        self.registry.remove_participant(participant);
+        Some(result)
+    }
+
+    pub fn disconnect_participant(
+        &mut self,
+        participant: &ParticipantId,
+    ) -> Option<ParticipantMeta> {
+        let meta = self.registry.get_participant(participant)?;
+        let result = self.participant_meta(meta);
+        let _ = self.registry.disconnect_participant(participant);
+        Some(result)
+    }
+
+    fn participant_meta(&self, meta: &super::registry::ParticipantMeta) -> ParticipantMeta {
+        ParticipantMeta {
             shard: meta.shard_id,
             binding: meta.binding,
             transport: meta.transport,
-        };
-        self.registry.remove_participant(participant);
-        Some(result)
+        }
     }
 
     pub async fn next_expired(&mut self) {

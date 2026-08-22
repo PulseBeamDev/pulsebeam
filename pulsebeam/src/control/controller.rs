@@ -106,6 +106,7 @@ pub struct ControllerActor {
     track_allocator: TrackAllocator,
     track_keys: HashMap<TrackIdentity, crate::keys::TrackKey>,
     track_allocations: HashMap<(TrackIdentity, ShardId), TrackAllocation>,
+    track_retries: HashSet<TrackIdentity>,
     generation: u64,
     command_backlog: VecDeque<(ShardId, ShardCommand)>,
     #[cfg(not(feature = "sim"))]
@@ -136,6 +137,7 @@ impl ControllerActor {
             track_allocator: TrackAllocator::new(shard_count),
             track_keys: HashMap::new(),
             track_allocations: HashMap::new(),
+            track_retries: HashSet::new(),
             generation: 0,
             command_backlog: VecDeque::new(),
             #[cfg(not(feature = "sim"))]
@@ -204,6 +206,7 @@ impl ControllerActor {
                 _ = self.core.next_expired() => {},
                 _ = poll_interval.tick() => {
                     self.router.poll_loads();
+                    self.retry_track_allocations();
                     self.flush_command_backlog();
                     for update in &mut self.updates { let _ = update.flush_backlog(); }
                 }
@@ -443,7 +446,7 @@ impl ControllerActor {
                 self.emit_placeholder(shard);
             }
             ShardEvent::ParticipantClosed { participant, .. } => {
-                self.remove_participant(participant).await;
+                self.remove_participant_with_mode(participant, true).await;
             }
         }
     }
@@ -653,6 +656,7 @@ impl ControllerActor {
             None => {
                 let Ok(allocation) = self.track_allocator.allocate(origin_shard, identity, now)
                 else {
+                    self.track_retries.insert(identity);
                     return;
                 };
                 self.track_allocations
@@ -713,6 +717,7 @@ impl ControllerActor {
             );
         };
 
+        let mut allocation_failed = false;
         for destination in effect_members
             .keys()
             .copied()
@@ -724,11 +729,17 @@ impl ControllerActor {
             {
                 let Ok(allocation) = self.track_allocator.allocate(destination, identity, now)
                 else {
+                    allocation_failed = true;
                     continue;
                 };
                 self.track_allocations
                     .insert((identity, destination), allocation);
             }
+        }
+        if allocation_failed {
+            self.track_retries.insert(identity);
+        } else {
+            self.track_retries.remove(&identity);
         }
         let unavailable: Vec<_> = effect_members
             .keys()
@@ -931,6 +942,13 @@ impl ControllerActor {
             }
         }
         self.publish_staged();
+    }
+
+    fn retry_track_allocations(&mut self) {
+        let retries: Vec<_> = self.track_retries.drain().collect();
+        for identity in retries {
+            self.reconcile_track(identity, false);
+        }
     }
 
     fn next_generation(&mut self) -> u64 {
@@ -1332,11 +1350,20 @@ impl ControllerActor {
         if current != state.old_connection_id {
             return Err(ControllerError::StaleConnection);
         }
-        self.remove_participant(state.participant_id).await;
+        self.remove_participant_with_mode(state.participant_id, true)
+            .await;
         self.handle_create_participant(state, offer).await
     }
 
     async fn remove_participant(&mut self, participant: ParticipantId) {
+        self.remove_participant_with_mode(participant, false).await;
+    }
+
+    async fn remove_participant_with_mode(
+        &mut self,
+        participant: ParticipantId,
+        retain_identity: bool,
+    ) {
         let Some(meta) = self
             .core
             .registry
@@ -1385,7 +1412,11 @@ impl ControllerActor {
         if let Some(room_id) = room_id {
             self.stage_participant_change_at(room_id, generation, None, Some(participant));
         }
-        let _ = self.core.delete_participant(&participant);
+        if retain_identity {
+            let _ = self.core.disconnect_participant(&participant);
+        } else {
+            let _ = self.core.delete_participant(&participant);
+        }
         self.topology.remove_participant(participant);
         self.publish_staged();
         let now = tokio::time::Instant::now();
