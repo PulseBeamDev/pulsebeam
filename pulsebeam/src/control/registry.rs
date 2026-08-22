@@ -79,10 +79,7 @@ impl RoomRegistry {
                 self.sweeper.insert(previous.room_id, EMPTY_ROOM_TIMEOUT);
             }
         }
-        let room = self
-            .rooms
-            .entry(room_id)
-            .or_insert_with(|| Room::new(room_id));
+        let room = self.rooms.entry(room_id).or_insert_with(Room::new);
         room.add_participant(&participant_id, shard_id);
     }
 
@@ -112,21 +109,6 @@ impl RoomRegistry {
             return;
         };
         meta.connection_id = Some(connection_id);
-    }
-
-    pub fn participants_in_room(
-        &self,
-        room_id: &RoomId,
-    ) -> Vec<(ParticipantId, ShardId, Option<ParticipantKey>)> {
-        let Some(room) = self.rooms.get(room_id) else {
-            return Vec::new();
-        };
-        room.participant_ids()
-            .filter_map(|participant| {
-                let meta = self.participants.get(participant)?;
-                Some((*participant, meta.shard_id, meta.binding))
-            })
-            .collect()
     }
 
     /// Record the arena key the owning shard reported for this participant.

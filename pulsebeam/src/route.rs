@@ -378,7 +378,7 @@ fn from_wire_route(route: pulsebeam_routing::RouteId) -> RouteId {
 /// subscriber membership: local subscribe/unsubscribe is frequent and purely
 /// local, while a cluster route is expensive to install. Churn mutates the
 /// local object and leaves the route untouched.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteAction {
     Forward {
         target: crate::keys::TrackKey,
@@ -400,17 +400,12 @@ pub(crate) enum RouteAction {
     },
 }
 
-/// The shard-owned half of a route: the accounting a packet mutates as it
-/// arrives.
-///
-/// The other half — the epoch and the compiled [`RouteAction`] — lives in the
-/// published [`ShardState`](crate::shard_update::ShardState), because that is what the
-/// control plane decides and the data plane only reads. What is left here is
-/// per-route processing state, which must be mutable on the owning core and
-/// therefore cannot live in an immutable image.
+/// The shard-owned route slot. Its epoch rejects stale control messages while
+/// the action and packet accounting stay in the same cache line.
 #[derive(Debug)]
 pub(crate) struct RouteRuntimeEntry {
-    pub handle: RouteHandle,
+    pub epoch: u16,
+    pub action: RouteAction,
     /// Expands the envelope's middle-32 against this route's own reference.
     pub expander: NtpExpander,
     /// Last `link_seq` seen, for hop-local loss/reorder/duplicate accounting.
@@ -592,13 +587,7 @@ impl SlotAllocator {
     }
 }
 
-/// The shard's per-route accounting, addressed by slot.
-///
-/// Not a route *table*: it decides nothing and resolves nothing. Whether a
-/// route is live, and what it points at, is the published
-/// [`ShardState`](crate::shard_update::ShardState)'s answer; this only holds the
-/// mutable processing state that must live on the owning core, and is
-/// created and dropped at the control plane's direction.
+/// The shard's route table, addressed by slot.
 #[derive(Debug)]
 pub(crate) struct RouteRuntime {
     shard_id: ShardId,
@@ -651,13 +640,16 @@ impl RouteRuntime {
             .slots
             .get(idx)
             .and_then(Option::as_ref)
-            .is_none_or(|entry| entry.handle != handle);
+            .is_none_or(|entry| entry.epoch != handle.epoch);
         if stale {
             self.install(handle, ntp_ref);
         }
         let Some(Some(entry)) = self.slots.get_mut(idx) else {
             pulsebeam_runtime::fatal!("route accounting must exist after installing it")
         };
+        if entry.last_link_seq.is_none() {
+            entry.expander = NtpExpander::new(ntp_ref);
+        }
         entry
     }
 
@@ -677,8 +669,40 @@ impl RouteRuntime {
             return;
         };
         *slot = Some(RouteRuntimeEntry {
-            handle,
+            epoch: handle.epoch,
+            action: RouteAction::Forward {
+                target: crate::keys::TrackKey::default(),
+            },
             expander: NtpExpander::new(ntp_ref),
+            last_link_seq: None,
+            stats: RouteStats::default(),
+        });
+    }
+
+    pub fn install_action(&mut self, handle: RouteHandle, action: RouteAction) {
+        debug_assert_eq!(
+            handle.shard(),
+            self.shard_id,
+            "a route's action only exists at the shard that owns it"
+        );
+        let idx = handle.route.index();
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx.saturating_add(1), || None);
+        }
+        let Some(slot) = self.slots.get_mut(idx) else {
+            debug_assert!(false, "the resize above guarantees this slot exists");
+            return;
+        };
+        if let Some(entry) = slot.as_mut()
+            && entry.epoch == handle.epoch
+        {
+            entry.action = action;
+            return;
+        }
+        *slot = Some(RouteRuntimeEntry {
+            epoch: handle.epoch,
+            action,
+            expander: NtpExpander::new(NtpTime::ZERO),
             last_link_seq: None,
             stats: RouteStats::default(),
         });
@@ -691,26 +715,32 @@ impl RouteRuntime {
             return false;
         };
         match slot {
-            Some(entry) if entry.handle == handle => {}
+            Some(entry) if entry.epoch == handle.epoch => {}
             _ => return false,
         }
         *slot = None;
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_counter("route_retired");
         true
     }
 
     #[cfg(test)]
     pub fn entry_mut(&mut self, handle: RouteHandle) -> Option<&mut RouteRuntimeEntry> {
         match self.slots.get_mut(handle.route.index()) {
-            Some(Some(entry)) if entry.handle == handle => Some(entry),
+            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
             _ => None,
         }
     }
 
     pub fn entry(&self, handle: RouteHandle) -> Option<&RouteRuntimeEntry> {
         match self.slots.get(handle.route.index()) {
-            Some(Some(entry)) if entry.handle == handle => Some(entry),
+            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
             _ => None,
         }
+    }
+
+    pub fn resolve(&self, handle: RouteHandle) -> Option<RouteAction> {
+        self.entry(handle).map(|entry| entry.action)
     }
 
     #[cfg(test)]
@@ -1026,6 +1056,68 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn same_epoch_action_updates_preserve_packet_accounting() {
+        let mut runtime = RouteRuntime::new(ShardId::new(0));
+        let route = handle(0, 0, 7);
+        runtime.install_action(
+            route,
+            RouteAction::Forward {
+                target: crate::keys::TrackKey::default(),
+            },
+        );
+        {
+            let entry = runtime.entry_mut(route).unwrap();
+            entry.observe(100);
+            entry.observe(103);
+        }
+        let before = runtime.entry(route).unwrap().stats;
+        let expander_before = runtime.entry(route).unwrap().expander;
+        runtime.install_action(
+            route,
+            RouteAction::Reverse {
+                target: crate::keys::TrackKey::default(),
+            },
+        );
+
+        let entry = runtime.entry(route).unwrap();
+        assert_eq!(
+            entry.action,
+            RouteAction::Reverse {
+                target: crate::keys::TrackKey::default()
+            }
+        );
+        assert_eq!(entry.stats, before);
+        assert_eq!(entry.last_link_seq, Some(103));
+        assert_eq!(entry.expander.reference(), expander_before.reference());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_epoch_restarts_packet_accounting() {
+        let mut runtime = RouteRuntime::new(ShardId::new(0));
+        let old = handle(0, 0, 7);
+        runtime.install_action(
+            old,
+            RouteAction::Forward {
+                target: crate::keys::TrackKey::default(),
+            },
+        );
+        runtime.entry_mut(old).unwrap().observe(100);
+
+        let replacement = handle(0, 0, 8);
+        runtime.install_action(
+            replacement,
+            RouteAction::Forward {
+                target: crate::keys::TrackKey::default(),
+            },
+        );
+
+        let entry = runtime.entry(replacement).unwrap();
+        assert_eq!(entry.stats, RouteStats::default());
+        assert_eq!(entry.last_link_seq, None);
+        assert!(runtime.entry(old).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn retiring_accounting_is_idempotent_and_epoch_checked() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         runtime.install(handle(0, 0, 4), NtpTime::ZERO);
@@ -1186,11 +1278,6 @@ mod layout {
             size_of::<Option<RouteRuntimeEntry>>() <= CACHE_LINE,
             "route accounting is {} bytes; a packet would straddle two lines",
             size_of::<Option<RouteRuntimeEntry>>()
-        );
-        assert!(
-            size_of::<Option<crate::shard_update::RouteBinding>>() <= CACHE_LINE / 2,
-            "a view binding is {} bytes; several should share a line",
-            size_of::<Option<crate::shard_update::RouteBinding>>()
         );
     }
 }

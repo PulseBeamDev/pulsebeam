@@ -411,3 +411,83 @@ fn audio_crosses_a_shard_boundary_test() {
             },
         ]);
 }
+
+#[test]
+fn an_audio_wildcard_does_not_allocate_a_data_destination_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("audio-does-not-imply-data")
+                .with_participant(Participant::data_participant("publisher"))
+                .with_participant(Participant::subscriber("audio_listener").hearing(1)),
+        )
+        .run(vec![
+            Step::DeclarePublishTopic {
+                description: "Publisher declares a data topic",
+                participant: "publisher",
+                topic: "events",
+            },
+            Step::Run {
+                description: "Install the audio wildcard and publish the data track",
+                duration: Duration::from_secs(3),
+            },
+            Step::PublishData {
+                description: "Publisher sends a data payload",
+                participant: "publisher",
+                topic: "events",
+                data: b"must-stay-data-only",
+            },
+            Step::Run {
+                description: "Allow the data publication to reconcile",
+                duration: Duration::from_secs(2),
+            },
+            Step::CheckRoutingCounter {
+                description: "Audio wildcard created no data destination",
+                name: "data_destination_allocated",
+                exact: 0,
+            },
+            Step::CheckDataCount {
+                description: "Audio-only listener receives no data payload",
+                participant: "audio_listener",
+                topic: "events",
+                expected: 0,
+            },
+        ]);
+}
+
+#[test]
+fn final_automatic_audio_listener_departure_retires_routes_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("audio-listener-departure")
+                .with_participant(Participant::data_participant("speaker").speaking_at(-30))
+                .with_participant(Participant::subscriber("listener").hearing(1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Install the automatic audio listener route",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckHeardFrom {
+                description: "Listener receives the speaker before departure",
+                participant: "listener",
+                expected: &["speaker"],
+            },
+            Step::Disconnect {
+                description: "The final automatic audio listener leaves",
+                participant: "listener",
+            },
+            Step::Run {
+                description: "Apply participant and route retirement",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckRoutingCounterAtLeast {
+                description: "The departed listener route was retired",
+                name: "route_retired",
+                min: 1,
+            },
+            Step::CheckNotConnected {
+                description: "The departed listener has no live transport",
+                participant: "listener",
+            },
+        ]);
+}

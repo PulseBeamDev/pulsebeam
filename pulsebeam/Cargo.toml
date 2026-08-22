@@ -98,7 +98,7 @@ unpace = []
 deep-metrics = ["pulsebeam-runtime/deep-metrics"]
 parking_lot = ["pulsebeam-runtime/parking_lot"]
 sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim"]
-real-worker-probes = []
+bench = []
 
 [[bench]]
 name = "fanout"

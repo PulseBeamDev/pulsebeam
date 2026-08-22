@@ -159,12 +159,13 @@ impl ShardRuntime {
             crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { key, .. } => {
                 self.retire_track(*key);
             }
-            crate::shard_update::ShardUpdateOp::InstallRoute { .. }
-            | crate::shard_update::ShardUpdateOp::InstallTransport { .. }
+            crate::shard_update::ShardUpdateOp::InstallRoute { handle, action } => {
+                self.routes.install_action(*handle, *action);
+            }
+            crate::shard_update::ShardUpdateOp::InstallTransport { .. }
             | crate::shard_update::ShardUpdateOp::RetireTransport { .. }
             | crate::shard_update::ShardUpdateOp::InsertParticipant
             | crate::shard_update::ShardUpdateOp::RemoveParticipant { .. }
-            | crate::shard_update::ShardUpdateOp::BindTrack { .. }
             | crate::shard_update::ShardUpdateOp::Placeholder => {}
         }
     }
@@ -233,19 +234,17 @@ impl ShardRuntime {
         debug_assert_eq!(packet.key, key);
         match packet.packet {
             TrackPacket::Rtp(packet) => self.route_rtp_with_plan(key, origin, packet, plan, ctx),
-            TrackPacket::Data(bytes) => {
-                self.route_unreliable_with_plan(key, origin, bytes, plan, ctx);
-            }
-            TrackPacket::Reliable(bytes) => {
-                self.route_reliable_with_plan(key, origin, bytes, plan, ctx);
+            TrackPacket::Data { lane, bytes } => {
+                self.route_data_with_plan(key, origin, lane, bytes, plan, ctx);
             }
         }
     }
 
-    pub fn route_unreliable_with_plan(
+    pub fn route_data_with_plan(
         &mut self,
         stream: TrackKey,
         origin: Origin,
+        lane: crate::track::DataLane,
         packet: Vec<u8>,
         plan: &crate::shard_update::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
@@ -255,58 +254,29 @@ impl ShardRuntime {
             return;
         };
         fanout_local(plan, |subscriber| {
-            forward_track(ctx, subscriber, stream, TrackPacketRef::Data(&packet), None);
-        });
-        if origin.is_local() {
-            let playout = ctx.wall.ntp();
-            fanout_remote(
-                plan,
-                &mut runtime.link_seq,
-                playout.middle32(),
-                || RoutedTrackPacket {
-                    key: stream,
-                    packet: TrackPacket::Data(packet.clone()),
-                },
-                ctx.router,
-            );
-        }
-    }
-
-    pub fn route_reliable_with_plan(
-        &mut self,
-        stream: TrackKey,
-        origin: Origin,
-        frame: Vec<u8>,
-        plan: &crate::shard_update::TrackPlan,
-        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
-    ) {
-        debug_assert!(!frame.is_empty());
-        let Some(_runtime) = self.tracks.get(stream) else {
-            debug_assert!(false, "reliable key must resolve to runtime state");
-            return;
-        };
-        fanout_local(plan, |subscriber| {
             forward_track(
                 ctx,
                 subscriber,
                 stream,
-                TrackPacketRef::Reliable(&frame),
+                TrackPacketRef::Data {
+                    lane,
+                    bytes: &packet,
+                },
                 None,
             );
         });
         if origin.is_local() {
             let playout = ctx.wall.ntp();
-            let Some(runtime) = self.tracks.get_mut(stream) else {
-                debug_assert!(false, "reliable key must remain live during dispatch");
-                return;
-            };
             fanout_remote(
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
                 || RoutedTrackPacket {
                     key: stream,
-                    packet: TrackPacket::Reliable(frame.clone()),
+                    packet: TrackPacket::Data {
+                        lane,
+                        bytes: packet.clone(),
+                    },
                 },
                 ctx.router,
             );
@@ -348,7 +318,6 @@ mod tests {
     use super::*;
     use crate::entity::{ParticipantId, TrackKind};
     use crate::id::ShardId;
-    use crate::track::{Track, TrackMeta};
     use slotmap::SlotMap;
     use std::cell::RefCell;
 
@@ -372,19 +341,7 @@ mod tests {
         crate::shard_update::TrackDescriptor {
             id,
             origin_key,
-            participant: None,
             encodings: vec![Some(Rid::from(rid))],
-            publication: Track::audio(
-                TrackMeta {
-                    room_id: crate::entity::RoomId::from_external(
-                        &crate::entity::ExternalRoomId::new("test-room").unwrap(),
-                    ),
-                    shard_id: ShardId::new(0),
-                    id,
-                    origin: ParticipantId::from_bytes([7; 16]),
-                },
-                None,
-            ),
         }
     }
 

@@ -1,5 +1,6 @@
 use crate::keys::TrackKey;
 use crate::rtp::RtpPacket;
+use crate::track::DataLane;
 
 #[allow(
     clippy::large_enum_variant,
@@ -7,22 +8,19 @@ use crate::rtp::RtpPacket;
 )]
 #[derive(Debug, Clone)]
 pub enum TrackPacket {
-    Data(Vec<u8>),
-    Reliable(Vec<u8>),
+    Data { lane: DataLane, bytes: Vec<u8> },
     Rtp(RtpPacket),
 }
 
 pub enum TrackPacketRef<'a> {
-    Data(&'a [u8]),
-    Reliable(&'a [u8]),
+    Data { lane: DataLane, bytes: &'a [u8] },
     Rtp(&'a RtpPacket),
 }
 
 impl TrackPacket {
     pub fn as_ref(&self) -> TrackPacketRef<'_> {
         match self {
-            Self::Data(bytes) => TrackPacketRef::Data(bytes),
-            Self::Reliable(bytes) => TrackPacketRef::Reliable(bytes),
+            Self::Data { lane, bytes } => TrackPacketRef::Data { lane: *lane, bytes },
             Self::Rtp(packet) => TrackPacketRef::Rtp(packet),
         }
     }
@@ -50,7 +48,7 @@ impl RoutedTrackPacket {
     pub fn into_rtp(self) -> Option<RtpPacket> {
         match self.packet {
             TrackPacket::Rtp(packet) => Some(packet),
-            TrackPacket::Data(_) | TrackPacket::Reliable(_) => {
+            TrackPacket::Data { .. } => {
                 debug_assert!(false, "a data packet cannot enter the RTP path");
                 None
             }

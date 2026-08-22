@@ -2,7 +2,7 @@ use ahash::{HashMap, HashMapExt};
 use str0m::channel::ChannelId;
 
 use crate::participant::event::ParticipantSink;
-use crate::track::{DataTopicChannel, DataTrackDirection, Topic};
+use crate::track::{DataLane, DataTopicChannel, DataTrackDirection, Topic};
 
 pub(super) struct ReliableChannels {
     publishers: HashMap<Topic, ChannelId>,
@@ -35,7 +35,7 @@ impl ReliableChannels {
                     return Err(());
                 }
                 self.publishers.insert(channel.topic.clone(), channel_id);
-                events.publish_reliable_data_topic(channel.topic.clone());
+                events.publish_data_topic(channel.topic.clone(), DataLane::Reliable);
             }
             DataTrackDirection::Subscribe => {
                 debug_assert!(channel.scope.is_none());
@@ -43,7 +43,12 @@ impl ReliableChannels {
                     return Err(());
                 }
                 self.subscribers.insert(channel.topic.clone(), channel_id);
-                events.subscribe_reliable_data_topic(channel.topic.clone(), channel_id);
+                events.subscribe_data_topic(
+                    channel.topic.clone(),
+                    None,
+                    channel_id,
+                    DataLane::Reliable,
+                );
             }
         }
         Ok(())
@@ -56,7 +61,7 @@ impl ReliableChannels {
                 debug_assert!(channel.scope.is_none());
                 let removed = self.publishers.remove(&channel.topic);
                 debug_assert!(removed.is_some());
-                events.unpublish_reliable_data_topic(channel.topic);
+                events.unpublish_data_topic(channel.topic, DataLane::Reliable);
             }
             DataTrackDirection::Subscribe => {
                 debug_assert!(channel.scope.is_none());
@@ -69,7 +74,7 @@ impl ReliableChannels {
                     );
                     return;
                 };
-                events.unsubscribe_reliable_data_topic(channel.topic, channel_id);
+                events.unsubscribe_data_topic(channel.topic, None, channel_id, DataLane::Reliable);
             }
         }
     }

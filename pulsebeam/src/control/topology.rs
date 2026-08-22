@@ -42,11 +42,6 @@ pub(crate) enum TrackSelector {
         room_id: RoomId,
         kind: TrackKind,
     },
-    PublisherKind {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        kind: TrackKind,
-    },
     DataTopic {
         room_id: RoomId,
         publisher: Option<ParticipantId>,
@@ -59,13 +54,6 @@ impl TrackSelector {
         match self {
             Self::Exact(identity) => *identity == track,
             Self::RoomKind { room_id, kind } => track.room_id == *room_id && track.kind() == *kind,
-            Self::PublisherKind {
-                room_id,
-                publisher,
-                kind,
-            } => {
-                track.room_id == *room_id && track.publisher == *publisher && track.kind() == *kind
-            }
             Self::DataTopic {
                 room_id,
                 publisher,
@@ -101,7 +89,6 @@ pub(crate) struct TrackTopology {
     data_publications: HashMap<TrackIdentity, (crate::track::Topic, crate::track::DataLane)>,
     subscriptions: SlotMap<SubscriptionId, Subscription>,
     by_room_kind: HashMap<(RoomId, TrackKind), HashSet<SubscriptionId>>,
-    by_publisher_kind: HashMap<(RoomId, ParticipantId, TrackKind), HashSet<SubscriptionId>>,
     by_identity: HashMap<TrackIdentity, HashSet<SubscriptionId>>,
     by_data_label: HashMap<(RoomId, String), HashSet<SubscriptionId>>,
 }
@@ -207,18 +194,6 @@ impl TrackTopology {
                     .insert(id);
                 debug_assert!(inserted);
             }
-            TrackSelector::PublisherKind {
-                room_id,
-                publisher,
-                kind,
-            } => {
-                let inserted = self
-                    .by_publisher_kind
-                    .entry((*room_id, *publisher, *kind))
-                    .or_default()
-                    .insert(id);
-                debug_assert!(inserted);
-            }
             TrackSelector::DataTopic { room_id, label, .. } => {
                 let inserted = self
                     .by_data_label
@@ -268,15 +243,6 @@ impl TrackTopology {
             TrackSelector::RoomKind { room_id, kind } => {
                 Self::remove_indexed(&mut self.by_room_kind, (*room_id, *kind), id)
             }
-            TrackSelector::PublisherKind {
-                room_id,
-                publisher,
-                kind,
-            } => Self::remove_indexed(
-                &mut self.by_publisher_kind,
-                (*room_id, *publisher, *kind),
-                id,
-            ),
             TrackSelector::DataTopic { room_id, label, .. } => {
                 Self::remove_indexed(&mut self.by_data_label, (*room_id, label.clone()), id)
             }
@@ -308,12 +274,6 @@ impl TrackTopology {
     ) -> impl Iterator<Item = Subscription> + '_ {
         let mut candidates = HashSet::new();
         if let Some(ids) = self.by_room_kind.get(&(identity.room_id, identity.kind())) {
-            candidates.extend(ids.iter().copied());
-        }
-        if let Some(ids) =
-            self.by_publisher_kind
-                .get(&(identity.room_id, identity.publisher, identity.kind()))
-        {
             candidates.extend(ids.iter().copied());
         }
         if let Some(ids) = self.by_identity.get(&identity) {
@@ -451,10 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn room_wildcards_are_namespaced_by_track_kind() {
+    fn audio_wildcard_does_not_match_data_tracks() {
         let mut topology = TrackTopology::default();
-        let audio = identity(TrackKind::Audio, 1);
-        let data = identity(TrackKind::Data, 2);
         let subscriber = participant(3);
         let _ = topology.subscribe(
             subscriber,
@@ -464,26 +422,8 @@ mod tests {
             },
         );
 
-        assert!(topology.matches(audio).count() == 1);
-        assert!(topology.matches(data).next().is_none());
-    }
-
-    #[test]
-    fn publisher_selectors_do_not_cross_publishers() {
-        let mut topology = TrackTopology::default();
-        let first = identity(TrackKind::Video, 1);
-        let second = identity(TrackKind::Video, 2);
-        let _ = topology.subscribe(
-            participant(3),
-            TrackSelector::PublisherKind {
-                room_id: room(),
-                publisher: first.publisher,
-                kind: TrackKind::Video,
-            },
-        );
-
-        assert_eq!(topology.matches(first).count(), 1);
-        assert_eq!(topology.matches(second).count(), 0);
+        assert_eq!(topology.matches(identity(TrackKind::Audio, 1)).count(), 1);
+        assert_eq!(topology.matches(identity(TrackKind::Data, 2)).count(), 0);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::keys::TrackKey;
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::participant::event::ParticipantSink;
 use crate::participant::{RoutedTrackPacket, TrackPacket};
-use crate::track::{GlobalKeyframeRequest, Topic, Track, TrackLayer, TrackMeta};
+use crate::track::{DataLane, GlobalKeyframeRequest, Topic, Track, TrackLayer, TrackMeta};
 
 /// The compiled identity of the participant emitting into the pipeline.
 ///
@@ -34,13 +34,10 @@ pub enum ParticipantEvent {
 pub enum ParticipantSubscriptionEvent {
     Subscribed {
         subscriber: ParticipantId,
-        subscriber_key: ParticipantKey,
-        slot: DownstreamSlotKey,
         track: TrackMeta,
     },
     Unsubscribed {
         subscriber: ParticipantId,
-        slot: DownstreamSlotKey,
         track: TrackMeta,
     },
 }
@@ -54,7 +51,6 @@ pub enum ParticipantLifecycleEvent {
     },
     Exited {
         participant_id: ParticipantId,
-        participant_key: ParticipantKey,
     },
 }
 
@@ -162,27 +158,24 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn subscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey) {
+    fn subscribe(&mut self, track: TrackMeta, _slot: DownstreamSlotKey) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Subscription(
                 ParticipantSubscriptionEvent::Subscribed {
                     subscriber: self.id,
-                    subscriber_key: self.key,
-                    slot,
                     track,
                 },
             ));
     }
 
     #[inline]
-    fn unsubscribe(&mut self, track: TrackMeta, slot: DownstreamSlotKey) {
+    fn unsubscribe(&mut self, track: TrackMeta, _slot: DownstreamSlotKey) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Subscription(
                 ParticipantSubscriptionEvent::Unsubscribed {
                     subscriber: self.id,
-                    slot,
                     track,
                 },
             ));
@@ -215,6 +208,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         topic: Topic,
         publisher: Option<ParticipantId>,
         channel: ChannelId,
+        lane: DataLane,
     ) {
         self.pipeline
             .participant_events
@@ -224,6 +218,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 topic,
                 publisher,
                 channel,
+                lane,
             }));
     }
 
@@ -233,6 +228,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         topic: Topic,
         publisher: Option<ParticipantId>,
         _channel: ChannelId,
+        lane: DataLane,
     ) {
         self.pipeline
             .participant_events
@@ -242,32 +238,33 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                     subscriber: self.id,
                     topic,
                     publisher,
+                    lane,
                 },
             ));
     }
 
     #[inline]
-    fn publish_data_topic(&mut self, topic: Topic) {
+    fn publish_data_topic(&mut self, topic: Topic, lane: DataLane) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(ShardEvent::DataTopicPublished {
                 room_id: self.room_id,
                 publisher: self.id,
-                publisher_key: self.key,
                 topic,
+                lane,
             }));
     }
 
     #[inline]
-    fn unpublish_data_topic(&mut self, topic: Topic) {
+    fn unpublish_data_topic(&mut self, topic: Topic, lane: DataLane) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ShardEvent::DataTopicUnpublished {
                     room_id: self.room_id,
                     publisher: self.id,
-                    publisher_key: self.key,
                     topic,
+                    lane,
                 },
             ));
     }
@@ -296,7 +293,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Lifecycle(
                 ParticipantLifecycleEvent::Exited {
                     participant_id: self.id,
-                    participant_key: self.key,
                 },
             ));
     }
@@ -317,63 +313,11 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         };
         self.pipeline.push_packet(RoutedTrackPacket {
             key,
-            packet: TrackPacket::Data(pkt),
+            packet: TrackPacket::Data {
+                lane: DataLane::Realtime,
+                bytes: pkt,
+            },
         });
-    }
-
-    #[inline]
-    fn publish_reliable_data_topic(&mut self, topic: Topic) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ShardEvent::ReliableDataTopicPublished {
-                    room_id: self.room_id,
-                    publisher: self.id,
-                    publisher_key: self.key,
-                    topic,
-                },
-            ));
-    }
-
-    #[inline]
-    fn unpublish_reliable_data_topic(&mut self, topic: Topic) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ShardEvent::ReliableDataTopicUnpublished {
-                    room_id: self.room_id,
-                    publisher: self.id,
-                    publisher_key: self.key,
-                    topic,
-                },
-            ));
-    }
-
-    #[inline]
-    fn subscribe_reliable_data_topic(&mut self, topic: Topic, channel: ChannelId) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ShardEvent::ReliableDataTopicSubscribed {
-                    room_id: self.room_id,
-                    subscriber: self.id,
-                    topic,
-                    channel,
-                },
-            ));
-    }
-
-    #[inline]
-    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic, _channel: ChannelId) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ShardEvent::ReliableDataTopicUnsubscribed {
-                    room_id: self.room_id,
-                    subscriber: self.id,
-                    topic,
-                },
-            ));
     }
 
     #[inline]
@@ -389,7 +333,10 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         };
         self.pipeline.push_packet(RoutedTrackPacket {
             key,
-            packet: TrackPacket::Reliable(frame),
+            packet: TrackPacket::Data {
+                lane: DataLane::Reliable,
+                bytes: frame,
+            },
         });
     }
 
@@ -478,7 +425,7 @@ mod tests {
 
         let drained: Vec<Vec<u8>> = std::iter::from_fn(|| pipeline.pop_packet())
             .map(|event| match event.packet {
-                TrackPacket::Data(bytes) => bytes,
+                TrackPacket::Data { bytes, .. } => bytes,
                 _ => unreachable!(),
             })
             .collect();
@@ -491,7 +438,13 @@ mod tests {
         let who = identity();
         let key = TrackKey::default();
         let mut sink = pipeline.participant_sink(who);
-        sink.publish_track_packet(Some(key), TrackPacket::Data(vec![1]));
+        sink.publish_track_packet(
+            Some(key),
+            TrackPacket::Data {
+                lane: DataLane::Realtime,
+                bytes: vec![1],
+            },
+        );
         sink.publish_reliable_sctp(Topic::for_test("t"), Some(key), vec![2]);
         sink.publish_sctp(Topic::for_test("t"), Some(key), vec![3]);
         #[allow(
@@ -502,11 +455,17 @@ mod tests {
 
         assert!(matches!(
             pipeline.pop_packet().unwrap().packet,
-            TrackPacket::Data(_)
+            TrackPacket::Data {
+                lane: DataLane::Realtime,
+                ..
+            }
         ));
         assert!(matches!(
             pipeline.pop_packet().unwrap().packet,
-            TrackPacket::Reliable(_)
+            TrackPacket::Data {
+                lane: DataLane::Reliable,
+                ..
+            }
         ));
         assert!(
             pipeline.pop_packet().is_none(),
@@ -525,7 +484,6 @@ mod tests {
 
         pipeline.push_shard_event(ShardEvent::ParticipantClosed {
             participant: who.id,
-            key: who.key,
         });
         assert!(pipeline.has_pending(), "a shard event is work");
         assert!(pipeline.pop_shard_event().is_some());

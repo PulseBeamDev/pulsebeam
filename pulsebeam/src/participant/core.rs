@@ -48,7 +48,6 @@ const POLL_WORK_BUDGET: usize = 256;
 const RTC_OUTPUT_BUDGET: usize = 128;
 const MAX_PENDING_INGRESS: usize = 256;
 const MAX_PENDING_FANOUT: usize = 256;
-const MAX_PENDING_RTC_MUTATIONS: usize = 256;
 
 fn inline_rtc_timeout(deadline: Instant, wall_now: Instant) -> Option<Instant> {
     let latest = wall_now
@@ -179,27 +178,8 @@ type TrackCatalog = SecondaryMap<TrackKey, TrackCatalogEntry>;
 
 /// Routing is not allowed to mutate an `Rtc`; it only queues work for the
 /// participant's mutate-then-drain loop.
-enum PendingFanout {
-    Sctp {
-        channel: ChannelId,
-        pkt: Vec<u8>,
-    },
-    ReliableSctp {
-        channel: ChannelId,
-        frame: Vec<u8>,
-    },
-    ReliableControl {
-        topic: Topic,
-        bytes: Vec<u8>,
-    },
-    Keyframe {
-        stream_id: StreamId,
-        kind: KeyframeRequestKind,
-    },
-}
-
-/// One str0m mutation. The poll loop applies one item and immediately returns
-/// to `poll_rtc()` before applying another mutation.
+/// One deferred str0m mutation. The poll loop applies one item and immediately
+/// returns to `poll_rtc()` before applying another mutation.
 enum PendingRtcMutation {
     Sctp {
         channel: ChannelId,
@@ -291,8 +271,7 @@ pub struct ParticipantCore {
     stream_writer: StreamWriter,
     pending_ingress: VecDeque<RecvPacketBatch>,
     pending_timeout: Option<Instant>,
-    pending_fanout: VecDeque<PendingFanout>,
-    pending_rtc_mutations: VecDeque<PendingRtcMutation>,
+    pending_mutations: VecDeque<PendingRtcMutation>,
     last_ingress: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     last_ingress_shard: Option<crate::id::ShardId>,
     rtc_deadline: Option<Instant>,
@@ -398,8 +377,7 @@ impl ParticipantCore {
         Self {
             pending_ingress: VecDeque::new(),
             pending_timeout: None,
-            pending_fanout: VecDeque::new(),
-            pending_rtc_mutations: VecDeque::new(),
+            pending_mutations: VecDeque::new(),
             last_ingress: None,
             last_ingress_shard: None,
             rtc_deadline: None,
@@ -462,14 +440,12 @@ impl ParticipantCore {
                 DataLane::Realtime => self.bind_published_data_stream(&topic, key),
                 DataLane::Reliable => self.bind_published_reliable_stream(&topic, key),
             },
-            ParticipantEffect::TrackSubscribed { key, channel, lane } => match lane {
-                DataLane::Realtime => {
-                    self.data.forwarding.insert(key, channel);
-                }
-                DataLane::Reliable => {
-                    self.data.reliable_forwarding.insert(key, channel);
-                }
-            },
+            ParticipantEffect::TrackSubscribed { key, channel, lane } => {
+                self.data.forwarding.insert(
+                    key,
+                    crate::participant::data::DataForwarding { lane, channel },
+                );
+            }
         }
     }
 
@@ -507,7 +483,6 @@ impl ParticipantCore {
             return;
         };
         self.data.forwarding.remove(key);
-        self.data.reliable_forwarding.remove(key);
         if self.track_keys.get(&binding.track_id) == Some(&key) {
             let _ = self.track_keys.remove(&binding.track_id);
         }
@@ -533,13 +508,13 @@ impl ParticipantCore {
                     debug_assert!(false, "a reliable control stream must have a topic");
                     return;
                 };
-                self.enqueue_fanout(PendingFanout::ReliableControl {
+                self.enqueue_fanout(PendingRtcMutation::ReliableControl {
                     topic: topic.clone(),
                     bytes: bytes.to_vec(),
                 });
             }
             ParticipantInput::Keyframe { stream_id, kind } => {
-                self.enqueue_fanout(PendingFanout::Keyframe { stream_id, kind });
+                self.enqueue_fanout(PendingRtcMutation::Keyframe { stream_id, kind });
             }
         }
     }
@@ -551,33 +526,32 @@ impl ParticipantCore {
         cache: Option<&TrackStreamCache>,
     ) {
         let TrackPacketRef::Rtp(packet) = packet else {
-            let (stream, reliable, bytes) = match packet {
-                TrackPacketRef::Data(bytes) => (key, false, bytes),
-                TrackPacketRef::Reliable(bytes) => (key, true, bytes),
+            let (stream, lane, bytes) = match packet {
+                TrackPacketRef::Data { lane, bytes } => (key, lane, bytes),
                 TrackPacketRef::Rtp(_) => {
                     debug_assert!(false, "the RTP path must be handled before data dispatch");
                     return;
                 }
             };
-            let channel = if reliable {
-                self.data.reliable_forwarding.get(stream).copied()
-            } else {
-                self.data.forwarding.get(stream).copied()
-            };
-            let Some(channel) = channel else {
+            let Some(binding) = self.data.forwarding.get(stream).copied() else {
                 debug_assert!(false, "a data forwarding plan must have a receiver binding");
                 return;
             };
-            if reliable {
-                self.enqueue_fanout(PendingFanout::ReliableSctp {
-                    channel,
-                    frame: bytes.to_vec(),
-                });
-            } else {
-                self.enqueue_fanout(PendingFanout::Sctp {
-                    channel,
-                    pkt: bytes.to_vec(),
-                });
+            debug_assert_eq!(binding.lane, lane);
+            let channel = binding.channel;
+            match lane {
+                crate::track::DataLane::Realtime => {
+                    self.enqueue_fanout(PendingRtcMutation::Sctp {
+                        channel,
+                        pkt: bytes.to_vec(),
+                    });
+                }
+                crate::track::DataLane::Reliable => {
+                    self.enqueue_fanout(PendingRtcMutation::ReliableSctp {
+                        channel,
+                        frame: bytes.to_vec(),
+                    });
+                }
             }
             return;
         };
@@ -701,12 +675,12 @@ impl ParticipantCore {
         }
     }
 
-    fn enqueue_fanout(&mut self, work: PendingFanout) {
-        if self.pending_fanout.len() >= MAX_PENDING_FANOUT {
+    fn enqueue_fanout(&mut self, work: PendingRtcMutation) {
+        if self.pending_mutations.len() >= MAX_PENDING_FANOUT {
             metrics::counter!("participant_fanout_shed").increment(1);
             return;
         }
-        self.pending_fanout.push_back(work);
+        self.pending_mutations.push_back(work);
     }
 
     fn handle_remote_keyframe_request_now(
@@ -749,35 +723,6 @@ impl ParticipantCore {
         }
     }
 
-    /// Converts one routed item into zero or more deferred `Rtc` mutations.
-    /// This only changes allocator state; actual str0m writes are performed by
-    /// `apply_one_rtc_mutation` below.
-    fn process_one_fanout(&mut self) -> bool {
-        let Some(work) = self.pending_fanout.pop_front() else {
-            return false;
-        };
-
-        let mutation = match work {
-            PendingFanout::Sctp { channel, pkt } => PendingRtcMutation::Sctp { channel, pkt },
-            PendingFanout::ReliableSctp { channel, frame } => {
-                PendingRtcMutation::ReliableSctp { channel, frame }
-            }
-            PendingFanout::ReliableControl { topic, bytes } => {
-                PendingRtcMutation::ReliableControl { topic, bytes }
-            }
-            PendingFanout::Keyframe { stream_id, kind } => {
-                PendingRtcMutation::Keyframe { stream_id, kind }
-            }
-        };
-        if self.pending_rtc_mutations.len() >= MAX_PENDING_RTC_MUTATIONS {
-            metrics::counter!("participant_rtc_mutation_shed").increment(1);
-        } else {
-            self.pending_rtc_mutations.push_back(mutation);
-        }
-
-        true
-    }
-
     /// Performs exactly one `Rtc` mutation. The caller must immediately resume
     /// the drain loop before this method can be called again.
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
@@ -786,7 +731,7 @@ impl ParticipantCore {
             return true;
         }
 
-        let Some(mutation) = self.pending_rtc_mutations.pop_front() else {
+        let Some(mutation) = self.pending_mutations.pop_front() else {
             return false;
         };
 
@@ -1019,10 +964,6 @@ impl ParticipantCore {
                     .handle_input(Input::Receive(receive_at.into(), recv));
                 self.rtc_needs_drain = true;
                 continue 'drain;
-            }
-
-            if self.process_one_fanout() {
-                continue;
             }
 
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
@@ -1290,13 +1231,19 @@ impl ParticipantCore {
                                 {
                                     self.data.published_streams.insert(cid, stream);
                                 }
-                                events.publish_data_topic(e.topic);
+                                events
+                                    .publish_data_topic(e.topic, crate::track::DataLane::Realtime);
                             }
                             DataTrackDirection::Subscribe => {
                                 self.data
                                     .subscribed_channels
                                     .insert((e.topic.clone(), e.scope), cid);
-                                events.subscribe_data_topic(e.topic, e.scope, cid);
+                                events.subscribe_data_topic(
+                                    e.topic,
+                                    e.scope,
+                                    cid,
+                                    crate::track::DataLane::Realtime,
+                                );
                             }
                         }
                     }
@@ -1629,7 +1576,7 @@ impl ParticipantCore {
                 self.data.published_streams.remove(&cid);
                 self.data.pending_published_streams.remove(&ch.topic);
                 self.data.published_channels.remove(&ch.topic);
-                events.unpublish_data_topic(ch.topic);
+                events.unpublish_data_topic(ch.topic, crate::track::DataLane::Realtime);
             }
             DataTrackDirection::Subscribe => {
                 let removed = self
@@ -1637,7 +1584,12 @@ impl ParticipantCore {
                     .subscribed_channels
                     .remove(&(ch.topic.clone(), ch.scope));
                 debug_assert!(removed.is_some());
-                events.unsubscribe_data_topic(ch.topic, ch.scope, cid);
+                events.unsubscribe_data_topic(
+                    ch.topic,
+                    ch.scope,
+                    cid,
+                    crate::track::DataLane::Realtime,
+                );
             }
         }
     }

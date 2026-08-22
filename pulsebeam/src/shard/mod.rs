@@ -1,5 +1,7 @@
 #![deny(clippy::manual_find, clippy::manual_flatten)]
 
+#[cfg(feature = "bench")]
+pub mod bench;
 pub(crate) mod core;
 pub(crate) mod demux;
 mod dirty;

@@ -1,14 +1,13 @@
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::manual_find, clippy::manual_flatten)]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::{ParticipantKey, TrackKey};
 use crate::route::{RouteAction, RouteHandle, TransportHandle};
 use pulsebeam_runtime::mailbox;
-use str0m::channel::ChannelId;
 use str0m::media::Rid;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -30,6 +29,15 @@ impl TrackPlan {
             reverse_route,
         }
     }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        fn distinct<K: Copy + Eq + std::hash::Hash>(values: &[K]) -> bool {
+            let mut seen = HashSet::with_capacity(values.len());
+            values.iter().copied().all(|value| seen.insert(value))
+        }
+
+        distinct(&self.local) && distinct(&self.remote)
+    }
 }
 
 fn unique<K>(values: impl IntoIterator<Item = K>, name: &str) -> Vec<K>
@@ -37,8 +45,9 @@ where
     K: Copy + Eq + std::hash::Hash + std::fmt::Debug,
 {
     let mut result = Vec::new();
+    let mut seen = HashSet::new();
     for value in values {
-        if result.contains(&value) {
+        if !seen.insert(value) {
             debug_assert!(false, "a track plan cannot contain duplicate {name} values");
             continue;
         }
@@ -53,21 +62,11 @@ pub(crate) struct TrackPlanUpdate {
     pub plan: Option<TrackPlan>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct ShardState {
-    pub shard: ShardId,
-    pub generation: u64,
-    pub routes: RouteImage,
-    pub transports: TransportImage,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
     pub id: TrackId,
     pub origin_key: ParticipantKey,
-    pub participant: Option<ParticipantKey>,
     pub encodings: Vec<Option<Rid>>,
-    pub publication: crate::track::Track,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,54 +74,6 @@ pub(crate) struct TrackRuntime {
     pub descriptor: Option<TrackDescriptor>,
     pub publisher: Option<ParticipantKey>,
     pub publisher_effect: Option<crate::participant::ParticipantEffect>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct RouteImage {
-    slots: Vec<Option<RouteBinding>>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RouteBinding {
-    pub handle: RouteHandle,
-    pub action: RouteAction,
-}
-
-impl RouteImage {
-    pub fn resolve(&self, handle: RouteHandle) -> Option<&RouteAction> {
-        self.resolve_binding(handle).map(|binding| &binding.action)
-    }
-
-    pub fn resolve_binding(&self, handle: RouteHandle) -> Option<&RouteBinding> {
-        match self.slots.get(handle.route.index()) {
-            Some(Some(binding)) if binding.handle == handle => Some(binding),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn install(&mut self, binding: RouteBinding) {
-        let idx = binding.handle.route.index();
-        if idx >= self.slots.len() {
-            self.slots.resize_with(idx.saturating_add(1), || None);
-        }
-        let Some(slot) = self.slots.get_mut(idx) else {
-            debug_assert!(false, "route slot must exist after resize");
-            return;
-        };
-        *slot = Some(binding);
-    }
-
-    pub(crate) fn retire(&mut self, handle: RouteHandle) {
-        let Some(slot) = self.slots.get_mut(handle.route.index()) else {
-            return;
-        };
-        if slot
-            .as_ref()
-            .is_some_and(|binding| binding.handle == handle)
-        {
-            *slot = None;
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -173,7 +124,8 @@ impl TransportImage {
 #[derive(Debug, Clone)]
 pub(crate) enum ShardUpdateOp {
     InstallRoute {
-        binding: RouteBinding,
+        handle: RouteHandle,
+        action: RouteAction,
     },
     RetireRoute {
         handle: RouteHandle,
@@ -194,12 +146,6 @@ pub(crate) enum ShardUpdateOp {
     },
     RemoveTrackRuntime {
         key: TrackKey,
-    },
-    BindTrack {
-        participant: ParticipantKey,
-        key: TrackKey,
-        channel: ChannelId,
-        lane: crate::track::DataLane,
     },
     Placeholder,
 }
@@ -282,16 +228,6 @@ impl ShardUpdateWriter {
         commit.plans.extend(plans);
     }
 
-    pub fn abort(&mut self) {
-        self.staged = None;
-    }
-
-    pub fn has_staged(&self) -> bool {
-        self.staged
-            .as_ref()
-            .is_some_and(|commit| !commit.is_empty())
-    }
-
     pub fn publish(&mut self) -> Option<u64> {
         let commit = self.staged.take()?;
         if commit.is_empty() {
@@ -357,15 +293,15 @@ pub(crate) fn new_shard_update(
 impl ShardUpdateOp {
     pub(crate) fn is_owned_by(&self, shard: ShardId) -> bool {
         match self {
-            Self::InstallRoute { binding } => binding.handle.shard() == shard,
-            Self::RetireRoute { handle } => handle.shard() == shard,
+            Self::InstallRoute { handle, .. } | Self::RetireRoute { handle } => {
+                handle.shard() == shard
+            }
             Self::InstallTransport { binding } => binding.handle.shard() == shard,
             Self::RetireTransport { handle } => handle.shard() == shard,
             Self::InsertParticipant { .. }
             | Self::RemoveParticipant { .. }
             | Self::InsertTrackRuntime { .. }
             | Self::RemoveTrackRuntime { .. }
-            | Self::BindTrack { .. }
             | Self::Placeholder => true,
         }
     }

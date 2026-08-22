@@ -303,75 +303,24 @@ impl ControllerActor {
                 room_id,
                 publisher,
                 topic,
-                ..
-            } => self.publish_data_track(
-                shard,
-                room_id,
-                publisher,
-                topic,
-                crate::track::DataLane::Realtime,
-            ),
-            ShardEvent::ReliableDataTopicPublished {
-                room_id,
-                publisher,
-                topic,
-                ..
-            } => self.publish_data_track(
-                shard,
-                room_id,
-                publisher,
-                topic,
-                crate::track::DataLane::Reliable,
-            ),
+                lane,
+            } => self.publish_data_track(shard, room_id, publisher, topic, lane),
             ShardEvent::DataTopicSubscribed {
                 room_id,
                 subscriber,
                 publisher,
                 topic,
                 channel,
-                ..
+                lane,
             } => {
-                let label =
-                    crate::track::publication_label(crate::track::DataLane::Realtime, &topic);
                 let selector = TrackSelector::DataTopic {
                     room_id,
                     publisher,
-                    label,
+                    label: crate::track::publication_label(lane, &topic),
                 };
-                let _ = self.topology.subscribe_data(
-                    subscriber,
-                    selector,
-                    channel,
-                    crate::track::DataLane::Realtime,
-                );
-                let identities: Vec<_> = self
+                let _ = self
                     .topology
-                    .tracks_in_room(room_id, TrackKind::Data)
-                    .collect();
-                for identity in identities {
-                    self.reconcile_track(identity, false);
-                }
-            }
-            ShardEvent::ReliableDataTopicSubscribed {
-                room_id,
-                subscriber,
-                topic,
-                channel,
-            } => {
-                let selector = TrackSelector::DataTopic {
-                    room_id,
-                    publisher: None,
-                    label: crate::track::publication_label(
-                        crate::track::DataLane::Reliable,
-                        &topic,
-                    ),
-                };
-                let _ = self.topology.subscribe_data(
-                    subscriber,
-                    selector,
-                    channel,
-                    crate::track::DataLane::Reliable,
-                );
+                    .subscribe_data(subscriber, selector, channel, lane);
                 let identities: Vec<_> = self
                     .topology
                     .tracks_in_room(room_id, TrackKind::Data)
@@ -385,57 +334,21 @@ impl ControllerActor {
                 subscriber,
                 publisher,
                 topic,
+                lane,
             } => {
                 let selector = TrackSelector::DataTopic {
                     publisher,
                     room_id,
-                    label: crate::track::publication_label(
-                        crate::track::DataLane::Realtime,
-                        &topic,
-                    ),
+                    label: crate::track::publication_label(lane, &topic),
                 };
                 self.remove_data_subscription(room_id, subscriber, selector);
-            }
-            ShardEvent::ReliableDataTopicUnsubscribed {
-                room_id,
-                subscriber,
-                topic,
-            } => {
-                self.remove_data_subscription(
-                    room_id,
-                    subscriber,
-                    TrackSelector::DataTopic {
-                        room_id,
-                        publisher: None,
-                        label: crate::track::publication_label(
-                            crate::track::DataLane::Reliable,
-                            &topic,
-                        ),
-                    },
-                );
             }
             ShardEvent::DataTopicUnpublished {
                 room_id,
                 publisher,
                 topic,
-                ..
-            } => self.unpublish_data_track(
-                room_id,
-                publisher,
-                topic,
-                crate::track::DataLane::Realtime,
-            ),
-            ShardEvent::ReliableDataTopicUnpublished {
-                room_id,
-                publisher,
-                topic,
-                ..
-            } => self.unpublish_data_track(
-                room_id,
-                publisher,
-                topic,
-                crate::track::DataLane::Reliable,
-            ),
+                lane,
+            } => self.unpublish_data_track(room_id, publisher, topic, lane),
             ShardEvent::TransportAuthenticated {
                 source,
                 destination,
@@ -585,7 +498,7 @@ impl ControllerActor {
         let mut members: HashMap<ShardId, Vec<(crate::keys::ParticipantKey, ParticipantId)>> =
             HashMap::new();
         for subscription in self.topology.matches(identity) {
-            if identity.kind() == TrackKind::Data && subscription.subscriber == identity.publisher {
+            if subscription.subscriber == identity.publisher {
                 continue;
             }
             let Some(meta) = self.core.registry.get_participant(&subscription.subscriber) else {
@@ -602,7 +515,7 @@ impl ControllerActor {
                 .or_default()
                 .push((key, subscription.subscriber));
         }
-        if identity.kind() != TrackKind::Data {
+        if identity.kind() == TrackKind::Video {
             for participant in self
                 .core
                 .registry
@@ -628,31 +541,6 @@ impl ControllerActor {
             subscribers.dedup_by_key(|(key, _)| *key);
         }
         let mut effect_members = members.clone();
-        if identity.kind() != TrackKind::Data {
-            for participant in self
-                .core
-                .registry
-                .participant_ids_in_room(&identity.room_id)
-            {
-                if participant == identity.publisher {
-                    continue;
-                }
-                let Some(meta) = self.core.registry.get_participant(&participant) else {
-                    continue;
-                };
-                let Some(key) = meta.binding else {
-                    continue;
-                };
-                effect_members
-                    .entry(meta.shard_id)
-                    .or_default()
-                    .push((key, participant));
-            }
-        }
-        for subscribers in effect_members.values_mut() {
-            subscribers.sort_unstable_by_key(|(key, _)| *key);
-            subscribers.dedup_by_key(|(key, _)| *key);
-        }
 
         let origin_allocation = match self
             .track_allocations
@@ -698,13 +586,7 @@ impl ControllerActor {
                         descriptor: Some(crate::shard_update::TrackDescriptor {
                             id: identity.id,
                             origin_key,
-                            participant: (shard == origin_shard).then_some(origin_key),
                             encodings: track.layers().iter().map(|layer| layer.rid).collect(),
-                            publication: actor
-                                .topology
-                                .track(identity)
-                                .cloned()
-                                .unwrap_or_else(|| track.clone()),
                         }),
                         ..Default::default()
                     },
@@ -742,6 +624,10 @@ impl ControllerActor {
                 };
                 self.track_allocations
                     .insert((identity, destination), allocation);
+                #[cfg(feature = "sim")]
+                if identity.kind() == TrackKind::Data {
+                    crate::sim_metrics::record_routing_counter("data_destination_allocated");
+                }
             }
         }
         if allocation_failed {
@@ -818,11 +704,9 @@ impl ControllerActor {
                 origin_shard,
                 generation,
                 crate::shard_update::ShardUpdateOp::InstallRoute {
-                    binding: crate::shard_update::RouteBinding {
-                        handle: origin_allocation.route,
-                        action: RouteAction::Reverse {
-                            target: origin_allocation.key,
-                        },
+                    handle: origin_allocation.route,
+                    action: RouteAction::Reverse {
+                        target: origin_allocation.key,
                     },
                 },
             );
@@ -873,11 +757,9 @@ impl ControllerActor {
                 destination,
                 generation,
                 crate::shard_update::ShardUpdateOp::InstallRoute {
-                    binding: crate::shard_update::RouteBinding {
-                        handle: allocation.route,
-                        action: RouteAction::Forward {
-                            target: allocation.key,
-                        },
+                    handle: allocation.route,
+                    action: RouteAction::Forward {
+                        target: allocation.key,
                     },
                 },
             );
@@ -1342,6 +1224,13 @@ impl ControllerActor {
             );
         }
         self.publish_staged();
+        let _ = self.topology.subscribe(
+            participant_id,
+            TrackSelector::RoomKind {
+                room_id,
+                kind: TrackKind::Audio,
+            },
+        );
         let room_tracks: Vec<_> = self
             .topology
             .identities()
@@ -1401,7 +1290,7 @@ impl ControllerActor {
                         .topology
                         .matches(*identity)
                         .any(|subscription| subscription.subscriber == participant)
-                    || (identity.kind() != TrackKind::Data
+                    || (identity.kind() == TrackKind::Video
                         && self
                             .core
                             .registry

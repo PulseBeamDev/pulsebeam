@@ -253,17 +253,13 @@ pub(crate) enum ShardEvent {
     },
     ParticipantClosed {
         participant: ParticipantId,
-        key: crate::shard::participants::ParticipantKey,
     },
     TrackSubscribed {
         subscriber: ParticipantId,
-        subscriber_key: crate::shard::participants::ParticipantKey,
-        slot: crate::keys::DownstreamSlotKey,
         track: crate::track::TrackMeta,
     },
     TrackUnsubscribed {
         subscriber: ParticipantId,
-        slot: crate::keys::DownstreamSlotKey,
         track: crate::track::TrackMeta,
     },
     TrackPublished {
@@ -276,14 +272,14 @@ pub(crate) enum ShardEvent {
     DataTopicPublished {
         room_id: crate::entity::RoomId,
         publisher: ParticipantId,
-        publisher_key: crate::shard::participants::ParticipantKey,
         topic: crate::track::Topic,
+        lane: crate::track::DataLane,
     },
     DataTopicUnpublished {
         room_id: crate::entity::RoomId,
         publisher: ParticipantId,
-        publisher_key: crate::shard::participants::ParticipantKey,
         topic: crate::track::Topic,
+        lane: crate::track::DataLane,
     },
     DataTopicSubscribed {
         room_id: crate::entity::RoomId,
@@ -291,35 +287,14 @@ pub(crate) enum ShardEvent {
         topic: crate::track::Topic,
         publisher: Option<ParticipantId>,
         channel: str0m::channel::ChannelId,
+        lane: crate::track::DataLane,
     },
     DataTopicUnsubscribed {
         room_id: crate::entity::RoomId,
         subscriber: ParticipantId,
         topic: crate::track::Topic,
         publisher: Option<ParticipantId>,
-    },
-    ReliableDataTopicPublished {
-        room_id: crate::entity::RoomId,
-        publisher: ParticipantId,
-        publisher_key: crate::shard::participants::ParticipantKey,
-        topic: crate::track::Topic,
-    },
-    ReliableDataTopicUnpublished {
-        room_id: crate::entity::RoomId,
-        publisher: ParticipantId,
-        publisher_key: crate::shard::participants::ParticipantKey,
-        topic: crate::track::Topic,
-    },
-    ReliableDataTopicSubscribed {
-        room_id: crate::entity::RoomId,
-        subscriber: ParticipantId,
-        topic: crate::track::Topic,
-        channel: str0m::channel::ChannelId,
-    },
-    ReliableDataTopicUnsubscribed {
-        room_id: crate::entity::RoomId,
-        subscriber: ParticipantId,
-        topic: crate::track::Topic,
+        lane: crate::track::DataLane,
     },
 }
 
@@ -769,9 +744,12 @@ mod reverse_tests {
         );
         let payload = MediaPayload {
             key: crate::keys::TrackKey::default(),
-            packet: crate::participant::TrackPacket::Data(b"payload".to_vec()),
+            packet: crate::participant::TrackPacket::Data {
+                lane: crate::track::DataLane::Realtime,
+                bytes: b"payload".to_vec(),
+            },
         };
-        let crate::participant::TrackPacket::Data(bytes) = payload.packet else {
+        let crate::participant::TrackPacket::Data { bytes, .. } = payload.packet else {
             unreachable!();
         };
         assert_eq!(bytes, b"payload");
@@ -813,10 +791,6 @@ mod architecture_tests {
             ShardEvent::DataTopicUnpublished { .. } => 6,
             ShardEvent::DataTopicSubscribed { .. } => 7,
             ShardEvent::DataTopicUnsubscribed { .. } => 8,
-            ShardEvent::ReliableDataTopicPublished { .. } => 9,
-            ShardEvent::ReliableDataTopicUnpublished { .. } => 10,
-            ShardEvent::ReliableDataTopicSubscribed { .. } => 11,
-            ShardEvent::ReliableDataTopicUnsubscribed { .. } => 12,
         }
     }
 
@@ -824,7 +798,6 @@ mod architecture_tests {
     fn event_surface_has_an_exhaustive_guard() {
         let event = ShardEvent::ParticipantClosed {
             participant: ParticipantId::from_bytes([0; 16]),
-            key: crate::shard::participants::ParticipantKey::default(),
         };
         assert_eq!(event_variant(&event), 0);
     }

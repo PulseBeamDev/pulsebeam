@@ -4,7 +4,7 @@ use crate::keys::DownstreamSlotKey;
 use crate::keys::TrackKey;
 #[cfg(test)]
 use crate::track::StreamId;
-use crate::track::{Topic, Track, TrackLayer, TrackMeta};
+use crate::track::{DataLane, Topic, Track, TrackLayer, TrackMeta};
 use str0m::channel::ChannelId;
 
 pub trait ParticipantSink {
@@ -23,25 +23,23 @@ pub trait ParticipantSink {
         topic: Topic,
         publisher: Option<crate::entity::ParticipantId>,
         channel: ChannelId,
+        lane: DataLane,
     );
     fn unsubscribe_data_topic(
         &mut self,
         topic: Topic,
         publisher: Option<crate::entity::ParticipantId>,
         channel: ChannelId,
+        lane: DataLane,
     );
-    fn publish_data_topic(&mut self, topic: Topic);
-    fn unpublish_data_topic(&mut self, topic: Topic);
+    fn publish_data_topic(&mut self, topic: Topic, lane: DataLane);
+    fn unpublish_data_topic(&mut self, topic: Topic, lane: DataLane);
     fn request_keyframe(&mut self, layer: &TrackLayer, fanout: Option<TrackKey>);
     fn exit(&mut self);
 
     fn publish_track_packet(&mut self, fanout: Option<TrackKey>, packet: TrackPacket);
     fn publish_sctp(&mut self, topic: Topic, stream: Option<TrackKey>, pkt: Vec<u8>);
 
-    fn publish_reliable_data_topic(&mut self, topic: Topic);
-    fn unpublish_reliable_data_topic(&mut self, topic: Topic);
-    fn subscribe_reliable_data_topic(&mut self, topic: Topic, channel: ChannelId);
-    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic, channel: ChannelId);
     fn publish_reliable_sctp(&mut self, topic: Topic, stream: Option<TrackKey>, frame: Vec<u8>);
     fn forward_reliable_control(
         &mut self,
@@ -114,6 +112,7 @@ pub mod test_utils {
             topic: Topic,
             _publisher: Option<crate::entity::ParticipantId>,
             _channel: ChannelId,
+            _lane: DataLane,
         ) {
             self.subscribe_data_topic_calls.push(topic);
         }
@@ -123,15 +122,16 @@ pub mod test_utils {
             topic: Topic,
             _publisher: Option<crate::entity::ParticipantId>,
             _channel: ChannelId,
+            _lane: DataLane,
         ) {
             self.unsubscribe_data_topic_calls.push(topic);
         }
 
-        fn publish_data_topic(&mut self, topic: Topic) {
+        fn publish_data_topic(&mut self, topic: Topic, _lane: DataLane) {
             self.publish_data_topic_calls.push(topic);
         }
 
-        fn unpublish_data_topic(&mut self, topic: Topic) {
+        fn unpublish_data_topic(&mut self, topic: Topic, _lane: DataLane) {
             self.unpublish_data_topic_calls.push(topic);
         }
 
@@ -154,10 +154,6 @@ pub mod test_utils {
             self.publish_sctp_calls.push(topic);
         }
 
-        fn publish_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn unpublish_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn subscribe_reliable_data_topic(&mut self, _topic: Topic, _channel: ChannelId) {}
-        fn unsubscribe_reliable_data_topic(&mut self, _topic: Topic, _channel: ChannelId) {}
         fn publish_reliable_sctp(
             &mut self,
             _topic: Topic,

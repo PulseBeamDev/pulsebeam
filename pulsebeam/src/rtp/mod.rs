@@ -18,8 +18,6 @@ pub mod timeline;
 
 #[cfg(test)]
 pub mod conformance;
-#[cfg(test)]
-mod switch_test;
 
 #[allow(
     clippy::disallowed_types,

@@ -2,19 +2,17 @@ use std::collections::HashMap;
 
 use indexmap::{IndexMap, IndexSet};
 
-use crate::entity::{ParticipantId, RoomId};
+use crate::entity::ParticipantId;
 use crate::id::ShardId;
 
 pub struct Room {
-    pub room_id: RoomId,
     participants: IndexMap<ParticipantId, ()>,
     participants_by_shard: HashMap<ShardId, IndexSet<ParticipantId>>,
 }
 
 impl Room {
-    pub fn new(room_id: RoomId) -> Self {
+    pub fn new() -> Self {
         Self {
-            room_id,
             participants: IndexMap::new(),
             participants_by_shard: HashMap::new(),
         }
@@ -47,10 +45,6 @@ impl Room {
                 self.participants_by_shard.remove(&shard_id);
             }
         }
-    }
-
-    pub fn shard_ids(&self) -> impl Iterator<Item = ShardId> + '_ {
-        self.participants_by_shard.keys().copied()
     }
 
     pub fn participant_count(&self) -> usize {

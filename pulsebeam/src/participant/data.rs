@@ -5,13 +5,18 @@ use str0m::channel::ChannelId;
 use crate::entity::ParticipantId;
 use crate::keys::TrackKey;
 use crate::participant::reliable::ReliableChannels;
-use crate::track::{DataTopicChannel, Topic};
+use crate::track::{DataLane, DataTopicChannel, Topic};
+
+#[derive(Clone, Copy)]
+pub(super) struct DataForwarding {
+    pub lane: DataLane,
+    pub channel: ChannelId,
+}
 
 pub(super) struct DataState {
     pub topic_channels: HashMap<ChannelId, DataTopicChannel>,
     pub published_channels: HashMap<Topic, ChannelId>,
-    pub forwarding: SecondaryMap<TrackKey, ChannelId>,
-    pub reliable_forwarding: SecondaryMap<TrackKey, ChannelId>,
+    pub forwarding: SecondaryMap<TrackKey, DataForwarding>,
     pub published_streams: HashMap<ChannelId, TrackKey>,
     pub reliable_published_streams: HashMap<ChannelId, TrackKey>,
     pub reliable_stream_topics: SecondaryMap<TrackKey, Topic>,
@@ -28,7 +33,6 @@ impl DataState {
             topic_channels: HashMap::new(),
             published_channels: HashMap::new(),
             forwarding: SecondaryMap::new(),
-            reliable_forwarding: SecondaryMap::new(),
             published_streams: HashMap::new(),
             reliable_published_streams: HashMap::new(),
             reliable_stream_topics: SecondaryMap::new(),
