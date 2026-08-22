@@ -1,6 +1,10 @@
 use crate::keys::TrackKey;
 use crate::rtp::RtpPacket;
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "RTP packets stay inline to keep the forwarding hot path allocation-free"
+)]
 #[derive(Debug, Clone)]
 pub enum TrackPacket {
     Data(Vec<u8>),

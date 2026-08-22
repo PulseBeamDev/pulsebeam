@@ -539,7 +539,10 @@ impl ParticipantCore {
             let (stream, reliable, bytes) = match packet {
                 TrackPacketRef::Data(bytes) => (key, false, bytes),
                 TrackPacketRef::Reliable(bytes) => (key, true, bytes),
-                TrackPacketRef::Rtp(_) => unreachable!(),
+                TrackPacketRef::Rtp(_) => {
+                    debug_assert!(false, "the RTP path must be handled before data dispatch");
+                    return;
+                }
             };
             let channel = if reliable {
                 self.data.reliable_forwarding.get(stream).copied()

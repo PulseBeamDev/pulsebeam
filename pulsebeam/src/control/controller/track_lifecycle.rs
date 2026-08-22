@@ -141,17 +141,11 @@ impl ControllerActor {
         &mut self,
         track_id: crate::entity::TrackId,
         destination: crate::id::ShardId,
-    ) -> Option<(
-        crate::keys::TrackKey,
-        crate::route::RouteAction,
-    )> {
+    ) -> Option<(crate::keys::TrackKey, crate::route::RouteAction)> {
         let publication = self.catalog.get(&track_id)?;
         let (id, origin) = (publication.id, publication.publisher);
         let key = self.prepare_track_key(destination, id, origin)?;
-        Some((
-            key,
-            RouteAction::Forward { target: key },
-        ))
+        Some((key, RouteAction::Forward { target: key }))
     }
 
     pub(super) async fn install_audio_destination(
@@ -220,10 +214,9 @@ impl ControllerActor {
             } else if let Some(destination) = binding.destinations.get(&shard_id) {
                 let (fanout, new_destination) = match destination {
                     crate::control::publication::Destination::Discovery { key } => (*key, true),
-                    crate::control::publication::Destination::Forwarding {
-                        key,
-                        ..
-                    } => (*key, false),
+                    crate::control::publication::Destination::Forwarding { key, .. } => {
+                        (*key, false)
+                    }
                 };
                 (fanout, new_destination)
             } else {
@@ -242,7 +235,7 @@ impl ControllerActor {
                 (fanout, true)
             }
         };
-        let (membership, displaced) = crate::control::patterns::declare_audience(
+        let (membership, displaced) = crate::control::patterns::declare_audience_with_kind(
             &mut self.audiences,
             pattern.clone(),
             subscriber,
@@ -251,6 +244,7 @@ impl ControllerActor {
                 key: subscriber_key,
                 delivery: crate::control::publication::AudienceDelivery::Track(slot),
             },
+            crate::control::publication::AudienceDelivery::same_kind,
         );
         self.index_publication(track.id);
         let needs_remote_route = self
@@ -298,10 +292,8 @@ impl ControllerActor {
             let crate::control::publication::Destination::Discovery { key } = *destination else {
                 pulsebeam_runtime::fatal!("a first video route must start from discovery");
             };
-            *destination = crate::control::publication::Destination::Forwarding {
-                key,
-                route: handle,
-            };
+            *destination =
+                crate::control::publication::Destination::Forwarding { key, route: handle };
             route_installed = true;
         }
 
@@ -369,17 +361,13 @@ impl ControllerActor {
         subscriber: ParticipantId,
         track: crate::track::TrackMeta,
     ) {
-        let pattern =
-            crate::control::patterns::Pattern::exact(
-                track.room_id,
-                track.origin,
-                crate::control::publication::AudienceName::Track(track.id),
-            );
-        let departure = crate::control::patterns::retract_audience(
-            &mut self.audiences,
-            &pattern,
-            &subscriber,
+        let pattern = crate::control::patterns::Pattern::exact(
+            track.room_id,
+            track.origin,
+            crate::control::publication::AudienceName::Track(track.id),
         );
+        let departure =
+            crate::control::patterns::retract_audience(&mut self.audiences, &pattern, &subscriber);
         if departure != crate::control::patterns::Departure::LastOnShard {
             if !self.publish_publication(track.id).await {
                 debug_assert!(false, "a changed video audience must publish its plan");
@@ -418,10 +406,7 @@ impl ControllerActor {
         if shard_id == binding.publisher_shard {
             Some(binding.origin_key)
         } else {
-            binding
-                .destinations
-                .get(&shard_id)
-                .map(|d| d.key())
+            binding.destinations.get(&shard_id).map(|d| d.key())
         }
     }
 

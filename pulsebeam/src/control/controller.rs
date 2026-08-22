@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::io;
+use std::time::Duration;
 
 use crate::control::state::ControlModel;
 use crate::{
@@ -1224,7 +1224,7 @@ impl ControllerActor {
         self.core
             .registry
             .bind_participant(&cfg.participant_id, binding);
-        let _membership = crate::control::patterns::declare_audience(
+        let _membership = crate::control::patterns::declare_audience_with_kind(
             &mut self.audiences,
             crate::control::patterns::Pattern::all(room_id),
             cfg.participant_id,
@@ -1233,6 +1233,7 @@ impl ControllerActor {
                 key: binding,
                 delivery: crate::control::publication::AudienceDelivery::Audio,
             },
+            crate::control::publication::AudienceDelivery::same_kind,
         );
 
         let (materialized_tx, materialized_rx) = oneshot::channel();
@@ -1250,10 +1251,8 @@ impl ControllerActor {
             .await
             .is_err()
         {
-            let _ = crate::control::patterns::retract_participant(
-                &mut self.audiences,
-                &participant_id,
-            );
+            let _ =
+                crate::control::patterns::retract_participant(&mut self.audiences, &participant_id);
             self.retire_transport(
                 shard_id,
                 handle,
@@ -1266,10 +1265,8 @@ impl ControllerActor {
             return Err(ControllerError::ServiceUnavailable);
         }
         if !materialized_rx.await.unwrap_or(false) {
-            let _ = crate::control::patterns::retract_participant(
-                &mut self.audiences,
-                &participant_id,
-            );
+            let _ =
+                crate::control::patterns::retract_participant(&mut self.audiences, &participant_id);
             self.retire_transport(
                 shard_id,
                 handle,

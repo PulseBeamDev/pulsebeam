@@ -208,12 +208,10 @@ impl ControlModel {
         id: crate::entity::TrackId,
         origin: crate::entity::ParticipantId,
     ) -> Option<crate::keys::TrackKey> {
-        let key = self.arenas.get_mut(shard.index()).map(|arena| {
-            arena.tracks.insert(TrackRecord {
-                id,
-                origin,
-            })
-        })?;
+        let key = self
+            .arenas
+            .get_mut(shard.index())
+            .map(|arena| arena.tracks.insert(TrackRecord { id, origin }))?;
         if let Some(tx) = self.pending.as_mut() {
             tx.tracks.push((shard, key));
         }

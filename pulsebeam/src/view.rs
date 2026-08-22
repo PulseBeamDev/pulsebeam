@@ -125,6 +125,10 @@ impl TransportImage {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "view batches are control-plane messages and runtime state stays inline"
+)]
 #[derive(Debug, Clone)]
 pub(crate) enum ViewOp {
     InstallRoute {

@@ -9,7 +9,10 @@ fn every_stream_lane_uses_the_same_route_key_shape() {
     let data_key: crate::keys::TrackKey = Default::default();
     let reliable_key: crate::keys::TrackKey = Default::default();
 
-    assert!(matches!(data.route_action(data_key), RouteAction::Forward { .. }));
+    assert!(matches!(
+        data.route_action(data_key),
+        RouteAction::Forward { .. }
+    ));
     assert!(matches!(
         reliable.route_action(reliable_key),
         RouteAction::Forward { .. }

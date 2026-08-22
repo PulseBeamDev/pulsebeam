@@ -259,11 +259,22 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
     /// drops any it subsumes, so no participant can match one publication
     /// twice. Returns what the caller owes route lifecycle, plus any groups
     /// the normalization emptied.
+    #[cfg(test)]
     pub fn declare(
         &mut self,
         pattern: Pattern<N>,
         participant: ParticipantId,
         member: Member<S>,
+    ) -> (Membership, Vec<Displaced<G>>) {
+        self.declare_with_kind(pattern, participant, member, |_, _| true)
+    }
+
+    pub fn declare_with_kind(
+        &mut self,
+        pattern: Pattern<N>,
+        participant: ParticipantId,
+        member: Member<S>,
+        same_kind: impl Fn(S, S) -> bool + Copy,
     ) -> (Membership, Vec<Displaced<G>>) {
         let already_held = self
             .by_participant
@@ -318,12 +329,44 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
             return (membership, vec![(id, departure, old.shard, old.key)]);
         }
         let held = self.by_participant.entry(participant).or_default();
-        if held.iter().any(|existing| existing.subsumes(&pattern)) {
+        if held.iter().any(|existing| {
+            if !existing.subsumes(&pattern) {
+                return false;
+            }
+            let Some(id) = self.ids.get(existing).copied() else {
+                debug_assert!(false, "a held pattern must have a group");
+                return false;
+            };
+            let Some(group) = self.groups.get(id.0 as usize).and_then(Option::as_ref) else {
+                debug_assert!(false, "a held pattern's group must resolve");
+                return false;
+            };
+            group
+                .members
+                .get(&participant)
+                .is_some_and(|previous| same_kind(previous.delivery, member.delivery))
+        }) {
             return (Membership::Unchanged, Vec::new());
         }
         let narrowed: Vec<Pattern<N>> = held
             .iter()
-            .filter(|existing| pattern.subsumes(existing))
+            .filter(|existing| {
+                if !pattern.subsumes(existing) {
+                    return false;
+                }
+                let Some(id) = self.ids.get(*existing).copied() else {
+                    debug_assert!(false, "a held pattern must have a group");
+                    return false;
+                };
+                let Some(group) = self.groups.get(id.0 as usize).and_then(Option::as_ref) else {
+                    debug_assert!(false, "a held pattern's group must resolve");
+                    return false;
+                };
+                group
+                    .members
+                    .get(&participant)
+                    .is_some_and(|previous| same_kind(previous.delivery, member.delivery))
+            })
             .cloned()
             .collect();
 
@@ -549,11 +592,7 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
             };
             for (participant, member) in &group.members {
                 if *participant != excluded && member.shard == shard {
-                    let previous = members.insert(member.key, member.delivery);
-                    debug_assert!(
-                        previous.is_none(),
-                        "normalized declarations must not duplicate a local recipient"
-                    );
+                    members.entry(member.key).or_insert(member.delivery);
                 }
             }
         }
@@ -646,17 +685,18 @@ impl<N: std::hash::Hash + Eq + Clone, S: Copy + PartialEq + std::fmt::Debug, G>
     }
 }
 
-pub(crate) fn declare_audience<N, S, G>(
+pub(crate) fn declare_audience_with_kind<N, S, G>(
     table: &mut PatternTable<N, S, G>,
     pattern: Pattern<N>,
     participant: ParticipantId,
     member: Member<S>,
+    same_kind: impl Fn(S, S) -> bool + Copy,
 ) -> (Membership, Vec<Displaced<G>>)
 where
     N: std::hash::Hash + Eq + Clone,
     S: Copy + PartialEq + std::fmt::Debug,
 {
-    table.declare(pattern, participant, member)
+    table.declare_with_kind(pattern, participant, member, same_kind)
 }
 
 pub(crate) fn retract_audience<N, S, G>(

@@ -37,6 +37,17 @@ pub(crate) enum AudienceDelivery {
     },
 }
 
+impl AudienceDelivery {
+    pub(crate) fn same_kind(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Track(_), Self::Track(_))
+                | (Self::Audio, Self::Audio)
+                | (Self::Data { .. }, Self::Data { .. })
+        )
+    }
+}
+
 /// One shard that receives this publication: what it calls it there, and the
 /// route serving it.
 ///
@@ -53,8 +64,7 @@ pub(crate) enum Destination {
 impl Destination {
     pub(crate) fn key(self) -> TrackKey {
         match self {
-            Self::Discovery { key } => key,
-            Self::Forwarding { key, .. } => key,
+            Self::Discovery { key } | Self::Forwarding { key, .. } => key,
         }
     }
 }

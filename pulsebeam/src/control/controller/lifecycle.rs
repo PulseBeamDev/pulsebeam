@@ -8,9 +8,7 @@
 use super::*;
 
 /// The op that removes a publication's runtime from the arena its key names.
-pub(super) fn runtime_removal_op(
-    key: crate::keys::TrackKey,
-) -> crate::view::ViewOp {
+pub(super) fn runtime_removal_op(key: crate::keys::TrackKey) -> crate::view::ViewOp {
     crate::view::ViewOp::RemoveTrackRuntime { key }
 }
 
@@ -123,9 +121,7 @@ impl ControllerActor {
         let mut targets = vec![(publisher_shard, publication.origin_key, None)];
         for (shard, held) in &publication.destinations {
             let (key, route) = match held {
-                crate::control::publication::Destination::Discovery { key } => {
-                    (*key, None)
-                }
+                crate::control::publication::Destination::Discovery { key } => (*key, None),
                 crate::control::publication::Destination::Forwarding { key, route } => {
                     (*key, Some(*route))
                 }
@@ -226,22 +222,18 @@ impl ControllerActor {
         );
         members
             .into_iter()
-            .filter_map(|(participant, delivery)| {
-                let crate::control::publication::AudienceDelivery::Data { channel, lane: _ } =
-                    delivery
-                else {
-                    debug_assert!(false, "a data subject must have data delivery metadata");
-                    return None;
-                };
-                Some((
+            .filter_map(|(participant, delivery)| match delivery {
+                crate::control::publication::AudienceDelivery::Data { channel, lane } => Some((
                     shard,
                     crate::view::ViewOp::BindTrack {
                         participant,
                         key,
                         channel,
-                        lane: *lane,
+                        lane,
                     },
-                ))
+                )),
+                crate::control::publication::AudienceDelivery::Track(_)
+                | crate::control::publication::AudienceDelivery::Audio => None,
             })
             .collect()
     }
@@ -258,10 +250,7 @@ impl ControllerActor {
         let mut ops = super::GenerationOps::lifecycle(Vec::with_capacity(4));
         let mut install_plan = true;
         match (&publication.media, key) {
-            (
-                crate::control::publication::Media::Data { topic, lane },
-                _,
-            ) => {
+            (crate::control::publication::Media::Data { topic, lane }, _) => {
                 let stream = key;
                 let stream_id = crate::control::state::DataStreamId::new(
                     publication.room,
@@ -270,11 +259,11 @@ impl ControllerActor {
                 );
                 ops.lifecycle.push((
                     shard,
-                        super::stream_lifecycle::insert_stream_runtime_op(
-                            stream,
-                            stream_id,
-                            (*lane).into(),
-                            (shard == publication.publisher_shard).then_some(publication.publisher_key),
+                    super::stream_lifecycle::insert_stream_runtime_op(
+                        stream,
+                        stream_id,
+                        (*lane).into(),
+                        (shard == publication.publisher_shard).then_some(publication.publisher_key),
                     ),
                 ));
                 if let Some(route) = route {
@@ -285,10 +274,7 @@ impl ControllerActor {
                 }
                 ops.extend_lifecycle(self.data_binding_ops(publication, shard, key));
             }
-            (
-                crate::control::publication::Media::Video { .. },
-                fanout,
-            ) => {
+            (crate::control::publication::Media::Video { .. }, fanout) => {
                 let descriptor = self.track_descriptor(id, shard)?;
                 if shard != publication.publisher_shard && route.is_none() {
                     install_plan = false;
@@ -340,10 +326,7 @@ impl ControllerActor {
                     ));
                 }
             }
-            (
-                crate::control::publication::Media::Audio,
-                fanout,
-            ) => {
+            (crate::control::publication::Media::Audio, fanout) => {
                 let descriptor = self.track_descriptor(id, shard)?;
                 let recipients = self.room_recipients(publication.room, shard);
                 if let Some(participant) = descriptor.participant {
@@ -393,10 +376,7 @@ impl ControllerActor {
         mint: impl Fn(
             &mut Self,
             crate::id::ShardId,
-        ) -> Option<(
-            crate::keys::TrackKey,
-            crate::route::RouteAction,
-        )>,
+        ) -> Option<(crate::keys::TrackKey, crate::route::RouteAction)>,
     ) -> bool {
         let Some(publication) = self.catalog.get(&id) else {
             return true;
@@ -422,10 +402,7 @@ impl ControllerActor {
         mint: &impl Fn(
             &mut Self,
             crate::id::ShardId,
-        ) -> Option<(
-            crate::keys::TrackKey,
-            crate::route::RouteAction,
-        )>,
+        ) -> Option<(crate::keys::TrackKey, crate::route::RouteAction)>,
     ) -> bool {
         if self
             .catalog
@@ -586,15 +563,27 @@ impl ControllerActor {
         let recipients = self
             .audiences
             .members_for(
-                self.audiences.match_subject(&publication.audience_subject()),
+                self.audiences
+                    .match_subject(&publication.audience_subject()),
                 shard,
                 publication.publisher,
             )
             .into_iter()
-            .filter_map(|(member, delivery)| match delivery {
-                crate::control::publication::AudienceDelivery::Track(_)
-                | crate::control::publication::AudienceDelivery::Audio
-                | crate::control::publication::AudienceDelivery::Data { .. } => Some(member),
+            .filter_map(|(member, delivery)| {
+                let matches = matches!(
+                    (&publication.media, delivery),
+                    (
+                        crate::control::publication::Media::Video { .. },
+                        crate::control::publication::AudienceDelivery::Track(_),
+                    ) | (
+                        crate::control::publication::Media::Audio,
+                        crate::control::publication::AudienceDelivery::Audio,
+                    ) | (
+                        crate::control::publication::Media::Data { .. },
+                        crate::control::publication::AudienceDelivery::Data { .. },
+                    )
+                );
+                matches.then_some(member)
             })
             .collect();
         let plan_key = key;
@@ -623,11 +612,7 @@ impl ControllerActor {
                 Some(publication.destinations.get(&shard)?.key())
             }
         })?;
-        let (plan_key, plan) = self.plan_for(
-            id,
-            shard,
-            key,
-        )?;
+        let (plan_key, plan) = self.plan_for(id, shard, key)?;
         debug_assert_eq!(plan_key, key);
         Some(plan)
     }

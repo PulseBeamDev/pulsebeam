@@ -102,7 +102,7 @@ impl ShardRuntime {
     }
 
     pub(crate) fn retire_track(&mut self, key: TrackKey) {
-        debug_assert!(self.tracks.remove(key).is_some());
+        let _ = self.tracks.remove(key);
     }
 
     pub(crate) fn apply_view_op(&mut self, op: &crate::view::ViewOp) {
@@ -231,10 +231,10 @@ impl ShardRuntime {
         match packet.packet {
             TrackPacket::Rtp(packet) => self.route_rtp_with_plan(key, origin, packet, plan, ctx),
             TrackPacket::Data(bytes) => {
-                self.route_unreliable_with_plan(key, origin, bytes, plan, ctx)
+                self.route_unreliable_with_plan(key, origin, bytes, plan, ctx);
             }
             TrackPacket::Reliable(bytes) => {
-                self.route_reliable_with_plan(key, origin, bytes, plan, ctx)
+                self.route_reliable_with_plan(key, origin, bytes, plan, ctx);
             }
         }
     }

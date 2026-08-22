@@ -73,13 +73,19 @@ impl ControllerActor {
             .iter()
             .filter_map(|(pattern, departure)| match pattern.name {
                 Some(crate::control::publication::AudienceName::Track(track_id))
-                    if self.catalog.get(&track_id).is_some_and(|p| p.kind() == crate::entity::TrackKind::Video) =>
+                    if self
+                        .catalog
+                        .get(&track_id)
+                        .is_some_and(|p| p.kind() == crate::entity::TrackKind::Video) =>
                 {
-                    Some((crate::control::patterns::Pattern {
-                        room: pattern.room,
-                        publisher: pattern.publisher,
-                        name: Some(crate::control::publication::AudienceName::Track(track_id)),
-                    }, *departure))
+                    Some((
+                        crate::control::patterns::Pattern {
+                            room: pattern.room,
+                            publisher: pattern.publisher,
+                            name: Some(crate::control::publication::AudienceName::Track(track_id)),
+                        },
+                        *departure,
+                    ))
                 }
                 _ => None,
             })
@@ -88,7 +94,10 @@ impl ControllerActor {
             .iter()
             .filter_map(|(pattern, _)| match pattern.name {
                 Some(crate::control::publication::AudienceName::Track(track_id))
-                    if self.catalog.get(&track_id).is_some_and(|p| p.kind() == crate::entity::TrackKind::Audio) =>
+                    if self
+                        .catalog
+                        .get(&track_id)
+                        .is_some_and(|p| p.kind() == crate::entity::TrackKind::Audio) =>
                 {
                     Some(track_id)
                 }
@@ -125,8 +134,7 @@ impl ControllerActor {
                 if departure != crate::control::patterns::Departure::LastOnShard {
                     continue;
                 }
-                let Some(crate::control::publication::AudienceName::Track(track_id)) =
-                    pattern.name
+                let Some(crate::control::publication::AudienceName::Track(track_id)) = pattern.name
                 else {
                     continue;
                 };

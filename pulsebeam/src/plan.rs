@@ -84,17 +84,17 @@ impl TrackPlans {
             Some(plan) => {
                 debug_assert!(
                     plan.local.iter().enumerate().all(|(index, value)| {
-                        plan.local[..index]
-                            .iter()
-                            .all(|candidate| candidate != value)
+                        plan.local
+                            .get(..index)
+                            .is_some_and(|prefix| prefix.iter().all(|candidate| candidate != value))
                     }),
                     "a track plan cannot contain duplicate local recipients"
                 );
                 debug_assert!(
                     plan.remote.iter().enumerate().all(|(index, value)| {
-                        plan.remote[..index]
-                            .iter()
-                            .all(|candidate| candidate != value)
+                        plan.remote
+                            .get(..index)
+                            .is_some_and(|prefix| prefix.iter().all(|candidate| candidate != value))
                     }),
                     "a track plan cannot contain duplicate remote routes"
                 );

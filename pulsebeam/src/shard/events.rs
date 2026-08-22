@@ -99,6 +99,7 @@ impl EventPipeline {
         self.participant_events.pop_front()
     }
 
+    #[cfg(test)]
     pub fn pop_track(&mut self) -> Option<RoutedTrackPacket> {
         self.track_queue.pop_front()
     }
@@ -493,6 +494,10 @@ mod tests {
         sink.publish_track_packet(Some(key), TrackPacket::Data(vec![1]));
         sink.publish_reliable_sctp(Topic::for_test("t"), Some(key), vec![2]);
         sink.publish_sctp(Topic::for_test("t"), Some(key), vec![3]);
+        #[allow(
+            clippy::drop_non_drop,
+            reason = "end the mutable pipeline borrow before inspection"
+        )]
         drop(sink);
 
         assert!(matches!(

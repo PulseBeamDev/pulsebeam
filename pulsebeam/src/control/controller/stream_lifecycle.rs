@@ -174,25 +174,21 @@ impl ControllerActor {
         lane: StreamLane,
     ) {
         let pattern = match publisher {
-            Some(publisher) => {
-                crate::control::patterns::Pattern::exact(
-                    room_id,
-                    publisher,
-                    crate::control::publication::AudienceName::Data {
-                        topic: topic.clone(),
-                        lane: lane.into(),
-                    },
-                )
-            }
-            None => {
-                crate::control::patterns::Pattern::any_publisher(
-                    room_id,
-                    crate::control::publication::AudienceName::Data {
-                        topic: topic.clone(),
-                        lane: lane.into(),
-                    },
-                )
-            }
+            Some(publisher) => crate::control::patterns::Pattern::exact(
+                room_id,
+                publisher,
+                crate::control::publication::AudienceName::Data {
+                    topic: topic.clone(),
+                    lane: lane.into(),
+                },
+            ),
+            None => crate::control::patterns::Pattern::any_publisher(
+                room_id,
+                crate::control::publication::AudienceName::Data {
+                    topic: topic.clone(),
+                    lane: lane.into(),
+                },
+            ),
         };
         let displaced_ids: indexmap::IndexSet<_> = self
             .audiences
@@ -201,7 +197,7 @@ impl ControllerActor {
             .filter(|held| pattern.subsumes(held))
             .flat_map(|held| self.audiences.publications_of_pattern(&held))
             .collect();
-        let _ = crate::control::patterns::declare_audience(
+        let _ = crate::control::patterns::declare_audience_with_kind(
             &mut self.audiences,
             pattern,
             subscriber,
@@ -213,6 +209,7 @@ impl ControllerActor {
                     lane: lane.into(),
                 },
             },
+            crate::control::publication::AudienceDelivery::same_kind,
         );
         // Which streams this reaches is a catalog question now, not something
         // the registry has to remember on the subscriber's behalf.
@@ -258,31 +255,24 @@ impl ControllerActor {
         lane: StreamLane,
     ) {
         let pattern = match publisher {
-            Some(publisher) => {
-                crate::control::patterns::Pattern::exact(
-                    room_id,
-                    publisher,
-                    crate::control::publication::AudienceName::Data {
-                        topic: topic.clone(),
-                        lane: lane.into(),
-                    },
-                )
-            }
-            None => {
-                crate::control::patterns::Pattern::any_publisher(
-                    room_id,
-                    crate::control::publication::AudienceName::Data {
-                        topic: topic.clone(),
-                        lane: lane.into(),
-                    },
-                )
-            }
+            Some(publisher) => crate::control::patterns::Pattern::exact(
+                room_id,
+                publisher,
+                crate::control::publication::AudienceName::Data {
+                    topic: topic.clone(),
+                    lane: lane.into(),
+                },
+            ),
+            None => crate::control::patterns::Pattern::any_publisher(
+                room_id,
+                crate::control::publication::AudienceName::Data {
+                    topic: topic.clone(),
+                    lane: lane.into(),
+                },
+            ),
         };
-        let _ = crate::control::patterns::retract_audience(
-            &mut self.audiences,
-            &pattern,
-            &subscriber,
-        );
+        let _ =
+            crate::control::patterns::retract_audience(&mut self.audiences, &pattern, &subscriber);
         let ids: Vec<_> = match publisher {
             Some(publisher) => vec![crate::control::state::DataStreamId::new(
                 room_id, publisher, topic,

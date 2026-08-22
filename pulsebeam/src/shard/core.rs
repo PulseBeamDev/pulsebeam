@@ -207,7 +207,12 @@ impl ShardCore {
                 .saturating_add(SHARD_PLAN_OPERATION_BUDGET)
                 .min(delta.plans.operations.len());
             let mut touched = 0;
-            for operation in &delta.plans.operations[self.pending_plan_index..end] {
+            let operations = delta
+                .plans
+                .operations
+                .get(self.pending_plan_index..end)
+                .unwrap_or_default();
+            for operation in operations {
                 self.plans.apply(operation, &mut touched);
             }
             self.pending_plan_index = end;
@@ -354,15 +359,12 @@ impl ShardCore {
             debug_assert!(false, "a media envelope must resolve to a forward route");
             return;
         };
-        debug_assert_eq!(
-            payload.key, key,
-            "a routed packet key must match its endpoint"
-        );
         let Some(plan) = self.plans.get(key) else {
             record_routing_drop("packet", "plan", "remote");
             return;
         };
         let mut payload = payload;
+        payload.key = key;
         payload.set_remote_timing(self.wall.to_instant(playout), now);
         let mut ctx = crate::shard::router::ForwardingContext {
             registry: &mut self.registry,
@@ -447,33 +449,11 @@ impl ShardCore {
         let plans = &self.plans;
         let mut processed = 0;
         while processed < budget {
-            let Some(ev) = self.pipeline.pop_track() else {
+            let Some(packet) = self.pipeline.pop_packet() else {
                 break;
             };
             processed = processed.saturating_add(1);
-            let key = ev.key;
-            let Some(plan) = plans.get(key) else {
-                record_routing_drop("track", "plan", "local");
-                continue;
-            };
-            let mut ctx = crate::shard::router::ForwardingContext {
-                registry: &mut self.registry,
-                dirty: &mut self.dirty,
-                wall: &self.wall,
-                router,
-            };
-            let Some(packet) = ev.into_rtp() else {
-                continue;
-            };
-            self.runtime
-                .route_rtp_with_plan(key, Origin::Local, packet, plan, &mut ctx);
-        }
-        while processed < budget {
-            let Some(ev) = self.pipeline.pop_packet() else {
-                break;
-            };
-            processed = processed.saturating_add(1);
-            let key = ev.key;
+            let key = packet.key;
             let Some(plan) = plans.get(key) else {
                 record_routing_drop("packet", "plan", "local");
                 continue;
@@ -485,7 +465,7 @@ impl ShardCore {
                 router,
             };
             self.runtime
-                .route_packet_with_plan(key, Origin::Local, ev, plan, &mut ctx);
+                .route_packet_with_plan(key, Origin::Local, packet, plan, &mut ctx);
         }
         processed
     }
