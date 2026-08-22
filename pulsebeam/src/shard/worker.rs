@@ -56,11 +56,11 @@ pub(crate) const SHARD_COMMAND_CAPACITY: usize = 1024;
 /// holding a second of stale video.
 pub(crate) const SHARD_FRAME_CAPACITY: usize = 1024;
 
-pub(crate) const SHARD_VIEW_CAPACITY: usize = 1024;
+pub(crate) const SHARD_UPDATE_CAPACITY: usize = 1024;
 
 pub(crate) const SHARD_COMMAND_BUDGET: usize = 64;
 pub(crate) const SHARD_FRAME_BUDGET: usize = 256;
-pub(crate) const SHARD_VIEW_OP_BUDGET: usize = 256;
+pub(crate) const SHARD_UPDATE_OP_BUDGET: usize = 256;
 pub(crate) const SHARD_PLAN_OPERATION_BUDGET: usize = 256;
 pub(crate) const SHARD_PIPELINE_BUDGET: usize = 512;
 pub(crate) const SHARD_EVENT_BUDGET: usize = 1024;
@@ -611,7 +611,7 @@ impl ShardWorker {
         if commands == SHARD_COMMAND_BUDGET {
             self.tick_budget_hit("commands");
         }
-        if self.core.apply_updates(SHARD_VIEW_OP_BUDGET) >= SHARD_VIEW_OP_BUDGET {
+        if self.core.apply_updates(SHARD_UPDATE_OP_BUDGET) >= SHARD_UPDATE_OP_BUDGET {
             self.tick_budget_hit("shard_update");
         }
         let mut frames: usize = 0;

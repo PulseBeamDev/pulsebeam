@@ -341,7 +341,7 @@ impl ShardUpdateWriter {
 pub(crate) fn new_shard_update(
     shard: ShardId,
 ) -> (ShardUpdateWriter, mailbox::Receiver<Box<ShardUpdate>>) {
-    let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_VIEW_CAPACITY);
+    let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_UPDATE_CAPACITY);
     (
         ShardUpdateWriter {
             shard,
@@ -406,22 +406,22 @@ mod tests {
     fn queued_generations_remain_in_order() {
         let shard = ShardId::new(0);
         let (mut writer, mut rx) = new_shard_update(shard);
-        for generation in 1..=(crate::shard::worker::SHARD_VIEW_CAPACITY + 1) as u64 {
+        for generation in 1..=(crate::shard::worker::SHARD_UPDATE_CAPACITY + 1) as u64 {
             writer.stage(generation, ShardUpdateOp::InsertParticipant);
             assert_eq!(writer.publish(), Some(generation));
         }
-        for expected in 1..=crate::shard::worker::SHARD_VIEW_CAPACITY as u64 {
+        for expected in 1..=crate::shard::worker::SHARD_UPDATE_CAPACITY as u64 {
             assert_eq!(rx.try_recv().unwrap().generation, expected);
         }
         assert!(writer.flush_backlog());
         assert_eq!(
             rx.try_recv().unwrap().generation,
-            (crate::shard::worker::SHARD_VIEW_CAPACITY + 1) as u64
+            (crate::shard::worker::SHARD_UPDATE_CAPACITY + 1) as u64
         );
     }
 
     #[test]
-    fn control_batch_validation_requires_new_owned_revision() {
+    fn shard_update_validation_requires_new_owned_revision() {
         let shard = ShardId::new(2);
         let valid = ShardUpdate::new(shard, 4);
         assert!(valid.validate_for(shard, 3));

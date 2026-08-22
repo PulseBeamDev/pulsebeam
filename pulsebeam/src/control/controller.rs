@@ -461,10 +461,30 @@ impl ControllerActor {
                 .or_default()
                 .push((key, subscription.subscriber));
         }
+        if identity.kind() != TrackKind::Data {
+            for participant in self
+                .core
+                .registry
+                .participant_ids_in_room(&identity.room_id)
+            {
+                if participant == identity.publisher {
+                    continue;
+                }
+                let Some(meta) = self.core.registry.get_participant(&participant) else {
+                    continue;
+                };
+                let Some(key) = meta.binding else { continue };
+                members
+                    .entry(meta.shard_id)
+                    .or_default()
+                    .push((key, participant));
+            }
+        }
         for subscribers in members.values_mut() {
             subscribers.sort_unstable_by_key(|(key, _)| *key);
             subscribers.dedup_by_key(|(key, _)| *key);
         }
+        let effect_members = members.clone();
 
         let origin_allocation = match self
             .track_allocations
@@ -653,20 +673,7 @@ impl ControllerActor {
                 Vec::new(),
             );
         }
-        for (destination, subscribers) in self.topology.matches(identity).fold(
-            HashMap::<ShardId, Vec<(crate::keys::ParticipantKey, ParticipantId)>>::new(),
-            |mut grouped, subscription| {
-                if let Some(meta) = self.core.registry.get_participant(&subscription.subscriber) {
-                    if let Some(key) = meta.binding {
-                        grouped
-                            .entry(meta.shard_id)
-                            .or_default()
-                            .push((key, subscription.subscriber));
-                    }
-                }
-                grouped
-            },
-        ) {
+        for (destination, subscribers) in effect_members {
             let key = self
                 .track_allocations
                 .get(&(identity, destination))
@@ -713,10 +720,6 @@ impl ControllerActor {
         update.stage(generation, op);
     }
 
-    fn stage_update(&mut self, shard: ShardId, op: crate::shard_update::ShardUpdateOp) {
-        self.stage_update_at(shard, self.generation, op);
-    }
-
     fn stage_plans_at(
         &mut self,
         shard: ShardId,
@@ -742,6 +745,39 @@ impl ControllerActor {
             return;
         };
         update.stage_participant_effect(generation, participant, effect);
+    }
+
+    fn stage_participant_change_at(
+        &mut self,
+        room_id: crate::entity::RoomId,
+        generation: u64,
+        added: Option<ParticipantId>,
+        removed: Option<ParticipantId>,
+    ) {
+        let participants: Vec<_> = self
+            .core
+            .registry
+            .participant_ids_in_room(&room_id)
+            .into_iter()
+            .filter(|participant| Some(*participant) != removed)
+            .collect();
+        for participant in participants {
+            let Some(meta) = self.core.registry.get_participant(&participant) else {
+                continue;
+            };
+            let Some(key) = meta.binding else {
+                continue;
+            };
+            self.stage_participant_at(
+                meta.shard_id,
+                generation,
+                key,
+                crate::participant::ParticipantEffect::ParticipantsChanged {
+                    added: added.into_iter().collect(),
+                    removed: removed.into_iter().collect(),
+                },
+            );
+        }
     }
 
     fn publish_staged(&mut self) {
@@ -930,6 +966,7 @@ impl ControllerActor {
             return Err(ControllerError::ServiceUnavailable);
         }
         let config = self.core.create_participant(rtc, state, shard, handle, key);
+        let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         if self
             .router
@@ -951,6 +988,31 @@ impl ControllerActor {
         if !ack_rx.await.unwrap_or(false) {
             self.remove_participant(participant_id).await;
             return Err(ControllerError::ServiceUnavailable);
+        }
+        let generation = self.next_generation();
+        self.stage_participant_change_at(room_id, generation, Some(participant_id), None);
+        if let Some(meta) = self.core.registry.get_participant(&participant_id)
+            && let Some(key) = meta.binding
+        {
+            let participants = self.core.registry.participant_ids_in_room(&room_id);
+            self.stage_participant_at(
+                meta.shard_id,
+                generation,
+                key,
+                crate::participant::ParticipantEffect::ParticipantsChanged {
+                    added: participants,
+                    removed: Vec::new(),
+                },
+            );
+        }
+        self.publish_staged();
+        let room_tracks: Vec<_> = self
+            .topology
+            .identities()
+            .filter(|identity| identity.room_id == room_id)
+            .collect();
+        for identity in room_tracks {
+            self.reconcile_track(identity, false);
         }
         Ok(answer)
     }
@@ -994,6 +1056,12 @@ impl ControllerActor {
                         .topology
                         .matches(*identity)
                         .any(|subscription| subscription.subscriber == participant)
+                    || (identity.kind() != TrackKind::Data
+                        && self
+                            .core
+                            .registry
+                            .get_participant(&participant)
+                            .is_some_and(|meta| meta.room_id == identity.room_id))
             })
             .collect();
         let retiring: Vec<_> = affected
@@ -1006,6 +1074,14 @@ impl ControllerActor {
             let members: Vec<_> = self.topology.matches(identity).collect();
             self.stage_track_removals_at(identity, members, generation);
             let _ = self.topology.unpublish(identity);
+        }
+        let room_id = self
+            .core
+            .registry
+            .get_participant(&participant)
+            .map(|meta| meta.room_id);
+        if let Some(room_id) = room_id {
+            self.stage_participant_change_at(room_id, generation, None, Some(participant));
         }
         let _ = self.core.delete_participant(&participant);
         self.topology.remove_participant(participant);

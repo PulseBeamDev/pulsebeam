@@ -338,6 +338,36 @@ mod tests {
     }
 
     #[test]
+    fn unsubscribe_removes_only_the_matching_subscription() {
+        let mut topology = TrackTopology::default();
+        let track = identity(TrackKind::Audio, 1);
+        let subscriber = participant(3);
+        let selector = TrackSelector::Exact(track);
+        let _ = topology.subscribe(subscriber, selector);
+        let _ = topology.subscribe(participant(4), selector);
+
+        assert!(topology.unsubscribe_matching(subscriber, selector));
+        assert_eq!(topology.matches(track).count(), 1);
+        assert!(!topology.unsubscribe_matching(subscriber, selector));
+    }
+
+    #[test]
+    fn a_retired_destination_gets_a_fresh_track_route() {
+        let mut allocator = TrackAllocator::new(2);
+        let track = identity(TrackKind::Audio, 1);
+        let first = allocator
+            .allocate(ShardId::new(1), track, Instant::now())
+            .expect("first destination allocation");
+        allocator.release(first, Instant::now());
+        let replacement = allocator
+            .allocate(ShardId::new(1), track, Instant::now())
+            .expect("replacement destination allocation");
+
+        assert_ne!(first.key, replacement.key);
+        assert_ne!(first.route, replacement.route);
+    }
+
+    #[test]
     fn removing_a_participant_removes_its_subscriptions_and_tracks() {
         let mut topology = TrackTopology::default();
         let owner = participant(1);

@@ -129,7 +129,7 @@ pub(crate) struct ShardCore {
     state: crate::shard_update::ShardState,
     update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
     pending_update: Option<Box<crate::shard_update::ShardUpdate>>,
-    pending_view_lifecycle: bool,
+    pending_update_lifecycle: bool,
     pending_plan_index: usize,
     pending_participant_effects: VecDeque<(ParticipantKey, crate::participant::ParticipantEffect)>,
     registry: ParticipantRegistry,
@@ -179,7 +179,7 @@ impl ShardCore {
             state,
             update_rx,
             pending_update: None,
-            pending_view_lifecycle: false,
+            pending_update_lifecycle: false,
             pending_plan_index: 0,
             pending_participant_effects: VecDeque::new(),
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
@@ -213,14 +213,14 @@ impl ShardCore {
                 debug_assert_eq!(delta.shard, self.shard_id);
                 debug_assert!(
                     delta.generation > self.state.generation,
-                    "view generations arrive strictly newer"
+                    "update generations arrive strictly newer"
                 );
                 self.pending_update = None;
-                self.pending_view_lifecycle = false;
+                self.pending_update_lifecycle = false;
                 self.pending_plan_index = 0;
                 continue;
             }
-            if !self.pending_view_lifecycle {
+            if !self.pending_update_lifecycle {
                 for op in delta.lifecycle.iter().filter(|op| {
                     matches!(op, crate::shard_update::ShardUpdateOp::InsertParticipant)
                 }) {
@@ -241,7 +241,7 @@ impl ShardCore {
                 }) {
                     self.apply_lifecycle_op(op);
                 }
-                self.pending_view_lifecycle = true;
+                self.pending_update_lifecycle = true;
             }
             let end = self
                 .pending_plan_index
@@ -268,7 +268,7 @@ impl ShardCore {
             self.state.generation = delta.generation;
             self.apply_pending_participant_effects();
             self.pending_update = None;
-            self.pending_view_lifecycle = false;
+            self.pending_update_lifecycle = false;
             self.pending_plan_index = 0;
             applied = applied.saturating_add(1);
         }
