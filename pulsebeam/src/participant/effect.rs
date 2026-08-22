@@ -13,6 +13,10 @@ pub enum ParticipantEffect {
         key: TrackKey,
         track: Track,
     },
+    TrackSourceBound {
+        key: TrackKey,
+        track_id: crate::entity::TrackId,
+    },
     TrackRemoved(TrackKey),
     TrackPublished {
         topic: Topic,

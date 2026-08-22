@@ -447,6 +447,10 @@ impl ParticipantCore {
                 self.signaling.apply_participants(added, removed);
             }
             ParticipantEffect::TrackInstalled { key, track } => self.install_track(key, track),
+            ParticipantEffect::TrackSourceBound { key, track_id } => {
+                self.track_keys.insert(track_id, key);
+                self.incoming_rtp_routes.bind_fanout(track_id, key);
+            }
             ParticipantEffect::TrackRemoved(key) => self.remove_compiled_track(key),
             ParticipantEffect::TrackPublished { topic, key, lane } => match lane {
                 DataLane::Realtime => self.bind_published_data_stream(&topic, key),

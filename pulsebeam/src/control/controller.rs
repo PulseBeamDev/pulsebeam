@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     time::Duration,
 };
@@ -575,6 +575,9 @@ impl ControllerActor {
         let mut members: HashMap<ShardId, Vec<(crate::keys::ParticipantKey, ParticipantId)>> =
             HashMap::new();
         for subscription in self.topology.matches(identity) {
+            if identity.kind() == TrackKind::Data && subscription.subscriber == identity.publisher {
+                continue;
+            }
             let Some(meta) = self.core.registry.get_participant(&subscription.subscriber) else {
                 continue;
             };
@@ -601,7 +604,9 @@ impl ControllerActor {
                 let Some(meta) = self.core.registry.get_participant(&participant) else {
                     continue;
                 };
-                let Some(key) = meta.binding else { continue };
+                let Some(key) = meta.binding else {
+                    continue;
+                };
                 members
                     .entry(meta.shard_id)
                     .or_default()
@@ -612,7 +617,32 @@ impl ControllerActor {
             subscribers.sort_unstable_by_key(|(key, _)| *key);
             subscribers.dedup_by_key(|(key, _)| *key);
         }
-        let effect_members = members.clone();
+        let mut effect_members = members.clone();
+        if identity.kind() != TrackKind::Data {
+            for participant in self
+                .core
+                .registry
+                .participant_ids_in_room(&identity.room_id)
+            {
+                if participant == identity.publisher {
+                    continue;
+                }
+                let Some(meta) = self.core.registry.get_participant(&participant) else {
+                    continue;
+                };
+                let Some(key) = meta.binding else {
+                    continue;
+                };
+                effect_members
+                    .entry(meta.shard_id)
+                    .or_default()
+                    .push((key, participant));
+            }
+        }
+        for subscribers in effect_members.values_mut() {
+            subscribers.sort_unstable_by_key(|(key, _)| *key);
+            subscribers.dedup_by_key(|(key, _)| *key);
+        }
 
         let origin_allocation = match self
             .track_allocations
@@ -638,7 +668,7 @@ impl ControllerActor {
             }
         }
 
-        let mut desired = members
+        let mut desired = effect_members
             .keys()
             .copied()
             .collect::<std::collections::HashSet<_>>();
@@ -716,7 +746,7 @@ impl ControllerActor {
             );
         };
 
-        for destination in members
+        for destination in effect_members
             .keys()
             .copied()
             .filter(|destination| *destination != origin_shard)
@@ -727,7 +757,7 @@ impl ControllerActor {
             {
                 let Ok(allocation) = self.track_allocator.allocate(destination, identity, now)
                 else {
-                    debug_assert!(false, "a subscriber shard must accept a track allocation");
+                    debug_assert!(false, "an audience shard must accept a track allocation");
                     continue;
                 };
                 self.track_allocations
@@ -787,7 +817,19 @@ impl ControllerActor {
             origin_local,
             remote_routes,
         );
-        for (destination, subscribers) in members {
+        self.stage_participant_at(
+            origin_shard,
+            generation,
+            origin_key,
+            crate::participant::ParticipantEffect::TrackSourceBound {
+                key: origin_allocation.key,
+                track_id: identity.id,
+            },
+        );
+        for destination in effect_members.keys().copied() {
+            if destination == origin_shard {
+                continue;
+            }
             let Some(allocation) = self
                 .track_allocations
                 .get(&(identity, destination))
@@ -795,6 +837,7 @@ impl ControllerActor {
             else {
                 continue;
             };
+            let subscribers = members.remove(&destination).unwrap_or_default();
             self.stage_update_at(
                 destination,
                 generation,
@@ -989,11 +1032,18 @@ impl ControllerActor {
         members: Vec<crate::control::topology::Subscription>,
         generation: u64,
     ) {
+        let mut removed = HashSet::new();
         for member in members {
+            if identity.kind() == TrackKind::Data && member.subscriber == identity.publisher {
+                continue;
+            }
             let Some(meta) = self.core.registry.get_participant(&member.subscriber) else {
                 continue;
             };
             let Some(key) = meta.binding else { continue };
+            if !removed.insert(member.subscriber) {
+                continue;
+            }
             let track_key = self
                 .track_allocations
                 .get(&(identity, meta.shard_id))
@@ -1006,6 +1056,35 @@ impl ControllerActor {
                 key,
                 crate::participant::ParticipantEffect::TrackRemoved(track_key),
             );
+        }
+        if identity.kind() != TrackKind::Data {
+            for participant in self
+                .core
+                .registry
+                .participant_ids_in_room(&identity.room_id)
+            {
+                if !removed.insert(participant) {
+                    continue;
+                }
+                let Some(meta) = self.core.registry.get_participant(&participant) else {
+                    continue;
+                };
+                let Some(key) = meta.binding else {
+                    continue;
+                };
+                let track_key = self
+                    .track_allocations
+                    .get(&(identity, meta.shard_id))
+                    .map(|allocation| allocation.key)
+                    .or_else(|| self.track_keys.get(&identity).copied())
+                    .unwrap_or_default();
+                self.stage_participant_at(
+                    meta.shard_id,
+                    generation,
+                    key,
+                    crate::participant::ParticipantEffect::TrackRemoved(track_key),
+                );
+            }
         }
         let allocations: Vec<_> = self
             .track_allocations
