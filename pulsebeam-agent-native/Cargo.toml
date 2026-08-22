@@ -14,3 +14,10 @@ workspace = true
 
 [dependencies]
 pulsebeam-agent-core = { path = "../pulsebeam-agent-core" }
+bytes = { workspace = true }
+pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m"] }
+pulsebeam-proto = { path = "../pulsebeam-proto" }
+str0m = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

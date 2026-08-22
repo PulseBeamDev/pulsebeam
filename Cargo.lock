@@ -2952,7 +2952,14 @@ dependencies = [
 name = "pulsebeam-agent-native"
 version = "0.3.2"
 dependencies = [
+ "bytes",
  "pulsebeam-agent-core",
+ "pulsebeam-core",
+ "pulsebeam-proto",
+ "str0m",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
