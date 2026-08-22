@@ -305,7 +305,9 @@ impl AudioAllocator {
             slot.timeline.rebase_audio(&pkt);
             slot.pending_marker = true;
         }
-        slot.timeline.rewrite(&mut pkt);
+        if !slot.timeline.rewrite_audio(&mut pkt) {
+            return None;
+        }
         if slot.pending_marker {
             pkt.marker = true;
             slot.pending_marker = false;
