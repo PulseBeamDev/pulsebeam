@@ -1,4 +1,4 @@
-use crate::keys::TrackKey;
+use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::rtp::RtpPacket;
 
 #[derive(Debug, Clone)]
@@ -23,13 +23,20 @@ pub struct VideoPacket {
     pub packet: RtpPacket,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum PacketRouteKey {
+    Track(TrackKey),
+    Unreliable(UnreliableStreamKey),
+    Reliable(ReliableStreamKey),
+}
+
 #[derive(Debug, Clone)]
-pub struct RoutedTrackPacket {
-    pub key: TrackKey,
+pub struct RoutedPacket {
+    pub key: PacketRouteKey,
     pub packet: TrackPacket,
 }
 
-impl RoutedTrackPacket {
+impl RoutedPacket {
     pub fn into_rtp(self) -> Option<RtpPacket> {
         match self.packet {
             TrackPacket::Audio(packet) => Some(packet.packet),

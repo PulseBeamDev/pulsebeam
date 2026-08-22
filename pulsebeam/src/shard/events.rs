@@ -8,7 +8,7 @@ use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::participant::event::ParticipantSink;
-use crate::participant::{RoutedTrackPacket, TrackPacket};
+use crate::participant::{PacketRouteKey, RoutedPacket, TrackPacket};
 use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::track::{GlobalKeyframeRequest, Topic, Track, TrackLayer, TrackMeta};
 
@@ -76,7 +76,7 @@ pub enum ShardInternalEvent {
 
 pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
-    track_queue: VecDeque<RoutedTrackPacket>,
+    track_queue: VecDeque<RoutedPacket>,
     data_queue: VecDeque<SctpEvent<UnreliableStreamKey>>,
     reliable_data_queue: VecDeque<SctpEvent<ReliableStreamKey>>,
     shard_events: VecDeque<ShardEvent>,
@@ -106,7 +106,7 @@ impl EventPipeline {
         self.participant_events.pop_front()
     }
 
-    pub fn pop_track(&mut self) -> Option<RoutedTrackPacket> {
+    pub fn pop_track(&mut self) -> Option<RoutedPacket> {
         self.track_queue.pop_front()
     }
 
@@ -307,9 +307,10 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         let Some(key) = fanout else {
             return;
         };
-        self.pipeline
-            .track_queue
-            .push_back(RoutedTrackPacket { key, packet });
+        self.pipeline.track_queue.push_back(RoutedPacket {
+            key: PacketRouteKey::Track(key),
+            packet,
+        });
     }
 
     #[inline]

@@ -375,8 +375,12 @@ impl ShardCore {
             (
                 action @ (crate::route::RouteAction::Video { .. }
                 | crate::route::RouteAction::Audio { .. }),
-                MediaPayload::Track(packet),
+                packet,
             ) => {
+                let crate::participant::PacketRouteKey::Track(packet_key) = packet.key else {
+                    debug_assert!(false, "an RTP route must carry a track key");
+                    return;
+                };
                 let key = match action {
                     crate::route::RouteAction::Video { local_track } => local_track.raw(),
                     crate::route::RouteAction::Audio { track } => track.raw(),
@@ -385,6 +389,10 @@ impl ShardCore {
                         return;
                     }
                 };
+                debug_assert_eq!(
+                    packet_key, key,
+                    "a routed track key must match its endpoint"
+                );
                 let Some(mut pkt) = packet.into_rtp() else {
                     return;
                 };
@@ -404,7 +412,17 @@ impl ShardCore {
                 self.runtime
                     .route_rtp_with_plan(key, Origin::Remote, pkt, plan, &mut ctx);
             }
-            (crate::route::RouteAction::Unreliable { stream }, MediaPayload::Data(bytes)) => {
+            (crate::route::RouteAction::Unreliable { stream }, packet) => {
+                let crate::participant::PacketRouteKey::Unreliable(packet_stream) = packet.key
+                else {
+                    debug_assert!(false, "an unreliable route must carry an unreliable key");
+                    return;
+                };
+                debug_assert_eq!(packet_stream, stream);
+                let crate::participant::TrackPacket::Data(bytes) = packet.packet else {
+                    debug_assert!(false, "an unreliable route must carry a data packet");
+                    return;
+                };
                 let Some(plan) = plans.get(crate::plan::PlanKey::Unreliable(stream)) else {
                     record_routing_drop("data", "plan", "remote");
                     return;
@@ -418,12 +436,21 @@ impl ShardCore {
                 self.runtime.route_unreliable_with_plan(
                     stream,
                     Origin::Remote,
-                    bytes,
+                    bytes.payload,
                     plan,
                     &mut ctx,
                 );
             }
-            (crate::route::RouteAction::Reliable { stream }, MediaPayload::Data(bytes)) => {
+            (crate::route::RouteAction::Reliable { stream }, packet) => {
+                let crate::participant::PacketRouteKey::Reliable(packet_stream) = packet.key else {
+                    debug_assert!(false, "a reliable route must carry a reliable key");
+                    return;
+                };
+                debug_assert_eq!(packet_stream, stream);
+                let crate::participant::TrackPacket::Data(bytes) = packet.packet else {
+                    debug_assert!(false, "a reliable route must carry a data packet");
+                    return;
+                };
                 let Some(plan) = plans.get(crate::plan::PlanKey::Reliable(stream)) else {
                     record_routing_drop("reliable", "plan", "remote");
                     return;
@@ -437,7 +464,7 @@ impl ShardCore {
                 self.runtime.route_reliable_with_plan(
                     stream,
                     Origin::Remote,
-                    bytes,
+                    bytes.payload,
                     plan,
                     &mut ctx,
                 );
@@ -526,7 +553,11 @@ impl ShardCore {
                 break;
             };
             processed = processed.saturating_add(1);
-            let Some(plan) = plans.get(crate::plan::PlanKey::Track(ev.key)) else {
+            let crate::participant::PacketRouteKey::Track(key) = ev.key else {
+                debug_assert!(false, "the track queue must contain track routes");
+                continue;
+            };
+            let Some(plan) = plans.get(crate::plan::PlanKey::Track(key)) else {
                 record_routing_drop("track", "plan", "local");
                 continue;
             };
@@ -536,7 +567,6 @@ impl ShardCore {
                 wall: &self.wall,
                 router,
             };
-            let key = ev.key;
             let Some(packet) = ev.into_rtp() else {
                 continue;
             };

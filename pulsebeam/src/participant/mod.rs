@@ -11,4 +11,4 @@ mod upstream;
 
 pub use core::*;
 pub use effect::{CompiledTrack, ParticipantEffect};
-pub use packet::{AudioPacket, DataPacket, RoutedTrackPacket, TrackPacket, VideoPacket};
+pub use packet::{AudioPacket, DataPacket, PacketRouteKey, RoutedPacket, TrackPacket, VideoPacket};

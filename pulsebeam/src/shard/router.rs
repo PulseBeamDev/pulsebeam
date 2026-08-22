@@ -6,7 +6,7 @@ use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
 use crate::keys::{AudioTrackKey, ParticipantKey, VideoTrackKey};
 use crate::participant::{
-    AudioPacket, ParticipantInput, RoutedTrackPacket, TrackPacket, VideoPacket,
+    AudioPacket, PacketRouteKey, ParticipantInput, RoutedPacket, TrackPacket, VideoPacket,
 };
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
@@ -342,13 +342,11 @@ impl ShardRuntime {
             plan,
             &mut track.link_seq,
             playout.middle32(),
-            || {
-                MediaPayload::Track(RoutedTrackPacket {
-                    key: fanout.raw(),
-                    packet: TrackPacket::Video(VideoPacket {
-                        packet: packet.to_transit(),
-                    }),
-                })
+            || RoutedPacket {
+                key: PacketRouteKey::Track(fanout.raw()),
+                packet: TrackPacket::Video(VideoPacket {
+                    packet: packet.to_transit(),
+                }),
             },
             ctx.router,
         );
@@ -383,13 +381,11 @@ impl ShardRuntime {
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
-                || {
-                    MediaPayload::Track(RoutedTrackPacket {
-                        key: track.raw(),
-                        packet: TrackPacket::Audio(AudioPacket {
-                            packet: pkt.to_transit(),
-                        }),
-                    })
+                || RoutedPacket {
+                    key: PacketRouteKey::Track(track.raw()),
+                    packet: TrackPacket::Audio(AudioPacket {
+                        packet: pkt.to_transit(),
+                    }),
                 },
                 ctx.router,
             );
@@ -442,7 +438,12 @@ impl ShardRuntime {
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
-                || MediaPayload::Data(packet.clone()),
+                || RoutedPacket {
+                    key: PacketRouteKey::Unreliable(stream),
+                    packet: TrackPacket::Data(crate::participant::DataPacket {
+                        payload: packet.clone(),
+                    }),
+                },
                 ctx.router,
             );
         }
@@ -474,7 +475,12 @@ impl ShardRuntime {
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
-                || MediaPayload::Data(frame.clone()),
+                || RoutedPacket {
+                    key: PacketRouteKey::Reliable(stream),
+                    packet: TrackPacket::Data(crate::participant::DataPacket {
+                        payload: frame.clone(),
+                    }),
+                },
                 ctx.router,
             );
         }

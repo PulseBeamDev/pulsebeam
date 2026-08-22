@@ -22,7 +22,7 @@ use tokio::time::{Instant, Sleep};
 use crate::{
     entity::{ParticipantId, TrackId},
     id::ShardId,
-    participant::{ParticipantConfig, RoutedTrackPacket},
+    participant::{ParticipantConfig, RoutedPacket},
     shard::metrics::ShardMetrics,
     shard::recorder::{ShardRecorder, ShardStatsReport},
     track::Track,
@@ -206,15 +206,7 @@ pub(crate) enum Reverse {
     DataAck(Vec<u8>),
 }
 
-/// Payload carried under an [`Envelope`]. Still typed this pass; byte
-/// serialization arrives with the UDP transport.
-pub(crate) enum MediaPayload {
-    Track(RoutedTrackPacket),
-    /// SCTP bytes for a client data channel. Which lane the client asked for is
-    /// in the destination's route entry, not here — the destination already
-    /// knows it, and it describes the client's channel, not this hop.
-    Data(Vec<u8>),
-}
+pub(crate) type MediaPayload = RoutedPacket;
 
 /// Everything one shard sends another: the data plane.
 ///
@@ -773,13 +765,20 @@ mod reverse_tests {
     #[test]
     fn media_payload_stays_compact() {
         const _: () = assert!(
-            std::mem::size_of::<MediaPayload>() <= std::mem::size_of::<RoutedTrackPacket>() + 16
+            std::mem::size_of::<MediaPayload>() <= std::mem::size_of::<RoutedPacket>() + 16
         );
-        let payload = MediaPayload::Data(b"payload".to_vec());
-        let MediaPayload::Data(bytes) = payload else {
+        let payload = MediaPayload {
+            key: crate::participant::PacketRouteKey::Unreliable(
+                crate::keys::UnreliableStreamKey::default(),
+            ),
+            packet: crate::participant::TrackPacket::Data(crate::participant::DataPacket {
+                payload: b"payload".to_vec(),
+            }),
+        };
+        let crate::participant::TrackPacket::Data(bytes) = payload.packet else {
             unreachable!();
         };
-        assert_eq!(bytes, b"payload");
+        assert_eq!(bytes.payload, b"payload");
     }
 
     /// An encoding is named by index, never by rid: the index is derivable from
