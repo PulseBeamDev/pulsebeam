@@ -25,12 +25,12 @@ use crate::keys::TrackKey;
 #[cfg(debug_assertions)]
 use crate::log::plog_error;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
-use crate::participant::TrackPacket;
 use crate::participant::data::DataState;
 use crate::participant::downstream::SlotConfig;
 use crate::participant::effect::ParticipantEffect;
 use crate::participant::event::ParticipantSink;
 use crate::participant::signaling;
+use crate::participant::{TrackPacket, TrackPacketRef};
 use crate::participant::{
     batcher::{AppendStatus, Batcher, NetworkEgress, OwnedPacketQueue},
     downstream::DownstreamAllocator,
@@ -261,16 +261,8 @@ pub enum ParticipantInput<'a> {
     Timeout(Instant),
     Track {
         key: TrackKey,
-        packet: &'a RtpPacket,
+        packet: TrackPacketRef<'a>,
         cache: Option<&'a TrackStreamCache>,
-    },
-    Data {
-        stream: TrackKey,
-        packet: &'a [u8],
-    },
-    ReliableData {
-        stream: TrackKey,
-        frame: &'a [u8],
     },
     ReliableControl {
         stream: TrackKey,
@@ -521,29 +513,6 @@ impl ParticipantCore {
             ParticipantInput::Track { key, packet, cache } => {
                 self.on_track_packet(key, packet, cache);
             }
-            ParticipantInput::Data { stream, packet } => {
-                let Some(&channel) = self.data.forwarding.get(stream) else {
-                    debug_assert!(false, "a data forwarding plan must have a receiver binding");
-                    return;
-                };
-                self.enqueue_fanout(PendingFanout::Sctp {
-                    channel,
-                    pkt: packet.to_vec(),
-                });
-            }
-            ParticipantInput::ReliableData { stream, frame } => {
-                let Some(&channel) = self.data.reliable_forwarding.get(stream) else {
-                    debug_assert!(
-                        false,
-                        "a reliable forwarding plan must have a receiver binding"
-                    );
-                    return;
-                };
-                self.enqueue_fanout(PendingFanout::ReliableSctp {
-                    channel,
-                    frame: frame.to_vec(),
-                });
-            }
             ParticipantInput::ReliableControl { stream, bytes } => {
                 let Some(topic) = self.data.reliable_stream_topics.get(stream) else {
                     debug_assert!(false, "a reliable control stream must have a topic");
@@ -563,9 +532,37 @@ impl ParticipantCore {
     fn on_track_packet(
         &mut self,
         key: TrackKey,
-        packet: &RtpPacket,
+        packet: TrackPacketRef<'_>,
         cache: Option<&TrackStreamCache>,
     ) {
+        let TrackPacketRef::Rtp(packet) = packet else {
+            let (stream, reliable, bytes) = match packet {
+                TrackPacketRef::Data(bytes) => (key, false, bytes),
+                TrackPacketRef::Reliable(bytes) => (key, true, bytes),
+                TrackPacketRef::Rtp(_) => unreachable!(),
+            };
+            let channel = if reliable {
+                self.data.reliable_forwarding.get(stream).copied()
+            } else {
+                self.data.forwarding.get(stream).copied()
+            };
+            let Some(channel) = channel else {
+                debug_assert!(false, "a data forwarding plan must have a receiver binding");
+                return;
+            };
+            if reliable {
+                self.enqueue_fanout(PendingFanout::ReliableSctp {
+                    channel,
+                    frame: bytes.to_vec(),
+                });
+            } else {
+                self.enqueue_fanout(PendingFanout::Sctp {
+                    channel,
+                    pkt: bytes.to_vec(),
+                });
+            }
+            return;
+        };
         let Some(entry) = self.catalog.get(key) else {
             debug_assert!(false, "a TrackPacket must target an installed track");
             return;

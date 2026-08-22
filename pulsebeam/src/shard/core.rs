@@ -26,7 +26,9 @@ use crate::{
 };
 
 pub(crate) use super::router::ShardTransport;
-use super::worker::{MediaPayload, Reverse, ShardCommand, ShardEvent, ShardFrame};
+use super::worker::{
+    MediaPayload, Reverse, SHARD_PLAN_CHANGE_BUDGET, ShardCommand, ShardEvent, ShardFrame,
+};
 
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
 
@@ -85,11 +87,12 @@ pub(crate) struct ShardCore {
     view: crate::view::ShardView,
     view_rx: mailbox::Receiver<Box<crate::view::ControlBatch>>,
     pending_view_delta: Option<Box<crate::view::ControlBatch>>,
+    pending_view_lifecycle: bool,
+    pending_plan_index: usize,
     pending_participant_effects: VecDeque<(ParticipantKey, crate::participant::ParticipantEffect)>,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
-    plans: crate::plan::FlatPlanPublisher,
-    plan_reader: crate::plan::PlanReader,
+    plans: crate::plan::FlatPlans,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -125,8 +128,6 @@ impl ShardCore {
         let shard_count = u16::try_from(shard_count).unwrap_or(u16::MAX);
         debug_assert!(shard_count > 0, "a node always has at least one shard");
         let runtime = ShardRuntime::new(shard_id);
-        let plans = crate::plan::FlatPlanPublisher::new();
-        let plan_reader = plans.reader();
         let view = crate::view::ShardView {
             shard: shard_id,
             ..Default::default()
@@ -136,11 +137,12 @@ impl ShardCore {
             view,
             view_rx,
             pending_view_delta: None,
+            pending_view_lifecycle: false,
+            pending_plan_index: 0,
             pending_participant_effects: VecDeque::new(),
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             runtime,
-            plans,
-            plan_reader,
+            plans: crate::plan::FlatPlans::default(),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -171,36 +173,58 @@ impl ShardCore {
                     delta.generation > self.view.generation,
                     "view generations arrive strictly newer"
                 );
+                self.pending_view_delta = None;
+                self.pending_view_lifecycle = false;
+                self.pending_plan_index = 0;
                 continue;
             }
-            for op in delta
-                .lifecycle
-                .iter()
-                .filter(|op| matches!(op, crate::view::ViewOp::InsertParticipant))
-            {
-                self.apply_lifecycle_op(op);
+            if !self.pending_view_lifecycle {
+                for op in delta
+                    .lifecycle
+                    .iter()
+                    .filter(|op| matches!(op, crate::view::ViewOp::InsertParticipant))
+                {
+                    self.apply_lifecycle_op(op);
+                }
+                self.apply_pending_participant_effects();
+                for (participant, effect) in &delta.participant_effects {
+                    let Some(meta) = self.registry.resolve_mut(*participant) else {
+                        self.pending_participant_effects
+                            .push_back((*participant, effect.clone()));
+                        continue;
+                    };
+                    meta.apply(effect.clone());
+                }
+                for op in delta.lifecycle.iter().filter(|op| {
+                    !is_retire(op) && !matches!(op, crate::view::ViewOp::InsertParticipant)
+                }) {
+                    self.apply_lifecycle_op(op);
+                }
+                self.pending_view_lifecycle = true;
             }
-            self.apply_pending_participant_effects();
-            for (participant, effect) in &delta.participant_effects {
-                let Some(meta) = self.registry.resolve_mut(*participant) else {
-                    self.pending_participant_effects
-                        .push_back((*participant, effect.clone()));
-                    continue;
-                };
-                meta.apply(effect.clone());
+            let end = self
+                .pending_plan_index
+                .saturating_add(SHARD_PLAN_CHANGE_BUDGET)
+                .min(delta.plans.changes.len());
+            let mut touched = 0;
+            for change in &delta.plans.changes[self.pending_plan_index..end] {
+                self.plans.apply_change(change, &mut touched);
             }
-            for op in delta.lifecycle.iter().filter(|op| {
-                !is_retire(op) && !matches!(op, crate::view::ViewOp::InsertParticipant)
-            }) {
-                self.apply_lifecycle_op(op);
+            self.pending_plan_index = end;
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::record_routing_work("plan_entries_touched", touched);
+            if self.pending_plan_index < delta.plans.changes.len() {
+                self.pending_view_delta = Some(delta);
+                break;
             }
-            self.plans.append(delta.plans);
-            self.plans.publish();
             for op in delta.lifecycle.iter().filter(|op| is_retire(op)) {
                 self.apply_lifecycle_op(op);
             }
             self.view.generation = delta.generation;
             self.apply_pending_participant_effects();
+            self.pending_view_delta = None;
+            self.pending_view_lifecycle = false;
+            self.pending_plan_index = 0;
             applied = applied.saturating_add(1);
         }
         applied
@@ -308,7 +332,6 @@ impl ShardCore {
         env: Envelope,
         payload: MediaPayload,
         now: Instant,
-        plans: &crate::plan::FlatPlans,
         router: &impl ShardTransport,
     ) {
         debug_assert_eq!(env.ty, crate::route::EnvelopeType::Media);
@@ -331,96 +354,28 @@ impl ShardCore {
             return;
         };
 
-        match (action, payload) {
-            (
-                crate::route::RouteAction::Forward {
-                    target: crate::route::RouteTarget::Track(key),
-                },
-                packet,
-            ) => {
-                debug_assert_eq!(
-                    packet.key, key,
-                    "a routed track key must match its endpoint"
-                );
-                let Some(mut pkt) = packet.into_rtp() else {
-                    return;
-                };
-                let Some(plan) = plans.get(crate::plan::PlanKey::Track(key)) else {
-                    record_routing_drop("track", "plan", "remote");
-                    return;
-                };
-                pkt.playout_time = self.wall.to_instant(playout);
-                pkt.arrival_ts = now;
-                pkt.rehome_extensions();
-                let mut ctx = crate::shard::router::ForwardingContext {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    wall: &self.wall,
-                    router,
-                };
-                self.runtime
-                    .route_rtp_with_plan(key, Origin::Remote, pkt, plan, &mut ctx);
-            }
-            (
-                crate::route::RouteAction::Forward {
-                    target: crate::route::RouteTarget::Unreliable(stream),
-                },
-                packet,
-            ) => {
-                debug_assert_eq!(packet.key, stream);
-                let crate::participant::TrackPacket::Data(bytes) = packet.packet else {
-                    debug_assert!(false, "an unreliable route must carry a data packet");
-                    return;
-                };
-                let Some(plan) = plans.get(crate::plan::PlanKey::Unreliable(stream)) else {
-                    record_routing_drop("data", "plan", "remote");
-                    return;
-                };
-                let mut ctx = crate::shard::router::ForwardingContext {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    wall: &self.wall,
-                    router,
-                };
-                self.runtime.route_unreliable_with_plan(
-                    stream,
-                    Origin::Remote,
-                    bytes,
-                    plan,
-                    &mut ctx,
-                );
-            }
-            (
-                crate::route::RouteAction::Forward {
-                    target: crate::route::RouteTarget::Reliable(stream),
-                },
-                packet,
-            ) => {
-                debug_assert_eq!(packet.key, stream);
-                let crate::participant::TrackPacket::Data(bytes) = packet.packet else {
-                    debug_assert!(false, "a reliable route must carry a data packet");
-                    return;
-                };
-                let Some(plan) = plans.get(crate::plan::PlanKey::Reliable(stream)) else {
-                    record_routing_drop("reliable", "plan", "remote");
-                    return;
-                };
-                let mut ctx = crate::shard::router::ForwardingContext {
-                    registry: &mut self.registry,
-                    dirty: &mut self.dirty,
-                    wall: &self.wall,
-                    router,
-                };
-                self.runtime.route_reliable_with_plan(
-                    stream,
-                    Origin::Remote,
-                    bytes,
-                    plan,
-                    &mut ctx,
-                );
-            }
-            _ => debug_assert!(false, "route action and payload type differ"),
-        }
+        let crate::route::RouteAction::Forward { target: key } = action else {
+            debug_assert!(false, "a media envelope must resolve to a forward route");
+            return;
+        };
+        debug_assert_eq!(
+            payload.key, key,
+            "a routed packet key must match its endpoint"
+        );
+        let Some(plan) = self.plans.get(key) else {
+            record_routing_drop("packet", "plan", "remote");
+            return;
+        };
+        let mut payload = payload;
+        payload.set_remote_timing(self.wall.to_instant(playout), now);
+        let mut ctx = crate::shard::router::ForwardingContext {
+            registry: &mut self.registry,
+            dirty: &mut self.dirty,
+            wall: &self.wall,
+            router,
+        };
+        self.runtime
+            .route_packet_with_plan(key, Origin::Remote, payload, plan, &mut ctx);
     }
 
     #[cfg(test)]
@@ -493,10 +448,7 @@ impl ShardCore {
         budget: usize,
     ) -> usize {
         debug_assert!(budget > 0);
-        let plan_reader = self.plan_reader.clone();
-        let Some(plans) = plan_reader.enter() else {
-            return 0;
-        };
+        let plans = &self.plans;
         let mut processed = 0;
         while processed < budget {
             let Some(ev) = self.pipeline.pop_track() else {
@@ -504,7 +456,7 @@ impl ShardCore {
             };
             processed = processed.saturating_add(1);
             let key = ev.key;
-            let Some(plan) = plans.get(crate::plan::PlanKey::Track(key)) else {
+            let Some(plan) = plans.get(key) else {
                 record_routing_drop("track", "plan", "local");
                 continue;
             };
@@ -521,16 +473,13 @@ impl ShardCore {
                 .route_rtp_with_plan(key, Origin::Local, packet, plan, &mut ctx);
         }
         while processed < budget {
-            let Some(ev) = self.pipeline.pop_data_sctp() else {
+            let Some(ev) = self.pipeline.pop_packet() else {
                 break;
             };
             processed = processed.saturating_add(1);
-            let Some(stream) = ev.stream else {
-                record_routing_drop("data", "runtime", "local");
-                continue;
-            };
-            let Some(plan) = plans.get(crate::plan::PlanKey::Unreliable(stream)) else {
-                record_routing_drop("data", "plan", "local");
+            let key = ev.key;
+            let Some(plan) = plans.get(key) else {
+                record_routing_drop("packet", "plan", "local");
                 continue;
             };
             let mut ctx = crate::shard::router::ForwardingContext {
@@ -540,29 +489,7 @@ impl ShardCore {
                 router,
             };
             self.runtime
-                .route_unreliable_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
-        }
-        while processed < budget {
-            let Some(ev) = self.pipeline.pop_reliable_data_sctp() else {
-                break;
-            };
-            processed = processed.saturating_add(1);
-            let Some(stream) = ev.stream else {
-                record_routing_drop("reliable", "runtime", "local");
-                continue;
-            };
-            let Some(plan) = plans.get(crate::plan::PlanKey::Reliable(stream)) else {
-                record_routing_drop("reliable", "plan", "local");
-                continue;
-            };
-            let mut ctx = crate::shard::router::ForwardingContext {
-                registry: &mut self.registry,
-                dirty: &mut self.dirty,
-                wall: &self.wall,
-                router,
-            };
-            self.runtime
-                .route_reliable_with_plan(stream, Origin::Local, ev.pkt, plan, &mut ctx);
+                .route_packet_with_plan(key, Origin::Local, ev, plan, &mut ctx);
         }
         processed
     }
@@ -653,11 +580,7 @@ impl ShardCore {
                             debug_assert!(false, "reliable control has no compiled stream key");
                             continue;
                         };
-                        let plan_reader = self.plan_reader.clone();
-                        let Some(plans) = plan_reader.enter() else {
-                            continue;
-                        };
-                        let Some(plan) = plans.get(crate::plan::PlanKey::Reliable(stream)) else {
+                        let Some(plan) = self.plans.get(stream) else {
                             debug_assert!(false, "reliable control has no compiled plan");
                             continue;
                         };
@@ -687,12 +610,7 @@ impl ShardCore {
             record_routing_drop("keyframe", "runtime", "local");
             return;
         };
-        let plan_reader = self.plan_reader.clone();
-        let Some(plans) = plan_reader.enter() else {
-            record_routing_drop("keyframe", "plan", "local");
-            return;
-        };
-        let Some(plan) = plans.get(crate::plan::PlanKey::Track(fanout)) else {
+        let Some(plan) = self.plans.get(fanout) else {
             record_routing_drop("keyframe", "plan", "local");
             return;
         };
@@ -772,22 +690,12 @@ impl ShardCore {
         now: Instant,
         router: &impl ShardTransport,
     ) {
-        let reader = self.plan_reader.clone();
-        let Some(plans) = reader.enter() else {
-            return;
-        };
         for frame in frames {
-            self.on_shard_frame_with_plans(frame, now, plans.as_ref(), router);
+            self.on_shard_frame(frame, now, router);
         }
     }
 
-    fn on_shard_frame_with_plans(
-        &mut self,
-        frame: ShardFrame,
-        now: Instant,
-        plans: &crate::plan::FlatPlans,
-        router: &impl ShardTransport,
-    ) {
+    fn on_shard_frame(&mut self, frame: ShardFrame, now: Instant, router: &impl ShardTransport) {
         match frame {
             ShardFrame::Ingress {
                 batch,
@@ -812,7 +720,7 @@ impl ShardCore {
                 self.on_owned_udp_batch(batch, handle, source_shard);
             }
             ShardFrame::Media { env, payload } => {
-                self.on_media_frame(env, payload, now, plans, router);
+                self.on_media_frame(env, payload, now, router);
             }
             ShardFrame::Reverse { env, body } => self.on_reverse_frame(env, body),
         }
@@ -827,7 +735,7 @@ impl ShardCore {
             return;
         };
         match (target, body) {
-            (crate::route::ReverseTarget::Track(track), Reverse::Keyframe { layer, kind }) => {
+            (track, Reverse::Keyframe { layer, kind }) => {
                 let Some((track_id, encodings)) = self.runtime.track_descriptor(track) else {
                     record_routing_drop("reverse", "runtime", "remote");
                     return;
@@ -844,7 +752,7 @@ impl ShardCore {
                     self.dirty.mark(origin, meta);
                 }
             }
-            (crate::route::ReverseTarget::Reliable(stream), Reverse::DataAck(bytes)) => {
+            (stream, Reverse::DataAck(bytes)) => {
                 if let Some(meta) = self.registry.resolve_mut(origin) {
                     meta.input(crate::participant::ParticipantInput::ReliableControl {
                         stream,
@@ -1083,15 +991,13 @@ mod wrong_owner_tests {
             crate::view::ViewOp::InstallRoute {
                 binding: crate::view::RouteBinding {
                     handle: route,
-                    action: crate::route::RouteAction::Forward {
-                        target: crate::route::RouteTarget::Track(track),
-                    },
+                    action: crate::route::RouteAction::Forward { target: track },
                 },
             },
         );
         let mut plans = crate::plan::PlanBatch::default();
         plans.push(crate::plan::PlanChange {
-            key: crate::plan::PlanKey::Track(track),
+            key: track,
             create: true,
             remove: false,
             local: crate::plan::MembershipDelta::default(),
@@ -1103,8 +1009,7 @@ mod wrong_owner_tests {
 
         assert_eq!(core.apply_view_deltas(1), 1);
         assert!(core.view.routes.resolve(route).is_some());
-        let plan_reader = core.plan_reader.clone();
-        let plans = plan_reader.enter().expect("the plan reader is alive");
-        assert!(plans.get(crate::plan::PlanKey::Track(track)).is_some());
+        let plans = &core.plans;
+        assert!(plans.get(track).is_some());
     }
 }

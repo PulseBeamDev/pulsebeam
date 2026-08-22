@@ -381,7 +381,7 @@ fn from_wire_route(route: pulsebeam_routing::RouteId) -> RouteId {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RouteAction {
     Forward {
-        target: RouteTarget,
+        target: crate::keys::TrackKey,
     },
     /// The reverse path for one published stream, resolving at the shard that
     /// owns the publisher.
@@ -393,26 +393,11 @@ pub(crate) enum RouteAction {
     /// per-sender route would protect — and with a 32-bit id space, paying
     /// `streams x shards` here would make it the largest consumer in the table.
     ///
-    /// No `origin` field: `ReverseTarget::Track` and `::Topic` both resolve to
+    /// No `origin` field: the track key resolves to
     /// an arena entry that already knows its own publisher.
     Reverse {
-        target: ReverseTarget,
+        target: crate::keys::TrackKey,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RouteTarget {
-    Track(crate::keys::TrackKey),
-    Unreliable(crate::keys::TrackKey),
-    Reliable(crate::keys::TrackKey),
-}
-
-/// What a reverse route points at, holding everything the destination needs to
-/// act on a frame that names nothing but the route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReverseTarget {
-    Track(crate::keys::TrackKey),
-    Reliable(crate::keys::TrackKey),
 }
 
 /// The shard-owned half of a route: the accounting a packet mutates as it

@@ -11,4 +11,4 @@ mod upstream;
 
 pub use core::*;
 pub use effect::ParticipantEffect;
-pub use packet::{RoutedTrackPacket, TrackFeedback, TrackPacket};
+pub use packet::{RoutedTrackPacket, TrackPacket, TrackPacketRef};

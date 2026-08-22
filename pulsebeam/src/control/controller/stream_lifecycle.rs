@@ -15,7 +15,6 @@ pub(super) fn insert_stream_runtime_op(
             crate::view::ViewOp::InsertTrackRuntime {
                 key,
                 runtime: crate::view::TrackRuntime::Data {
-                    lane: crate::track::DataLane::Realtime,
                     publisher,
                     publisher_effect: publisher.map(|_| {
                         crate::participant::ParticipantEffect::TrackPublished {
@@ -31,7 +30,6 @@ pub(super) fn insert_stream_runtime_op(
             crate::view::ViewOp::InsertTrackRuntime {
                 key,
                 runtime: crate::view::TrackRuntime::Data {
-                    lane: crate::track::DataLane::Reliable,
                     publisher,
                     publisher_effect: publisher.map(|_| {
                         crate::participant::ParticipantEffect::TrackPublished {
@@ -51,12 +49,10 @@ pub(super) fn install_stream_route_op(
     route: RouteHandle,
 ) -> crate::view::ViewOp {
     let action = match key {
-        crate::control::state::RuntimeStreamKey::Unreliable(stream) => RouteAction::Forward {
-            target: crate::route::RouteTarget::Unreliable(stream),
-        },
-        crate::control::state::RuntimeStreamKey::Reliable(stream) => RouteAction::Forward {
-            target: crate::route::RouteTarget::Reliable(stream),
-        },
+        crate::control::state::RuntimeStreamKey::Unreliable(stream)
+        | crate::control::state::RuntimeStreamKey::Reliable(stream) => {
+            RouteAction::Forward { target: stream }
+        }
     };
     crate::view::ViewOp::InstallRoute {
         binding: crate::view::RouteBinding {
@@ -175,12 +171,7 @@ impl ControllerActor {
                 return false;
             };
             let Some(route) = self
-                .grant_route(
-                    shard_id,
-                    RouteAction::Reverse {
-                        target: ReverseTarget::Reliable(stream),
-                    },
-                )
+                .grant_route(shard_id, RouteAction::Reverse { target: stream })
                 .await
             else {
                 self.catalog.remove(&publication_id);

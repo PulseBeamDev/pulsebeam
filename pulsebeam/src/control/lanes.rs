@@ -60,14 +60,10 @@ impl LaneRegistry {
     pub(crate) fn route_action(&self, key: RuntimeStreamKey) -> Option<RouteAction> {
         match (self.lane, key) {
             (StreamLane::Unreliable, RuntimeStreamKey::Unreliable(stream)) => {
-                Some(RouteAction::Forward {
-                    target: crate::route::RouteTarget::Unreliable(stream),
-                })
+                Some(RouteAction::Forward { target: stream })
             }
             (StreamLane::Reliable, RuntimeStreamKey::Reliable(stream)) => {
-                Some(RouteAction::Forward {
-                    target: crate::route::RouteTarget::Reliable(stream),
-                })
+                Some(RouteAction::Forward { target: stream })
             }
             _ => None,
         }

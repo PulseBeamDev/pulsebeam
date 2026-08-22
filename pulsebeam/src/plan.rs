@@ -1,11 +1,5 @@
-#![allow(
-    clippy::disallowed_types,
-    reason = "left-right is the isolated publication primitive for one shard's plan"
-)]
-
 use std::collections::HashMap;
 
-use left_right::Absorb;
 use slotmap::SecondaryMap;
 
 use crate::{
@@ -36,7 +30,7 @@ pub(crate) enum ReverseRouteChange {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PlanChange {
-    pub key: PlanKey,
+    pub key: TrackKey,
     pub create: bool,
     pub remove: bool,
     pub local: MembershipDelta<ParticipantKey>,
@@ -56,7 +50,7 @@ impl PlanChange {
     }
 
     pub(crate) fn between(
-        key: PlanKey,
+        key: TrackKey,
         old: Option<&ControlPlan>,
         new: Option<&ControlPlan>,
     ) -> Self {
@@ -296,13 +290,6 @@ impl ControlPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PlanKey {
-    Track(TrackKey),
-    Unreliable(TrackKey),
-    Reliable(TrackKey),
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FlatTrackPlan {
     pub local: DenseMembership<ParticipantKey>,
@@ -313,50 +300,24 @@ pub(crate) struct FlatTrackPlan {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FlatPlans {
     tracks: SecondaryMap<TrackKey, FlatTrackPlan>,
-    unreliable: SecondaryMap<TrackKey, FlatTrackPlan>,
-    reliable: SecondaryMap<TrackKey, FlatTrackPlan>,
 }
 
 impl FlatPlans {
-    pub(crate) fn get(&self, key: PlanKey) -> Option<&FlatTrackPlan> {
-        match key {
-            PlanKey::Track(key) => self.tracks.get(key),
-            PlanKey::Unreliable(key) => self.unreliable.get(key),
-            PlanKey::Reliable(key) => self.reliable.get(key),
-        }
+    pub(crate) fn get(&self, key: TrackKey) -> Option<&FlatTrackPlan> {
+        self.tracks.get(key)
     }
 
-    fn get_mut(&mut self, key: PlanKey) -> Option<&mut FlatTrackPlan> {
-        match key {
-            PlanKey::Track(key) => self.tracks.get_mut(key),
-            PlanKey::Unreliable(key) => self.unreliable.get_mut(key),
-            PlanKey::Reliable(key) => self.reliable.get_mut(key),
-        }
+    fn get_mut(&mut self, key: TrackKey) -> Option<&mut FlatTrackPlan> {
+        self.tracks.get_mut(key)
     }
 
-    fn insert(&mut self, key: PlanKey, plan: FlatTrackPlan) {
-        match key {
-            PlanKey::Track(key) => {
-                let previous = self.tracks.insert(key, plan);
-                debug_assert!(previous.is_none());
-            }
-            PlanKey::Unreliable(key) => {
-                let previous = self.unreliable.insert(key, plan);
-                debug_assert!(previous.is_none());
-            }
-            PlanKey::Reliable(key) => {
-                let previous = self.reliable.insert(key, plan);
-                debug_assert!(previous.is_none());
-            }
-        }
+    fn insert(&mut self, key: TrackKey, plan: FlatTrackPlan) {
+        let previous = self.tracks.insert(key, plan);
+        debug_assert!(previous.is_none());
     }
 
-    fn remove(&mut self, key: PlanKey) {
-        match key {
-            PlanKey::Track(key) => debug_assert!(self.tracks.remove(key).is_some()),
-            PlanKey::Unreliable(key) => debug_assert!(self.unreliable.remove(key).is_some()),
-            PlanKey::Reliable(key) => debug_assert!(self.reliable.remove(key).is_some()),
-        }
+    fn remove(&mut self, key: TrackKey) {
+        debug_assert!(self.tracks.remove(key).is_some());
     }
 
     fn apply(&mut self, change: &PlanChange, touched: &mut usize) {
@@ -398,63 +359,15 @@ impl FlatPlans {
         }
     }
 
+    pub(crate) fn apply_change(&mut self, change: &PlanChange, touched: &mut usize) {
+        self.apply(change, touched);
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_batch(&mut self, batch: &PlanBatch, touched: &mut usize) {
         for change in &batch.changes {
             self.apply(change, touched);
         }
-    }
-}
-
-impl Absorb<PlanBatch> for FlatPlans {
-    fn absorb_first(&mut self, operation: &mut PlanBatch, _: &Self) {
-        let mut touched = 0;
-        self.apply_batch(operation, &mut touched);
-        #[cfg(feature = "sim")]
-        crate::sim_metrics::record_routing_work("plan_entries_touched", touched);
-    }
-
-    fn absorb_second(&mut self, operation: PlanBatch, _: &Self) {
-        let mut touched = 0;
-        self.apply_batch(&operation, &mut touched);
-        #[cfg(feature = "sim")]
-        crate::sim_metrics::record_routing_work("plan_entries_touched", touched);
-    }
-
-    fn sync_with(&mut self, first: &Self) {
-        *self = first.clone();
-    }
-}
-
-pub(crate) struct FlatPlanPublisher {
-    writer: left_right::WriteHandle<FlatPlans, PlanBatch>,
-    reader: PlanReader,
-}
-
-pub(crate) type PlanReader = left_right::ReadHandle<FlatPlans>;
-
-impl FlatPlanPublisher {
-    pub(crate) fn new() -> Self {
-        let (writer, reader) = left_right::new_from_empty(FlatPlans::default());
-        Self { writer, reader }
-    }
-
-    pub(crate) fn append(&mut self, batch: PlanBatch) {
-        if !batch.is_empty() {
-            self.writer.append(batch);
-        }
-    }
-
-    pub(crate) fn publish(&mut self) {
-        self.writer.publish();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read(&self) -> Option<left_right::ReadGuard<'_, FlatPlans>> {
-        self.reader.enter()
-    }
-
-    pub(crate) fn reader(&self) -> PlanReader {
-        self.reader.clone()
     }
 }
 
@@ -486,8 +399,8 @@ mod tests {
         let [first, second, third] = participant_keys(3).try_into().unwrap();
         let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
         let track = keys.insert(());
-        let key = PlanKey::Track(track);
-        let mut publisher = FlatPlanPublisher::new();
+        let key = track;
+        let mut plans = FlatPlans::default();
         let mut initial = PlanBatch::default();
         initial.push(PlanChange {
             key,
@@ -500,8 +413,8 @@ mod tests {
             remote: MembershipDelta::default(),
             reverse: ReverseRouteChange::Unchanged,
         });
-        publisher.append(initial);
-        publisher.publish();
+        let mut touched = 0;
+        plans.apply_batch(&initial, &mut touched);
         let mut update = PlanBatch::default();
         update.push(PlanChange {
             key,
@@ -514,9 +427,7 @@ mod tests {
             remote: MembershipDelta::default(),
             reverse: ReverseRouteChange::Unchanged,
         });
-        publisher.append(update);
-        publisher.publish();
-        let plans = publisher.read().unwrap();
+        plans.apply_batch(&update, &mut touched);
         let plan = plans.get(key).unwrap();
         assert_eq!(plan.local.len(), 2);
         assert!(!plan.local.values().contains(&second));
@@ -527,7 +438,7 @@ mod tests {
         let keys = participant_keys(1024);
         let mut slots = slotmap::SlotMap::<TrackKey, ()>::with_key();
         let track = slots.insert(());
-        let key = PlanKey::Track(track);
+        let key = track;
         let mut plans = FlatPlans::default();
         let mut initial = PlanBatch::default();
         initial.push(PlanChange {
@@ -568,7 +479,7 @@ mod tests {
         let [first, second, third] = participant_keys(3).try_into().unwrap();
         let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
         let track = keys.insert(());
-        let key = PlanKey::Track(track);
+        let key = track;
         let old = FlatTrackPlan {
             local: DenseMembership::from_values([first, second, third]),
             remote: DenseMembership::default(),
@@ -619,7 +530,7 @@ mod tests {
             },
         );
         let change = PlanChange::between(
-            PlanKey::Track(slotmap::SlotMap::<TrackKey, ()>::with_key().insert(())),
+            slotmap::SlotMap::<TrackKey, ()>::with_key().insert(()),
             Some(&reordered),
             Some(&next),
         );

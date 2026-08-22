@@ -5,7 +5,7 @@ use crate::clock::WallAnchor;
 use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::ParticipantKey;
-use crate::participant::{ParticipantInput, RoutedTrackPacket, TrackPacket};
+use crate::participant::{ParticipantInput, RoutedTrackPacket, TrackPacket, TrackPacketRef};
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 
@@ -38,20 +38,10 @@ pub(crate) struct ForwardingContext<'a, R> {
 }
 
 struct TrackRuntime {
-    id: TrackId,
+    id: Option<TrackId>,
     origin_key: ParticipantKey,
     encodings: Vec<Option<Rid>>,
     cache: Option<TrackStreamCache>,
-    link_seq: u32,
-}
-
-struct UnreliableRuntime {
-    publisher: Option<ParticipantKey>,
-    link_seq: u32,
-}
-
-/// The same stream, plus what the feedback path needs to address its publisher.
-pub(crate) struct ReliableRuntime {
     publisher: Option<ParticipantKey>,
     link_seq: u32,
 }
@@ -83,7 +73,7 @@ fn forward_track(
     ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     subscriber: ParticipantKey,
     fanout: TrackKey,
-    pkt: &RtpPacket,
+    pkt: TrackPacketRef<'_>,
     cache: Option<&TrackStreamCache>,
 ) {
     let Some(participant) = ctx.registry.resolve_mut(subscriber) else {
@@ -98,43 +88,8 @@ fn forward_track(
     ctx.dirty.mark(subscriber, participant);
 }
 
-fn forward_unreliable(
-    registry: &mut super::participants::ParticipantRegistry,
-    dirty: &mut super::dirty::DirtyTracker,
-    subscriber: ParticipantKey,
-    stream: TrackKey,
-    pkt: &[u8],
-) {
-    let Some(participant) = registry.resolve_mut(subscriber) else {
-        debug_assert!(false, "a data plan must name a live participant");
-        return;
-    };
-    participant.input(ParticipantInput::Data {
-        stream,
-        packet: pkt,
-    });
-    dirty.mark(subscriber, participant);
-}
-
-fn forward_reliable(
-    registry: &mut super::participants::ParticipantRegistry,
-    dirty: &mut super::dirty::DirtyTracker,
-    subscriber: ParticipantKey,
-    stream: TrackKey,
-    frame: &[u8],
-) {
-    let Some(participant) = registry.resolve_mut(subscriber) else {
-        debug_assert!(false, "a reliable data plan must name a live participant");
-        return;
-    };
-    participant.input(ParticipantInput::ReliableData { stream, frame });
-    dirty.mark(subscriber, participant);
-}
-
 pub(crate) struct ShardRuntime {
     tracks: SecondaryMap<TrackKey, TrackRuntime>,
-    unreliable: SecondaryMap<TrackKey, UnreliableRuntime>,
-    reliable: SecondaryMap<TrackKey, ReliableRuntime>,
     pub(crate) routes: RouteRuntime,
 }
 
@@ -142,17 +97,12 @@ impl ShardRuntime {
     pub fn new(shard_id: ShardId) -> Self {
         Self {
             tracks: SecondaryMap::new(),
-            unreliable: SecondaryMap::new(),
-            reliable: SecondaryMap::new(),
             routes: RouteRuntime::new(shard_id),
         }
     }
 
     pub(crate) fn retire_track(&mut self, key: TrackKey) {
-        let media = self.tracks.remove(key).is_some();
-        let realtime = self.unreliable.remove(key).is_some();
-        let reliable = self.reliable.remove(key).is_some();
-        debug_assert_eq!(media as u8 + realtime as u8 + reliable as u8, 1);
+        debug_assert!(self.tracks.remove(key).is_some());
     }
 
     pub(crate) fn apply_view_op(&mut self, op: &crate::view::ViewOp) {
@@ -162,82 +112,41 @@ impl ShardRuntime {
                 debug_assert!(retired || self.routes.entry(*handle).is_none());
             }
             crate::view::ViewOp::InsertTrackRuntime { key, runtime } => {
-                let crate::view::TrackRuntime::Media(descriptor) = runtime else {
-                    let crate::view::TrackRuntime::Data {
-                        lane, publisher, ..
-                    } = runtime
-                    else {
-                        unreachable!()
-                    };
-                    match lane {
-                        crate::track::DataLane::Realtime => {
-                            let previous = self.unreliable.insert(
-                                *key,
-                                UnreliableRuntime {
-                                    publisher: *publisher,
-                                    link_seq: 0,
-                                },
-                            );
-                            debug_assert!(
-                                previous.is_none()
-                                    || previous
-                                        .as_ref()
-                                        .is_some_and(|old| old.publisher == *publisher)
-                            );
-                            if let Some(previous) = previous
-                                && let Some(current) = self.unreliable.get_mut(*key)
-                            {
-                                current.link_seq = previous.link_seq;
-                            }
-                        }
-                        crate::track::DataLane::Reliable => {
-                            let previous = self.reliable.insert(
-                                *key,
-                                ReliableRuntime {
-                                    publisher: *publisher,
-                                    link_seq: 0,
-                                },
-                            );
-                            debug_assert!(
-                                previous.is_none()
-                                    || previous
-                                        .as_ref()
-                                        .is_some_and(|old| old.publisher == *publisher)
-                            );
-                            if let Some(previous) = previous
-                                && let Some(current) = self.reliable.get_mut(*key)
-                            {
-                                current.link_seq = previous.link_seq;
-                            }
-                        }
+                let (id, origin_key, encodings, publisher) = match runtime {
+                    crate::view::TrackRuntime::Media(descriptor) => (
+                        Some(descriptor.id),
+                        descriptor.origin_key,
+                        descriptor.encodings.clone(),
+                        None,
+                    ),
+                    crate::view::TrackRuntime::Data { publisher, .. } => {
+                        (None, publisher.unwrap_or_default(), Vec::new(), *publisher)
                     }
-                    return;
                 };
-                if matches!(descriptor.id.kind(), crate::entity::TrackKind::Data) {
-                    debug_assert!(false, "a track runtime key must match its publication kind");
-                    return;
-                }
                 let key = *key;
                 if let Some(previous) = self.tracks.get(key) {
                     debug_assert_eq!(
-                        previous.id, descriptor.id,
+                        previous.id, id,
                         "a runtime key cannot change its logical track"
                     );
                     debug_assert_eq!(
-                        previous.origin_key, descriptor.origin_key,
+                        previous.origin_key, origin_key,
                         "a runtime key cannot change its publisher binding"
                     );
-                    if previous.id != descriptor.id {
+                    if previous.id != id {
                         return;
                     }
                 }
                 let previous = self.tracks.insert(
                     key,
                     TrackRuntime {
-                        id: descriptor.id,
-                        origin_key: descriptor.origin_key,
-                        encodings: descriptor.encodings.clone(),
-                        cache: None,
+                        id,
+                        origin_key,
+                        encodings,
+                        cache: id
+                            .is_some_and(|id| id.kind() == crate::entity::TrackKind::Video)
+                            .then(TrackStreamCache::new),
+                        publisher,
                         link_seq: 0,
                     },
                 );
@@ -263,90 +172,10 @@ impl ShardRuntime {
     pub(crate) fn track_descriptor(&self, key: TrackKey) -> Option<(TrackId, &[Option<Rid>])> {
         self.tracks
             .get(key)
-            .map(|track| (track.id, track.encodings.as_slice()))
+            .and_then(|track| track.id.map(|id| (id, track.encodings.as_slice())))
     }
 
     #[inline]
-    pub fn route_video_with_plan(
-        &mut self,
-        fanout: TrackKey,
-        pkt: RtpPacket,
-        plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
-    ) {
-        let Some(track) = self.tracks.get_mut(fanout) else {
-            debug_assert!(false, "compiled video key must resolve to runtime state");
-            return;
-        };
-        if track.id.kind() != crate::entity::TrackKind::Video {
-            debug_assert!(false, "a video key must resolve to a video publication");
-            return;
-        }
-        let rid = pkt.ext_vals.rid;
-        let seq = pkt.seq_no;
-        let cache = track.cache.get_or_insert_with(TrackStreamCache::new);
-        let too_old = cache.push(pkt);
-        let Some(packet) = too_old
-            .as_ref()
-            .or_else(|| cache.encoding(rid).and_then(|stream| stream.get(seq)))
-        else {
-            debug_assert!(false, "a cached packet must be readable");
-            return;
-        };
-        fanout_local(plan, |subscriber| {
-            forward_track(ctx, subscriber, fanout, packet, Some(cache));
-        });
-        let playout = ctx.wall.to_ntp(packet.playout_time);
-        fanout_remote(
-            plan,
-            &mut track.link_seq,
-            playout.middle32(),
-            || RoutedTrackPacket {
-                key: fanout,
-                packet: TrackPacket::Rtp(packet.to_transit()),
-            },
-            ctx.router,
-        );
-    }
-
-    fn route_audio_with_plan(
-        &mut self,
-        track: TrackKey,
-        origin: Origin,
-        pkt: RtpPacket,
-        plan: &crate::plan::FlatTrackPlan,
-        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
-    ) {
-        let Some(runtime) = self.tracks.get(track) else {
-            debug_assert!(false, "compiled audio key must resolve to runtime state");
-            return;
-        };
-        if runtime.id.kind() != crate::entity::TrackKind::Audio {
-            debug_assert!(false, "an audio key must resolve to an audio publication");
-            return;
-        }
-        fanout_local(plan, |subscriber| {
-            forward_track(ctx, subscriber, track, &pkt, None);
-        });
-        if origin.is_local() {
-            let playout = ctx.wall.to_ntp(pkt.playout_time);
-            let Some(runtime) = self.tracks.get_mut(track) else {
-                debug_assert!(false, "audio key must resolve to runtime state");
-                return;
-            };
-            fanout_remote(
-                plan,
-                &mut runtime.link_seq,
-                playout.middle32(),
-                || RoutedTrackPacket {
-                    key: track,
-                    packet: TrackPacket::Rtp(pkt.to_transit()),
-                },
-                ctx.router,
-            );
-        }
-    }
-
     pub fn route_rtp_with_plan(
         &mut self,
         key: TrackKey,
@@ -355,19 +184,60 @@ impl ShardRuntime {
         plan: &crate::plan::FlatTrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
-        let Some(kind) = self.tracks.get(key).map(|runtime| runtime.id.kind()) else {
+        let Some(runtime) = self.tracks.get_mut(key) else {
             debug_assert!(false, "an RTP packet must resolve to a live track");
             return;
         };
-        match kind {
-            crate::entity::TrackKind::Video => {
-                self.route_video_with_plan(key, pkt, plan, ctx);
+        let rid = pkt.ext_vals.rid;
+        let seq = pkt.seq_no;
+        let too_old;
+        let (packet, cache) = if let Some(track_cache) = runtime.cache.as_mut() {
+            too_old = track_cache.push(pkt);
+            let Some(packet) = too_old
+                .as_ref()
+                .or_else(|| track_cache.encoding(rid).and_then(|stream| stream.get(seq)))
+            else {
+                debug_assert!(false, "a cached packet must be readable");
+                return;
+            };
+            (packet, Some(&*track_cache))
+        } else {
+            (&pkt, None)
+        };
+        fanout_local(plan, |subscriber| {
+            forward_track(ctx, subscriber, key, TrackPacketRef::Rtp(packet), cache);
+        });
+        if origin.is_local() {
+            let playout = ctx.wall.to_ntp(packet.playout_time);
+            fanout_remote(
+                plan,
+                &mut runtime.link_seq,
+                playout.middle32(),
+                || RoutedTrackPacket {
+                    key,
+                    packet: TrackPacket::Rtp(packet.to_transit()),
+                },
+                ctx.router,
+            );
+        }
+    }
+
+    pub fn route_packet_with_plan(
+        &mut self,
+        key: TrackKey,
+        origin: Origin,
+        packet: RoutedTrackPacket,
+        plan: &crate::plan::FlatTrackPlan,
+        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+    ) {
+        debug_assert_eq!(packet.key, key);
+        match packet.packet {
+            TrackPacket::Rtp(packet) => self.route_rtp_with_plan(key, origin, packet, plan, ctx),
+            TrackPacket::Data(bytes) => {
+                self.route_unreliable_with_plan(key, origin, bytes, plan, ctx)
             }
-            crate::entity::TrackKind::Audio => {
-                self.route_audio_with_plan(key, origin, pkt, plan, ctx);
-            }
-            crate::entity::TrackKind::Data => {
-                debug_assert!(false, "a data track cannot carry RTP");
+            TrackPacket::Reliable(bytes) => {
+                self.route_reliable_with_plan(key, origin, bytes, plan, ctx)
             }
         }
     }
@@ -380,12 +250,12 @@ impl ShardRuntime {
         plan: &crate::plan::FlatTrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
-        let Some(runtime) = self.unreliable.get_mut(stream) else {
+        let Some(runtime) = self.tracks.get_mut(stream) else {
             debug_assert!(false, "data key must resolve to runtime state");
             return;
         };
         fanout_local(plan, |subscriber| {
-            forward_unreliable(ctx.registry, ctx.dirty, subscriber, stream, &packet);
+            forward_track(ctx, subscriber, stream, TrackPacketRef::Data(&packet), None);
         });
         if origin.is_local() {
             let playout = ctx.wall.ntp();
@@ -411,16 +281,22 @@ impl ShardRuntime {
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         debug_assert!(!frame.is_empty());
-        let Some(_runtime) = self.reliable.get(stream) else {
+        let Some(_runtime) = self.tracks.get(stream) else {
             debug_assert!(false, "reliable key must resolve to runtime state");
             return;
         };
         fanout_local(plan, |subscriber| {
-            forward_reliable(ctx.registry, ctx.dirty, subscriber, stream, &frame);
+            forward_track(
+                ctx,
+                subscriber,
+                stream,
+                TrackPacketRef::Reliable(&frame),
+                None,
+            );
         });
         if origin.is_local() {
             let playout = ctx.wall.ntp();
-            let Some(runtime) = self.reliable.get_mut(stream) else {
+            let Some(runtime) = self.tracks.get_mut(stream) else {
                 debug_assert!(false, "reliable key must remain live during dispatch");
                 return;
             };
@@ -430,7 +306,7 @@ impl ShardRuntime {
                 playout.middle32(),
                 || RoutedTrackPacket {
                     key: stream,
-                    packet: TrackPacket::Data(frame.clone()),
+                    packet: TrackPacket::Reliable(frame.clone()),
                 },
                 ctx.router,
             );
@@ -456,25 +332,13 @@ impl ShardRuntime {
         );
     }
 
-    pub fn resolve_reverse(
-        &self,
-        action: RouteAction,
-    ) -> Option<(ParticipantKey, crate::route::ReverseTarget)> {
+    pub fn resolve_reverse(&self, action: RouteAction) -> Option<(ParticipantKey, TrackKey)> {
         let RouteAction::Reverse { target } = action else {
             debug_assert!(false, "reverse frame resolved a non-reverse route");
             return None;
         };
-        let origin = match target {
-            crate::route::ReverseTarget::Track(key) => self
-                .tracks
-                .get(key)
-                .filter(|runtime| runtime.id.kind() == crate::entity::TrackKind::Video)
-                .map(|runtime| runtime.origin_key),
-            crate::route::ReverseTarget::Reliable(stream) => self
-                .reliable
-                .get(stream)
-                .and_then(|runtime| runtime.publisher),
-        }?;
+        let runtime = self.tracks.get(target)?;
+        let origin = runtime.publisher.unwrap_or(runtime.origin_key);
         Some((origin, target))
     }
 }
@@ -486,6 +350,19 @@ mod tests {
     use crate::id::ShardId;
     use crate::track::{Track, TrackMeta};
     use slotmap::SlotMap;
+    use std::cell::RefCell;
+
+    struct CaptureTransport {
+        frames: RefCell<Vec<ShardFrame>>,
+    }
+
+    impl ShardTransport for CaptureTransport {
+        fn send_media(&self, _: ShardId, _: Envelope, _: MediaPayload) {}
+
+        fn send_frame(&self, _: ShardId, frame: ShardFrame) {
+            self.frames.borrow_mut().push(frame);
+        }
+    }
 
     fn descriptor(
         id: TrackId,
@@ -545,16 +422,37 @@ mod tests {
         let op = crate::view::ViewOp::InsertTrackRuntime {
             key,
             runtime: crate::view::TrackRuntime::Data {
-                lane: crate::track::DataLane::Reliable,
                 publisher: None,
                 publisher_effect: None,
             },
         };
 
         runtime.apply_view_op(&op);
-        runtime.reliable.get_mut(key).unwrap().link_seq = 17;
+        runtime.tracks.get_mut(key).unwrap().link_seq = 17;
+        runtime.tracks.get_mut(key).unwrap().cache = Some(TrackStreamCache::new());
         runtime.apply_view_op(&op);
 
-        assert_eq!(runtime.reliable.get(key).unwrap().link_seq, 17);
+        assert_eq!(runtime.tracks.get(key).unwrap().link_seq, 17);
+        assert!(runtime.tracks.get(key).unwrap().cache.is_some());
+    }
+
+    #[test]
+    fn reliable_feedback_uses_the_generic_reverse_route() {
+        let transport = CaptureTransport {
+            frames: RefCell::new(Vec::new()),
+        };
+        let target =
+            crate::route::RouteHandle::new(crate::route::RouteId::new(ShardId::new(2), 9), 1);
+        let plan = crate::plan::FlatTrackPlan {
+            reverse_route: Some(target),
+            ..Default::default()
+        };
+        ShardRuntime::new(ShardId::new(0)).route_reliable_control(vec![4, 5], &plan, &transport);
+
+        assert!(matches!(
+            transport.frames.borrow().first(),
+            Some(ShardFrame::Reverse { env, body: Reverse::DataAck(bytes) })
+                if *env == crate::route::Envelope::feedback(target) && bytes == &vec![4, 5]
+        ));
     }
 }

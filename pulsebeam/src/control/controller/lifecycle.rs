@@ -7,13 +7,13 @@
 
 use super::*;
 
-pub(super) fn plan_removal(key: crate::control::publication::RuntimeKey) -> crate::plan::PlanKey {
+pub(super) fn plan_removal(key: crate::control::publication::RuntimeKey) -> crate::keys::TrackKey {
     use crate::control::publication::RuntimeKey;
     match key {
-        RuntimeKey::Video(key) => crate::plan::PlanKey::Track(key),
-        RuntimeKey::Audio(key) => crate::plan::PlanKey::Track(key),
-        RuntimeKey::Unreliable(key) => crate::plan::PlanKey::Unreliable(key),
-        RuntimeKey::Reliable(key) => crate::plan::PlanKey::Reliable(key),
+        RuntimeKey::Video(key) => key,
+        RuntimeKey::Audio(key) => key,
+        RuntimeKey::Unreliable(key) => key,
+        RuntimeKey::Reliable(key) => key,
     }
 }
 
@@ -683,14 +683,14 @@ impl ControllerActor {
         id: crate::entity::TrackId,
         shard: crate::id::ShardId,
         key: crate::control::publication::RuntimeKey,
-    ) -> Option<(crate::plan::PlanKey, crate::plan::FlatTrackPlan)> {
+    ) -> Option<(crate::keys::TrackKey, crate::plan::FlatTrackPlan)> {
         let publication = self.catalog.get(&id)?;
         let (plan_key, recipients) = match (&publication.media, key) {
             (
                 crate::control::publication::Media::Video { .. },
                 crate::control::publication::RuntimeKey::Video(key),
             ) => (
-                crate::plan::PlanKey::Track(key),
+                key,
                 self.video_patterns
                     .members_for(
                         self.video_patterns
@@ -710,7 +710,7 @@ impl ControllerActor {
                 crate::control::publication::Media::Audio,
                 crate::control::publication::RuntimeKey::Audio(key),
             ) => (
-                crate::plan::PlanKey::Track(key),
+                key,
                 self.audio_patterns
                     .members_for(
                         self.audio_patterns
@@ -733,7 +733,7 @@ impl ControllerActor {
                 == crate::control::lanes::StreamLane::Unreliable =>
             {
                 (
-                    crate::plan::PlanKey::Unreliable(key),
+                    key,
                     self.data_patterns
                         .members_for(
                             self.data_patterns
@@ -757,7 +757,7 @@ impl ControllerActor {
                 == crate::control::lanes::StreamLane::Reliable =>
             {
                 (
-                    crate::plan::PlanKey::Reliable(key),
+                    key,
                     self.data_patterns
                         .members_for(
                             self.data_patterns
@@ -810,7 +810,7 @@ impl ControllerActor {
             shard,
             crate::control::publication::RuntimeKey::Video(key),
         )?;
-        debug_assert_eq!(plan_key, crate::plan::PlanKey::Track(key));
+        debug_assert_eq!(plan_key, key);
         Some(plan)
     }
 

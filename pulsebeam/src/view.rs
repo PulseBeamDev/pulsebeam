@@ -33,7 +33,6 @@ pub(crate) struct TrackDescriptor {
 pub(crate) enum TrackRuntime {
     Media(TrackDescriptor),
     Data {
-        lane: crate::track::DataLane,
         publisher: Option<ParticipantKey>,
         publisher_effect: Option<crate::participant::ParticipantEffect>,
     },
@@ -334,9 +333,9 @@ mod tests {
     use super::*;
     use crate::keys::TrackKey;
 
-    fn track_plan() -> (crate::plan::PlanKey, PlanBatch) {
+    fn track_plan() -> (TrackKey, PlanBatch) {
         let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
-        let key = crate::plan::PlanKey::Track(keys.insert(()));
+        let key = keys.insert(());
         let mut batch = PlanBatch::default();
         batch.push(crate::plan::PlanChange {
             key,

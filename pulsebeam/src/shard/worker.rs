@@ -61,6 +61,7 @@ pub(crate) const SHARD_VIEW_CAPACITY: usize = 1024;
 pub(crate) const SHARD_COMMAND_BUDGET: usize = 64;
 pub(crate) const SHARD_FRAME_BUDGET: usize = 256;
 pub(crate) const SHARD_VIEW_OP_BUDGET: usize = 256;
+pub(crate) const SHARD_PLAN_CHANGE_BUDGET: usize = 256;
 pub(crate) const SHARD_PIPELINE_BUDGET: usize = 512;
 pub(crate) const SHARD_EVENT_BUDGET: usize = 1024;
 pub(crate) const SHARD_UDP_BATCH_BUDGET: usize = 256;

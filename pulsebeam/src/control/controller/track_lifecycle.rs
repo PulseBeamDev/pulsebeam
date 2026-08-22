@@ -104,9 +104,7 @@ impl ControllerActor {
             let handle = self
                 .grant_route(
                     shard_id,
-                    crate::route::RouteAction::Reverse {
-                        target: crate::route::ReverseTarget::Track(fanout),
-                    },
+                    crate::route::RouteAction::Reverse { target: fanout },
                 )
                 .await?;
             track.set_reverse(Some(handle));
@@ -152,9 +150,7 @@ impl ControllerActor {
         let key = self.prepare_track_key(destination, id, origin)?;
         Some((
             crate::control::publication::RuntimeKey::Audio(key),
-            RouteAction::Forward {
-                target: crate::route::RouteTarget::Track(key),
-            },
+            RouteAction::Forward { target: key },
         ))
     }
 
@@ -486,9 +482,7 @@ impl ControllerActor {
                     crate::view::ViewOp::InstallRoute {
                         binding: crate::view::RouteBinding {
                             handle: *handle,
-                            action: crate::route::RouteAction::Forward {
-                                target: crate::route::RouteTarget::Track(fanout),
-                            },
+                            action: crate::route::RouteAction::Forward { target: fanout },
                         },
                     },
                 ),
@@ -504,7 +498,7 @@ impl ControllerActor {
                     },
                 );
             }
-            ops.plan(shard_id, crate::plan::PlanKey::Track(fanout), plan)
+            ops.plan(shard_id, fanout, plan)
         })
     }
 
@@ -546,7 +540,7 @@ impl ControllerActor {
                 self.track_fanout(track_id, target),
                 self.video_plan_for(track_id, target),
             ) {
-                ops = ops.plan(target, crate::plan::PlanKey::Track(key), plan);
+                ops = ops.plan(target, key, plan);
             }
         }
         self.publish_generation(ops);

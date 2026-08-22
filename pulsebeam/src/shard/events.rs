@@ -12,11 +12,6 @@ use crate::participant::event::ParticipantSink;
 use crate::participant::{RoutedTrackPacket, TrackPacket};
 use crate::track::{GlobalKeyframeRequest, Topic, Track, TrackLayer, TrackMeta};
 
-pub struct SctpEvent<K> {
-    pub pkt: Vec<u8>,
-    pub stream: Option<K>,
-}
-
 /// The compiled identity of the participant emitting into the pipeline.
 ///
 /// A sink is built per participant in the dirty loop, which already holds
@@ -77,9 +72,8 @@ pub enum ShardInternalEvent {
 pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
     track_queue: VecDeque<RoutedTrackPacket>,
-    data_queue: VecDeque<SctpEvent<TrackKey>>,
-    reliable_data_queue: VecDeque<SctpEvent<TrackKey>>,
     shard_events: VecDeque<ShardEvent>,
+    packet_capacity: usize,
 }
 
 impl EventPipeline {
@@ -87,9 +81,8 @@ impl EventPipeline {
         Self {
             participant_events: VecDeque::with_capacity(cap),
             track_queue: VecDeque::with_capacity(cap),
-            data_queue: VecDeque::with_capacity(cap),
-            reliable_data_queue: VecDeque::with_capacity(cap),
             shard_events: VecDeque::with_capacity(cap),
+            packet_capacity: cap,
         }
     }
 
@@ -110,16 +103,23 @@ impl EventPipeline {
         self.track_queue.pop_front()
     }
 
+    fn push_packet(&mut self, packet: RoutedTrackPacket) -> bool {
+        if self.track_queue.len() >= self.packet_capacity {
+            metrics::counter!("routing_drop", "lane" => "packet", "stage" => "pipeline", "origin" => "local").increment(1);
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::record_routing_drop("packet", "pipeline", "local");
+            return false;
+        }
+        self.track_queue.push_back(packet);
+        true
+    }
+
     pub fn push_shard_event(&mut self, ev: ShardEvent) {
         self.shard_events.push_back(ev);
     }
 
-    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent<TrackKey>> {
-        self.data_queue.pop_front()
-    }
-
-    pub fn pop_reliable_data_sctp(&mut self) -> Option<SctpEvent<TrackKey>> {
-        self.reliable_data_queue.pop_front()
+    pub fn pop_packet(&mut self) -> Option<RoutedTrackPacket> {
+        self.track_queue.pop_front()
     }
 
     pub fn pop_shard_event(&mut self) -> Option<ShardEvent> {
@@ -129,8 +129,6 @@ impl EventPipeline {
     pub fn has_pending(&self) -> bool {
         !self.participant_events.is_empty()
             || !self.track_queue.is_empty()
-            || !self.data_queue.is_empty()
-            || !self.reliable_data_queue.is_empty()
             || !self.shard_events.is_empty()
     }
 }
@@ -307,16 +305,19 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         let Some(key) = fanout else {
             return;
         };
-        self.pipeline
-            .track_queue
-            .push_back(RoutedTrackPacket { key, packet });
+        self.pipeline.push_packet(RoutedTrackPacket { key, packet });
     }
 
     #[inline]
     fn publish_sctp(&mut self, _topic: Topic, stream: Option<TrackKey>, pkt: Vec<u8>) {
-        self.pipeline
-            .data_queue
-            .push_back(SctpEvent { pkt, stream });
+        let Some(key) = stream else {
+            metrics::counter!("routing_drop", "lane" => "data", "stage" => "runtime", "origin" => "local").increment(1);
+            return;
+        };
+        self.pipeline.push_packet(RoutedTrackPacket {
+            key,
+            packet: TrackPacket::Data(pkt),
+        });
     }
 
     #[inline]
@@ -381,9 +382,14 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             frame,
         }
         .encode_to_vec();
-        self.pipeline
-            .reliable_data_queue
-            .push_back(SctpEvent { pkt: frame, stream });
+        let Some(key) = stream else {
+            metrics::counter!("routing_drop", "lane" => "reliable", "stage" => "runtime", "origin" => "local").increment(1);
+            return;
+        };
+        self.pipeline.push_packet(RoutedTrackPacket {
+            key,
+            packet: TrackPacket::Reliable(frame),
+        });
     }
 
     #[inline]
@@ -434,7 +440,7 @@ mod tests {
             Some(TrackKey::default()),
             TrackPacket::Rtp(RtpPacket::default()),
         );
-        sink.publish_sctp(Topic::for_test("t"), None, vec![1]);
+        sink.publish_sctp(Topic::for_test("t"), Some(TrackKey::default()), vec![1]);
         sink.exit();
 
         assert!(
@@ -445,15 +451,17 @@ mod tests {
             pipeline.pop_track().is_some(),
             "RTP stayed in the track queue"
         );
-        assert!(pipeline.pop_data_sctp().is_some(), "data went to data");
+        assert!(
+            pipeline.pop_packet().is_some(),
+            "data stayed in the packet pipeline"
+        );
         assert!(
             pipeline.pop_participant_event().is_some(),
             "lifecycle went to participant events"
         );
 
         assert!(pipeline.pop_track().is_none(), "and nothing crossed");
-        assert!(pipeline.pop_data_sctp().is_none());
-        assert!(pipeline.pop_reliable_data_sctp().is_none());
+        assert!(pipeline.pop_packet().is_none());
     }
 
     /// Queues drain in the order they were filled. Media is a sequence, and reordering it here
@@ -464,13 +472,41 @@ mod tests {
         let who = identity();
         let mut sink = pipeline.participant_sink(who);
         for n in 0..3u8 {
-            sink.publish_sctp(Topic::for_test("t"), None, vec![n]);
+            sink.publish_sctp(Topic::for_test("t"), Some(TrackKey::default()), vec![n]);
         }
 
-        let drained: Vec<Vec<u8>> = std::iter::from_fn(|| pipeline.pop_data_sctp())
-            .map(|event| event.pkt)
+        let drained: Vec<Vec<u8>> = std::iter::from_fn(|| pipeline.pop_packet())
+            .map(|event| match event.packet {
+                TrackPacket::Data(bytes) => bytes,
+                _ => unreachable!(),
+            })
             .collect();
         assert_eq!(drained, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn the_generic_packet_pipeline_is_bounded_and_keeps_reliable_semantics() {
+        let mut pipeline = EventPipeline::with_capacity(2);
+        let who = identity();
+        let key = TrackKey::default();
+        let mut sink = pipeline.participant_sink(who);
+        sink.publish_track_packet(Some(key), TrackPacket::Data(vec![1]));
+        sink.publish_reliable_sctp(Topic::for_test("t"), Some(key), vec![2]);
+        sink.publish_sctp(Topic::for_test("t"), Some(key), vec![3]);
+        drop(sink);
+
+        assert!(matches!(
+            pipeline.pop_packet().unwrap().packet,
+            TrackPacket::Data(_)
+        ));
+        assert!(matches!(
+            pipeline.pop_packet().unwrap().packet,
+            TrackPacket::Reliable(_)
+        ));
+        assert!(
+            pipeline.pop_packet().is_none(),
+            "the fixed packet capacity must be enforced"
+        );
     }
 
     /// `has_pending` decides whether the shard loops again, so it has to agree with every queue.

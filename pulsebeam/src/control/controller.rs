@@ -14,7 +14,7 @@ use crate::{
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
-    route::{ReverseTarget, RouteAction, RouteHandle, TransportHandle},
+    route::{RouteAction, RouteHandle, TransportHandle},
     shard::{
         ShardContext,
         worker::{ShardCommand, ShardEvent, ShardEventMessage},
@@ -106,7 +106,7 @@ const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct PlanRequest {
     shard: crate::id::ShardId,
-    key: crate::plan::PlanKey,
+    key: crate::keys::TrackKey,
     plan: Option<crate::plan::FlatTrackPlan>,
 }
 
@@ -151,7 +151,7 @@ impl GenerationOps {
     fn plan(
         mut self,
         shard: crate::id::ShardId,
-        key: crate::plan::PlanKey,
+        key: crate::keys::TrackKey,
         plan: crate::plan::FlatTrackPlan,
     ) -> Self {
         self.plans.push(PlanRequest {
@@ -162,7 +162,7 @@ impl GenerationOps {
         self
     }
 
-    fn remove_plan(mut self, shard: crate::id::ShardId, key: crate::plan::PlanKey) -> Self {
+    fn remove_plan(mut self, shard: crate::id::ShardId, key: crate::keys::TrackKey) -> Self {
         self.plans.push(PlanRequest {
             shard,
             key,
@@ -171,7 +171,7 @@ impl GenerationOps {
         self
     }
 
-    fn push_remove_plan(&mut self, shard: crate::id::ShardId, key: crate::plan::PlanKey) {
+    fn push_remove_plan(&mut self, shard: crate::id::ShardId, key: crate::keys::TrackKey) {
         self.plans.push(PlanRequest {
             shard,
             key,
@@ -230,7 +230,7 @@ pub struct ControllerActor {
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
     views: Vec<crate::view::ShardViewWriter>,
-    compiled_plans: Vec<HashMap<crate::plan::PlanKey, crate::plan::ControlPlan>>,
+    compiled_plans: Vec<HashMap<crate::keys::TrackKey, crate::plan::ControlPlan>>,
     /// Every publication on this node, whatever kind.
     catalog: crate::control::publication::Catalog,
     /// Data and reliable stream routing. One type per lane rather than three
@@ -670,7 +670,7 @@ impl ControllerActor {
             view.stage(generation, op);
         }
         let mut staged_plans: HashMap<
-            (crate::id::ShardId, crate::plan::PlanKey),
+            (crate::id::ShardId, crate::keys::TrackKey),
             Option<crate::plan::ControlPlan>,
         > = HashMap::new();
         let mut batches = (0..self.views.len())
