@@ -42,7 +42,7 @@ impl TransportAllocators {
             debug_assert!(false, "transport allocation targeted an unknown shard");
             return Err(RouteError::Exhausted { max_slots: 0 });
         };
-        let (slot, epoch) = allocator.allocate(now)?;
+        let (slot, epoch) = allocator.allocate_transport(now)?;
         Ok(TransportHandle::new(
             TransportRoute::new(shard, slot),
             epoch,

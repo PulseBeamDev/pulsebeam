@@ -499,11 +499,23 @@ impl SlotAllocator {
     /// is fresh and the caller must push one entry; anything lower is a
     /// quarantined slot coming back, already bumped to a new epoch.
     pub(crate) fn allocate(&mut self, now: Instant) -> Result<(u32, u16), RouteError> {
+        self.allocate_inner(now, true)
+    }
+
+    pub(crate) fn allocate_transport(&mut self, now: Instant) -> Result<(u32, u16), RouteError> {
+        self.allocate_inner(now, false)
+    }
+
+    fn allocate_inner(
+        &mut self,
+        now: Instant,
+        inject_failure: bool,
+    ) -> Result<(u32, u16), RouteError> {
         // Exhaustion is the one failure every caller has written a rollback for and none has ever
         // taken: a namespace only fills under a participant count no plan reaches. Injecting it is
         // what puts those recovery paths under test at all. It lives here rather than at the table
         // it used to serve because this is now the only place an address can fail to exist.
-        if pulsebeam_runtime::buggify!("route table exhausted") {
+        if inject_failure && pulsebeam_runtime::buggify!("route table exhausted") {
             return Err(RouteError::Exhausted {
                 max_slots: self.max_slots,
             });
