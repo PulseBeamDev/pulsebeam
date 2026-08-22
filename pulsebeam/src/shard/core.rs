@@ -83,8 +83,8 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
 pub(crate) struct ShardCore {
     pub(crate) shard_id: crate::id::ShardId,
     view: crate::view::ShardView,
-    view_rx: mailbox::Receiver<Box<crate::view::GenerationCommit>>,
-    pending_view_delta: Option<Box<crate::view::GenerationCommit>>,
+    view_rx: mailbox::Receiver<Box<crate::view::ControlBatch>>,
+    pending_view_delta: Option<Box<crate::view::ControlBatch>>,
     pending_participant_effects: VecDeque<(ParticipantKey, crate::participant::ParticipantEffect)>,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
@@ -116,7 +116,7 @@ impl ShardCore {
         max_gso_segments: usize,
         shard_count: usize,
         wall: WallAnchor,
-        view_rx: mailbox::Receiver<Box<crate::view::GenerationCommit>>,
+        view_rx: mailbox::Receiver<Box<crate::view::ControlBatch>>,
     ) -> Self {
         let shard_id = shard_id.into();
         debug_assert!(shard_count > 0);
@@ -167,7 +167,7 @@ impl ShardCore {
                 debug_assert!(false, "a readable view delta must be retained");
                 break;
             };
-            if delta.shard != self.shard_id || delta.generation <= self.view.generation {
+            if !delta.validate_for(self.shard_id, self.view.generation) {
                 debug_assert_eq!(delta.shard, self.shard_id);
                 debug_assert!(
                     delta.generation > self.view.generation,

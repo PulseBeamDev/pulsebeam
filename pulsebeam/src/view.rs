@@ -181,6 +181,8 @@ pub(crate) struct GenerationCommit {
     pub plans: PlanBatch,
 }
 
+pub(crate) type ControlBatch = GenerationCommit;
+
 impl GenerationCommit {
     fn new(shard: ShardId, generation: u64) -> Self {
         Self {
@@ -194,6 +196,12 @@ impl GenerationCommit {
 
     fn is_empty(&self) -> bool {
         self.participant_effects.is_empty() && self.lifecycle.is_empty() && self.plans.is_empty()
+    }
+
+    pub(crate) fn validate_for(&self, shard: ShardId, current_revision: u64) -> bool {
+        self.shard == shard
+            && self.generation > current_revision
+            && self.lifecycle.iter().all(|op| op.is_owned_by(shard))
     }
 }
 
@@ -302,7 +310,7 @@ impl ShardViewWriter {
 
 pub(crate) fn new_shard_view(
     shard: ShardId,
-) -> (ShardViewWriter, mailbox::Receiver<Box<GenerationCommit>>) {
+) -> (ShardViewWriter, mailbox::Receiver<Box<ControlBatch>>) {
     let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_VIEW_CAPACITY);
     (
         ShardViewWriter {
@@ -389,5 +397,14 @@ mod tests {
             rx.try_recv().unwrap().generation,
             (crate::shard::worker::SHARD_VIEW_CAPACITY + 1) as u64
         );
+    }
+
+    #[test]
+    fn control_batch_validation_requires_new_owned_revision() {
+        let shard = ShardId::new(2);
+        let valid = GenerationCommit::new(shard, 4);
+        assert!(valid.validate_for(shard, 3));
+        assert!(!valid.validate_for(shard, 4));
+        assert!(!valid.validate_for(ShardId::new(3), 3));
     }
 }

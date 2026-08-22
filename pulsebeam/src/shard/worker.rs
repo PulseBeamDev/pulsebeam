@@ -425,7 +425,7 @@ impl ShardWorker {
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
         command_rx: mailbox::Receiver<ShardCommand>,
-        view_rx: mailbox::Receiver<Box<crate::view::GenerationCommit>>,
+        view_rx: mailbox::Receiver<Box<crate::view::ControlBatch>>,
         event_tx: mailbox::Sender<ShardEventMessage>,
         frame_rx: mailbox::Receiver<ShardFrame>,
         frame_txs: Vec<mailbox::Sender<ShardFrame>>,
