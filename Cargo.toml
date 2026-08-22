@@ -14,6 +14,7 @@ members = [
   "pulsebeam-runtime",
   "pulsebeam-simulator",
   "pulsebeam-testdata",
+  "tools/pulsebeam-agent-web-size",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ license = "AGPL-3.0"
 [workspace.dependencies]
 arc-swap = "1.7.1"
 anyhow = "1"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 aya = "0.14.0"
 aya-ebpf = "0.2.1"
 bytes = "1.11.1"
@@ -36,7 +38,9 @@ fastrand = "2.3.0"
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"
 rand = "0.10.1"
+hkdf = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
+sha2 = { version = "0.10", default-features = false }
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/overusing-readiness" }
 str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/bwe-6" }
 # str0m = { git = "https://github.com/algesten/str0m.git", rev = "92fac41" }
@@ -66,6 +70,12 @@ debug = "line-tables-only"
 codegen-units = 1
 panic = "abort"
 lto = true
+
+[profile.agent-wasm]
+inherits = "release"
+opt-level = "z"
+debug = false
+strip = "symbols"
 
 [profile.test]
 panic = "abort"

@@ -1,7 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pulsebeam_agent_core::MonotonicTime;
-use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClockAnchor {
@@ -19,6 +18,12 @@ impl ClockAnchor {
 
     pub fn now(&self) -> MonotonicTime {
         self.monotonic.saturating_add(self.instant.elapsed())
+    }
+
+    pub fn instant_now(&self) -> Instant {
+        self.instant
+            .checked_add(self.instant.elapsed())
+            .unwrap_or(self.instant)
     }
 
     pub fn at(&self, now: MonotonicTime) -> Instant {

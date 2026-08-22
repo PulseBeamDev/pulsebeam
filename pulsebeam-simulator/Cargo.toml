@@ -29,6 +29,7 @@ rand.workspace = true
 proptest = "1.11.0"
 pulsebeam = { path = "../pulsebeam", features = ["sim"] }
 pulsebeam-agent = { path = "../pulsebeam-agent", features = ["sim"] }
+pulsebeam-agent-native = { path = "../pulsebeam-agent-native", features = ["sim"] }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
 pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["sim"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }

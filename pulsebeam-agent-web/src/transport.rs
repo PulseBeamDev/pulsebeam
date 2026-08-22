@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use pulsebeam_agent_core::{CoreEffect, TransportGeneration};
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 use crate::interop::EncodingConfig;
 use crate::interop::{
     BrowserEvent, DataChannelConfig, GenerationEvent, PeerConfig, SenderPreset, WebError,
@@ -46,9 +46,9 @@ pub struct WebTransport {
     channels: BTreeMap<String, DataChannelConfig>,
     sender_updates: SenderUpdateQueue,
     events: VecDeque<GenerationEvent<BrowserEvent>>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     sent: VecDeque<(TransportGeneration, String, Vec<u8>)>,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "browser"))]
     browser: BrowserTransport,
 }
 
@@ -61,9 +61,9 @@ impl WebTransport {
             channels: BTreeMap::new(),
             sender_updates: SenderUpdateQueue::new(),
             events: VecDeque::new(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
             sent: VecDeque::new(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", feature = "browser"))]
             browser: BrowserTransport::new(),
         })
     }
@@ -105,7 +105,7 @@ impl WebTransport {
             });
         }
         self.generation = Some(generation);
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         self.browser
             .replace(&self.config, generation, &self.channels)?;
         Ok(())
@@ -121,10 +121,10 @@ impl WebTransport {
         if !self.channels.contains_key(channel) {
             return Err(WebError::Browser(format!("unknown data channel {channel}")));
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         self.sent
             .push_back((generation, channel.to_owned(), payload));
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         self.browser.send(channel, &payload)?;
         Ok(())
     }
@@ -135,21 +135,21 @@ impl WebTransport {
 
     pub async fn flush_sender_updates(&mut self) -> Result<(), WebError> {
         while let Some((sender, preset)) = self.sender_updates.take_next() {
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", feature = "browser"))]
             self.browser.apply_sender_preset(&sender, &preset).await?;
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
             let _ = (sender, preset);
         }
         Ok(())
     }
 
     pub fn poll_event(&mut self) -> Option<GenerationEvent<BrowserEvent>> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         self.browser.drain_events(&mut self.events);
         self.events.pop_front()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     pub fn poll_sent(&mut self) -> Option<(TransportGeneration, String, Vec<u8>)> {
         self.sent.pop_front()
     }
@@ -164,11 +164,11 @@ impl WebTransport {
         delay: std::time::Duration,
     ) -> Result<(), WebError> {
         self.require_generation(generation)?;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         self.browser.schedule_timer(generation, delay)?;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         let _ = delay;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         self.events
             .push_back(GenerationEvent::new(generation, BrowserEvent::Timer));
         Ok(())
@@ -179,9 +179,9 @@ impl WebTransport {
         generation: TransportGeneration,
     ) -> Result<String, WebError> {
         self.require_generation(generation)?;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         return self.browser.create_offer().await;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         Ok("mock-offer".to_owned())
     }
 
@@ -191,11 +191,11 @@ impl WebTransport {
         sdp: &str,
     ) -> Result<(), WebError> {
         self.require_generation(generation)?;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             return self.browser.set_answer(sdp).await;
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         {
             debug_assert!(!sdp.is_empty());
             Ok(())
@@ -221,11 +221,11 @@ impl WebTransport {
         sender: &str,
         track: Option<&MediaStreamTrackHandle>,
     ) -> Result<(), WebError> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             self.browser.replace_sender_track(sender, track).await
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         {
             let _ = (sender, track);
             Ok(())
@@ -235,21 +235,21 @@ impl WebTransport {
 
 #[derive(Clone)]
 pub struct MediaStreamTrackHandle {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "browser"))]
     raw: wasm_bindgen::JsValue,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     id: String,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     kind: String,
 }
 
 impl MediaStreamTrackHandle {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "browser"))]
     pub fn from_js(raw: wasm_bindgen::JsValue) -> Self {
         Self { raw }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     pub fn mock(id: impl Into<String>, kind: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -258,31 +258,31 @@ impl MediaStreamTrackHandle {
     }
 
     pub fn id(&self) -> String {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             return property(&self.raw, "id")
                 .ok()
                 .and_then(|value| value.as_string())
                 .unwrap_or_default();
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         self.id.clone()
     }
 
     pub fn kind(&self) -> String {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             return property(&self.raw, "kind")
                 .ok()
                 .and_then(|value| value.as_string())
                 .unwrap_or_default();
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         self.kind.clone()
     }
 
     pub fn set_enabled(&self, enabled: bool) -> Result<(), WebError> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             js_sys::Reflect::set(
                 &self.raw,
@@ -291,22 +291,24 @@ impl MediaStreamTrackHandle {
             )
             .map_err(js_error)?;
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         let _ = enabled;
         Ok(())
     }
 }
 
 pub struct MediaStreamHandle {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "browser"))]
     raw: wasm_bindgen::JsValue,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     tracks: Vec<MediaStreamTrackHandle>,
 }
 
 impl MediaStreamHandle {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "browser"))]
     pub fn new() -> Result<Self, WebError> {
+        use wasm_bindgen::JsCast;
+
         let constructor = js_sys::Reflect::get(
             &js_sys::global(),
             &wasm_bindgen::JsValue::from_str("MediaStream"),
@@ -320,56 +322,56 @@ impl MediaStreamHandle {
         })
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "browser"))]
     pub fn from_js(raw: wasm_bindgen::JsValue) -> Self {
         Self { raw }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     pub fn new() -> Self {
         Self { tracks: Vec::new() }
     }
 
     pub fn add_track(&mut self, track: &MediaStreamTrackHandle) -> Result<(), WebError> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             let _ = call_method(&self.raw, "addTrack", std::slice::from_ref(&track.raw))?;
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         self.tracks.push(track.clone());
         Ok(())
     }
 
     pub fn remove_track(&mut self, track: &MediaStreamTrackHandle) -> Result<(), WebError> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             let _ = call_method(&self.raw, "removeTrack", std::slice::from_ref(&track.raw))?;
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         self.tracks.retain(|candidate| candidate.id() != track.id());
         Ok(())
     }
 
     pub fn tracks(&self) -> Result<Vec<MediaStreamTrackHandle>, WebError> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             let tracks = call_method(&self.raw, "getTracks", &[])?;
             let tracks = js_sys::Array::from(&tracks);
             return Ok(tracks.iter().map(MediaStreamTrackHandle::from_js).collect());
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         Ok(self.tracks.clone())
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
 impl Default for MediaStreamHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 struct BrowserTransport {
     peer: Option<wasm_bindgen::JsValue>,
     senders: BTreeMap<String, wasm_bindgen::JsValue>,
@@ -378,7 +380,7 @@ struct BrowserTransport {
     callbacks: Vec<wasm_bindgen::closure::Closure<dyn FnMut(wasm_bindgen::JsValue)>>,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 impl BrowserTransport {
     fn new() -> Self {
         Self {
@@ -637,7 +639,7 @@ impl BrowserTransport {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn data_channel_options(config: &DataChannelConfig) -> Result<wasm_bindgen::JsValue, WebError> {
     let object = js_sys::Object::new();
     js_sys::Reflect::set(
@@ -657,7 +659,7 @@ fn data_channel_options(config: &DataChannelConfig) -> Result<wasm_bindgen::JsVa
     Ok(object.into())
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn transceiver_options(direction: &str, video: bool) -> wasm_bindgen::JsValue {
     let object = js_sys::Object::new();
     let _ = js_sys::Reflect::set(
@@ -695,7 +697,7 @@ fn transceiver_options(direction: &str, video: bool) -> wasm_bindgen::JsValue {
     object.into()
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn install_data_callback(
     raw: &wasm_bindgen::JsValue,
     generation: TransportGeneration,
@@ -723,12 +725,14 @@ fn install_data_callback(
     Ok(callback)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn call_method(
     target: &wasm_bindgen::JsValue,
     name: &str,
     arguments: &[wasm_bindgen::JsValue],
 ) -> Result<wasm_bindgen::JsValue, WebError> {
+    use wasm_bindgen::JsCast;
+
     let function = js_sys::Reflect::get(target, &wasm_bindgen::JsValue::from_str(name))
         .map_err(js_error)?
         .dyn_into::<js_sys::Function>()
@@ -740,12 +744,12 @@ fn call_method(
     function.apply(target, &args).map_err(js_error)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn property(target: &wasm_bindgen::JsValue, name: &str) -> Result<wasm_bindgen::JsValue, WebError> {
     js_sys::Reflect::get(target, &wasm_bindgen::JsValue::from_str(name)).map_err(js_error)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 async fn await_promise(value: wasm_bindgen::JsValue) -> Result<wasm_bindgen::JsValue, WebError> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
@@ -758,7 +762,7 @@ async fn await_promise(value: wasm_bindgen::JsValue) -> Result<wasm_bindgen::JsV
     .map_err(js_error)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn set_encoding(raw: &wasm_bindgen::JsValue, encoding: &EncodingConfig) -> Result<(), WebError> {
     use wasm_bindgen::JsValue;
     let set = |name: &str, value: JsValue| {
@@ -782,7 +786,7 @@ fn set_encoding(raw: &wasm_bindgen::JsValue, encoding: &EncodingConfig) -> Resul
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn js_error(error: wasm_bindgen::JsValue) -> WebError {
     WebError::Browser(
         error

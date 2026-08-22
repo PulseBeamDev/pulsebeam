@@ -12,14 +12,25 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["browser"]
+browser = [
+    "dep:js-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+]
+protocol = ["pulsebeam-agent-core/protocol"]
+e2ee = ["browser", "pulsebeam-agent-core/e2ee"]
+
 [dependencies]
 pulsebeam-agent-core = { path = "../pulsebeam-agent-core" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = "0.3.85"
-wasm-bindgen = "0.2.108"
-wasm-bindgen-futures = "0.4.58"
-web-sys = { version = "0.3.85", features = [
+js-sys = { version = "0.3.85", optional = true }
+wasm-bindgen = { version = "0.2.108", optional = true }
+wasm-bindgen-futures = { version = "0.4.58", optional = true }
+web-sys = { version = "0.3.85", optional = true, features = [
     "Blob",
     "Headers",
     "MessageChannel",

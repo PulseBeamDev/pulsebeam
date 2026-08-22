@@ -79,6 +79,16 @@ impl TopicPublisher {
         self.stream_id
     }
 
+    pub fn start_stream(&mut self, stream_id: u64) -> Result<(), TopicError> {
+        if stream_id == 0 {
+            return Err(TopicError::InvalidStreamId);
+        }
+        self.stream_id = stream_id;
+        self.next_seq = 0;
+        self.retransmits.clear();
+        Ok(())
+    }
+
     pub fn publish(&mut self, payload: Vec<u8>) -> Result<RelMsg, TopicError> {
         let seq = self.next_seq;
         self.next_seq = self
@@ -124,12 +134,22 @@ impl TopicPublisher {
         output
     }
 
-    pub fn encode_delivery(&self, publisher_id: impl Into<String>, message: &RelMsg) -> Vec<u8> {
+    pub fn encode_delivery(publisher_id: impl Into<String>, message: &RelMsg) -> Vec<u8> {
         RelDelivery {
             publisher_id: publisher_id.into(),
             frame: message.encode_to_vec(),
         }
         .encode_to_vec()
+    }
+
+    pub fn accept_control(&self, bytes: &[u8]) -> Result<Vec<RelMsg>, TopicError> {
+        debug_assert!(!bytes.is_empty());
+        let control =
+            RelControl::decode(bytes).map_err(|error| TopicError::Decode(error.to_string()))?;
+        let Some(rel_control::Msg::Nack(nack)) = control.msg else {
+            return Ok(Vec::new());
+        };
+        Ok(self.retransmit(&nack))
     }
 }
 

@@ -1,3 +1,4 @@
+#[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
 use std::collections::VecDeque;
 
 use pulsebeam_agent_core::{HttpRequest, HttpResponse};
@@ -5,17 +6,17 @@ use pulsebeam_agent_core::{HttpRequest, HttpResponse};
 use crate::interop::WebError;
 
 pub struct FetchClient {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     mock: MockFetch,
 }
 
 impl FetchClient {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "browser"))]
     pub fn browser() -> Self {
         Self {}
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     pub fn mock() -> Self {
         Self {
             mock: MockFetch::default(),
@@ -23,30 +24,30 @@ impl FetchClient {
     }
 
     pub async fn execute(&mut self, request: HttpRequest) -> Result<HttpResponse, WebError> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
         {
             execute_browser(request).await
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
         {
             self.mock.execute(request)
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
     pub fn mock_mut(&mut self) -> &mut MockFetch {
         &mut self.mock
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
 impl Default for FetchClient {
     fn default() -> Self {
         Self::mock()
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 async fn execute_browser(request: HttpRequest) -> Result<HttpResponse, WebError> {
     use js_sys::Uint8Array;
     use wasm_bindgen::JsCast;
@@ -62,7 +63,7 @@ async fn execute_browser(request: HttpRequest) -> Result<HttpResponse, WebError>
     init.set_headers(&headers);
     if !request.body.is_empty() {
         let body = Uint8Array::from(request.body.as_slice());
-        init.set_body(Some(body.as_ref()));
+        init.set_body(body.as_ref());
     }
     let browser_request = Request::new_with_str_and_init(&request.uri, &init).map_err(js_error)?;
     let window =
@@ -87,7 +88,7 @@ async fn execute_browser(request: HttpRequest) -> Result<HttpResponse, WebError>
     Ok(output)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser"))]
 fn js_error(error: wasm_bindgen::JsValue) -> WebError {
     WebError::Http(
         error
@@ -96,14 +97,14 @@ fn js_error(error: wasm_bindgen::JsValue) -> WebError {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
 #[derive(Default)]
 pub struct MockFetch {
     responses: VecDeque<Result<HttpResponse, WebError>>,
     requests: Vec<HttpRequest>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), not(feature = "browser")))]
 impl MockFetch {
     pub fn push_response(&mut self, response: Result<HttpResponse, WebError>) {
         self.responses.push_back(response);

@@ -1,9 +1,18 @@
 use std::time::Duration;
 
+#[cfg(feature = "protocol")]
+use pulsebeam_proto::prelude::Message;
+#[cfg(feature = "protocol")]
+use pulsebeam_proto::reliable::RelDelivery;
+
 use pulsebeam_agent_core::{
-    AgentCore, ChannelKey, CoreEffect, CoreInput, E2eeKey, E2eeSession, MonotonicTime,
-    OrderedEvent, OrderedReceiver, RequestId, TopicPublisher, TransportGeneration,
+    AgentCore, ChannelKey, CoreEffect, CoreInput, MonotonicTime, RequestId, TransportGeneration,
 };
+
+#[cfg(feature = "e2ee")]
+use pulsebeam_agent_core::{E2eeDirection, E2eeDomain, E2eeEpoch, E2eeKeyRing, E2eeMasterKey};
+#[cfg(feature = "protocol")]
+use pulsebeam_agent_core::{OrderedEvent, OrderedReceiver, TopicPublisher};
 
 fn time(milliseconds: u64) -> MonotonicTime {
     MonotonicTime::from(Duration::from_millis(milliseconds))
@@ -74,6 +83,7 @@ fn reconnect_deadline_is_deterministic() {
     );
 }
 
+#[cfg(feature = "protocol")]
 #[test]
 fn ordered_topic_fixture_replays_in_order() {
     let mut publisher = TopicPublisher::new(7).expect("nonzero stream fixture");
@@ -81,15 +91,22 @@ fn ordered_topic_fixture_replays_in_order() {
     let second = publisher.publish(vec![2]).expect("second message");
     let third = publisher.publish(vec![3]).expect("third message");
     let mut receiver = OrderedReceiver::default();
+    let delivery = |message: &pulsebeam_proto::reliable::RelMsg| {
+        RelDelivery {
+            publisher_id: String::from("alice"),
+            frame: message.encode_to_vec(),
+        }
+        .encode_to_vec()
+    };
     let first_events = receiver
-        .accept_delivery(&publisher.encode_delivery("alice", &first))
+        .accept_delivery(&delivery(&first))
         .expect("first delivery is decodable");
     assert!(first_events.iter().any(|event| matches!(
         event,
         OrderedEvent::Message { seq: 0, payload, .. } if payload == &[1]
     )));
     let mut events = receiver
-        .accept_delivery(&publisher.encode_delivery("alice", &third))
+        .accept_delivery(&delivery(&third))
         .expect("third delivery is decodable");
     assert!(
         events
@@ -97,7 +114,7 @@ fn ordered_topic_fixture_replays_in_order() {
             .any(|event| matches!(event, OrderedEvent::Nack(_)))
     );
     events = receiver
-        .accept_delivery(&publisher.encode_delivery("alice", &second))
+        .accept_delivery(&delivery(&second))
         .expect("second delivery is decodable");
     assert!(events.iter().any(|event| matches!(
         event,
@@ -109,13 +126,20 @@ fn ordered_topic_fixture_replays_in_order() {
     )));
 }
 
+#[cfg(feature = "e2ee")]
 #[test]
 fn e2ee_fixture_has_stable_frame_shape_and_round_trip() {
-    let key = E2eeKey::new(9, [0x42; 32]);
-    let mut sender = E2eeSession::new(key.clone()).expect("fixture key is valid");
-    let mut receiver = E2eeSession::new(key).expect("fixture key is valid");
+    let key = E2eeMasterKey::new(9, [0x42; 32]);
+    let epoch = E2eeEpoch::new([0x19; 16]).expect("fixture epoch is valid");
+    let domain =
+        E2eeDomain::new("alice", "fixture", E2eeDirection::Send).expect("fixture domain is valid");
+    let mut ring = E2eeKeyRing::new(2).expect("fixture key ring is valid");
+    ring.install(key, epoch, domain.clone())
+        .expect("fixture key installs");
+    let mut sender = ring.encryptor(9, epoch, &domain).expect("sender is valid");
+    let mut receiver = ring.receiver(9, epoch, &domain).expect("receiver is valid");
     let frame = sender.encrypt(b"conformance").expect("encryption succeeds");
-    assert_eq!(frame.len(), 13 + b"conformance".len() + 16);
+    assert_eq!(frame.len(), 29 + b"conformance".len() + 16);
     assert_eq!(
         receiver.decrypt(&frame).expect("decryption succeeds"),
         b"conformance"

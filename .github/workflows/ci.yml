@@ -122,6 +122,10 @@ jobs:
       run: make agent-wasm
       env:
         CARGO_TERM_COLOR: always
+    - name: WASM size budget
+      run: make agent-wasm-size
+      env:
+        CARGO_TERM_COLOR: always
     - name: Browser fixture
       run: make agent-browser-test
       env:
@@ -136,6 +140,10 @@ jobs:
         CARGO_TERM_COLOR: always
     - name: Existing simulation tests
       run: make test-sim
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Isolated native-agent simulation tests
+      run: make test-sim-agent-native
       env:
         CARGO_TERM_COLOR: always
     - name: Workspace architectural lint

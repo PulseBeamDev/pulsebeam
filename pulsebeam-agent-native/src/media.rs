@@ -114,31 +114,61 @@ impl RtpRecoveryBuffer {
         };
         if packet.sequence == next {
             self.next_sequence = Some(next.wrapping_add(1));
-            return vec![RecoveryResult {
+            let mut output = vec![RecoveryResult {
                 packet,
                 missing: Vec::new(),
             }];
+            output.extend(self.flush_pending());
+            return output;
         }
         let distance = packet.sequence.wrapping_sub(next);
         if distance < 0x8000 {
-            if self.pending.len() == self.capacity {
+            if self.pending.len() >= self.capacity {
                 self.pending.pop_first();
             }
-            let received = packet.clone();
             self.pending.insert(packet.sequence, packet);
-            let missing = (0..distance)
-                .map(|offset| next.wrapping_add(offset))
-                .collect();
-            return vec![RecoveryResult {
-                packet: received,
-                missing,
-            }];
         }
         Vec::new()
     }
 
     pub fn recover(&mut self, packet: RtpPacket) -> Vec<RecoveryResult> {
-        self.pending.insert(packet.sequence, packet);
+        let Some(next) = self.next_sequence else {
+            return self.accept(packet);
+        };
+        if packet.sequence != next {
+            if packet.sequence.wrapping_sub(next) >= 0x8000 {
+                return Vec::new();
+            }
+            if self.pending.len() >= self.capacity {
+                self.pending.pop_first();
+            }
+            self.pending.insert(packet.sequence, packet);
+            return self.flush_pending();
+        }
+        self.accept(packet)
+    }
+
+    pub fn missing(&self) -> Vec<u16> {
+        let Some(next) = self.next_sequence else {
+            return Vec::new();
+        };
+        let Some((&first, _)) = self
+            .pending
+            .iter()
+            .min_by_key(|(sequence, _)| sequence.wrapping_sub(next))
+        else {
+            return Vec::new();
+        };
+        let distance = first.wrapping_sub(next);
+        if distance >= 0x8000 {
+            return Vec::new();
+        }
+        (0..distance)
+            .map(|offset| next.wrapping_add(offset))
+            .collect()
+    }
+
+    fn flush_pending(&mut self) -> Vec<RecoveryResult> {
         let mut output = Vec::new();
         while let Some(next) = self.next_sequence {
             let Some(packet) = self.pending.remove(&next) else {
@@ -306,8 +336,8 @@ mod tests {
             Vec::<u16>::new()
         );
         let gap = recovery.accept(packet("0", 12));
-        assert_eq!(gap[0].missing, vec![11]);
-        assert_eq!(gap[0].packet.sequence, 12);
+        assert!(gap.is_empty());
+        assert_eq!(recovery.missing(), vec![11]);
         let recovered = recovery.recover(packet("0", 11));
         assert_eq!(
             recovered

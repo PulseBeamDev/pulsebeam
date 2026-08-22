@@ -1,0 +1,18 @@
+[package]
+name = "pulsebeam-agent-web-size-fixture"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["browser"]
+production = ["browser", "protocol", "e2ee"]
+browser = ["pulsebeam-agent-web/browser"]
+protocol = ["pulsebeam-agent-web/protocol"]
+e2ee = ["pulsebeam-agent-web/e2ee"]
+
+[dependencies]
+pulsebeam-agent-web = { path = "../../pulsebeam-agent-web", default-features = false }

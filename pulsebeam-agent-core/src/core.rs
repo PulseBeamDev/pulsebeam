@@ -102,8 +102,16 @@ pub struct AgentCore {
     generation: TransportGeneration,
     reconnect_attempt: u32,
     deadline: Option<MonotonicTime>,
+    terminal: Option<TerminalOutcome>,
     effects: VecDeque<CoreEffect>,
     events: VecDeque<CoreEvent>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalOutcome {
+    Connected,
+    Failed,
+    Closed,
 }
 
 impl AgentCore {
@@ -114,6 +122,7 @@ impl AgentCore {
             generation: TransportGeneration::INITIAL,
             reconnect_attempt: 0,
             deadline: None,
+            terminal: None,
             effects: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -129,9 +138,15 @@ impl AgentCore {
 
     pub fn handle(&mut self, now: MonotonicTime, input: CoreInput) -> Result<(), CoreError> {
         match input {
-            CoreInput::Start => self.start(),
+            CoreInput::Start => self.start(now),
             CoreInput::TransportConnected { generation } => {
                 self.require_generation(generation)?;
+                if self.state == ConnectionState::Connected
+                    || self.terminal == Some(TerminalOutcome::Failed)
+                    || self.terminal == Some(TerminalOutcome::Closed)
+                {
+                    return Ok(());
+                }
                 if self.state != ConnectionState::Connecting {
                     return Err(CoreError::InvalidState {
                         state: self.state,
@@ -141,15 +156,26 @@ impl AgentCore {
                 self.state = ConnectionState::Connected;
                 self.reconnect_attempt = 0;
                 self.deadline = None;
+                self.terminal = Some(TerminalOutcome::Connected);
                 self.emit_state_change();
                 Ok(())
             }
             CoreInput::TransportFailed { generation, reason } => {
                 self.require_generation(generation)?;
+                if self.terminal == Some(TerminalOutcome::Failed)
+                    || self.terminal == Some(TerminalOutcome::Closed)
+                {
+                    return Ok(());
+                }
                 self.transport_failed(now, reason)
             }
             CoreInput::TransportClosed { generation } => {
                 self.require_generation(generation)?;
+                if self.terminal == Some(TerminalOutcome::Failed)
+                    || self.terminal == Some(TerminalOutcome::Closed)
+                {
+                    return Ok(());
+                }
                 self.transport_failed(now, String::from("transport closed"))
             }
             CoreInput::Send {
@@ -198,7 +224,7 @@ impl AgentCore {
         &self.config.reconnect_policy
     }
 
-    fn start(&mut self) -> Result<(), CoreError> {
+    fn start(&mut self, now: MonotonicTime) -> Result<(), CoreError> {
         if self.state != ConnectionState::Idle && self.state != ConnectionState::Closed {
             return Err(CoreError::InvalidState {
                 state: self.state,
@@ -207,19 +233,18 @@ impl AgentCore {
         }
         self.reconnect_attempt = 0;
         self.deadline = None;
-        self.begin_connect()
-            .inspect(|_| debug_assert!(self.next_deadline().is_none()))?;
-        Ok(())
+        self.begin_connect(now)
     }
 
-    fn begin_connect(&mut self) -> Result<(), CoreError> {
+    fn begin_connect(&mut self, now: MonotonicTime) -> Result<(), CoreError> {
         let generation = self
             .generation
             .next()
             .ok_or(CoreError::GenerationExhausted)?;
         self.generation = generation;
         self.state = ConnectionState::Connecting;
-        self.deadline = None;
+        self.deadline = Some(now.saturating_add(self.config.connect_timeout));
+        self.terminal = None;
         self.effects.push_back(CoreEffect::Connect { generation });
         self.emit_state_change();
         Ok(())
@@ -230,9 +255,11 @@ impl AgentCore {
             generation: self.generation,
             reason,
         });
+        self.terminal = Some(TerminalOutcome::Failed);
         if self.reconnect_attempt >= self.config.reconnect_policy.max_attempts {
             self.deadline = None;
             self.state = ConnectionState::Closed;
+            self.terminal = Some(TerminalOutcome::Closed);
             self.emit_state_change();
             return Ok(());
         }
@@ -260,8 +287,14 @@ impl AgentCore {
         if now < deadline {
             return Ok(());
         }
-        debug_assert!(self.state == ConnectionState::Reconnecting);
-        self.begin_connect()
+        debug_assert!(matches!(
+            self.state,
+            ConnectionState::Connecting | ConnectionState::Reconnecting
+        ));
+        if self.state == ConnectionState::Connecting {
+            return self.transport_failed(now, String::from("connection timeout"));
+        }
+        self.begin_connect(now)
     }
 
     fn require_generation(&self, received: TransportGeneration) -> Result<(), CoreError> {
@@ -423,6 +456,7 @@ mod tests {
                 initial_delay: Duration::from_millis(10),
                 max_delay: Duration::from_millis(20),
             },
+            connect_timeout: Duration::from_secs(10),
         });
         core.handle(time(100), CoreInput::Start).unwrap();
         core.poll_effect();
@@ -437,7 +471,7 @@ mod tests {
         core.handle(time(209), CoreInput::Timer).unwrap();
         assert_eq!(core.next_deadline(), Some(time(210)));
         core.handle(time(210), CoreInput::Timer).unwrap();
-        assert_eq!(core.next_deadline(), None);
+        assert_eq!(core.next_deadline(), Some(time(10_210)));
         assert_eq!(
             core.poll_effect(),
             Some(CoreEffect::Connect {

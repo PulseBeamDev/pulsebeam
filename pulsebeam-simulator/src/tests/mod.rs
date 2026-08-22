@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod agent_native;
 pub mod bwe;
 pub mod common;
 pub mod connectivity;
