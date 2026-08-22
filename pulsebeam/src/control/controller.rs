@@ -1,5 +1,5 @@
 use std::time::Duration;
-use std::{collections::HashMap, io};
+use std::io;
 
 use crate::control::state::ControlModel;
 use crate::{
@@ -107,7 +107,7 @@ const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 struct PlanRequest {
     shard: crate::id::ShardId,
     key: crate::keys::TrackKey,
-    plan: Option<crate::plan::FlatTrackPlan>,
+    plan: Option<crate::plan::TrackPlan>,
 }
 
 struct GenerationOps {
@@ -152,7 +152,7 @@ impl GenerationOps {
         mut self,
         shard: crate::id::ShardId,
         key: crate::keys::TrackKey,
-        plan: crate::plan::FlatTrackPlan,
+        plan: crate::plan::TrackPlan,
     ) -> Self {
         self.plans.push(PlanRequest {
             shard,
@@ -218,19 +218,17 @@ pub struct ControllerActor {
     /// The canonical lifecycle state. Only this actor mutates it, and no
     /// shard ever reads it — a shard reads the view projected from it.
     state: ControlModel,
-    /// Video declarations. Always fully concrete: a video subscription *is* a
-    /// downstream slot allocation, and a slot belongs to one track, so a
-    /// pattern here can never wildcard the name.
-    video_patterns: crate::control::patterns::PatternTable<
-        crate::entity::TrackId,
-        crate::keys::DownstreamSlotKey,
-        crate::control::patterns::VideoAudience,
+    /// All declarations share one indexed table. The subject and delivery
+    /// variants keep the small differences at the edges without duplicating
+    /// lifecycle, matching, or shard-count accounting.
+    audiences: crate::control::patterns::PatternTable<
+        crate::control::publication::AudienceName,
+        crate::control::publication::AudienceDelivery,
     >,
     /// One writer per shard. Never shared, never locked, and never handed to
     /// a shard: the one-publish-per-generation budget is only checkable
     /// because there is exactly one caller.
     views: Vec<crate::view::ShardViewWriter>,
-    compiled_plans: Vec<HashMap<crate::keys::TrackKey, crate::plan::ControlPlan>>,
     /// Every publication on this node, whatever kind.
     catalog: crate::control::publication::Catalog,
     /// Data and reliable stream routing. One type per lane rather than three
@@ -239,24 +237,6 @@ pub struct ControllerActor {
     pending: PendingSubscriptions,
     pending_streams: PendingStreams,
     pending_audio: Vec<crate::entity::TrackId>,
-    audio_patterns: crate::control::patterns::PatternTable<
-        crate::entity::TrackId,
-        (),
-        crate::control::patterns::AudioAudience,
-    >,
-    /// Data declarations, keyed by topic *and* lane.
-    ///
-    /// Reliability is part of the subject rather than an attribute of the
-    /// publication: `Topic::publisher()` can be resolved `.ordered()` or
-    /// `.latest()`, and the two are independent namespaces, so the same name
-    /// carries both without either claiming it. Putting the lane in the name
-    /// keeps that separation while still letting one table serve both, instead
-    /// of the paired registries it replaces.
-    data_patterns: crate::control::patterns::PatternTable<
-        (crate::track::Topic, StreamLane),
-        str0m::channel::ChannelId,
-        crate::control::patterns::DataAudience,
-    >,
     #[cfg(not(feature = "sim"))]
     steering: Option<crate::ebpf::Steering>,
 }
@@ -288,16 +268,13 @@ impl ControllerActor {
             cluster_id: 0,
             node_id: 0,
             state: ControlModel::new(shard_count),
-            video_patterns: crate::control::patterns::PatternTable::new(),
+            audiences: crate::control::patterns::PatternTable::new(),
             views,
-            compiled_plans: (0..shard_count).map(|_| HashMap::new()).collect(),
             catalog: crate::control::publication::Catalog::new(),
             lanes: Lanes::new(),
             pending: PendingSubscriptions::default(),
             pending_streams: PendingStreams::default(),
             pending_audio: Vec::new(),
-            audio_patterns: crate::control::patterns::PatternTable::new(),
-            data_patterns: crate::control::patterns::PatternTable::new(),
             #[cfg(not(feature = "sim"))]
             steering: None,
         }
@@ -669,47 +646,24 @@ impl ControllerActor {
             };
             view.stage(generation, op);
         }
-        let mut staged_plans: HashMap<
-            (crate::id::ShardId, crate::keys::TrackKey),
-            Option<crate::plan::ControlPlan>,
-        > = HashMap::new();
         let mut batches = (0..self.views.len())
             .map(|_| crate::plan::PlanBatch::default())
             .collect::<Vec<_>>();
         for request in generation_ops.plans {
-            let Some(shard_plans) = self.compiled_plans.get(request.shard.index()) else {
+            let Some(batch) = batches.get_mut(request.shard.index()) else {
                 debug_assert!(false, "a plan request must target a live shard");
                 self.abort_transaction(now);
                 return None;
             };
-            let old = match staged_plans.get(&(request.shard, request.key)) {
-                Some(Some(plan)) => Some(plan),
-                Some(None) => None,
-                None => shard_plans.get(&request.key),
-            };
-            let next = request.plan.as_ref().map(|plan| match old {
-                Some(old) => crate::plan::ControlPlan::from_target(old, plan),
-                None => crate::plan::ControlPlan::from_flat(plan),
+            batch.push(crate::plan::PlanOperation {
+                key: request.key,
+                plan: request.plan,
             });
-            let change = crate::plan::PlanChange::between(request.key, old, next.as_ref());
-            if change.remove && old.is_none() {
-                debug_assert!(false, "a plan cannot be removed before it exists");
-                continue;
-            }
-            if !change.is_empty() {
-                let Some(batch) = batches.get_mut(request.shard.index()) else {
-                    debug_assert!(false, "a plan request must target a live shard");
-                    self.abort_transaction(now);
-                    return None;
-                };
-                batch.push(change);
-            }
-            staged_plans.insert((request.shard, request.key), next);
         }
         for (index, batch) in batches.into_iter().enumerate() {
             if !batch.is_empty() {
                 let Some(view) = self.views.get_mut(index) else {
-                    debug_assert!(false, "a compiled plan must target a live view");
+                    debug_assert!(false, "a track plan operation must target a live view");
                     self.abort_transaction(now);
                     return None;
                 };
@@ -727,20 +681,6 @@ impl ControllerActor {
         if self.state.commit().is_err() {
             self.abort_transaction(now);
             return None;
-        }
-        for ((shard, key), plan) in staged_plans {
-            let Some(shard_plans) = self.compiled_plans.get_mut(shard.index()) else {
-                debug_assert!(false, "a committed plan must target a live shard");
-                continue;
-            };
-            match plan {
-                Some(plan) => {
-                    shard_plans.insert(key, plan);
-                }
-                None => {
-                    debug_assert!(shard_plans.remove(&key).is_some());
-                }
-            }
         }
         Some(reserved)
     }
@@ -1139,12 +1079,7 @@ impl ControllerActor {
                 let fanout = self.prepare_track_key(shard_id, track_id, track.meta().origin)?;
                 let track_id = track.id();
                 let origin_key = match track_id.kind() {
-                    crate::entity::TrackKind::Video => {
-                        crate::control::publication::RuntimeKey::Video(fanout)
-                    }
-                    crate::entity::TrackKind::Audio => {
-                        crate::control::publication::RuntimeKey::Audio(fanout)
-                    }
+                    crate::entity::TrackKind::Video | crate::entity::TrackKind::Audio => fanout,
                     crate::entity::TrackKind::Data => {
                         debug_assert!(false, "data does not publish through the track path");
                         self.state.remove_track(shard_id, fanout);
@@ -1290,13 +1225,13 @@ impl ControllerActor {
             .registry
             .bind_participant(&cfg.participant_id, binding);
         let _membership = crate::control::patterns::declare_audience(
-            &mut self.audio_patterns,
+            &mut self.audiences,
             crate::control::patterns::Pattern::all(room_id),
             cfg.participant_id,
             crate::control::patterns::Member {
                 shard: shard_id,
                 key: binding,
-                delivery: (),
+                delivery: crate::control::publication::AudienceDelivery::Audio,
             },
         );
 
@@ -1316,7 +1251,7 @@ impl ControllerActor {
             .is_err()
         {
             let _ = crate::control::patterns::retract_participant(
-                &mut self.audio_patterns,
+                &mut self.audiences,
                 &participant_id,
             );
             self.retire_transport(
@@ -1332,7 +1267,7 @@ impl ControllerActor {
         }
         if !materialized_rx.await.unwrap_or(false) {
             let _ = crate::control::patterns::retract_participant(
-                &mut self.audio_patterns,
+                &mut self.audiences,
                 &participant_id,
             );
             self.retire_transport(
@@ -1390,11 +1325,11 @@ impl ControllerActor {
         destination: crate::id::ShardId,
     ) {
         let group = self
-            .audio_patterns
+            .audiences
             .group_of(&crate::control::patterns::Pattern::all(room_id));
         let tracks: Vec<_> = group
             .into_iter()
-            .flat_map(|group| self.audio_patterns.publications_of(group))
+            .flat_map(|group| self.audiences.publications_of(group))
             .collect();
         for track_id in tracks {
             if !self.install_audio_destination(track_id, destination).await {

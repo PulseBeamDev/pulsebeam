@@ -142,14 +142,14 @@ impl ControllerActor {
         track_id: crate::entity::TrackId,
         destination: crate::id::ShardId,
     ) -> Option<(
-        crate::control::publication::RuntimeKey,
+        crate::keys::TrackKey,
         crate::route::RouteAction,
     )> {
         let publication = self.catalog.get(&track_id)?;
         let (id, origin) = (publication.id, publication.publisher);
         let key = self.prepare_track_key(destination, id, origin)?;
         Some((
-            crate::control::publication::RuntimeKey::Audio(key),
+            key,
             RouteAction::Forward { target: key },
         ))
     }
@@ -204,31 +204,26 @@ impl ControllerActor {
             debug_assert!(false, "track metadata room must match its origin");
             return;
         }
-        let pattern =
-            crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
-        let previous_member = self.video_patterns.member_key(&pattern, &subscriber);
+        let pattern = crate::control::patterns::Pattern::exact(
+            track.room_id,
+            track.origin,
+            crate::control::publication::AudienceName::Track(track.id),
+        );
+        let previous_member = self.audiences.member_key(&pattern, &subscriber);
         let (fanout, new_destination) = {
             let Some(binding) = self.catalog.get(&track.id) else {
                 debug_assert!(false, "a subscription must name a published track");
                 return;
             };
-            if let Some(fanout) = binding
-                .origin_key
-                .track()
-                .filter(|_| shard_id == binding.publisher_shard)
-            {
-                (fanout, false)
+            if shard_id == binding.publisher_shard {
+                (binding.origin_key, false)
             } else if let Some(destination) = binding.destinations.get(&shard_id) {
                 let (fanout, new_destination) = match destination {
                     crate::control::publication::Destination::Discovery { key } => (*key, true),
                     crate::control::publication::Destination::Forwarding {
-                        key: crate::control::publication::RuntimeKey::Video(key),
+                        key,
                         ..
                     } => (*key, false),
-                    crate::control::publication::Destination::Forwarding { .. } => {
-                        debug_assert!(false, "a video destination must carry a video key");
-                        return;
-                    }
                 };
                 (fanout, new_destination)
             } else {
@@ -248,13 +243,13 @@ impl ControllerActor {
             }
         };
         let (membership, displaced) = crate::control::patterns::declare_audience(
-            &mut self.video_patterns,
+            &mut self.audiences,
             pattern.clone(),
             subscriber,
             crate::control::patterns::Member {
                 shard: shard_id,
                 key: subscriber_key,
-                delivery: slot,
+                delivery: crate::control::publication::AudienceDelivery::Track(slot),
             },
         );
         self.index_publication(track.id);
@@ -275,7 +270,7 @@ impl ControllerActor {
                 .await
             else {
                 let _ = crate::control::patterns::retract_audience(
-                    &mut self.video_patterns,
+                    &mut self.audiences,
                     &pattern,
                     &subscriber,
                 );
@@ -304,7 +299,7 @@ impl ControllerActor {
                 pulsebeam_runtime::fatal!("a first video route must start from discovery");
             };
             *destination = crate::control::publication::Destination::Forwarding {
-                key: crate::control::publication::RuntimeKey::Video(key),
+                key,
                 route: handle,
             };
             route_installed = true;
@@ -375,9 +370,13 @@ impl ControllerActor {
         track: crate::track::TrackMeta,
     ) {
         let pattern =
-            crate::control::patterns::Pattern::exact(track.room_id, track.origin, track.id);
+            crate::control::patterns::Pattern::exact(
+                track.room_id,
+                track.origin,
+                crate::control::publication::AudienceName::Track(track.id),
+            );
         let departure = crate::control::patterns::retract_audience(
-            &mut self.video_patterns,
+            &mut self.audiences,
             &pattern,
             &subscriber,
         );
@@ -417,12 +416,12 @@ impl ControllerActor {
     ) -> Option<crate::shard::router::TrackKey> {
         let binding = self.catalog.get(&track_id)?;
         if shard_id == binding.publisher_shard {
-            binding.origin_key.track()
+            Some(binding.origin_key)
         } else {
             binding
                 .destinations
                 .get(&shard_id)
-                .and_then(|d| d.key().track())
+                .map(|d| d.key())
         }
     }
 
@@ -463,10 +462,10 @@ impl ControllerActor {
         track_id: crate::entity::TrackId,
         shard_id: crate::id::ShardId,
         fanout: crate::shard::router::TrackKey,
-        plan: crate::plan::FlatTrackPlan,
+        plan: crate::plan::TrackPlan,
     ) -> Option<RouteHandle> {
         let descriptor = self.track_descriptor(track_id, shard_id)?;
-        let recipients = plan.local.values().to_vec();
+        let recipients = plan.local.clone();
         let publication = descriptor.publication.clone();
         self.publish_with_route(shard_id, "video", move |_, handle| {
             let lifecycle = vec![
@@ -474,7 +473,10 @@ impl ControllerActor {
                     shard_id,
                     crate::view::ViewOp::InsertTrackRuntime {
                         key: fanout,
-                        runtime: crate::view::TrackRuntime::Media(descriptor),
+                        runtime: crate::view::TrackRuntime {
+                            descriptor: Some(descriptor),
+                            ..Default::default()
+                        },
                     },
                 ),
                 (
@@ -521,7 +523,7 @@ impl ControllerActor {
             return false;
         };
         let crate::control::publication::Destination::Forwarding {
-            key: crate::control::publication::RuntimeKey::Video(key),
+            key,
             route: current,
         } = *destination
         else {

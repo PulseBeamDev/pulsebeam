@@ -46,9 +46,9 @@ struct TrackRuntime {
     link_seq: u32,
 }
 
-/// Hand a packet to every destination-local recipient in a compiled plan.
-fn fanout_local(plan: &crate::plan::FlatTrackPlan, mut deliver: impl FnMut(ParticipantKey)) {
-    for &subscriber in plan.local.values() {
+/// Hand a packet to every destination-local recipient in an owned track plan.
+fn fanout_local(plan: &crate::plan::TrackPlan, mut deliver: impl FnMut(ParticipantKey)) {
+    for &subscriber in &plan.local {
         deliver(subscriber);
     }
 }
@@ -56,13 +56,13 @@ fn fanout_local(plan: &crate::plan::FlatTrackPlan, mut deliver: impl FnMut(Parti
 /// Forward a packet to the shards a plan routes to, numbering each hop so the
 /// destination can tell loss from reordering.
 fn fanout_remote(
-    plan: &crate::plan::FlatTrackPlan,
+    plan: &crate::plan::TrackPlan,
     link_seq: &mut u32,
     playout: u32,
     mut payload: impl FnMut() -> MediaPayload,
     ctx: &impl ShardTransport,
 ) {
-    for remote in plan.remote.values() {
+    for remote in &plan.remote {
         let env = Envelope::media(*remote, *link_seq, playout);
         *link_seq = link_seq.wrapping_add(1);
         ctx.send_media(remote.shard(), env, payload());
@@ -112,17 +112,16 @@ impl ShardRuntime {
                 debug_assert!(retired || self.routes.entry(*handle).is_none());
             }
             crate::view::ViewOp::InsertTrackRuntime { key, runtime } => {
-                let (id, origin_key, encodings, publisher) = match runtime {
-                    crate::view::TrackRuntime::Media(descriptor) => (
-                        Some(descriptor.id),
-                        descriptor.origin_key,
-                        descriptor.encodings.clone(),
-                        None,
-                    ),
-                    crate::view::TrackRuntime::Data { publisher, .. } => {
-                        (None, publisher.unwrap_or_default(), Vec::new(), *publisher)
-                    }
-                };
+                let descriptor = runtime.descriptor.as_ref();
+                let id = descriptor.map(|descriptor| descriptor.id);
+                let origin_key = descriptor
+                    .map(|descriptor| descriptor.origin_key)
+                    .or(runtime.publisher)
+                    .unwrap_or_default();
+                let encodings = descriptor
+                    .map(|descriptor| descriptor.encodings.clone())
+                    .unwrap_or_default();
+                let publisher = runtime.publisher;
                 let key = *key;
                 if let Some(previous) = self.tracks.get(key) {
                     debug_assert_eq!(
@@ -142,10 +141,8 @@ impl ShardRuntime {
                     TrackRuntime {
                         id,
                         origin_key,
+                        cache: (!encodings.is_empty()).then(TrackStreamCache::new),
                         encodings,
-                        cache: id
-                            .is_some_and(|id| id.kind() == crate::entity::TrackKind::Video)
-                            .then(TrackStreamCache::new),
                         publisher,
                         link_seq: 0,
                     },
@@ -181,7 +178,7 @@ impl ShardRuntime {
         key: TrackKey,
         origin: Origin,
         pkt: RtpPacket,
-        plan: &crate::plan::FlatTrackPlan,
+        plan: &crate::plan::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         let Some(runtime) = self.tracks.get_mut(key) else {
@@ -227,7 +224,7 @@ impl ShardRuntime {
         key: TrackKey,
         origin: Origin,
         packet: RoutedTrackPacket,
-        plan: &crate::plan::FlatTrackPlan,
+        plan: &crate::plan::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         debug_assert_eq!(packet.key, key);
@@ -247,7 +244,7 @@ impl ShardRuntime {
         stream: TrackKey,
         origin: Origin,
         packet: Vec<u8>,
-        plan: &crate::plan::FlatTrackPlan,
+        plan: &crate::plan::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         let Some(runtime) = self.tracks.get_mut(stream) else {
@@ -277,7 +274,7 @@ impl ShardRuntime {
         stream: TrackKey,
         origin: Origin,
         frame: Vec<u8>,
-        plan: &crate::plan::FlatTrackPlan,
+        plan: &crate::plan::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         debug_assert!(!frame.is_empty());
@@ -316,7 +313,7 @@ impl ShardRuntime {
     pub fn route_reliable_control(
         &self,
         bytes: Vec<u8>,
-        plan: &crate::plan::FlatTrackPlan,
+        plan: &crate::plan::TrackPlan,
         router: &impl ShardTransport,
     ) {
         let Some(target) = plan.reverse_route else {
@@ -401,11 +398,17 @@ mod tests {
 
         runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
             key,
-            runtime: crate::view::TrackRuntime::Media(descriptor(track_id, origin_key, "q")),
+            runtime: crate::view::TrackRuntime {
+                descriptor: Some(descriptor(track_id, origin_key, "q")),
+                ..Default::default()
+            },
         });
         runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
             key,
-            runtime: crate::view::TrackRuntime::Media(descriptor(track_id, origin_key, "f")),
+            runtime: crate::view::TrackRuntime {
+                descriptor: Some(descriptor(track_id, origin_key, "f")),
+                ..Default::default()
+            },
         });
 
         assert_eq!(
@@ -421,9 +424,10 @@ mod tests {
         let key = keys.insert(());
         let op = crate::view::ViewOp::InsertTrackRuntime {
             key,
-            runtime: crate::view::TrackRuntime::Data {
+            runtime: crate::view::TrackRuntime {
                 publisher: None,
                 publisher_effect: None,
+                ..Default::default()
             },
         };
 
@@ -443,7 +447,7 @@ mod tests {
         };
         let target =
             crate::route::RouteHandle::new(crate::route::RouteId::new(ShardId::new(2), 9), 1);
-        let plan = crate::plan::FlatTrackPlan {
+        let plan = crate::plan::TrackPlan {
             reverse_route: Some(target),
             ..Default::default()
         };

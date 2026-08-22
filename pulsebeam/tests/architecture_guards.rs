@@ -47,7 +47,7 @@ fn deleted_types_stay_deleted() {
 }
 
 #[test]
-fn left_right_stays_in_the_plan_publication_module() {
+fn stale_plan_publication_symbols_stay_deleted() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -62,10 +62,16 @@ fn left_right_stays_in_the_plan_publication_module() {
             continue;
         }
         let text = fs::read_to_string(&file).unwrap();
-        if text.contains("left_right") {
+        for name in [
+            "PlanReader",
+            "FlatPlanPublisher",
+            "PlanChange",
+            "ControlPlan",
+            "FlatPlans",
+        ] {
             assert!(
-                file.ends_with(Path::new("pulsebeam/src/plan.rs")),
-                "left-right publication must stay isolated: {file:?}"
+                !text.contains(name),
+                "stale plan machinery {name} in {file:?}"
             );
         }
     }

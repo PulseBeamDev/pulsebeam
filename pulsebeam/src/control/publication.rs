@@ -18,49 +18,23 @@ use crate::id::ShardId;
 use crate::keys::{ParticipantKey, TrackKey};
 use crate::route::RouteHandle;
 
-/// A publication's key in one shard's arena, whichever arena that is.
-///
-/// The variant is the arena. Video and audio share `tracks`; the data lanes
-/// have their own, which is the only thing about a lane the routing layer still
-/// needs to know.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum AudienceName {
+    Track(TrackId),
+    Data {
+        topic: crate::track::Topic,
+        lane: crate::track::DataLane,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RuntimeKey {
-    Video(TrackKey),
-    Audio(TrackKey),
-    Unreliable(TrackKey),
-    Reliable(TrackKey),
-}
-
-impl RuntimeKey {
-    pub fn track(self) -> Option<TrackKey> {
-        match self {
-            Self::Video(key) => Some(key),
-            Self::Audio(key) => Some(key),
-            _ => None,
-        }
-    }
-
-    /// The data arenas' key, likewise. `RuntimeStreamKey` is the compiled form
-    /// the shard already speaks; this is the same distinction seen from the
-    /// catalog, where a media key is also possible.
-    pub fn stream(self) -> Option<crate::control::state::RuntimeStreamKey> {
-        use crate::control::state::RuntimeStreamKey;
-        match self {
-            Self::Unreliable(key) => Some(RuntimeStreamKey::Unreliable(key)),
-            Self::Reliable(key) => Some(RuntimeStreamKey::Reliable(key)),
-            Self::Video(_) | Self::Audio(_) => None,
-        }
-    }
-}
-
-impl From<crate::control::state::RuntimeStreamKey> for RuntimeKey {
-    fn from(key: crate::control::state::RuntimeStreamKey) -> Self {
-        use crate::control::state::RuntimeStreamKey;
-        match key {
-            RuntimeStreamKey::Unreliable(key) => Self::Unreliable(key),
-            RuntimeStreamKey::Reliable(key) => Self::Reliable(key),
-        }
-    }
+pub(crate) enum AudienceDelivery {
+    Track(crate::keys::DownstreamSlotKey),
+    Audio,
+    Data {
+        channel: str0m::channel::ChannelId,
+        lane: crate::track::DataLane,
+    },
 }
 
 /// One shard that receives this publication: what it calls it there, and the
@@ -73,13 +47,13 @@ impl From<crate::control::state::RuntimeStreamKey> for RuntimeKey {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Destination {
     Discovery { key: TrackKey },
-    Forwarding { key: RuntimeKey, route: RouteHandle },
+    Forwarding { key: TrackKey, route: RouteHandle },
 }
 
 impl Destination {
-    pub(crate) fn key(self) -> RuntimeKey {
+    pub(crate) fn key(self) -> TrackKey {
         match self {
-            Self::Discovery { key } => RuntimeKey::Video(key),
+            Self::Discovery { key } => key,
             Self::Forwarding { key, .. } => key,
         }
     }
@@ -110,7 +84,7 @@ pub(crate) struct Publication {
     pub publisher: ParticipantId,
     pub publisher_shard: ShardId,
     pub publisher_key: ParticipantKey,
-    pub origin_key: RuntimeKey,
+    pub origin_key: TrackKey,
     pub reverse_route: Option<RouteHandle>,
     pub destinations: IndexMap<ShardId, Destination>,
     pub media: Media,
@@ -141,6 +115,24 @@ impl Publication {
             _ => None,
         }
     }
+
+    pub fn audience_name(&self) -> AudienceName {
+        match &self.media {
+            Media::Data { topic, lane } => AudienceName::Data {
+                topic: topic.clone(),
+                lane: *lane,
+            },
+            Media::Audio | Media::Video { .. } => AudienceName::Track(self.id),
+        }
+    }
+
+    pub fn audience_subject(&self) -> crate::control::patterns::Subject<AudienceName> {
+        crate::control::patterns::Subject {
+            room: self.room,
+            publisher: self.publisher,
+            name: self.audience_name(),
+        }
+    }
 }
 
 /// Compile a publication's forwarding plan for one shard.
@@ -155,7 +147,7 @@ pub(crate) fn forwarding_plan(
     reverse_route: Option<RouteHandle>,
     recipients: Vec<ParticipantKey>,
     shard: ShardId,
-) -> crate::plan::FlatTrackPlan {
+) -> crate::plan::TrackPlan {
     let remote_routes = if shard == publisher_shard {
         destinations
             .iter()
@@ -172,18 +164,18 @@ pub(crate) fn forwarding_plan(
     } else {
         Vec::new()
     };
-    let mut plan = crate::plan::FlatTrackPlan::default();
-    plan.local = crate::plan::DenseMembership::from_values(recipients.into_iter().filter(|key| {
-        let loopback = shard == publisher_shard && *key == publisher_key;
-        debug_assert!(
-            !loopback,
-            "the control plane must never compile loopback forwarding"
-        );
-        !loopback
-    }));
-    plan.remote = crate::plan::DenseMembership::from_values(remote_routes);
-    plan.reverse_route = reverse_route;
-    plan
+    crate::plan::TrackPlan::new(
+        recipients.into_iter().filter(|key| {
+            let loopback = shard == publisher_shard && *key == publisher_key;
+            debug_assert!(
+                !loopback,
+                "the control plane must never compile loopback forwarding"
+            );
+            !loopback
+        }),
+        remote_routes,
+        reverse_route,
+    )
 }
 
 /// Every publication on the node, with the indexes a declaration needs to find
@@ -351,7 +343,7 @@ mod tests {
             publisher: pid(publisher),
             publisher_shard: ShardId::new(0),
             publisher_key: ParticipantKey::default(),
-            origin_key: RuntimeKey::Audio(TrackKey::default()),
+            origin_key: TrackKey::default(),
             reverse_route: None,
             destinations: IndexMap::new(),
             media: Media::Audio,
@@ -367,7 +359,7 @@ mod tests {
             publisher: pid(publisher),
             publisher_shard: ShardId::new(0),
             publisher_key: ParticipantKey::default(),
-            origin_key: RuntimeKey::Unreliable(TrackKey::default()),
+            origin_key: TrackKey::default(),
             reverse_route: None,
             destinations: IndexMap::new(),
             media: Media::Data { lane, topic },

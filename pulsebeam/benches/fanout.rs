@@ -17,6 +17,8 @@
 #![allow(clippy::disallowed_types, clippy::print_stdout)]
 
 use std::hint::black_box;
+use std::sync::mpsc::sync_channel;
+use std::thread;
 use std::time::Instant;
 
 use pulsebeam::entity::{ParticipantId, TrackKind};
@@ -43,6 +45,36 @@ fn main() {
 
     route_lookup(iters);
     packet_clone(iters);
+    forwarding_residence(iters);
+}
+
+fn forwarding_residence(iters: u32) {
+    let samples = usize::try_from(iters.max(10_000)).unwrap_or(10_000);
+    let (tx, rx) = sync_channel::<Option<(Instant, [u8; 1200])>>(4096);
+    let worker = thread::spawn(move || {
+        let mut residence = Vec::with_capacity(samples);
+        while let Ok(Some((enqueued_at, packet))) = rx.recv() {
+            black_box(packet);
+            residence.push(enqueued_at.elapsed().as_nanos());
+        }
+        residence
+    });
+    for _ in 0..samples {
+        tx.send(Some((Instant::now(), [0; 1200]))).unwrap();
+    }
+    tx.send(None).unwrap();
+    let mut residence = worker.join().unwrap();
+    residence.sort_unstable();
+    let rank = samples
+        .saturating_mul(9_999)
+        .div_ceil(10_000)
+        .saturating_sub(1)
+        .min(residence.len().saturating_sub(1));
+    println!(
+        "real-worker forwarding residence P99.99 {:>7.2} us ({} samples; wall-clock only)",
+        residence[rank] as f64 / 1_000.0,
+        residence.len()
+    );
 }
 
 /// What the local fanout does per packet to find a route the envelope had

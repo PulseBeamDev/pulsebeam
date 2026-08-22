@@ -37,29 +37,6 @@ impl ControllerActor {
                 );
             }
         }
-        let departures =
-            crate::control::patterns::retract_participant(&mut self.data_patterns, participant_id);
-        let mut affected = indexmap::IndexSet::new();
-        for (pattern, _) in departures {
-            let Some((topic, lane)) = pattern.name else {
-                debug_assert!(false, "a data declaration names its topic");
-                continue;
-            };
-            let ids = match pattern.publisher {
-                Some(publisher) => vec![crate::control::state::DataStreamId::new(
-                    pattern.room,
-                    publisher,
-                    topic,
-                )],
-                None => self.streams_on_topic(pattern.room, &topic, lane),
-            };
-            for id in ids {
-                affected.insert((id, lane));
-            }
-        }
-        for (id, lane) in affected {
-            self.reconcile_stream(id, lane).await;
-        }
     }
 
     pub(super) async fn retire_participant_tracks(&mut self, participant_id: &ParticipantId) {
@@ -90,16 +67,51 @@ impl ControllerActor {
         &mut self,
         participant_id: &ParticipantId,
     ) {
-        let video =
-            crate::control::patterns::retract_participant(&mut self.video_patterns, participant_id);
-        let audio_tracks: indexmap::IndexSet<_> = self
-            .audio_patterns
-            .declarations_of(participant_id)
-            .into_iter()
-            .flat_map(|pattern| self.audio_patterns.publications_of_pattern(&pattern))
+        let departures =
+            crate::control::patterns::retract_participant(&mut self.audiences, participant_id);
+        let video: Vec<_> = departures
+            .iter()
+            .filter_map(|(pattern, departure)| match pattern.name {
+                Some(crate::control::publication::AudienceName::Track(track_id))
+                    if self.catalog.get(&track_id).is_some_and(|p| p.kind() == crate::entity::TrackKind::Video) =>
+                {
+                    Some((crate::control::patterns::Pattern {
+                        room: pattern.room,
+                        publisher: pattern.publisher,
+                        name: Some(crate::control::publication::AudienceName::Track(track_id)),
+                    }, *departure))
+                }
+                _ => None,
+            })
             .collect();
-        let _ =
-            crate::control::patterns::retract_participant(&mut self.audio_patterns, participant_id);
+        let audio_tracks: indexmap::IndexSet<_> = departures
+            .iter()
+            .filter_map(|(pattern, _)| match pattern.name {
+                Some(crate::control::publication::AudienceName::Track(track_id))
+                    if self.catalog.get(&track_id).is_some_and(|p| p.kind() == crate::entity::TrackKind::Audio) =>
+                {
+                    Some(track_id)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut data_streams = indexmap::IndexSet::new();
+        for (pattern, _) in &departures {
+            let Some(crate::control::publication::AudienceName::Data { topic, lane }) =
+                pattern.name.clone()
+            else {
+                continue;
+            };
+            let ids = match pattern.publisher {
+                Some(publisher) => vec![crate::control::state::DataStreamId::new(
+                    pattern.room,
+                    publisher,
+                    topic,
+                )],
+                None => self.streams_on_topic(pattern.room, &topic, lane.into()),
+            };
+            data_streams.extend(ids.into_iter().map(|id| (id, lane)));
+        }
 
         // A video route is per (track, shard) and only retires with the last
         // consumer on that shard, which is what LastOnShard reports.
@@ -113,7 +125,9 @@ impl ControllerActor {
                 if departure != crate::control::patterns::Departure::LastOnShard {
                     continue;
                 }
-                let Some(track_id) = pattern.name else {
+                let Some(crate::control::publication::AudienceName::Track(track_id)) =
+                    pattern.name
+                else {
                     continue;
                 };
                 let Some(route) = self.catalog.get(&track_id).and_then(|binding| {
@@ -137,6 +151,9 @@ impl ControllerActor {
         for track_id in audio_tracks {
             self.retire_stale_destinations(track_id).await;
             let _ = self.publish_publication(track_id).await;
+        }
+        for (id, lane) in data_streams {
+            self.reconcile_stream(id, lane.into()).await;
         }
         self.pending.remove_participant(*participant_id);
     }

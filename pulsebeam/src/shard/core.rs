@@ -27,7 +27,7 @@ use crate::{
 
 pub(crate) use super::router::ShardTransport;
 use super::worker::{
-    MediaPayload, Reverse, SHARD_PLAN_CHANGE_BUDGET, ShardCommand, ShardEvent, ShardFrame,
+    MediaPayload, Reverse, SHARD_PLAN_OPERATION_BUDGET, ShardCommand, ShardEvent, ShardFrame,
 };
 
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
@@ -92,7 +92,7 @@ pub(crate) struct ShardCore {
     pending_participant_effects: VecDeque<(ParticipantKey, crate::participant::ParticipantEffect)>,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
-    plans: crate::plan::FlatPlans,
+    plans: crate::plan::TrackPlans,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -142,7 +142,7 @@ impl ShardCore {
             pending_participant_effects: VecDeque::new(),
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             runtime,
-            plans: crate::plan::FlatPlans::default(),
+            plans: crate::plan::TrackPlans::default(),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -204,16 +204,16 @@ impl ShardCore {
             }
             let end = self
                 .pending_plan_index
-                .saturating_add(SHARD_PLAN_CHANGE_BUDGET)
-                .min(delta.plans.changes.len());
+                .saturating_add(SHARD_PLAN_OPERATION_BUDGET)
+                .min(delta.plans.operations.len());
             let mut touched = 0;
-            for change in &delta.plans.changes[self.pending_plan_index..end] {
-                self.plans.apply_change(change, &mut touched);
+            for operation in &delta.plans.operations[self.pending_plan_index..end] {
+                self.plans.apply(operation, &mut touched);
             }
             self.pending_plan_index = end;
             #[cfg(feature = "sim")]
             crate::sim_metrics::record_routing_work("plan_entries_touched", touched);
-            if self.pending_plan_index < delta.plans.changes.len() {
+            if self.pending_plan_index < delta.plans.operations.len() {
                 self.pending_view_delta = Some(delta);
                 break;
             }
@@ -285,23 +285,19 @@ impl ShardCore {
             }
             crate::view::ViewOp::InsertTrackRuntime { runtime, .. } => {
                 self.runtime.apply_view_op(op);
-                let crate::view::TrackRuntime::Data {
-                    publisher: Some(publisher),
-                    publisher_effect: Some(effect),
-                    ..
-                } = runtime
-                else {
-                    return;
-                };
-                let Some(meta) = self.registry.resolve_mut(*publisher) else {
-                    debug_assert!(
-                        false,
-                        "a data publisher must be live shard={} key={:?}",
-                        self.shard_id, publisher
-                    );
-                    return;
-                };
-                meta.apply(effect.clone());
+                if let (Some(publisher), Some(effect)) =
+                    (runtime.publisher, runtime.publisher_effect.as_ref())
+                {
+                    let Some(meta) = self.registry.resolve_mut(publisher) else {
+                        debug_assert!(
+                            false,
+                            "a published topic must be live shard={} key={:?}",
+                            self.shard_id, publisher
+                        );
+                        return;
+                    };
+                    meta.apply(effect.clone());
+                }
             }
             crate::view::ViewOp::RemoveTrackRuntime { .. } => self.runtime.apply_view_op(op),
             crate::view::ViewOp::BindTrack {
@@ -581,7 +577,7 @@ impl ShardCore {
                             continue;
                         };
                         let Some(plan) = self.plans.get(stream) else {
-                            debug_assert!(false, "reliable control has no compiled plan");
+                            debug_assert!(false, "reliable control has no owned track plan");
                             continue;
                         };
                         self.runtime.route_reliable_control(bytes, plan, router);
@@ -719,7 +715,11 @@ impl ShardCore {
                 }
                 self.on_owned_udp_batch(batch, handle, source_shard);
             }
-            ShardFrame::Media { env, payload } => {
+            ShardFrame::Media {
+                env,
+                payload,
+                enqueued_at: _,
+            } => {
                 self.on_media_frame(env, payload, now, router);
             }
             ShardFrame::Reverse { env, body } => self.on_reverse_frame(env, body),
@@ -996,13 +996,9 @@ mod wrong_owner_tests {
             },
         );
         let mut plans = crate::plan::PlanBatch::default();
-        plans.push(crate::plan::PlanChange {
+        plans.push(crate::plan::PlanOperation {
             key: track,
-            create: true,
-            remove: false,
-            local: crate::plan::MembershipDelta::default(),
-            remote: crate::plan::MembershipDelta::default(),
-            reverse: crate::plan::ReverseRouteChange::Unchanged,
+            plan: Some(crate::plan::TrackPlan::default()),
         });
         writer.stage_plans(1, plans);
         assert_eq!(writer.publish(), Some(1));

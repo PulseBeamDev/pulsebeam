@@ -29,13 +29,11 @@ pub(crate) struct TrackDescriptor {
     pub publication: crate::track::Track,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum TrackRuntime {
-    Media(TrackDescriptor),
-    Data {
-        publisher: Option<ParticipantKey>,
-        publisher_effect: Option<crate::participant::ParticipantEffect>,
-    },
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TrackRuntime {
+    pub descriptor: Option<TrackDescriptor>,
+    pub publisher: Option<ParticipantKey>,
+    pub publisher_effect: Option<crate::participant::ParticipantEffect>,
 }
 
 #[derive(Debug, Default)]
@@ -237,7 +235,7 @@ impl ShardViewWriter {
         if commit.generation != generation {
             pulsebeam_runtime::fatal!("a shard generation cannot mix plan generations");
         }
-        commit.plans.changes.extend(plans.changes);
+        commit.plans.operations.extend(plans.operations);
     }
 
     pub fn abort(&mut self) {
@@ -337,13 +335,9 @@ mod tests {
         let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
         let key = keys.insert(());
         let mut batch = PlanBatch::default();
-        batch.push(crate::plan::PlanChange {
+        batch.push(crate::plan::PlanOperation {
             key,
-            create: true,
-            remove: false,
-            local: crate::plan::MembershipDelta::default(),
-            remote: crate::plan::MembershipDelta::default(),
-            reverse: crate::plan::ReverseRouteChange::Unchanged,
+            plan: Some(crate::plan::TrackPlan::default()),
         });
         (key, batch)
     }
@@ -361,7 +355,7 @@ mod tests {
         assert_eq!(commit.shard, shard);
         assert_eq!(commit.generation, 7);
         assert_eq!(commit.lifecycle.len(), 1);
-        assert_eq!(commit.plans.changes.len(), 1);
+        assert_eq!(commit.plans.operations.len(), 1);
     }
 
     #[test]

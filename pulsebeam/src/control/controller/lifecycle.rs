@@ -7,49 +7,19 @@
 
 use super::*;
 
-pub(super) fn plan_removal(key: crate::control::publication::RuntimeKey) -> crate::keys::TrackKey {
-    use crate::control::publication::RuntimeKey;
-    match key {
-        RuntimeKey::Video(key) => key,
-        RuntimeKey::Audio(key) => key,
-        RuntimeKey::Unreliable(key) => key,
-        RuntimeKey::Reliable(key) => key,
-    }
-}
-
 /// The op that removes a publication's runtime from the arena its key names.
 pub(super) fn runtime_removal_op(
-    key: crate::control::publication::RuntimeKey,
+    key: crate::keys::TrackKey,
 ) -> crate::view::ViewOp {
-    use crate::control::publication::RuntimeKey;
-    match key {
-        RuntimeKey::Video(key) => crate::view::ViewOp::RemoveTrackRuntime { key },
-        RuntimeKey::Audio(key) => crate::view::ViewOp::RemoveTrackRuntime { key },
-        RuntimeKey::Unreliable(key) | RuntimeKey::Reliable(key) => {
-            crate::view::ViewOp::RemoveTrackRuntime { key }
-        }
-    }
+    crate::view::ViewOp::RemoveTrackRuntime { key }
 }
 
 pub(super) fn remove_runtime_key(
     state: &mut crate::control::state::ControlModel,
     shard: crate::id::ShardId,
-    key: crate::control::publication::RuntimeKey,
+    key: crate::keys::TrackKey,
 ) {
-    match key {
-        crate::control::publication::RuntimeKey::Video(key) => {
-            state.remove_track(shard, key);
-        }
-        crate::control::publication::RuntimeKey::Audio(key) => {
-            state.remove_track(shard, key);
-        }
-        crate::control::publication::RuntimeKey::Unreliable(key) => {
-            state.remove_data(shard, key);
-        }
-        crate::control::publication::RuntimeKey::Reliable(key) => {
-            state.remove_reliable(shard, key);
-        }
-    }
+    state.remove_track(shard, key);
 }
 
 impl ControllerActor {
@@ -58,78 +28,16 @@ impl ControllerActor {
             debug_assert!(false, "an indexed publication must exist in the catalog");
             return;
         };
-        let room = publication.room;
-        let publisher = publication.publisher;
-        match &publication.media {
-            crate::control::publication::Media::Video { .. } => {
-                self.video_patterns.attach_publication(
-                    &crate::control::patterns::Subject {
-                        room,
-                        publisher,
-                        name: id,
-                    },
-                    id,
-                );
-            }
-            crate::control::publication::Media::Audio => {
-                self.audio_patterns.attach_publication(
-                    &crate::control::patterns::Subject {
-                        room,
-                        publisher,
-                        name: id,
-                    },
-                    id,
-                );
-            }
-            crate::control::publication::Media::Data { lane, topic } => {
-                self.data_patterns.attach_publication(
-                    &crate::control::patterns::Subject {
-                        room,
-                        publisher,
-                        name: (topic.clone(), (*lane).into()),
-                    },
-                    id,
-                );
-            }
-        }
+        self.audiences
+            .attach_publication(&publication.audience_subject(), id);
     }
 
     pub(super) fn unindex_publication(&mut self, id: crate::entity::TrackId) {
         let Some(publication) = self.catalog.get(&id) else {
             return;
         };
-        let room = publication.room;
-        let publisher = publication.publisher;
-        match &publication.media {
-            crate::control::publication::Media::Video { .. } => {
-                self.video_patterns.detach_publication(
-                    &crate::control::patterns::Subject {
-                        room,
-                        publisher,
-                        name: id,
-                    },
-                    id,
-                );
-            }
-            crate::control::publication::Media::Audio => self.audio_patterns.detach_publication(
-                &crate::control::patterns::Subject {
-                    room,
-                    publisher,
-                    name: id,
-                },
-                id,
-            ),
-            crate::control::publication::Media::Data { lane, topic } => {
-                self.data_patterns.detach_publication(
-                    &crate::control::patterns::Subject {
-                        room,
-                        publisher,
-                        name: (topic.clone(), (*lane).into()),
-                    },
-                    id,
-                );
-            }
-        }
+        self.audiences
+            .detach_publication(&publication.audience_subject(), id);
     }
 
     /// Retire a publication of any kind: its declarations, its routes, its
@@ -151,12 +59,16 @@ impl ControllerActor {
         let room = publication.room;
         let publisher = publication.publisher;
         self.unindex_publication(id);
-        let retired_pattern = crate::control::patterns::Pattern::exact(room, publisher, id);
+        let retired_pattern = crate::control::patterns::Pattern::exact(
+            room,
+            publisher,
+            crate::control::publication::AudienceName::Track(id),
+        );
 
         // A video track's subscribers named it directly and never unsubscribe
         // from something that goes away, so their declarations go with it.
         if kind == crate::entity::TrackKind::Video {
-            let _ = self.video_patterns.retire_pattern(&retired_pattern);
+            let _ = self.audiences.retire_pattern(&retired_pattern);
         }
 
         let mut releases = Vec::new();
@@ -175,14 +87,12 @@ impl ControllerActor {
             ));
             releases.push((publisher_shard, route));
         }
-        generation_ops = generation_ops.remove_plan(publisher_shard, plan_removal(origin_key));
-        if let Some(track_key) = origin_key.track() {
-            generation_ops = generation_ops.participant_effect(
-                publisher_shard,
-                publisher_key,
-                crate::participant::ParticipantEffect::TrackRemoved(track_key),
-            );
-        }
+        generation_ops = generation_ops.remove_plan(publisher_shard, origin_key);
+        generation_ops = generation_ops.participant_effect(
+            publisher_shard,
+            publisher_key,
+            crate::participant::ParticipantEffect::TrackRemoved(origin_key),
+        );
         generation_ops
             .lifecycle
             .push((publisher_shard, runtime_removal_op(origin_key)));
@@ -214,7 +124,7 @@ impl ControllerActor {
         for (shard, held) in &publication.destinations {
             let (key, route) = match held {
                 crate::control::publication::Destination::Discovery { key } => {
-                    (crate::control::publication::RuntimeKey::Video(*key), None)
+                    (*key, None)
                 }
                 crate::control::publication::Destination::Forwarding { key, route } => {
                     (*key, Some(*route))
@@ -296,7 +206,7 @@ impl ControllerActor {
         &self,
         publication: &crate::control::publication::Publication,
         shard: crate::id::ShardId,
-        key: crate::control::publication::RuntimeKey,
+        key: crate::keys::TrackKey,
     ) -> Vec<(crate::id::ShardId, crate::view::ViewOp)> {
         let crate::control::publication::Media::Data { lane, topic } = &publication.media else {
             return Vec::new();
@@ -304,51 +214,43 @@ impl ControllerActor {
         let subject = crate::control::patterns::Subject {
             room: publication.room,
             publisher: publication.publisher,
-            name: (topic.clone(), (*lane).into()),
+            name: crate::control::publication::AudienceName::Data {
+                topic: topic.clone(),
+                lane: *lane,
+            },
         };
-        let members = self.data_patterns.members_for(
-            self.data_patterns.match_subject(&subject),
+        let members = self.audiences.members_for(
+            self.audiences.match_subject(&subject),
             shard,
             publication.publisher,
         );
-        match key.stream() {
-            Some(crate::control::state::RuntimeStreamKey::Unreliable(stream)) => members
-                .into_iter()
-                .map(|(participant, channel)| {
-                    (
-                        shard,
-                        crate::view::ViewOp::BindTrack {
-                            participant,
-                            key: stream,
-                            channel,
-                            lane: crate::track::DataLane::Realtime,
-                        },
-                    )
-                })
-                .collect(),
-            Some(crate::control::state::RuntimeStreamKey::Reliable(stream)) => members
-                .into_iter()
-                .map(|(participant, channel)| {
-                    (
-                        shard,
-                        crate::view::ViewOp::BindTrack {
-                            participant,
-                            key: stream,
-                            channel,
-                            lane: crate::track::DataLane::Reliable,
-                        },
-                    )
-                })
-                .collect(),
-            None => Vec::new(),
-        }
+        members
+            .into_iter()
+            .filter_map(|(participant, delivery)| {
+                let crate::control::publication::AudienceDelivery::Data { channel, lane: _ } =
+                    delivery
+                else {
+                    debug_assert!(false, "a data subject must have data delivery metadata");
+                    return None;
+                };
+                Some((
+                    shard,
+                    crate::view::ViewOp::BindTrack {
+                        participant,
+                        key,
+                        channel,
+                        lane: *lane,
+                    },
+                ))
+            })
+            .collect()
     }
 
     fn publication_ops(
         &self,
         id: crate::entity::TrackId,
         shard: crate::id::ShardId,
-        key: crate::control::publication::RuntimeKey,
+        key: crate::keys::TrackKey,
         route: Option<RouteHandle>,
     ) -> Option<super::GenerationOps> {
         let publication = self.catalog.get(&id)?;
@@ -357,11 +259,10 @@ impl ControllerActor {
         let mut install_plan = true;
         match (&publication.media, key) {
             (
-                crate::control::publication::Media::Data { topic, .. },
-                crate::control::publication::RuntimeKey::Unreliable(_)
-                | crate::control::publication::RuntimeKey::Reliable(_),
+                crate::control::publication::Media::Data { topic, lane },
+                _,
             ) => {
-                let stream = key.stream()?;
+                let stream = key;
                 let stream_id = crate::control::state::DataStreamId::new(
                     publication.room,
                     publication.publisher,
@@ -369,10 +270,11 @@ impl ControllerActor {
                 );
                 ops.lifecycle.push((
                     shard,
-                    super::stream_lifecycle::insert_stream_runtime_op(
-                        stream,
-                        stream_id,
-                        (shard == publication.publisher_shard).then_some(publication.publisher_key),
+                        super::stream_lifecycle::insert_stream_runtime_op(
+                            stream,
+                            stream_id,
+                            (*lane).into(),
+                            (shard == publication.publisher_shard).then_some(publication.publisher_key),
                     ),
                 ));
                 if let Some(route) = route {
@@ -385,7 +287,7 @@ impl ControllerActor {
             }
             (
                 crate::control::publication::Media::Video { .. },
-                crate::control::publication::RuntimeKey::Video(fanout),
+                fanout,
             ) => {
                 let descriptor = self.track_descriptor(id, shard)?;
                 if shard != publication.publisher_shard && route.is_none() {
@@ -430,14 +332,17 @@ impl ControllerActor {
                         shard,
                         crate::view::ViewOp::InsertTrackRuntime {
                             key: fanout,
-                            runtime: crate::view::TrackRuntime::Media(descriptor),
+                            runtime: crate::view::TrackRuntime {
+                                descriptor: Some(descriptor),
+                                ..Default::default()
+                            },
                         },
                     ));
                 }
             }
             (
                 crate::control::publication::Media::Audio,
-                crate::control::publication::RuntimeKey::Audio(fanout),
+                fanout,
             ) => {
                 let descriptor = self.track_descriptor(id, shard)?;
                 let recipients = self.room_recipients(publication.room, shard);
@@ -468,13 +373,12 @@ impl ControllerActor {
                     shard,
                     crate::view::ViewOp::InsertTrackRuntime {
                         key: fanout,
-                        runtime: crate::view::TrackRuntime::Media(descriptor),
+                        runtime: crate::view::TrackRuntime {
+                            descriptor: Some(descriptor),
+                            ..Default::default()
+                        },
                     },
                 ));
-            }
-            _ => {
-                debug_assert!(false, "a publication target must match its media kind");
-                return None;
             }
         }
         if install_plan {
@@ -490,7 +394,7 @@ impl ControllerActor {
             &mut Self,
             crate::id::ShardId,
         ) -> Option<(
-            crate::control::publication::RuntimeKey,
+            crate::keys::TrackKey,
             crate::route::RouteAction,
         )>,
     ) -> bool {
@@ -519,7 +423,7 @@ impl ControllerActor {
             &mut Self,
             crate::id::ShardId,
         ) -> Option<(
-            crate::control::publication::RuntimeKey,
+            crate::keys::TrackKey,
             crate::route::RouteAction,
         )>,
     ) -> bool {
@@ -591,14 +495,12 @@ impl ControllerActor {
         };
         let mut ops = super::GenerationOps::lifecycle(Vec::with_capacity(3));
         let key = held.key();
-        if let Some(track_key) = key.track() {
-            for participant in self.room_recipients(room_id, destination) {
-                ops.push_participant_effect(
-                    destination,
-                    participant,
-                    crate::participant::ParticipantEffect::TrackRemoved(track_key),
-                );
-            }
+        for participant in self.room_recipients(room_id, destination) {
+            ops.push_participant_effect(
+                destination,
+                participant,
+                crate::participant::ParticipantEffect::TrackRemoved(key),
+            );
         }
         let route = match held {
             crate::control::publication::Destination::Discovery { .. } => None,
@@ -607,7 +509,7 @@ impl ControllerActor {
                     destination,
                     crate::view::ViewOp::RetireRoute { handle: route },
                 ));
-                ops = ops.remove_plan(destination, plan_removal(key));
+                ops = ops.remove_plan(destination, key);
                 ops.lifecycle.push((destination, runtime_removal_op(key)));
                 Some(route)
             }
@@ -643,32 +545,28 @@ impl ControllerActor {
         for (destination, held) in destinations {
             match *held {
                 crate::control::publication::Destination::Discovery { .. } => {
-                    if let Some(track_key) = held.key().track() {
-                        for participant in self.room_recipients(room_id, *destination) {
-                            generation_ops.push_participant_effect(
-                                *destination,
-                                participant,
-                                crate::participant::ParticipantEffect::TrackRemoved(track_key),
-                            );
-                        }
+                    for participant in self.room_recipients(room_id, *destination) {
+                        generation_ops.push_participant_effect(
+                            *destination,
+                            participant,
+                            crate::participant::ParticipantEffect::TrackRemoved(held.key()),
+                        );
                     }
                 }
                 crate::control::publication::Destination::Forwarding { key, route } => {
-                    if let Some(track_key) = key.track() {
-                        for participant in self.room_recipients(room_id, *destination) {
-                            generation_ops.push_participant_effect(
-                                *destination,
-                                participant,
-                                crate::participant::ParticipantEffect::TrackRemoved(track_key),
-                            );
-                        }
+                    for participant in self.room_recipients(room_id, *destination) {
+                        generation_ops.push_participant_effect(
+                            *destination,
+                            participant,
+                            crate::participant::ParticipantEffect::TrackRemoved(key),
+                        );
                     }
                     generation_ops.lifecycle.push((
                         *destination,
                         crate::view::ViewOp::RetireRoute { handle: route },
                     ));
                     releases.push((*destination, route));
-                    generation_ops.push_remove_plan(*destination, plan_removal(key));
+                    generation_ops.push_remove_plan(*destination, key);
                     generation_ops
                         .lifecycle
                         .push((*destination, runtime_removal_op(key)));
@@ -682,103 +580,24 @@ impl ControllerActor {
         &self,
         id: crate::entity::TrackId,
         shard: crate::id::ShardId,
-        key: crate::control::publication::RuntimeKey,
-    ) -> Option<(crate::keys::TrackKey, crate::plan::FlatTrackPlan)> {
+        key: crate::keys::TrackKey,
+    ) -> Option<(crate::keys::TrackKey, crate::plan::TrackPlan)> {
         let publication = self.catalog.get(&id)?;
-        let (plan_key, recipients) = match (&publication.media, key) {
-            (
-                crate::control::publication::Media::Video { .. },
-                crate::control::publication::RuntimeKey::Video(key),
-            ) => (
-                key,
-                self.video_patterns
-                    .members_for(
-                        self.video_patterns
-                            .match_subject(&crate::control::patterns::Subject {
-                                room: publication.room,
-                                publisher: publication.publisher,
-                                name: id,
-                            }),
-                        shard,
-                        publication.publisher,
-                    )
-                    .into_iter()
-                    .map(|member| member.0)
-                    .collect(),
-            ),
-            (
-                crate::control::publication::Media::Audio,
-                crate::control::publication::RuntimeKey::Audio(key),
-            ) => (
-                key,
-                self.audio_patterns
-                    .members_for(
-                        self.audio_patterns
-                            .match_subject(&crate::control::patterns::Subject {
-                                room: publication.room,
-                                publisher: publication.publisher,
-                                name: id,
-                            }),
-                        shard,
-                        publication.publisher,
-                    )
-                    .into_iter()
-                    .map(|member| member.0)
-                    .collect(),
-            ),
-            (
-                crate::control::publication::Media::Data { lane, topic },
-                crate::control::publication::RuntimeKey::Unreliable(key),
-            ) if crate::control::lanes::StreamLane::from(*lane)
-                == crate::control::lanes::StreamLane::Unreliable =>
-            {
-                (
-                    key,
-                    self.data_patterns
-                        .members_for(
-                            self.data_patterns
-                                .match_subject(&crate::control::patterns::Subject {
-                                    room: publication.room,
-                                    publisher: publication.publisher,
-                                    name: (topic.clone(), (*lane).into()),
-                                }),
-                            shard,
-                            publication.publisher,
-                        )
-                        .into_iter()
-                        .map(|member| member.0)
-                        .collect(),
-                )
-            }
-            (
-                crate::control::publication::Media::Data { lane, topic },
-                crate::control::publication::RuntimeKey::Reliable(key),
-            ) if crate::control::lanes::StreamLane::from(*lane)
-                == crate::control::lanes::StreamLane::Reliable =>
-            {
-                (
-                    key,
-                    self.data_patterns
-                        .members_for(
-                            self.data_patterns
-                                .match_subject(&crate::control::patterns::Subject {
-                                    room: publication.room,
-                                    publisher: publication.publisher,
-                                    name: (topic.clone(), (*lane).into()),
-                                }),
-                            shard,
-                            publication.publisher,
-                        )
-                        .into_iter()
-                        .map(|member| member.0)
-                        .collect(),
-                )
-            }
-            _ => {
-                debug_assert!(false, "a runtime key must match its publication plan");
-                return None;
-            }
-        };
+        let recipients = self
+            .audiences
+            .members_for(
+                self.audiences.match_subject(&publication.audience_subject()),
+                shard,
+                publication.publisher,
+            )
+            .into_iter()
+            .filter_map(|(member, delivery)| match delivery {
+                crate::control::publication::AudienceDelivery::Track(_)
+                | crate::control::publication::AudienceDelivery::Audio
+                | crate::control::publication::AudienceDelivery::Data { .. } => Some(member),
+            })
+            .collect();
+        let plan_key = key;
         Some((
             plan_key,
             crate::control::publication::forwarding_plan(
@@ -796,19 +615,18 @@ impl ControllerActor {
         &self,
         id: crate::entity::TrackId,
         shard: crate::id::ShardId,
-    ) -> Option<crate::plan::FlatTrackPlan> {
+    ) -> Option<crate::plan::TrackPlan> {
         let key = self.catalog.get(&id).and_then(|publication| {
             if publication.publisher_shard == shard {
-                publication.origin_key
+                Some(publication.origin_key)
             } else {
-                publication.destinations.get(&shard)?.key()
+                Some(publication.destinations.get(&shard)?.key())
             }
-            .track()
         })?;
         let (plan_key, plan) = self.plan_for(
             id,
             shard,
-            crate::control::publication::RuntimeKey::Video(key),
+            key,
         )?;
         debug_assert_eq!(plan_key, key);
         Some(plan)
@@ -818,37 +636,10 @@ impl ControllerActor {
         &self,
         publication: &crate::control::publication::Publication,
     ) -> Vec<crate::id::ShardId> {
-        match &publication.media {
-            crate::control::publication::Media::Video { .. } => self
-                .video_patterns
-                .match_subject(&crate::control::patterns::Subject {
-                    room: publication.room,
-                    publisher: publication.publisher,
-                    name: publication.id,
-                })
-                .into_iter()
-                .flat_map(|group| self.video_patterns.shards_of(group))
-                .collect(),
-            crate::control::publication::Media::Audio => self
-                .audio_patterns
-                .match_subject(&crate::control::patterns::Subject {
-                    room: publication.room,
-                    publisher: publication.publisher,
-                    name: publication.id,
-                })
-                .into_iter()
-                .flat_map(|group| self.audio_patterns.shards_of(group))
-                .collect(),
-            crate::control::publication::Media::Data { lane, topic } => self
-                .data_patterns
-                .match_subject(&crate::control::patterns::Subject {
-                    room: publication.room,
-                    publisher: publication.publisher,
-                    name: (topic.clone(), (*lane).into()),
-                })
-                .into_iter()
-                .flat_map(|group| self.data_patterns.shards_of(group))
-                .collect(),
-        }
+        self.audiences
+            .match_subject(&publication.audience_subject())
+            .into_iter()
+            .flat_map(|group| self.audiences.shards_of(group))
+            .collect()
     }
 }

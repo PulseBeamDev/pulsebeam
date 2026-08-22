@@ -33,12 +33,6 @@ use crate::id::ShardId;
 use crate::keys::ParticipantKey;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum AnyAudience {}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum VideoAudience {}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum AudioAudience {}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum DataAudience {}
 
 #[derive(Debug)]
 pub(crate) struct GroupId<K = AnyAudience>(pub u32, PhantomData<fn() -> K>);

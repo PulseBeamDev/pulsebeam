@@ -1,63 +1,35 @@
 use super::*;
 
-/// The view ops a stream key implies.
-///
-/// None of these take a lane: `RuntimeStreamKey`'s variant *is* the lane, and
-/// passing one alongside meant every call site carried a second source of truth
-/// plus a `debug_assert` to catch the two disagreeing.
 pub(super) fn insert_stream_runtime_op(
-    key: crate::control::state::RuntimeStreamKey,
+    key: crate::keys::TrackKey,
     id: crate::control::state::DataStreamId,
+    lane: StreamLane,
     publisher: Option<crate::shard::participants::ParticipantKey>,
 ) -> crate::view::ViewOp {
-    match key {
-        crate::control::state::RuntimeStreamKey::Unreliable(key) => {
-            crate::view::ViewOp::InsertTrackRuntime {
-                key,
-                runtime: crate::view::TrackRuntime::Data {
-                    publisher,
-                    publisher_effect: publisher.map(|_| {
-                        crate::participant::ParticipantEffect::TrackPublished {
-                            topic: id.topic.clone(),
-                            key,
-                            lane: crate::track::DataLane::Realtime,
-                        }
-                    }),
-                },
-            }
-        }
-        crate::control::state::RuntimeStreamKey::Reliable(key) => {
-            crate::view::ViewOp::InsertTrackRuntime {
-                key,
-                runtime: crate::view::TrackRuntime::Data {
-                    publisher,
-                    publisher_effect: publisher.map(|_| {
-                        crate::participant::ParticipantEffect::TrackPublished {
-                            topic: id.topic.clone(),
-                            key,
-                            lane: crate::track::DataLane::Reliable,
-                        }
-                    }),
-                },
-            }
-        }
+    crate::view::ViewOp::InsertTrackRuntime {
+        key,
+        runtime: crate::view::TrackRuntime {
+            publisher,
+            publisher_effect: publisher.map(|_| {
+                crate::participant::ParticipantEffect::TrackPublished {
+                    topic: id.topic,
+                    key,
+                    lane: lane.into(),
+                }
+            }),
+            ..Default::default()
+        },
     }
 }
 
 pub(super) fn install_stream_route_op(
-    key: crate::control::state::RuntimeStreamKey,
+    key: crate::keys::TrackKey,
     route: RouteHandle,
 ) -> crate::view::ViewOp {
-    let action = match key {
-        crate::control::state::RuntimeStreamKey::Unreliable(stream)
-        | crate::control::state::RuntimeStreamKey::Reliable(stream) => {
-            RouteAction::Forward { target: stream }
-        }
-    };
     crate::view::ViewOp::InstallRoute {
         binding: crate::view::RouteBinding {
             handle: route,
-            action,
+            action: RouteAction::Forward { target: key },
         },
     }
 }
@@ -124,7 +96,7 @@ impl ControllerActor {
         let Some(key) = self.lanes.get(lane).mint(&mut self.state, shard_id, &id) else {
             return false;
         };
-        let runtime_key: crate::control::publication::RuntimeKey = key.into();
+        let runtime_key = key;
         let Some(publisher) = self
             .core
             .registry
@@ -157,19 +129,7 @@ impl ControllerActor {
         self.index_publication(publication_id);
 
         if matches!(lane, StreamLane::Reliable) {
-            let Some(stream) = (match key {
-                crate::control::state::RuntimeStreamKey::Reliable(stream) => Some(stream),
-                _ => None,
-            }) else {
-                debug_assert!(false, "reliable readiness must carry a reliable key");
-                self.catalog.remove(&publication_id);
-                crate::control::controller::lifecycle::remove_runtime_key(
-                    &mut self.state,
-                    shard_id,
-                    runtime_key,
-                );
-                return false;
-            };
+            let stream = key;
             let Some(route) = self
                 .grant_route(shard_id, RouteAction::Reverse { target: stream })
                 .await
@@ -215,27 +175,43 @@ impl ControllerActor {
     ) {
         let pattern = match publisher {
             Some(publisher) => {
-                crate::control::patterns::Pattern::exact(room_id, publisher, (topic.clone(), lane))
+                crate::control::patterns::Pattern::exact(
+                    room_id,
+                    publisher,
+                    crate::control::publication::AudienceName::Data {
+                        topic: topic.clone(),
+                        lane: lane.into(),
+                    },
+                )
             }
             None => {
-                crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
+                crate::control::patterns::Pattern::any_publisher(
+                    room_id,
+                    crate::control::publication::AudienceName::Data {
+                        topic: topic.clone(),
+                        lane: lane.into(),
+                    },
+                )
             }
         };
         let displaced_ids: indexmap::IndexSet<_> = self
-            .data_patterns
+            .audiences
             .declarations_of(&subscriber)
             .into_iter()
             .filter(|held| pattern.subsumes(held))
-            .flat_map(|held| self.data_patterns.publications_of_pattern(&held))
+            .flat_map(|held| self.audiences.publications_of_pattern(&held))
             .collect();
         let _ = crate::control::patterns::declare_audience(
-            &mut self.data_patterns,
+            &mut self.audiences,
             pattern,
             subscriber,
             crate::control::patterns::Member {
                 shard: shard_id,
                 key: subscriber_key,
-                delivery: channel,
+                delivery: crate::control::publication::AudienceDelivery::Data {
+                    channel,
+                    lane: lane.into(),
+                },
             },
         );
         // Which streams this reaches is a catalog question now, not something
@@ -283,14 +259,27 @@ impl ControllerActor {
     ) {
         let pattern = match publisher {
             Some(publisher) => {
-                crate::control::patterns::Pattern::exact(room_id, publisher, (topic.clone(), lane))
+                crate::control::patterns::Pattern::exact(
+                    room_id,
+                    publisher,
+                    crate::control::publication::AudienceName::Data {
+                        topic: topic.clone(),
+                        lane: lane.into(),
+                    },
+                )
             }
             None => {
-                crate::control::patterns::Pattern::any_publisher(room_id, (topic.clone(), lane))
+                crate::control::patterns::Pattern::any_publisher(
+                    room_id,
+                    crate::control::publication::AudienceName::Data {
+                        topic: topic.clone(),
+                        lane: lane.into(),
+                    },
+                )
             }
         };
         let _ = crate::control::patterns::retract_audience(
-            &mut self.data_patterns,
+            &mut self.audiences,
             &pattern,
             &subscriber,
         );
@@ -329,16 +318,7 @@ impl ControllerActor {
                     .lanes
                     .get(lane)
                     .mint(&mut actor.state, destination, &stream)?;
-                let Some(action) = actor.lanes.get(lane).route_action(key) else {
-                    crate::control::controller::lifecycle::remove_runtime_key(
-                        &mut actor.state,
-                        destination,
-                        key.into(),
-                    );
-                    debug_assert!(false, "a lane must only mint its own route action");
-                    return None;
-                };
-                Some((key.into(), action))
+                Some((key, actor.lanes.get(lane).route_action(key)))
             })
             .await;
         let published = self.publish_publication(publication_id).await;

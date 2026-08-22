@@ -10,7 +10,7 @@
 //! else.
 
 use crate::{
-    control::state::{ControlModel, DataStreamId, RuntimeStreamKey},
+    control::state::{ControlModel, DataStreamId},
     id::ShardId,
     route::RouteAction,
 };
@@ -57,16 +57,8 @@ impl LaneRegistry {
 
     /// The route action that carries this lane's traffic. `None` when the key
     /// belongs to the other lane, which is a caller bug rather than a state.
-    pub(crate) fn route_action(&self, key: RuntimeStreamKey) -> Option<RouteAction> {
-        match (self.lane, key) {
-            (StreamLane::Unreliable, RuntimeStreamKey::Unreliable(stream)) => {
-                Some(RouteAction::Forward { target: stream })
-            }
-            (StreamLane::Reliable, RuntimeStreamKey::Reliable(stream)) => {
-                Some(RouteAction::Forward { target: stream })
-            }
-            _ => None,
-        }
+    pub(crate) fn route_action(&self, key: crate::keys::TrackKey) -> RouteAction {
+        RouteAction::Forward { target: key }
     }
 
     pub(crate) fn mint(
@@ -74,15 +66,12 @@ impl LaneRegistry {
         state: &mut ControlModel,
         destination: ShardId,
         id: &DataStreamId,
-    ) -> Option<RuntimeStreamKey> {
-        match self.lane {
-            StreamLane::Unreliable => state
-                .mint_data(destination, id.clone())
-                .map(RuntimeStreamKey::Unreliable),
-            StreamLane::Reliable => state
-                .mint_reliable(destination, id.clone())
-                .map(RuntimeStreamKey::Reliable),
-        }
+    ) -> Option<crate::keys::TrackKey> {
+        let track_id = id.publisher_id.derive_track_id(
+            crate::entity::TrackKind::Data,
+            &crate::track::publication_label(self.lane.into(), &id.topic),
+        );
+        state.mint_track(destination, track_id, id.publisher_id)
     }
 }
 

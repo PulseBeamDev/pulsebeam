@@ -38,19 +38,6 @@ impl DataStreamId {
     }
 }
 
-fn id_to_track_id(id: &DataStreamId, lane: crate::track::DataLane) -> crate::entity::TrackId {
-    id.publisher_id.derive_track_id(
-        crate::entity::TrackKind::Data,
-        &crate::track::publication_label(lane, &id.topic),
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RuntimeStreamKey {
-    Unreliable(crate::keys::TrackKey),
-    Reliable(crate::keys::TrackKey),
-}
-
 /// One shard's slot namespace for one route family.
 ///
 /// The allocator lives here rather than on the shard because the shard bits
@@ -115,7 +102,6 @@ pub(crate) struct ParticipantRecord {
 pub(crate) struct TrackRecord {
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
-    pub lane: Option<crate::track::DataLane>,
 }
 
 #[derive(Debug)]
@@ -226,39 +212,6 @@ impl ControlModel {
             arena.tracks.insert(TrackRecord {
                 id,
                 origin,
-                lane: None,
-            })
-        })?;
-        if let Some(tx) = self.pending.as_mut() {
-            tx.tracks.push((shard, key));
-        }
-        Some(key)
-    }
-
-    pub fn mint_data(&mut self, shard: ShardId, id: DataStreamId) -> Option<crate::keys::TrackKey> {
-        let key = self.arenas.get_mut(shard.index()).map(|arena| {
-            arena.tracks.insert(TrackRecord {
-                id: id_to_track_id(&id, crate::track::DataLane::Realtime),
-                origin: id.publisher_id,
-                lane: Some(crate::track::DataLane::Realtime),
-            })
-        })?;
-        if let Some(tx) = self.pending.as_mut() {
-            tx.tracks.push((shard, key));
-        }
-        Some(key)
-    }
-
-    pub fn mint_reliable(
-        &mut self,
-        shard: ShardId,
-        id: DataStreamId,
-    ) -> Option<crate::keys::TrackKey> {
-        let key = self.arenas.get_mut(shard.index()).map(|arena| {
-            arena.tracks.insert(TrackRecord {
-                id: id_to_track_id(&id, crate::track::DataLane::Reliable),
-                origin: id.publisher_id,
-                lane: Some(crate::track::DataLane::Reliable),
             })
         })?;
         if let Some(tx) = self.pending.as_mut() {
@@ -285,26 +238,6 @@ impl ControlModel {
         if let Some(record) = record {
             debug_assert!(!record.id.as_str().is_empty());
             debug_assert!(!record.origin.as_str().is_empty());
-        }
-    }
-
-    pub fn remove_data(&mut self, shard: ShardId, key: crate::keys::TrackKey) {
-        let record = self
-            .arenas
-            .get_mut(shard.index())
-            .and_then(|arena| arena.tracks.remove(key));
-        if let Some(record) = record {
-            debug_assert_eq!(record.lane, Some(crate::track::DataLane::Realtime));
-        }
-    }
-
-    pub fn remove_reliable(&mut self, shard: ShardId, key: crate::keys::TrackKey) {
-        let record = self
-            .arenas
-            .get_mut(shard.index())
-            .and_then(|arena| arena.tracks.remove(key));
-        if let Some(record) = record {
-            debug_assert_eq!(record.lane, Some(crate::track::DataLane::Reliable));
         }
     }
 
@@ -526,15 +459,20 @@ mod tests {
                 participant_id,
             )
             .unwrap();
-        let stream = DataStreamId::new(
-            crate::entity::RoomId::from_external(
-                &crate::entity::ExternalRoomId::new("room").unwrap(),
-            ),
-            participant_id,
-            crate::track::Topic::for_test("topic"),
-        );
-        let data = state.mint_data(shard, stream.clone()).unwrap();
-        let reliable = state.mint_reliable(shard, stream).unwrap();
+        let data = state
+            .mint_track(
+                shard,
+                participant_id.derive_track_id(crate::entity::TrackKind::Data, "realtime"),
+                participant_id,
+            )
+            .unwrap();
+        let reliable = state
+            .mint_track(
+                shard,
+                participant_id.derive_track_id(crate::entity::TrackKind::Data, "reliable"),
+                participant_id,
+            )
+            .unwrap();
         state.abort(Instant::now());
         assert!(state.arenas[0].participants.get(participant).is_none());
         assert!(state.arenas[0].tracks.get(track).is_none());

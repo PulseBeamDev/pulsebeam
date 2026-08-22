@@ -28,7 +28,7 @@ impl ControllerActor {
         &mut self,
         shard_id: crate::id::ShardId,
         action: crate::route::RouteAction,
-        plan: Option<(crate::keys::TrackKey, crate::plan::FlatTrackPlan)>,
+        plan: Option<(crate::keys::TrackKey, crate::plan::TrackPlan)>,
     ) -> Option<RouteHandle> {
         self.publish_with_route(shard_id, "endpoint", move |_, handle| {
             let lifecycle = vec![(
