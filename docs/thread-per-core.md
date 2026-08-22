@@ -1,8 +1,10 @@
 # Thread-per-core
 
-This SFU is thread-per-core. A shard owns its participants, its routes, its
-packet buffers and its measurements outright, runs on one core, and reaches
-other shards only by message. `ShardWorker` is `!Send` on purpose.
+This SFU is thread-per-core. A shard owns its mutable participants, routes,
+packet buffers and packet runtime outright, runs on one core, and reaches other
+shards only by message. `ShardWorker` is `!Send` on purpose. Immutable,
+coherent snapshots may be shared across cores when one node-local writer owns
+publication.
 
 That is unusual enough that the obvious "improvement" is usually a regression.
 This file says what the rules are and why, so the reasoning survives the person
@@ -11,26 +13,32 @@ document its `reason` strings point at.**
 
 ## The rules
 
-1. **A shard does not share mutable state with another shard.** Not behind a
-   lock, not behind atomics. If two shards need to agree on something, one sends
-   the other a message.
+1. **A shard does not share mutable packet runtime with another shard.** Not
+   behind a lock, not behind a shared collection, and not through per-packet
+   reference counting. If two shards need to agree on mutable runtime, one
+   sends the other a message.
 2. **A shard never blocks on another shard.** No `Mutex`, no awaiting a full
    queue held by a peer. (The one place two directions could deadlock is
    documented at `ShardWorker::flush_shard_events`.)
-3. **Refcounts are core-local.** An `Arc` whose count is touched by two cores on
-   a per-packet path is a bug, even when it is "just" an increment.
-4. **Anything crossing a shard boundary is a value, not a handle.** A handle
-   implies shared memory, and cross-node there is none.
+3. **Immutable snapshots may cross cores.** A node-local snapshot has one
+   publication locus, replaces the complete value, and may have readers on any
+   core. `ArcSwap` and `left-right` are valid mechanisms for this contract.
+4. **Anything crossing a node boundary is a value, not a handle.** A local
+   snapshot handle may be shared within its node, but wire messages contain
+   owned/materialized values.
+5. **Atomics represent independent facts.** A single atomic may hold a flag,
+   counter, monotonic value, or complete one-word state machine. Several atomic
+   loads do not form a coherent snapshot.
 
 ## Why, concretely
 
-### Sharing is not slow because of the lock. It is slow because of the line.
+### Shared mutable state is not free because the lock is absent.
 
 An uncontended atomic increment is a few nanoseconds. A *contended* one — where
 two cores each hold the cache line in their L1 and take turns invalidating each
-other — costs hundreds, and it stalls the other core too. The cost does not
-appear in a profile as "synchronisation"; it appears as every function on both
-cores getting slower.
+other — costs hundreds, and it stalls the other core too. Immutable snapshot
+reads are a different shape: readers share stable data while one writer
+publishes a replacement, rather than mutating packet-path state in place.
 
 This is why `RtpPacket::to_transit` copies the payload instead of sharing the
 `Arc`: the refcount header sits immediately before the bytes, so a remote drop
@@ -100,8 +108,9 @@ Now:
 The same path works unchanged when the destination is another node, because it
 was never reading memory it did not own.
 
-Do not reintroduce a shared handle to make this cheaper. It is a control-rate
-message carrying a small value; the cost is not where the pressure is.
+Do not replace a coherent snapshot with independently shared fields. A shared
+handle is appropriate when it has one writer, immutable readers, and an owned
+cross-node representation.
 
 ### Metrics travel the same way
 
@@ -131,15 +140,18 @@ Installing the recorder per tick rather than per thread is deliberate: under
 `WorkerExecution::SharedRuntime` every shard of a node shares one thread, so
 attribution has to come from the installed recorder, not from thread identity.
 
-## Escape hatches
+## Shared-state boundaries
 
-`#[allow(clippy::disallowed_types)]` with a comment saying which of these it is.
-The list is short on purpose, and it is closed — if a use does not fit one of
-these, it is rule 1 and the answer is a message.
+`#[allow(clippy::disallowed_types)]` with a comment saying which boundary it
+implements. The important distinction is mutable packet runtime versus
+immutable node-local publication.
 
 - **Tests.** A test is not a shard; a counter for unique ids is convenience, not
   architecture. Allowed at the test module, not the file, so it cannot drift
   over production code in the same file.
+- **Immutable snapshots.** One writer per node-local logical snapshot, with
+  cross-core readers. The writer capability is not duplicated, and every
+  publication replaces one complete value (`ArcSwap<T>` or `left-right`).
 - **Startup wiring.** One `Arc` per shard, cloned before any shard runs, never
   touched again (`Arc<ShardMetrics>`).
 - **Fixed preallocated counters.** `ShardMetrics`, per the rule above.
@@ -149,7 +161,8 @@ these, it is rule 1 and the answer is a message.
   registered, written and read by one shard on one core, so nothing contends.
   Keep them core-local; do not let one cross a shard boundary.
 - **Below the shard model.** `pulsebeam-runtime` implements the seams shards are
-  built from. Nothing there licenses an `Arc` inside a shard.
+  built from. Nothing there licenses mutable shared packet state inside a
+  shard.
 - **Not a shard.** The agent, simulator and CLI are ordinary async programs.
 
 ## Enforcement

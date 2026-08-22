@@ -19,12 +19,10 @@ allow-print-in-tests = true
 # ---------------------------------------------------------------------------
 # Shared-state primitives.
 #
-# This is a thread-per-core SFU: a shard owns its participants, its routes and
-# its packet buffers outright, and reaches other shards only by message. Cross-
-# core sharing is not a performance trade-off here, it is a design error — it
-# reintroduces the coherence traffic and the torn reads the architecture exists
-# to avoid, and it does not survive the move to a second node, where there is no
-# shared memory to reach into at all.
+# This is a thread-per-core SFU: a shard owns its mutable packet runtime and
+# reaches other shards by message. Immutable snapshots may be shared across
+# cores when one node-local writer publishes complete versions. Cross-node
+# correctness must still use owned values because there is no shared memory.
 #
 # Every one of these has a legitimate narrow use. Take the escape hatch with a
 # comment saying which:
@@ -35,14 +33,14 @@ allow-print-in-tests = true
 # one has to be a decision somebody wrote down.
 disallowed-types = [
     { path = "bytes::Bytes", reason = "refcounted payload shared across shard boundaries. Cross-shard data is copied deliberately so allocation and release stay core-local; use Vec<u8> unless an explicit, reviewed exception is required." },
-    { path = "std::sync::Arc", reason = "cross-core refcount. Fine when the count is bounded and touched at startup (one per shard); wrong on any path that runs per packet. Prefer Rc, or an owned value the shard holds outright." },
+    { path = "std::sync::Arc", reason = "shared ownership requires a reviewed boundary. Immutable node-local snapshots may be read across cores; mutable packet state and per-packet refcount churn remain forbidden." },
     { path = "std::sync::Mutex", reason = "a shard must never block on another shard. Use a message." },
     { path = "std::sync::RwLock", reason = "as Mutex. A reader still takes a cache line other cores want." },
-    { path = "std::sync::atomic::AtomicBool", reason = "shared mutable state. Several atomics read together do not form a consistent snapshot — see docs/thread-per-core.md. Fine for a fixed, preallocated counter set like ShardMetrics." },
-    { path = "std::sync::atomic::AtomicU8", reason = "as AtomicBool." },
-    { path = "std::sync::atomic::AtomicU32", reason = "as AtomicBool." },
-    { path = "std::sync::atomic::AtomicU64", reason = "as AtomicBool." },
-    { path = "std::sync::atomic::AtomicUsize", reason = "as AtomicBool." },
+    { path = "std::sync::atomic::AtomicBool", reason = "use only for an independent flag or genuine single-word state machine. Several atomics read together do not form a consistent snapshot — see docs/thread-per-core.md." },
+    { path = "std::sync::atomic::AtomicU8", reason = "use only for an independent value or genuine single-word state machine; do not assemble snapshots from several atomics." },
+    { path = "std::sync::atomic::AtomicU32", reason = "use only for an independent value or genuine single-word state machine; do not assemble snapshots from several atomics." },
+    { path = "std::sync::atomic::AtomicU64", reason = "use only for an independent value or genuine single-word state machine; do not assemble snapshots from several atomics." },
+    { path = "std::sync::atomic::AtomicUsize", reason = "use only for an independent value or genuine single-word state machine; do not assemble snapshots from several atomics." },
 ]
 
 # ---------------------------------------------------------------------------
