@@ -439,11 +439,17 @@ impl ControllerActor {
             ShardEvent::TransportAuthenticated {
                 source,
                 destination,
+                source_shard,
+                handle,
                 shard: owner,
                 ..
             } => {
                 self.pin_flow_to_owner(source, destination, owner.index() as u16);
-                self.emit_placeholder(shard);
+                self.command_backlog.push_back((
+                    source_shard,
+                    ShardCommand::AuthenticateTransport { source, handle },
+                ));
+                self.emit_placeholder(owner);
             }
             ShardEvent::ParticipantClosed { participant, .. } => {
                 self.remove_participant_with_mode(participant, true).await;
