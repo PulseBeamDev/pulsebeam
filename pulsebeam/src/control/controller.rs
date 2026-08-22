@@ -441,15 +441,19 @@ impl ControllerActor {
                 destination,
                 source_shard,
                 handle,
-                shard: owner,
+                shard: owner_shard,
                 ..
             } => {
-                self.pin_flow_to_owner(source, destination, owner.index() as u16);
+                let Some(owner) = u16::try_from(owner_shard.index()).ok() else {
+                    debug_assert!(false, "shard index must fit in u16");
+                    return;
+                };
+                self.pin_flow_to_owner(source, destination, owner);
                 self.command_backlog.push_back((
                     source_shard,
                     ShardCommand::AuthenticateTransport { source, handle },
                 ));
-                self.emit_placeholder(owner);
+                self.emit_placeholder(owner_shard);
             }
             ShardEvent::ParticipantClosed { participant, .. } => {
                 self.remove_participant_with_mode(participant, true).await;
@@ -522,14 +526,6 @@ impl ControllerActor {
             .topology
             .tracks_in_room(room_id, TrackKind::Data)
             .collect();
-        let previous_keys: Vec<_> = identities
-            .iter()
-            .filter_map(|identity| {
-                self.track_allocations
-                    .get(&(*identity, shard))
-                    .map(|allocation| (*identity, allocation.key))
-            })
-            .collect();
         if self
             .topology
             .remove_matching(subscriber, selector)
@@ -537,11 +533,13 @@ impl ControllerActor {
         {
             return;
         }
-        for identity in &identities {
-            self.reconcile_track(*identity, false);
-        }
-        let removed: Vec<_> = previous_keys
-            .into_iter()
+        let removed: Vec<_> = identities
+            .iter()
+            .filter_map(|identity| {
+                self.track_allocations
+                    .get(&(*identity, shard))
+                    .map(|allocation| (*identity, allocation.key))
+            })
             .filter(|(identity, _)| {
                 !self
                     .topology
@@ -549,6 +547,9 @@ impl ControllerActor {
                     .any(|subscription| subscription.subscriber == subscriber)
             })
             .collect();
+        for identity in &identities {
+            self.reconcile_track(*identity, false);
+        }
         if removed.is_empty() {
             return;
         }
@@ -671,10 +672,11 @@ impl ControllerActor {
                 allocation
             }
         };
-        if track.kind() == TrackKind::Video && track.reverse().is_none() {
-            if let Some(track) = self.topology.track_mut(identity) {
-                track.set_reverse(Some(origin_allocation.route));
-            }
+        if track.kind() == TrackKind::Video
+            && track.reverse().is_none()
+            && let Some(track) = self.topology.track_mut(identity)
+        {
+            track.set_reverse(Some(origin_allocation.route));
         }
         let generation = self.next_generation();
 
@@ -772,24 +774,25 @@ impl ControllerActor {
             .filter_map(|(held, shard)| (*held == identity).then_some(*shard))
             .collect();
         for destination in current {
-            if destination != origin_shard && !desired.contains(&destination) {
-                if let Some(allocation) = self.track_allocations.remove(&(identity, destination)) {
-                    self.stage_update_at(
-                        destination,
-                        generation,
-                        crate::shard_update::ShardUpdateOp::RetireRoute {
-                            handle: allocation.route,
-                        },
-                    );
-                    self.stage_update_at(
-                        destination,
-                        generation,
-                        crate::shard_update::ShardUpdateOp::RemoveTrackRuntime {
-                            key: allocation.key,
-                        },
-                    );
-                    self.track_allocator.release(allocation, now);
-                }
+            if destination != origin_shard
+                && !desired.contains(&destination)
+                && let Some(allocation) = self.track_allocations.remove(&(identity, destination))
+            {
+                self.stage_update_at(
+                    destination,
+                    generation,
+                    crate::shard_update::ShardUpdateOp::RetireRoute {
+                        handle: allocation.route,
+                    },
+                );
+                self.stage_update_at(
+                    destination,
+                    generation,
+                    crate::shard_update::ShardUpdateOp::RemoveTrackRuntime {
+                        key: allocation.key,
+                    },
+                );
+                self.track_allocator.release(allocation, now);
             }
         }
         let remote_routes: Vec<_> = members
@@ -1259,7 +1262,14 @@ impl ControllerActor {
                 .router
                 .stable_route(&state.room_id)
                 .ok_or(ControllerError::ServiceUnavailable)?,
-            RoomPlacement::RoundRobin => ShardId::new(slot % self.router.shard_count()),
+            RoomPlacement::RoundRobin => {
+                let shard_count = self.router.shard_count();
+                debug_assert_ne!(shard_count, 0);
+                ShardId::new(
+                    slot.checked_rem(shard_count)
+                        .ok_or(ControllerError::ServiceUnavailable)?,
+                )
+            }
         };
         let now = tokio::time::Instant::now();
         let handle = self

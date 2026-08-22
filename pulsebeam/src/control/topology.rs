@@ -328,8 +328,8 @@ impl TrackTopology {
         candidates
             .into_iter()
             .filter_map(|id| self.subscriptions.get(id))
+            .filter(move |&subscription| subscription.selector.matches(identity, data_label))
             .cloned()
-            .filter(move |subscription| subscription.selector.matches(identity, data_label))
     }
 
     pub(crate) fn contains(&self, identity: TrackIdentity) -> bool {

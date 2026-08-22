@@ -157,7 +157,7 @@ impl ShardRuntime {
                 }
             }
             crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { key, .. } => {
-                self.retire_track(*key)
+                self.retire_track(*key);
             }
             crate::shard_update::ShardUpdateOp::InstallRoute { .. }
             | crate::shard_update::ShardUpdateOp::InstallTransport { .. }

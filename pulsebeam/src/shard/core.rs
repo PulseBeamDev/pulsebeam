@@ -47,13 +47,15 @@ impl TrackPlanTable {
         match &update.plan {
             Some(plan) => {
                 debug_assert!(plan.local.iter().enumerate().all(|(index, value)| {
-                    plan.local[..index]
+                    plan.local
                         .iter()
+                        .take(index)
                         .all(|candidate| candidate != value)
                 }));
                 debug_assert!(plan.remote.iter().enumerate().all(|(index, value)| {
-                    plan.remote[..index]
+                    plan.remote
                         .iter()
+                        .take(index)
                         .all(|candidate| candidate != value)
                 }));
                 self.tracks.insert(update.key, plan.clone());
@@ -317,7 +319,7 @@ impl ShardCore {
                 self.state.routes.install(binding.clone());
             }
             crate::shard_update::ShardUpdateOp::RetireRoute { handle } => {
-                self.state.routes.retire(*handle)
+                self.state.routes.retire(*handle);
             }
             crate::shard_update::ShardUpdateOp::InstallTransport { binding } => {
                 self.state.transports.install(*binding);
@@ -325,7 +327,8 @@ impl ShardCore {
             crate::shard_update::ShardUpdateOp::RetireTransport { handle } => {
                 self.state.transports.retire(*handle);
             }
-            crate::shard_update::ShardUpdateOp::InsertParticipant => {}
+            crate::shard_update::ShardUpdateOp::InsertParticipant
+            | crate::shard_update::ShardUpdateOp::Placeholder => {}
             crate::shard_update::ShardUpdateOp::RemoveParticipant { key } => {
                 self.timers.cancel(*key);
                 let _ = self.registry.remove_key(*key);
@@ -349,7 +352,7 @@ impl ShardCore {
                 }
             }
             crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { .. } => {
-                self.runtime.apply_update_op(op)
+                self.runtime.apply_update_op(op);
             }
             crate::shard_update::ShardUpdateOp::BindTrack {
                 participant,
@@ -367,7 +370,6 @@ impl ShardCore {
                     lane: *lane,
                 });
             }
-            crate::shard_update::ShardUpdateOp::Placeholder => {}
         }
     }
 
