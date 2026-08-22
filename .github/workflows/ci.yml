@@ -42,6 +42,7 @@ jobs:
       run: make test
       env:
         CARGO_TERM_COLOR: always
+
     - name: Test routing crate
       run: make test-routing
       env:
@@ -57,6 +58,58 @@ jobs:
       run: make build-ebpf
       env:
         CARGO_TERM_COLOR: always
+
+  agent-architecture:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config firefox-esr
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.10
+    - run: rustup component add clippy rustfmt
+    - run: rustup target add wasm32-unknown-unknown
+    - name: Install matching WASM browser test runner
+      run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+    - name: Protected path guard
+      run: make protected-paths
+    - name: Additive crate checks
+      run: make agent-check
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Additive crate tests
+      run: make agent-test agent-conformance
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Additive crate clippy
+      run: cargo clippy -p pulsebeam-agent-core -p pulsebeam-agent-native -p pulsebeam-agent-web --all-targets
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Core and web WASM checks
+      run: make agent-wasm
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Browser fixture
+      run: make agent-browser-test
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Existing reference crate tests
+      run: cargo test -p pulsebeam-agent
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Existing workspace unit tests
+      run: make test-unit
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Existing simulation tests
+      run: make test-sim
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Workspace architectural lint
+      run: make lint-check
+      env:
+        CARGO_TERM_COLOR: always
+    - name: Protected path guard after validation
+      run: make protected-paths
 
   # eBPF attach/load needs elevated kernel privileges, which the normal `build`
   # job does not have and should not gain. Keep the behavioural smoke test in
