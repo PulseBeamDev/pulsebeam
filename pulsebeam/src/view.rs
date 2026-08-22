@@ -8,7 +8,6 @@ use crate::id::ShardId;
 use crate::keys::{ParticipantKey, TrackKey};
 use crate::plan::PlanBatch;
 use crate::route::{RouteAction, RouteHandle, TransportHandle};
-use crate::shard::router::{ReliableStreamKey, UnreliableStreamKey};
 use pulsebeam_runtime::mailbox;
 use str0m::channel::ChannelId;
 use str0m::media::Rid;
@@ -28,6 +27,16 @@ pub(crate) struct TrackDescriptor {
     pub participant: Option<ParticipantKey>,
     pub encodings: Vec<Option<Rid>>,
     pub publication: crate::track::Track,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TrackRuntime {
+    Media(TrackDescriptor),
+    Data {
+        lane: crate::track::DataLane,
+        publisher: Option<ParticipantKey>,
+        publisher_effect: Option<crate::participant::ParticipantEffect>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -139,36 +148,16 @@ pub(crate) enum ViewOp {
     },
     InsertTrackRuntime {
         key: TrackKey,
-        descriptor: TrackDescriptor,
+        runtime: TrackRuntime,
     },
     RemoveTrackRuntime {
         key: TrackKey,
     },
-    InsertUnreliableRuntime {
-        key: UnreliableStreamKey,
-        publisher: Option<ParticipantKey>,
-        publisher_effect: Option<crate::participant::ParticipantEffect>,
-    },
-    RemoveUnreliableRuntime {
-        key: UnreliableStreamKey,
-    },
-    InsertReliableRuntime {
-        key: ReliableStreamKey,
-        publisher: Option<ParticipantKey>,
-        publisher_effect: Option<crate::participant::ParticipantEffect>,
-    },
-    RemoveReliableRuntime {
-        key: ReliableStreamKey,
-    },
-    BindSubscribedData {
+    BindTrack {
         participant: ParticipantKey,
-        stream: UnreliableStreamKey,
+        key: TrackKey,
         channel: ChannelId,
-    },
-    BindSubscribedReliable {
-        participant: ParticipantKey,
-        stream: ReliableStreamKey,
-        channel: ChannelId,
+        lane: crate::track::DataLane,
     },
 }
 
@@ -335,12 +324,7 @@ impl ViewOp {
             | Self::RemoveParticipant { .. }
             | Self::InsertTrackRuntime { .. }
             | Self::RemoveTrackRuntime { .. }
-            | Self::InsertUnreliableRuntime { .. }
-            | Self::RemoveUnreliableRuntime { .. }
-            | Self::InsertReliableRuntime { .. }
-            | Self::RemoveReliableRuntime { .. }
-            | Self::BindSubscribedData { .. }
-            | Self::BindSubscribedReliable { .. } => true,
+            | Self::BindTrack { .. } => true,
         }
     }
 }

@@ -12,27 +12,35 @@ pub(super) fn insert_stream_runtime_op(
 ) -> crate::view::ViewOp {
     match key {
         crate::control::state::RuntimeStreamKey::Unreliable(key) => {
-            crate::view::ViewOp::InsertUnreliableRuntime {
+            crate::view::ViewOp::InsertTrackRuntime {
                 key,
-                publisher,
-                publisher_effect: publisher.map(|_| {
-                    crate::participant::ParticipantEffect::DataPublished {
-                        topic: id.topic.clone(),
-                        stream: key,
-                    }
-                }),
+                runtime: crate::view::TrackRuntime::Data {
+                    lane: crate::track::DataLane::Realtime,
+                    publisher,
+                    publisher_effect: publisher.map(|_| {
+                        crate::participant::ParticipantEffect::TrackPublished {
+                            topic: id.topic.clone(),
+                            key,
+                            lane: crate::track::DataLane::Realtime,
+                        }
+                    }),
+                },
             }
         }
         crate::control::state::RuntimeStreamKey::Reliable(key) => {
-            crate::view::ViewOp::InsertReliableRuntime {
+            crate::view::ViewOp::InsertTrackRuntime {
                 key,
-                publisher,
-                publisher_effect: publisher.map(|_| {
-                    crate::participant::ParticipantEffect::ReliableDataPublished {
-                        topic: id.topic.clone(),
-                        stream: key,
-                    }
-                }),
+                runtime: crate::view::TrackRuntime::Data {
+                    lane: crate::track::DataLane::Reliable,
+                    publisher,
+                    publisher_effect: publisher.map(|_| {
+                        crate::participant::ParticipantEffect::TrackPublished {
+                            topic: id.topic.clone(),
+                            key,
+                            lane: crate::track::DataLane::Reliable,
+                        }
+                    }),
+                },
             }
         }
     }

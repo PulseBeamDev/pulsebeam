@@ -1,7 +1,7 @@
 use std::time::Duration;
 use std::{collections::HashMap, io};
 
-use crate::control::state::ControlPlaneState;
+use crate::control::state::ControlModel;
 use crate::{
     control::{
         core::{ControllerCore, RoomPlacement},
@@ -217,7 +217,7 @@ pub struct ControllerActor {
     node_id: u16,
     /// The canonical lifecycle state. Only this actor mutates it, and no
     /// shard ever reads it — a shard reads the view projected from it.
-    state: ControlPlaneState,
+    state: ControlModel,
     /// Video declarations. Always fully concrete: a video subscription *is* a
     /// downstream slot allocation, and a slot belongs to one track, so a
     /// pattern here can never wildcard the name.
@@ -287,7 +287,7 @@ impl ControllerActor {
             tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
-            state: ControlPlaneState::new(shard_count),
+            state: ControlModel::new(shard_count),
             video_patterns: crate::control::patterns::PatternTable::new(),
             views,
             compiled_plans: (0..shard_count).map(|_| HashMap::new()).collect(),
@@ -1140,14 +1140,10 @@ impl ControllerActor {
                 let track_id = track.id();
                 let origin_key = match track_id.kind() {
                     crate::entity::TrackKind::Video => {
-                        crate::control::publication::RuntimeKey::Video(
-                            crate::keys::VideoTrackKey::new(fanout),
-                        )
+                        crate::control::publication::RuntimeKey::Video(fanout)
                     }
                     crate::entity::TrackKind::Audio => {
-                        crate::control::publication::RuntimeKey::Audio(
-                            crate::keys::AudioTrackKey::new(fanout),
-                        )
+                        crate::control::publication::RuntimeKey::Audio(fanout)
                     }
                     crate::entity::TrackKind::Data => {
                         debug_assert!(false, "data does not publish through the track path");

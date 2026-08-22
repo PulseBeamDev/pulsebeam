@@ -9,7 +9,7 @@ use left_right::Absorb;
 use slotmap::SecondaryMap;
 
 use crate::{
-    keys::{ParticipantKey, ReliableStreamKey, TrackKey, UnreliableStreamKey},
+    keys::{ParticipantKey, TrackKey},
     route::RouteHandle,
 };
 
@@ -299,8 +299,8 @@ impl ControlPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PlanKey {
     Track(TrackKey),
-    Unreliable(UnreliableStreamKey),
-    Reliable(ReliableStreamKey),
+    Unreliable(TrackKey),
+    Reliable(TrackKey),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -313,8 +313,8 @@ pub(crate) struct FlatTrackPlan {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FlatPlans {
     tracks: SecondaryMap<TrackKey, FlatTrackPlan>,
-    unreliable: SecondaryMap<UnreliableStreamKey, FlatTrackPlan>,
-    reliable: SecondaryMap<ReliableStreamKey, FlatTrackPlan>,
+    unreliable: SecondaryMap<TrackKey, FlatTrackPlan>,
+    reliable: SecondaryMap<TrackKey, FlatTrackPlan>,
 }
 
 impl FlatPlans {

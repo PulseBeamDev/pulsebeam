@@ -403,8 +403,8 @@ pub(crate) enum RouteAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteTarget {
     Track(crate::keys::TrackKey),
-    Unreliable(crate::keys::UnreliableStreamKey),
-    Reliable(crate::keys::ReliableStreamKey),
+    Unreliable(crate::keys::TrackKey),
+    Reliable(crate::keys::TrackKey),
 }
 
 /// What a reverse route points at, holding everything the destination needs to
@@ -412,7 +412,7 @@ pub(crate) enum RouteTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReverseTarget {
     Track(crate::keys::TrackKey),
-    Reliable(crate::keys::ReliableStreamKey),
+    Reliable(crate::keys::TrackKey),
 }
 
 /// The shard-owned half of a route: the accounting a packet mutates as it

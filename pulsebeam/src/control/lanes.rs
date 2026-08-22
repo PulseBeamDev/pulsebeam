@@ -10,7 +10,7 @@
 //! else.
 
 use crate::{
-    control::state::{ControlPlaneState, DataStreamId, RuntimeStreamKey},
+    control::state::{ControlModel, DataStreamId, RuntimeStreamKey},
     id::ShardId,
     route::RouteAction,
 };
@@ -75,7 +75,7 @@ impl LaneRegistry {
 
     pub(crate) fn mint(
         &self,
-        state: &mut ControlPlaneState,
+        state: &mut ControlModel,
         destination: ShardId,
         id: &DataStreamId,
     ) -> Option<RuntimeStreamKey> {

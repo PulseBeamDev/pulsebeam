@@ -22,7 +22,7 @@ use tokio::time::{Instant, Sleep};
 use crate::{
     entity::{ParticipantId, TrackId},
     id::ShardId,
-    participant::{ParticipantConfig, RoutedPacket},
+    participant::{ParticipantConfig, RoutedTrackPacket},
     shard::metrics::ShardMetrics,
     shard::recorder::{ShardRecorder, ShardStatsReport},
     track::Track,
@@ -206,7 +206,7 @@ pub(crate) enum Reverse {
     DataAck(Vec<u8>),
 }
 
-pub(crate) type MediaPayload = RoutedPacket;
+pub(crate) type MediaPayload = RoutedTrackPacket;
 
 /// Everything one shard sends another: the data plane.
 ///
@@ -765,20 +765,16 @@ mod reverse_tests {
     #[test]
     fn media_payload_stays_compact() {
         const _: () = assert!(
-            std::mem::size_of::<MediaPayload>() <= std::mem::size_of::<RoutedPacket>() + 16
+            std::mem::size_of::<MediaPayload>() <= std::mem::size_of::<RoutedTrackPacket>() + 16
         );
         let payload = MediaPayload {
-            key: crate::participant::PacketRouteKey::Unreliable(
-                crate::keys::UnreliableStreamKey::default(),
-            ),
-            packet: crate::participant::TrackPacket::Data(crate::participant::DataPacket {
-                payload: b"payload".to_vec(),
-            }),
+            key: crate::keys::TrackKey::default(),
+            packet: crate::participant::TrackPacket::Data(b"payload".to_vec()),
         };
         let crate::participant::TrackPacket::Data(bytes) = payload.packet else {
             unreachable!();
         };
-        assert_eq!(bytes.payload, b"payload");
+        assert_eq!(bytes, b"payload");
     }
 
     /// An encoding is named by index, never by rid: the index is derivable from

@@ -1,7 +1,7 @@
 use super::packet::TrackPacket;
 use crate::entity::{ParticipantId, TrackId};
 use crate::keys::DownstreamSlotKey;
-use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
+use crate::keys::TrackKey;
 #[cfg(test)]
 use crate::track::StreamId;
 use crate::track::{Topic, Track, TrackLayer, TrackMeta};
@@ -36,23 +36,18 @@ pub trait ParticipantSink {
     fn exit(&mut self);
 
     fn publish_track_packet(&mut self, fanout: Option<TrackKey>, packet: TrackPacket);
-    fn publish_sctp(&mut self, topic: Topic, stream: Option<UnreliableStreamKey>, pkt: Vec<u8>);
+    fn publish_sctp(&mut self, topic: Topic, stream: Option<TrackKey>, pkt: Vec<u8>);
 
     fn publish_reliable_data_topic(&mut self, topic: Topic);
     fn unpublish_reliable_data_topic(&mut self, topic: Topic);
     fn subscribe_reliable_data_topic(&mut self, topic: Topic, channel: ChannelId);
     fn unsubscribe_reliable_data_topic(&mut self, topic: Topic, channel: ChannelId);
-    fn publish_reliable_sctp(
-        &mut self,
-        topic: Topic,
-        stream: Option<ReliableStreamKey>,
-        frame: Vec<u8>,
-    );
+    fn publish_reliable_sctp(&mut self, topic: Topic, stream: Option<TrackKey>, frame: Vec<u8>);
     fn forward_reliable_control(
         &mut self,
         publisher: ParticipantId,
         topic: Topic,
-        stream: Option<ReliableStreamKey>,
+        stream: Option<TrackKey>,
         bytes: Vec<u8>,
     );
 }
@@ -155,12 +150,7 @@ pub mod test_utils {
             }
         }
 
-        fn publish_sctp(
-            &mut self,
-            topic: Topic,
-            _stream: Option<UnreliableStreamKey>,
-            _pkt: Vec<u8>,
-        ) {
+        fn publish_sctp(&mut self, topic: Topic, _stream: Option<TrackKey>, _pkt: Vec<u8>) {
             self.publish_sctp_calls.push(topic);
         }
 
@@ -171,7 +161,7 @@ pub mod test_utils {
         fn publish_reliable_sctp(
             &mut self,
             _topic: Topic,
-            _stream: Option<ReliableStreamKey>,
+            _stream: Option<TrackKey>,
             _frame: Vec<u8>,
         ) {
         }
@@ -179,7 +169,7 @@ pub mod test_utils {
             &mut self,
             _publisher: ParticipantId,
             _topic: Topic,
-            _stream: Option<ReliableStreamKey>,
+            _stream: Option<TrackKey>,
             _bytes: Vec<u8>,
         ) {
         }

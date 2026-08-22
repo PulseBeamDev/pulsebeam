@@ -55,9 +55,7 @@ impl ControllerActor {
         };
         binding.destinations.insert(
             destination,
-            crate::control::publication::Destination::Discovery {
-                key: crate::keys::VideoTrackKey::new(key),
-            },
+            crate::control::publication::Destination::Discovery { key },
         );
     }
 
@@ -153,7 +151,7 @@ impl ControllerActor {
         let (id, origin) = (publication.id, publication.publisher);
         let key = self.prepare_track_key(destination, id, origin)?;
         Some((
-            crate::control::publication::RuntimeKey::Audio(crate::keys::AudioTrackKey::new(key)),
+            crate::control::publication::RuntimeKey::Audio(key),
             RouteAction::Forward {
                 target: crate::route::RouteTarget::Track(key),
             },
@@ -226,13 +224,11 @@ impl ControllerActor {
                 (fanout, false)
             } else if let Some(destination) = binding.destinations.get(&shard_id) {
                 let (fanout, new_destination) = match destination {
-                    crate::control::publication::Destination::Discovery { key } => {
-                        (key.raw(), true)
-                    }
+                    crate::control::publication::Destination::Discovery { key } => (*key, true),
                     crate::control::publication::Destination::Forwarding {
                         key: crate::control::publication::RuntimeKey::Video(key),
                         ..
-                    } => (key.raw(), false),
+                    } => (*key, false),
                     crate::control::publication::Destination::Forwarding { .. } => {
                         debug_assert!(false, "a video destination must carry a video key");
                         return;
@@ -250,9 +246,7 @@ impl ControllerActor {
                 };
                 binding.destinations.insert(
                     shard_id,
-                    crate::control::publication::Destination::Discovery {
-                        key: crate::keys::VideoTrackKey::new(fanout),
-                    },
+                    crate::control::publication::Destination::Discovery { key: fanout },
                 );
                 (fanout, true)
             }
@@ -484,7 +478,7 @@ impl ControllerActor {
                     shard_id,
                     crate::view::ViewOp::InsertTrackRuntime {
                         key: fanout,
-                        descriptor,
+                        runtime: crate::view::TrackRuntime::Media(descriptor),
                     },
                 ),
                 (
@@ -504,12 +498,10 @@ impl ControllerActor {
                 ops = ops.participant_effect(
                     shard_id,
                     participant,
-                    crate::participant::ParticipantEffect::TrackInstalled(
-                        crate::participant::CompiledTrack {
-                            key: fanout,
-                            track: publication.clone(),
-                        },
-                    ),
+                    crate::participant::ParticipantEffect::TrackInstalled {
+                        key: fanout,
+                        track: publication.clone(),
+                    },
                 );
             }
             ops.plan(shard_id, crate::plan::PlanKey::Track(fanout), plan)

@@ -105,8 +105,6 @@ fn is_retire(op: &crate::view::ViewOp) -> bool {
             | crate::view::ViewOp::RetireTransport { .. }
             | crate::view::ViewOp::RemoveParticipant { .. }
             | crate::view::ViewOp::RemoveTrackRuntime { .. }
-            | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
-            | crate::view::ViewOp::RemoveReliableRuntime { .. }
     )
 }
 
@@ -261,80 +259,42 @@ impl ShardCore {
                 self.pending_participant_effects
                     .retain(|(participant, _)| *participant != *key);
             }
-            crate::view::ViewOp::InsertTrackRuntime { .. } => {
+            crate::view::ViewOp::InsertTrackRuntime { runtime, .. } => {
                 self.runtime.apply_view_op(op);
+                let crate::view::TrackRuntime::Data {
+                    publisher: Some(publisher),
+                    publisher_effect: Some(effect),
+                    ..
+                } = runtime
+                else {
+                    return;
+                };
+                let Some(meta) = self.registry.resolve_mut(*publisher) else {
+                    debug_assert!(
+                        false,
+                        "a data publisher must be live shard={} key={:?}",
+                        self.shard_id, publisher
+                    );
+                    return;
+                };
+                meta.apply(effect.clone());
             }
-            crate::view::ViewOp::RemoveTrackRuntime { .. }
-            | crate::view::ViewOp::RemoveUnreliableRuntime { .. }
-            | crate::view::ViewOp::RemoveReliableRuntime { .. } => self.runtime.apply_view_op(op),
-            crate::view::ViewOp::InsertUnreliableRuntime {
-                publisher,
-                publisher_effect,
-                ..
-            } => {
-                self.runtime.apply_view_op(op);
-                if let (Some(publisher), Some(effect)) = (publisher, publisher_effect) {
-                    let Some(meta) = self.registry.resolve_mut(*publisher) else {
-                        debug_assert!(
-                            false,
-                            "a data publisher must be live shard={} key={:?}",
-                            self.shard_id, publisher
-                        );
-                        return;
-                    };
-                    meta.apply(effect.clone());
-                }
-            }
-            crate::view::ViewOp::InsertReliableRuntime {
-                publisher,
-                publisher_effect,
-                ..
-            } => {
-                self.runtime.apply_view_op(op);
-                if let (Some(publisher), Some(effect)) = (publisher, publisher_effect) {
-                    let Some(meta) = self.registry.resolve_mut(*publisher) else {
-                        debug_assert!(
-                            false,
-                            "a reliable data publisher must be live shard={} key={:?}",
-                            self.shard_id, publisher
-                        );
-                        return;
-                    };
-                    meta.apply(effect.clone());
-                }
-            }
-            crate::view::ViewOp::BindSubscribedData {
+            crate::view::ViewOp::RemoveTrackRuntime { .. } => self.runtime.apply_view_op(op),
+            crate::view::ViewOp::BindTrack {
                 participant,
-                stream,
+                key,
                 channel,
+                lane,
             } => {
                 let Some(meta) = self.registry.resolve_mut(*participant) else {
                     debug_assert!(false, "a data binding must name a live participant");
                     return;
                 };
-                meta.apply(crate::participant::ParticipantEffect::DataSubscribed {
-                    stream: *stream,
+                meta.apply(crate::participant::ParticipantEffect::TrackSubscribed {
+                    key: *key,
                     channel: *channel,
+                    lane: *lane,
                 });
-            }
-            crate::view::ViewOp::BindSubscribedReliable {
-                participant,
-                stream,
-                channel,
-            } => {
-                let Some(meta) = self.registry.resolve_mut(*participant) else {
-                    debug_assert!(
-                        false,
-                        "a reliable data binding must name a live participant"
-                    );
-                    return;
-                };
-                meta.apply(
-                    crate::participant::ParticipantEffect::ReliableDataSubscribed {
-                        stream: *stream,
-                        channel: *channel,
-                    },
-                );
             }
         }
     }
@@ -378,12 +338,8 @@ impl ShardCore {
                 },
                 packet,
             ) => {
-                let crate::participant::PacketRouteKey::Track(packet_key) = packet.key else {
-                    debug_assert!(false, "an RTP route must carry a track key");
-                    return;
-                };
                 debug_assert_eq!(
-                    packet_key, key,
+                    packet.key, key,
                     "a routed track key must match its endpoint"
                 );
                 let Some(mut pkt) = packet.into_rtp() else {
@@ -411,12 +367,7 @@ impl ShardCore {
                 },
                 packet,
             ) => {
-                let crate::participant::PacketRouteKey::Unreliable(packet_stream) = packet.key
-                else {
-                    debug_assert!(false, "an unreliable route must carry an unreliable key");
-                    return;
-                };
-                debug_assert_eq!(packet_stream, stream);
+                debug_assert_eq!(packet.key, stream);
                 let crate::participant::TrackPacket::Data(bytes) = packet.packet else {
                     debug_assert!(false, "an unreliable route must carry a data packet");
                     return;
@@ -434,7 +385,7 @@ impl ShardCore {
                 self.runtime.route_unreliable_with_plan(
                     stream,
                     Origin::Remote,
-                    bytes.payload,
+                    bytes,
                     plan,
                     &mut ctx,
                 );
@@ -445,11 +396,7 @@ impl ShardCore {
                 },
                 packet,
             ) => {
-                let crate::participant::PacketRouteKey::Reliable(packet_stream) = packet.key else {
-                    debug_assert!(false, "a reliable route must carry a reliable key");
-                    return;
-                };
-                debug_assert_eq!(packet_stream, stream);
+                debug_assert_eq!(packet.key, stream);
                 let crate::participant::TrackPacket::Data(bytes) = packet.packet else {
                     debug_assert!(false, "a reliable route must carry a data packet");
                     return;
@@ -467,7 +414,7 @@ impl ShardCore {
                 self.runtime.route_reliable_with_plan(
                     stream,
                     Origin::Remote,
-                    bytes.payload,
+                    bytes,
                     plan,
                     &mut ctx,
                 );
@@ -556,10 +503,7 @@ impl ShardCore {
                 break;
             };
             processed = processed.saturating_add(1);
-            let crate::participant::PacketRouteKey::Track(key) = ev.key else {
-                debug_assert!(false, "the track queue must contain track routes");
-                continue;
-            };
+            let key = ev.key;
             let Some(plan) = plans.get(crate::plan::PlanKey::Track(key)) else {
                 record_routing_drop("track", "plan", "local");
                 continue;

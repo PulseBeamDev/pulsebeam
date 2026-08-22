@@ -6,10 +6,10 @@ use str0m::media::KeyframeRequestKind;
 
 use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId};
+use crate::keys::TrackKey;
 use crate::keys::{DownstreamSlotKey, ParticipantKey};
 use crate::participant::event::ParticipantSink;
-use crate::participant::{PacketRouteKey, RoutedPacket, TrackPacket};
-use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
+use crate::participant::{RoutedTrackPacket, TrackPacket};
 use crate::track::{GlobalKeyframeRequest, Topic, Track, TrackLayer, TrackMeta};
 
 pub struct SctpEvent<K> {
@@ -69,16 +69,16 @@ pub enum ShardInternalEvent {
         fanout: Option<TrackKey>,
     },
     ReliableControlReceived {
-        stream: Option<ReliableStreamKey>,
+        stream: Option<TrackKey>,
         bytes: Vec<u8>,
     },
 }
 
 pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
-    track_queue: VecDeque<RoutedPacket>,
-    data_queue: VecDeque<SctpEvent<UnreliableStreamKey>>,
-    reliable_data_queue: VecDeque<SctpEvent<ReliableStreamKey>>,
+    track_queue: VecDeque<RoutedTrackPacket>,
+    data_queue: VecDeque<SctpEvent<TrackKey>>,
+    reliable_data_queue: VecDeque<SctpEvent<TrackKey>>,
     shard_events: VecDeque<ShardEvent>,
 }
 
@@ -106,7 +106,7 @@ impl EventPipeline {
         self.participant_events.pop_front()
     }
 
-    pub fn pop_track(&mut self) -> Option<RoutedPacket> {
+    pub fn pop_track(&mut self) -> Option<RoutedTrackPacket> {
         self.track_queue.pop_front()
     }
 
@@ -114,11 +114,11 @@ impl EventPipeline {
         self.shard_events.push_back(ev);
     }
 
-    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent<UnreliableStreamKey>> {
+    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent<TrackKey>> {
         self.data_queue.pop_front()
     }
 
-    pub fn pop_reliable_data_sctp(&mut self) -> Option<SctpEvent<ReliableStreamKey>> {
+    pub fn pop_reliable_data_sctp(&mut self) -> Option<SctpEvent<TrackKey>> {
         self.reliable_data_queue.pop_front()
     }
 
@@ -307,14 +307,13 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         let Some(key) = fanout else {
             return;
         };
-        self.pipeline.track_queue.push_back(RoutedPacket {
-            key: PacketRouteKey::Track(key),
-            packet,
-        });
+        self.pipeline
+            .track_queue
+            .push_back(RoutedTrackPacket { key, packet });
     }
 
     #[inline]
-    fn publish_sctp(&mut self, _topic: Topic, stream: Option<UnreliableStreamKey>, pkt: Vec<u8>) {
+    fn publish_sctp(&mut self, _topic: Topic, stream: Option<TrackKey>, pkt: Vec<u8>) {
         self.pipeline
             .data_queue
             .push_back(SctpEvent { pkt, stream });
@@ -376,12 +375,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_reliable_sctp(
-        &mut self,
-        _topic: Topic,
-        stream: Option<ReliableStreamKey>,
-        frame: Vec<u8>,
-    ) {
+    fn publish_reliable_sctp(&mut self, _topic: Topic, stream: Option<TrackKey>, frame: Vec<u8>) {
         let frame = RelDelivery {
             publisher_id: self.id.as_str(),
             frame,
@@ -397,7 +391,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         &mut self,
         _publisher: ParticipantId,
         _topic: Topic,
-        stream: Option<ReliableStreamKey>,
+        stream: Option<TrackKey>,
         bytes: Vec<u8>,
     ) {
         self.pipeline
@@ -434,15 +428,11 @@ mod tests {
         let mut sink = pipeline.participant_sink(who);
         sink.publish_track_packet(
             Some(TrackKey::default()),
-            TrackPacket::Video(crate::participant::VideoPacket {
-                packet: RtpPacket::default(),
-            }),
+            TrackPacket::Rtp(RtpPacket::default()),
         );
         sink.publish_track_packet(
             Some(TrackKey::default()),
-            TrackPacket::Video(crate::participant::VideoPacket {
-                packet: RtpPacket::default(),
-            }),
+            TrackPacket::Rtp(RtpPacket::default()),
         );
         sink.publish_sctp(Topic::for_test("t"), None, vec![1]);
         sink.exit();
@@ -502,9 +492,7 @@ mod tests {
 
         pipeline.participant_sink(who).publish_track_packet(
             Some(TrackKey::default()),
-            TrackPacket::Video(crate::participant::VideoPacket {
-                packet: RtpPacket::default(),
-            }),
+            TrackPacket::Rtp(RtpPacket::default()),
         );
         assert!(pipeline.has_pending(), "so is a track packet");
         assert!(pipeline.pop_track().is_some());

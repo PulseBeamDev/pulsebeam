@@ -10,8 +10,8 @@ use super::*;
 pub(super) fn plan_removal(key: crate::control::publication::RuntimeKey) -> crate::plan::PlanKey {
     use crate::control::publication::RuntimeKey;
     match key {
-        RuntimeKey::Video(key) => crate::plan::PlanKey::Track(key.raw()),
-        RuntimeKey::Audio(key) => crate::plan::PlanKey::Track(key.raw()),
+        RuntimeKey::Video(key) => crate::plan::PlanKey::Track(key),
+        RuntimeKey::Audio(key) => crate::plan::PlanKey::Track(key),
         RuntimeKey::Unreliable(key) => crate::plan::PlanKey::Unreliable(key),
         RuntimeKey::Reliable(key) => crate::plan::PlanKey::Reliable(key),
     }
@@ -23,24 +23,25 @@ pub(super) fn runtime_removal_op(
 ) -> crate::view::ViewOp {
     use crate::control::publication::RuntimeKey;
     match key {
-        RuntimeKey::Video(key) => crate::view::ViewOp::RemoveTrackRuntime { key: key.raw() },
-        RuntimeKey::Audio(key) => crate::view::ViewOp::RemoveTrackRuntime { key: key.raw() },
-        RuntimeKey::Unreliable(key) => crate::view::ViewOp::RemoveUnreliableRuntime { key },
-        RuntimeKey::Reliable(key) => crate::view::ViewOp::RemoveReliableRuntime { key },
+        RuntimeKey::Video(key) => crate::view::ViewOp::RemoveTrackRuntime { key },
+        RuntimeKey::Audio(key) => crate::view::ViewOp::RemoveTrackRuntime { key },
+        RuntimeKey::Unreliable(key) | RuntimeKey::Reliable(key) => {
+            crate::view::ViewOp::RemoveTrackRuntime { key }
+        }
     }
 }
 
 pub(super) fn remove_runtime_key(
-    state: &mut crate::control::state::ControlPlaneState,
+    state: &mut crate::control::state::ControlModel,
     shard: crate::id::ShardId,
     key: crate::control::publication::RuntimeKey,
 ) {
     match key {
         crate::control::publication::RuntimeKey::Video(key) => {
-            state.remove_track(shard, key.raw());
+            state.remove_track(shard, key);
         }
         crate::control::publication::RuntimeKey::Audio(key) => {
-            state.remove_track(shard, key.raw());
+            state.remove_track(shard, key);
         }
         crate::control::publication::RuntimeKey::Unreliable(key) => {
             state.remove_data(shard, key);
@@ -316,10 +317,11 @@ impl ControllerActor {
                 .map(|(participant, channel)| {
                     (
                         shard,
-                        crate::view::ViewOp::BindSubscribedData {
+                        crate::view::ViewOp::BindTrack {
                             participant,
-                            stream,
+                            key: stream,
                             channel,
+                            lane: crate::track::DataLane::Realtime,
                         },
                     )
                 })
@@ -329,10 +331,11 @@ impl ControllerActor {
                 .map(|(participant, channel)| {
                     (
                         shard,
-                        crate::view::ViewOp::BindSubscribedReliable {
+                        crate::view::ViewOp::BindTrack {
                             participant,
-                            stream,
+                            key: stream,
                             channel,
+                            lane: crate::track::DataLane::Reliable,
                         },
                     )
                 })
@@ -392,12 +395,10 @@ impl ControllerActor {
                         ops = ops.participant_effect(
                             shard,
                             participant,
-                            crate::participant::ParticipantEffect::TrackInstalled(
-                                crate::participant::CompiledTrack {
-                                    key: fanout.raw(),
-                                    track: descriptor.publication.clone(),
-                                },
-                            ),
+                            crate::participant::ParticipantEffect::TrackInstalled {
+                                key: fanout,
+                                track: descriptor.publication.clone(),
+                            },
                         );
                     }
                 } else {
@@ -406,12 +407,10 @@ impl ControllerActor {
                         ops = ops.participant_effect(
                             shard,
                             participant,
-                            crate::participant::ParticipantEffect::TrackInstalled(
-                                crate::participant::CompiledTrack {
-                                    key: fanout.raw(),
-                                    track: descriptor.publication.clone(),
-                                },
-                            ),
+                            crate::participant::ParticipantEffect::TrackInstalled {
+                                key: fanout,
+                                track: descriptor.publication.clone(),
+                            },
                         );
                     }
                     for participant in recipients {
@@ -421,19 +420,17 @@ impl ControllerActor {
                         ops = ops.participant_effect(
                             shard,
                             participant,
-                            crate::participant::ParticipantEffect::TrackInstalled(
-                                crate::participant::CompiledTrack {
-                                    key: fanout.raw(),
-                                    track: descriptor.publication.clone(),
-                                },
-                            ),
+                            crate::participant::ParticipantEffect::TrackInstalled {
+                                key: fanout,
+                                track: descriptor.publication.clone(),
+                            },
                         );
                     }
                     ops.lifecycle.push((
                         shard,
                         crate::view::ViewOp::InsertTrackRuntime {
-                            key: fanout.raw(),
-                            descriptor,
+                            key: fanout,
+                            runtime: crate::view::TrackRuntime::Media(descriptor),
                         },
                     ));
                 }
@@ -448,12 +445,10 @@ impl ControllerActor {
                     ops = ops.participant_effect(
                         shard,
                         participant,
-                        crate::participant::ParticipantEffect::TrackInstalled(
-                            crate::participant::CompiledTrack {
-                                key: fanout.raw(),
-                                track: descriptor.publication.clone(),
-                            },
-                        ),
+                        crate::participant::ParticipantEffect::TrackInstalled {
+                            key: fanout,
+                            track: descriptor.publication.clone(),
+                        },
                     );
                 }
                 for participant in recipients {
@@ -463,19 +458,17 @@ impl ControllerActor {
                     ops = ops.participant_effect(
                         shard,
                         participant,
-                        crate::participant::ParticipantEffect::TrackInstalled(
-                            crate::participant::CompiledTrack {
-                                key: fanout.raw(),
-                                track: descriptor.publication.clone(),
-                            },
-                        ),
+                        crate::participant::ParticipantEffect::TrackInstalled {
+                            key: fanout,
+                            track: descriptor.publication.clone(),
+                        },
                     );
                 }
                 ops.lifecycle.push((
                     shard,
                     crate::view::ViewOp::InsertTrackRuntime {
-                        key: fanout.raw(),
-                        descriptor,
+                        key: fanout,
+                        runtime: crate::view::TrackRuntime::Media(descriptor),
                     },
                 ));
             }
@@ -697,7 +690,7 @@ impl ControllerActor {
                 crate::control::publication::Media::Video { .. },
                 crate::control::publication::RuntimeKey::Video(key),
             ) => (
-                crate::plan::PlanKey::Track(key.raw()),
+                crate::plan::PlanKey::Track(key),
                 self.video_patterns
                     .members_for(
                         self.video_patterns
@@ -717,7 +710,7 @@ impl ControllerActor {
                 crate::control::publication::Media::Audio,
                 crate::control::publication::RuntimeKey::Audio(key),
             ) => (
-                crate::plan::PlanKey::Track(key.raw()),
+                crate::plan::PlanKey::Track(key),
                 self.audio_patterns
                     .members_for(
                         self.audio_patterns
@@ -815,7 +808,7 @@ impl ControllerActor {
         let (plan_key, plan) = self.plan_for(
             id,
             shard,
-            crate::control::publication::RuntimeKey::Video(crate::keys::VideoTrackKey::new(key)),
+            crate::control::publication::RuntimeKey::Video(key),
         )?;
         debug_assert_eq!(plan_key, crate::plan::PlanKey::Track(key));
         Some(plan)

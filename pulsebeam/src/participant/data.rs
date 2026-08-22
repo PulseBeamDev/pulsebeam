@@ -3,23 +3,23 @@ use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
 
 use crate::entity::ParticipantId;
-use crate::keys::{ReliableStreamKey, UnreliableStreamKey};
+use crate::keys::TrackKey;
 use crate::participant::reliable::ReliableChannels;
 use crate::track::{DataTopicChannel, Topic};
 
 pub(super) struct DataState {
     pub topic_channels: HashMap<ChannelId, DataTopicChannel>,
     pub published_channels: HashMap<Topic, ChannelId>,
-    pub forwarding: SecondaryMap<UnreliableStreamKey, ChannelId>,
-    pub reliable_forwarding: SecondaryMap<ReliableStreamKey, ChannelId>,
-    pub published_streams: HashMap<ChannelId, UnreliableStreamKey>,
-    pub reliable_published_streams: HashMap<ChannelId, ReliableStreamKey>,
-    pub reliable_stream_topics: SecondaryMap<ReliableStreamKey, Topic>,
-    pub reliable_subscribed_streams: HashMap<ChannelId, ReliableStreamKey>,
+    pub forwarding: SecondaryMap<TrackKey, ChannelId>,
+    pub reliable_forwarding: SecondaryMap<TrackKey, ChannelId>,
+    pub published_streams: HashMap<ChannelId, TrackKey>,
+    pub reliable_published_streams: HashMap<ChannelId, TrackKey>,
+    pub reliable_stream_topics: SecondaryMap<TrackKey, Topic>,
     pub subscribed_channels: HashMap<(Topic, Option<ParticipantId>), ChannelId>,
     pub reliable: ReliableChannels,
-    pub pending_published_streams: HashMap<Topic, UnreliableStreamKey>,
-    pub pending_reliable_streams: HashMap<Topic, ReliableStreamKey>,
+    pub reliable_subscribed_streams: HashMap<ChannelId, TrackKey>,
+    pub pending_published_streams: HashMap<Topic, TrackKey>,
+    pub pending_reliable_streams: HashMap<Topic, TrackKey>,
 }
 
 impl DataState {
@@ -32,9 +32,9 @@ impl DataState {
             published_streams: HashMap::new(),
             reliable_published_streams: HashMap::new(),
             reliable_stream_topics: SecondaryMap::new(),
-            reliable_subscribed_streams: HashMap::new(),
             subscribed_channels: HashMap::new(),
             reliable: ReliableChannels::new(),
+            reliable_subscribed_streams: HashMap::new(),
             pending_published_streams: HashMap::new(),
             pending_reliable_streams: HashMap::new(),
         }

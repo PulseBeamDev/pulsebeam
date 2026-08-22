@@ -10,5 +10,5 @@ mod signaling;
 mod upstream;
 
 pub use core::*;
-pub use effect::{CompiledTrack, ParticipantEffect};
-pub use packet::{AudioPacket, DataPacket, PacketRouteKey, RoutedPacket, TrackPacket, VideoPacket};
+pub use effect::ParticipantEffect;
+pub use packet::{RoutedTrackPacket, TrackFeedback, TrackPacket};

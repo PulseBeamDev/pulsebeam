@@ -21,22 +21,22 @@ use tokio::time::Instant;
 
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
+use crate::keys::TrackKey;
 #[cfg(debug_assertions)]
 use crate::log::plog_error;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
+use crate::participant::TrackPacket;
 use crate::participant::data::DataState;
 use crate::participant::downstream::SlotConfig;
-use crate::participant::effect::{CompiledTrack, ParticipantEffect};
+use crate::participant::effect::ParticipantEffect;
 use crate::participant::event::ParticipantSink;
 use crate::participant::signaling;
-use crate::participant::{AudioPacket, TrackPacket, VideoPacket};
 use crate::participant::{
     batcher::{AppendStatus, Batcher, NetworkEgress, OwnedPacketQueue},
     downstream::DownstreamAllocator,
     upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamAllocator},
 };
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
-use crate::shard::router::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
 use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
     KEYFRAME_DEBOUNCE, MAX_DATA_TOPIC_CHANNELS, StreamId, StreamWrite, StreamWriter, Topic, Track,
@@ -265,15 +265,15 @@ pub enum ParticipantInput<'a> {
         cache: Option<&'a TrackStreamCache>,
     },
     Data {
-        stream: UnreliableStreamKey,
+        stream: TrackKey,
         packet: &'a [u8],
     },
     ReliableData {
-        stream: ReliableStreamKey,
+        stream: TrackKey,
         frame: &'a [u8],
     },
     ReliableControl {
-        stream: ReliableStreamKey,
+        stream: TrackKey,
         bytes: &'a [u8],
     },
     Keyframe {
@@ -364,7 +364,7 @@ impl ParticipantCore {
     /// frame on that channel falls back to a room-scoped lookup; afterwards
     /// the key rides on the event and nothing on the packet path hashes a
     /// name.
-    fn bind_published_data_stream(&mut self, topic: &Topic, stream: UnreliableStreamKey) {
+    fn bind_published_data_stream(&mut self, topic: &Topic, stream: TrackKey) {
         if let Some(&channel) = self.data.published_channels.get(topic) {
             self.data.published_streams.insert(channel, stream);
         } else {
@@ -374,7 +374,7 @@ impl ParticipantCore {
         }
     }
 
-    fn bind_published_reliable_stream(&mut self, topic: &Topic, stream: ReliableStreamKey) {
+    fn bind_published_reliable_stream(&mut self, topic: &Topic, stream: TrackKey) {
         self.data
             .reliable_stream_topics
             .insert(stream, topic.clone());
@@ -454,28 +454,27 @@ impl ParticipantCore {
             ParticipantEffect::ParticipantsChanged { added, removed } => {
                 self.signaling.apply_participants(added, removed);
             }
-            ParticipantEffect::TrackInstalled(compiled) => self.install_track(compiled),
+            ParticipantEffect::TrackInstalled { key, track } => self.install_track(key, track),
             ParticipantEffect::TrackRemoved(key) => self.remove_compiled_track(key),
-            ParticipantEffect::DataPublished { topic, stream } => {
-                self.bind_published_data_stream(&topic, stream);
-            }
-            ParticipantEffect::ReliableDataPublished { topic, stream } => {
-                self.bind_published_reliable_stream(&topic, stream);
-            }
-            ParticipantEffect::DataSubscribed { stream, channel } => {
-                self.data.forwarding.insert(stream, channel);
-            }
-            ParticipantEffect::ReliableDataSubscribed { stream, channel } => {
-                self.data.reliable_forwarding.insert(stream, channel);
-            }
+            ParticipantEffect::TrackPublished { topic, key, lane } => match lane {
+                DataLane::Realtime => self.bind_published_data_stream(&topic, key),
+                DataLane::Reliable => self.bind_published_reliable_stream(&topic, key),
+            },
+            ParticipantEffect::TrackSubscribed { key, channel, lane } => match lane {
+                DataLane::Realtime => {
+                    self.data.forwarding.insert(key, channel);
+                }
+                DataLane::Reliable => {
+                    self.data.reliable_forwarding.insert(key, channel);
+                }
+            },
         }
     }
 
-    fn install_track(&mut self, compiled: CompiledTrack) {
-        let track_id = compiled.track.id();
-        let participant_id = compiled.track.meta().origin;
-        let key = compiled.key;
-        debug_assert_eq!(track_id.kind(), compiled.kind());
+    fn install_track(&mut self, key: TrackKey, track: Track) {
+        let track_id = track.id();
+        let participant_id = track.meta().origin;
+        debug_assert_eq!(track_id.kind(), track.kind());
         if let Some(previous) = self.catalog.get(key) {
             debug_assert_eq!(previous.track_id, track_id);
             debug_assert_eq!(previous.participant_id, participant_id);
@@ -494,7 +493,7 @@ impl ParticipantCore {
         if participant_id == self.participant_id {
             self.incoming_rtp_routes.bind_fanout(track_id, key);
         } else if track_id.kind() != TrackKind::Data {
-            self.on_track_published(key, compiled.track);
+            self.on_track_published(key, track);
         }
     }
 
@@ -1570,8 +1569,7 @@ impl ParticipantCore {
             sr,
         ) {
             let packet = match media.kind() {
-                MediaKind::Audio => TrackPacket::Audio(AudioPacket { packet: rtp }),
-                MediaKind::Video => TrackPacket::Video(VideoPacket { packet: rtp }),
+                MediaKind::Audio | MediaKind::Video => TrackPacket::Rtp(rtp),
             };
             events.publish_track_packet(route.fanout, packet);
         } else {

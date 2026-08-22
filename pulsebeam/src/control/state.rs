@@ -38,10 +38,17 @@ impl DataStreamId {
     }
 }
 
+fn id_to_track_id(id: &DataStreamId, lane: crate::track::DataLane) -> crate::entity::TrackId {
+    id.publisher_id.derive_track_id(
+        crate::entity::TrackKind::Data,
+        &crate::track::publication_label(lane, &id.topic),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeStreamKey {
-    Unreliable(crate::keys::UnreliableStreamKey),
-    Reliable(crate::keys::ReliableStreamKey),
+    Unreliable(crate::keys::TrackKey),
+    Reliable(crate::keys::TrackKey),
 }
 
 /// One shard's slot namespace for one route family.
@@ -108,19 +115,13 @@ pub(crate) struct ParticipantRecord {
 pub(crate) struct TrackRecord {
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
-}
-
-#[derive(Debug)]
-pub(crate) struct StreamRecord {
-    pub id: DataStreamId,
+    pub lane: Option<crate::track::DataLane>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ShardArenas {
     pub participants: SlotMap<crate::keys::ParticipantKey, ParticipantRecord>,
     pub tracks: SlotMap<crate::keys::TrackKey, TrackRecord>,
-    pub unreliable: SlotMap<crate::keys::UnreliableStreamKey, StreamRecord>,
-    pub reliable: SlotMap<crate::keys::ReliableStreamKey, StreamRecord>,
 }
 
 impl ShardArenas {
@@ -128,8 +129,6 @@ impl ShardArenas {
         Self {
             participants: SlotMap::with_key(),
             tracks: SlotMap::with_key(),
-            unreliable: SlotMap::with_key(),
-            reliable: SlotMap::with_key(),
         }
     }
 }
@@ -152,8 +151,6 @@ pub(crate) struct LifecycleTransaction {
     pub reservations: Vec<RouteReservation>,
     pub participants: Vec<(ShardId, crate::keys::ParticipantKey)>,
     pub tracks: Vec<(ShardId, crate::keys::TrackKey)>,
-    pub unreliable: Vec<(ShardId, crate::keys::UnreliableStreamKey)>,
-    pub reliable: Vec<(ShardId, crate::keys::ReliableStreamKey)>,
 }
 
 impl LifecycleTransaction {
@@ -163,8 +160,6 @@ impl LifecycleTransaction {
             reservations: Vec::new(),
             participants: Vec::new(),
             tracks: Vec::new(),
-            unreliable: Vec::new(),
-            reliable: Vec::new(),
         }
     }
 }
@@ -187,7 +182,7 @@ pub(crate) enum TransactionError {
 /// that "one publish per affected shard per generation" is enforceable by
 /// looking at one function rather than trusting fifty call sites.
 #[derive(Debug)]
-pub(crate) struct ControlPlaneState {
+pub(crate) struct ControlModel {
     pending: Option<LifecycleTransaction>,
     pub arenas: Vec<ShardArenas>,
     pub transport: PerShardAllocator,
@@ -195,7 +190,7 @@ pub(crate) struct ControlPlaneState {
     generation: u64,
 }
 
-impl ControlPlaneState {
+impl ControlModel {
     pub fn new(shard_count: usize) -> Self {
         Self {
             pending: None,
@@ -227,27 +222,29 @@ impl ControlPlaneState {
         id: crate::entity::TrackId,
         origin: crate::entity::ParticipantId,
     ) -> Option<crate::keys::TrackKey> {
-        let key = self
-            .arenas
-            .get_mut(shard.index())
-            .map(|arena| arena.tracks.insert(TrackRecord { id, origin }))?;
+        let key = self.arenas.get_mut(shard.index()).map(|arena| {
+            arena.tracks.insert(TrackRecord {
+                id,
+                origin,
+                lane: None,
+            })
+        })?;
         if let Some(tx) = self.pending.as_mut() {
             tx.tracks.push((shard, key));
         }
         Some(key)
     }
 
-    pub fn mint_data(
-        &mut self,
-        shard: ShardId,
-        id: DataStreamId,
-    ) -> Option<crate::keys::UnreliableStreamKey> {
-        let key = self
-            .arenas
-            .get_mut(shard.index())
-            .map(|arena| arena.unreliable.insert(StreamRecord { id }))?;
+    pub fn mint_data(&mut self, shard: ShardId, id: DataStreamId) -> Option<crate::keys::TrackKey> {
+        let key = self.arenas.get_mut(shard.index()).map(|arena| {
+            arena.tracks.insert(TrackRecord {
+                id: id_to_track_id(&id, crate::track::DataLane::Realtime),
+                origin: id.publisher_id,
+                lane: Some(crate::track::DataLane::Realtime),
+            })
+        })?;
         if let Some(tx) = self.pending.as_mut() {
-            tx.unreliable.push((shard, key));
+            tx.tracks.push((shard, key));
         }
         Some(key)
     }
@@ -256,13 +253,16 @@ impl ControlPlaneState {
         &mut self,
         shard: ShardId,
         id: DataStreamId,
-    ) -> Option<crate::keys::ReliableStreamKey> {
-        let key = self
-            .arenas
-            .get_mut(shard.index())
-            .map(|arena| arena.reliable.insert(StreamRecord { id }))?;
+    ) -> Option<crate::keys::TrackKey> {
+        let key = self.arenas.get_mut(shard.index()).map(|arena| {
+            arena.tracks.insert(TrackRecord {
+                id: id_to_track_id(&id, crate::track::DataLane::Reliable),
+                origin: id.publisher_id,
+                lane: Some(crate::track::DataLane::Reliable),
+            })
+        })?;
         if let Some(tx) = self.pending.as_mut() {
-            tx.reliable.push((shard, key));
+            tx.tracks.push((shard, key));
         }
         Some(key)
     }
@@ -288,23 +288,23 @@ impl ControlPlaneState {
         }
     }
 
-    pub fn remove_data(&mut self, shard: ShardId, key: crate::keys::UnreliableStreamKey) {
+    pub fn remove_data(&mut self, shard: ShardId, key: crate::keys::TrackKey) {
         let record = self
             .arenas
             .get_mut(shard.index())
-            .and_then(|arena| arena.unreliable.remove(key));
+            .and_then(|arena| arena.tracks.remove(key));
         if let Some(record) = record {
-            debug_assert!(!record.id.topic.as_ref().is_empty());
+            debug_assert_eq!(record.lane, Some(crate::track::DataLane::Realtime));
         }
     }
 
-    pub fn remove_reliable(&mut self, shard: ShardId, key: crate::keys::ReliableStreamKey) {
+    pub fn remove_reliable(&mut self, shard: ShardId, key: crate::keys::TrackKey) {
         let record = self
             .arenas
             .get_mut(shard.index())
-            .and_then(|arena| arena.reliable.remove(key));
+            .and_then(|arena| arena.tracks.remove(key));
         if let Some(record) = record {
-            debug_assert!(!record.id.topic.as_ref().is_empty());
+            debug_assert_eq!(record.lane, Some(crate::track::DataLane::Reliable));
         }
     }
 
@@ -439,12 +439,6 @@ impl ControlPlaneState {
         for &(shard, key) in &tx.tracks {
             self.remove_track(shard, key);
         }
-        for &(shard, key) in &tx.unreliable {
-            self.remove_data(shard, key);
-        }
-        for &(shard, key) in &tx.reliable {
-            self.remove_reliable(shard, key);
-        }
         Some(tx)
     }
 }
@@ -457,7 +451,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_reserved_route_carries_the_shard_placement_chose() {
-        let mut state = ControlPlaneState::new(8);
+        let mut state = ControlModel::new(8);
         state.begin().unwrap();
         let handle = state
             .reserve_transport(ShardId::new(5), Instant::now())
@@ -467,7 +461,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn reserving_without_a_transaction_does_not_consume_a_slot() {
-        let mut state = ControlPlaneState::new(1);
+        let mut state = ControlModel::new(1);
         let shard = ShardId::new(0);
         assert_eq!(
             state.reserve_transport(shard, Instant::now()),
@@ -481,7 +475,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_two_families_allocate_from_separate_namespaces() {
-        let mut state = ControlPlaneState::new(2);
+        let mut state = ControlModel::new(2);
         let now = Instant::now();
         let shard = ShardId::new(1);
         let (transport_slot, _) = state.transport.allocate(shard, now).unwrap();
@@ -496,7 +490,7 @@ mod tests {
     /// reconnect storm would exhaust the namespace one failed join at a time.
     #[tokio::test(start_paused = true)]
     async fn an_aborted_reservation_returns_to_the_allocator() {
-        let mut state = ControlPlaneState::new(2);
+        let mut state = ControlModel::new(2);
         let shard = ShardId::new(0);
 
         state.begin().unwrap();
@@ -513,14 +507,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn only_one_transaction_stages_at_a_time() {
-        let mut state = ControlPlaneState::new(2);
+        let mut state = ControlModel::new(2);
         state.begin().unwrap();
         assert_eq!(state.begin(), Err(TransactionError::Busy));
     }
 
     #[tokio::test(start_paused = true)]
     async fn abort_removes_every_minted_runtime_key() {
-        let mut state = ControlPlaneState::new(1);
+        let mut state = ControlModel::new(1);
         let shard = ShardId::new(0);
         state.begin().unwrap();
         let participant_id = crate::entity::ParticipantId::from_bytes([1; 16]);
@@ -544,8 +538,8 @@ mod tests {
         state.abort(Instant::now());
         assert!(state.arenas[0].participants.get(participant).is_none());
         assert!(state.arenas[0].tracks.get(track).is_none());
-        assert!(state.arenas[0].unreliable.get(data).is_none());
-        assert!(state.arenas[0].reliable.get(reliable).is_none());
+        assert!(state.arenas[0].tracks.get(data).is_none());
+        assert!(state.arenas[0].tracks.get(reliable).is_none());
     }
 
     /// A key minted with no transaction staged is live, and an unrelated
@@ -559,7 +553,7 @@ mod tests {
     /// and their media stopped for good.
     #[tokio::test(start_paused = true)]
     async fn an_abort_does_not_destroy_keys_minted_before_it() {
-        let mut state = ControlPlaneState::new(1);
+        let mut state = ControlModel::new(1);
         let shard = ShardId::new(0);
         let origin = crate::entity::ParticipantId::from_bytes([3; 16]);
 
@@ -593,7 +587,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn removed_track_key_does_not_resolve_after_reissue() {
-        let mut state = ControlPlaneState::new(1);
+        let mut state = ControlModel::new(1);
         let shard = ShardId::new(0);
         let origin = crate::entity::ParticipantId::from_bytes([2; 16]);
         let track_id = origin.derive_track_id(crate::entity::TrackKind::Video, "track");

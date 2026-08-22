@@ -15,9 +15,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::ShardId;
-use crate::keys::{
-    AudioTrackKey, ParticipantKey, ReliableStreamKey, TrackKey, UnreliableStreamKey, VideoTrackKey,
-};
+use crate::keys::{ParticipantKey, TrackKey};
 use crate::route::RouteHandle;
 
 /// A publication's key in one shard's arena, whichever arena that is.
@@ -27,17 +25,17 @@ use crate::route::RouteHandle;
 /// needs to know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeKey {
-    Video(VideoTrackKey),
-    Audio(AudioTrackKey),
-    Unreliable(UnreliableStreamKey),
-    Reliable(ReliableStreamKey),
+    Video(TrackKey),
+    Audio(TrackKey),
+    Unreliable(TrackKey),
+    Reliable(TrackKey),
 }
 
 impl RuntimeKey {
     pub fn track(self) -> Option<TrackKey> {
         match self {
-            Self::Video(key) => Some(key.raw()),
-            Self::Audio(key) => Some(key.raw()),
+            Self::Video(key) => Some(key),
+            Self::Audio(key) => Some(key),
             _ => None,
         }
     }
@@ -74,7 +72,7 @@ impl From<crate::control::state::RuntimeStreamKey> for RuntimeKey {
 /// mistake that made cross-shard audio silently undeliverable.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Destination {
-    Discovery { key: VideoTrackKey },
+    Discovery { key: TrackKey },
     Forwarding { key: RuntimeKey, route: RouteHandle },
 }
 
@@ -353,7 +351,7 @@ mod tests {
             publisher: pid(publisher),
             publisher_shard: ShardId::new(0),
             publisher_key: ParticipantKey::default(),
-            origin_key: RuntimeKey::Audio(AudioTrackKey::new(TrackKey::default())),
+            origin_key: RuntimeKey::Audio(TrackKey::default()),
             reverse_route: None,
             destinations: IndexMap::new(),
             media: Media::Audio,
@@ -369,7 +367,7 @@ mod tests {
             publisher: pid(publisher),
             publisher_shard: ShardId::new(0),
             publisher_key: ParticipantKey::default(),
-            origin_key: RuntimeKey::Unreliable(Default::default()),
+            origin_key: RuntimeKey::Unreliable(TrackKey::default()),
             reverse_route: None,
             destinations: IndexMap::new(),
             media: Media::Data { lane, topic },

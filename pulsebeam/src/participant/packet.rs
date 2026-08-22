@@ -1,48 +1,30 @@
-use crate::keys::{ReliableStreamKey, TrackKey, UnreliableStreamKey};
+use crate::keys::TrackKey;
 use crate::rtp::RtpPacket;
 
 #[derive(Debug, Clone)]
 pub enum TrackPacket {
-    Data(DataPacket),
-    Audio(AudioPacket),
-    Video(VideoPacket),
+    Data(Vec<u8>),
+    Rtp(RtpPacket),
 }
 
 #[derive(Debug, Clone)]
-pub struct DataPacket {
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AudioPacket {
-    pub packet: RtpPacket,
-}
-
-#[derive(Debug, Clone)]
-pub struct VideoPacket {
-    pub packet: RtpPacket,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PacketRouteKey {
-    Track(TrackKey),
-    Unreliable(UnreliableStreamKey),
-    Reliable(ReliableStreamKey),
-}
-
-#[derive(Debug, Clone)]
-pub struct RoutedPacket {
-    pub key: PacketRouteKey,
+pub struct RoutedTrackPacket {
+    pub key: TrackKey,
     pub packet: TrackPacket,
 }
 
-impl RoutedPacket {
+#[derive(Debug, Clone)]
+pub struct TrackFeedback {
+    pub key: TrackKey,
+    pub bytes: Vec<u8>,
+}
+
+impl RoutedTrackPacket {
     pub fn into_rtp(self) -> Option<RtpPacket> {
         match self.packet {
-            TrackPacket::Audio(packet) => Some(packet.packet),
-            TrackPacket::Video(packet) => Some(packet.packet),
+            TrackPacket::Rtp(packet) => Some(packet),
             TrackPacket::Data(_) => {
-                debug_assert!(false, "a routed data packet cannot enter the RTP path");
+                debug_assert!(false, "a data packet cannot enter the RTP path");
                 None
             }
         }
