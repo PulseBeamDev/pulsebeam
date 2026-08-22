@@ -13,3 +13,5 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+aws-lc-rs = "1.16.3"
+pulsebeam-proto = { path = "../pulsebeam-proto" }

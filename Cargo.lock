@@ -2933,6 +2933,10 @@ dependencies = [
 [[package]]
 name = "pulsebeam-agent-core"
 version = "0.3.2"
+dependencies = [
+ "aws-lc-rs",
+ "pulsebeam-proto",
+]
 
 [[package]]
 name = "pulsebeam-agent-native"
