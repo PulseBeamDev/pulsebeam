@@ -404,7 +404,7 @@ pub(crate) enum RouteAction {
 /// arrives.
 ///
 /// The other half — the epoch and the compiled [`RouteAction`] — lives in the
-/// published [`ShardView`](crate::view::ShardView), because that is what the
+/// published [`ShardState`](crate::shard_update::ShardState), because that is what the
 /// control plane decides and the data plane only reads. What is left here is
 /// per-route processing state, which must be mutable on the owning core and
 /// therefore cannot live in an immutable image.
@@ -584,7 +584,7 @@ impl SlotAllocator {
 ///
 /// Not a route *table*: it decides nothing and resolves nothing. Whether a
 /// route is live, and what it points at, is the published
-/// [`ShardView`](crate::view::ShardView)'s answer; this only holds the
+/// [`ShardState`](crate::shard_update::ShardState)'s answer; this only holds the
 /// mutable processing state that must live on the owning core, and is
 /// created and dropped at the control plane's direction.
 #[derive(Debug)]
@@ -1176,9 +1176,9 @@ mod layout {
             size_of::<Option<RouteRuntimeEntry>>()
         );
         assert!(
-            size_of::<Option<crate::view::RouteBinding>>() <= CACHE_LINE / 2,
+            size_of::<Option<crate::shard_update::RouteBinding>>() <= CACHE_LINE / 2,
             "a view binding is {} bytes; several should share a line",
-            size_of::<Option<crate::view::RouteBinding>>()
+            size_of::<Option<crate::shard_update::RouteBinding>>()
         );
     }
 }

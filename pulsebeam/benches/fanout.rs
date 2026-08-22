@@ -17,9 +17,10 @@
 #![allow(clippy::disallowed_types, clippy::print_stdout)]
 
 use std::hint::black_box;
-use std::sync::mpsc::sync_channel;
-use std::thread;
 use std::time::Instant;
+
+#[cfg(feature = "real-worker-probes")]
+use std::{sync::mpsc::sync_channel, thread};
 
 use pulsebeam::entity::{ParticipantId, TrackKind};
 use pulsebeam::rtp::RtpPacket;
@@ -45,10 +46,12 @@ fn main() {
 
     route_lookup(iters);
     packet_clone(iters);
-    forwarding_residence(iters);
+    #[cfg(feature = "real-worker-probes")]
+    worker_churn_probe(iters);
 }
 
-fn forwarding_residence(iters: u32) {
+#[cfg(feature = "real-worker-probes")]
+fn worker_churn_probe(iters: u32) {
     let samples = usize::try_from(iters.max(10_000)).unwrap_or(10_000);
     let (tx, rx) = sync_channel::<Option<(Instant, [u8; 1200])>>(4096);
     let worker = thread::spawn(move || {
@@ -71,7 +74,7 @@ fn forwarding_residence(iters: u32) {
         .saturating_sub(1)
         .min(residence.len().saturating_sub(1));
     println!(
-        "real-worker forwarding residence P99.99 {:>7.2} us ({} samples; wall-clock only)",
+        "real-worker churn probe P99.99 {:>7.2} us ({} samples)",
         residence[rank] as f64 / 1_000.0,
         residence.len()
     );

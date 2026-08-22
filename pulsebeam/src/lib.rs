@@ -43,14 +43,13 @@ pub(crate) mod log;
 pub mod message;
 pub mod node;
 pub mod participant;
-pub(crate) mod plan;
 pub mod route;
 pub mod rtp;
 pub mod shard;
+pub(crate) mod shard_update;
 #[cfg(feature = "sim")]
 pub mod sim_metrics;
 pub mod track;
-pub(crate) mod view;
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

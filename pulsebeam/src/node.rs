@@ -420,8 +420,8 @@ impl NodeBuilder {
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
-            let (view_writer, view_reader) = crate::view::new_shard_view(shard_id);
-            view_writers.push(view_writer);
+            let (update_writer, update_reader) = crate::shard_update::new_shard_update(shard_id);
+            view_writers.push(update_writer);
             let (shard_command_tx, shard_command_rx) =
                 mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
             let shard_event_tx = shard_event_tx.clone();
@@ -440,7 +440,7 @@ impl NodeBuilder {
                     udp_sock.into_unified_socket()?,
                     tcp_sock,
                     shard_command_rx,
-                    view_reader,
+                    update_reader,
                     shard_event_tx,
                     frame_rx,
                     frame_txs,
@@ -501,7 +501,7 @@ impl NodeBuilder {
                                     udp_sock,
                                     tcp_sock,
                                     shard_command_rx,
-                                    view_reader,
+                                    update_reader,
                                     shard_event_tx,
                                     frame_rx,
                                     frame_txs,

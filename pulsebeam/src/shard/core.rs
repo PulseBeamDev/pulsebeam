@@ -2,6 +2,7 @@ use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
 };
+use slotmap::SecondaryMap;
 use std::collections::VecDeque;
 use tokio::time::Instant;
 
@@ -31,6 +32,47 @@ use super::worker::{
 };
 
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
+
+#[derive(Debug, Default)]
+struct TrackPlanTable {
+    tracks: SecondaryMap<crate::keys::TrackKey, crate::shard_update::TrackPlan>,
+}
+
+impl TrackPlanTable {
+    fn get(&self, key: crate::keys::TrackKey) -> Option<&crate::shard_update::TrackPlan> {
+        self.tracks.get(key)
+    }
+
+    fn apply(&mut self, update: &crate::shard_update::TrackPlanUpdate, touched: &mut usize) {
+        match &update.plan {
+            Some(plan) => {
+                debug_assert!(plan.local.iter().enumerate().all(|(index, value)| {
+                    plan.local[..index]
+                        .iter()
+                        .all(|candidate| candidate != value)
+                }));
+                debug_assert!(plan.remote.iter().enumerate().all(|(index, value)| {
+                    plan.remote[..index]
+                        .iter()
+                        .all(|candidate| candidate != value)
+                }));
+                self.tracks.insert(update.key, plan.clone());
+                *touched = touched.saturating_add(
+                    plan.local
+                        .len()
+                        .saturating_add(plan.remote.len())
+                        .saturating_add(usize::from(plan.reverse_route.is_some())),
+                );
+            }
+            None => {
+                debug_assert!(self.tracks.contains_key(update.key));
+                if self.tracks.remove(update.key).is_some() {
+                    *touched = touched.saturating_add(1);
+                }
+            }
+        }
+    }
+}
 
 fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) {
     metrics::counter!(
@@ -84,15 +126,15 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
 
 pub(crate) struct ShardCore {
     pub(crate) shard_id: crate::id::ShardId,
-    view: crate::view::ShardView,
-    view_rx: mailbox::Receiver<Box<crate::view::ControlBatch>>,
-    pending_view_delta: Option<Box<crate::view::ControlBatch>>,
+    state: crate::shard_update::ShardState,
+    update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
+    pending_update: Option<Box<crate::shard_update::ShardUpdate>>,
     pending_view_lifecycle: bool,
     pending_plan_index: usize,
     pending_participant_effects: VecDeque<(ParticipantKey, crate::participant::ParticipantEffect)>,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
-    plans: crate::plan::TrackPlans,
+    plans: TrackPlanTable,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -101,13 +143,13 @@ pub(crate) struct ShardCore {
     wall: WallAnchor,
 }
 
-fn is_retire(op: &crate::view::ViewOp) -> bool {
+fn is_retire(op: &crate::shard_update::ShardUpdateOp) -> bool {
     matches!(
         op,
-        crate::view::ViewOp::RetireRoute { .. }
-            | crate::view::ViewOp::RetireTransport { .. }
-            | crate::view::ViewOp::RemoveParticipant { .. }
-            | crate::view::ViewOp::RemoveTrackRuntime { .. }
+        crate::shard_update::ShardUpdateOp::RetireRoute { .. }
+            | crate::shard_update::ShardUpdateOp::RetireTransport { .. }
+            | crate::shard_update::ShardUpdateOp::RemoveParticipant { .. }
+            | crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { .. }
     )
 }
 
@@ -117,7 +159,7 @@ impl ShardCore {
         max_gso_segments: usize,
         shard_count: usize,
         wall: WallAnchor,
-        view_rx: mailbox::Receiver<Box<crate::view::ControlBatch>>,
+        update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
     ) -> Self {
         let shard_id = shard_id.into();
         debug_assert!(shard_count > 0);
@@ -128,21 +170,21 @@ impl ShardCore {
         let shard_count = u16::try_from(shard_count).unwrap_or(u16::MAX);
         debug_assert!(shard_count > 0, "a node always has at least one shard");
         let runtime = ShardRuntime::new(shard_id);
-        let view = crate::view::ShardView {
+        let state = crate::shard_update::ShardState {
             shard: shard_id,
             ..Default::default()
         };
         Self {
             shard_id,
-            view,
-            view_rx,
-            pending_view_delta: None,
+            state,
+            update_rx,
+            pending_update: None,
             pending_view_lifecycle: false,
             pending_plan_index: 0,
             pending_participant_effects: VecDeque::new(),
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             runtime,
-            plans: crate::plan::TrackPlans::default(),
+            plans: TrackPlanTable::default(),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -152,38 +194,36 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn apply_view_deltas(&mut self, budget: usize) -> usize {
+    pub(crate) fn apply_updates(&mut self, budget: usize) -> usize {
         debug_assert!(budget > 0);
-        debug_assert_eq!(self.view.shard, self.shard_id);
+        debug_assert_eq!(self.state.shard, self.shard_id);
         let mut applied = 0;
         while applied < budget {
-            if self.pending_view_delta.is_none() {
-                let Ok(delta) = self.view_rx.try_recv() else {
+            if self.pending_update.is_none() {
+                let Ok(delta) = self.update_rx.try_recv() else {
                     break;
                 };
-                self.pending_view_delta = Some(delta);
+                self.pending_update = Some(delta);
             }
-            let Some(delta) = self.pending_view_delta.take() else {
+            let Some(delta) = self.pending_update.take() else {
                 debug_assert!(false, "a readable view delta must be retained");
                 break;
             };
-            if !delta.validate_for(self.shard_id, self.view.generation) {
+            if !delta.validate_for(self.shard_id, self.state.generation) {
                 debug_assert_eq!(delta.shard, self.shard_id);
                 debug_assert!(
-                    delta.generation > self.view.generation,
+                    delta.generation > self.state.generation,
                     "view generations arrive strictly newer"
                 );
-                self.pending_view_delta = None;
+                self.pending_update = None;
                 self.pending_view_lifecycle = false;
                 self.pending_plan_index = 0;
                 continue;
             }
             if !self.pending_view_lifecycle {
-                for op in delta
-                    .lifecycle
-                    .iter()
-                    .filter(|op| matches!(op, crate::view::ViewOp::InsertParticipant))
-                {
+                for op in delta.lifecycle.iter().filter(|op| {
+                    matches!(op, crate::shard_update::ShardUpdateOp::InsertParticipant)
+                }) {
                     self.apply_lifecycle_op(op);
                 }
                 self.apply_pending_participant_effects();
@@ -196,7 +236,8 @@ impl ShardCore {
                     meta.apply(effect.clone());
                 }
                 for op in delta.lifecycle.iter().filter(|op| {
-                    !is_retire(op) && !matches!(op, crate::view::ViewOp::InsertParticipant)
+                    !is_retire(op)
+                        && !matches!(op, crate::shard_update::ShardUpdateOp::InsertParticipant)
                 }) {
                     self.apply_lifecycle_op(op);
                 }
@@ -205,11 +246,10 @@ impl ShardCore {
             let end = self
                 .pending_plan_index
                 .saturating_add(SHARD_PLAN_OPERATION_BUDGET)
-                .min(delta.plans.operations.len());
+                .min(delta.plans.len());
             let mut touched = 0;
             let operations = delta
                 .plans
-                .operations
                 .get(self.pending_plan_index..end)
                 .unwrap_or_default();
             for operation in operations {
@@ -218,16 +258,16 @@ impl ShardCore {
             self.pending_plan_index = end;
             #[cfg(feature = "sim")]
             crate::sim_metrics::record_routing_work("plan_entries_touched", touched);
-            if self.pending_plan_index < delta.plans.operations.len() {
-                self.pending_view_delta = Some(delta);
+            if self.pending_plan_index < delta.plans.len() {
+                self.pending_update = Some(delta);
                 break;
             }
             for op in delta.lifecycle.iter().filter(|op| is_retire(op)) {
                 self.apply_lifecycle_op(op);
             }
-            self.view.generation = delta.generation;
+            self.state.generation = delta.generation;
             self.apply_pending_participant_effects();
-            self.pending_view_delta = None;
+            self.pending_update = None;
             self.pending_view_lifecycle = false;
             self.pending_plan_index = 0;
             applied = applied.saturating_add(1);
@@ -268,28 +308,30 @@ impl ShardCore {
         participant.drain_network(&mut egress);
     }
 
-    fn apply_lifecycle_op(&mut self, op: &crate::view::ViewOp) {
+    fn apply_lifecycle_op(&mut self, op: &crate::shard_update::ShardUpdateOp) {
         debug_assert!(op.is_owned_by(self.shard_id));
         match op {
-            crate::view::ViewOp::InstallRoute { binding } => {
-                self.view.routes.install(binding.clone());
+            crate::shard_update::ShardUpdateOp::InstallRoute { binding } => {
+                self.state.routes.install(binding.clone());
             }
-            crate::view::ViewOp::RetireRoute { handle } => self.view.routes.retire(*handle),
-            crate::view::ViewOp::InstallTransport { binding } => {
-                self.view.transports.install(*binding);
+            crate::shard_update::ShardUpdateOp::RetireRoute { handle } => {
+                self.state.routes.retire(*handle)
             }
-            crate::view::ViewOp::RetireTransport { handle } => {
-                self.view.transports.retire(*handle);
+            crate::shard_update::ShardUpdateOp::InstallTransport { binding } => {
+                self.state.transports.install(*binding);
             }
-            crate::view::ViewOp::InsertParticipant => {}
-            crate::view::ViewOp::RemoveParticipant { key } => {
+            crate::shard_update::ShardUpdateOp::RetireTransport { handle } => {
+                self.state.transports.retire(*handle);
+            }
+            crate::shard_update::ShardUpdateOp::InsertParticipant => {}
+            crate::shard_update::ShardUpdateOp::RemoveParticipant { key } => {
                 self.timers.cancel(*key);
                 let _ = self.registry.remove_key(*key);
                 self.pending_participant_effects
                     .retain(|(participant, _)| *participant != *key);
             }
-            crate::view::ViewOp::InsertTrackRuntime { runtime, .. } => {
-                self.runtime.apply_view_op(op);
+            crate::shard_update::ShardUpdateOp::InsertTrackRuntime { runtime, .. } => {
+                self.runtime.apply_update_op(op);
                 if let (Some(publisher), Some(effect)) =
                     (runtime.publisher, runtime.publisher_effect.as_ref())
                 {
@@ -304,8 +346,10 @@ impl ShardCore {
                     meta.apply(effect.clone());
                 }
             }
-            crate::view::ViewOp::RemoveTrackRuntime { .. } => self.runtime.apply_view_op(op),
-            crate::view::ViewOp::BindTrack {
+            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { .. } => {
+                self.runtime.apply_update_op(op)
+            }
+            crate::shard_update::ShardUpdateOp::BindTrack {
                 participant,
                 key,
                 channel,
@@ -321,11 +365,12 @@ impl ShardCore {
                     lane: *lane,
                 });
             }
+            crate::shard_update::ShardUpdateOp::Placeholder => {}
         }
     }
 
-    pub(crate) async fn view_readable(&mut self) -> Option<()> {
-        self.view_rx.readable().await
+    pub(crate) async fn update_readable(&mut self) -> Option<()> {
+        self.update_rx.readable().await
     }
 
     fn on_media_frame(
@@ -341,8 +386,8 @@ impl ShardCore {
         #[allow(clippy::cast_possible_truncation)]
         let playout_ntp32 = env.extension as u32;
         let handle = env.handle;
-        let view = &self.view;
-        let Some(binding) = view.routes.resolve_binding(handle) else {
+        let state = &self.state;
+        let Some(binding) = state.routes.resolve_binding(handle) else {
             return;
         };
         #[cfg(feature = "sim")]
@@ -426,7 +471,7 @@ impl ShardCore {
         source_shard: crate::id::ShardId,
     ) {
         debug_assert_eq!(handle.shard(), self.shard_id);
-        let Some(key) = self.view.transports.resolve(handle) else {
+        let Some(key) = self.state.transports.resolve(handle) else {
             return;
         };
         let Some(participant) = self.registry.resolve_mut(key) else {
@@ -690,16 +735,12 @@ impl ShardCore {
                 metrics::counter!("shard_ingress_forwarded").increment(1);
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("shard_ingress_forwarded");
-                if self.view.transports.resolve(handle).is_some() {
+                if self.state.transports.resolve(handle).is_some() {
                     self.registry.learn_addr(batch.src, handle);
                 }
                 self.on_owned_udp_batch(batch, handle, source_shard);
             }
-            ShardFrame::Media {
-                env,
-                payload,
-                enqueued_at: _,
-            } => {
+            ShardFrame::Media { env, payload } => {
                 self.on_media_frame(env, payload, now, router);
             }
             ShardFrame::Reverse { env, body } => self.on_reverse_frame(env, body),
@@ -708,7 +749,7 @@ impl ShardCore {
 
     fn on_reverse_frame(&mut self, env: Envelope, body: Reverse) {
         debug_assert_eq!(env.ty, crate::route::EnvelopeType::Feedback);
-        let Some(action) = self.view.routes.resolve(env.handle).copied() else {
+        let Some(action) = self.state.routes.resolve(env.handle).copied() else {
             return;
         };
         let Some((origin, target)) = self.runtime.resolve_reverse(action) else {
@@ -872,13 +913,13 @@ mod wrong_owner_tests {
     #[tokio::test(start_paused = true)]
     async fn a_datagram_for_another_shard_is_dropped_not_asserted() {
         let shard = ShardId::new(0);
-        let (_writer, view_rx) = crate::view::new_shard_view(shard);
+        let (_writer, update_rx) = crate::shard_update::new_shard_update(shard);
         let mut core = ShardCore::new(
             shard,
             4,
             4,
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
-            view_rx,
+            update_rx,
         );
 
         let foreign = TransportRoute::new(ShardId::new(3), 41);
@@ -916,13 +957,13 @@ mod wrong_owner_tests {
     #[tokio::test(start_paused = true)]
     async fn a_datagram_for_another_shard_is_forwarded_to_its_owner() {
         let shard = ShardId::new(0);
-        let (_writer, view_rx) = crate::view::new_shard_view(shard);
+        let (_writer, update_rx) = crate::shard_update::new_shard_update(shard);
         let mut core = ShardCore::new(
             shard,
             4,
             4,
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
-            view_rx,
+            update_rx,
         );
         let router = CaptureTransport {
             frames: std::cell::RefCell::new(Vec::new()),
@@ -954,13 +995,13 @@ mod wrong_owner_tests {
     #[tokio::test(start_paused = true)]
     async fn a_view_delta_is_applied_as_one_consistent_state_transition() {
         let shard = ShardId::new(0);
-        let (mut writer, view_rx) = crate::view::new_shard_view(shard);
+        let (mut writer, update_rx) = crate::shard_update::new_shard_update(shard);
         let mut core = ShardCore::new(
             shard,
             4,
             1,
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
-            view_rx,
+            update_rx,
         );
         let mut track_keys = slotmap::SlotMap::<crate::keys::TrackKey, ()>::with_key();
         let track = track_keys.insert(());
@@ -968,23 +1009,22 @@ mod wrong_owner_tests {
 
         writer.stage(
             1,
-            crate::view::ViewOp::InstallRoute {
-                binding: crate::view::RouteBinding {
+            crate::shard_update::ShardUpdateOp::InstallRoute {
+                binding: crate::shard_update::RouteBinding {
                     handle: route,
                     action: crate::route::RouteAction::Forward { target: track },
                 },
             },
         );
-        let mut plans = crate::plan::PlanBatch::default();
-        plans.push(crate::plan::PlanOperation {
+        let plans = vec![crate::shard_update::TrackPlanUpdate {
             key: track,
-            plan: Some(crate::plan::TrackPlan::default()),
-        });
+            plan: Some(crate::shard_update::TrackPlan::default()),
+        }];
         writer.stage_plans(1, plans);
         assert_eq!(writer.publish(), Some(1));
 
-        assert_eq!(core.apply_view_deltas(1), 1);
-        assert!(core.view.routes.resolve(route).is_some());
+        assert_eq!(core.apply_updates(1), 1);
+        assert!(core.state.routes.resolve(route).is_some());
         let plans = &core.plans;
         assert!(plans.get(track).is_some());
     }

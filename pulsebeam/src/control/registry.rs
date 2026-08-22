@@ -2,11 +2,10 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{
     control::room::Room,
-    entity::{ConnectionId, ParticipantId, RoomId, TrackId},
+    entity::{ConnectionId, ParticipantId, RoomId},
     id::ShardId,
     route::TransportHandle,
     shard::participants::ParticipantKey,
-    track::Track,
 };
 use futures_lite::StreamExt;
 use tokio_util::time::DelayQueue;
@@ -52,20 +51,6 @@ impl RoomRegistry {
         self.rooms.get(room_id)
     }
 
-    pub fn room_mut_for(&mut self, participant_id: &ParticipantId) -> Option<&mut Room> {
-        let meta = self.participants.get(participant_id).or_else(|| {
-            tracing::warn!(%participant_id, "participant not found in reigstry, dropping");
-            None
-        })?;
-        if !meta.connected {
-            return None;
-        }
-        self.rooms.get_mut(&meta.room_id).or_else(|| {
-            tracing::warn!(%participant_id, room = %meta.room_id, "room not found in registry, dropping");
-            None
-        })
-    }
-
     pub fn add_participant(
         &mut self,
         participant_id: ParticipantId,
@@ -103,25 +88,6 @@ impl RoomRegistry {
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
         self.participants.get(participant_id)
-    }
-
-    pub fn participant_keys_in_room(
-        &self,
-        room_id: &RoomId,
-        shard_id: ShardId,
-    ) -> Vec<ParticipantKey> {
-        let Some(room) = self.rooms.get(room_id) else {
-            return Vec::new();
-        };
-        room.participant_ids_on_shard(shard_id)
-            .filter_map(|participant| {
-                #[cfg(feature = "sim")]
-                crate::sim_metrics::record_routing_work("participants_examined", 1);
-                let meta = self.participants.get(participant)?;
-                debug_assert_eq!(meta.shard_id, shard_id);
-                meta.binding
-            })
-            .collect()
     }
 
     pub fn participant_ids_in_room(&self, room_id: &RoomId) -> Vec<ParticipantId> {
@@ -163,13 +129,6 @@ impl RoomRegistry {
             .collect()
     }
 
-    pub fn shards_in_room(&self, room_id: &RoomId) -> impl Iterator<Item = ShardId> + '_ {
-        self.rooms
-            .get(room_id)
-            .into_iter()
-            .flat_map(Room::shard_ids)
-    }
-
     /// Record the arena key the owning shard reported for this participant.
     /// Idempotent: a retry after a lost acknowledgement must not create a
     /// second binding.
@@ -189,37 +148,6 @@ impl RoomRegistry {
     }
 
     /// The transport route to retire when this participant goes away.
-    pub fn transport_of(
-        &self,
-        participant_id: &ParticipantId,
-    ) -> Option<(ShardId, TransportHandle)> {
-        let meta = self.participants.get(participant_id)?;
-        if !meta.connected {
-            return None;
-        }
-        Some((meta.shard_id, meta.transport?))
-    }
-
-    pub fn disconnect_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
-        let meta = self.participants.get_mut(participant_id)?;
-        if !meta.connected {
-            debug_assert!(false, "a participant must only be disconnected once");
-            return Some(meta.shard_id);
-        }
-        let shard_id = meta.shard_id;
-        let room_id = meta.room_id;
-        meta.connected = false;
-        meta.transport = None;
-        meta.binding = None;
-        if let Some(room) = self.rooms.get_mut(&room_id) {
-            room.remove_participant(participant_id, shard_id);
-            if room.participant_count() == 0 {
-                self.sweeper.insert(room_id, EMPTY_ROOM_TIMEOUT);
-            }
-        }
-        Some(shard_id)
-    }
-
     /// Returns the shard_id that was hosting the participant, if found.
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
         let meta = self.participants.remove(participant_id)?;
@@ -230,41 +158,6 @@ impl RoomRegistry {
             }
         }
         Some(meta.shard_id)
-    }
-
-    pub fn add_track(&mut self, track: Track) -> Option<(RoomId, Vec<ShardId>)> {
-        let origin = self.participants.get(&track.meta().origin)?;
-        if !origin.connected {
-            return None;
-        }
-        let origin_shard = origin.shard_id;
-        let room = self.room_mut_for(&track.meta().origin)?;
-        room.add_track(track.clone());
-        let ids = room.recipient_shard_ids(origin_shard).collect();
-        let room_id = room.room_id;
-
-        Some((room_id, ids))
-    }
-
-    pub fn remove_track(
-        &mut self,
-        origin: ParticipantId,
-        track_id: TrackId,
-    ) -> Option<(RoomId, Vec<ShardId>)> {
-        let origin_meta = self.participants.get(&origin)?;
-        if !origin_meta.connected {
-            return None;
-        }
-        let origin_shard = origin_meta.shard_id;
-        let room = self.room_mut_for(&origin)?;
-        if !room.remove_track(&origin, &track_id) {
-            return None;
-        }
-
-        let ids = room.recipient_shard_ids(origin_shard).collect();
-        let room_id = room.room_id;
-
-        Some((room_id, ids))
     }
 
     pub async fn next_expired(&mut self) {
@@ -436,26 +329,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_keeps_the_connection_generation_for_reconnect() {
-        let mut reg = RoomRegistry::new();
-        let rid = room_id("room-reconnect");
-        let pid = participant_id();
-        let connection_id = ConnectionId::new();
-
-        reg.add_participant(pid, rid, ShardId::new(0), None);
-        reg.set_connection_id(&pid, connection_id);
-        reg.disconnect_participant(&pid);
-
-        let meta = reg
-            .get_participant(&pid)
-            .expect("disconnected participants retain their generation");
-        assert_eq!(meta.connection_id, Some(connection_id));
-        assert!(!meta.connected);
-        assert!(reg.participants_in_room(&rid).is_empty());
-        assert!(reg.transport_of(&pid).is_none());
-    }
-
-    #[tokio::test]
     async fn multiple_rooms_are_independent() {
         let mut reg = RoomRegistry::new();
         let rid1 = room_id("room-x");
@@ -470,35 +343,6 @@ mod tests {
 
         assert!(reg.get_room(&rid1).is_none());
         assert!(reg.get_room(&rid2).is_some());
-    }
-
-    /// The registry is the one place that knows where a participant is, and
-    /// that has to include the transport route its teardown needs. It used to
-    /// be split across three indexes — this one, the lifecycle state, and a
-    /// copy on every shard — so "where is Alice" had three answers that could
-    /// drift apart.
-    #[tokio::test]
-    async fn the_registry_is_the_only_index_of_where_a_participant_is() {
-        let mut reg = RoomRegistry::new();
-        let participant = participant_id();
-        let room = room_id("one-index");
-        let transport =
-            TransportHandle::new(crate::route::TransportRoute::new(ShardId::new(3), 7), 2);
-
-        reg.add_participant(participant, room, ShardId::new(3), Some(transport));
-
-        assert_eq!(
-            reg.transport_of(&participant),
-            Some((ShardId::new(3), transport)),
-            "teardown finds the route to retire without a second index"
-        );
-
-        reg.remove_participant(&participant);
-        assert_eq!(
-            reg.transport_of(&participant),
-            None,
-            "and it goes away with the participant"
-        );
     }
 
     /// A repeated prepare must report the same key rather than minting a

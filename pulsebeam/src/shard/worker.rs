@@ -151,7 +151,7 @@ pub(crate) enum ShardError {
 }
 
 /// The only imperative operations the controller may request from a shard.
-/// Topology and lifecycle changes are published through `ShardView`.
+/// Topology and lifecycle changes are published through `ShardUpdate`.
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
     MaterializeParticipant {
@@ -230,7 +230,6 @@ pub(crate) enum ShardFrame {
     Media {
         env: Envelope,
         payload: MediaPayload,
-        enqueued_at: Instant,
     },
     /// Anything travelling back toward a publisher, addressed by the reverse
     /// route its shard opened. One variant for all of it because they share a
@@ -360,14 +359,7 @@ impl ShardTransport for ChannelTransport {
     fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
         // Dropping under backpressure is the media contract: this lane is
         // lossy by design, and `link_seq` makes the loss visible downstream.
-        let _ = self.enqueue(
-            dst,
-            ShardFrame::Media {
-                env,
-                payload,
-                enqueued_at: Instant::now(),
-            },
-        );
+        let _ = self.enqueue(dst, ShardFrame::Media { env, payload });
     }
 
     fn send_frame(&self, dst: ShardId, frame: ShardFrame) {
@@ -406,7 +398,6 @@ pub(crate) struct ShardWorker {
     stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
     stats_due: Instant,
     last_busy: Duration,
-    forwarding_residence_ns: Vec<u64>,
 
     // Mark !Send
     _marker: PhantomData<*mut ()>,
@@ -427,7 +418,7 @@ impl ShardWorker {
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
         command_rx: mailbox::Receiver<ShardCommand>,
-        view_rx: mailbox::Receiver<Box<crate::view::ControlBatch>>,
+        update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
         event_tx: mailbox::Sender<ShardEventMessage>,
         frame_rx: mailbox::Receiver<ShardFrame>,
         frame_txs: Vec<mailbox::Sender<ShardFrame>>,
@@ -441,7 +432,7 @@ impl ShardWorker {
             udp_socket.max_gso_segments(),
             shard_count,
             wall,
-            view_rx,
+            update_rx,
         );
         let router = ChannelTransport {
             shard_id,
@@ -470,7 +461,6 @@ impl ShardWorker {
                 .checked_add(STATS_REPORT_INTERVAL)
                 .unwrap_or_else(Instant::now),
             last_busy: Duration::ZERO,
-            forwarding_residence_ns: Vec::with_capacity(16_384),
             _marker: PhantomData,
         }
     }
@@ -545,7 +535,6 @@ impl ShardWorker {
     /// gives up waiting after [`STATS_DEADLINE_SLACK`] so a saturated shard —
     /// the one whose numbers matter most — still reports.
     fn report_stats(&mut self, now: Instant, busy: Duration) {
-        self.report_forwarding_residence();
         let Some(tx) = &self.stats_tx else {
             return;
         };
@@ -561,37 +550,6 @@ impl ShardWorker {
         // next report carries everything this one would have.
         let _ = tx.try_send(Box::new(self.recorder.snapshot(self.router.shard_id)));
         self.stats_due = now.checked_add(STATS_REPORT_INTERVAL).unwrap_or(now);
-    }
-
-    fn record_forwarding_residence(&mut self, enqueued_at: Instant, now: Instant) {
-        if self.forwarding_residence_ns.len() < 1_000_000 {
-            self.forwarding_residence_ns.push(
-                now.saturating_duration_since(enqueued_at)
-                    .as_nanos()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            );
-        }
-    }
-
-    fn report_forwarding_residence(&mut self) {
-        let count = self.forwarding_residence_ns.len();
-        if count < 100 {
-            return;
-        }
-        let rank = count
-            .saturating_mul(9_999)
-            .div_ceil(10_000)
-            .saturating_sub(1);
-        let (_, sample, _) = self.forwarding_residence_ns.select_nth_unstable(rank);
-        let micros = *sample as f64 / 1_000.0;
-        metrics::histogram!("forwarding_residence_p9999_us").record(micros);
-        tracing::info!(
-            samples = count,
-            p9999_us = micros,
-            "real-worker forwarding residence"
-        );
-        self.forwarding_residence_ns.clear();
     }
 
     fn next_wait_deadline(&mut self) -> Option<Instant> {
@@ -619,7 +577,7 @@ impl ShardWorker {
         // Block until at least one source is ready.
         tokio::select! {
             biased;
-            Some(_) = self.core.view_readable() => {}
+            Some(_) = self.core.update_readable() => {}
             Ok(_) = self.udp_socket.readable() => {}
             Some(_) = self.frame_rx.readable() => {}
             Ok(_) = self.tcp_socket.readable() => {}
@@ -653,8 +611,8 @@ impl ShardWorker {
         if commands == SHARD_COMMAND_BUDGET {
             self.tick_budget_hit("commands");
         }
-        if self.core.apply_view_deltas(SHARD_VIEW_OP_BUDGET) >= SHARD_VIEW_OP_BUDGET {
-            self.tick_budget_hit("view");
+        if self.core.apply_updates(SHARD_VIEW_OP_BUDGET) >= SHARD_VIEW_OP_BUDGET {
+            self.tick_budget_hit("shard_update");
         }
         let mut frames: usize = 0;
         self.frame_batch.clear();
@@ -664,17 +622,6 @@ impl ShardWorker {
             };
             frames = frames.saturating_add(1);
             self.frame_batch.push(ev);
-        }
-        let mut frame_index = 0;
-        while frame_index < self.frame_batch.len() {
-            let enqueued_at = match self.frame_batch.get(frame_index) {
-                Some(ShardFrame::Media { enqueued_at, .. }) => Some(*enqueued_at),
-                _ => None,
-            };
-            if let Some(enqueued_at) = enqueued_at {
-                self.record_forwarding_residence(enqueued_at, now);
-            }
-            frame_index = frame_index.saturating_add(1);
         }
         self.core
             .on_shard_frames(self.frame_batch.drain(..), now, &self.router);

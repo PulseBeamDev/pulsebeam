@@ -1,9 +1,13 @@
+use slotmap::SlotMap;
+use tokio::time::Instant;
+
 use crate::{
     control::{controller::ParticipantState, registry::RoomRegistry},
     entity::{ParticipantId, RoomId},
     id::ShardId,
     participant::ParticipantConfig,
-    shard::worker::{ShardEvent, ShardEventMessage},
+    route::{PackedRoute, RouteError, SlotAllocator, TransportHandle, TransportRoute},
+    shard::participants::ParticipantKey,
 };
 use str0m::Rtc;
 
@@ -15,10 +19,51 @@ pub enum RoomPlacement {
     RoundRobin,
 }
 
+struct TransportAllocators {
+    shards: Vec<SlotAllocator>,
+}
+
+impl TransportAllocators {
+    fn new(shard_count: usize) -> Self {
+        Self {
+            shards: (0..shard_count)
+                .map(|index| {
+                    SlotAllocator::with_max_slots(
+                        ShardId::new(index),
+                        PackedRoute::MAX_SLOT.saturating_add(1),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn allocate(&mut self, shard: ShardId, now: Instant) -> Result<TransportHandle, RouteError> {
+        let Some(allocator) = self.shards.get_mut(shard.index()) else {
+            debug_assert!(false, "transport allocation targeted an unknown shard");
+            return Err(RouteError::Exhausted { max_slots: 0 });
+        };
+        let (slot, epoch) = allocator.allocate(now)?;
+        Ok(TransportHandle::new(
+            TransportRoute::new(shard, slot),
+            epoch,
+        ))
+    }
+
+    fn retire(&mut self, handle: TransportHandle, now: Instant) {
+        let Some(allocator) = self.shards.get_mut(handle.shard().index()) else {
+            debug_assert!(false, "transport retirement targeted an unknown shard");
+            return;
+        };
+        allocator.retire(handle.route.slot(), now);
+    }
+}
+
 pub struct ControllerCore {
     pub(crate) registry: RoomRegistry,
     room_shard_slot: usize,
     placement: RoomPlacement,
+    transport: TransportAllocators,
+    participants: Vec<SlotMap<ParticipantKey, ParticipantId>>,
 }
 
 impl ControllerCore {
@@ -28,7 +73,21 @@ impl ControllerCore {
             registry: RoomRegistry::new(),
             room_shard_slot,
             placement,
+            transport: TransportAllocators::new(0),
+            participants: Vec::new(),
         }
+    }
+
+    pub fn with_shards(
+        shard_count: usize,
+        room_shard_slot: usize,
+        placement: RoomPlacement,
+    ) -> Self {
+        debug_assert!(shard_count > 0);
+        let mut core = Self::with_placement(room_shard_slot, placement);
+        core.transport = TransportAllocators::new(shard_count);
+        core.participants = (0..shard_count).map(|_| SlotMap::with_key()).collect();
+        core
     }
 
     pub fn room_slot(&self, room_id: &RoomId) -> (usize, RoomPlacement) {
@@ -43,52 +102,52 @@ impl ControllerCore {
         )
     }
 
-    pub fn process_shard_event(&mut self, event: ShardEventMessage) {
-        match event.1 {
-            ShardEvent::TrackPublished { track, .. } => {
-                let _ = self.registry.add_track(*track);
-            }
-            ShardEvent::TrackUnpublished { origin, track_id } => {
-                let _ = self.registry.remove_track(origin, track_id);
-            }
-            ShardEvent::ParticipantClosed {
-                participant: participant_id,
-                ..
-            } => {
-                let _ = self.registry.disconnect_participant(&participant_id);
-            }
-            // Facts the controller records elsewhere, or that only the shard
-            // acts on. Listed rather than wildcarded so a new event has to be
-            // considered here.
-            ShardEvent::TransportAuthenticated { .. }
-            | ShardEvent::TrackSubscribed { .. }
-            | ShardEvent::TrackUnsubscribed { .. }
-            | ShardEvent::DataTopicPublished { .. }
-            | ShardEvent::DataTopicUnpublished { .. }
-            | ShardEvent::DataTopicSubscribed { .. }
-            | ShardEvent::DataTopicUnsubscribed { .. }
-            | ShardEvent::ReliableDataTopicPublished { .. }
-            | ShardEvent::ReliableDataTopicUnpublished { .. }
-            | ShardEvent::ReliableDataTopicSubscribed { .. }
-            | ShardEvent::ReliableDataTopicUnsubscribed { .. } => {}
-        }
+    pub fn reserve_transport(
+        &mut self,
+        shard: ShardId,
+        now: Instant,
+    ) -> Result<TransportHandle, RouteError> {
+        self.transport.allocate(shard, now)
     }
 
-    pub async fn next_expired(&mut self) {
-        self.registry.next_expired().await;
+    pub fn release_transport(&mut self, handle: TransportHandle, now: Instant) {
+        self.transport.retire(handle, now);
+    }
+
+    pub fn mint_participant(
+        &mut self,
+        shard: ShardId,
+        participant: ParticipantId,
+    ) -> Option<ParticipantKey> {
+        let key = self
+            .participants
+            .get_mut(shard.index())?
+            .insert(participant);
+        Some(key)
+    }
+
+    pub fn remove_participant_key(&mut self, shard: ShardId, key: ParticipantKey) {
+        let Some(arena) = self.participants.get_mut(shard.index()) else {
+            debug_assert!(false, "participant key targeted an unknown shard");
+            return;
+        };
+        let removed = arena.remove(key);
+        debug_assert!(removed.is_some(), "participant key must be live at removal");
     }
 
     pub fn create_participant(
         &mut self,
         rtc: Rtc,
         state: ParticipantState,
-        shard_id: ShardId,
-        transport: Option<crate::route::TransportHandle>,
+        shard: ShardId,
+        transport: TransportHandle,
+        key: ParticipantKey,
     ) -> ParticipantConfig {
         self.registry
-            .add_participant(state.participant_id, state.room_id, shard_id, transport);
+            .add_participant(state.participant_id, state.room_id, shard, Some(transport));
         self.registry
             .set_connection_id(&state.participant_id, state.connection_id);
+        self.registry.bind_participant(&state.participant_id, key);
         ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
@@ -97,10 +156,25 @@ impl ControllerCore {
         }
     }
 
-    pub fn delete_participant(&mut self, participant_id: &ParticipantId) {
-        if self.registry.get_participant(participant_id).is_none() {
-            return;
-        }
-        let _ = self.registry.remove_participant(participant_id);
+    pub fn delete_participant(&mut self, participant: &ParticipantId) -> Option<ParticipantMeta> {
+        let meta = self.registry.get_participant(participant)?;
+        let result = ParticipantMeta {
+            shard: meta.shard_id,
+            binding: meta.binding,
+            transport: meta.transport,
+        };
+        self.registry.remove_participant(participant);
+        Some(result)
     }
+
+    pub async fn next_expired(&mut self) {
+        self.registry.next_expired().await;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ParticipantMeta {
+    pub shard: ShardId,
+    pub binding: Option<ParticipantKey>,
+    pub transport: Option<TransportHandle>,
 }

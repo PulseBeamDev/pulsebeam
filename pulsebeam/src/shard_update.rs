@@ -6,14 +6,55 @@ use std::collections::VecDeque;
 use crate::entity::TrackId;
 use crate::id::ShardId;
 use crate::keys::{ParticipantKey, TrackKey};
-use crate::plan::PlanBatch;
 use crate::route::{RouteAction, RouteHandle, TransportHandle};
 use pulsebeam_runtime::mailbox;
 use str0m::channel::ChannelId;
 use str0m::media::Rid;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TrackPlan {
+    pub local: Vec<ParticipantKey>,
+    pub remote: Vec<RouteHandle>,
+    pub reverse_route: Option<RouteHandle>,
+}
+
+impl TrackPlan {
+    pub(crate) fn new(
+        local: impl IntoIterator<Item = ParticipantKey>,
+        remote: impl IntoIterator<Item = RouteHandle>,
+        reverse_route: Option<RouteHandle>,
+    ) -> Self {
+        Self {
+            local: unique(local, "local"),
+            remote: unique(remote, "remote"),
+            reverse_route,
+        }
+    }
+}
+
+fn unique<K>(values: impl IntoIterator<Item = K>, name: &str) -> Vec<K>
+where
+    K: Copy + Eq + std::hash::Hash + std::fmt::Debug,
+{
+    let mut result = Vec::new();
+    for value in values {
+        if result.contains(&value) {
+            debug_assert!(false, "a track plan cannot contain duplicate {name} values");
+            continue;
+        }
+        result.push(value);
+    }
+    result
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrackPlanUpdate {
+    pub key: TrackKey,
+    pub plan: Option<TrackPlan>,
+}
+
 #[derive(Debug, Default)]
-pub(crate) struct ShardView {
+pub(crate) struct ShardState {
     pub shard: ShardId,
     pub generation: u64,
     pub routes: RouteImage,
@@ -127,10 +168,10 @@ impl TransportImage {
 
 #[allow(
     clippy::large_enum_variant,
-    reason = "view batches are control-plane messages and runtime state stays inline"
+    reason = "shard updates are control-plane messages and runtime state stays inline"
 )]
 #[derive(Debug, Clone)]
-pub(crate) enum ViewOp {
+pub(crate) enum ShardUpdateOp {
     InstallRoute {
         binding: RouteBinding,
     },
@@ -160,27 +201,26 @@ pub(crate) enum ViewOp {
         channel: ChannelId,
         lane: crate::track::DataLane,
     },
+    Placeholder,
 }
 
 #[derive(Debug)]
-pub(crate) struct GenerationCommit {
+pub(crate) struct ShardUpdate {
     pub shard: ShardId,
     pub generation: u64,
     pub participant_effects: Vec<(ParticipantKey, crate::participant::ParticipantEffect)>,
-    pub lifecycle: Vec<ViewOp>,
-    pub plans: PlanBatch,
+    pub lifecycle: Vec<ShardUpdateOp>,
+    pub plans: Vec<TrackPlanUpdate>,
 }
 
-pub(crate) type ControlBatch = GenerationCommit;
-
-impl GenerationCommit {
+impl ShardUpdate {
     fn new(shard: ShardId, generation: u64) -> Self {
         Self {
             shard,
             generation,
             participant_effects: Vec::new(),
             lifecycle: Vec::new(),
-            plans: PlanBatch::default(),
+            plans: Vec::new(),
         }
     }
 
@@ -195,19 +235,19 @@ impl GenerationCommit {
     }
 }
 
-pub(crate) struct ShardViewWriter {
+pub(crate) struct ShardUpdateWriter {
     shard: ShardId,
-    tx: mailbox::Sender<Box<GenerationCommit>>,
-    staged: Option<Box<GenerationCommit>>,
-    backlog: VecDeque<Box<GenerationCommit>>,
+    tx: mailbox::Sender<Box<ShardUpdate>>,
+    staged: Option<Box<ShardUpdate>>,
+    backlog: VecDeque<Box<ShardUpdate>>,
     closed: bool,
 }
 
-impl ShardViewWriter {
-    pub fn stage(&mut self, generation: u64, op: ViewOp) {
+impl ShardUpdateWriter {
+    pub fn stage(&mut self, generation: u64, op: ShardUpdateOp) {
         let commit = self
             .staged
-            .get_or_insert_with(|| Box::new(GenerationCommit::new(self.shard, generation)));
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
         if commit.generation != generation {
             pulsebeam_runtime::fatal!("a shard generation cannot mix lifecycle generations");
         }
@@ -222,24 +262,24 @@ impl ShardViewWriter {
     ) {
         let commit = self
             .staged
-            .get_or_insert_with(|| Box::new(GenerationCommit::new(self.shard, generation)));
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
         if commit.generation != generation {
             pulsebeam_runtime::fatal!("a shard generation cannot mix participant effects");
         }
         commit.participant_effects.push((participant, effect));
     }
 
-    pub fn stage_plans(&mut self, generation: u64, plans: PlanBatch) {
+    pub fn stage_plans(&mut self, generation: u64, plans: Vec<TrackPlanUpdate>) {
         if plans.is_empty() {
             return;
         }
         let commit = self
             .staged
-            .get_or_insert_with(|| Box::new(GenerationCommit::new(self.shard, generation)));
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
         if commit.generation != generation {
             pulsebeam_runtime::fatal!("a shard generation cannot mix plan generations");
         }
-        commit.plans.operations.extend(plans.operations);
+        commit.plans.extend(plans);
     }
 
     pub fn abort(&mut self) {
@@ -298,12 +338,12 @@ impl ShardViewWriter {
     }
 }
 
-pub(crate) fn new_shard_view(
+pub(crate) fn new_shard_update(
     shard: ShardId,
-) -> (ShardViewWriter, mailbox::Receiver<Box<ControlBatch>>) {
+) -> (ShardUpdateWriter, mailbox::Receiver<Box<ShardUpdate>>) {
     let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_VIEW_CAPACITY);
     (
-        ShardViewWriter {
+        ShardUpdateWriter {
             shard,
             tx,
             staged: None,
@@ -314,7 +354,7 @@ pub(crate) fn new_shard_view(
     )
 }
 
-impl ViewOp {
+impl ShardUpdateOp {
     pub(crate) fn is_owned_by(&self, shard: ShardId) -> bool {
         match self {
             Self::InstallRoute { binding } => binding.handle.shard() == shard,
@@ -325,7 +365,8 @@ impl ViewOp {
             | Self::RemoveParticipant { .. }
             | Self::InsertTrackRuntime { .. }
             | Self::RemoveTrackRuntime { .. }
-            | Self::BindTrack { .. } => true,
+            | Self::BindTrack { .. }
+            | Self::Placeholder => true,
         }
     }
 }
@@ -335,23 +376,22 @@ mod tests {
     use super::*;
     use crate::keys::TrackKey;
 
-    fn track_plan() -> (TrackKey, PlanBatch) {
+    fn track_plan() -> (TrackKey, Vec<TrackPlanUpdate>) {
         let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
         let key = keys.insert(());
-        let mut batch = PlanBatch::default();
-        batch.push(crate::plan::PlanOperation {
+        let plans = vec![TrackPlanUpdate {
             key,
-            plan: Some(crate::plan::TrackPlan::default()),
-        });
-        (key, batch)
+            plan: Some(TrackPlan::default()),
+        }];
+        (key, plans)
     }
 
     #[test]
     fn lifecycle_and_plan_are_one_ordered_generation_without_shared_interpretation() {
         let shard = ShardId::new(1);
-        let (mut writer, mut rx) = new_shard_view(shard);
+        let (mut writer, mut rx) = new_shard_update(shard);
         let (_, plans) = track_plan();
-        writer.stage(7, ViewOp::InsertParticipant);
+        writer.stage(7, ShardUpdateOp::InsertParticipant);
         writer.stage_plans(7, plans);
         assert_eq!(writer.publish(), Some(7));
 
@@ -359,15 +399,15 @@ mod tests {
         assert_eq!(commit.shard, shard);
         assert_eq!(commit.generation, 7);
         assert_eq!(commit.lifecycle.len(), 1);
-        assert_eq!(commit.plans.operations.len(), 1);
+        assert_eq!(commit.plans.len(), 1);
     }
 
     #[test]
     fn queued_generations_remain_in_order() {
         let shard = ShardId::new(0);
-        let (mut writer, mut rx) = new_shard_view(shard);
+        let (mut writer, mut rx) = new_shard_update(shard);
         for generation in 1..=(crate::shard::worker::SHARD_VIEW_CAPACITY + 1) as u64 {
-            writer.stage(generation, ViewOp::InsertParticipant);
+            writer.stage(generation, ShardUpdateOp::InsertParticipant);
             assert_eq!(writer.publish(), Some(generation));
         }
         for expected in 1..=crate::shard::worker::SHARD_VIEW_CAPACITY as u64 {
@@ -383,7 +423,7 @@ mod tests {
     #[test]
     fn control_batch_validation_requires_new_owned_revision() {
         let shard = ShardId::new(2);
-        let valid = GenerationCommit::new(shard, 4);
+        let valid = ShardUpdate::new(shard, 4);
         assert!(valid.validate_for(shard, 3));
         assert!(!valid.validate_for(shard, 4));
         assert!(!valid.validate_for(ShardId::new(3), 3));

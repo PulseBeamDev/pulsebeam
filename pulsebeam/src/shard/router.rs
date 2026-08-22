@@ -47,7 +47,7 @@ struct TrackRuntime {
 }
 
 /// Hand a packet to every destination-local recipient in an owned track plan.
-fn fanout_local(plan: &crate::plan::TrackPlan, mut deliver: impl FnMut(ParticipantKey)) {
+fn fanout_local(plan: &crate::shard_update::TrackPlan, mut deliver: impl FnMut(ParticipantKey)) {
     for &subscriber in &plan.local {
         deliver(subscriber);
     }
@@ -56,7 +56,7 @@ fn fanout_local(plan: &crate::plan::TrackPlan, mut deliver: impl FnMut(Participa
 /// Forward a packet to the shards a plan routes to, numbering each hop so the
 /// destination can tell loss from reordering.
 fn fanout_remote(
-    plan: &crate::plan::TrackPlan,
+    plan: &crate::shard_update::TrackPlan,
     link_seq: &mut u32,
     playout: u32,
     mut payload: impl FnMut() -> MediaPayload,
@@ -105,13 +105,13 @@ impl ShardRuntime {
         let _ = self.tracks.remove(key);
     }
 
-    pub(crate) fn apply_view_op(&mut self, op: &crate::view::ViewOp) {
+    pub(crate) fn apply_update_op(&mut self, op: &crate::shard_update::ShardUpdateOp) {
         match op {
-            crate::view::ViewOp::RetireRoute { handle } => {
+            crate::shard_update::ShardUpdateOp::RetireRoute { handle } => {
                 let retired = self.routes.retire(*handle);
                 debug_assert!(retired || self.routes.entry(*handle).is_none());
             }
-            crate::view::ViewOp::InsertTrackRuntime { key, runtime } => {
+            crate::shard_update::ShardUpdateOp::InsertTrackRuntime { key, runtime } => {
                 let descriptor = runtime.descriptor.as_ref();
                 let id = descriptor.map(|descriptor| descriptor.id);
                 let origin_key = descriptor
@@ -156,13 +156,16 @@ impl ShardRuntime {
                     current.link_seq = previous.link_seq;
                 }
             }
-            crate::view::ViewOp::RemoveTrackRuntime { key, .. } => self.retire_track(*key),
-            crate::view::ViewOp::InstallRoute { .. }
-            | crate::view::ViewOp::InstallTransport { .. }
-            | crate::view::ViewOp::RetireTransport { .. }
-            | crate::view::ViewOp::InsertParticipant
-            | crate::view::ViewOp::RemoveParticipant { .. }
-            | crate::view::ViewOp::BindTrack { .. } => {}
+            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { key, .. } => {
+                self.retire_track(*key)
+            }
+            crate::shard_update::ShardUpdateOp::InstallRoute { .. }
+            | crate::shard_update::ShardUpdateOp::InstallTransport { .. }
+            | crate::shard_update::ShardUpdateOp::RetireTransport { .. }
+            | crate::shard_update::ShardUpdateOp::InsertParticipant
+            | crate::shard_update::ShardUpdateOp::RemoveParticipant { .. }
+            | crate::shard_update::ShardUpdateOp::BindTrack { .. }
+            | crate::shard_update::ShardUpdateOp::Placeholder => {}
         }
     }
 
@@ -178,7 +181,7 @@ impl ShardRuntime {
         key: TrackKey,
         origin: Origin,
         pkt: RtpPacket,
-        plan: &crate::plan::TrackPlan,
+        plan: &crate::shard_update::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         let Some(runtime) = self.tracks.get_mut(key) else {
@@ -224,7 +227,7 @@ impl ShardRuntime {
         key: TrackKey,
         origin: Origin,
         packet: RoutedTrackPacket,
-        plan: &crate::plan::TrackPlan,
+        plan: &crate::shard_update::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         debug_assert_eq!(packet.key, key);
@@ -244,7 +247,7 @@ impl ShardRuntime {
         stream: TrackKey,
         origin: Origin,
         packet: Vec<u8>,
-        plan: &crate::plan::TrackPlan,
+        plan: &crate::shard_update::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         let Some(runtime) = self.tracks.get_mut(stream) else {
@@ -274,7 +277,7 @@ impl ShardRuntime {
         stream: TrackKey,
         origin: Origin,
         frame: Vec<u8>,
-        plan: &crate::plan::TrackPlan,
+        plan: &crate::shard_update::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
         debug_assert!(!frame.is_empty());
@@ -313,7 +316,7 @@ impl ShardRuntime {
     pub fn route_reliable_control(
         &self,
         bytes: Vec<u8>,
-        plan: &crate::plan::TrackPlan,
+        plan: &crate::shard_update::TrackPlan,
         router: &impl ShardTransport,
     ) {
         let Some(target) = plan.reverse_route else {
@@ -365,8 +368,8 @@ mod tests {
         id: TrackId,
         origin_key: ParticipantKey,
         rid: &'static str,
-    ) -> crate::view::TrackDescriptor {
-        crate::view::TrackDescriptor {
+    ) -> crate::shard_update::TrackDescriptor {
+        crate::shard_update::TrackDescriptor {
             id,
             origin_key,
             participant: None,
@@ -396,16 +399,16 @@ mod tests {
         let track_id =
             ParticipantId::from_bytes([7; 16]).derive_track_id(TrackKind::Video, "track");
 
-        runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
+        runtime.apply_update_op(&crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
             key,
-            runtime: crate::view::TrackRuntime {
+            runtime: crate::shard_update::TrackRuntime {
                 descriptor: Some(descriptor(track_id, origin_key, "q")),
                 ..Default::default()
             },
         });
-        runtime.apply_view_op(&crate::view::ViewOp::InsertTrackRuntime {
+        runtime.apply_update_op(&crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
             key,
-            runtime: crate::view::TrackRuntime {
+            runtime: crate::shard_update::TrackRuntime {
                 descriptor: Some(descriptor(track_id, origin_key, "f")),
                 ..Default::default()
             },
@@ -422,19 +425,19 @@ mod tests {
         let mut runtime = ShardRuntime::new(ShardId::new(0));
         let mut keys = SlotMap::<TrackKey, ()>::with_key();
         let key = keys.insert(());
-        let op = crate::view::ViewOp::InsertTrackRuntime {
+        let op = crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
             key,
-            runtime: crate::view::TrackRuntime {
+            runtime: crate::shard_update::TrackRuntime {
                 publisher: None,
                 publisher_effect: None,
                 ..Default::default()
             },
         };
 
-        runtime.apply_view_op(&op);
+        runtime.apply_update_op(&op);
         runtime.tracks.get_mut(key).unwrap().link_seq = 17;
         runtime.tracks.get_mut(key).unwrap().cache = Some(TrackStreamCache::new());
-        runtime.apply_view_op(&op);
+        runtime.apply_update_op(&op);
 
         assert_eq!(runtime.tracks.get(key).unwrap().link_seq, 17);
         assert!(runtime.tracks.get(key).unwrap().cache.is_some());
@@ -447,7 +450,7 @@ mod tests {
         };
         let target =
             crate::route::RouteHandle::new(crate::route::RouteId::new(ShardId::new(2), 9), 1);
-        let plan = crate::plan::TrackPlan {
+        let plan = crate::shard_update::TrackPlan {
             reverse_route: Some(target),
             ..Default::default()
         };
