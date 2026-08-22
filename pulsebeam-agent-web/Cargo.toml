@@ -1,0 +1,16 @@
+[package]
+name = "pulsebeam-agent-web"
+license = "Apache-2.0"
+publish = false
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pulsebeam-agent-core = { path = "../pulsebeam-agent-core" }

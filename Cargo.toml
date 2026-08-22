@@ -3,6 +3,9 @@ resolver = "2"
 members = [
   "pulsebeam",
   "pulsebeam-agent",
+  "pulsebeam-agent-core",
+  "pulsebeam-agent-native",
+  "pulsebeam-agent-web",
   "pulsebeam-cli",
   "pulsebeam-core",
   "pulsebeam-ebpf",
