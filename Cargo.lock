@@ -2931,6 +2931,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-agent-core"
+version = "0.3.2"
+
+[[package]]
+name = "pulsebeam-agent-native"
+version = "0.3.2"
+dependencies = [
+ "pulsebeam-agent-core",
+]
+
+[[package]]
+name = "pulsebeam-agent-web"
+version = "0.3.2"
+dependencies = [
+ "pulsebeam-agent-core",
+]
+
+[[package]]
 name = "pulsebeam-cli"
 version = "0.3.2"
 dependencies = [
