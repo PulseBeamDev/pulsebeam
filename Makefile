@@ -8,7 +8,8 @@ SIM := sim
 TARGET = pulsebeam
 TEST =
 
-.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing
+.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing \
+	test test-unit test-sim test-sim-seed agent-check agent-test agent-conformance agent-wasm agent-browser-test protected-paths
 all: build
 
 dev:
@@ -27,6 +28,31 @@ run-profile: profile
 	$(BINARY)
 
 test: test-unit test-sim
+
+agent-check:
+	$(CARGO_CMD) check -p pulsebeam-agent-core -p pulsebeam-agent-native -p pulsebeam-agent-web
+
+agent-test:
+	$(CARGO_CMD) test -p pulsebeam-agent-core --all-targets
+	$(CARGO_CMD) test -p pulsebeam-agent-native --all-targets
+	$(CARGO_CMD) test -p pulsebeam-agent-web --all-targets
+
+agent-conformance:
+	$(CARGO_CMD) test -p pulsebeam-agent-core --test conformance
+	$(CARGO_CMD) test -p pulsebeam-agent-native --test conformance
+	$(CARGO_CMD) test -p pulsebeam-agent-web --test conformance
+
+agent-wasm:
+	rustup target add wasm32-unknown-unknown
+	$(CARGO_CMD) check -p pulsebeam-agent-core --target wasm32-unknown-unknown
+	$(CARGO_CMD) check -p pulsebeam-agent-web --target wasm32-unknown-unknown
+
+agent-browser-test:
+	$(CARGO_CMD) test -p pulsebeam-agent-web --target wasm32-unknown-unknown --test browser
+
+protected-paths:
+	@test -z "$$(git status --short --untracked-files=all -- pulsebeam-agent)"
+	@if [ ! -d ../pulsebeam-js ]; then exit 0; fi; test -z "$$(git -C ../pulsebeam-js status --short --untracked-files=all)"
 
 # `sim` is on because the shaper lives behind it, and the shaper is the authority on what a
 # simulated link can carry. Without the feature its tests are not compiled, so they never ran
