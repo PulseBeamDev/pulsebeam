@@ -22,7 +22,7 @@ use tokio::time::{Instant, Sleep};
 use crate::{
     entity::{ParticipantId, TrackId},
     id::ShardId,
-    participant::{ParticipantConfig, TrackPacket},
+    participant::{ParticipantConfig, RoutedTrackPacket},
     shard::metrics::ShardMetrics,
     shard::recorder::{ShardRecorder, ShardStatsReport},
     track::Track,
@@ -209,7 +209,7 @@ pub(crate) enum Reverse {
 /// Payload carried under an [`Envelope`]. Still typed this pass; byte
 /// serialization arrives with the UDP transport.
 pub(crate) enum MediaPayload {
-    Track(TrackPacket),
+    Track(RoutedTrackPacket),
     /// SCTP bytes for a client data channel. Which lane the client asked for is
     /// in the destination's route entry, not here — the destination already
     /// knows it, and it describes the client's channel, not this hop.
