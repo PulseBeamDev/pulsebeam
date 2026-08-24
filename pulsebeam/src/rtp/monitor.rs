@@ -302,7 +302,6 @@ pub struct StreamMonitor {
     smoothed_loss_ratio: f64,
     last_packet_at: Instant,
     bwe: BitrateEstimate,
-    audio_monitor: Option<AudioMonitor>,
 
     cost_filter: RateFilter,
     stable_filter: RateFilter,
@@ -317,10 +316,6 @@ impl StreamMonitor {
     pub fn new(kind: TrackKind, stream_id: String, stats: StreamStats) -> Self {
         let now = Instant::now();
         let nominal_bitrate_bps = crate::bitrate::saturating_bps(stats.bitrate_bps());
-        let audio_monitor = match kind {
-            TrackKind::Audio => Some(AudioMonitor::new()),
-            TrackKind::Video | TrackKind::Data => None,
-        };
         // Audio has no simulcast layer to select between, so there's nothing
         // for a loss-driven quality signal to act on yet; stubbed Excellent
         // rather than run the (currently video-only) hysteresis machinery
@@ -344,7 +339,6 @@ impl StreamMonitor {
             window_highest_seq: None,
             window_actual_packets: 0,
             smoothed_loss_ratio: 0.0,
-            audio_monitor,
             bwe: BitrateEstimate::new(),
             cost_filter: RateFilter::new(),
             stable_filter: RateFilter::with_taus(
@@ -397,15 +391,6 @@ impl StreamMonitor {
             self.window_highest_seq = Some(seq);
         }
         self.window_actual_packets = self.window_actual_packets.saturating_add(1);
-
-        if let Some(audio_monitor) = self.audio_monitor.as_mut() {
-            let ext = &packet.ext_vals;
-            audio_monitor.process_packet(
-                packet.arrival_ts,
-                ext.voice_activity.unwrap_or_default(),
-                ext.audio_level.unwrap_or_default(),
-            );
-        }
     }
 
     /// This encoding's measurements, as one coherent value.
@@ -501,10 +486,6 @@ impl StreamMonitor {
             u32::try_from(crate::bitrate::saturating_bps(reactive)).unwrap_or(u32::MAX);
         self.stats.stable_bitrate_bps =
             u32::try_from(crate::bitrate::saturating_bps(stable)).unwrap_or(u32::MAX);
-        if let Some(audio_monitor) = self.audio_monitor.as_mut() {
-            audio_monitor.poll(now);
-        }
-
         // Step A: Inactivity & Flap Prevention
         let time_since_last_packet = now.saturating_duration_since(self.last_packet_at);
         let was_inactive = self.stats.is_inactive();
@@ -802,125 +783,6 @@ impl BitrateEstimate {
 
     pub fn is_warm(&self) -> bool {
         self.warm
-    }
-}
-
-/// Tuning constants for the "Leaky Integrator"
-const AUDIO_ATTACK_RATE: f32 = 0.2; // How fast we react to new speech (0.0-1.0)
-const AUDIO_DECAY_RATE: f32 = 0.05; // How fast we fade out (keeps user in Top-N during pauses)
-
-// Anything quieter than -50dB is considered background noise and clipped to 0.0.
-const NOISE_THRESHOLD_DB: i8 = -50;
-// The theoretical floor for silence in this integer scale (-127dB).
-const SILENCE_DB_FLOOR: f32 = -127.0;
-
-#[derive(Debug, Clone, Copy)]
-pub struct AudioDerivedMetrics {
-    /// A stable score (0.0-1.0) representing "Dominance".
-    /// High during speech, decays slowly during pauses.
-    /// USE THIS for sorting Top-N.
-    pub speech_intensity_envelope: f32,
-
-    /// The instantaneous volume (0.0-1.0), normalized and noise-gated.
-    /// USE THIS for visualizers (green borders/audio bars).
-    pub normalized_volume: f32,
-
-    /// Time elapsed since the last "active" voice frame was detected.
-    /// USE THIS for tie-breaking active speakers.
-    pub silence_duration: Duration,
-}
-
-#[derive(Debug)]
-pub struct AudioMonitor {
-    // Internal State
-    envelope: f32,
-    last_packet_at: Instant,
-    last_speech_at: Instant,
-}
-
-impl Default for AudioMonitor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AudioMonitor {
-    pub fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            envelope: 0.0,
-            last_packet_at: now,
-            last_speech_at: now, // Initialize to now so we don't start with infinite silence
-        }
-    }
-
-    /// Process audio level.
-    ///
-    /// * `vad_bit`: True if the encoder detects voice.
-    /// * `level`: i8 dBov. 0 is Max, -30 is normal, -127 is silence.
-    pub fn process_packet(&mut self, now: Instant, vad_bit: bool, level: i8) {
-        // 1. Calculate time delta for frame-independent decay
-        // (Assuming roughly 20ms packets, but handling jitter/loss)
-        let dt_secs = now
-            .saturating_duration_since(self.last_packet_at)
-            .as_secs_f32();
-        self.last_packet_at = now;
-
-        // 2. Normalize Level
-        // Range: -127 (Silence) -> 0 (Max).
-        // We clip anything below NOISE_THRESHOLD_DB (-50) to 0.0.
-        let raw_vol = if level < NOISE_THRESHOLD_DB {
-            0.0
-        } else {
-            // Normalize linear range [-127, 0] to [0.0, 1.0]
-            // Example: -30dB -> (-30 - (-127)) / 127 = 97/127 = ~0.76
-            (level as f32 - SILENCE_DB_FLOOR) / (0.0 - SILENCE_DB_FLOOR)
-        };
-
-        // 3. Update "Last Speech" Timer
-        // We require BOTH the VAD bit AND significant volume.
-        let is_speaking = vad_bit && raw_vol > 0.0;
-
-        if is_speaking {
-            self.last_speech_at = now;
-
-            // ATTACK: Rapidly increase envelope based on volume intensity
-            // We add to the envelope, but clamp at 1.0.
-            self.envelope += raw_vol * AUDIO_ATTACK_RATE;
-        } else {
-            // DECAY: Exponential decay based on time delta.
-            // Normalize decay to work regardless of packet rate (target ~50Hz).
-            let decay_factor = 1.0 - (AUDIO_DECAY_RATE * (dt_secs / 0.02));
-            self.envelope *= decay_factor.max(0.0);
-        }
-
-        // Clamp envelope to 0.0 - 1.0
-        self.envelope = self.envelope.clamp(0.0, 1.0);
-    }
-
-    /// Poll function to force decay if no packets are arriving
-    /// (e.g., if the user went on mute or network died).
-    pub fn poll(&mut self, now: Instant) {
-        let dt_secs = now
-            .saturating_duration_since(self.last_packet_at)
-            .as_secs_f32();
-
-        // If we haven't seen a packet in > 200ms, force decay
-        if dt_secs > 0.2 {
-            let decay_factor = 1.0 - (AUDIO_DECAY_RATE * (dt_secs / 0.02));
-            self.envelope *= decay_factor.max(0.0);
-            self.envelope = self.envelope.clamp(0.0, 1.0);
-            self.last_packet_at = now; // Reset tick
-        }
-    }
-
-    pub fn get_metrics(&self, now: Instant) -> AudioDerivedMetrics {
-        AudioDerivedMetrics {
-            speech_intensity_envelope: self.envelope,
-            // Derive a simple volume for UI from the current envelope or raw input
-            normalized_volume: self.envelope,
-            silence_duration: now.saturating_duration_since(self.last_speech_at),
-        }
     }
 }
 

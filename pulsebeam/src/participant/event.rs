@@ -1,42 +1,26 @@
-use crate::entity::{ParticipantId, TrackId};
-use crate::rtp::RtpPacket;
-use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
+use super::packet::TrackPacket;
+use super::reverse::ReversePacket;
+use crate::entity::TrackId;
+use crate::keys::TrackKey;
+use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
 
-pub trait ParticipantSink {
-    fn subscribe(&mut self, track: TrackMeta);
-    fn unsubscribe(&mut self, track: TrackMeta);
-    fn publish_track(&mut self, track: Track, states: crate::track::TrackStates);
-    /// A published track's latest measurements. Sent, not shared.
-    fn publish_track_stats(
+pub(crate) trait ParticipantSink {
+    fn connected(
         &mut self,
-        track_id: crate::entity::TrackId,
-        states: crate::track::TrackStates,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        source_shard: crate::id::ShardId,
     );
+    fn activate_track(&mut self, track: TrackMeta);
+    fn deactivate_track(&mut self, track: TrackMeta);
+    fn publish_track(&mut self, track: Track);
     fn unpublish_track(&mut self, track_id: TrackId);
-    fn subscribe_data_topic(
-        &mut self,
-        topic: Topic,
-        publisher: Option<crate::entity::ParticipantId>,
-    );
-    fn unsubscribe_data_topic(
-        &mut self,
-        topic: Topic,
-        publisher: Option<crate::entity::ParticipantId>,
-    );
-    fn publish_data_topic(&mut self, topic: Topic);
-    fn unpublish_data_topic(&mut self, topic: Topic);
-    fn request_keyframe(&mut self, layer: &TrackLayer);
+    fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
+    fn unsubscribe_tracks(&mut self, selector: TrackSelector);
+    fn request_reverse(&mut self, stream: Option<TrackKey>, packet: ReversePacket);
     fn exit(&mut self);
 
-    fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket);
-    fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>);
-
-    fn publish_reliable_data_topic(&mut self, topic: Topic);
-    fn unpublish_reliable_data_topic(&mut self, topic: Topic);
-    fn subscribe_reliable_data_topic(&mut self, topic: Topic);
-    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic);
-    fn publish_reliable_sctp(&mut self, topic: Topic, frame: Vec<u8>);
-    fn forward_reliable_control(&mut self, publisher: ParticipantId, topic: Topic, bytes: Vec<u8>);
+    fn publish_track_packet(&mut self, fanout: Option<TrackKey>, packet: TrackPacket);
 }
 
 #[cfg(test)]
@@ -47,106 +31,62 @@ pub mod test_utils {
 
     #[derive(Debug, Default)]
     pub struct MockParticipantSink {
-        pub subscribe_calls: Vec<TrackMeta>,
-        pub unsubscribe_calls: Vec<TrackMeta>,
+        pub activate_track_calls: Vec<TrackMeta>,
+        pub deactivate_track_calls: Vec<TrackMeta>,
         pub publish_track_calls: Vec<TrackId>,
         pub unpublish_track_calls: Vec<TrackId>,
-        pub subscribe_data_topic_calls: Vec<Topic>,
-        pub unsubscribe_data_topic_calls: Vec<Topic>,
-        pub publish_data_topic_calls: Vec<Topic>,
-        pub unpublish_data_topic_calls: Vec<Topic>,
-        pub request_keyframe_calls: Vec<(StreamId, crate::entity::ParticipantId)>,
+        pub reverse_requests: Vec<Option<TrackKey>>,
         pub exit_count: usize,
-        pub publish_rtp_calls: Vec<StreamId>,
-        pub publish_sctp_calls: Vec<Topic>,
+        pub publish_track_packet_calls: Vec<TrackKey>,
     }
 
     impl MockParticipantSink {
         pub fn new() -> Self {
             Self::default()
         }
-
-        pub fn reset(&mut self) {
-            *self = Self::default();
-        }
     }
 
     impl ParticipantSink for MockParticipantSink {
-        fn subscribe(&mut self, track: TrackMeta) {
-            self.subscribe_calls.push(track);
-        }
-
-        fn unsubscribe(&mut self, track: TrackMeta) {
-            self.unsubscribe_calls.push(track);
-        }
-
-        fn publish_track_stats(
+        fn connected(
             &mut self,
-            _track_id: crate::entity::TrackId,
-            _states: crate::track::TrackStates,
+            _source: std::net::SocketAddr,
+            _destination: std::net::SocketAddr,
+            _source_shard: crate::id::ShardId,
         ) {
         }
 
-        fn publish_track(&mut self, track: Track, _states: crate::track::TrackStates) {
-            self.publish_track_calls.push(track.meta.id);
+        fn activate_track(&mut self, track: TrackMeta) {
+            self.activate_track_calls.push(track);
+        }
+
+        fn deactivate_track(&mut self, track: TrackMeta) {
+            self.deactivate_track_calls.push(track);
+        }
+
+        fn publish_track(&mut self, track: Track) {
+            self.publish_track_calls.push(track.id());
         }
 
         fn unpublish_track(&mut self, track_id: TrackId) {
             self.unpublish_track_calls.push(track_id);
         }
 
-        fn subscribe_data_topic(
-            &mut self,
-            topic: Topic,
-            _publisher: Option<crate::entity::ParticipantId>,
-        ) {
-            self.subscribe_data_topic_calls.push(topic);
-        }
+        fn subscribe_tracks(&mut self, _selector: TrackSelector, _selection: SelectionPolicy) {}
 
-        fn unsubscribe_data_topic(
-            &mut self,
-            topic: Topic,
-            _publisher: Option<crate::entity::ParticipantId>,
-        ) {
-            self.unsubscribe_data_topic_calls.push(topic);
-        }
+        fn unsubscribe_tracks(&mut self, _selector: TrackSelector) {}
 
-        fn publish_data_topic(&mut self, topic: Topic) {
-            self.publish_data_topic_calls.push(topic);
-        }
-
-        fn unpublish_data_topic(&mut self, topic: Topic) {
-            self.unpublish_data_topic_calls.push(topic);
-        }
-
-        fn request_keyframe(&mut self, layer: &TrackLayer) {
-            self.request_keyframe_calls
-                .push((layer.stream_id(), layer.meta.origin));
+        fn request_reverse(&mut self, stream: Option<TrackKey>, _packet: ReversePacket) {
+            self.reverse_requests.push(stream);
         }
 
         fn exit(&mut self) {
             self.exit_count = self.exit_count.saturating_add(1);
         }
 
-        fn publish_rtp(&mut self, stream_id: StreamId, _pkt: RtpPacket) {
-            self.publish_rtp_calls.push(stream_id);
-        }
-
-        fn publish_sctp(&mut self, topic: Topic, _pkt: Vec<u8>) {
-            self.publish_sctp_calls.push(topic);
-        }
-
-        fn publish_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn unpublish_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn subscribe_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn unsubscribe_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn publish_reliable_sctp(&mut self, _topic: Topic, _frame: Vec<u8>) {}
-        fn forward_reliable_control(
-            &mut self,
-            _publisher: ParticipantId,
-            _topic: Topic,
-            _bytes: Vec<u8>,
-        ) {
+        fn publish_track_packet(&mut self, fanout: Option<TrackKey>, _packet: TrackPacket) {
+            if let Some(key) = fanout {
+                self.publish_track_packet_calls.push(key);
+            }
         }
     }
 }

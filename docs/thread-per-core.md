@@ -1,8 +1,10 @@
 # Thread-per-core
 
-This SFU is thread-per-core. A shard owns its participants, its routes, its
-packet buffers and its measurements outright, runs on one core, and reaches
-other shards only by message. `ShardWorker` is `!Send` on purpose.
+This SFU is thread-per-core. A shard owns its mutable participants, compiled
+track plans, routes, packet buffers and packet runtime outright, runs on one
+core, and reaches other shards only by message. `ShardWorker` is `!Send` on
+purpose. The controller sends owned plan updates; every shard materializes and
+mutates only its own copy.
 
 That is unusual enough that the obvious "improvement" is usually a regression.
 This file says what the rules are and why, so the reasoning survives the person
@@ -11,26 +13,36 @@ document its `reason` strings point at.**
 
 ## The rules
 
-1. **A shard does not share mutable state with another shard.** Not behind a
-   lock, not behind atomics. If two shards need to agree on something, one sends
-   the other a message.
+1. **A shard does not share mutable packet runtime with another shard.** Not
+   behind a lock, not behind a shared collection, and not through per-packet
+   reference counting. If two shards need to agree on mutable runtime, one
+   sends the other a message.
 2. **A shard never blocks on another shard.** No `Mutex`, no awaiting a full
    queue held by a peer. (The one place two directions could deadlock is
    documented at `ShardWorker::flush_shard_events`.)
-3. **Refcounts are core-local.** An `Arc` whose count is touched by two cores on
-   a per-packet path is a bug, even when it is "just" an increment.
-4. **Anything crossing a shard boundary is a value, not a handle.** A handle
-   implies shared memory, and cross-node there is none.
+3. **Routing plans cross cores as owned messages.** A controller generation is
+   sent through the shard's bounded mailbox. It is not a shared map or a
+   reader handle into controller memory.
+4. **A coherent immutable measurement snapshot may cross cores within one
+   node.** It has one writer, publication replaces the complete value, readers
+   never mutate it, and it is not packet ownership. `VideoStats` is the current
+   exception; it does not make `ArcSwap` or `left-right` a routing mechanism.
+5. **Anything crossing a node boundary is a value, not a handle.** A local
+   snapshot handle may be shared within its node, but wire messages contain
+   owned/materialized values.
+6. **Atomics represent independent facts.** A single atomic may hold a flag,
+   counter, monotonic value, or complete one-word state machine. Several atomic
+   loads do not form a coherent snapshot.
 
 ## Why, concretely
 
-### Sharing is not slow because of the lock. It is slow because of the line.
+### Shared mutable state is not free because the lock is absent.
 
 An uncontended atomic increment is a few nanoseconds. A *contended* one — where
 two cores each hold the cache line in their L1 and take turns invalidating each
-other — costs hundreds, and it stalls the other core too. The cost does not
-appear in a profile as "synchronisation"; it appears as every function on both
-cores getting slower.
+other — costs hundreds, and it stalls the other core too. Immutable snapshot
+reads are a different shape: readers share stable data while one writer
+publishes a replacement, rather than mutating packet-path state in place.
 
 This is why `RtpPacket::to_transit` copies the payload instead of sharing the
 `Arc`: the refcount header sits immediately before the bytes, so a remote drop
@@ -65,13 +77,38 @@ shard, read for load reporting where a skewed pair changes nothing.
 ### The design has to work with no shared memory at all
 
 The goal is more than one node. A destination node cannot read a publisher
-node's atomics — there is no address space to reach into. So any design that
-depends on shared measurement state is not a shortcut to be optimised later; it
-is a design that stops working at the boundary the project is aimed at.
+node's atomics or an `ArcSwap` handle — there is no address space to reach
+into. A node-local immutable snapshot is an optimization with a required
+materialized representation at the node boundary, not the distributed
+protocol.
 
 Message-passing is not the slower option here. It is the only option that scales
 past one box, and it gives consistent snapshots for free, because a message is
 one coherent value.
+
+## How routing plans move
+
+The unified routing plan follows the strict message-passing rule.
+
+- Shards report publication, subscription and participant lifecycle facts to
+  the controller through a bounded event mailbox.
+- The controller owns `TrackTopology`, route allocation and reconciliation. It
+  compiles exact `TrackPlan` values containing only local participant keys,
+  remote route handles and an optional reverse route.
+- A `ShardUpdate` carries owned lifecycle operations, participant effects and
+  plan replacements to one shard. The shard stores them in its own route,
+  participant and plan tables.
+- Cross-shard packets carry an owned `RoutedTrackPacket` and a route handle.
+  They never borrow a controller plan or another shard's runtime.
+
+There is no shared `ShardView`, `left-right` reader or `ArcSwap` plan image.
+Update generations preserve order; plan work is applied in bounded chunks so
+topology churn cannot turn one tick into an unbounded plan-copy phase. Installs
+precede plan changes and retirements follow them. Lifecycle vectors are
+currently applied as a batch, so the controller must keep them bounded until
+the shard has a lifecycle cursor. A racing packet may be dropped, but forwarding
+never blocks for the controller and cannot observe a route slot as a different
+incarnation because the epoch is validated.
 
 ## How measurements actually move
 
@@ -86,22 +123,25 @@ node.
 
 Now:
 
-- `StreamMonitor` keeps its measurements as **plain fields** and produces a
-  `StreamStats` **value** on demand. It is `Copy`; there is nothing to share.
-- On the slow poll a publishing participant hands its own shard a snapshot per
-  track (`ShardInternalEvent::TrackStatsUpdated`). Within one shard, so still
-  no sharing.
-- The shard applies it locally and sends `ShardFrame::Telemetry` to every
-  destination holding a route for that track — route-addressed, best-effort,
-  latest-wins. Losing one costs a slightly stale allocation and nothing else.
-- A destination replaces its `layer_states` wholesale. **One message is one
-  coherent view**, which is the property eight atomics could not give.
+- `StreamMonitor` keeps measurements as plain fields and produces `StreamStats`
+  values. No field is independently published.
+- On the participant's slow stats poll, the publishing shard builds one
+  `VideoStatsSnapshot` containing every encoding and replaces it through one
+  `ArcSwap` store.
+- Cloned video `Track` descriptors on this node carry the read side of that
+  snapshot. A downstream allocator loads one complete snapshot at allocation
+  time; packet forwarding does not load it.
+- Audio and data use `NullStats`. Routing itself does not branch on this and
+  does not contain a telemetry lane.
 
-The same path works unchanged when the destination is another node, because it
-was never reading memory it did not own.
+This is a coherent, node-local measurement publication with one writer. It is
+not the future cross-node representation. Before a track descriptor crosses a
+node boundary, its stats must be materialized into an owned latest-wins value
+and refreshed by message. Copying the `ArcSwap` handle into a wire-facing
+abstraction would violate rule 5.
 
-Do not reintroduce a shared handle to make this cheaper. It is a control-rate
-message carrying a small value; the cost is not where the pressure is.
+Do not replace the coherent snapshot with independently shared fields, and do
+not use this exception to share routing plans or packet runtime.
 
 ### Metrics travel the same way
 
@@ -131,25 +171,30 @@ Installing the recorder per tick rather than per thread is deliberate: under
 `WorkerExecution::SharedRuntime` every shard of a node shares one thread, so
 attribution has to come from the installed recorder, not from thread identity.
 
-## Escape hatches
+## Shared-state boundaries
 
-`#[allow(clippy::disallowed_types)]` with a comment saying which of these it is.
-The list is short on purpose, and it is closed — if a use does not fit one of
-these, it is rule 1 and the answer is a message.
+`#[allow(clippy::disallowed_types)]` with a comment saying which boundary it
+implements. The important distinction is mutable packet runtime versus
+immutable node-local publication.
 
 - **Tests.** A test is not a shard; a counter for unique ids is convenience, not
   architecture. Allowed at the test module, not the file, so it cannot drift
   over production code in the same file.
-- **Startup wiring.** One `Arc` per shard, cloned before any shard runs, never
-  touched again (`Arc<ShardMetrics>`).
-- **Fixed preallocated counters.** `ShardMetrics`, per the rule above.
+- **Immutable video measurements.** `VideoStats` has one publisher-side writer
+  and control-rate allocator readers on the same node. One `ArcSwap` store
+  replaces the complete encoding vector. This exception does not include
+  plans, routes or packet ownership.
+- **Fixed preallocated counters.** `Arc<ShardMetrics>` is created during startup
+  and has one shard writer. Control-plane load reporting reads independent
+  counters for which a skewed pair has no semantic meaning.
 - **Forced by a dependency.** str0m's `RtpWrite` takes `Arc<[u8]>` and its
   extension map stores `Arc<dyn Any>`. `metrics::Counter::from_arc` demands
   `Arc<F: Send + Sync>`, so `shard::recorder`'s slots are `Arc<AtomicU64>` —
   registered, written and read by one shard on one core, so nothing contends.
   Keep them core-local; do not let one cross a shard boundary.
 - **Below the shard model.** `pulsebeam-runtime` implements the seams shards are
-  built from. Nothing there licenses an `Arc` inside a shard.
+  built from. Nothing there licenses mutable shared packet state inside a
+  shard.
 - **Not a shard.** The agent, simulator and CLI are ordinary async programs.
 
 ## Enforcement

@@ -183,6 +183,12 @@ pub fn record_routing_counter(name: &'static str) {
     });
 }
 
+pub fn record_routing_work(name: &'static str, amount: usize) {
+    SAMPLES.with_borrow_mut(|s| {
+        *s.routing_counters.entry(name.to_owned()).or_default() += amount as u64;
+    });
+}
+
 pub fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) {
     SAMPLES.with_borrow_mut(|s| {
         let key = format!("routing_drop:{lane}:{stage}:{origin}");
@@ -192,6 +198,10 @@ pub fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'st
 
 pub fn routing_counter(name: &'static str) -> u64 {
     SAMPLES.with_borrow(|s| s.routing_counters.get(name).copied().unwrap_or(0))
+}
+
+pub fn routing_work(name: &'static str) -> u64 {
+    routing_counter(name)
 }
 
 pub fn routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) -> u64 {

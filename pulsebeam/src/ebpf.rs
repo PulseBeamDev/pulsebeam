@@ -87,8 +87,11 @@ pub(crate) fn attach(sockets: &[BoundUdpSocket]) -> Result<Option<Steering>> {
         .ok_or_else(|| anyhow!("eBPF object has no pulsebeam_client program"))?;
     let program: &mut SkReuseport = program.try_into().context("opening pulsebeam_client")?;
     program.load().context("loading pulsebeam_client")?;
+    let Some(first_socket) = sockets.first() else {
+        return Err(anyhow!("eBPF steering requires at least one UDP socket"));
+    };
     program
-        .attach(sockets[0].as_fd())
+        .attach(first_socket.as_fd())
         .context("attaching pulsebeam_client to SO_REUSEPORT")?;
 
     metrics::gauge!("ebpf_steering_attached").set(1.0);

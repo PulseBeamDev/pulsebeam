@@ -5,8 +5,8 @@ use super::handles::{
 };
 use super::mailbox;
 use super::slots::Speaker;
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -58,6 +58,7 @@ struct AgentInner {
     stats: watch::Receiver<Arc<StatisticsSnapshot>>,
     connection: watch::Receiver<ConnectionState>,
     publications: watch::Receiver<Arc<HashMap<String, Publication>>>,
+    participants: watch::Receiver<Arc<HashSet<ParticipantId>>>,
     speakers: watch::Receiver<Arc<[Speaker]>>,
 }
 
@@ -547,6 +548,7 @@ pub enum ParticipantChange {
 pub struct Participants {
     agent: Agent,
     publications: watch::Receiver<Arc<HashMap<String, Publication>>>,
+    participants: watch::Receiver<Arc<HashSet<ParticipantId>>>,
     known: HashMap<ParticipantId, ParticipantAvailability>,
     pending: VecDeque<ParticipantChange>,
 }
@@ -554,7 +556,8 @@ pub struct Participants {
 impl Participants {
     fn new(agent: Agent) -> Self {
         let publications = agent.inner.publications.clone();
-        let known = participant_availability(&publications.borrow());
+        let participants = agent.inner.participants.clone();
+        let known = participant_availability(&participants.borrow(), &publications.borrow());
         let pending = known
             .keys()
             .cloned()
@@ -563,6 +566,7 @@ impl Participants {
         Self {
             agent,
             publications,
+            participants,
             known,
             pending,
         }
@@ -573,11 +577,12 @@ impl Participants {
             if let Some(change) = self.pending.pop_front() {
                 return Ok(change);
             }
-            self.publications
-                .changed()
-                .await
-                .map_err(|_| AgentError::Closed)?;
-            let current = participant_availability(&self.publications.borrow());
+            tokio::select! {
+                result = self.publications.changed() => result.map_err(|_| AgentError::Closed)?,
+                result = self.participants.changed() => result.map_err(|_| AgentError::Closed)?,
+            }
+            let current =
+                participant_availability(&self.participants.borrow(), &self.publications.borrow());
             for (id, availability) in &current {
                 match self.known.get(id) {
                     None => self.pending.push_back(ParticipantChange::Joined(
@@ -608,10 +613,24 @@ impl Participants {
 }
 
 fn participant_availability(
+    roster: &HashSet<ParticipantId>,
     publications: &HashMap<String, Publication>,
 ) -> HashMap<ParticipantId, ParticipantAvailability> {
     let mut participants = HashMap::new();
+    for participant in roster {
+        participants.insert(
+            participant.clone(),
+            ParticipantAvailability {
+                video: false,
+                audio: false,
+                video_paused: false,
+            },
+        );
+    }
     for publication in publications.values() {
+        if !participants.contains_key(publication.publisher_id()) {
+            continue;
+        }
         let availability = participants
             .entry(publication.publisher_id().to_owned())
             .or_insert(ParticipantAvailability {
@@ -662,7 +681,8 @@ mod tests {
         .into_iter()
         .collect();
 
-        let participants = participant_availability(&publications);
+        let participants =
+            participant_availability(&["alice".to_owned()].into_iter().collect(), &publications);
 
         assert_eq!(participants.len(), 1);
         assert_eq!(
@@ -865,8 +885,10 @@ pub struct AgentRunner {
     stats: watch::Sender<Arc<StatisticsSnapshot>>,
     connection: watch::Sender<ConnectionState>,
     publications: watch::Sender<Arc<HashMap<String, Publication>>>,
+    participants: watch::Sender<Arc<HashSet<ParticipantId>>>,
     speakers: watch::Sender<Arc<[Speaker]>>,
     publication_state: HashMap<String, Publication>,
+    participant_state: HashSet<ParticipantId>,
     /// Correlates agent-side str0m logs with the SFU peer in simulator traces.
     #[cfg(feature = "sim")]
     sim_span: tracing::Span,
@@ -885,6 +907,7 @@ impl AgentRunner {
         let (stats, stats_rx) = watch::channel(Arc::new(driver.stats().clone()));
         let (connection, connection_rx) = watch::channel(ConnectionState::Connecting);
         let (publications, publication_rx) = watch::channel(Arc::new(HashMap::new()));
+        let (participants, participants_rx) = watch::channel(Arc::new(HashSet::new()));
         let (speakers, speakers_rx) = watch::channel(Arc::from(Vec::new()));
         let agent = Agent {
             inner: Arc::new(AgentInner {
@@ -893,6 +916,7 @@ impl AgentRunner {
                 stats: stats_rx,
                 connection: connection_rx,
                 publications: publication_rx,
+                participants: participants_rx,
                 speakers: speakers_rx,
             }),
         };
@@ -903,8 +927,10 @@ impl AgentRunner {
                 stats,
                 connection,
                 publications,
+                participants,
                 speakers,
                 publication_state: HashMap::new(),
+                participant_state: HashSet::new(),
                 #[cfg(feature = "sim")]
                 sim_span,
             },
@@ -926,6 +952,22 @@ impl AgentRunner {
                 AgentEvent::StatsUpdated => {
                     self.stats
                         .send_replace(Arc::new(self.driver.stats().clone()));
+                }
+                AgentEvent::ParticipantsChanged {
+                    added,
+                    removed,
+                    snapshot,
+                } => {
+                    if snapshot {
+                        self.participant_state = added.into_iter().collect();
+                    } else {
+                        self.participant_state.extend(added);
+                        for participant in removed {
+                            self.participant_state.remove(&participant);
+                        }
+                    }
+                    self.participants
+                        .send_replace(Arc::new(self.participant_state.clone()));
                 }
                 AgentEvent::RemoteTrackDiscovered(track) => {
                     let publication = Publication::from_signaling(track);

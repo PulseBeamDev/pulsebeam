@@ -18,6 +18,7 @@ workspace = true
 
 
 [dependencies]
+arc-swap = { workspace = true }
 ahash = "0.8.12"
 aya = { workspace = true }
 anyhow = { workspace = true }
@@ -37,7 +38,7 @@ mimalloc = "0.1.52"
 pprof = { version = "0.15.0", features = [
   "flamegraph",
   "prost-codec",
-  "protobuf"
+  "protobuf",
 ] }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m"] }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
@@ -59,7 +60,7 @@ tower-http = { version = "0.7.0", features = [
   "compression-zstd",
   "cors",
   "decompression-gzip",
-  "decompression-zstd"
+  "decompression-zstd",
 ] }
 tracing = { workspace = true }
 tracing-appender = "0.2.5"
@@ -71,7 +72,10 @@ uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
 zerocopy = { version = "0.8.56", features = ["derive"] }
 
 [dev-dependencies]
-pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m", "test-utils"] }
+pulsebeam-core = { path = "../pulsebeam-core", features = [
+  "str0m",
+  "test-utils",
+] }
 ctor = "1.0.10"
 hex = "0.4.3"
 more-asserts = { workspace = true }
@@ -94,10 +98,5 @@ str0m = { workspace = true, features = ["wincrypto"] }
 [features]
 default = []
 unpace = []
-deep-metrics = ["pulsebeam-runtime/deep-metrics"]
 parking_lot = ["pulsebeam-runtime/parking_lot"]
 sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim"]
-
-[[bench]]
-name = "fanout"
-harness = false

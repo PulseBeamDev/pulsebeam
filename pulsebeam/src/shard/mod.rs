@@ -9,5 +9,6 @@ pub(crate) mod participants;
 pub(crate) mod recorder;
 pub(crate) mod router;
 mod timer;
+mod updates;
 pub(crate) mod worker;
 pub(crate) use worker::ShardContext;

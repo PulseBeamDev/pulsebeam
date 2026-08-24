@@ -1,82 +1,57 @@
 use std::collections::HashMap;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
-use crate::entity::{ParticipantId, RoomId, TrackId};
+use crate::entity::ParticipantId;
 use crate::id::ShardId;
-use crate::track::Track;
 
 pub struct Room {
-    pub room_id: RoomId,
-    participants: IndexMap<ParticipantId, Vec<Track>>,
-    participant_shards: HashMap<ShardId, usize>,
+    participants: IndexMap<ParticipantId, ()>,
+    participants_by_shard: HashMap<ShardId, IndexSet<ParticipantId>>,
 }
 
 impl Room {
-    pub fn new(room_id: RoomId) -> Self {
+    pub fn new() -> Self {
         Self {
-            room_id,
             participants: IndexMap::new(),
-            participant_shards: HashMap::new(),
+            participants_by_shard: HashMap::new(),
         }
     }
 
     pub fn add_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
-        self.participants.insert(*participant_id, Vec::new());
-        let count = self.participant_shards.entry(shard_id).or_insert(0);
-        *count = count.saturating_add(1);
+        let previous = self.participants.insert(*participant_id, ());
+        debug_assert!(
+            previous.is_none(),
+            "a room cannot contain a participant twice"
+        );
+        if previous.is_some() {
+            return;
+        }
+        let inserted = self
+            .participants_by_shard
+            .entry(shard_id)
+            .or_default()
+            .insert(*participant_id);
+        debug_assert!(inserted, "a participant must have one room shard entry");
     }
 
     pub fn remove_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
-        self.participants.swap_remove(participant_id);
-        if let Some(count) = self.participant_shards.get_mut(&shard_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.participant_shards.remove(&shard_id);
+        if self.participants.swap_remove(participant_id).is_some()
+            && let Some(participants) = self.participants_by_shard.get_mut(&shard_id)
+        {
+            let removed = participants.swap_remove(participant_id);
+            debug_assert!(removed, "a participant must have one room shard entry");
+            if participants.is_empty() {
+                self.participants_by_shard.remove(&shard_id);
             }
         }
-    }
-
-    pub(super) fn add_track(&mut self, track: Track) {
-        let tracks = self.participants.entry(track.meta.origin).or_default();
-
-        if !tracks.iter().any(|t| t.meta.id == track.meta.id) {
-            tracks.push(track);
-        }
-    }
-
-    pub(super) fn remove_track(&mut self, origin: &ParticipantId, track_id: &TrackId) -> bool {
-        let Some(tracks) = self.participants.get_mut(origin) else {
-            return false;
-        };
-
-        let before = tracks.len();
-        tracks.retain(|t| t.meta.id != *track_id);
-        before != tracks.len()
-    }
-
-    pub fn recipient_shard_ids(
-        &self,
-        origin_shard_id: ShardId,
-    ) -> impl Iterator<Item = ShardId> + '_ {
-        self.participant_shards
-            .iter()
-            .filter(move |(shard_id, count)| **shard_id != origin_shard_id || **count > 1)
-            .map(|(shard_id, _)| *shard_id)
     }
 
     pub fn participant_count(&self) -> usize {
         self.participants.len()
     }
 
-    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
-        self.participants.values().flatten()
-    }
-
-    pub fn tracks_published_by(&self, participant_id: &ParticipantId) -> Vec<Track> {
-        self.participants
-            .get(participant_id)
-            .cloned()
-            .unwrap_or_default()
+    pub fn participant_ids(&self) -> impl Iterator<Item = &ParticipantId> {
+        self.participants.keys()
     }
 }

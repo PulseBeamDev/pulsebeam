@@ -285,6 +285,11 @@ fn steering_stops_cross_shard_forwarding_once_flows_authenticate() {
                 description: "let every flow authenticate",
                 duration: Duration::from_secs(8),
             },
+            Step::CheckRoutingCounterAtLeast {
+                description: "the source shard receives the owner authentication acknowledgment",
+                name: "demux_flow_authenticated",
+                min: 1,
+            },
             Step::CheckRoutingCounterSettles {
                 description: "no packet crosses a shard boundary at steady state",
                 name: "shard_wrong_owner_forward",
@@ -1025,7 +1030,9 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
             Step::CheckVideoQualityInterval {
                 description: "The viewer can see the publisher who replaced her",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50).allow_gaps(2),
+                // The new publication starts a fresh RTP stream while the cellular
+                // path may lose a few packets during the route transition.
+                quality: VideoQuality::min_frames(50).allow_gaps(5),
             },
             Step::CheckMediaRouted {
                 description: "And nothing was thrown away on the way in",

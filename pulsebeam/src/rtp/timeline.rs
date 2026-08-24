@@ -76,7 +76,8 @@ impl Timeline {
     }
 
     /// Create a new timeline whose starting sequence number is drawn from `rng`.
-    pub fn new<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
+    pub fn new(clock_rate: Frequency) -> Self {
+        let rng = &mut pulsebeam_runtime::rand::os_rng();
         let base_seq_no = (rng.next_u32() & 0xFFFF) as u16;
         Self::new_with_base(clock_rate, base_seq_no)
     }
@@ -169,6 +170,16 @@ impl Timeline {
         let output_seq: SeqNo = (*pkt.seq_no).wrapping_add(*self.seq_base).into();
         let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
         self.apply(pkt, output_seq, output_ts);
+    }
+
+    pub fn rewrite_audio(&mut self, pkt: &mut RtpPacket) -> bool {
+        let output_seq: SeqNo = (*pkt.seq_no).wrapping_add(*self.seq_base).into();
+        if self.epoch.is_some() && output_seq <= self.max_output {
+            return false;
+        }
+        let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
+        self.apply(pkt, output_seq, output_ts);
+        true
     }
 
     /// Rewrite `pkt` onto the next free output sequence number.
@@ -319,6 +330,23 @@ mod test {
         assert_eq!(*b1.seq_no, (*a2.seq_no).wrapping_add(1));
         assert!(b1.rtp_ts.numer() > a2.rtp_ts.numer());
         assert_eq!(b1.rtp_ts.numer() - a1.rtp_ts.numer(), 9000);
+    }
+
+    #[test]
+    fn audio_drops_a_late_packet_after_a_switch() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut a = pkt(100, 10_000, t0);
+        timeline.rebase_audio(&a);
+        assert!(timeline.rewrite_audio(&mut a));
+
+        let mut b = pkt(200, 20_000, t0 + Duration::from_millis(20));
+        timeline.rebase_audio(&b);
+        assert!(timeline.rewrite_audio(&mut b));
+
+        let mut late = pkt(199, 19_840, t0 + Duration::from_millis(19));
+        assert!(!timeline.rewrite_audio(&mut late));
     }
 
     #[test]

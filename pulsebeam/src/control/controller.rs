@@ -1,18 +1,20 @@
-use std::io;
-use std::time::Duration;
+use std::{collections::VecDeque, io, time::Duration};
 
+use crate::track::{SelectionPolicy, TrackSelector};
 use crate::{
     control::{
-        core::{ControllerCore, ControllerEvent, ControllerEventQueue, RoomPlacement},
+        core::{ControllerCore, RoomPlacement},
+        lifecycle::{TrackLifecycle, TrackLifecycleOperation, TrackLifecycleOutcome},
         negotiator::{Negotiator, NegotiatorError},
-        router::ShardRouter,
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
+    id::ShardId,
+    route::TransportHandle,
     shard::{
         ShardContext,
-        worker::{ShardCommand, ShardEventWrapper},
+        worker::{ShardCommand, ShardEvent, ShardEventMessage},
     },
 };
 use pulsebeam_runtime::mailbox;
@@ -77,13 +79,12 @@ pub struct PatchParticipantReply {
 pub enum ControllerError {
     #[error("sdp offer is rejected: {0}")]
     OfferRejected(#[from] NegotiatorError),
-
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
-
+    #[error("participant connection generation is stale")]
+    StaleConnection,
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
-
     #[error("unknown error: {0}")]
     Unknown(String),
 }
@@ -91,417 +92,623 @@ pub enum ControllerError {
 const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct ControllerActor {
-    router: ShardRouter,
+    router: crate::control::router::ShardRouter,
     core: ControllerCore,
     negotiator: Negotiator,
-    eq: ControllerEventQueue,
-    /// Moved into the TCP acceptor task at the start of `run()`.
     tcp_listener: Option<pulsebeam_core::net::TcpListener>,
-    /// Routing parameters encoded into every ICE ufrag.  Single-node deployments
-    /// use 0 for both; set via `NodeBuilder` when multi-node support lands.
     cluster_id: u16,
     node_id: u16,
+    updates: Vec<crate::shard_update::ShardUpdateWriter>,
+    lifecycle: TrackLifecycle,
+    command_backlog: VecDeque<(ShardId, ShardCommand)>,
+    #[cfg(not(feature = "sim"))]
+    steering: Option<crate::ebpf::Steering>,
 }
 
 impl ControllerActor {
-    pub fn new(
-        rng: pulsebeam_runtime::rand::Rng,
-        shard_contexts: Vec<ShardContext>,
-        candidates: Vec<Candidate>,
-        tcp_listener: pulsebeam_core::net::TcpListener,
-    ) -> Self {
-        Self::with_room_shard_slot(
-            rng,
-            shard_contexts,
-            candidates,
-            tcp_listener,
-            crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
-        )
-    }
-
-    pub fn with_room_shard_slot(
-        rng: pulsebeam_runtime::rand::Rng,
-        shard_contexts: Vec<ShardContext>,
-        candidates: Vec<Candidate>,
-        tcp_listener: pulsebeam_core::net::TcpListener,
-        room_shard_slot: usize,
-    ) -> Self {
-        Self::with_placement(
-            rng,
-            shard_contexts,
-            candidates,
-            tcp_listener,
-            room_shard_slot,
-            RoomPlacement::Hashed,
-        )
-    }
-
-    pub fn with_placement(
-        mut rng: pulsebeam_runtime::rand::Rng,
+    pub(crate) fn with_placement(
+        _rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<Candidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
         room_shard_slot: usize,
         placement: RoomPlacement,
+        updates: Vec<crate::shard_update::ShardUpdateWriter>,
     ) -> Self {
         let shard_count = shard_contexts.len();
-        let router = ShardRouter::new(shard_contexts, &mut rng);
-
+        debug_assert_eq!(updates.len(), shard_count);
         Self {
-            router,
-            core: ControllerCore::with_placement(room_shard_slot, placement),
+            router: crate::control::router::ShardRouter::new(shard_contexts),
+            core: ControllerCore::with_shards(shard_count, room_shard_slot, placement),
             negotiator: Negotiator::new(candidates),
-            eq: ControllerEventQueue::new(shard_count),
             tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
+            updates,
+            lifecycle: TrackLifecycle::new(shard_count),
+            command_backlog: VecDeque::new(),
+            #[cfg(not(feature = "sim"))]
+            steering: None,
         }
     }
 
-    pub async fn run(
+    #[cfg(not(feature = "sim"))]
+    pub(crate) fn set_steering(&mut self, steering: crate::ebpf::Steering) {
+        debug_assert!(self.steering.is_none());
+        self.steering = Some(steering);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    fn pin_flow_to_owner(
+        &mut self,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        shard: u16,
+    ) {
+        let Some(steering) = self.steering.as_mut() else {
+            return;
+        };
+        let flow = crate::ebpf::flow_key(source, destination);
+        if let Err(error) = steering.install_flow(flow, shard) {
+            tracing::warn!(%error, shard, "failed to install authenticated eBPF flow");
+        }
+    }
+
+    #[cfg(feature = "sim")]
+    fn pin_flow_to_owner(
+        &mut self,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        shard: u16,
+    ) {
+        pulsebeam_runtime::net::install_steering_flow(source, destination, shard);
+    }
+
+    pub(crate) async fn run(
         mut self,
         mut command_rx: mailbox::Receiver<ControllerCommand>,
-        mut shard_event_rx: mailbox::Receiver<ShardEventWrapper>,
+        mut shard_event_rx: mailbox::Receiver<ShardEventMessage>,
         shutdown: CancellationToken,
     ) {
-        // Spawn the TCP acceptor onto the current LocalSet / LocalRuntime.
-        // It owns the listener, enforces caps, reads the first STUN frame from
-        // each connection, and sends results back through the mailbox.
         let Some(listener) = self.tcp_listener.take() else {
             pulsebeam_runtime::fatal!("ControllerActor::run called twice")
         };
-        let acceptor = TcpAcceptorHandle::spawn(listener, shutdown.child_token());
+        let acceptor = TcpAcceptorHandle::spawn(
+            listener,
+            crate::control::tcp_acceptor::TcpAcceptorConfig {
+                cluster_id: self.cluster_id,
+                node_id: self.node_id,
+                shard_count: self.router.shard_count(),
+            },
+            shutdown.child_token(),
+        );
         let mut pending_rx = acceptor.event_rx;
-
         let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut next_cmd_at = tokio::time::Instant::now();
-        #[cfg(not(feature = "unpace"))]
-        let cooldown_duration = SHARD_LOAD_POLL_INTERVAL.checked_div(4).unwrap_or_default();
-        #[cfg(feature = "unpace")]
-        let cooldown_duration = std::time::Duration::from_secs(0);
 
         loop {
             tokio::select! {
-                // let command to backpressure to signal clients to slow down.
                 biased;
-
-                Some(e) = shard_event_rx.recv() => {
-                    self.core.process_shard_event(e, &mut self.eq);
-                }
-
-                _ = self.core.next_expired() => {}
-
+                Some(event) = shard_event_rx.recv() => self.handle_shard_event(event).await,
+                _ = self.core.next_expired() => {},
                 _ = poll_interval.tick() => {
                     self.router.poll_loads();
-                }
-
-                Some(ev) = pending_rx.recv() => {
-                    if let Some(conn) = ev.result {
-                        self.route_tcp_connection(conn);
+                    let outcomes = self
+                        .lifecycle
+                        .retry(&self.core.registry, tokio::time::Instant::now());
+                    for outcome in outcomes {
+                        self.publish_track_lifecycle(outcome);
                     }
+                    self.flush_command_backlog();
+                    for update in &mut self.updates { let _ = update.flush_backlog(); }
                 }
-
-                Some(cmd) = recv_command_paced(&mut command_rx, next_cmd_at) => {
-                    let is_join = matches!(cmd, ControllerCommand::CreateParticipant(_, _));
-
-                    self.process_command(cmd);
-
-                    #[cfg(not(feature = "unpace"))]
-                    if is_join {
-                        let poll_from = tokio::time::Instant::now();
-                    next_cmd_at = poll_from.checked_add(cooldown_duration).unwrap_or(poll_from);
-                    }
+                Some(event) = pending_rx.recv() => {
+                    if let Some(connection) = event.result { self.route_tcp_connection(connection); }
                 }
-
-                _ = shutdown.cancelled() => {
-                    break;
-                }
-
+                Some(command) = command_rx.recv() => self.process_command(command).await,
+                _ = shutdown.cancelled() => break,
                 else => break,
             }
-
-            self.drain_core_events().await;
+            self.flush_command_backlog();
         }
     }
 
-    pub fn process_command(&mut self, cmd: ControllerCommand) {
-        match cmd {
-            ControllerCommand::CreateParticipant(m, reply_tx) => {
-                let answer = self
-                    .handle_create_participant(m.state, m.offer)
-                    .map(|res| CreateParticipantReply { answer: res });
-                let _ = reply_tx.send(answer);
+    pub async fn process_command(&mut self, command: ControllerCommand) {
+        match command {
+            ControllerCommand::CreateParticipant(message, reply) => {
+                let result = self
+                    .handle_create_participant(message.state, message.offer)
+                    .await
+                    .map(|answer| CreateParticipantReply { answer });
+                let _ = reply.send(result);
             }
-
-            ControllerCommand::DeleteParticipant(m) => {
-                self.core
-                    .delete_participant(&m.participant_id, &mut self.eq);
+            ControllerCommand::DeleteParticipant(message) => {
+                self.remove_participant(message.participant_id).await;
             }
-            ControllerCommand::PatchParticipant(m, reply_tx) => {
-                let answer = self
-                    .handle_patch_participant(m.state, m.offer)
-                    .map(|res| PatchParticipantReply { answer: res });
-                let _ = reply_tx.send(answer);
+            ControllerCommand::PatchParticipant(message, reply) => {
+                let result = self
+                    .handle_patch_participant(message.state, message.offer)
+                    .await
+                    .map(|answer| PatchParticipantReply { answer });
+                let _ = reply.send(result);
             }
         }
     }
 
-    async fn drain_core_events(&mut self) {
-        while let Some(ev) = self.eq.pop() {
-            match ev {
-                ControllerEvent::ShardCommandSent(shard_id, cmd) => {
-                    self.router.send(shard_id, cmd).await;
+    async fn handle_shard_event(&mut self, (_shard, event): ShardEventMessage) {
+        match event {
+            ShardEvent::TrackPublished { track } => {
+                if let Some(outcome) =
+                    self.lifecycle
+                        .publish(track, &self.core.registry, tokio::time::Instant::now())
+                {
+                    self.publish_track_lifecycle(outcome);
                 }
             }
+            ShardEvent::TrackUnpublished { origin, track_id } => {
+                if let Some(outcome) = self.lifecycle.unpublish(
+                    origin,
+                    track_id,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                ) {
+                    self.apply_track_lifecycle(outcome);
+                    self.publish_staged();
+                }
+            }
+            ShardEvent::TrackSubscribed {
+                subscriber, track, ..
+            } => {
+                let outcome = self.lifecycle.activate(
+                    track.room_id,
+                    track.origin,
+                    track.id,
+                    subscriber,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                );
+                self.publish_track_lifecycle(outcome);
+            }
+            ShardEvent::TrackUnsubscribed {
+                subscriber, track, ..
+            } => {
+                let outcome = self.lifecycle.deactivate(
+                    track.room_id,
+                    track.origin,
+                    track.id,
+                    subscriber,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                );
+                self.publish_track_lifecycle(outcome);
+            }
+            ShardEvent::TrackSubscriptionAdded {
+                room_id,
+                subscriber,
+                selector,
+                selection,
+            } => {
+                let outcomes = self.lifecycle.subscribe(
+                    room_id,
+                    subscriber,
+                    selector,
+                    selection,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                );
+                for outcome in outcomes {
+                    self.publish_track_lifecycle(outcome);
+                }
+            }
+            ShardEvent::TrackSubscriptionRemoved {
+                room_id,
+                subscriber,
+                selector,
+            } => {
+                let outcomes = self.lifecycle.unsubscribe(
+                    room_id,
+                    subscriber,
+                    selector,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                );
+                for outcome in outcomes {
+                    self.publish_track_lifecycle(outcome);
+                }
+            }
+            ShardEvent::TransportAuthenticated {
+                source,
+                destination,
+                source_shard,
+                handle,
+                shard: owner_shard,
+                ..
+            } => {
+                let Some(owner) = u16::try_from(owner_shard.index()).ok() else {
+                    debug_assert!(false, "shard index must fit in u16");
+                    return;
+                };
+                self.pin_flow_to_owner(source, destination, owner);
+                self.command_backlog.push_back((
+                    source_shard,
+                    ShardCommand::AuthenticateTransport { source, handle },
+                ));
+                self.emit_placeholder(owner_shard);
+            }
+            ShardEvent::ParticipantClosed { participant, .. } => {
+                self.remove_participant_with_mode(participant, true).await;
+            }
+        }
+    }
+}
+
+impl ControllerActor {
+    fn apply_track_lifecycle(&mut self, outcome: TrackLifecycleOutcome) {
+        for operation in outcome.operations {
+            match operation {
+                TrackLifecycleOperation::Update { shard, op } => {
+                    self.stage_update_at(shard, outcome.generation, op);
+                }
+                TrackLifecycleOperation::Plans { shard, plans } => {
+                    self.stage_plans_at(shard, outcome.generation, plans);
+                }
+                TrackLifecycleOperation::ParticipantEffect {
+                    shard,
+                    participant,
+                    effect,
+                } => self.stage_participant_at(shard, outcome.generation, participant, effect),
+            }
         }
     }
 
-    pub fn handle_patch_participant(
-        &mut self,
-        state: ParticipantState,
-        offer: SdpOffer,
-    ) -> Result<SdpAnswer, ControllerError> {
-        self.core
-            .delete_participant(&state.participant_id, &mut self.eq);
-        self.handle_create_participant(state, offer)
+    fn publish_track_lifecycle(&mut self, outcome: TrackLifecycleOutcome) {
+        self.apply_track_lifecycle(outcome);
+        self.publish_staged();
     }
 
-    /// Route an accepted TCP connection to the shard that owns its participant.
-    ///
-    /// Routing priority:
-    /// 1. If the ufrag decodes to a valid `IceUfrag` **for this cluster and node**,
-    ///    use the encoded `shard_id` directly — O(1), no lookup.
-    /// 2. If the ufrag decodes but targets a *different* cluster or node, the
-    ///    connection was misrouted (load-balancer bug) or crafted by an attacker.
-    ///    Drop it immediately.
-    /// 3. If the ufrag cannot be decoded (old client format during a rolling
-    ///    upgrade), fall back to hash(peer_addr) routing.
-    /// 4. If no ufrag at all, fall back to hash(peer_addr) routing.
-    fn route_tcp_connection(&mut self, conn: PendingTcpConn) {
-        let Some(ufrag) = conn.server_ufrag.and_then(|ufrag| IceUfrag::decode(&ufrag)) else {
-            tracing::warn!("invalid ufrag, disconnecting due to likely a malicous actor");
+    fn stage_update_at(
+        &mut self,
+        shard: ShardId,
+        generation: u64,
+        op: crate::shard_update::ShardUpdateOp,
+    ) {
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            debug_assert!(false, "an update must target a live shard");
             return;
         };
-
-        if ufrag.cluster_id != self.cluster_id || ufrag.node_id != self.node_id {
-            tracing::warn!(
-                peer_addr = %conn.peer_addr,
-                ufrag_cluster = ufrag.cluster_id,
-                ufrag_node    = ufrag.node_id,
-                our_cluster   = self.cluster_id,
-                our_node      = self.node_id,
-                "TCP connection ufrag targets a different node, dropping"
-            );
-            return; // stream dropped here, OS socket closed
-        }
-
-        self.eq.send(
-            ufrag.shard_id,
-            ShardCommand::AddTcpConnection {
-                stream: conn.stream,
-                peer_addr: conn.peer_addr,
-            },
-        );
+        update.stage(generation, op);
     }
 
-    pub fn handle_create_participant(
+    fn stage_plans_at(
+        &mut self,
+        shard: ShardId,
+        generation: u64,
+        plans: Vec<crate::shard_update::TrackPlanUpdate>,
+    ) {
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            debug_assert!(false, "plans must target a live shard");
+            return;
+        };
+        update.stage_plans(generation, plans);
+    }
+
+    fn stage_participant_at(
+        &mut self,
+        shard: ShardId,
+        generation: u64,
+        participant: crate::keys::ParticipantKey,
+        effect: crate::participant::ParticipantEffect,
+    ) {
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            debug_assert!(false, "participant effects must target a live shard");
+            return;
+        };
+        update.stage_participant_effect(generation, participant, effect);
+    }
+
+    fn stage_participant_change_at(
+        &mut self,
+        room_id: crate::entity::RoomId,
+        generation: u64,
+        added: Option<ParticipantId>,
+        removed: Option<ParticipantId>,
+    ) {
+        let participants: Vec<_> = self
+            .core
+            .registry
+            .participant_ids_in_room(&room_id)
+            .into_iter()
+            .filter(|participant| Some(*participant) != added && Some(*participant) != removed)
+            .collect();
+        for participant in participants {
+            let Some(meta) = self.core.registry.get_participant(&participant) else {
+                continue;
+            };
+            let Some(key) = meta.binding else {
+                continue;
+            };
+            self.stage_participant_at(
+                meta.shard_id,
+                generation,
+                key,
+                crate::participant::ParticipantEffect::ParticipantsChanged {
+                    added: added.into_iter().collect(),
+                    removed: removed.into_iter().collect(),
+                },
+            );
+        }
+    }
+
+    fn publish_staged(&mut self) {
+        for update in &mut self.updates {
+            let _ = update.publish();
+        }
+    }
+
+    fn emit_placeholder(&mut self, shard: ShardId) {
+        let generation = self.lifecycle.next_generation();
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            debug_assert!(false, "shard update targeted an unknown shard");
+            return;
+        };
+        update.stage(generation, crate::shard_update::ShardUpdateOp::Placeholder);
+        let _ = update.publish();
+    }
+
+    fn flush_command_backlog(&mut self) {
+        while let Some((shard, command)) = self.command_backlog.pop_front() {
+            match self.router.try_send(shard, command) {
+                Ok(()) => {}
+                Err(error) => match *error {
+                    mailbox::TrySendError::Full(command) => {
+                        self.command_backlog.push_front((shard, command));
+                        break;
+                    }
+                    mailbox::TrySendError::Closed(_) => {
+                        tracing::warn!(%shard, "shard command mailbox closed");
+                    }
+                },
+            }
+        }
+    }
+
+    fn route_tcp_connection(&mut self, connection: PendingTcpConn) {
+        debug_assert!(connection.handle.shard().index() < self.router.shard_count());
+        self.command_backlog.push_back((
+            connection.handle.shard(),
+            ShardCommand::AdoptTcpConnection {
+                stream: connection.stream,
+                peer_addr: connection.peer_addr,
+            },
+        ));
+    }
+
+    fn publish_transport(
+        &mut self,
+        shard: ShardId,
+        handle: TransportHandle,
+        key: crate::keys::ParticipantKey,
+    ) -> bool {
+        let generation = self.lifecycle.next_generation();
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            return false;
+        };
+        update.stage(
+            generation,
+            crate::shard_update::ShardUpdateOp::InsertParticipant,
+        );
+        update.stage(
+            generation,
+            crate::shard_update::ShardUpdateOp::InstallTransport {
+                binding: crate::shard_update::TransportBinding {
+                    handle,
+                    participant: key,
+                },
+            },
+        );
+        update.publish().is_some()
+    }
+
+    async fn handle_create_participant(
         &mut self,
         state: ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
-        // Determine shard first so we can encode it into the ICE ufrag.
+        let participant_id = state.participant_id;
         let (slot, placement) = self.core.room_slot(&state.room_id);
-        let shard_id = match placement {
-            RoomPlacement::Hashed => {
-                let routing_key = format!("{}-{}", state.room_id, slot);
-                self.router
-                    .try_route(&routing_key)
-                    .ok_or(ControllerError::ServiceUnavailable)?
-            }
+        let shard = match placement {
+            RoomPlacement::Hashed => self
+                .router
+                .stable_route(&state.room_id)
+                .ok_or(ControllerError::ServiceUnavailable)?,
             RoomPlacement::RoundRobin => {
-                crate::id::ShardId::new(slot.checked_rem(self.router.shard_count()).unwrap_or(0))
+                let shard_count = self.router.shard_count();
+                debug_assert_ne!(shard_count, 0);
+                ShardId::new(
+                    slot.checked_rem(shard_count)
+                        .ok_or(ControllerError::ServiceUnavailable)?,
+                )
             }
         };
-
-        // Encode routing metadata into the ICE ufrag.  The shard worker and
-        // demuxer can decode shard_id / participant_id directly from STUN
-        // binding requests — no distributed lookup needed.
-        let ufrag = IceUfrag::new(
-            self.cluster_id,
-            self.node_id,
-            shard_id,
-            state.participant_id,
+        let now = tokio::time::Instant::now();
+        let handle = self
+            .core
+            .reserve_transport(shard, now)
+            .map_err(|_| ControllerError::ServiceUnavailable)?;
+        let key = self
+            .core
+            .mint_participant(shard, state.participant_id)
+            .ok_or(ControllerError::ServiceUnavailable)?;
+        let creds = IceUfrag::new(self.cluster_id, self.node_id, handle.route, handle.epoch)
+            .into_ice_creds();
+        let (rtc, answer) = match self.negotiator.create_answer(offer, creds) {
+            Ok(value) => value,
+            Err(error) => {
+                self.core.remove_participant_key(shard, key);
+                self.core.release_transport(handle, now);
+                return Err(error.into());
+            }
+        };
+        if !self.publish_transport(shard, handle, key) {
+            self.core.remove_participant_key(shard, key);
+            self.core.release_transport(handle, now);
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        let config = self.core.create_participant(rtc, state, shard, handle, key);
+        let room_id = config.room_id;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .router
+            .send(
+                shard,
+                ShardCommand::MaterializeParticipant {
+                    key,
+                    transport: handle,
+                    config: Box::new(config),
+                    ack: ack_tx,
+                },
+            )
+            .await
+            .is_err()
+        {
+            self.remove_participant(participant_id).await;
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        if !ack_rx.await.unwrap_or(false) {
+            self.remove_participant(participant_id).await;
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        let generation = self.lifecycle.next_generation();
+        self.stage_participant_change_at(room_id, generation, Some(participant_id), None);
+        if let Some(meta) = self.core.registry.get_participant(&participant_id)
+            && let Some(key) = meta.binding
+        {
+            let participants = self
+                .core
+                .registry
+                .participant_ids_in_room(&room_id)
+                .into_iter()
+                .filter(|participant| *participant != participant_id)
+                .collect();
+            self.stage_participant_at(
+                meta.shard_id,
+                generation,
+                key,
+                crate::participant::ParticipantEffect::ParticipantsChanged {
+                    added: participants,
+                    removed: Vec::new(),
+                },
+            );
+        }
+        self.publish_staged();
+        let outcomes = self.lifecycle.subscribe_defaults(
+            room_id,
+            participant_id,
+            [
+                (TrackSelector::audio(), SelectionPolicy::All),
+                (TrackSelector::video(), SelectionPolicy::Allocated),
+            ],
+            &self.core.registry,
+            tokio::time::Instant::now(),
         );
-        let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
-
-        let (rtc, answer) = self.negotiator.create_answer(offer, creds)?;
-        let cfg = self.core.create_participant(rtc, state, shard_id);
-
-        self.eq.broadcast(|| ShardCommand::RegisterParticipant {
-            shard_id,
-            room_id: cfg.room_id,
-            participant_id: cfg.participant_id,
-        });
-        self.eq
-            .send(shard_id, ShardCommand::AddParticipant(Box::new(cfg)));
+        for outcome in outcomes {
+            self.publish_track_lifecycle(outcome);
+        }
         Ok(answer)
+    }
+
+    async fn handle_patch_participant(
+        &mut self,
+        state: ParticipantState,
+        offer: SdpOffer,
+    ) -> Result<SdpAnswer, ControllerError> {
+        let current = self
+            .core
+            .registry
+            .get_participant(&state.participant_id)
+            .and_then(|meta| meta.connection_id);
+        if current != state.old_connection_id {
+            return Err(ControllerError::StaleConnection);
+        }
+        self.remove_participant_with_mode(state.participant_id, true)
+            .await;
+        self.handle_create_participant(state, offer).await
+    }
+
+    async fn remove_participant(&mut self, participant: ParticipantId) {
+        self.remove_participant_with_mode(participant, false).await;
+    }
+
+    async fn remove_participant_with_mode(
+        &mut self,
+        participant: ParticipantId,
+        retain_identity: bool,
+    ) {
+        let Some(meta) = self
+            .core
+            .registry
+            .get_participant(&participant)
+            .map(|meta| crate::control::core::ParticipantMeta {
+                shard: meta.shard_id,
+                binding: meta.binding,
+                transport: meta.transport,
+            })
+        else {
+            return;
+        };
+        let mut outcomes = self.lifecycle.remove_participant(
+            participant,
+            &self.core.registry,
+            tokio::time::Instant::now(),
+        );
+        let generation = outcomes
+            .first()
+            .map(|outcome| outcome.generation)
+            .unwrap_or_else(|| self.lifecycle.next_generation());
+        if let Some(outcome) = outcomes.first()
+            && outcome.generation == generation
+        {
+            let outcome = outcomes.remove(0);
+            self.apply_track_lifecycle(outcome);
+        }
+        let room_id = self
+            .core
+            .registry
+            .get_participant(&participant)
+            .map(|meta| meta.room_id);
+        if let Some(room_id) = room_id {
+            self.stage_participant_change_at(room_id, generation, None, Some(participant));
+        }
+        if retain_identity {
+            let _ = self.core.disconnect_participant(&participant);
+        } else {
+            let _ = self.core.delete_participant(&participant);
+        }
+        self.publish_staged();
+        for outcome in outcomes {
+            self.publish_track_lifecycle(outcome);
+        }
+        let Some(handle) = meta.transport else { return };
+        let generation = self.lifecycle.next_generation();
+        if let Some(update) = self.updates.get_mut(meta.shard.index()) {
+            update.stage(
+                generation,
+                crate::shard_update::ShardUpdateOp::RetireTransport { handle },
+            );
+            if let Some(key) = meta.binding {
+                update.stage(
+                    generation,
+                    crate::shard_update::ShardUpdateOp::RemoveParticipant { key },
+                );
+            }
+            let _ = update.publish();
+        }
+        if let Some(key) = meta.binding {
+            self.core.remove_participant_key(meta.shard, key);
+        }
+        self.core
+            .release_transport(handle, tokio::time::Instant::now());
     }
 }
 
 pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
-
-async fn recv_command_paced(
-    rx: &mut mailbox::Receiver<ControllerCommand>,
-    allowed_at: tokio::time::Instant,
-) -> Option<ControllerCommand> {
-    tokio::time::sleep_until(allowed_at).await;
-    rx.recv().await
-}
-
-#[cfg(test)]
-mod tests {
-    // Tests assert by panicking; the process ending is the mechanism.
-    // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    use super::*;
-    use crate::id::ShardId;
-    use crate::{
-        control::{tcp_acceptor::PendingTcpConn, ufrag::IceUfrag},
-        entity::ParticipantId,
-        shard::{ShardContext, metrics::ShardMetrics},
-    };
-    use pulsebeam_core::net::TcpListener;
-    use pulsebeam_runtime::{mailbox, net::tcp::BufferedTcpStream, rand::seeded_rng};
-    use std::{net::IpAddr, sync::Arc};
-
-    fn run_local<Fut>(test: Fut)
-    where
-        Fut: std::future::Future<Output = ()> + Send + 'static,
-    {
-        pulsebeam_runtime::testing::run_local(test_host_ip(), test);
-    }
-
-    fn test_host_ip() -> IpAddr {
-        pulsebeam_runtime::testing::test_host_ip("192.168.250.10")
-    }
-
-    fn dummy_pid() -> ParticipantId {
-        ParticipantId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
-    }
-
-    async fn make_actor(num_shards: usize) -> ControllerActor {
-        let listener = TcpListener::bind(std::net::SocketAddr::new(test_host_ip(), 0))
-            .await
-            .unwrap();
-        let shard_contexts: Vec<ShardContext> = (0..num_shards)
-            .map(|_| {
-                let (tx, _rx) = mailbox::new(128);
-                ShardContext {
-                    command_tx: tx,
-                    metrics: Arc::new(ShardMetrics::new()),
-                }
-            })
-            .collect();
-        ControllerActor::new(seeded_rng(42), shard_contexts, vec![], listener)
-    }
-
-    /// Accept one server-side TCP stream from a fresh loopback listener.
-    async fn accept_one() -> (
-        pulsebeam_core::net::TcpStream,
-        pulsebeam_core::net::TcpStream,
-        std::net::SocketAddr,
-    ) {
-        let listener = TcpListener::bind(std::net::SocketAddr::new(test_host_ip(), 0))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (client, accepted) = tokio::join!(
-            pulsebeam_core::net::TcpStream::connect(addr),
-            listener.accept()
-        );
-        let client = client.unwrap();
-        let (server, peer_addr) = accepted.unwrap();
-        (client, server, peer_addr)
-    }
-
-    /// Wrap a raw server-side stream as a `BufferedTcpStream` for route tests.
-    async fn make_buffered() -> (pulsebeam_core::net::TcpStream, BufferedTcpStream) {
-        let (_client, server, _peer) = accept_one().await;
-        (_client, BufferedTcpStream::new(server))
-    }
-
-    // ── route_tcp_connection ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_route_valid_ufrag_routes_to_correct_shard() {
-        run_local(async {
-            let mut actor = make_actor(3).await;
-            let (_client, stream) = make_buffered().await;
-            let peer_addr = "1.2.3.4:5000".parse().unwrap();
-
-            // Encode for cluster=0, node=0 (actor defaults), shard=2
-            let ufrag = IceUfrag::new(0, 0, 2, dummy_pid()).encode();
-            let conn = PendingTcpConn {
-                stream,
-                peer_addr,
-                server_ufrag: Some(ufrag),
-            };
-            actor.route_tcp_connection(conn);
-
-            let event = actor.eq.pop().expect("event must be queued");
-            match event {
-                ControllerEvent::ShardCommandSent(
-                    shard_id,
-                    ShardCommand::AddTcpConnection { peer_addr: pa, .. },
-                ) => {
-                    assert_eq!(
-                        shard_id,
-                        ShardId::new(2),
-                        "must route to the shard encoded in the ufrag"
-                    );
-                    assert_eq!(pa, peer_addr);
-                }
-                _ => panic!("unexpected event: {event:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn test_route_wrong_cluster_drops_connection() {
-        run_local(async {
-            let mut actor = make_actor(2).await;
-            // actor.cluster_id = 0, ufrag encodes cluster_id = 1
-            let (_client, stream) = make_buffered().await;
-            let conn = PendingTcpConn {
-                stream,
-                peer_addr: "1.2.3.4:5001".parse().unwrap(),
-                server_ufrag: Some(IceUfrag::new(1, 0, 0, dummy_pid()).encode()),
-            };
-            actor.route_tcp_connection(conn);
-            assert!(
-                actor.eq.pop().is_none(),
-                "wrong-cluster connection must be silently dropped"
-            );
-        });
-    }
-
-    #[test]
-    fn test_route_wrong_node_drops_connection() {
-        run_local(async {
-            let mut actor = make_actor(2).await;
-            // actor.node_id = 0, ufrag encodes node_id = 7
-            let (_client, stream) = make_buffered().await;
-            let conn = PendingTcpConn {
-                stream,
-                peer_addr: "1.2.3.4:5002".parse().unwrap(),
-                server_ufrag: Some(IceUfrag::new(0, 7, 0, dummy_pid()).encode()),
-            };
-            actor.route_tcp_connection(conn);
-            assert!(
-                actor.eq.pop().is_none(),
-                "wrong-node connection must be silently dropped"
-            );
-        });
-    }
-}

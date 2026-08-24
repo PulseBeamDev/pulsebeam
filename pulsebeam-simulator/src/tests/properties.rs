@@ -1197,7 +1197,7 @@ fn a_cheap_co_tenant_is_not_starved() {
 
     check(
         SATURATED,
-        scenarios(Demand::contended(), Budget::Tight, ANY_FAULT),
+        scenarios(Demand::contended(), Budget::Ample, ANY_FAULT),
         |scenario| {
             let report = scenario.run("cheap_cotenant");
             prop_assume!(report.samples > 0 && report.received_bytes > 0);

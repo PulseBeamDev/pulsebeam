@@ -1,5 +1,12 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "Track distributes immutable publisher snapshots through ArcSwap"
+)]
+
+use arc_swap::ArcSwap;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::entity::TrackId;
@@ -13,7 +20,7 @@ use crate::rtp::{
 };
 pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
-use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
+use str0m::media::{Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::Ssrc;
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
@@ -23,14 +30,6 @@ pub type StreamId = (TrackId, Option<Rid>);
 /// Leading-edge debounce interval for keyframe requests forwarded upstream.
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const MAX_SIMULCAST_LAYERS: usize = 3;
-
-#[derive(Debug, Clone)]
-pub struct GlobalKeyframeRequest {
-    pub shard_id: ShardId,
-    pub origin: ParticipantId,
-    pub stream_id: StreamId,
-    pub kind: KeyframeRequestKind,
-}
 
 /// Deferred outbound RTP write.  Applying it to `Rtc` is deliberately the
 /// participant core's responsibility so it can drain str0m between writes.
@@ -98,10 +97,75 @@ impl StreamWriter {
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
+    pub room_id: crate::entity::RoomId,
     /// The shard ID that hosts this track's publisher.
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TrackSelector {
+    pub(crate) track: Option<TrackId>,
+    pub(crate) publisher: Option<ParticipantId>,
+    pub(crate) kind: Option<TrackKind>,
+    pub(crate) label: Option<String>,
+}
+
+impl TrackSelector {
+    pub(crate) fn audio() -> Self {
+        Self::kind(TrackKind::Audio)
+    }
+
+    pub(crate) fn video() -> Self {
+        Self::kind(TrackKind::Video)
+    }
+
+    pub(crate) fn data_topic(publisher: Option<ParticipantId>, label: String) -> Self {
+        Self {
+            track: None,
+            publisher,
+            kind: Some(TrackKind::Data),
+            label: Some(label),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn track(track: TrackId) -> Self {
+        Self {
+            track: Some(track),
+            publisher: None,
+            kind: None,
+            label: None,
+        }
+    }
+
+    fn kind(kind: TrackKind) -> Self {
+        Self {
+            track: None,
+            publisher: None,
+            kind: Some(kind),
+            label: None,
+        }
+    }
+
+    pub(crate) fn matches(&self, track: &Track) -> bool {
+        self.track.is_none_or(|expected| track.id() == expected)
+            && self
+                .publisher
+                .is_none_or(|expected| track.meta().origin == expected)
+            && self.kind.is_none_or(|expected| track.kind() == expected)
+            && self
+                .label
+                .as_deref()
+                .is_none_or(|expected| track.publication_label().as_deref() == Some(expected))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionPolicy {
+    All,
+    Allocated,
 }
 
 /// One encoding's ingest: normalize the packet, then measure it.
@@ -241,6 +305,21 @@ pub(crate) fn vla_stream_framerate(
         .max()
 }
 
+pub enum UpstreamStats {
+    Video(VideoStats),
+    Audio(NullStats),
+    Data(NullStats),
+}
+
+impl UpstreamStats {
+    fn update(&mut self, monitor: &TrackMonitor) {
+        match self {
+            Self::Video(stats) => stats.update(monitor),
+            Self::Audio(stats) | Self::Data(stats) => stats.update(monitor),
+        }
+    }
+}
+
 pub struct UpstreamTrack {
     pub meta: TrackMeta,
     /// One clock for the whole track. Every encoding is the same source over the
@@ -252,6 +331,7 @@ pub struct UpstreamTrack {
     /// activity, aggregate demand), while each encoding keeps its own
     /// `StreamStats` so the downstream allocator still sees per-layer metadata.
     pub monitor: TrackMonitor,
+    stats: UpstreamStats,
 }
 
 impl PartialEq for UpstreamTrack {
@@ -281,11 +361,7 @@ impl UpstreamTrack {
 
     pub fn poll_stats(&mut self, now: Instant) {
         self.monitor.poll(now);
-    }
-
-    /// This track's measurement handles, to hand along the media path.
-    pub fn layer_states(&self) -> TrackStates {
-        self.monitor.layer_states()
+        self.stats.update(&self.monitor);
     }
 }
 
@@ -348,6 +424,12 @@ impl TrackMonitor {
             .collect()
     }
 
+    fn snapshot(&self) -> VideoStatsSnapshot {
+        VideoStatsSnapshot {
+            layers: self.layer_states(),
+        }
+    }
+
     pub fn poll(&mut self, now: Instant) {
         // Derive the sibling gate from packet arrivals, never from the encodings'
         // published `inactive` flags: those flags are what this loop writes, so
@@ -383,52 +465,244 @@ impl TrackMonitor {
 }
 
 #[derive(Debug, Clone)]
-pub struct Track {
+pub enum Track {
+    Audio(AudioTrack),
+    Video(VideoTrack),
+    Data(DataTrack),
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioTrack {
+    pub meta: TrackMeta,
+    pub reverse: Option<crate::route::RouteHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoTrack {
     pub meta: TrackMeta,
     pub layers: Vec<TrackLayer>,
-    /// Where subscribing shards send everything that flows back toward this
-    /// track's publisher — keyframe requests today, NACKs later. Stamped by the
-    /// publisher's shard when it publishes, then carried to every other shard
-    /// by the control plane: the compiled reverse plan, so the data plane never
-    /// has to name the track to ask for anything.
-    pub reverse: Option<crate::route::ReverseRoute>,
+    stats: VideoStats,
+    pub reverse: Option<crate::route::RouteHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataTrack {
+    pub meta: TrackMeta,
+    pub topic: crate::track::Topic,
+    pub lane: crate::track::DataLane,
+    pub reverse: Option<crate::route::RouteHandle>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VideoStatsSnapshot {
+    layers: Vec<(Option<Rid>, StreamStats)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoStats(Arc<ArcSwap<VideoStatsSnapshot>>);
+
+impl VideoStats {
+    fn new(layers: &[TrackLayer]) -> Self {
+        let snapshot = VideoStatsSnapshot {
+            layers: layers
+                .iter()
+                .map(|layer| {
+                    (
+                        layer.rid,
+                        StreamStats::new(
+                            false,
+                            layer.quality.seed_bitrate_bps(),
+                            layer.quality.fallback_height(),
+                        ),
+                    )
+                })
+                .collect(),
+        };
+        Self(Arc::new(ArcSwap::from_pointee(snapshot)))
+    }
+
+    fn update(&self, monitor: &TrackMonitor) {
+        let previous = self.0.load_full();
+        let mut snapshot = monitor.snapshot();
+        for (rid, current) in &mut snapshot.layers {
+            if !current.inactive {
+                continue;
+            }
+            let Some((_, old)) = previous.layers.iter().find(|(old_rid, _)| old_rid == rid) else {
+                continue;
+            };
+            current.bitrate_bps = old.bitrate_bps;
+            current.stable_bitrate_bps = old.stable_bitrate_bps;
+            current.decode_targets = old.decode_targets;
+            current.decode_target_kbps = old.decode_target_kbps;
+            current.full_fps = old.full_fps;
+        }
+        self.0.store(Arc::new(snapshot));
+    }
+
+    pub(crate) fn layer_states(&self) -> TrackStates {
+        self.0.load().layers.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NullStats;
+
+impl NullStats {
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn update(&self, _monitor: &TrackMonitor) {}
 }
 
 impl Track {
-    pub fn lowest_quality(&self) -> &TrackLayer {
-        self.layers
-            .iter()
-            .min_by_key(|l| l.quality)
-            .unwrap_or_else(|| {
-                pulsebeam_runtime::fatal!("track {} was published with no layers", self.meta.id)
-            })
+    pub fn audio(meta: TrackMeta, reverse: Option<crate::route::RouteHandle>) -> Self {
+        Self::Audio(AudioTrack { meta, reverse })
+    }
+
+    pub fn video(
+        meta: TrackMeta,
+        layers: Vec<TrackLayer>,
+        reverse: Option<crate::route::RouteHandle>,
+    ) -> Self {
+        Self::Video(VideoTrack {
+            meta,
+            stats: VideoStats::new(&layers),
+            layers,
+            reverse,
+        })
+    }
+
+    pub fn data(
+        meta: TrackMeta,
+        topic: Topic,
+        lane: DataLane,
+        reverse: Option<crate::route::RouteHandle>,
+    ) -> Self {
+        Self::Data(DataTrack {
+            meta,
+            topic,
+            lane,
+            reverse,
+        })
+    }
+
+    pub fn meta(&self) -> &TrackMeta {
+        match self {
+            Self::Audio(track) => &track.meta,
+            Self::Video(track) => &track.meta,
+            Self::Data(track) => &track.meta,
+        }
+    }
+
+    pub fn meta_mut(&mut self) -> &mut TrackMeta {
+        match self {
+            Self::Audio(track) => &mut track.meta,
+            Self::Video(track) => &mut track.meta,
+            Self::Data(track) => &mut track.meta,
+        }
+    }
+
+    pub fn id(&self) -> TrackId {
+        self.meta().id
+    }
+
+    pub fn kind(&self) -> TrackKind {
+        self.id().kind()
+    }
+
+    pub fn reverse(&self) -> Option<crate::route::RouteHandle> {
+        match self {
+            Self::Audio(track) => track.reverse,
+            Self::Video(track) => track.reverse,
+            Self::Data(track) => track.reverse,
+        }
+    }
+
+    pub fn set_reverse(&mut self, reverse: Option<crate::route::RouteHandle>) {
+        match self {
+            Self::Audio(track) => track.reverse = reverse,
+            Self::Video(track) => track.reverse = reverse,
+            Self::Data(track) => track.reverse = reverse,
+        }
+    }
+
+    pub fn publication_label(&self) -> Option<String> {
+        match self {
+            Self::Data(track) => Some(publication_label(track.lane, &track.topic)),
+            Self::Audio(_) | Self::Video(_) => None,
+        }
+    }
+
+    pub fn requires_reverse_route(&self) -> bool {
+        matches!(
+            self,
+            Self::Video(_)
+                | Self::Data(DataTrack {
+                    lane: DataLane::Reliable,
+                    ..
+                })
+        )
+    }
+
+    pub fn layers(&self) -> &[TrackLayer] {
+        match self {
+            Self::Video(track) => &track.layers,
+            Self::Audio(_) | Self::Data(_) => &[],
+        }
+    }
+
+    pub fn as_video(&self) -> Option<&VideoTrack> {
+        match self {
+            Self::Video(track) => Some(track),
+            Self::Audio(_) | Self::Data(_) => None,
+        }
+    }
+
+    pub fn as_video_mut(&mut self) -> Option<&mut VideoTrack> {
+        match self {
+            Self::Video(track) => Some(track),
+            Self::Audio(_) | Self::Data(_) => None,
+        }
+    }
+
+    pub(crate) fn stats(&self) -> Option<VideoStats> {
+        self.as_video().map(|track| track.stats.clone())
+    }
+
+    pub fn lowest_quality(&self) -> Option<&TrackLayer> {
+        self.layers().iter().min_by_key(|l| l.quality)
     }
 
     /// Lowest layer that is currently healthy, falling back to the absolute
     /// lowest when no layer is healthy yet. Prefer this over `lowest_quality`
     /// when staging an initial layer so the slot can actually receive a keyframe
     /// (an inactive layer never produces packets and the slot would stall).
-    pub fn lowest_healthy_quality(&self, is_healthy: impl Fn(&TrackLayer) -> bool) -> &TrackLayer {
-        self.layers
+    pub fn lowest_healthy_quality(
+        &self,
+        is_healthy: impl Fn(&TrackLayer) -> bool,
+    ) -> Option<&TrackLayer> {
+        self.layers()
             .iter()
             .filter(|l| is_healthy(l))
             .min_by_key(|l| l.quality)
-            .unwrap_or_else(|| self.lowest_quality())
+            .or_else(|| self.lowest_quality())
     }
 
     pub fn by_quality(&self, quality: LayerQuality) -> Option<&TrackLayer> {
-        self.layers.iter().find(|l| l.quality == quality)
+        self.layers().iter().find(|l| l.quality == quality)
     }
 
     pub fn higher_quality(&self, current: LayerQuality) -> Option<&TrackLayer> {
-        self.layers
+        self.layers()
             .iter()
             .filter(|l| l.quality > current)
             .min_by_key(|l| l.quality)
     }
 
     pub fn lower_quality(&self, current: LayerQuality) -> Option<&TrackLayer> {
-        self.layers
+        self.layers()
             .iter()
             .filter(|l| l.quality < current)
             .max_by_key(|l| l.quality)
@@ -497,15 +771,9 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             normalizer: StreamNormalizer::new(mid, None),
             monitor,
         }]),
+        stats: UpstreamStats::Audio(NullStats::new()),
     };
-    (
-        sender,
-        Track {
-            meta,
-            layers: Vec::with_capacity(MAX_SIMULCAST_LAYERS),
-            reverse: None,
-        },
-    )
+    (sender, Track::audio(meta, None))
 }
 
 /// Construct a new video track sender and its per-layer descriptors.
@@ -562,17 +830,20 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     layers.sort_by_key(|e| std::cmp::Reverse(e.quality));
 
     tracing::info!(track_id = ?meta.id, layers = ?layers.len(), "discovered video layers mapping");
-    let track = Track {
+    let stats = VideoStats::new(&layers);
+    let track = Track::Video(VideoTrack {
         meta: meta.clone(),
         layers,
+        stats: stats.clone(),
         reverse: None,
-    };
+    });
 
     (
         UpstreamTrack {
             meta,
             synchronizer: TrackSynchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor: TrackMonitor::new(senders),
+            stats: UpstreamStats::Video(stats),
         },
         track,
     )
@@ -591,6 +862,9 @@ pub mod test_utils {
     ) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+            ),
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
@@ -601,6 +875,9 @@ pub mod test_utils {
     pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
         let meta = TrackMeta {
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+            ),
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
@@ -644,7 +921,7 @@ mod data_track {
     /// cross-core traffic, which is the wrong direction.
     ///
     /// The clones are not inherent: they exist only to build lookup keys, and a
-    /// dense key in `RouteAction::Data` removes them the way `LocalTrackKey`
+    /// dense key in `RouteAction::Unreliable` removes them the way `TrackKey`
     /// did for video. Fix the cause, not the symptom.
     pub struct Topic(String);
 
@@ -693,12 +970,26 @@ mod data_track {
     }
 
     impl DataLane {
-        fn as_str(self) -> &'static str {
+        pub fn as_str(self) -> &'static str {
             match self {
                 DataLane::Realtime => "rt",
                 DataLane::Reliable => "rel",
             }
         }
+    }
+
+    /// The canonical label naming a data *publication*: a topic on a lane.
+    ///
+    /// Direction and scope describe a channel, not the thing published on it,
+    /// so they are absent here — a publisher's channel and a subscriber's
+    /// channel for the same topic name one publication between them.
+    ///
+    /// Injective without escaping, which is why this can be plain
+    /// concatenation: `rt` and `rel` are prefix-free after `v1/`, and a topic
+    /// is `[A-Za-z0-9_-]+` by the grammar above, so it can carry no separator.
+    /// That is enforced where a label is parsed, not assumed here.
+    pub fn publication_label(lane: DataLane, topic: &crate::track::Topic) -> String {
+        format!("v1/{}/{}", lane.as_str(), topic)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -980,8 +1271,8 @@ mod data_track {
 
         #[test]
         fn test_reliable_subscribe_rejects_publisher_scope() {
-            let mut rng = test_rng();
-            let publisher_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let publisher_id = ParticipantId::new();
             let label = format!("v1/rel/sub/chat/{}", publisher_id.as_str());
             let err = DataTrackIntent::try_from(&rel_cfg(&label)).unwrap_err();
             assert_eq!(
@@ -1020,8 +1311,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_subscribe_valid() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/sub/game-sync/{}", participant_id.as_str());
             let res = DataTrackIntent::try_from(&cfg(&label)).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
@@ -1035,8 +1326,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_publish_rejected() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/pub/game-sync/{}", participant_id.as_str());
             let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
             assert_eq!(err, DataTrackIntentError::ScopeNotAllowedForPublish);
@@ -1051,8 +1342,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_subscribe_trailing_garbage() {
-            let mut rng = test_rng();
-            let participant_id = ParticipantId::new(&mut rng);
+            let _rng = test_rng();
+            let participant_id = ParticipantId::new();
             let label = format!("v1/rt/sub/game-sync/{}/trailing", participant_id.as_str());
             let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
             assert!(matches!(err, DataTrackIntentError::InvalidScope(_)));
@@ -1373,7 +1664,7 @@ mod simulcast_pause_tests {
     /// A three-encoding video track and a starting instant.
     fn track() -> (UpstreamTrack, Instant) {
         let now = Instant::now();
-        let participant = ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(7));
+        let participant = ParticipantId::new();
         let (upstream, _) = test_utils::make_video_track(
             participant,
             Mid::from("v"),

@@ -34,9 +34,15 @@ tokio-util = "0.7.18"
 tracing = { workspace = true }
 turmoil = { workspace = true, optional = true }
 socket2 = { version = "0.6", features = ["all"] }
-zerocopy = { version = "0.8.54", default-features = false, features = ["alloc"] }
+zerocopy = { version = "0.8.54", default-features = false, features = [
+  "alloc",
+] }
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["socket", "uio", "net"] }
+nix = { version = "0.31", default-features = false, features = [
+  "socket",
+  "uio",
+  "net",
+] }
 
 [dev-dependencies]
 async-stream = "0.3.6"
@@ -46,6 +52,5 @@ futures-test = "0.3.32"
 
 [features]
 default = ["parking_lot"]
-deep-metrics = []
 parking_lot = ["dep:parking_lot", "once_cell/parking_lot"]
 sim = ["pulsebeam-core/sim", "dep:turmoil", "dep:pulsebeam-routing"]

@@ -18,8 +18,6 @@ pub mod timeline;
 
 #[cfg(test)]
 pub mod conformance;
-#[cfg(test)]
-mod switch_test;
 
 #[allow(
     clippy::disallowed_types,
@@ -79,6 +77,15 @@ pub struct RtpPacket {
     /// Whether this packet begins a frame that can be decoded without any
     /// preceding frame (an H.264 IDR, or any Opus packet).
     pub is_keyframe: bool,
+    /// Whether this packet is the first of its frame.
+    ///
+    /// A Dependency Descriptor rides on every packet of a frame and carries the
+    /// template structure on every packet of a *keyframe*, so `is_keyframe`
+    /// alone does not identify the packet a receiver can start assembling from.
+    /// Replaying a keyframe from anywhere else hands over a frame with no
+    /// beginning, which the receiver discards — along with the structure, which
+    /// only keyframes carry, leaving the stream permanently unparseable.
+    pub is_frame_start: bool,
     /// Which switch-relevant H.264 NAL units this payload carries. Always empty
     /// for audio.
     pub nal: h264::NalFlags,
@@ -101,6 +108,7 @@ impl Default for RtpPacket {
             arrival_ts: Instant::now(),
             playout_time: Instant::now(),
             is_keyframe: false,
+            is_frame_start: true,
             nal: h264::NalFlags::empty(),
             payload: Arc::new([0u8; 1200]), // 1.2KB payload for test realism
         }
@@ -136,6 +144,10 @@ impl RtpPacket {
             arrival_ts: rtp.timestamp.into(),
             playout_time: rtp.timestamp.into(),
             is_keyframe: is_keyframe_start,
+            // Without a Dependency Descriptor a packet is its own frame, which
+            // is what the receiver assumes too. `normalize` corrects this from
+            // the descriptor when one is present.
+            is_frame_start: true,
             nal,
             payload: rtp.payload,
         };
@@ -174,6 +186,7 @@ impl RtpPacket {
             arrival_ts: self.arrival_ts,
             playout_time: self.playout_time,
             is_keyframe: self.is_keyframe,
+            is_frame_start: self.is_frame_start,
             nal: self.nal,
             payload: Arc::from(&self.payload[..]),
         }
@@ -382,6 +395,7 @@ pub mod test_utils {
                 arrival_ts: at,
                 playout_time: at,
                 is_keyframe: nal.idr(),
+                is_frame_start: true,
                 nal,
                 payload: Arc::from(payload.as_slice()),
                 ..Default::default()

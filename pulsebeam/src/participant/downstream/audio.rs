@@ -9,8 +9,10 @@ use crate::control::MAX_SEND_AUDIO_SLOTS;
 use crate::entity::{AudioOrigin, TrackId};
 use crate::log::{LogCtx, plog_debug, plog_warn};
 use crate::participant::downstream::SlotConfig;
+use crate::participant::intent::AudioIntent;
 use crate::rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline};
 use crate::track::StreamWriter;
+use std::ops::{Deref, DerefMut};
 
 /// One subscriber's audio slots, and the contest for them.
 ///
@@ -41,24 +43,33 @@ pub struct AudioAllocator {
     intent: AudioIntent,
 }
 
-/// A subscriber's audio selection policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AudioIntent {
-    /// Tracks that hold a slot regardless of loudness, in preference order.
-    pub pinned: Vec<TrackId>,
-    /// Fill the slots pinning does not claim by loudness.
-    pub auto: bool,
+pub struct DownstreamAudio {
+    allocator: AudioAllocator,
 }
 
-impl Default for AudioIntent {
-    fn default() -> Self {
+impl DownstreamAudio {
+    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         Self {
-            pinned: Vec::new(),
-            auto: true,
+            allocator: AudioAllocator::new(ctx, manual_sub),
         }
     }
 }
 
+impl Deref for DownstreamAudio {
+    type Target = AudioAllocator;
+
+    fn deref(&self) -> &Self::Target {
+        &self.allocator
+    }
+}
+
+impl DerefMut for DownstreamAudio {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.allocator
+    }
+}
+
+/// A subscriber's audio selection policy.
 pub struct Slot {
     pt: Pt,
     mid: Mid,
@@ -305,7 +316,9 @@ impl AudioAllocator {
             slot.timeline.rebase_audio(&pkt);
             slot.pending_marker = true;
         }
-        slot.timeline.rewrite(&mut pkt);
+        if !slot.timeline.rewrite_audio(&mut pkt) {
+            return None;
+        }
         if slot.pending_marker {
             pkt.marker = true;
             slot.pending_marker = false;

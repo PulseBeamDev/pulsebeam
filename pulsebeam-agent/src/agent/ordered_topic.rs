@@ -91,6 +91,7 @@ impl PublisherDelivery {
 }
 
 pub(super) struct OrderedTopics {
+    publisher_id: String,
     publishers: HashMap<String, Publisher>,
     publisher_channels: HashMap<ChannelId, String>,
     subscribers: HashMap<String, Subscriber>,
@@ -98,8 +99,10 @@ pub(super) struct OrderedTopics {
 }
 
 impl OrderedTopics {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(publisher_id: String) -> Self {
+        debug_assert!(!publisher_id.is_empty());
         Self {
+            publisher_id,
             publishers: HashMap::new(),
             publisher_channels: HashMap::new(),
             subscribers: HashMap::new(),
@@ -292,7 +295,7 @@ impl OrderedTopics {
         };
         publisher.next_seq = publisher.next_seq.wrapping_add(1);
         debug_assert_ne!(publisher.next_seq, 0, "reliable sequence exhausted");
-        let encoded = message.encode_to_vec();
+        let encoded = encode_delivery(&self.publisher_id, &message);
         if publisher.retransmits.len() == RETRANSMIT_CAPACITY {
             publisher.retransmits.pop_front();
         }
@@ -340,14 +343,16 @@ impl OrderedTopics {
                     payload: Vec::new(),
                     resync_required: true,
                 };
-                let _ = channel.write(true, &reset.encode_to_vec());
+                let encoded = encode_delivery(&self.publisher_id, &reset);
+                let _ = channel.write(true, &encoded);
             }
             for message in publisher
                 .retransmits
                 .iter()
                 .filter(|message| message.seq >= nack.from_seq)
             {
-                let _ = channel.write(true, &message.encode_to_vec());
+                let encoded = encode_delivery(&self.publisher_id, message);
+                let _ = channel.write(true, &encoded);
             }
         }
     }
@@ -404,6 +409,15 @@ impl OrderedTopics {
             }
         }
     }
+}
+
+fn encode_delivery(publisher_id: &str, message: &RelMsg) -> Vec<u8> {
+    debug_assert!(!publisher_id.is_empty());
+    RelDelivery {
+        publisher_id: publisher_id.to_owned(),
+        frame: message.encode_to_vec(),
+    }
+    .encode_to_vec()
 }
 
 fn add_channel(
@@ -475,6 +489,21 @@ mod tests {
             parse_label(&subscriber),
             Some((DataTrackDirection::Subscribe, "chat".to_string(), None))
         );
+    }
+
+    #[test]
+    fn delivery_envelope_keeps_the_publisher_identity_with_the_message() {
+        let message = RelMsg {
+            stream_id: 7,
+            seq: 3,
+            payload: b"state".to_vec(),
+            resync_required: false,
+        };
+
+        let encoded = encode_delivery("publisher", &message);
+        let delivery = RelDelivery::decode(encoded.as_slice()).unwrap();
+        assert_eq!(delivery.publisher_id, "publisher");
+        assert_eq!(RelMsg::decode(delivery.frame.as_slice()).unwrap(), message);
     }
 
     #[test]

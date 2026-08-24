@@ -2,30 +2,29 @@
 //! startup and never again. Carries the sanctioned exception in
 //! `shard::metrics`; nothing else here may share.
 
+use std::{collections::VecDeque, pin::Pin};
 #[allow(
     clippy::disallowed_types,
     reason = "Arc<ShardMetrics>, one per shard, see module note"
 )]
-use std::{marker::PhantomData, pin::Pin, sync::Arc};
+use std::{marker::PhantomData, rc::Rc, sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
-use crate::route::{MediaEnvelope, ReverseRoute, RouteEnvelope, RouteId};
+use crate::route::Envelope;
 
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
-    rand::Rng,
 };
-use str0m::media::KeyframeRequestKind;
 use tokio::time::{Instant, Sleep};
 
 use crate::{
-    entity::{self, ParticipantId, RoomId, TrackId},
+    entity::{ParticipantId, TrackId},
     id::ShardId,
-    participant::ParticipantConfig,
-    rtp::RtpPacket,
+    participant::{ParticipantConfig, RoutedTrackPacket},
     shard::metrics::ShardMetrics,
-    track::{Topic, Track, TrackMeta},
+    shard::recorder::{ShardRecorder, ShardStatsReport},
+    track::Track,
 };
 
 use super::core::{ShardCore, ShardTransport};
@@ -34,22 +33,17 @@ use super::core::{ShardCore, ShardTransport};
 ///
 /// Deliberately large and preallocated. Every entry is one topology change
 /// (publish, subscribe, teardown, participant lifecycle) — control-rate events,
-/// not per-packet — so a healthy node never comes close. It is sized this way
-/// so that filling it is unambiguous evidence of a stalled controller rather
-/// than a burst, which is what lets [`ShardWorker::flush_shard_events`] treat
-/// it as fatal instead of blocking.
-pub const SHARD_EVENT_CAPACITY: usize = 65_536;
+/// not per-packet — so a healthy node never comes close.
+pub(crate) const SHARD_EVENT_CAPACITY: usize = 65_536;
 
 /// Depth of the controller -> shard command queue.
 ///
-/// The shard *can* block on this one, so it does not need the headroom its
-/// reverse does; sizing them alike would make an ordinary burst look like the
-/// stalled controller [`SHARD_EVENT_CAPACITY`]'s overflow exists to diagnose.
+/// Both directions are non-blocking; the controller requeues a full command
+/// mailbox and retries on a later tick.
 ///
-/// Both directions must read this from here. Restating the depth at the call
-/// site would let the two drift apart, and the ratio below would then be
-/// asserted about a number nothing uses.
-pub const SHARD_COMMAND_CAPACITY: usize = 1024;
+/// Both directions read these capacities from here so the queue bounds do not
+/// drift apart at their call sites.
+pub(crate) const SHARD_COMMAND_CAPACITY: usize = 1024;
 
 /// Depth of the shard -> shard media queue, one per receiving shard.
 ///
@@ -59,237 +53,204 @@ pub const SHARD_COMMAND_CAPACITY: usize = 1024;
 /// backlog — deep enough to absorb one scheduling hiccup on the receiving
 /// core, shallow enough that a stalled shard sheds load promptly instead of
 /// holding a second of stale video.
-pub const SHARD_FRAME_CAPACITY: usize = 1024;
+pub(crate) const SHARD_FRAME_CAPACITY: usize = 1024;
 
-const _: () = assert!(
-    SHARD_EVENT_CAPACITY >= SHARD_COMMAND_CAPACITY * 16,
-    "the queue a shard cannot block on must have far more headroom than the one it can"
-);
+pub(crate) const SHARD_UPDATE_CAPACITY: usize = 1024;
+
+pub(crate) const SHARD_COMMAND_BUDGET: usize = 64;
+pub(crate) const SHARD_FRAME_BUDGET: usize = 256;
+pub(crate) const SHARD_UPDATE_OP_BUDGET: usize = 256;
+pub(crate) const SHARD_PLAN_OPERATION_BUDGET: usize = 256;
+pub(crate) const SHARD_PIPELINE_BUDGET: usize = 512;
+pub(crate) const SHARD_EVENT_BUDGET: usize = 1024;
+pub(crate) const SHARD_UDP_BATCH_BUDGET: usize = 256;
+pub(crate) const SHARD_PARTICIPANT_BUDGET: usize = 64;
+
+/// How often a shard hands its metrics to the control plane.
+///
+/// The values are cumulative and absolute, so this is a staleness bound and
+/// nothing more — a lost report costs a stale scrape, never a lost count.
+pub(crate) const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Depth of the shard -> aggregator metrics queue.
+///
+/// Shallow on purpose. At one report per second per shard a backlog means the
+/// aggregator is wedged, and the newest report supersedes every older one, so
+/// queueing them would only export staler numbers more slowly.
+pub(crate) const STATS_CAPACITY: usize = 4;
+
+/// A tick busier than this defers its metrics report to the next one.
+///
+/// The snapshot is sub-microsecond, but there is no reason to spend it on top
+/// of a tick that is already long when the next tick will almost certainly be
+/// cheaper. [`STATS_DEADLINE_SLACK`] bounds how long that can go on.
+const STATS_BUSY_TICK: Duration = Duration::from_micros(200);
+const LONG_TICK: Duration = Duration::from_millis(10);
+
+/// How far past its due time a report may be deferred waiting for a cheap
+/// tick. A shard saturated for this long reports anyway: stale metrics from a
+/// struggling shard are exactly the ones worth having.
+const STATS_DEADLINE_SLACK: Duration = STATS_REPORT_INTERVAL;
+
+/// Registered once per shard so `/metrics` carries `# HELP` for what every
+/// shard always reports. Repeating these per tick would be harmless but
+/// pointless; the recorder ignores a description it already has.
+fn describe_shard_metrics() {
+    metrics::describe_gauge!(
+        "participants_live",
+        "participants this shard currently owns"
+    );
+    metrics::describe_counter!(
+        "busy_us",
+        metrics::Unit::Microseconds,
+        "cumulative time this shard spent processing"
+    );
+    metrics::describe_counter!(
+        "idle_us",
+        metrics::Unit::Microseconds,
+        "cumulative time this shard spent parked"
+    );
+    metrics::describe_histogram!(
+        "tick_us",
+        metrics::Unit::Microseconds,
+        "how long one shard loop iteration took"
+    );
+    metrics::describe_counter!(
+        "routing_drop",
+        "recoverable packet or topology drops by lane, stage, and origin"
+    );
+    metrics::describe_counter!(
+        "shard_wrong_owner_drop",
+        "packets received by a shard that does not own their transport route"
+    );
+    metrics::describe_counter!(
+        "shard_tick_budget_hit",
+        "ticks that exhausted a bounded work phase before its queue drained"
+    );
+    metrics::describe_counter!(
+        "shard_long_tick",
+        "ticks longer than the realtime latency alarm threshold"
+    );
+    metrics::describe_counter!(
+        "upstream_route_miss",
+        "incoming media with no matching upstream SSRC route"
+    );
+    metrics::describe_counter!(
+        "upstream_route_table_full",
+        "incoming media whose upstream SSRC route table could not accept a new entry"
+    );
+}
 
 #[derive(Debug, thiserror::Error)]
-pub enum ShardError {
+pub(crate) enum ShardError {
     #[error("IO error: {0}")]
     IO(#[from] std::io::Error),
     #[error("Manager hung up")]
     ManagerDisconnected,
 }
 
-/// Everything the controller sends a shard. This is the control plane: it is
-/// reliable, it is semantic, and it is the only source of topology — shards
-/// never send each other any of this.
+/// The only imperative operations the controller may request from a shard.
+/// Topology and lifecycle changes are published through `ShardUpdate`.
 #[derive(Debug)]
-pub enum ShardCommand {
-    /// Boxed because it dwarfs every other variant: an inline
-    /// `ParticipantConfig` would set the size of the enum, and the command
-    /// queue preallocates [`SHARD_COMMAND_CAPACITY`] of them per shard.
-    AddParticipant(Box<ParticipantConfig>),
-    RemoveParticipant(ParticipantId),
-    AddTcpConnection {
+pub(crate) enum ShardCommand {
+    MaterializeParticipant {
+        key: crate::shard::participants::ParticipantKey,
+        transport: crate::route::TransportHandle,
+        config: Box<ParticipantConfig>,
+        ack: tokio::sync::oneshot::Sender<bool>,
+    },
+    AdoptTcpConnection {
         stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
         peer_addr: std::net::SocketAddr,
     },
-    RegisterParticipant {
-        shard_id: ShardId,
-        room_id: RoomId,
-        participant_id: entity::ParticipantId,
-    },
-    UnregisterParticipant {
-        shard_id: ShardId,
-        room_id: RoomId,
-        participant_id: ParticipantId,
-    },
-    PublishTrack(Track, RoomId),
-    UnpublishTracks {
-        room_id: RoomId,
-        origin: ParticipantId,
-        track_ids: Vec<TrackId>,
-    },
-    /// A [`Topology`] one shard raised, relayed by the controller to the shards
-    /// it picked. The controller adds nothing but the origin.
-    Relay {
-        from_shard_id: ShardId,
-        topology: Topology,
+    AuthenticateTransport {
+        source: std::net::SocketAddr,
+        handle: crate::route::TransportHandle,
     },
 }
 
-/// A topology change one shard announces and the controller relays verbatim.
-///
-/// Both directions carry the same value, so the controller's whole job for
-/// these is choosing recipients — it never re-encodes, and there is no second
-/// enum to keep in step.
-#[derive(Debug, Clone)]
-pub enum Topology {
-    /// The destination installed a route and is handing over the sender handle.
-    /// Only on receiving this may the publisher emit media to it.
-    TrackSubscribed {
-        track: TrackMeta,
-        route: RouteId,
-        epoch: u16,
-    },
-    /// No more local subscribers; stop forwarding. Carries the route it is
-    /// retiring so teardown is idempotent: a stale unsubscribe overtaken by a
-    /// fresh subscription names the old incarnation and is ignored, instead of
-    /// tearing down the new one.
-    TrackUnsubscribed {
-        track: TrackMeta,
-        route: RouteId,
-        epoch: u16,
-    },
-    /// The destination installed a route for this concrete stream, or (with no
-    /// publisher) registered a wildcard interest in the topic.
-    DataTopicSubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-        route: Option<RouteId>,
-        epoch: u16,
-    },
-    DataTopicUnsubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-    },
-    /// A data publisher appeared, so destinations holding a wildcard
-    /// subscription for the topic can resolve it into a concrete route.
-    DataTopicPublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-    },
-    ReliableTopicSubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: Option<ParticipantId>,
-        route: Option<RouteId>,
-        epoch: u16,
-    },
-    /// Drop every handle held for this topic; the destination retired its routes.
-    ReliableTopicUnsubscribed { room_id: RoomId, topic: Topic },
-    ReliableTopicPublished {
-        room_id: RoomId,
-        publisher: ParticipantId,
-        topic: Topic,
-        /// Where subscribers send this topic's application-level acks.
-        reverse: Option<ReverseRoute>,
-    },
-}
-
-/// What a subscriber sends back to a publisher.
-///
-/// Kept compact because it is going on a wire: the reverse route already
-/// identifies the stream, so a body names only what the destination cannot
-/// derive. Encodings are named by their index in the track's declared order —
-/// both ends have that from the control plane — so a rid never travels.
-///
-/// ```text
-/// RouteEnvelope(8) | tag(1) | body
-///   Keyframe  layer(1) kind(1)        -> 11 bytes
-///   Nack      layer(1) pid(2) blp(2)  -> 14 bytes
-///   DataAck   len(2) payload(len)     -> 11 + len
-/// ```
-#[derive(Debug, Clone)]
-pub enum Reverse {
-    /// Ask for a keyframe on one encoding.
-    Keyframe {
-        layer: u8,
-        kind: KeyframeRequestKind,
-    },
-    /// RTP loss report in the RTCP generic-NACK shape: `pid` is the first lost
-    /// sequence number and `blp` a bitmask of the 16 that follow. Not raised
-    /// yet — this is the slot it goes in.
-    #[allow(dead_code)]
-    Nack { layer: u8, pid: u16, blp: u16 },
-    /// The application's own reliability protocol for a reliable data topic:
-    /// the subscriber telling the publisher what it is missing. Opaque here —
-    /// the SFU relays it without interpreting it, which is what keeps
-    /// end-to-end reliability an endpoint concern rather than a hop guarantee.
-    DataAck(Vec<u8>),
-}
-
-/// Payload carried under an [`MediaEnvelope`]. Still typed this pass; byte
-/// serialization arrives with the UDP transport.
-pub enum MediaPayload {
-    Video(RtpPacket),
-    Audio(RtpPacket),
-    /// SCTP bytes for a client data channel. Which lane the client asked for is
-    /// in the destination's route entry, not here — the destination already
-    /// knows it, and it describes the client's channel, not this hop.
-    Data(Vec<u8>),
-}
+pub(crate) type MediaPayload = RoutedTrackPacket;
 
 /// Everything one shard sends another: the data plane.
 ///
 /// Best-effort by construction. Cross-node this becomes a UDP datagram, so
 /// nothing that must not be dropped is representable here — topology travels
 /// the control plane ([`ShardCommand`] / [`ShardEvent`]) and never this way.
-pub enum ShardFrame {
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the payload enum carries materialized TrackPacket values and owned SCTP bytes so cross-shard payloads remain core-local"
+)]
+pub(crate) enum ShardFrame {
+    Ingress {
+        batch: RecvPacketBatch,
+        handle: crate::route::TransportHandle,
+        source_shard: ShardId,
+    },
     /// Forward payload, addressed by the destination's own route. Carries no
     /// semantic ids: everything needed to deliver it lives in the destination's
     /// compiled route entry.
     Media {
-        env: MediaEnvelope,
+        env: Envelope,
         payload: MediaPayload,
     },
-    /// Anything travelling back toward a publisher, addressed by the reverse
-    /// route its shard opened. One variant for all of it because they share a
-    /// contract: every one is an idempotent request the sender repeats if it
-    /// still needs it, so losing one costs a round trip and nothing else.
-    Reverse { env: RouteEnvelope, body: Reverse },
-    /// Forward telemetry: what a publisher's encodings currently measure,
-    /// addressed by the destination's own route.
-    ///
-    /// A value, not a handle. Measurements used to be an `Arc` of atomics the
-    /// subscriber's shard read directly, which shared a refcount across cores
-    /// and — worse — never gave a coherent view, since eight independent atomic
-    /// reads can straddle a writer. One message is one consistent snapshot, and
-    /// it is the only shape that works when the destination is another node.
-    ///
-    /// Latest-wins: losing one costs a slightly stale allocation and nothing
-    /// else, so it belongs on the best-effort lane.
-    Stats {
-        env: RouteEnvelope,
-        stats: crate::track::TrackStates,
-    },
-    /// A datagram batch that landed on the wrong shard's socket. Node-local
-    /// with no cross-node analogue — a node demuxes its own participants — so
-    /// it is addressed semantically and never leaves the box.
-    Ingress {
-        participant_id: ParticipantId,
-        batch: RecvPacketBatch,
+    Reverse {
+        env: Envelope,
+        packet: crate::participant::reverse::ReversePacket,
     },
 }
 
-#[derive(Debug)]
-pub struct ShardEventWrapper {
-    pub from_shard_id: ShardId,
-    pub ev: ShardEvent,
-}
+pub(crate) type ShardEventMessage = (ShardId, ShardEvent);
 
-/// Everything a shard tells the controller. The other half of the control
-/// plane; like [`ShardCommand`] it is reliable and semantic.
+/// Runtime facts observed by a shard. The controller converts these facts into
+/// canonical state and publishes the resulting execution image.
 #[derive(Debug)]
-pub enum ShardEvent {
-    /// A local participant published a track. The controller owns the room, so
-    /// it turns this into `PublishTrack` for the shards that need to know.
-    TrackPublished(Track),
+pub(crate) enum ShardEvent {
+    TransportAuthenticated {
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        source_shard: ShardId,
+        handle: crate::route::TransportHandle,
+        shard: ShardId,
+    },
+    ParticipantClosed {
+        participant: ParticipantId,
+    },
+    TrackSubscribed {
+        subscriber: ParticipantId,
+        track: crate::track::TrackMeta,
+    },
+    TrackUnsubscribed {
+        subscriber: ParticipantId,
+        track: crate::track::TrackMeta,
+    },
+    TrackSubscriptionAdded {
+        room_id: crate::entity::RoomId,
+        subscriber: ParticipantId,
+        selector: crate::track::TrackSelector,
+        selection: crate::track::SelectionPolicy,
+    },
+    TrackSubscriptionRemoved {
+        room_id: crate::entity::RoomId,
+        subscriber: ParticipantId,
+        selector: crate::track::TrackSelector,
+    },
+    TrackPublished {
+        track: Track,
+    },
     TrackUnpublished {
         origin: ParticipantId,
         track_id: TrackId,
     },
-    ParticipantExited(ParticipantId),
-    /// A topology change for the controller to relay, unchanged, to whichever
-    /// shards it decides are concerned.
-    Relay(Topology),
 }
 
 #[derive(Clone)]
-pub struct ShardContext {
-    pub command_tx: mailbox::Sender<ShardCommand>,
+pub(crate) struct ShardContext {
+    pub(crate) command_tx: mailbox::Sender<ShardCommand>,
     #[allow(
         clippy::disallowed_types,
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
-    pub metrics: Arc<ShardMetrics>,
+    pub(crate) metrics: Arc<ShardMetrics>,
 }
 
 /// Carries the best-effort lane over in-process channels. Cross-node this
@@ -302,9 +263,6 @@ struct ChannelTransport {
 
 impl ChannelTransport {
     fn enqueue(&self, dst: ShardId, ev: ShardFrame) -> bool {
-        if dst == self.shard_id {
-            return true;
-        }
         let Some(tx) = self.frame_txs.get(dst.index()) else {
             debug_assert!(
                 false,
@@ -318,7 +276,7 @@ impl ChannelTransport {
 }
 
 impl ShardTransport for ChannelTransport {
-    fn send_media(&self, dst: ShardId, env: MediaEnvelope, payload: MediaPayload) {
+    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
         // Dropping under backpressure is the media contract: this lane is
         // lossy by design, and `link_seq` makes the loss visible downstream.
         let _ = self.enqueue(dst, ShardFrame::Media { env, payload });
@@ -337,20 +295,29 @@ impl ShardTransport for ChannelTransport {
     }
 }
 
-pub struct ShardWorker {
+pub(crate) struct ShardWorker {
     core: ShardCore,
     recv_batch: Vec<RecvPacketBatch>,
     udp_socket: UnifiedSocket,
     tcp_socket: net::tcp::TcpTransport,
     command_rx: mailbox::Receiver<ShardCommand>,
-    event_tx: mailbox::Sender<ShardEventWrapper>,
+    event_tx: mailbox::Sender<ShardEventMessage>,
+    shard_event_backlog: VecDeque<ShardEvent>,
     frame_rx: mailbox::Receiver<ShardFrame>,
+    frame_batch: Vec<ShardFrame>,
     router: ChannelTransport,
     #[allow(
         clippy::disallowed_types,
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
     metrics: Arc<ShardMetrics>,
+    /// This shard's own `metrics` recorder. `Rc` because it never leaves the
+    /// core; the handles it hands out are the only things that must be `Sync`,
+    /// and only because the `metrics` crate's signatures say so.
+    recorder: Rc<ShardRecorder>,
+    stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
+    stats_due: Instant,
+    last_busy: Duration,
 
     // Mark !Send
     _marker: PhantomData<*mut ()>,
@@ -366,19 +333,27 @@ impl ShardWorker {
         clippy::disallowed_types,
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
-    pub fn new(
+    pub(crate) fn new(
         shard_id: ShardId,
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
         command_rx: mailbox::Receiver<ShardCommand>,
-        event_tx: mailbox::Sender<ShardEventWrapper>,
+        update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
+        event_tx: mailbox::Sender<ShardEventMessage>,
         frame_rx: mailbox::Receiver<ShardFrame>,
         frame_txs: Vec<mailbox::Sender<ShardFrame>>,
         metrics: Arc<ShardMetrics>,
-        rng: Rng,
+        stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
         wall: WallAnchor,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng, wall);
+        let shard_count = frame_txs.len();
+        let core = ShardCore::new(
+            shard_id,
+            udp_socket.max_gso_segments(),
+            shard_count,
+            wall,
+            update_rx,
+        );
         let router = ChannelTransport {
             shard_id,
             frame_txs,
@@ -391,9 +366,21 @@ impl ShardWorker {
             tcp_socket,
             command_rx,
             event_tx,
+            shard_event_backlog: VecDeque::new(),
             frame_rx,
+            frame_batch: Vec::with_capacity(SHARD_FRAME_BUDGET),
             router,
             metrics,
+            recorder: {
+                let recorder = Rc::new(ShardRecorder::new());
+                metrics::with_local_recorder(&*recorder, describe_shard_metrics);
+                recorder
+            },
+            stats_tx,
+            stats_due: Instant::now()
+                .checked_add(STATS_REPORT_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            last_busy: Duration::ZERO,
             _marker: PhantomData,
         }
     }
@@ -416,19 +403,91 @@ impl ShardWorker {
             self.metrics
                 .record_idle(busy_start.saturating_duration_since(loop_start));
 
-            self.tick(busy_start);
-            self.flush_shard_events()?;
+            // Every `metrics::*` call reached from here resolves against this
+            // shard's own recorder rather than the process-global one, so an
+            // increment touches memory no other core does. Installed per tick
+            // rather than per thread because under `SharedRuntime` every shard
+            // of a node shares one thread, and attribution must come from the
+            // installed recorder rather than from thread identity.
+            let recorder = Rc::clone(&self.recorder);
+            let previous_busy = self.last_busy;
+            metrics::with_local_recorder(&*recorder, || {
+                self.observe_health(previous_busy);
+                self.tick(busy_start);
+                self.flush_shard_events()
+            })?;
 
-            // TODO: record forwarding latency
             let busy_end = Instant::now();
             loop_start = busy_end;
             let busy_duration = busy_end.duration_since(busy_start);
             self.metrics.record_busy(busy_duration);
+            self.last_busy = busy_duration;
+
+            self.report_stats(busy_end, busy_duration);
+        }
+    }
+
+    /// What every shard reports whether or not it is carrying traffic.
+    ///
+    /// Without these a quiet shard registers no metrics at all, and `/metrics`
+    /// cannot distinguish a healthy idle shard from one that died — which is
+    /// the first question worth asking of a thread-per-core node.
+    ///
+    /// Recorded for the previous tick so it costs one recorder scope per loop
+    /// rather than two.
+    fn observe_health(&self, previous_busy: Duration) {
+        metrics::gauge!("participants_live").set(self.core.participant_count() as f64);
+        let (busy_us, idle_us) = self.metrics.read_raw();
+        metrics::counter!("busy_us").absolute(busy_us);
+        metrics::counter!("idle_us").absolute(idle_us);
+        metrics::histogram!("tick_us")
+            .record(u64::try_from(previous_busy.as_micros()).unwrap_or(u64::MAX) as f64);
+        if previous_busy >= LONG_TICK {
+            metrics::counter!("shard_long_tick").increment(1);
+        }
+    }
+
+    /// Hand this shard's cumulative metrics to the control plane.
+    ///
+    /// Runs after the tick's work is done and the shard is on its way back to
+    /// the park, never between packets. It waits for a cheap tick when it can,
+    /// so the snapshot lands in slack rather than on top of a long tick, and
+    /// gives up waiting after [`STATS_DEADLINE_SLACK`] so a saturated shard —
+    /// the one whose numbers matter most — still reports.
+    fn report_stats(&mut self, now: Instant, busy: Duration) {
+        let Some(tx) = &self.stats_tx else {
+            return;
+        };
+        if now < self.stats_due {
+            return;
+        }
+        let hard_deadline = self.stats_due.checked_add(STATS_DEADLINE_SLACK);
+        if busy > STATS_BUSY_TICK && hard_deadline.is_some_and(|hard| now < hard) {
+            return;
+        }
+
+        // Dropping is free: the values are cumulative and absolute, so the
+        // next report carries everything this one would have.
+        let _ = tx.try_send(Box::new(self.recorder.snapshot(self.router.shard_id)));
+        self.stats_due = now.checked_add(STATS_REPORT_INTERVAL).unwrap_or(now);
+    }
+
+    fn next_wait_deadline(&mut self) -> Option<Instant> {
+        // A quiet shard must still wake to report, or its metrics would freeze
+        // at whatever it last had traffic for.
+        let stats_deadline = self.stats_tx.as_ref().map(|_| self.stats_due);
+        match (self.core.next_timer_deadline(), stats_deadline) {
+            (Some(timer), Some(stats)) => Some(timer.min(stats)),
+            (timer, stats) => timer.or(stats),
         }
     }
 
     async fn wait_for_inputs(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), ShardError> {
-        let has_timer = if let Some(d) = self.core.next_timer_deadline() {
+        if !self.shard_event_backlog.is_empty() {
+            return Ok(());
+        }
+        let deadline = self.next_wait_deadline();
+        let has_timer = if let Some(d) = deadline {
             sleep.as_mut().reset(d);
             true
         } else {
@@ -438,6 +497,7 @@ impl ShardWorker {
         // Block until at least one source is ready.
         tokio::select! {
             biased;
+            Some(_) = self.core.update_readable() => {}
             Ok(_) = self.udp_socket.readable() => {}
             Some(_) = self.frame_rx.readable() => {}
             Ok(_) = self.tcp_socket.readable() => {}
@@ -451,144 +511,129 @@ impl ShardWorker {
 
     fn tick(&mut self, now: Instant) {
         // phase 1: input
-        while let Ok(cmd) = self.command_rx.try_recv() {
+        let mut commands: usize = 0;
+        for _ in 0..SHARD_COMMAND_BUDGET {
+            let Ok(cmd) = self.command_rx.try_recv() else {
+                break;
+            };
+            commands = commands.saturating_add(1);
             match cmd {
-                ShardCommand::AddTcpConnection { stream, peer_addr } => {
+                ShardCommand::AdoptTcpConnection { stream, peer_addr } => {
                     if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
                         tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
                     }
                 }
                 cmd => {
-                    let _ = self.core.on_command(cmd, now, &self.router);
+                    let _ = self.core.on_command(cmd, &self.router);
                 }
             }
         }
-        while let Ok(ev) = self.frame_rx.try_recv() {
-            self.core.on_shard_frame(ev, now, &self.router);
+        if commands == SHARD_COMMAND_BUDGET {
+            self.tick_budget_hit("commands");
+        }
+        if self.core.apply_updates(SHARD_UPDATE_OP_BUDGET) >= SHARD_UPDATE_OP_BUDGET {
+            self.tick_budget_hit("shard_update");
+        }
+        let mut frames: usize = 0;
+        self.frame_batch.clear();
+        for _ in 0..SHARD_FRAME_BUDGET {
+            let Ok(ev) = self.frame_rx.try_recv() else {
+                break;
+            };
+            frames = frames.saturating_add(1);
+            self.frame_batch.push(ev);
+        }
+        self.core
+            .on_shard_frames(self.frame_batch.drain(..), now, &self.router);
+        if frames == SHARD_FRAME_BUDGET {
+            self.tick_budget_hit("frames");
         }
         self.core.fire_timers(now);
 
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
         let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
-        for batch in self.recv_batch.drain(..) {
-            self.core.on_udp_batch(batch, &self.router);
+        let received = self.recv_batch.len();
+        for batch in self
+            .recv_batch
+            .drain(..SHARD_UDP_BATCH_BUDGET.min(received))
+        {
+            self.core.on_udp_batch_routed(batch, &self.router);
+        }
+        if received >= SHARD_UDP_BATCH_BUDGET {
+            self.tick_budget_hit("udp");
         }
 
-        self.core
-            .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
-        self.core.flush_stream_buffers(&self.router);
-        self.core
-            .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
-        self.core.flush_participant_events(now, &self.router);
+        if self.core.poll_and_flush_dirty(
+            now,
+            &mut self.udp_socket,
+            &mut self.tcp_socket,
+            SHARD_PARTICIPANT_BUDGET,
+        ) == SHARD_PARTICIPANT_BUDGET
+        {
+            self.tick_budget_hit("participants");
+        }
+        if self
+            .core
+            .flush_stream_buffers(&self.router, SHARD_PIPELINE_BUDGET)
+            == SHARD_PIPELINE_BUDGET
+        {
+            self.tick_budget_hit("pipeline");
+        }
+        if self.core.poll_and_flush_dirty(
+            now,
+            &mut self.udp_socket,
+            &mut self.tcp_socket,
+            SHARD_PARTICIPANT_BUDGET,
+        ) == SHARD_PARTICIPANT_BUDGET
+        {
+            self.tick_budget_hit("participants");
+        }
+        if self
+            .core
+            .flush_participant_events(&self.router, SHARD_PIPELINE_BUDGET)
+            == SHARD_PIPELINE_BUDGET
+        {
+            self.tick_budget_hit("participant_events");
+        }
 
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
     }
 
-    /// Hand this tick's topology events to the controller.
-    ///
-    /// **Never await here.** The controller awaits when it sends a shard a
-    /// command, so a shard that awaits sending an event closes a cycle: with
-    /// both channels full, the controller blocks on a shard that is blocked on
-    /// the controller and neither ever drains. The shard side is the one that
-    /// must not block, because a shard that never blocks is what makes the
-    /// controller's await safe — its commands are always drained.
-    ///
-    /// So this is `try_send`, and a full queue is fatal rather than handled:
-    /// [`SHARD_EVENT_CAPACITY`] is sized far above any rate real topology churn
-    /// can produce, so reaching it means the controller has stopped consuming
-    /// and the cluster's view of the topology is already wrong. Continuing from
-    /// there would silently drop subscriptions and teardowns.
+    /// Hand this tick's topology events to the controller without dropping
+    /// lifecycle state when the controller mailbox is temporarily full.
     fn flush_shard_events(&mut self) -> Result<(), ShardError> {
-        while let Some(event) = self.core.pop_shard_event() {
-            let wrapped = ShardEventWrapper {
-                from_shard_id: self.router.shard_id,
-                ev: event,
+        for _ in 0..SHARD_EVENT_BUDGET {
+            let event = self
+                .shard_event_backlog
+                .pop_front()
+                .or_else(|| self.core.pop_shard_event());
+            let Some(event) = event else {
+                break;
             };
-            match self.event_tx.try_send(wrapped) {
+            match self.event_tx.try_send((self.router.shard_id, event)) {
                 Ok(()) => {}
                 Err(mailbox::TrySendError::Closed(_)) => {
                     tracing::warn!("shard event channel is closed, exiting");
                     return Err(ShardError::ManagerDisconnected);
                 }
                 Err(mailbox::TrySendError::Full(ev)) => {
-                    pulsebeam_runtime::fatal!(
-                        "shard {} filled the {SHARD_EVENT_CAPACITY}-slot control queue to the \
-                         controller and cannot block on it without deadlocking (the controller \
-                         awaits on the reverse channel). The controller has stopped draining \
-                         topology events, so cluster routing state is already diverging. \
-                         Dropped: {:?}",
-                        self.router.shard_id,
-                        ev.ev
-                    );
+                    self.shard_event_backlog.push_front(ev.1);
+                    break;
                 }
             }
         }
 
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod reverse_tests {
-    // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See docs/thread-per-core.md.
-    use super::*;
-
-    /// The reverse lane is going on a wire, so the documented layout is the
-    /// contract: a route already names the stream, so a body may only carry
-    /// what the destination cannot derive. This pins the sizes the doc comment
-    /// on [`Reverse`] promises, so a field added without thinking shows up here
-    /// rather than in a datagram.
-    #[test]
-    fn reverse_bodies_stay_compact() {
-        const HEADER: usize = crate::route::ROUTE_ENVELOPE_LEN + 1; // envelope + tag
-
-        fn wire_len(body: &Reverse) -> usize {
-            HEADER
-                + match body {
-                    Reverse::Keyframe { .. } => 2,              // layer, kind
-                    Reverse::Nack { .. } => 5,                  // layer, pid, blp
-                    Reverse::DataAck(bytes) => 2 + bytes.len(), // len prefix
-                }
+        if !self.shard_event_backlog.is_empty() || self.core.has_pending_events() {
+            self.tick_budget_hit("shard_events");
         }
 
-        assert_eq!(
-            wire_len(&Reverse::Keyframe {
-                layer: 0,
-                kind: KeyframeRequestKind::Pli,
-            }),
-            11,
-            "a keyframe request must fit the documented 11 bytes"
-        );
-        assert_eq!(
-            wire_len(&Reverse::Nack {
-                layer: 0,
-                pid: 1,
-                blp: 0,
-            }),
-            14,
-            "a NACK must fit the documented 14 bytes"
-        );
-        assert_eq!(wire_len(&Reverse::DataAck(vec![0u8; 8])), 19);
+        Ok(())
     }
 
-    /// An encoding is named by index, never by rid: the index is derivable from
-    /// the track descriptor both ends already hold, and a rid is a variable
-    /// length string that has no business on a per-request lane.
-    #[test]
-    fn an_encoding_is_named_by_index_not_by_rid() {
-        let body = Reverse::Keyframe {
-            layer: 2,
-            kind: KeyframeRequestKind::Pli,
-        };
-        assert_eq!(
-            std::mem::size_of_val(&match body {
-                Reverse::Keyframe { layer, .. } => layer,
-                _ => unreachable!(),
-            }),
-            1,
-            "an encoding selector must be one byte"
-        );
+    fn tick_budget_hit(&self, phase: &'static str) {
+        metrics::counter!("shard_tick_budget_hit", "phase" => phase).increment(1);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_counter("shard_tick_budget_hit");
     }
 }

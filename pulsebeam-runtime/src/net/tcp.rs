@@ -488,12 +488,17 @@ impl TcpTransport {
 
     /// Frame `batch` per RFC 4571 and write to the peer's stream.
     ///
-    /// **Lossy**: a new batch is dropped when a previous partial frame is still
-    /// waiting or the kernel send buffer is full. A partial frame itself is
-    /// retained so later frames cannot corrupt RFC 4571 alignment.
+    /// A batch is accepted only after it has been written or retained in the
+    /// bounded per-connection egress buffer. `WouldBlock` leaves it with the
+    /// caller so a full egress buffer cannot silently discard valid frames.
     pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<usize> {
-        for group in batch.packets {
-            self.try_send_group(group)?;
+        for (index, group) in batch.packets.iter().enumerate() {
+            if !self.try_send_group(group)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("TCP egress buffer is full before batch item {index}"),
+                ));
+            }
         }
         Ok(batch.packets.len())
     }
@@ -531,7 +536,12 @@ impl TcpTransport {
 
             while !conn.pending.is_empty() {
                 match conn.write.try_write(&conn.pending) {
-                    Ok(0) => return Ok(false),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "TCP write accepted zero bytes",
+                        ));
+                    }
                     Ok(n) => {
                         debug_assert!(n <= conn.pending.len());
                         if n > conn.pending.len() {
@@ -542,7 +552,14 @@ impl TcpTransport {
                         }
                         conn.pending.advance(n);
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if conn.pending.len().saturating_add(buf.len()) > MAX_TCP_WRITE_BUF {
+                            return Ok(false);
+                        }
+                        conn.pending.extend_from_slice(&buf);
+                        debug_assert!(conn.pending.len() <= MAX_TCP_WRITE_BUF);
+                        return Ok(true);
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -558,7 +575,12 @@ impl TcpTransport {
 
             while !buf.is_empty() {
                 match conn.write.try_write(&buf) {
-                    Ok(0) => return Ok(false),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "TCP write accepted zero bytes",
+                        ));
+                    }
                     Ok(n) => {
                         debug_assert!(n <= buf.len());
                         if n > buf.len() {
@@ -582,7 +604,7 @@ impl TcpTransport {
 
         match outcome {
             Ok(true) => {}
-            Ok(false) => self.remove_conn(&batch.dst),
+            Ok(false) => return Ok(false),
             Err(error) => {
                 tracing::warn!(peer_addr = %batch.dst, %error, "TCP write error");
                 self.remove_conn(&batch.dst);
@@ -918,9 +940,8 @@ mod tests {
         });
     }
 
-    /// Verify that try_send_batch is lossy: flooding a peer that has stopped
-    /// reading never panics and always returns Ok(true) (packets are dropped,
-    /// not buffered), keeping memory bounded.
+    /// Flooding a peer that has stopped reading never panics and reports
+    /// back-pressure once the bounded egress buffer is full.
     #[test]
     fn test_send_to_slow_reader_is_lossy() {
         run_local(async {
@@ -937,7 +958,7 @@ mod tests {
             // Stop reading — kernel TX buffer will fill quickly.
             drop(client);
 
-            // Flood: every call must return Ok(true) (lossy drop), never buffering.
+            // Flood until the bounded egress buffer reports back-pressure.
             let payload = vec![0u8; MAX_FRAME_SIZE];
             for _ in 0..200 {
                 let packets = [SendPacket {
@@ -946,11 +967,10 @@ mod tests {
                     segment_size: MAX_FRAME_SIZE,
                 }];
                 let batch = SendPacketBatch { packets: &packets };
-                assert_eq!(
-                    sock.try_send_batch(&batch).unwrap(),
-                    1,
-                    "try_send_batch must always return Ok(true) under back-pressure"
-                );
+                match sock.try_send_batch(&batch) {
+                    Ok(sent) => assert_eq!(sent, 1),
+                    Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                }
             }
             // Connection may or may not still be present (depends on whether the
             // kernel signalled a hard error), but we must not have panicked.

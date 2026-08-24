@@ -79,6 +79,7 @@ pub struct NodeBuilder {
     workers: usize,
     local_addr: Option<SocketAddr>,
     external_addrs: Vec<SocketAddr>,
+    advertise_bound_udp: bool,
 
     // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
@@ -117,6 +118,7 @@ impl NodeBuilder {
             workers: 1,
             local_addr: None,
             external_addrs: Vec::new(),
+            advertise_bound_udp: false,
             rng: None,
             udp_mode: UdpMode::Batch,
             http_api: None,
@@ -170,6 +172,15 @@ impl NodeBuilder {
     /// Set multiple external addresses (e.g. dual-stack IPv4/IPv6) advertised to peers.
     pub fn external_addrs(mut self, addrs: Vec<SocketAddr>) -> Self {
         self.external_addrs = addrs;
+        self
+    }
+
+    /// Advertise the UDP addresses assigned by the kernel after binding.
+    ///
+    /// This is for a loopback caller binding `:0`; production deployments
+    /// should continue to provide stable external addresses explicitly.
+    pub fn advertise_bound_udp(mut self) -> Self {
+        self.advertise_bound_udp = true;
         self
     }
 
@@ -238,9 +249,9 @@ impl NodeBuilder {
         let local_addr = self
             .local_addr
             .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
-        if self.external_addrs.is_empty() {
+        if self.external_addrs.is_empty() && !self.advertise_bound_udp {
             return Err(anyhow::anyhow!(
-                "NodeBuilder requires at least one external IPv4 address; call `.external_addrs(...)`"
+                "NodeBuilder requires external addresses; call `.external_addrs(...)` or `.advertise_bound_udp()` for loopback :0"
             ));
         }
 
@@ -263,11 +274,6 @@ impl NodeBuilder {
             }
         }
 
-        if v4_addrs.is_empty() {
-            return Err(anyhow::anyhow!(
-                "NodeBuilder requires at least one IPv4 external address in `.external_addrs(...)`"
-            ));
-        }
         if v4_addrs.len() > 1 {
             return Err(anyhow::anyhow!(
                 "NodeBuilder currently supports exactly one external IPv4 address"
@@ -425,8 +431,8 @@ impl NodeBuilder {
             .enumerate()
         {
             let shard_id = ShardId::new(shard_idx);
-            let (view_writer, view_reader) = crate::view::new_shard_view(shard_id);
-            view_writers.push(view_writer);
+            let (update_writer, update_reader) = crate::shard_update::new_shard_update(shard_id);
+            view_writers.push(update_writer);
             let (shard_command_tx, shard_command_rx) =
                 mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
             let shard_event_tx = shard_event_tx.clone();
@@ -445,7 +451,7 @@ impl NodeBuilder {
                     udp_sock.into_unified_socket()?,
                     tcp_sock,
                     shard_command_rx,
-                    view_reader,
+                    update_reader,
                     shard_event_tx,
                     frame_rx,
                     frame_txs,
@@ -506,7 +512,7 @@ impl NodeBuilder {
                                     udp_sock,
                                     tcp_sock,
                                     shard_command_rx,
-                                    view_reader,
+                                    update_reader,
                                     shard_event_tx,
                                     frame_rx,
                                     frame_txs,

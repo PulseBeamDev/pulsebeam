@@ -74,6 +74,15 @@ pub(crate) struct RtcTemplate {
     medias: Vec<MediaTemplate>,
 }
 
+type BuiltRtc = (
+    Rtc,
+    ChannelId,
+    Vec<MediaAdded>,
+    Vec<ChannelId>,
+    SdpOffer,
+    SdpPendingOffer,
+);
+
 impl RtcTemplate {
     pub(crate) fn new(
         config: RtcConfig,
@@ -99,17 +108,7 @@ impl RtcTemplate {
     pub(crate) fn build_with_channels(
         &self,
         channels: Vec<ChannelConfig>,
-    ) -> Result<
-        (
-            Rtc,
-            ChannelId,
-            Vec<MediaAdded>,
-            Vec<ChannelId>,
-            SdpOffer,
-            SdpPendingOffer,
-        ),
-        AgentError,
-    > {
+    ) -> Result<BuiltRtc, AgentError> {
         let mut rtc = self.config.clone().build(Instant::now().into());
         for candidate in &self.candidates {
             let _ = rtc.add_local_candidate(candidate.clone());
@@ -336,6 +335,11 @@ fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Op
 
 pub(crate) enum AgentEvent {
     StatsUpdated,
+    ParticipantsChanged {
+        added: Vec<ParticipantId>,
+        removed: Vec<ParticipantId>,
+        snapshot: bool,
+    },
     RemoteTrackDiscovered(Track),
     RemoteTrackRemoved(String),
     /// Who the SFU is forwarding audio for, loudest first, whenever that changes.
@@ -360,6 +364,7 @@ pub(crate) struct DriverInit {
     /// The connection generation, echoed as `If-Match` on the next reconnect and replaced by the
     /// one the server answers with. Identity is the participant id; this says which connection.
     pub etag: String,
+    #[cfg(feature = "sim")]
     pub room_id: String,
     pub participant_id: String,
     pub medias: Vec<MediaAdded>,
@@ -523,6 +528,7 @@ struct SessionSubsystem {
     /// The connection generation, echoed as `If-Match` on the next reconnect and replaced by the
     /// one the server answers with. Identity is the participant id; this says which connection.
     etag: String,
+    #[cfg(feature = "sim")]
     room_id: String,
     participant_id: String,
     disconnected_reason: Option<String>,
@@ -596,7 +602,7 @@ impl AgentDriver {
                 data_targets: HashMap::new(),
                 channel_remap: HashMap::new(),
             },
-            ordered_topics: OrderedTopics::new(),
+            ordered_topics: OrderedTopics::new(init.participant_id.clone()),
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
                 publication_sources: HashMap::new(),
@@ -634,6 +640,7 @@ impl AgentDriver {
                 api: init.api,
                 resource_uri: init.resource_uri,
                 etag: init.etag,
+                #[cfg(feature = "sim")]
                 room_id: init.room_id,
                 participant_id: init.participant_id,
                 disconnected_reason: None,
@@ -665,6 +672,7 @@ impl AgentDriver {
         &self.session.participant_id
     }
 
+    #[cfg(feature = "sim")]
     pub fn room_id(&self) -> &str {
         &self.session.room_id
     }
@@ -1413,7 +1421,21 @@ impl AgentDriver {
 
         match payload {
             signaling::server_message::Payload::State(update) => {
+                let added: Vec<ParticipantId> = update
+                    .participants_added
+                    .iter()
+                    .map(|participant| participant.participant_id.clone())
+                    .collect();
+                let removed = update.participants_removed.clone();
+                let snapshot = update.snapshot;
                 let sync = self.slot_manager.sync(update);
+                if snapshot || !added.is_empty() || !removed.is_empty() {
+                    self.emit(AgentEvent::ParticipantsChanged {
+                        added,
+                        removed,
+                        snapshot,
+                    });
+                }
                 let (assignments, discovered, removed) = (
                     sync.new_assignments,
                     sync.newly_discovered_tracks,

@@ -2,10 +2,9 @@ use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use crate::entity::TrackId;
 use crate::log::{LogCtx, plog_info, plog_warn};
-use crate::participant::downstream::{DownstreamAllocator, Intent};
+use crate::participant::intent::{AudioIntent, VideoIntent as Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
-use str0m::Rtc;
 use str0m::channel::ChannelId;
 use str0m::media::Mid;
 
@@ -25,6 +24,48 @@ pub enum SignalingInputEvent {
     UpstreamTrackState { mid: Mid, active: bool },
 }
 
+#[derive(Clone)]
+pub(crate) struct SignalingVideoBinding {
+    pub(crate) mid: String,
+    pub(crate) track_id: String,
+    pub(crate) paused: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SignalingAudioBinding {
+    pub(crate) mid: String,
+    pub(crate) track_id: String,
+    pub(crate) level_dbov: i32,
+}
+
+pub(crate) struct SignalingSnapshot {
+    pub(crate) publications: Vec<crate::track::TrackMeta>,
+    pub(crate) participants: HashSet<String>,
+    pub(crate) video: Vec<SignalingVideoBinding>,
+    pub(crate) audio: Vec<SignalingAudioBinding>,
+}
+
+pub(crate) struct SignalingIntents {
+    pub(crate) video: Option<HashMap<Mid, Intent>>,
+    pub(crate) audio: Option<AudioIntent>,
+    pub(crate) playout_delay: Option<(u32, u32)>,
+}
+
+pub(crate) struct SignalingOutput {
+    pub(crate) cid: ChannelId,
+    pub(crate) bytes: Vec<u8>,
+}
+
+struct SignalingCommit {
+    participants: HashSet<String>,
+    publications: HashSet<String>,
+    video: Vec<signaling::VideoBinding>,
+    audio: Vec<(String, String)>,
+    video_changed: bool,
+    audio_changed: bool,
+    force_full: bool,
+}
+
 /// The shape of the audio group, for deciding whether to resend it.
 ///
 /// Loudness is deliberately absent: it moves with every packet, so including it
@@ -41,8 +82,6 @@ fn audio_shape(items: &[signaling::AudioBinding]) -> Vec<(String, String)> {
         .collect()
 }
 
-use crate::participant::downstream::AudioIntent;
-
 pub struct Signaling {
     ctx: LogCtx,
     pub cid: Option<ChannelId>,
@@ -52,17 +91,21 @@ pub struct Signaling {
     // Batch updates and only serialize when something moved.
     dirty_roster: bool,
     dirty_bindings: bool,
+    full_state_retries: u8,
 
     /// What the client has been told. The roster is carried as a diff because it
     /// is the large set; the bindings are bounded by the subscriber's slots and
     /// are sent whole, so only their shape is kept, to skip an unchanged group.
     previous_participants: HashSet<String>,
+    participants: HashSet<String>,
     previous_publications: HashSet<String>,
     previous_video: Vec<signaling::VideoBinding>,
     previous_audio: Vec<(String, String)>,
 
     last_client_intents: Option<HashMap<Mid, Intent>>,
     last_audio_intent: Option<AudioIntent>,
+    last_playout_delay: Option<(u32, u32)>,
+    pending_commit: Option<SignalingCommit>,
 }
 
 impl Signaling {
@@ -72,12 +115,16 @@ impl Signaling {
             cid: None,
             dirty_roster: true,
             dirty_bindings: true,
+            full_state_retries: 0,
             previous_participants: HashSet::new(),
+            participants: HashSet::new(),
             previous_publications: HashSet::new(),
             previous_video: Vec::new(),
             previous_audio: Vec::new(),
             last_client_intents: None,
             last_audio_intent: None,
+            last_playout_delay: None,
+            pending_commit: None,
 
             slot_count: 0,
             audio_slot_count: 0,
@@ -86,6 +133,9 @@ impl Signaling {
 
     pub fn set_cid(&mut self, cid: ChannelId) {
         self.cid = Some(cid);
+        self.dirty_roster = true;
+        self.dirty_bindings = true;
+        self.full_state_retries = 2;
     }
 
     pub fn set_slot_count(&mut self, slot_count: usize) {
@@ -96,17 +146,17 @@ impl Signaling {
         self.audio_slot_count = slot_count;
     }
 
-    pub fn reconcile(&mut self, downstream: &mut DownstreamAllocator) {
-        if let Some(last_client_intents) = &self.last_client_intents {
-            downstream.video.configure(last_client_intents);
-            self.mark_assignments_dirty();
+    pub(crate) fn reconcile(&self) -> SignalingIntents {
+        SignalingIntents {
+            video: self.last_client_intents.clone(),
+            audio: self.last_audio_intent.clone(),
+            playout_delay: self.last_playout_delay,
         }
     }
 
     pub fn handle_input(
         &mut self,
         data: &[u8],
-        downstream: &mut DownstreamAllocator,
     ) -> Result<Vec<SignalingInputEvent>, SignalingError> {
         let mut events = Vec::new();
         if data.len() > MAX_SIGNALING_MSG_SIZE {
@@ -136,7 +186,7 @@ impl Signaling {
                     });
                 }
                 plog_info!(self.ctx, "received client intent: {:?}", intent);
-                self.apply_client_intent(intent, downstream);
+                self.apply_client_intent(intent);
                 self.dirty_bindings = true;
             }
             None => {}
@@ -145,11 +195,7 @@ impl Signaling {
         Ok(events)
     }
 
-    fn apply_client_intent(
-        &mut self,
-        intent: signaling::ClientIntent,
-        downstream: &mut DownstreamAllocator,
-    ) {
+    fn apply_client_intent(&mut self, intent: signaling::ClientIntent) {
         let mut intents = HashMap::with_capacity(intent.video.len());
         for req in intent.video {
             let track_id_str = req.track_id.clone();
@@ -178,17 +224,13 @@ impl Signaling {
         }
         if let Some(audio) = intent.audio {
             let audio = self.decode_audio_intent(audio);
-            downstream.set_audio_intent(audio.clone());
             self.last_audio_intent = Some(audio);
         }
-        downstream.set_playout_delay(
-            intent
-                .ext
-                .and_then(|ext| ext.playout_delay)
-                .map(|p| (p.min_ms, p.max_ms)),
-        );
+        self.last_playout_delay = intent
+            .ext
+            .and_then(|ext| ext.playout_delay)
+            .map(|p| (p.min_ms, p.max_ms));
         self.last_client_intents = Some(intents);
-        self.reconcile(downstream);
     }
 
     /// Pins past the negotiated slot count are dropped rather than rejected.
@@ -220,43 +262,52 @@ impl Signaling {
         }
     }
 
-    /// What the client last asked for, or the default when it has said nothing.
-    pub fn audio_intent(&self) -> AudioIntent {
-        self.last_audio_intent.clone().unwrap_or_default()
-    }
-
     pub fn mark_tracks_dirty(&mut self) {
         self.dirty_roster = true;
+        self.full_state_retries = 2;
     }
 
     pub fn mark_assignments_dirty(&mut self) {
         self.dirty_bindings = true;
     }
 
-    pub fn poll(&mut self, rtc: &mut Rtc, downstream: &DownstreamAllocator) -> bool {
+    pub(crate) fn participants_snapshot(&self) -> HashSet<String> {
+        self.participants.clone()
+    }
+
+    pub fn apply_participants(
+        &mut self,
+        added: impl IntoIterator<Item = crate::entity::ParticipantId>,
+        removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
+    ) {
+        for participant in added {
+            self.participants.insert(participant.as_str());
+        }
+        for participant in removed {
+            self.participants.remove(&participant.as_str());
+        }
+        self.dirty_roster = true;
+        self.full_state_retries = 2;
+    }
+
+    pub(crate) fn poll(&mut self, snapshot: &SignalingSnapshot) -> Option<SignalingOutput> {
+        if self.pending_commit.is_some() {
+            return None;
+        }
         if !self.dirty_roster && !self.dirty_bindings {
-            return false;
+            return None;
         }
 
-        let Some(cid) = self.cid else {
-            return false;
-        };
-
-        let Some(mut channel) = rtc.channel(cid) else {
-            return false;
-        };
+        let cid = self.cid?;
 
         // The roster: every publication the client could ask for, and the people
         // behind them. Video and audio both, because a pin has to be able to
         // name an audio track before anybody has heard it.
         let mut publications = Vec::new();
         let mut participants = Vec::new();
-        let mut seen_participants = HashSet::new();
-        for meta in downstream.video.tracks().chain(downstream.audio_tracks()) {
+        let seen_participants = snapshot.participants.clone();
+        for meta in &snapshot.publications {
             let participant_id = meta.origin.as_str();
-            if seen_participants.insert(participant_id.clone()) {
-                participants.push(participant_id.clone());
-            }
             publications.push(signaling::Publication {
                 track_id: meta.id.as_str(),
                 participant_id,
@@ -269,6 +320,7 @@ impl Signaling {
                 .into(),
             });
         }
+        participants.extend(seen_participants.iter().cloned());
 
         let current_publication_ids: HashSet<String> = publications
             .iter()
@@ -276,9 +328,10 @@ impl Signaling {
             .collect();
         debug_assert_eq!(current_publication_ids.len(), publications.len());
 
+        let force_full = self.full_state_retries != 0;
         let participants_added: Vec<signaling::Participant> = participants
             .iter()
-            .filter(|id| !self.previous_participants.contains(*id))
+            .filter(|id| force_full || !self.previous_participants.contains(*id))
             .map(|id| signaling::Participant {
                 participant_id: id.clone(),
             })
@@ -290,7 +343,9 @@ impl Signaling {
             .collect();
         let publications_added: Vec<signaling::Publication> = publications
             .into_iter()
-            .filter(|publication| !self.previous_publications.contains(&publication.track_id))
+            .filter(|publication| {
+                force_full || !self.previous_publications.contains(&publication.track_id)
+            })
             .collect();
         let publications_removed: Vec<String> = self
             .previous_publications
@@ -301,37 +356,37 @@ impl Signaling {
         // The bindings: bounded by the subscriber's slots, so each group is sent
         // whole or not at all. Audio moves an order of magnitude more often than
         // video, which is why they are separate groups.
-        let current_video: Vec<signaling::VideoBinding> = downstream
+        let current_video: Vec<signaling::VideoBinding> = snapshot
             .video
-            .slots()
+            .iter()
             .map(|s| signaling::VideoBinding {
-                mid: s.mid.to_string(),
-                track_id: s.track.id.as_str(),
+                mid: s.mid.clone(),
+                track_id: s.track_id.clone(),
                 paused: s.paused,
             })
             .collect();
-        let current_audio: Vec<signaling::AudioBinding> = downstream
-            .audio_assignments()
+        let current_audio: Vec<signaling::AudioBinding> = snapshot
+            .audio
             .iter()
             .map(|h| signaling::AudioBinding {
-                mid: h.mid.to_string(),
-                track_id: h.origin.track.as_str(),
-                level_dbov: i32::from(h.level_dbov),
+                mid: h.mid.clone(),
+                track_id: h.track_id.clone(),
+                level_dbov: h.level_dbov,
             })
             .collect();
         let current_audio_shape = audio_shape(&current_audio);
 
-        let video_changed = current_video != self.previous_video;
-        let audio_changed = current_audio_shape != self.previous_audio;
+        let video_changed = force_full || current_video != self.previous_video;
+        let audio_changed = force_full || current_audio_shape != self.previous_audio;
 
         let roster_changed = !participants_added.is_empty()
             || !participants_removed.is_empty()
             || !publications_added.is_empty()
             || !publications_removed.is_empty();
-        if !roster_changed && !video_changed && !audio_changed {
+        if !force_full && !roster_changed && !video_changed && !audio_changed {
             self.dirty_roster = false;
             self.dirty_bindings = false;
-            return false;
+            return None;
         }
 
         let state = signaling::ServerState {
@@ -345,6 +400,7 @@ impl Signaling {
             audio: audio_changed.then_some(signaling::AudioBindings {
                 items: current_audio,
             }),
+            snapshot: force_full,
         };
 
         let msg = signaling::ServerMessage {
@@ -352,25 +408,40 @@ impl Signaling {
         };
         let buf = msg.encode_to_vec();
 
-        if let Err(e) = channel.write(true, &buf) {
-            plog_warn!(self.ctx, "Failed to write signaling: {:?}", e);
-            // Nothing is committed, so the next poll rebuilds and retries. This
-            // is the only reason the diff is safe without a resync path: an
-            // unsent update is not a lost one.
-            return false;
-        }
+        self.pending_commit = Some(SignalingCommit {
+            participants: seen_participants,
+            publications: current_publication_ids,
+            video: current_video,
+            audio: current_audio_shape,
+            video_changed,
+            audio_changed,
+            force_full,
+        });
+        Some(SignalingOutput { cid, bytes: buf })
+    }
 
-        self.previous_participants = seen_participants;
-        self.previous_publications = current_publication_ids;
-        if video_changed {
-            self.previous_video = current_video;
+    pub(crate) fn commit_sent(&mut self) {
+        let Some(commit) = self.pending_commit.take() else {
+            debug_assert!(false, "signaling commit requires a pending output");
+            return;
+        };
+        self.previous_participants = commit.participants;
+        self.previous_publications = commit.publications;
+        if commit.video_changed {
+            self.previous_video = commit.video;
         }
-        if audio_changed {
-            self.previous_audio = current_audio_shape;
+        if commit.audio_changed {
+            self.previous_audio = commit.audio;
         }
-        self.dirty_roster = false;
-        self.dirty_bindings = false;
-        true
+        if commit.force_full {
+            self.full_state_retries = self.full_state_retries.saturating_sub(1);
+        }
+        self.dirty_roster = self.full_state_retries != 0;
+        self.dirty_bindings = self.full_state_retries != 0;
+    }
+
+    pub(crate) fn retry_pending(&mut self) {
+        let _ = self.pending_commit.take();
     }
 }
 
