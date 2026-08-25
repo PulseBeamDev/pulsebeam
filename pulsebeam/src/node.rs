@@ -69,6 +69,7 @@ impl ShardRuntime {
     fn shard_count(self, data_threads: usize) -> usize {
         match self {
             Self::ThreadPerCore | Self::CurrentRuntime => data_threads,
+            #[allow(clippy::expect_used, reason = "too many shards")]
             Self::WorkStealing { shards_per_worker } => data_threads
                 .checked_mul(shards_per_worker)
                 .expect("configured shard count overflowed usize"),
@@ -143,14 +144,12 @@ mod shard_executor {
                 let worker_cores = cpu_cores.to_vec();
 
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
-                // TODO: tune these with real benchmark
+                // TODO: tune these with real benchmark. Default seems good
                 builder
                     .worker_threads(data_threads)
                     .thread_name("pb-data")
                     .enable_all()
-                    // .event_interval(3)
-                    // .max_io_events_per_tick(16)
-                    // .disable_lifo_slot()
+                    .disable_lifo_slot()
                     .enable_alt_timer();
 
                 // Apply exactly the same OS tuning as thread-per-core, but to
@@ -1092,18 +1091,19 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) -> bool 
         };
 
         let current_thread_id = thread_native_id();
+        // small enough priority to avoid inversion with IRQ
         let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
-        let priority = ThreadPriority::from_posix(ScheduleParams { sched_priority: 50 });
+        let priority = ThreadPriority::from_posix(ScheduleParams { sched_priority: 10 });
         let realtime = if let Err(e) =
             thread_priority::set_thread_priority_and_policy(current_thread_id, priority, policy)
         {
             tracing::warn!(
-                "Failed to set Data Thread to SCHED_FIFO at priority 50 (requires CAP_SYS_NICE): {:?}",
+                "Failed to set Data Thread to SCHED_FIFO at priority 10 (requires CAP_SYS_NICE): {:?}",
                 e
             );
             false
         } else {
-            tracing::info!("Data thread successfully elevated to SCHED_FIFO (Priority 50)");
+            tracing::info!("Data thread successfully elevated to SCHED_FIFO (Priority 10)");
             true
         };
 

@@ -60,6 +60,8 @@ struct Args {
     /// Pin to a specific network interface name (e.g., enp0s13f0u1u2)
     #[arg(short = 'i', long = "iface")]
     iface: Option<String>,
+    #[arg(short, long, default_value_t = 16)]
+    shards: usize,
 }
 
 fn main() {
@@ -99,7 +101,13 @@ fn main() {
         .unwrap_or_else(|err| pulsebeam_runtime::fatal!("cannot build the node runtime: {err}"));
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    if let Err(err) = rt.block_on(run(shutdown.clone(), workers, rtc_port, args.iface)) {
+    if let Err(err) = rt.block_on(run(
+        shutdown.clone(),
+        workers,
+        rtc_port,
+        args.iface,
+        args.shards,
+    )) {
         pulsebeam_runtime::fatal!("server failed: {err:#}");
     }
     shutdown.cancel();
@@ -110,6 +118,7 @@ pub async fn run(
     workers: usize,
     rtc_port: u16,
     network_interface: Option<String>,
+    shards_per_worker: usize,
 ) -> Result<()> {
     let external_ips =
         pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
@@ -133,7 +142,7 @@ pub async fn run(
         .local_addr(local_addr)
         .external_addrs(external_addrs)
         .rng(rng)
-        .work_stealing(16)
+        .work_stealing(shards_per_worker)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr);
 
