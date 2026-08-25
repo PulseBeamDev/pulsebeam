@@ -22,6 +22,7 @@ const FUA_HEADER_SIZE: usize = 2;
 const FUB_HEADER_SIZE: usize = 4;
 
 const FU_START_MASK: u8 = 0x80;
+const FU_END_MASK: u8 = 0x40;
 
 const FLAG_SPS: u8 = 1 << 0;
 const FLAG_PPS: u8 = 1 << 1;
@@ -143,6 +144,129 @@ pub fn classify(payload: &[u8]) -> NalFlags {
     flags
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PacketizedChunk {
+    pub payload: Vec<u8>,
+    pub start_of_frame: bool,
+    pub end_of_frame: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Packetizer {
+    mtu: usize,
+}
+
+impl Packetizer {
+    pub fn new(mtu: usize) -> Self {
+        debug_assert!(
+            mtu > FUA_HEADER_SIZE,
+            "H.264 RTP payload budget must fit FU-A headers"
+        );
+        Self {
+            mtu: mtu.max(FUA_HEADER_SIZE.saturating_add(1)),
+        }
+    }
+
+    pub fn packetize(&self, access_unit: &[u8]) -> Vec<PacketizedChunk> {
+        let nalus = annex_b_nalus(access_unit);
+        debug_assert!(
+            !nalus.is_empty(),
+            "H.264 access unit must contain at least one NAL unit"
+        );
+        let mut chunks = Vec::new();
+        for nalu in nalus {
+            if nalu.len() <= self.mtu {
+                chunks.push(PacketizedChunk {
+                    payload: nalu.to_vec(),
+                    start_of_frame: false,
+                    end_of_frame: false,
+                });
+                continue;
+            }
+
+            let Some((&header, body)) = nalu.split_first() else {
+                debug_assert!(false, "Annex-B parser must not return empty NAL units");
+                continue;
+            };
+            debug_assert!(
+                !body.is_empty(),
+                "only a NAL larger than the MTU is fragmented"
+            );
+            let fragment_payload = self.mtu.saturating_sub(FUA_HEADER_SIZE).max(1);
+            let fragments = body.len().div_ceil(fragment_payload);
+            for fragment_index in 0..fragments {
+                let start = fragment_index.saturating_mul(fragment_payload);
+                let end = fragment_index
+                    .saturating_add(1)
+                    .saturating_mul(fragment_payload)
+                    .min(body.len());
+                debug_assert!(start < end && end <= body.len());
+                let start_fragment = fragment_index == 0;
+                let end_fragment = fragment_index.saturating_add(1) == fragments;
+                let mut payload =
+                    Vec::with_capacity(end.saturating_sub(start).saturating_add(FUA_HEADER_SIZE));
+                payload.push((header & 0xe0) | FUA_NALU_TYPE);
+                payload.push(
+                    (header & NALU_TYPE_MASK)
+                        | if start_fragment { FU_START_MASK } else { 0 }
+                        | if end_fragment { FU_END_MASK } else { 0 },
+                );
+                let Some(fragment) = body.get(start..end) else {
+                    debug_assert!(false, "fragment bounds were checked above");
+                    continue;
+                };
+                payload.extend_from_slice(fragment);
+                chunks.push(PacketizedChunk {
+                    payload,
+                    start_of_frame: false,
+                    end_of_frame: false,
+                });
+            }
+        }
+        if let Some(first) = chunks.first_mut() {
+            first.start_of_frame = true;
+        }
+        if let Some(last) = chunks.last_mut() {
+            last.end_of_frame = true;
+        }
+        chunks
+    }
+}
+
+fn annex_b_nalus(access_unit: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i.saturating_add(3) < access_unit.len() {
+        let start = match (
+            access_unit.get(i),
+            access_unit.get(i.saturating_add(1)),
+            access_unit.get(i.saturating_add(2)),
+            access_unit.get(i.saturating_add(3)),
+        ) {
+            (Some(0), Some(0), Some(1), _) => Some(i.saturating_add(3)),
+            (Some(0), Some(0), Some(0), Some(1)) => Some(i.saturating_add(4)),
+            _ => None,
+        };
+        if let Some(start) = start {
+            starts.push((i, start));
+            i = start;
+        } else {
+            i = i.saturating_add(1);
+        }
+    }
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &(_, start))| {
+            let end = starts
+                .get(index.saturating_add(1))
+                .map(|(next, _)| *next)
+                .unwrap_or(access_unit.len());
+            access_unit.get(start..end).filter(|nalu| !nalu.is_empty())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +363,44 @@ mod tests {
 
         let middle = [FUA_NALU_TYPE, IDR_NALU_TYPE];
         assert!(!classify(&middle).idr(), "a continuation is not a keyframe");
+    }
+
+    #[test]
+    fn annex_b_access_units_become_mode_one_h264_rtp_payloads() {
+        let mut access_unit = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f];
+        access_unit.extend_from_slice(&[0, 0, 1, 0x68, 0xce, 0x06]);
+        access_unit.extend_from_slice(&[0, 0, 1, 0x65]);
+        access_unit.extend(std::iter::repeat_n(0x55, 2_500));
+
+        let chunks = Packetizer::new(1_100).packetize(&access_unit);
+        assert!(chunks.first().is_some_and(|chunk| chunk.start_of_frame));
+        assert!(chunks.last().is_some_and(|chunk| chunk.end_of_frame));
+        assert!(chunks.iter().all(|chunk| chunk.payload.len() <= 1_100));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !chunk.payload.starts_with(&[0, 0, 1]))
+        );
+        assert!(classify(&chunks[0].payload).sps());
+        assert!(classify(&chunks[1].payload).pps());
+
+        let idr = &chunks[2..];
+        assert!(
+            idr.first()
+                .is_some_and(|chunk| classify(&chunk.payload).idr())
+        );
+        assert!(
+            idr.iter()
+                .all(|chunk| chunk.payload[0] & NALU_TYPE_MASK == FUA_NALU_TYPE)
+        );
+        assert!(
+            idr.first()
+                .is_some_and(|chunk| chunk.payload[1] & FU_START_MASK != 0)
+        );
+        assert!(
+            idr.last()
+                .is_some_and(|chunk| chunk.payload[1] & FU_END_MASK != 0)
+        );
     }
 
     #[test]

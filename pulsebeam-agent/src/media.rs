@@ -225,7 +225,11 @@ impl H264Looper {
         let mut frame_count: u64 = 0;
         // The pipeline owns Dependency Descriptor generation; the source only
         // declares its scalability depth and which frames are keyframes.
-        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, temporal_layers);
+        let mut frame_sender = if self.opaque_payload {
+            crate::pipeline::FrameSender::new(mid, rid, 1, temporal_layers)
+        } else {
+            crate::pipeline::FrameSender::h264(mid, rid, 1, temporal_layers)
+        };
 
         loop {
             let tick_time = interval.tick().await;
@@ -525,7 +529,7 @@ impl VbrLooper {
         let clock_rate = 90_000f64;
         let mid = sender.mid;
         let rid = sender.rid;
-        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, 1);
+        let mut frame_sender = crate::pipeline::FrameSender::h264(mid, rid, 1, 1);
 
         let start = tokio::time::Instant::now();
         if let Some(frame_times) = self.frame_times.take() {

@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PulseBeam Viewer</title>
+<div id="videos"></div>
+<script type="module">
+  const videoRoot = document.querySelector("#videos");
+  const videos = [];
+  let peer;
+
+  function addVideo(track) {
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.srcObject = new MediaStream([track]);
+    videoRoot.append(video);
+    videos.push(video);
+  }
+
+  async function connect({ apiUrl, room }) {
+    peer = new RTCPeerConnection();
+    for (let slot = 0; slot < 7; slot += 1) {
+      peer.addTransceiver("video", { direction: "recvonly" });
+    }
+    peer.ontrack = ({ track }) => {
+      if (track.kind === "video") addVideo(track);
+    };
+
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    const response = await fetch(`${apiUrl}/api/v1/rooms/${room}/participants`, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: offer.sdp,
+    });
+    if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
+    await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
+  }
+
+  async function stats() {
+    const report = await peer.getStats();
+    const codecs = new Map();
+    const inbound = [];
+    for (const item of report.values()) {
+      if (item.type === "codec") codecs.set(item.id, item.mimeType);
+      if (item.type === "inbound-rtp" && item.kind === "video") {
+        inbound.push({
+          bytesReceived: item.bytesReceived ?? 0,
+          codec: codecs.get(item.codecId) ?? null,
+          framesDecoded: item.framesDecoded ?? 0,
+          framesReceived: item.framesReceived ?? 0,
+          keyFramesDecoded: item.keyFramesDecoded ?? 0,
+        });
+      }
+    }
+    return {
+      connectionState: peer.connectionState,
+      inbound,
+      rendered: videos.map((video) => ({
+        height: video.videoHeight,
+        readyState: video.readyState,
+        width: video.videoWidth,
+      })),
+    };
+  }
+
+  window.pulsebeamViewer = { connect, stats };
+</script>

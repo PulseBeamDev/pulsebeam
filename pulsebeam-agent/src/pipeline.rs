@@ -17,7 +17,10 @@ use std::time::{Duration, SystemTime};
 
 use pulsebeam_core::dd::temporal::TemporalDdSource;
 use pulsebeam_core::dd::{DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory};
-use pulsebeam_core::framing::{FrameDepacketizer, FramePacketizer};
+use pulsebeam_core::{
+    framing::{FrameDepacketizer, FramePacketizer},
+    h264::Packetizer as H264Packetizer,
+};
 use str0m::media::{MediaTime, Mid, Rid};
 use str0m::rtp::vla::{
     ResolutionAndFramerate, SimulcastStreamAllocation, SpatialLayerAllocation,
@@ -42,6 +45,7 @@ pub struct FrameSender {
     rid: Option<Rid>,
     encoding_count: usize,
     packetizer: FramePacketizer,
+    h264_packetizer: Option<H264Packetizer>,
     next_seq: u64,
     dd: TemporalDdSource,
 }
@@ -54,9 +58,18 @@ impl FrameSender {
             rid,
             encoding_count,
             packetizer: FramePacketizer::default(),
+            h264_packetizer: None,
             next_seq: 0,
             dd: TemporalDdSource::new(temporal_layers.max(1)),
         }
+    }
+
+    pub fn h264(mid: Mid, rid: Option<Rid>, encoding_count: usize, temporal_layers: u8) -> Self {
+        let mut sender = Self::new(mid, rid, encoding_count, temporal_layers);
+        sender.h264_packetizer = Some(H264Packetizer::new(
+            pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD,
+        ));
+        sender
     }
 
     /// Split `frame` into RTP packets. A single Dependency Descriptor is generated
@@ -74,9 +87,32 @@ impl FrameSender {
             )
         });
 
-        let chunks: Vec<_> = self.packetizer.packetize(&frame.data).collect();
+        let chunks: Vec<_> = if let Some(packetizer) = &self.h264_packetizer {
+            packetizer
+                .packetize(&frame.data)
+                .into_iter()
+                .map(|chunk| {
+                    (
+                        Arc::from(chunk.payload),
+                        chunk.start_of_frame,
+                        chunk.end_of_frame,
+                    )
+                })
+                .collect()
+        } else {
+            self.packetizer
+                .packetize(&frame.data)
+                .map(|chunk| {
+                    (
+                        Arc::from(chunk.data),
+                        chunk.start_of_frame,
+                        chunk.end_of_frame,
+                    )
+                })
+                .collect()
+        };
         let mut packets = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
+        for (payload, start_of_frame, end_of_frame) in chunks {
             // Audio level is not optional decoration: the SFU's speaker selector ranks by it and
             // drops any audio packet that arrives without one.
             let mut ext_vals = ExtensionValues {
@@ -88,10 +124,10 @@ impl FrameSender {
                 let mut bytes = raw.0.clone();
                 if let Some(first) = bytes.first_mut() {
                     let mut flags = *first & !(START_OF_FRAME_BIT | END_OF_FRAME_BIT);
-                    if chunk.start_of_frame {
+                    if start_of_frame {
                         flags |= START_OF_FRAME_BIT;
                     }
-                    if chunk.end_of_frame {
+                    if end_of_frame {
                         flags |= END_OF_FRAME_BIT;
                     }
                     *first = flags;
@@ -115,9 +151,9 @@ impl FrameSender {
                 rid: self.rid,
                 seq,
                 ts: frame.ts,
-                marker: chunk.end_of_frame,
+                marker: end_of_frame,
                 ssrc: None,
-                payload: Arc::from(chunk.data),
+                payload,
                 ext_vals,
                 arrival: frame.capture_time,
             });

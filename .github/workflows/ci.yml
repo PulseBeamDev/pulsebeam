@@ -82,6 +82,30 @@ jobs:
       - name: Test routing crate
         run: make test-routing
 
+  browser:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+
+      - name: Install Chromium
+        run: |
+          npm ci --prefix browser
+          PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/browser/.playwright npx --prefix browser playwright install --with-deps chromium
+          PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/browser/.playwright npx --prefix browser playwright install --only-shell chromium
+
+      - name: Browser interoperability regression
+        run: make test-browser
+
       # bpfel-unknown-none is tier 3: there is no prebuilt std for it, so the
       # eBPF crate always needs nightly's `-Z build-std=core`, not a target
       # rustup can install (see Makefile's build-ebpf).
