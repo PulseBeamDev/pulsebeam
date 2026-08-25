@@ -2,13 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
 
 jobs:
   # Separate from the test job on purpose: a lint failure and a test failure are
@@ -18,45 +20,78 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
-    - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.10
-    - run: rustup component add clippy rustfmt
-    - name: Formatting
-      run: cargo fmt --all --check
-    - name: Lint
-      run: make lint-check
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - run: rustup component add clippy rustfmt
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: make lint-check
 
   build:
     runs-on: ubuntu-latest
+
+    outputs:
+      has_ebpf: ${{ steps.layout.outputs.has_ebpf }}
+      run_ebpf_smoke: ${{ steps.layout.outputs.run_ebpf_smoke }}
+
     steps:
-    - uses: actions/checkout@v5
-    - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.10
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: nextest
-    - name: Run tests
-      run: make test
-      env:
-        CARGO_TERM_COLOR: always
-    - name: Test routing crate
-      run: make test-routing
-      env:
-        CARGO_TERM_COLOR: always
-    # bpfel-unknown-none is tier 3: there is no prebuilt std for it, so the
-    # eBPF crate always needs nightly's `-Z build-std=core`, not a target
-    # rustup can install (see Makefile's build-ebpf).
-    - name: Install nightly for eBPF build-std
-      if: hashFiles('pulsebeam-ebpf/Cargo.toml') != ''
-      run: rustup toolchain install nightly --component rust-src --profile minimal
-    - name: Build eBPF program
-      if: hashFiles('pulsebeam-ebpf/Cargo.toml') != ''
-      run: make build-ebpf
-      env:
-        CARGO_TERM_COLOR: always
+      - uses: actions/checkout@v5
+
+      - name: Detect repository layout
+        id: layout
+        shell: bash
+        run: |
+          if [[ -f pulsebeam-ebpf/Cargo.toml ]]; then
+            echo "has_ebpf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ebpf=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -f pulsebeam-ebpf/Cargo.toml && -f pulsebeam/Cargo.toml ]]; then
+            echo "run_ebpf_smoke=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_ebpf_smoke=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Run tests
+        run: make test
+
+      - name: Test routing crate
+        run: make test-routing
+
+      # bpfel-unknown-none is tier 3: there is no prebuilt std for it, so the
+      # eBPF crate always needs nightly's `-Z build-std=core`, not a target
+      # rustup can install (see Makefile's build-ebpf).
+      - name: Install nightly for eBPF build-std
+        if: steps.layout.outputs.has_ebpf == 'true'
+        run: rustup toolchain install nightly --component rust-src --profile minimal
+
+      - name: Build eBPF program
+        if: steps.layout.outputs.has_ebpf == 'true'
+        run: make build-ebpf
 
   # eBPF attach/load needs elevated kernel privileges, which the normal `build`
   # job does not have and should not gain. Keep the behavioural smoke test in
@@ -64,20 +99,35 @@ jobs:
   ebpf-smoke:
     runs-on: ubuntu-latest
     needs: build
-    if: hashFiles('pulsebeam-ebpf/Cargo.toml') != '' && hashFiles('pulsebeam/Cargo.toml') != ''
-    continue-on-error: false
+    if: needs.build.outputs.run_ebpf_smoke == 'true'
+
     steps:
-    - uses: actions/checkout@v5
-    - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.10
-    - name: Install nightly for eBPF build-std
-      run: rustup toolchain install nightly --component rust-src --profile minimal
-    - name: Build eBPF program
-      run: make build-ebpf
-    # The test is ignored in ordinary builds because it needs a real kernel
-    # eBPF attach; this job is the privileged execution path.
-    - name: Attach/load smoke test (privileged)
-      run: sudo -E env "PATH=$PATH" cargo test -p pulsebeam --lib ebpf::tests::loader_attaches_to_a_reuseport_group --release -- --ignored --test-threads=1
-      env:
-        CARGO_TERM_COLOR: always
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Install nightly for eBPF build-std
+        run: rustup toolchain install nightly --component rust-src --profile minimal
+
+      - name: Build eBPF program
+        run: make build-ebpf
+
+      # The test is ignored in ordinary builds because it needs a real kernel
+      # eBPF attach; this job is the privileged execution path.
+      - name: Attach/load smoke test (privileged)
+        run: >
+          sudo -E env "PATH=$PATH"
+          cargo test
+          -p pulsebeam
+          --lib
+          ebpf::tests::loader_attaches_to_a_reuseport_group
+          --release
+          --
+          --ignored
+          --test-threads=1
