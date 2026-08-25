@@ -2892,6 +2892,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mimalloc",
  "more-asserts",
+ "parking_lot",
  "pprof",
  "proptest",
  "pulsebeam-core",

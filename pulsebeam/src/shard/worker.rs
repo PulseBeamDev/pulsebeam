@@ -311,6 +311,10 @@ pub(crate) struct ShardWorker {
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
     metrics: Arc<ShardMetrics>,
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Arc<ShardRecorder>, only cloned at init"
+    )]
     recorder: Arc<ShardRecorder>,
     stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
     stats_due: Instant,
@@ -366,7 +370,7 @@ impl ShardWorker {
             router,
             metrics,
             recorder: {
-                let recorder = Arc::new(ShardRecorder::new());
+                let recorder = ShardRecorder::shared();
                 metrics::with_local_recorder(&*recorder, describe_shard_metrics);
                 recorder
             },
@@ -385,7 +389,7 @@ impl ShardWorker {
     }
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
-        let recorder = Arc::clone(&self.recorder);
+        let recorder = &self.recorder.clone();
         let sleep = tokio::time::sleep(tokio::time::Duration::MAX);
         tokio::pin!(sleep);
 
@@ -398,7 +402,7 @@ impl ShardWorker {
                 .record_idle(busy_start.saturating_duration_since(loop_start));
 
             let previous_busy = self.last_busy;
-            metrics::with_local_recorder(&*recorder, || {
+            metrics::with_local_recorder(recorder, || {
                 self.observe_health(previous_busy);
                 self.tick(busy_start);
                 self.flush_shard_events()

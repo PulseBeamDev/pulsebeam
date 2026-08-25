@@ -70,6 +70,7 @@ utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
 zerocopy = { version = "0.8.56", features = ["derive"] }
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 pulsebeam-core = { path = "../pulsebeam-core", features = [

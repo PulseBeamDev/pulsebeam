@@ -15,7 +15,7 @@
     reason = "the handles are Arc<AtomicU64> because metrics::Counter::from_arc demands Send + Sync. Each slot is registered, written and read by exactly one shard on one core, so nothing is shared between cores and nothing contends. See docs/thread-per-core.md."
 )]
 
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -325,14 +325,18 @@ struct Registry {
 }
 
 pub(crate) struct ShardRecorder {
-    registry: RefCell<Registry>,
+    registry: Mutex<Registry>,
 }
 
 impl ShardRecorder {
     pub(crate) fn new() -> Self {
         Self {
-            registry: RefCell::new(Registry::default()),
+            registry: Mutex::new(Registry::default()),
         }
+    }
+
+    pub(crate) fn shared() -> Arc<Self> {
+        Arc::new(Self::new())
     }
 
     /// Copy out everything this shard has recorded.
@@ -340,7 +344,7 @@ impl ShardRecorder {
     /// A linear scan of the arenas, not a walk of the lookup maps. The maps
     /// exist only for registration, which happens once per call site.
     pub(crate) fn snapshot(&self, shard: ShardId) -> ShardStatsReport {
-        let mut reg = self.registry.borrow_mut();
+        let mut reg = self.registry.lock();
 
         let mut counters = Vec::new();
         let mut gauge_bits = Vec::new();
@@ -410,19 +414,19 @@ impl Registry {
 
 impl Recorder for ShardRecorder {
     fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        self.registry.borrow_mut().describe(key, unit, description);
+        self.registry.lock().describe(key, unit, description);
     }
 
     fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        self.registry.borrow_mut().describe(key, unit, description);
+        self.registry.lock().describe(key, unit, description);
     }
 
     fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        self.registry.borrow_mut().describe(key, unit, description);
+        self.registry.lock().describe(key, unit, description);
     }
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        let mut reg = self.registry.borrow_mut();
+        let mut reg = self.registry.lock();
         if let Some(slot) = reg.counters.get(key) {
             return Counter::from_arc(Arc::clone(slot));
         }
@@ -438,7 +442,7 @@ impl Recorder for ShardRecorder {
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        let mut reg = self.registry.borrow_mut();
+        let mut reg = self.registry.lock();
         if let Some(slot) = reg.gauges.get(key) {
             return Gauge::from_arc(Arc::clone(slot));
         }
@@ -454,7 +458,7 @@ impl Recorder for ShardRecorder {
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-        let mut reg = self.registry.borrow_mut();
+        let mut reg = self.registry.lock();
         if let Some(hist) = reg.histograms.get(key) {
             return Histogram::from_arc(Arc::clone(hist));
         }
