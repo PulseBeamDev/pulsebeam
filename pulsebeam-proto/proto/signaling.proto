@@ -114,13 +114,13 @@ message AudioBindings { repeated AudioBinding items = 1; }
 // and includes the complete current roster and publication set so a receiver can
 // recover from a lost update without a request or acknowledgment.
 message ServerState {
-  repeated Participant participants_added = 1;
-  repeated string participants_removed = 2;   // participant ids
-  repeated Publication publications_added = 3;
-  repeated string publications_removed = 4;   // track ids
-  optional VideoBindings video = 5;
-  optional AudioBindings audio = 6;
-  bool snapshot = 7;
+  bool snapshot = 1;
+  repeated Participant participants_added = 2;
+  repeated string participants_removed = 3;   // participant ids
+  repeated Publication publications_added = 4;
+  repeated string publications_removed = 5;   // track ids
+  optional VideoBindings video = 6;
+  optional AudioBindings audio = 7;
 }
 
 // ========================================================================

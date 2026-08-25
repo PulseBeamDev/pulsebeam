@@ -47,7 +47,7 @@ async function stop(process) {
   if (process.exitCode === null) process.kill("SIGKILL");
 }
 
-test("a late README viewer decodes bench H.264 video", async ({ page }) => {
+test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) => {
   const browserConsole = [];
   page.on("console", (message) => {
     browserConsole.push(`${message.type()}: ${message.text()}`);
@@ -90,6 +90,7 @@ test("a late README viewer decodes bench H.264 video", async ({ page }) => {
     await page.evaluate(() => window.pulsebeamViewer.connect({
       apiUrl: "http://127.0.0.1:7070",
       room: "bench-room-0",
+      meetShape: true,
     }));
 
     await expect.poll(async () => {
