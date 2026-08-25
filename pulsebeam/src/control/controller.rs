@@ -193,12 +193,6 @@ impl ControllerActor {
                 _ = self.core.next_expired() => {},
                 _ = poll_interval.tick() => {
                     self.router.poll_loads();
-                    let outcomes = self
-                        .lifecycle
-                        .retry(&self.core.registry, tokio::time::Instant::now());
-                    for outcome in outcomes {
-                        self.publish_track_lifecycle(outcome);
-                    }
                     self.flush_command_backlog();
                     for update in &mut self.updates { let _ = update.flush_backlog(); }
                 }
@@ -531,10 +525,7 @@ impl ControllerActor {
             }
         };
         let now = tokio::time::Instant::now();
-        let handle = self
-            .core
-            .reserve_transport(shard, now)
-            .map_err(|_| ControllerError::ServiceUnavailable)?;
+        let handle = self.core.reserve_transport(shard, now);
         let key = self
             .core
             .mint_participant(shard, state.participant_id)

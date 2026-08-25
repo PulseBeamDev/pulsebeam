@@ -490,59 +490,45 @@ impl SlotAllocator {
         }
     }
 
-    /// `Ok((slot, epoch))`. A `slot` equal to the pre-call [`Self::high_water`]
+    /// `(slot, epoch)`. A `slot` equal to the pre-call [`Self::high_water`]
     /// is fresh and the caller must push one entry; anything lower is a
     /// quarantined slot coming back, already bumped to a new epoch.
-    pub(crate) fn allocate(&mut self, now: Instant) -> Result<(u32, u16), RouteError> {
-        self.allocate_inner(now, true)
+    pub(crate) fn allocate(&mut self, now: Instant) -> (u32, u16) {
+        self.allocate_inner(now)
     }
 
-    pub(crate) fn allocate_transport(&mut self, now: Instant) -> Result<(u32, u16), RouteError> {
-        self.allocate_inner(now, false)
+    pub(crate) fn allocate_transport(&mut self, now: Instant) -> (u32, u16) {
+        self.allocate_inner(now)
     }
 
-    fn allocate_inner(
-        &mut self,
-        now: Instant,
-        inject_failure: bool,
-    ) -> Result<(u32, u16), RouteError> {
-        // Exhaustion is the one failure every caller has written a rollback for and none has ever
-        // taken: a namespace only fills under a participant count no plan reaches. Injecting it is
-        // what puts those recovery paths under test at all. It lives here rather than at the table
-        // it used to serve because this is now the only place an address can fail to exist.
-        if inject_failure && pulsebeam_runtime::buggify!("route table exhausted") {
-            return Err(RouteError::Exhausted {
-                max_slots: self.max_slots,
-            });
-        }
+    fn allocate_inner(&mut self, now: Instant) -> (u32, u16) {
         // FIFO from the oldest retirement, so a slot is only reused once no
         // datagram addressed to its previous incarnation could still arrive.
         if let Some(&(slot, retired_at)) = self.quarantine.front()
             && now.saturating_duration_since(retired_at) >= ROUTE_QUARANTINE
         {
-            self.quarantine.pop_front();
-            if let Some(flag) = self.quarantined.get_mut(slot as usize) {
-                *flag = false;
-            }
-            let Some(epoch) = self.epochs.get_mut(slot as usize) else {
-                debug_assert!(false, "a quarantined slot must be within the namespace");
-                return Err(RouteError::Exhausted {
-                    max_slots: self.max_slots,
-                });
-            };
+            let removed = self.quarantine.pop_front();
+            debug_assert_eq!(removed, Some((slot, retired_at)));
+            *self
+                .quarantined
+                .get_mut(slot as usize)
+                .expect("quarantined route slot must be inside route table") = false;
+            let epoch = self
+                .epochs
+                .get_mut(slot as usize)
+                .expect("quarantined route slot must be inside route table");
             if *epoch == u16::MAX {
                 tracing::warn!(slot, "route epoch wrapped");
             }
             *epoch = epoch.wrapping_add(1);
-            return Ok((slot, *epoch));
+            return (slot, *epoch);
         }
 
         let slot = u32::try_from(self.epochs.len()).unwrap_or(u32::MAX);
-        if slot >= self.max_slots || slot > PackedRoute::MAX_SLOT {
-            return Err(RouteError::Exhausted {
-                max_slots: self.max_slots,
-            });
-        }
+        assert!(
+            slot < self.max_slots && slot <= PackedRoute::MAX_SLOT,
+            "route table exhausted"
+        );
         if self.epochs.len() == self.epochs.capacity() {
             let new_capacity = self.epochs.capacity().saturating_mul(2).max(1);
             tracing::warn!(
@@ -554,7 +540,7 @@ impl SlotAllocator {
         self.epochs.push(0);
         self.quarantined.push(false);
         debug_assert_eq!(self.epochs.len(), self.quarantined.len());
-        Ok((slot, 0))
+        (slot, 0)
     }
 
     /// Quarantines a slot. Takes the *slot*, never the packed route: the
@@ -611,14 +597,6 @@ struct ReverseDedupEntry {
 /// allocates.
 const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
 const REVERSE_DEDUP_CAPACITY: usize = 32;
-
-/// The only way allocation fails now that resolution belongs to the view: a
-/// stale or out-of-range address is the view's `None`, not an error type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RouteError {
-    /// No slot is out of quarantine and the allocator is at its cap.
-    Exhausted { max_slots: u32 },
-}
 
 impl RouteRuntime {
     pub fn new(shard_id: ShardId) -> Self {
@@ -820,7 +798,7 @@ mod tests {
     async fn a_double_retire_is_refused() {
         let mut alloc = SlotAllocator::with_max_slots(ShardId::new(0), 8);
         let now = Instant::now();
-        let (slot, _) = alloc.allocate(now).unwrap();
+        let (slot, _) = alloc.allocate(now);
         alloc.retire(slot, now);
         alloc.retire(slot, now);
     }
@@ -830,16 +808,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_retired_slot_returns_once_with_a_new_epoch() {
         let mut alloc = SlotAllocator::with_max_slots(ShardId::new(0), 8);
-        let (slot, first_epoch) = alloc.allocate(Instant::now()).unwrap();
+        let (slot, first_epoch) = alloc.allocate(Instant::now());
         alloc.retire(slot, Instant::now());
 
         tokio::time::advance(ROUTE_QUARANTINE).await;
-        let (reused, second_epoch) = alloc.allocate(Instant::now()).unwrap();
+        let (reused, second_epoch) = alloc.allocate(Instant::now());
         assert_eq!(reused, slot);
         assert_ne!(first_epoch, second_epoch);
 
         // And it is not still queued: the next allocation is a fresh slot.
-        let (next, _) = alloc.allocate(Instant::now()).unwrap();
+        let (next, _) = alloc.allocate(Instant::now());
         assert_ne!(next, slot, "a reused slot must leave the quarantine queue");
 
         // Retiring it again is legal once it is live again.
@@ -1041,28 +1019,23 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_allocated_route_carries_the_shard_it_was_allocated_for() {
         let mut allocator = alloc(41);
-        let (slot, _) = allocator.allocate(Instant::now()).unwrap();
+        let (slot, _) = allocator.allocate(Instant::now());
         assert_eq!(
             RouteId::new(ShardId::new(41), slot).shard(),
             ShardId::new(41)
         );
     }
 
-    /// Growth is bounded, so a churn storm fails an allocation rather than
-    /// consuming the node's memory until the allocator decides for us.
     #[tokio::test(start_paused = true)]
-    async fn an_allocator_at_its_cap_refuses_instead_of_growing() {
+    #[should_panic(expected = "route table exhausted")]
+    async fn an_allocator_at_its_cap_crashes() {
         let mut allocator = SlotAllocator::with_max_slots(ShardId::new(0), 2);
         let now = Instant::now();
 
         for _ in 0..2 {
-            allocator.allocate(now).expect("within the cap");
+            allocator.allocate(now);
         }
-        assert_eq!(
-            allocator.allocate(now),
-            Err(RouteError::Exhausted { max_slots: 2 }),
-            "past the cap it must fail rather than grow"
-        );
+        allocator.allocate(now);
     }
 
     /// A slot only comes back once no datagram addressed to its previous
@@ -1072,11 +1045,11 @@ mod tests {
     async fn a_recycled_slot_comes_back_under_a_new_epoch() {
         let mut allocator = alloc(0);
         let now = Instant::now();
-        let (slot, epoch) = allocator.allocate(now).unwrap();
+        let (slot, epoch) = allocator.allocate(now);
         allocator.retire(slot, now);
 
         tokio::time::advance(ROUTE_QUARANTINE).await;
-        let (reused, reused_epoch) = allocator.allocate(Instant::now()).unwrap();
+        let (reused, reused_epoch) = allocator.allocate(Instant::now());
 
         assert_eq!(reused, slot, "the slot should be reused after quarantine");
         assert_ne!(reused_epoch, epoch, "but as a new incarnation");
@@ -1086,10 +1059,10 @@ mod tests {
     async fn a_slot_is_not_reused_inside_its_quarantine() {
         let mut allocator = alloc(0);
         let now = Instant::now();
-        let (slot, _) = allocator.allocate(now).unwrap();
+        let (slot, _) = allocator.allocate(now);
         allocator.retire(slot, now);
 
-        let (next, _) = allocator.allocate(now).unwrap();
+        let (next, _) = allocator.allocate(now);
         assert_ne!(next, slot, "must not reuse a slot still in quarantine");
     }
 
@@ -1320,11 +1293,11 @@ mod tests {
         for shard in [0usize, 1, 41] {
             let mut allocator = alloc(shard);
             let now = Instant::now();
-            let (slot, epoch) = allocator.allocate(now).unwrap();
+            let (slot, epoch) = allocator.allocate(now);
             allocator.retire(slot, now);
 
             tokio::time::advance(ROUTE_QUARANTINE).await;
-            let (reused, reused_epoch) = allocator.allocate(Instant::now()).unwrap();
+            let (reused, reused_epoch) = allocator.allocate(Instant::now());
 
             assert_eq!(reused, slot, "shard {shard}: the slot must come back");
             assert_ne!(

@@ -6,7 +6,7 @@ use tokio::time::Instant;
 use crate::{
     entity::{ParticipantId, RoomId, TrackId, TrackKind},
     id::ShardId,
-    route::{PackedRoute, RouteError, RouteHandle, RouteId, SlotAllocator},
+    route::{PackedRoute, RouteHandle, RouteId, SlotAllocator},
     track::{SelectionPolicy, Track, TrackSelector},
 };
 
@@ -627,17 +627,20 @@ impl TrackAllocator {
         shard: ShardId,
         identity: TrackIdentity,
         now: Instant,
-    ) -> Result<TrackAllocation, RouteError> {
-        let Some(allocator) = self.routes.get_mut(shard.index()) else {
-            debug_assert!(false, "track allocation targeted an unknown shard");
-            return Err(RouteError::Exhausted { max_slots: 0 });
-        };
-        let (slot, epoch) = allocator.allocate(now)?;
+    ) -> TrackAllocation {
+        let allocator = self
+            .routes
+            .get_mut(shard.index())
+            .expect("track allocation must target a configured shard");
+
+        let (slot, epoch) = allocator.allocate(now);
+
         let key = self.keys.insert(identity);
-        Ok(TrackAllocation {
+
+        TrackAllocation {
             key,
             route: RouteHandle::new(RouteId::new(shard, slot), epoch),
-        })
+        }
     }
 
     pub(crate) fn release(&mut self, allocation: TrackAllocation, now: Instant) {
@@ -803,13 +806,9 @@ mod tests {
     fn a_retired_destination_gets_a_fresh_track_route() {
         let mut allocator = TrackAllocator::new(2);
         let track = TrackIdentity::from_track(&track(TrackKind::Audio, 1, 1, "audio"));
-        let first = allocator
-            .allocate(ShardId::new(1), track, Instant::now())
-            .expect("first destination allocation");
+        let first = allocator.allocate(ShardId::new(1), track, Instant::now());
         allocator.release(first, Instant::now());
-        let replacement = allocator
-            .allocate(ShardId::new(1), track, Instant::now())
-            .expect("replacement destination allocation");
+        let replacement = allocator.allocate(ShardId::new(1), track, Instant::now());
 
         assert_ne!(first.key, replacement.key);
         assert_ne!(first.route, replacement.route);

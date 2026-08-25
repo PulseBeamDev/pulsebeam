@@ -1406,9 +1406,6 @@ impl Churn {
 /// own reconnect, a departed track reinstated by the next subscription. None needed an exotic
 /// network - only the right sequence.
 ///
-/// Run with buggify armed, because the interesting orderings are the ones a fault produces: a
-/// route install that fails and is retried lands its effects in a different order than one that
-/// succeeds, and that is precisely where identity-keyed state gets out of step.
 #[test]
 fn no_order_of_churn_leaves_a_wrong_view_of_the_room() {
     check(

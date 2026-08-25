@@ -6,7 +6,7 @@ use crate::{
     entity::{ParticipantId, RoomId},
     id::ShardId,
     participant::ParticipantConfig,
-    route::{PackedRoute, RouteError, SlotAllocator, TransportHandle, TransportRoute},
+    route::{PackedRoute, SlotAllocator, TransportHandle, TransportRoute},
     shard::participants::ParticipantKey,
 };
 use str0m::Rtc;
@@ -37,16 +37,13 @@ impl TransportAllocators {
         }
     }
 
-    fn allocate(&mut self, shard: ShardId, now: Instant) -> Result<TransportHandle, RouteError> {
-        let Some(allocator) = self.shards.get_mut(shard.index()) else {
-            debug_assert!(false, "transport allocation targeted an unknown shard");
-            return Err(RouteError::Exhausted { max_slots: 0 });
-        };
-        let (slot, epoch) = allocator.allocate_transport(now)?;
-        Ok(TransportHandle::new(
-            TransportRoute::new(shard, slot),
-            epoch,
-        ))
+    fn allocate(&mut self, shard: ShardId, now: Instant) -> TransportHandle {
+        let allocator = self
+            .shards
+            .get_mut(shard.index())
+            .expect("transport allocation must target a configured shard");
+        let (slot, epoch) = allocator.allocate_transport(now);
+        TransportHandle::new(TransportRoute::new(shard, slot), epoch)
     }
 
     fn retire(&mut self, handle: TransportHandle, now: Instant) {
@@ -102,11 +99,7 @@ impl ControllerCore {
         )
     }
 
-    pub fn reserve_transport(
-        &mut self,
-        shard: ShardId,
-        now: Instant,
-    ) -> Result<TransportHandle, RouteError> {
+    pub fn reserve_transport(&mut self, shard: ShardId, now: Instant) -> TransportHandle {
         self.transport.allocate(shard, now)
     }
 

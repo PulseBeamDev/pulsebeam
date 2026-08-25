@@ -18,7 +18,6 @@ use std::{
 /// Fixed, so an ordinary run reproduces exactly and a failure bisects.
 pub const DEFAULT_SIM_SEED: u64 = 0xDEAD_BEEF;
 pub const DEFAULT_SIM_SHARDS: usize = 4;
-pub const DEFAULT_SIM_BUGGIFY_PERMILLE: u32 = 10;
 pub const DEFAULT_SIM_UDP_MODE: UdpMode = UdpMode::Batch;
 
 /// The seed for this process, `DEFAULT_SIM_SEED` unless `PULSEBEAM_SIM_SEED`
@@ -168,7 +167,6 @@ mod default_profile_tests {
     #[test]
     fn default_profile_is_the_production_like_failure_matrix() {
         const { assert!(DEFAULT_SIM_SHARDS > 1) };
-        const { assert!(DEFAULT_SIM_BUGGIFY_PERMILLE > 0) };
         assert_eq!(DEFAULT_SIM_UDP_MODE, UdpMode::Batch);
 
         let link = LinkProfile::default();

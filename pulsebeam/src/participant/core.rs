@@ -674,7 +674,8 @@ impl Participant {
     /// Handles Transmits (UDP/TCP) and Events (Logic).
     fn poll_rtc(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
         let mut outputs = 0usize;
-        let result = loop {
+
+        loop {
             if outputs >= RTC_OUTPUT_BUDGET {
                 metrics::counter!("participant_rtc_output_budget_hit").increment(1);
                 break Some(now);
@@ -696,8 +697,7 @@ impl Participant {
                     break None;
                 }
             }
-        };
-        result
+        }
     }
 
     fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {

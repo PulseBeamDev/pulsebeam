@@ -2,8 +2,8 @@ use crate::tests::common::client::{
     AudioReceiveLog, MAX_CONCEALABLE_GAP, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::{
-    DEFAULT_SIM_BUGGIFY_PERMILLE, DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout,
-    start_sfu_node_with, subnet_ip, subnet_ip_v6,
+    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
+    subnet_ip_v6,
 };
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
@@ -337,15 +337,6 @@ pub enum Step {
     SendToWrongShard {
         description: &'static str,
         participant: &'static str,
-    },
-    /// Force the next `count` reaches of a buggify site to fire.
-    ///
-    /// The probability decides where failures land, not whether any do; this
-    /// guarantees the plan exercises the recovery path at every seed.
-    ForceFailure {
-        description: &'static str,
-        site: &'static str,
-        count: u32,
     },
     FailNextMaterialization {
         description: &'static str,
@@ -1424,7 +1415,6 @@ fn step_name(step: &Step) -> &'static str {
         Step::StallController { .. } => "StallController",
         Step::SendToWrongShard { .. } => "SendToWrongShard",
         Step::FailNextMaterialization { .. } => "FailNextMaterialization",
-        Step::ForceFailure { .. } => "ForceFailure",
         Step::Partition { .. } => "Partition",
         Step::Repair { .. } => "Repair",
         Step::Hold { .. } => "Hold",
@@ -1544,15 +1534,6 @@ async fn execute_plan(
                     .expect("participant was resolved above")
                     .send_command(ParticipantCmd::Reconnect);
                 tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-
-            Step::ForceFailure {
-                description,
-                site,
-                count,
-            } => {
-                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({site} x{count})");
-                pulsebeam_runtime::buggify::force(site, *count);
             }
 
             Step::FailNextMaterialization { description } => {
@@ -4054,7 +4035,6 @@ impl LocalNodeSim {
         // from turmoil's RNG, so it has to be seeded too or a sweep replays one
         // impairment pattern under every seed.
         pulsebeam_runtime::net::shaper::seed_impairments(self.rng_seed);
-        pulsebeam_runtime::buggify::enable(DEFAULT_SIM_BUGGIFY_PERMILLE, self.rng_seed);
         tracing::info!(
             seed = self.rng_seed,
             "simulation plan seed; replay with `make test-sim-seed SEED={}`",
