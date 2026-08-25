@@ -1,0 +1,15 @@
+[package]
+name = "pulsebeam-rtc"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+# str0m = { package = "str0m", git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1" }
+
+[lints]
+workspace = true

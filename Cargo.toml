@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
   "pulsebeam",
   "pulsebeam-agent",
@@ -8,6 +8,7 @@ members = [
   "pulsebeam-ebpf",
   "pulsebeam-proto",
   "pulsebeam-routing",
+  "pulsebeam-rtc",
   "pulsebeam-runtime",
   "pulsebeam-simulator",
   "pulsebeam-testdata",
@@ -61,6 +62,9 @@ panic = "abort"
 [profile.release]
 debug = "line-tables-only"
 codegen-units = 1
+
+debug-assertions = false
+overflow-checks = false
 panic = "abort"
 lto = true
 
@@ -113,8 +117,8 @@ suspicious = { level = "deny", priority = -1 }
 # Shared state, ambient clock, blocking. Each entry there carries a `reason`.
 disallowed_types = "deny"
 disallowed_methods = "deny"
-await_holding_lock = "deny"     # mostly covered by the `disallowed_types` ban
-                                # on Mutex/RwLock; this catches parking_lot
+await_holding_lock = "deny" # mostly covered by the `disallowed_types` ban
+# on Mutex/RwLock; this catches parking_lot
 
 # -- overflow ----------------------------------------------------------------
 # `overflow-checks` is off in release, so a bare `+`/`-`/`*` that leaves range
@@ -163,32 +167,32 @@ expect_used = "deny"
 panic = "deny"
 unreachable = "deny"
 exit = "deny"
-string_slice = "deny"           # panics on a non-char-boundary byte index
+string_slice = "deny"  # panics on a non-char-boundary byte index
 unimplemented = "deny"
 todo = "deny"
 
 # -- correctness -------------------------------------------------------------
-float_cmp = "deny"              # bitrates and loss ratios are compared all over
+float_cmp = "deny"  # bitrates and loss ratios are compared all over
 mem_forget = "deny"
 
 # -- debug output must not reach a release build -----------------------------
 dbg_macro = "deny"
 print_stdout = "deny"
-print_stderr = "deny"           # tracing, not eprintln; a stray one survived a
-                                # debugging session more than once
+print_stderr = "deny" # tracing, not eprintln; a stray one survived a
+# debugging session more than once
 
 # -- allocation and copying on the forwarding path ---------------------------
 # The costs this codebase keeps having to find by hand.
 redundant_clone = "deny"
 assigning_clones = "deny"
-or_fun_call = "deny"            # eager allocation in an `unwrap_or`
+or_fun_call = "deny"           # eager allocation in an `unwrap_or`
 needless_collect = "deny"
 inefficient_to_string = "deny"
 box_collection = "deny"
 rc_buffer = "deny"
 large_stack_arrays = "deny"
 result_large_err = "deny"
-large_enum_variant = "deny"     # a big variant makes every value of the enum big
+large_enum_variant = "deny"    # a big variant makes every value of the enum big
 mutex_atomic = "deny"
 
 # -- readability -------------------------------------------------------------
