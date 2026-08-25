@@ -250,7 +250,39 @@ impl ShardUpdateWriter {
         }
     }
 
-    pub fn flush_backlog(&mut self) -> bool {
+    #[cfg(test)]
+    pub fn enqueue(&mut self) -> Option<u64> {
+        let commit = self.staged.take()?;
+        if commit.is_empty() {
+            return None;
+        }
+        let generation = commit.generation;
+        self.backlog.push_back(commit);
+        Some(generation)
+    }
+
+    pub fn flush_one(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+        let Some(commit) = self.backlog.pop_front() else {
+            return true;
+        };
+        match self.tx.try_send(commit) {
+            Ok(()) => true,
+            Err(mailbox::TrySendError::Full(commit)) => {
+                self.backlog.push_front(commit);
+                false
+            }
+            Err(mailbox::TrySendError::Closed(commit)) => {
+                self.backlog.push_front(commit);
+                self.closed = true;
+                false
+            }
+        }
+    }
+
+    fn flush_backlog(&mut self) -> bool {
         if self.closed {
             return false;
         }
@@ -269,6 +301,10 @@ impl ShardUpdateWriter {
             }
         }
         true
+    }
+
+    pub fn has_backlog(&self) -> bool {
+        !self.backlog.is_empty()
     }
 }
 
@@ -347,11 +383,30 @@ mod tests {
         for expected in 1..=crate::shard::worker::SHARD_UPDATE_CAPACITY as u64 {
             assert_eq!(rx.try_recv().unwrap().generation, expected);
         }
-        assert!(writer.flush_backlog());
+        assert!(writer.flush_one());
         assert_eq!(
             rx.try_recv().unwrap().generation,
             (crate::shard::worker::SHARD_UPDATE_CAPACITY + 1) as u64
         );
+    }
+
+    #[test]
+    fn one_flush_attempt_never_drains_multiple_generations() {
+        let shard = ShardId::new(0);
+        let (mut writer, mut rx) = new_shard_update(shard);
+        writer.stage(1, ShardUpdateOp::InsertParticipant);
+        assert_eq!(writer.enqueue(), Some(1));
+        writer.stage(2, ShardUpdateOp::InsertParticipant);
+        assert_eq!(writer.enqueue(), Some(2));
+
+        assert!(writer.flush_one());
+        assert_eq!(rx.try_recv().unwrap().generation, 1);
+        assert!(writer.has_backlog());
+        assert!(matches!(rx.try_recv(), Err(mailbox::TryRecvError::Empty)));
+
+        assert!(writer.flush_one());
+        assert_eq!(rx.try_recv().unwrap().generation, 2);
+        assert!(!writer.has_backlog());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use crate::{
     control::room::Room,
@@ -7,10 +7,6 @@ use crate::{
     route::TransportHandle,
     shard::participants::ParticipantKey,
 };
-use futures_lite::StreamExt;
-use tokio_util::time::DelayQueue;
-
-const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Everything the control plane knows about one participant.
 ///
@@ -33,7 +29,6 @@ pub struct ParticipantMeta {
 }
 
 pub struct RoomRegistry {
-    sweeper: DelayQueue<RoomId>,
     rooms: HashMap<RoomId, Room>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
 }
@@ -41,7 +36,6 @@ pub struct RoomRegistry {
 impl RoomRegistry {
     pub fn new() -> Self {
         Self {
-            sweeper: DelayQueue::with_capacity(1024),
             rooms: HashMap::new(),
             participants: HashMap::new(),
         }
@@ -72,12 +66,8 @@ impl RoomRegistry {
                 connection_id: None,
                 connected: true,
             },
-        ) && let Some(room) = self.rooms.get_mut(&previous.room_id)
-        {
-            room.remove_participant(&participant_id, previous.shard_id);
-            if room.participant_count() == 0 {
-                self.sweeper.insert(previous.room_id, EMPTY_ROOM_TIMEOUT);
-            }
+        ) {
+            self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
         }
         let room = self.rooms.entry(room_id).or_insert_with(Room::new);
         room.add_participant(&participant_id, shard_id);
@@ -133,12 +123,7 @@ impl RoomRegistry {
     /// Returns the shard_id that was hosting the participant, if found.
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
         let meta = self.participants.remove(participant_id)?;
-        if let Some(room) = self.rooms.get_mut(&meta.room_id) {
-            room.remove_participant(participant_id, meta.shard_id);
-            if room.participant_count() == 0 {
-                self.sweeper.insert(meta.room_id, EMPTY_ROOM_TIMEOUT);
-            }
-        }
+        self.remove_from_room(&meta.room_id, participant_id, meta.shard_id);
         Some(meta.shard_id)
     }
 
@@ -146,34 +131,29 @@ impl RoomRegistry {
         &mut self,
         participant_id: &ParticipantId,
     ) -> Option<(ShardId, Option<TransportHandle>, Option<ParticipantKey>)> {
-        let meta = self.participants.get_mut(participant_id)?;
-        let result = (meta.shard_id, meta.transport.take(), meta.binding.take());
-        meta.connected = false;
-        if let Some(room) = self.rooms.get_mut(&meta.room_id) {
-            room.remove_participant(participant_id, meta.shard_id);
-            if room.participant_count() == 0 {
-                self.sweeper.insert(meta.room_id, EMPTY_ROOM_TIMEOUT);
-            }
-        }
+        let (result, room_id, shard_id) = {
+            let meta = self.participants.get_mut(participant_id)?;
+            let result = (meta.shard_id, meta.transport.take(), meta.binding.take());
+            meta.connected = false;
+            (result, meta.room_id, meta.shard_id)
+        };
+        self.remove_from_room(&room_id, participant_id, shard_id);
         Some(result)
     }
 
-    pub async fn next_expired(&mut self) {
-        // DelayQueue returns Poll::Ready(None) immediately when empty, which
-        // would cause the select! caller to spin at 100% CPU. Park forever
-        // when there is nothing scheduled.
-        if self.sweeper.is_empty() {
-            std::future::pending::<()>().await;
-        }
-        if let Some(entry) = self.sweeper.next().await {
-            self.maybe_delete_room(entry.get_ref());
-        }
-    }
-
-    fn maybe_delete_room(&mut self, room_id: &RoomId) {
-        if let Some(room) = self.rooms.get(room_id)
-            && room.participant_count() == 0
-        {
+    fn remove_from_room(
+        &mut self,
+        room_id: &RoomId,
+        participant_id: &ParticipantId,
+        shard_id: ShardId,
+    ) {
+        let empty = if let Some(room) = self.rooms.get_mut(room_id) {
+            room.remove_participant(participant_id, shard_id);
+            room.participant_count() == 0
+        } else {
+            false
+        };
+        if empty {
             self.rooms.remove(room_id);
         }
     }
@@ -223,8 +203,8 @@ mod tests {
         assert_eq!(room.participant_count(), 2);
     }
 
-    #[tokio::test]
-    async fn add_participant_moves_existing_participant_to_new_room() {
+    #[test]
+    fn add_participant_moves_existing_participant_to_new_room() {
         let mut reg = RoomRegistry::new();
         let old_room = room_id("room-b-old");
         let new_room = room_id("room-b-new");
@@ -233,15 +213,15 @@ mod tests {
         reg.add_participant(pid, old_room, ShardId::new(0), None);
         reg.add_participant(pid, new_room, ShardId::new(1), None);
 
-        assert_eq!(reg.get_room(&old_room).unwrap().participant_count(), 0);
+        assert!(reg.get_room(&old_room).is_none());
         assert_eq!(reg.get_room(&new_room).unwrap().participant_count(), 1);
         let meta = reg.get_participant(&pid).unwrap();
         assert_eq!(meta.room_id, new_room);
         assert_eq!(meta.shard_id, ShardId::new(1));
     }
 
-    #[tokio::test]
-    async fn remove_participant_returns_shard_id() {
+    #[test]
+    fn remove_participant_returns_shard_id() {
         let mut reg = RoomRegistry::new();
         let rid = room_id("room-c");
         let pid = participant_id();
@@ -259,9 +239,8 @@ mod tests {
         assert!(reg.remove_participant(&pid).is_none());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn room_not_immediately_deleted_after_last_participant_leaves() {
-        // The room should remain until the sweeper fires, not be deleted inline.
+    #[test]
+    fn room_is_immediately_deleted_after_last_participant_leaves() {
         let mut reg = RoomRegistry::new();
         let rid = room_id("room-d");
         let pid = participant_id();
@@ -269,33 +248,11 @@ mod tests {
         reg.add_participant(pid, rid, ShardId::new(0), None);
         reg.remove_participant(&pid);
 
-        // Room still present; deletion is deferred via the sweeper.
-        reg.get_room(&rid).unwrap();
-        // But the sweeper has one pending entry.
-        assert!(!reg.sweeper.is_empty());
-        let e = reg.sweeper.next().await.unwrap();
-        assert_eq!(*e.get_ref(), rid);
-    }
-
-    #[tokio::test]
-    async fn maybe_delete_room_removes_empty_room() {
-        let mut reg = RoomRegistry::new();
-        let rid = room_id("room-e");
-        let pid = participant_id();
-
-        reg.add_participant(pid, rid, ShardId::new(0), None);
-        reg.remove_participant(&pid);
-
-        // Simulate the sweeper firing.
-        reg.maybe_delete_room(&rid);
-
         assert!(reg.get_room(&rid).is_none());
     }
 
-    #[tokio::test]
-    async fn maybe_delete_room_keeps_room_if_participant_rejoined() {
-        // If a participant re-joins between the remove and the sweeper firing,
-        // the room must NOT be deleted.
+    #[test]
+    fn participant_can_rejoin_a_deleted_room() {
         let mut reg = RoomRegistry::new();
         let rid = room_id("room-f");
         let pid1 = participant_id();
@@ -304,18 +261,14 @@ mod tests {
         reg.add_participant(pid1, rid, ShardId::new(0), None);
         reg.remove_participant(&pid1);
 
-        // A new participant joins before the sweeper fires.
         reg.add_participant(pid2, rid, ShardId::new(1), None);
-
-        // Sweeper fires — room should survive because it is not empty.
-        reg.maybe_delete_room(&rid);
 
         reg.get_room(&rid).unwrap();
         assert_eq!(reg.get_room(&rid).unwrap().participant_count(), 1);
     }
 
-    #[tokio::test]
-    async fn participant_removed_from_registry_after_remove() {
+    #[test]
+    fn participant_removed_from_registry_after_remove() {
         let mut reg = RoomRegistry::new();
         let rid = room_id("room-h");
         let pid = participant_id();
@@ -326,8 +279,8 @@ mod tests {
         assert!(reg.get_participant(&pid).is_none());
     }
 
-    #[tokio::test]
-    async fn multiple_rooms_are_independent() {
+    #[test]
+    fn multiple_rooms_are_independent() {
         let mut reg = RoomRegistry::new();
         let rid1 = room_id("room-x");
         let rid2 = room_id("room-y");
@@ -337,8 +290,6 @@ mod tests {
         reg.add_participant(pid1, rid1, ShardId::new(0), None);
         reg.add_participant(pid2, rid2, ShardId::new(1), None);
         reg.remove_participant(&pid1);
-        reg.maybe_delete_room(&rid1);
-
         assert!(reg.get_room(&rid1).is_none());
         assert!(reg.get_room(&rid2).is_some());
     }

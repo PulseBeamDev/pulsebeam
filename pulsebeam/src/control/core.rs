@@ -173,10 +173,6 @@ impl ControllerCore {
             transport: meta.transport,
         }
     }
-
-    pub async fn next_expired(&mut self) {
-        self.registry.next_expired().await;
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
