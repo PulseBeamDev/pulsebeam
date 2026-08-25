@@ -37,6 +37,10 @@ impl TransportAllocators {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a transport allocation for an unconfigured shard is a controller invariant violation"
+    )]
     fn allocate(&mut self, shard: ShardId, now: Instant) -> TransportHandle {
         let allocator = self
             .shards

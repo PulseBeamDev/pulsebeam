@@ -771,10 +771,10 @@ fn screenshare_and_camera_conference_test() {
                 participant: "screen",
                 quality: VideoQuality::min_frames(1_000).allow_gaps(3),
             },
-            Step::CheckVideoQuality {
-                description: "Camera participant renders the screen share cleanly throughout",
+            Step::CheckVideoQualityInterval {
+                description: "Camera participant renders the screen share cleanly throughout the soak",
                 participant: "camera",
-                quality: VideoQuality::min_frames(150).allow_gaps(3),
+                quality: VideoQuality::min_frames(65).allow_gaps(3),
             },
         ]);
 }

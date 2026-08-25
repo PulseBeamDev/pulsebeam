@@ -501,6 +501,10 @@ impl SlotAllocator {
         self.allocate_inner(now)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a quarantined slot is allocated from the route table that owns its metadata"
+    )]
     fn allocate_inner(&mut self, now: Instant) -> (u32, u16) {
         // FIFO from the oldest retirement, so a slot is only reused once no
         // datagram addressed to its previous incarnation could still arrive.

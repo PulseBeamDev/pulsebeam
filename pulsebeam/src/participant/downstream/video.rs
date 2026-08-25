@@ -926,7 +926,7 @@ impl Slot {
         }
 
         events.request_reverse(
-            Some(fanout),
+            fanout,
             crate::participant::reverse::ReversePacket::keyframe(
                 staging.stream_id().1,
                 str0m::media::KeyframeRequestKind::Pli,
@@ -1368,9 +1368,9 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
 impl AllocationEngine {
     const RESERVE_FRACTION: f64 = 0.10;
     const UPGRADE_RESERVE_FRACTION: f64 = Self::RESERVE_FRACTION;
-    // A slot keeps its layer until its cost exceeds ~1.33x the budget (1/0.75),
+    // A slot keeps its layer until its cost exceeds ~1.54x the budget (1/0.65),
     // giving recoveries a hysteresis dead-band against churn.
-    const DOWNGRADE_FACTOR: f64 = 0.75;
+    const DOWNGRADE_FACTOR: f64 = 0.65;
 
     /// Frame height (px) used for spatial gating.
     fn height(&self, layer: &TrackLayer) -> u32 {
@@ -1913,6 +1913,52 @@ mod assignment_tests {
             1,
             "a non-scalable encoding is a single rung"
         );
+    }
+
+    #[test]
+    fn retained_layer_uses_the_wider_downgrade_dead_band() {
+        let pid = ParticipantId::new();
+        let (tx, built, mut states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let high = track.by_quality(LayerQuality::High).unwrap();
+        state_of_mut(&mut states, high)
+            .update_for_test()
+            .bitrate(2_000_000);
+
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let key = keys.insert(());
+        let view = SlotView {
+            key,
+            mid: Mid::from("s0"),
+            max_height: 720,
+            min_height: 720,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::High,
+            forwarding: true,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+
+        let retained = engine.run_compute(Bitrate::from(1_310_000), std::slice::from_ref(&view));
+        assert!(matches!(
+            retained.get(key),
+            Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
+        ));
+
+        let downgraded = engine.run_compute(Bitrate::from(1_290_000), std::slice::from_ref(&view));
+        assert!(!matches!(
+            downgraded.get(key),
+            Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
+        ));
     }
 
     #[test]
@@ -2791,7 +2837,7 @@ mod slot_switch_tests {
             fanouts.get(&track_id).copied()
         });
         assert_eq!(
-            sink.reverse_requests.first().copied().flatten(),
+            sink.reverse_requests.first().copied(),
             fanouts.get(&low.stream_id().0).copied(),
             "a deferred switch must keep asking the publisher for a keyframe"
         );

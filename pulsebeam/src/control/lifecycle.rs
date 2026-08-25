@@ -187,6 +187,10 @@ impl DesiredTrackState {
         shards
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "bindings are filtered from the same location map they are read from"
+    )]
     fn local_bindings(&self, shard: ShardId) -> Vec<ParticipantKey> {
         let mut participants = self
             .bindings
@@ -242,6 +246,10 @@ impl TrackLifecycle {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "generation exhaustion is fatal because update order must stay monotonic"
+    )]
     pub(crate) fn next_generation(&mut self) -> u64 {
         self.generation = self
             .generation
@@ -467,6 +475,10 @@ impl TrackLifecycle {
         stager.finish()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "reconciliation only runs for a published track whose publisher remains bound"
+    )]
     fn desired_state(&self, identity: TrackIdentity, registry: &RoomRegistry) -> DesiredTrackState {
         let track = self
             .topology
@@ -524,6 +536,10 @@ impl TrackLifecycle {
         destination
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the desired track is cloned from the topology entry updated here"
+    )]
     fn ensure_reverse_route(
         &mut self,
         identity: TrackIdentity,
@@ -665,6 +681,10 @@ impl TrackLifecycle {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "active views are staged only after their origin and remote allocations are reserved"
+    )]
     fn stage_active_views(
         &mut self,
         identity: TrackIdentity,
@@ -819,6 +839,10 @@ impl TrackLifecycle {
         );
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a live bound participant has a destination reserved during reconciliation"
+    )]
     fn stage_track_effect(
         &self,
         identity: TrackIdentity,
@@ -967,6 +991,10 @@ impl TrackLifecycle {
         destinations
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "route state is changed only for an allocation reserved by this lifecycle"
+    )]
     fn set_route_installed(&mut self, identity: TrackIdentity, shard: ShardId, installed: bool) {
         let destination = self
             .allocations
@@ -975,6 +1003,10 @@ impl TrackLifecycle {
         destination.route_installed = installed;
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "residency is changed only for an allocation reserved by this lifecycle"
+    )]
     fn set_resident(&mut self, identity: TrackIdentity, shard: ShardId, resident: bool) {
         let destination = self
             .allocations
@@ -983,6 +1015,10 @@ impl TrackLifecycle {
         destination.resident = resident;
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "destination state is changed only for an allocation reserved by this lifecycle"
+    )]
     fn set_destination_state(
         &mut self,
         identity: TrackIdentity,

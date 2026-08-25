@@ -622,6 +622,10 @@ impl TrackAllocator {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a track allocation for an unconfigured shard is a lifecycle invariant violation"
+    )]
     pub(crate) fn allocate(
         &mut self,
         shard: ShardId,

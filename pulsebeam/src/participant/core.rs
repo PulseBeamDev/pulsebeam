@@ -724,10 +724,12 @@ impl Participant {
             Event::KeyframeRequest(req) => {
                 if let Some(layer) = self.downstream.handle_keyframe_request(req) {
                     let stream_id = layer.stream_id();
-                    events.request_reverse(
-                        self.upstream.track_fanout(stream_id.0),
-                        ReversePacket::keyframe(stream_id.1, KeyframeRequestKind::Pli),
-                    );
+                    if let Some(fanout) = self.upstream.track_fanout(stream_id.0) {
+                        events.request_reverse(
+                            fanout,
+                            ReversePacket::keyframe(stream_id.1, KeyframeRequestKind::Pli),
+                        );
+                    }
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
@@ -851,10 +853,12 @@ impl Participant {
                         if !matches!(control.msg, Some(rel_control::Msg::Nack(_))) {
                             return;
                         }
-                        events.request_reverse(
-                            self.downstream.data.subscribed_stream(data.id),
-                            ReversePacket::reliable_control(data.data.to_vec()),
-                        );
+                        if let Some(stream) = self.downstream.data.subscribed_stream(data.id) {
+                            events.request_reverse(
+                                stream,
+                                ReversePacket::reliable_control(data.data.to_vec()),
+                            );
+                        }
                     }
                     (DataLane::Realtime, DataTrackDirection::Subscribe) => {}
                 }

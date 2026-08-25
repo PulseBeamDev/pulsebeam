@@ -17,7 +17,7 @@ pub(crate) trait ParticipantSink {
     fn unpublish_track(&mut self, track_id: TrackId);
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
-    fn request_reverse(&mut self, stream: Option<TrackKey>, packet: ReversePacket);
+    fn request_reverse(&mut self, stream: TrackKey, packet: ReversePacket);
     fn exit(&mut self);
 
     fn publish_track_packet(&mut self, fanout: Option<TrackKey>, packet: TrackPacket);
@@ -35,7 +35,7 @@ pub mod test_utils {
         pub deactivate_track_calls: Vec<TrackMeta>,
         pub publish_track_calls: Vec<TrackId>,
         pub unpublish_track_calls: Vec<TrackId>,
-        pub reverse_requests: Vec<Option<TrackKey>>,
+        pub reverse_requests: Vec<TrackKey>,
         pub exit_count: usize,
         pub publish_track_packet_calls: Vec<TrackKey>,
     }
@@ -75,7 +75,7 @@ pub mod test_utils {
 
         fn unsubscribe_tracks(&mut self, _selector: TrackSelector) {}
 
-        fn request_reverse(&mut self, stream: Option<TrackKey>, _packet: ReversePacket) {
+        fn request_reverse(&mut self, stream: TrackKey, _packet: ReversePacket) {
             self.reverse_requests.push(stream);
         }
 

@@ -53,7 +53,7 @@ pub enum ParticipantLifecycleEvent {
 
 pub enum ShardInternalEvent {
     ReverseRequested {
-        stream: Option<TrackKey>,
+        stream: TrackKey,
         packet: ReversePacket,
     },
 }
@@ -218,7 +218,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn request_reverse(&mut self, stream: Option<TrackKey>, packet: ReversePacket) {
+    fn request_reverse(&mut self, stream: TrackKey, packet: ReversePacket) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Internal(

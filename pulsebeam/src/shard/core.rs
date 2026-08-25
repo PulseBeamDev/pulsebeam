@@ -527,10 +527,6 @@ impl ShardExecution {
                         stream,
                         packet,
                     } => {
-                        let Some(stream) = stream else {
-                            debug_assert!(false, "reverse packet has no compiled stream key");
-                            continue;
-                        };
                         let Some(plan) = self.plans.get(stream) else {
                             debug_assert!(false, "reverse packet has no owned track plan");
                             continue;
