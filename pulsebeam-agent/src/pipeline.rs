@@ -72,12 +72,7 @@ impl FrameSender {
         sender
     }
 
-    /// Split `frame` into RTP packets. A single Dependency Descriptor is generated
-    /// for the frame, then stamped on every packet with that packet's own
-    /// start/end-of-frame flags so the receiver can reassemble under reordering.
     pub fn packetize(&mut self, frame: &MediaFrame) -> Vec<RtpPacket> {
-        let dd_bytes = self.dd.next(frame.is_keyframe);
-
         let vla = frame.target_bitrate_bps.and_then(|bps| {
             vla_for(
                 self.encoding_count,
@@ -111,8 +106,16 @@ impl FrameSender {
                 })
                 .collect()
         };
+        if chunks.is_empty() {
+            return Vec::new();
+        }
+        let Some(dd_bytes) = self.dd.next_frame(frame.is_keyframe, chunks.len()) else {
+            debug_assert!(false, "valid frame descriptors fit the RTP extension");
+            return Vec::new();
+        };
+        debug_assert_eq!(dd_bytes.len(), chunks.len());
         let mut packets = Vec::with_capacity(chunks.len());
-        for (payload, start_of_frame, end_of_frame) in chunks {
+        for ((payload, start_of_frame, end_of_frame), raw) in chunks.into_iter().zip(dd_bytes) {
             // Audio level is not optional decoration: the SFU's speaker selector ranks by it and
             // drops any audio packet that arrives without one.
             let mut ext_vals = ExtensionValues {
@@ -120,20 +123,15 @@ impl FrameSender {
                 voice_activity: frame.voice_activity,
                 ..ExtensionValues::default()
             };
-            if let Some(raw) = &dd_bytes {
-                let mut bytes = raw.0.clone();
-                if let Some(first) = bytes.first_mut() {
-                    let mut flags = *first & !(START_OF_FRAME_BIT | END_OF_FRAME_BIT);
-                    if start_of_frame {
-                        flags |= START_OF_FRAME_BIT;
-                    }
-                    if end_of_frame {
-                        flags |= END_OF_FRAME_BIT;
-                    }
-                    *first = flags;
-                }
-                ext_vals.user_values.set(RawDependencyDescriptor(bytes));
-            }
+            debug_assert_eq!(
+                raw.0.first().map(|first| first & START_OF_FRAME_BIT != 0),
+                Some(start_of_frame)
+            );
+            debug_assert_eq!(
+                raw.0.first().map(|first| first & END_OF_FRAME_BIT != 0),
+                Some(end_of_frame)
+            );
+            ext_vals.user_values.set(raw);
             if let Some(vla) = vla.clone() {
                 ext_vals.user_values.set(vla);
             }
@@ -525,6 +523,32 @@ mod tests {
         );
         assert!(got.is_keyframe, "keyframe recovered from the DD");
         assert!(got.contiguous);
+    }
+
+    #[test]
+    fn a_fragmented_keyframe_carries_its_template_only_on_the_first_packet() {
+        let mid = Mid::from("v0");
+        let mut sender = FrameSender::new(mid, None, 1, 1);
+        let payload: Vec<u8> = (0..3000u32)
+            .map(|i| u8::try_from((i * 7 + 3) % 256).expect("masked to a byte"))
+            .collect();
+        let packets = sender.packetize(&frame(payload, true));
+        assert!(packets.len() > 1, "fixture must fragment the keyframe");
+
+        let mut reader = DependencyDescriptorReader::new();
+        for (index, packet) in packets.iter().enumerate() {
+            let raw = packet
+                .ext_vals
+                .user_values
+                .get::<RawDependencyDescriptor>()
+                .expect("every video packet carries a dependency descriptor");
+            let dd = reader
+                .read(&raw.0)
+                .expect("descriptor parses in packet order");
+            assert_eq!(dd.start_of_frame, index == 0);
+            assert_eq!(dd.end_of_frame, index + 1 == packets.len());
+            assert_eq!(dd.attached_structure.is_some(), index == 0);
+        }
     }
 
     #[test]

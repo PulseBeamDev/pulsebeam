@@ -242,7 +242,7 @@ async fn spawn_agent(
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &ctx.api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let mut builder = AgentBuilder::new(api, socket).without_dependency_descriptor();
+    let mut builder = AgentBuilder::new(api, socket);
 
     if simulcast {
         builder = builder.video_upstream_slots(

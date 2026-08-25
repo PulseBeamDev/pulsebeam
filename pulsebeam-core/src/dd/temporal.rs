@@ -161,12 +161,21 @@ impl TemporalDdGenerator {
             template_index < self.structure.templates.len(),
             "temporal id {template_index} has no template"
         );
-        let deps = self
+        let mut deps = self
             .structure
             .templates
             .get(template_index)
             .cloned()
             .unwrap_or_default();
+        let mut fields = DdFields::empty();
+        if is_keyframe {
+            deps.frame_diffs.clear();
+            for chain_diff in &mut deps.chain_diffs {
+                *chain_diff = 0;
+            }
+            fields.set_custom_fdiffs(true);
+            fields.set_custom_chains(!deps.chain_diffs.is_empty());
+        }
         #[allow(
             clippy::cast_possible_truncation,
             reason = "reduced mod MAX_TEMPLATES, which is 64"
@@ -182,7 +191,7 @@ impl TemporalDdGenerator {
             frame_number: self.frame_number,
             attached_structure: is_keyframe.then(|| Box::new(self.structure.clone())),
             active_decode_targets: None,
-            fields: DdFields::empty(),
+            fields,
             resolution: None,
             frame_dependencies: deps,
         };
@@ -225,16 +234,34 @@ impl TemporalDdSource {
         self.generator.decode_target_count()
     }
 
-    /// Encode the next frame's descriptor to wire bytes. `None` only if the
-    /// descriptor somehow exceeds the extension's length bound, which the L1T{N}
-    /// structures never do.
-    pub fn next(&mut self, is_keyframe: bool) -> Option<crate::dd::RawDependencyDescriptor> {
+    /// A template structure may appear only on a frame's first RTP packet.
+    pub fn next_frame(
+        &mut self,
+        is_keyframe: bool,
+        packet_count: usize,
+    ) -> Option<Vec<crate::dd::RawDependencyDescriptor>> {
+        debug_assert!(packet_count > 0, "an encoded frame needs an RTP packet");
         let dd = self.generator.next(is_keyframe);
-        let mut buf = [0u8; crate::dd::model::MAX_DD_LEN];
-        let n = self.writer.write(&dd, &mut buf).ok()?;
-        Some(crate::dd::RawDependencyDescriptor(
-            buf.get(..n)?.iter().copied().collect(),
-        ))
+        let mut packets = Vec::with_capacity(packet_count);
+        for index in 0..packet_count {
+            let mut packet_dd = dd.clone();
+            packet_dd.start_of_frame = index == 0;
+            packet_dd.end_of_frame = index.saturating_add(1) == packet_count;
+            if index != 0 {
+                packet_dd.attached_structure = None;
+            }
+
+            let mut buf = [0u8; crate::dd::model::MAX_DD_LEN];
+            let n = self.writer.write(&packet_dd, &mut buf).ok()?;
+            packets.push(crate::dd::RawDependencyDescriptor(
+                buf.get(..n)?.iter().copied().collect(),
+            ));
+        }
+        Some(packets)
+    }
+
+    pub fn next(&mut self, is_keyframe: bool) -> Option<crate::dd::RawDependencyDescriptor> {
+        self.next_frame(is_keyframe, 1)?.into_iter().next()
     }
 }
 
@@ -325,6 +352,22 @@ mod test {
     }
 
     #[test]
+    fn keyframe_resets_frame_and_chain_dependencies() {
+        let mut g = TemporalDdGenerator::new(3);
+        let keyframe = g.next(true);
+        assert!(keyframe.frame_dependencies.frame_diffs.is_empty());
+        assert!(
+            keyframe
+                .frame_dependencies
+                .chain_diffs
+                .iter()
+                .all(|diff| *diff == 0)
+        );
+        assert!(keyframe.fields.custom_fdiffs());
+        assert!(keyframe.fields.custom_chains());
+    }
+
+    #[test]
     fn source_emits_wire_bytes_a_reader_parses_with_correct_membership() {
         let mut source = TemporalDdSource::new(3);
         let mut reader = DependencyDescriptorReader::new();
@@ -352,6 +395,22 @@ mod test {
         assert_eq!(d2.temporal_id(), 1);
         assert!(d2.is_in_decode_target(1));
         assert!(!d2.is_in_decode_target(0));
+    }
+
+    #[test]
+    fn only_the_first_packet_of_a_keyframe_carries_the_structure() {
+        let mut source = TemporalDdSource::new(1);
+        let raws = source
+            .next_frame(true, 3)
+            .expect("encodes within the length bound");
+        let mut reader = DependencyDescriptorReader::new();
+
+        for (index, raw) in raws.iter().enumerate() {
+            let dd = reader.read(&raw.0).expect("descriptor parses");
+            assert_eq!(dd.start_of_frame, index == 0);
+            assert_eq!(dd.end_of_frame, index + 1 == raws.len());
+            assert_eq!(dd.attached_structure.is_some(), index == 0);
+        }
     }
 
     #[test]
