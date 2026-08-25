@@ -133,6 +133,7 @@ pub async fn run(
         .local_addr(local_addr)
         .external_addrs(external_addrs)
         .rng(rng)
+        .work_stealing(16)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr);
 

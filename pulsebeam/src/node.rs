@@ -43,40 +43,372 @@ enum ListenerSource {
     PreBound(TcpListener),
 }
 
-enum WorkerExecution {
-    ThreadPerWorker,
-    SharedRuntime,
+/// How logical shards are executed.
+///
+/// A shard remains the ownership, routing, socket, and metrics unit in every
+/// mode. This enum changes only how shard futures receive CPU time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardRuntime {
+    /// One logical shard on one dedicated current-thread Tokio runtime.
+    ThreadPerCore,
+
+    /// Many logical shards scheduled by a Tokio multi-thread work-stealing runtime.
+    WorkStealing {
+        /// Number of logical shards created for every Tokio scheduler worker.
+        shards_per_worker: usize,
+    },
+
+    /// Run every shard as a local task on the caller's runtime.
+    ///
+    /// This exists for simulation, whose synthetic reuseport sockets are
+    /// deliberately thread-local. It is not the production work-stealing mode.
+    CurrentRuntime,
 }
 
-#[cfg(not(feature = "sim"))]
-async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    let socket2_sock = socket2::Socket::new(
-        socket2::Domain::for_address(addr),
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
+impl ShardRuntime {
+    fn shard_count(self, data_threads: usize) -> usize {
+        match self {
+            Self::ThreadPerCore | Self::CurrentRuntime => data_threads,
+            Self::WorkStealing { shards_per_worker } => data_threads
+                .checked_mul(shards_per_worker)
+                .expect("configured shard count overflowed usize"),
+        }
+    }
+}
 
-    if addr.is_ipv6() {
-        // Prefer dual-stack listeners so a single IPv6 socket can accept IPv4-mapped peers.
-        socket2_sock.set_only_v6(false)?;
+mod platform {
+    use super::*;
+
+    #[cfg(not(feature = "sim"))]
+    mod imp {
+        use super::*;
+
+        pub(in crate::node) async fn bind_tcp_listener(
+            addr: SocketAddr,
+        ) -> std::io::Result<TcpListener> {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(addr),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+
+            if addr.is_ipv6() {
+                // Prefer dual-stack listeners so a single IPv6 socket can
+                // accept IPv4-mapped peers.
+                socket.set_only_v6(false)?;
+            }
+
+            socket.set_nonblocking(true)?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&addr.into())?;
+            socket.listen(1024)?;
+
+            tokio::net::TcpListener::from_std(socket.into())
+        }
     }
 
-    socket2_sock.set_nonblocking(true)?;
-    socket2_sock.set_reuse_address(true)?;
-    socket2_sock.bind(&addr.into())?;
-    socket2_sock.listen(1024)?;
+    #[cfg(feature = "sim")]
+    mod imp {
+        use super::*;
 
-    tokio::net::TcpListener::from_std(socket2_sock.into())
+        pub(in crate::node) async fn bind_tcp_listener(
+            addr: SocketAddr,
+        ) -> std::io::Result<TcpListener> {
+            TcpListener::bind(addr).await
+        }
+    }
+
+    pub(super) use imp::bind_tcp_listener;
 }
 
-#[cfg(feature = "sim")]
-async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    TcpListener::bind(addr).await
+mod shard_executor {
+    use super::*;
+
+    #[cfg(not(feature = "sim"))]
+    mod imp {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Owns the dedicated Tokio runtime used only by data-plane shard tasks.
+        ///
+        /// The runtime is deliberately separate from the caller/control runtime:
+        /// controller, HTTP, metrics, and other control-plane tasks never run here.
+        struct WorkStealingRuntime {
+            runtime: Option<tokio::runtime::Runtime>,
+        }
+
+        impl WorkStealingRuntime {
+            fn build(data_threads: usize, cpu_cores: &[core_affinity::CoreId]) -> Result<Self> {
+                let next_worker = AtomicUsize::new(0);
+                let worker_cores = cpu_cores.to_vec();
+
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                // TODO: tune these with real benchmark
+                builder
+                    .worker_threads(data_threads)
+                    .thread_name("pb-data")
+                    .enable_all()
+                    // .event_interval(3)
+                    // .max_io_events_per_tick(16)
+                    // .disable_lifo_slot()
+                    .enable_alt_timer();
+
+                // Apply exactly the same OS tuning as thread-per-core, but to
+                // Tokio's physical scheduler workers rather than logical shards.
+                // `on_thread_start` can also observe later blocking-pool threads;
+                // the scheduler workers are created with the runtime, so only the
+                // first `data_threads` callbacks are data workers we tune/pin.
+                builder.on_thread_start(move || {
+                    let worker_idx = next_worker.fetch_add(1, Ordering::Relaxed);
+                    if worker_idx >= data_threads {
+                        return;
+                    }
+
+                    let core_id = if worker_cores.is_empty() {
+                        None
+                    } else {
+                        worker_cores.get(worker_idx % worker_cores.len()).copied()
+                    };
+
+                    let realtime = tune_current_data_thread(core_id);
+                    metrics::gauge!(
+                        "data_worker_realtime",
+                        "worker" => worker_idx.to_string()
+                    )
+                    .set(f64::from(realtime));
+                });
+
+                let runtime = builder
+                    .build()
+                    .context("building Tokio work-stealing data runtime")?;
+
+                Ok(Self {
+                    runtime: Some(runtime),
+                })
+            }
+
+            fn handle(&self) -> &tokio::runtime::Handle {
+                self.runtime
+                    .as_ref()
+                    .expect("work-stealing data runtime is alive")
+                    .handle()
+            }
+        }
+
+        impl Drop for WorkStealingRuntime {
+            fn drop(&mut self) {
+                if let Some(runtime) = self.runtime.take() {
+                    // `NodeBuilder::run` itself is async on the control runtime.
+                    // A normal nested Runtime drop may block and panic there;
+                    // background shutdown cancels its data tasks without doing so.
+                    runtime.shutdown_background();
+                }
+            }
+        }
+
+        enum Execution {
+            /// Compatibility/local-test path. Production deployments should use
+            /// one of the two dedicated data-plane execution modes below.
+            CurrentRuntime,
+
+            ThreadPerCore {
+                cpu_cores: Vec<core_affinity::CoreId>,
+                threads: Vec<std::thread::JoinHandle<()>>,
+            },
+
+            WorkStealing {
+                runtime: WorkStealingRuntime,
+            },
+        }
+
+        pub(in crate::node) struct Executor {
+            execution: Execution,
+        }
+
+        impl Executor {
+            pub(in crate::node) fn new(
+                mode: ShardRuntime,
+                data_threads: usize,
+                cpu_cores: Vec<core_affinity::CoreId>,
+            ) -> Result<Self> {
+                let execution = match mode {
+                    ShardRuntime::CurrentRuntime => Execution::CurrentRuntime,
+                    ShardRuntime::ThreadPerCore => Execution::ThreadPerCore {
+                        cpu_cores,
+                        threads: Vec::with_capacity(data_threads),
+                    },
+                    ShardRuntime::WorkStealing { shards_per_worker } => {
+                        tracing::info!(
+                            data_threads,
+                            shards_per_worker,
+                            shards = data_threads.saturating_mul(shards_per_worker),
+                            "starting dedicated Tokio work-stealing data runtime"
+                        );
+
+                        Execution::WorkStealing {
+                            runtime: WorkStealingRuntime::build(data_threads, &cpu_cores)?,
+                        }
+                    }
+                };
+
+                Ok(Self { execution })
+            }
+
+            /// Start one logical shard on the configured data-plane executor.
+            ///
+            /// `control_tasks` is used only by the compatibility CurrentRuntime
+            /// path. In both production modes shard execution is completely
+            /// separate from the caller/control runtime.
+            pub(in crate::node) fn spawn<F>(
+                &mut self,
+                shard_id: ShardId,
+                launch: F,
+                control_tasks: &mut JoinSet<()>,
+            ) -> Result<()>
+            where
+                F: FnOnce() -> Result<ShardWorker> + Send + 'static,
+            {
+                match &mut self.execution {
+                    Execution::CurrentRuntime => {
+                        let shard = launch()?;
+                        control_tasks.spawn_local(ignore(shard.run()));
+                    }
+                    Execution::WorkStealing { runtime } => {
+                        let shard = launch()?;
+                        // Dropping a Tokio JoinHandle detaches the task; the
+                        // dedicated Runtime remains its owner and shuts it down.
+                        drop(runtime.handle().spawn(ignore(shard.run())));
+                    }
+                    Execution::ThreadPerCore { cpu_cores, threads } => {
+                        let core_id = if cpu_cores.is_empty() {
+                            None
+                        } else {
+                            cpu_cores.get(shard_id.index() % cpu_cores.len()).copied()
+                        };
+
+                        let handle = std::thread::Builder::new()
+                            .name(format!("pb-w-{shard_id}"))
+                            .spawn(move || {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .enable_alt_timer()
+                                    .build_local(tokio::runtime::LocalOptions::default())
+                                    .unwrap_or_else(|err| {
+                                        pulsebeam_runtime::fatal!(
+                                            "shard {shard_id} cannot build its runtime: {err}"
+                                        )
+                                    });
+
+                                let realtime = tune_current_data_thread(core_id);
+                                metrics::gauge!(
+                                    "shard_realtime",
+                                    "shard" => shard_id.index().to_string()
+                                )
+                                .set(f64::from(realtime));
+
+                                #[allow(
+                                    clippy::disallowed_methods,
+                                    reason = "the shard's dedicated OS thread enters its async runtime exactly once, here"
+                                )]
+                                rt.block_on(async move {
+                                    let shard = launch().unwrap_or_else(|err| {
+                                        pulsebeam_runtime::fatal!(
+                                            "shard {shard_id} cannot start: {err}"
+                                        )
+                                    });
+
+                                    // Nothing else competes for this executor,
+                                    // so Tokio's cooperative budget is unnecessary.
+                                    tokio::task::unconstrained(shard.run()).await;
+                                });
+                            })
+                            .with_context(|| {
+                                format!("cannot spawn the thread for shard {shard_id}")
+                            })?;
+
+                        threads.push(handle);
+                    }
+                }
+
+                Ok(())
+            }
+
+            /// The caller/control runtime may be deprioritized only after all
+            /// physical data threads have been created, otherwise they could
+            /// inherit the control thread's scheduling policy.
+            pub(in crate::node) fn should_tune_control_thread(&self) -> bool {
+                !matches!(self.execution, Execution::CurrentRuntime)
+            }
+
+            /// Finish ownership of the data executor after the control tasks are
+            /// gone. TPC threads are joined; dropping WorkStealingRuntime starts
+            /// non-blocking runtime shutdown and cancels its shard tasks.
+            pub(in crate::node) fn finish(self) {
+                if let Execution::ThreadPerCore { threads, .. } = self.execution {
+                    for handle in threads {
+                        let _ = handle.join();
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sim")]
+    mod imp {
+        use super::*;
+
+        pub(in crate::node) struct Executor;
+
+        impl Executor {
+            pub(in crate::node) fn new(
+                mode: ShardRuntime,
+                _data_threads: usize,
+                _cpu_cores: Vec<core_affinity::CoreId>,
+            ) -> Result<Self> {
+                if !matches!(mode, ShardRuntime::CurrentRuntime) {
+                    return Err(anyhow::anyhow!(
+                        "a simulated node must use `.with_current_runtime()`"
+                    ));
+                }
+
+                Ok(Self)
+            }
+
+            pub(in crate::node) fn spawn<F>(
+                &mut self,
+                _shard_id: ShardId,
+                launch: F,
+                control_tasks: &mut JoinSet<()>,
+            ) -> Result<()>
+            where
+                F: FnOnce() -> Result<ShardWorker> + 'static,
+            {
+                let shard = launch()?;
+                control_tasks.spawn_local(ignore(shard.run()));
+                Ok(())
+            }
+
+            pub(in crate::node) fn should_tune_control_thread(&self) -> bool {
+                false
+            }
+
+            pub(in crate::node) fn finish(self) {}
+        }
+    }
+
+    pub(super) use imp::Executor;
 }
 
+use platform::bind_tcp_listener;
 pub struct NodeBuilder {
+    // Data-plane topology
+    //
+    // `data_threads` is physical executor width. Logical shard count is derived
+    // from it and `shard_runtime`.
+    data_threads: usize,
+    shard_runtime: ShardRuntime,
+
     // Configuration
-    workers: usize,
     local_addr: Option<SocketAddr>,
     external_addrs: Vec<SocketAddr>,
     advertise_bound_udp: bool,
@@ -89,12 +421,10 @@ pub struct NodeBuilder {
     http_api: Option<ListenerSource>,
     internal_metrics: Option<ListenerSource>,
 
-    worker_execution: WorkerExecution,
-
     ebpf: bool,
 
     /// When `true`, UDP candidates are suppressed so that clients are forced
-    /// to use the TCP path.  Used in simulation tests that exercise TCP-only
+    /// to use the TCP path. Used in simulation tests that exercise TCP-only
     /// connectivity.
     tcp_only: bool,
 
@@ -115,7 +445,8 @@ impl Default for NodeBuilder {
 impl NodeBuilder {
     pub fn new() -> Self {
         Self {
-            workers: 1,
+            data_threads: 1,
+            shard_runtime: ShardRuntime::ThreadPerCore,
             local_addr: None,
             external_addrs: Vec::new(),
             advertise_bound_udp: false,
@@ -123,7 +454,6 @@ impl NodeBuilder {
             udp_mode: UdpMode::Batch,
             http_api: None,
             internal_metrics: None,
-            worker_execution: WorkerExecution::ThreadPerWorker,
             ebpf: true,
             tcp_only: false,
             room_shard_slot: crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
@@ -146,7 +476,7 @@ impl NodeBuilder {
     ///
     /// Lowering it is how a test reaches the cross-shard media path without
     /// needing a room large enough to spill naturally: below the threshold a
-    /// room is co-located and its fanout never leaves one core.
+    /// room is co-located and its fanout never leaves one shard.
     pub fn room_shard_slot(mut self, participants: usize) -> Self {
         assert!(
             participants > 0,
@@ -156,10 +486,55 @@ impl NodeBuilder {
         self
     }
 
-    /// Set the number of UDP workers (default: 1).
-    pub fn workers(mut self, workers: usize) -> Self {
-        self.workers = workers;
+    /// Set the number of physical data-plane executor threads.
+    ///
+    /// In thread-per-core mode this is also the number of logical shards. In
+    /// work-stealing mode the logical shard count is this value multiplied by
+    /// `shards_per_worker`.
+    pub fn data_threads(mut self, data_threads: usize) -> Self {
+        assert!(data_threads > 0, "a node needs at least one data thread");
+        self.data_threads = data_threads;
         self
+    }
+
+    /// Backward-compatible alias for `data_threads`.
+    ///
+    /// Prefer `data_threads`: a Tokio work-stealing worker is no longer the same
+    /// thing as a logical PulseBeam shard.
+    pub fn workers(self, workers: usize) -> Self {
+        self.data_threads(workers)
+    }
+
+    /// Execute one logical shard per dedicated OS thread/current-thread runtime.
+    pub fn thread_per_core(mut self) -> Self {
+        self.shard_runtime = ShardRuntime::ThreadPerCore;
+        self
+    }
+
+    /// Execute oversharded logical shards on a Tokio multi-thread work-stealing runtime.
+    ///
+    /// For example, `data_threads(4).work_stealing(16)` creates four Tokio
+    /// scheduler workers and sixty-four independently owned logical shards.
+    pub fn work_stealing(mut self, shards_per_worker: usize) -> Self {
+        assert!(
+            shards_per_worker > 0,
+            "a work-stealing worker must own at least one shard"
+        );
+        self.shard_runtime = ShardRuntime::WorkStealing { shards_per_worker };
+        self
+    }
+
+    /// Run shards as local tasks on the caller's runtime.
+    ///
+    /// This is retained for simulation. It deliberately does not mean
+    /// work-stealing: `spawn_local` tasks stay on the local executor thread.
+    pub fn with_current_runtime(mut self) -> Self {
+        self.shard_runtime = ShardRuntime::CurrentRuntime;
+        self
+    }
+
+    fn configured_shard_count(&self) -> usize {
+        self.shard_runtime.shard_count(self.data_threads)
     }
 
     /// Set the local bind address for UDP/TCP transports.
@@ -221,19 +596,13 @@ impl NodeBuilder {
         self
     }
 
-    /// Run shard workers on the current Tokio runtime instead of spawning one thread per worker.
-    pub fn with_current_runtime(mut self) -> Self {
-        self.worker_execution = WorkerExecution::SharedRuntime;
-        self
-    }
-
     pub fn without_ebpf(mut self) -> Self {
         self.ebpf = false;
         self
     }
 
     /// Suppress UDP host candidates so that only the TCP passive candidate is
-    /// advertised.  Clients that support TCP active will be forced onto TCP.
+    /// advertised. Clients that support TCP active will be forced onto TCP.
     /// Useful for integration / simulation tests that exercise the TCP path.
     pub fn tcp_only(mut self) -> Self {
         self.tcp_only = true;
@@ -242,7 +611,9 @@ impl NodeBuilder {
 
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
-        let workers_count = self.workers;
+        let data_threads = self.data_threads;
+        let shard_runtime = self.shard_runtime;
+        let requested_shard_count = self.configured_shard_count();
 
         // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
         // both IPv6 and IPv4 peers.
@@ -290,7 +661,7 @@ impl NodeBuilder {
         advertised_addrs.extend(v6_addrs);
         let primary_external_addr = advertised_addrs.first().copied();
 
-        let mut join_set = JoinSet::new();
+        let mut control_tasks = JoinSet::new();
         // Initialised here so the global recorder is in place before anything
         // runs, but served after the shards exist — it needs their metrics lane.
         let internal_ctx = match self.internal_metrics {
@@ -312,39 +683,54 @@ impl NodeBuilder {
         let cpu_cores = get_core_ids().unwrap_or_default();
         if cpu_cores.is_empty() {
             tracing::warn!(
-                "no CPU cores detected for thread affinity; worker threads will not be pinned"
+                "no CPU cores detected for thread affinity; dedicated data threads will not be pinned"
             );
         } else {
             tracing::info!(
                 count = cpu_cores.len(),
-                "detected CPU cores for thread affinity"
+                "detected CPU cores for data-plane affinity"
             );
         }
 
         let udp_sockets = bind_udp_sockets(
             local_addr,
             primary_external_addr,
-            workers_count,
+            requested_shard_count,
             self.udp_mode,
         )
         .await?;
 
         debug_assert!(!udp_sockets.is_empty());
+        let shard_count = udp_sockets.len();
 
-        let steering = match crate::control::steering::attach(&udp_sockets) {
-            Ok(steering) => {
-                metrics::gauge!("ebpf_steering_attached").set(1.0);
-                tracing::info!("attached eBPF UDP steering");
-                Some(steering)
+        if shard_count != requested_shard_count {
+            tracing::warn!(
+                requested = requested_shard_count,
+                running = shard_count,
+                "node is running fewer logical shards than configured"
+            );
+        }
+
+        let steering = if self.ebpf {
+            match crate::control::steering::attach(&udp_sockets) {
+                Ok(steering) => {
+                    metrics::gauge!("ebpf_steering_attached").set(1.0);
+                    tracing::info!("attached eBPF UDP steering");
+                    Some(steering)
+                }
+                Err(err) => {
+                    metrics::gauge!("ebpf_steering_attached").set(0.0);
+                    tracing::warn!(
+                        "eBPF UDP steering disabled; using userspace bootstrap forwarding: {:?}",
+                        err
+                    );
+                    None
+                }
             }
-            Err(err) => {
-                metrics::gauge!("ebpf_steering_attached").set(0.0);
-                tracing::warn!(
-                    "eBPF UDP steering disabled; using userspace bootstrap forwarding: {:?}",
-                    err
-                );
-                None
-            }
+        } else {
+            metrics::gauge!("ebpf_steering_attached").set(0.0);
+            tracing::info!("eBPF UDP steering disabled by configuration");
+            None
         };
 
         let tcp_listener = bind_tcp_listener(local_addr)
@@ -353,12 +739,14 @@ impl NodeBuilder {
         let bound_tcp_addr = tcp_listener.local_addr()?;
         tracing::info!(
             local_addr = ?bound_tcp_addr,
-            workers = udp_sockets.len(),
+            data_threads,
+            shards = shard_count,
+            runtime = ?shard_runtime,
             "RTC listeners ready"
         );
         let tcp_local_addr = primary_external_addr.unwrap_or(bound_tcp_addr);
 
-        let tcp_sockets: Vec<net::tcp::TcpTransport> = (0..workers_count)
+        let tcp_sockets: Vec<net::tcp::TcpTransport> = (0..shard_count)
             .map(|_| net::tcp::TcpTransport::new(tcp_local_addr))
             .collect();
 
@@ -389,15 +777,16 @@ impl NodeBuilder {
             }
         }
 
+        // This is the only owner of data-plane execution. The caller runtime
+        // remains the control runtime for controller/API/metrics tasks.
+        let mut shard_executor =
+            shard_executor::Executor::new(shard_runtime, data_threads, cpu_cores.clone())?;
+
         let (shard_event_tx, shard_event_rx) =
             mailbox::new(crate::shard::worker::SHARD_EVENT_CAPACITY);
-        // Stays empty under `sim`, where every shard shares one runtime.
-        #[cfg_attr(feature = "sim", allow(unused_mut))]
-        let mut shard_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        let mut frame_txs = Vec::new();
-        let mut frame_rxs = Vec::new();
-        let use_shared_runtime = matches!(self.worker_execution, WorkerExecution::SharedRuntime);
-        for _ in 0..udp_sockets.len() {
+        let mut frame_txs = Vec::with_capacity(shard_count);
+        let mut frame_rxs = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
             let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_FRAME_CAPACITY);
             frame_txs.push(tx);
             frame_rxs.push(rx);
@@ -415,13 +804,13 @@ impl NodeBuilder {
         // here, so every shard shares a timeline and nothing reads it again.
         let wall_anchor = WallAnchor::new(SystemTime::now(), Instant::now());
 
-        let mut shard_contexts = Vec::new();
+        let mut shard_contexts = Vec::with_capacity(shard_count);
 
         // Only built when something will scrape it, so a node without the
         // internal server never pays for a snapshot it would throw away.
         let stats_lane = internal_ctx.is_some().then(|| {
             mailbox::new::<Box<crate::shard::recorder::ShardStatsReport>>(
-                crate::shard::worker::STATS_CAPACITY.saturating_mul(workers_count.max(1)),
+                crate::shard::worker::STATS_CAPACITY.saturating_mul(shard_count.max(1)),
             )
         });
         let (stats_tx, stats_rx) = match stats_lane {
@@ -429,7 +818,7 @@ impl NodeBuilder {
             None => (None, None),
         };
 
-        let mut view_writers = Vec::with_capacity(workers_count);
+        let mut view_writers = Vec::with_capacity(shard_count);
 
         for (shard_idx, ((udp_sock, tcp_sock), frame_rx)) in udp_sockets
             .into_iter()
@@ -452,10 +841,11 @@ impl NodeBuilder {
             let worker_occupancy = occupancy.clone();
             let shard_stats_tx = stats_tx.clone();
 
-            if use_shared_runtime {
-                let shard = ShardWorker::new(
+            let launch = move || -> Result<ShardWorker> {
+                let udp_sock = udp_sock.into_unified_socket()?;
+                Ok(ShardWorker::new(
                     shard_id,
-                    udp_sock.into_unified_socket()?,
+                    udp_sock,
                     tcp_sock,
                     shard_command_rx,
                     update_reader,
@@ -465,79 +855,10 @@ impl NodeBuilder {
                     worker_occupancy,
                     shard_stats_tx,
                     wall_anchor,
-                );
-                join_set.spawn_local(ignore(shard.run()));
-            } else {
-                // A simulated socket is a member of a thread-local
-                // `SO_REUSEPORT` group and deliberately not `Send`: the group
-                // that decides which member a datagram belongs to lives on the
-                // host's thread. Simulations always take the branch above.
-                #[cfg(feature = "sim")]
-                pulsebeam_runtime::fatal!("a simulated node runs its shards on one runtime");
+                ))
+            };
 
-                #[cfg(not(feature = "sim"))]
-                {
-                    let core_id = if cpu_cores.is_empty() {
-                        None
-                    } else {
-                        shard_idx
-                            .checked_rem(cpu_cores.len())
-                            .and_then(|i| cpu_cores.get(i))
-                            .copied()
-                    };
-                    let builder = std::thread::Builder::new().name(format!("pb-w-{shard_id}"));
-                    let handle = builder
-                        .spawn(move || {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .enable_alt_timer()
-                                .build_local(tokio::runtime::LocalOptions::default())
-                                .unwrap_or_else(|err| {
-                                    pulsebeam_runtime::fatal!(
-                                        "shard {shard_id} cannot build its runtime: {err}"
-                                    )
-                                });
-                            let realtime = tune_current_data_thread(core_id);
-                            metrics::gauge!(
-                                "shard_realtime",
-                                "shard" => shard_id.index().to_string()
-                            )
-                            .set(f64::from(realtime));
-                            #[allow(
-                                clippy::disallowed_methods,
-                                reason = "the shard's dedicated OS thread enters its async runtime exactly once, here"
-                            )]
-                            rt.block_on(async move {
-                                let udp_sock = match udp_sock.into_unified_socket() {
-                                    Ok(sock) => sock,
-                                    Err(err) => pulsebeam_runtime::fatal!(
-                                        "shard {shard_id} cannot use its bound UDP socket: {err}"
-                                    ),
-                                };
-                                let shard = ShardWorker::new(
-                                    shard_id,
-                                    udp_sock,
-                                    tcp_sock,
-                                    shard_command_rx,
-                                    update_reader,
-                                    shard_event_tx,
-                                    frame_rx,
-                                    frame_txs,
-                                    worker_occupancy,
-                                    shard_stats_tx,
-                                    wall_anchor,
-                                );
-                                tokio::task::unconstrained(shard.run()).await;
-                            });
-                        })
-                        .unwrap_or_else(|err| {
-                            pulsebeam_runtime::fatal!(
-                                "cannot spawn the thread for shard {shard_id}: {err}"
-                            )
-                        });
-                    shard_handles.push(handle);
-                }
-            }
+            shard_executor.spawn(shard_id, launch, &mut control_tasks)?;
 
             shard_contexts.push(ShardContext {
                 command_tx: shard_command_tx,
@@ -546,16 +867,16 @@ impl NodeBuilder {
         }
 
         if let (Some(ctx), Some(stats_rx)) = (internal_ctx, stats_rx) {
-            join_set.spawn(ignore(ctx.serve_internal_http(
-                workers_count,
+            control_tasks.spawn(ignore(ctx.serve_internal_http(
+                shard_count,
                 stats_rx,
                 shutdown.child_token(),
             )));
         }
 
-        // set current thread to lower priority after spawning worker threads so
-        // we don't lower the worker threads' priorities
-        if matches!(self.worker_execution, WorkerExecution::ThreadPerWorker) {
+        // Lower control priority only after production data threads have been
+        // created, so they do not inherit the control-plane scheduling policy.
+        if shard_executor.should_tune_control_thread() {
             tune_current_control_thread();
         }
 
@@ -573,7 +894,7 @@ impl NodeBuilder {
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);
 
-        join_set.spawn(ignore(controller.run(
+        control_tasks.spawn(ignore(controller.run(
             controller_command_rx,
             shard_event_rx,
             shutdown.child_token(),
@@ -628,7 +949,7 @@ impl NodeBuilder {
             let api_server = axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown.child_token().cancelled_owned());
 
-            join_set.spawn(async move {
+            control_tasks.spawn(async move {
                 if let Err(e) = api_server.await {
                     tracing::error!("http server error: {e}");
                 }
@@ -637,16 +958,15 @@ impl NodeBuilder {
 
         // Wait for shutdown
         tokio::select! {
-            _ = join_set.join_all() => {}
+            _ = control_tasks.join_all() => {}
             _ = shutdown.cancelled() => {
                 tracing::info!("node received shutdown");
             }
         }
 
-        // TODO: should we bother joining here?
-        for handle in shard_handles {
-            let _ = handle.join();
-        }
+        // At this point the control task set has been consumed/dropped by the
+        // select above. Finish the independently-owned data executor afterwards.
+        shard_executor.finish();
 
         Ok(())
     }
@@ -659,12 +979,12 @@ pub struct NodeContext {
 async fn bind_udp_sockets(
     local_addr: SocketAddr,
     advertised_addr: Option<SocketAddr>,
-    workers: usize,
+    shards: usize,
     mode: UdpMode,
 ) -> Result<Vec<net::BoundUdpSocket>> {
-    let mut sockets = Vec::with_capacity(workers);
+    let mut sockets = Vec::with_capacity(shards);
 
-    for shard_index in 0..workers {
+    for shard_index in 0..shards {
         let shard_index = u16::try_from(shard_index).unwrap_or(u16::MAX);
         let socket =
             match net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await {
@@ -676,10 +996,10 @@ async fn bind_udp_sockets(
                     // Shedding workers here is not a capacity trade-off: a
                     // single-shard node never executes a cross-shard path at all.
                     tracing::warn!(
-                        requested = workers,
+                        requested = shards,
                         running = sockets.len(),
                         "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
-                     workers than requested: {e}"
+                     shards than requested: {e}"
                     );
                     break;
                 }
@@ -966,6 +1286,9 @@ mod internal {
     }
 
     async fn rt_background_monitor(prometheus: PrometheusHandle) {
+        // This task is spawned on the caller/control runtime, and these metric
+        // names have always described that runtime. Data-runtime metrics, if
+        // added, should use a separate prefix rather than changing this meaning.
         let metrics = Handle::current().metrics();
 
         describe_gauge!(
@@ -1213,10 +1536,11 @@ mod tests {
     /// configuration it starts from, where a silent change turns into a differently-shaped node
     /// with every test still green.
     #[test]
-    fn the_defaults_describe_a_single_worker_node_with_no_services() {
+    fn the_defaults_describe_a_single_thread_per_core_shard() {
         let builder = NodeBuilder::new();
 
-        assert_eq!(builder.workers, 1);
+        assert_eq!(builder.data_threads, 1);
+        assert_eq!(builder.configured_shard_count(), 1);
         assert!(builder.local_addr.is_none());
         assert!(builder.external_addrs.is_empty());
         assert!(builder.http_api.is_none(), "no API is exposed unless asked");
@@ -1224,10 +1548,7 @@ mod tests {
         assert!(!builder.tcp_only, "UDP candidates are offered by default");
         assert!(matches!(builder.udp_mode, UdpMode::Batch));
         assert!(builder.ebpf);
-        assert!(matches!(
-            builder.worker_execution,
-            WorkerExecution::ThreadPerWorker
-        ));
+        assert_eq!(builder.shard_runtime, ShardRuntime::ThreadPerCore);
         assert!(matches!(
             builder.room_placement,
             crate::control::core::RoomPlacement::Hashed
@@ -1239,10 +1560,40 @@ mod tests {
     }
 
     #[test]
+    fn work_stealing_overshards_each_scheduler_worker() {
+        let builder = NodeBuilder::new().data_threads(4).work_stealing(16);
+
+        assert_eq!(builder.data_threads, 4);
+        assert_eq!(builder.configured_shard_count(), 64);
+        assert_eq!(
+            builder.shard_runtime,
+            ShardRuntime::WorkStealing {
+                shards_per_worker: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn thread_per_core_keeps_one_shard_per_data_thread() {
+        let builder = NodeBuilder::new().data_threads(8).thread_per_core();
+
+        assert_eq!(builder.data_threads, 8);
+        assert_eq!(builder.configured_shard_count(), 8);
+    }
+
+    #[test]
+    fn the_workers_alias_still_sets_data_threads() {
+        let builder = NodeBuilder::new().workers(6);
+
+        assert_eq!(builder.data_threads, 6);
+        assert_eq!(builder.configured_shard_count(), 6);
+    }
+
+    #[test]
     fn the_builder_records_what_it_was_asked_for() {
         let addr: SocketAddr = "127.0.0.1:7070".parse().unwrap();
         let builder = NodeBuilder::new()
-            .workers(4)
+            .data_threads(4)
             .local_addr(addr)
             .external_addrs(vec![addr])
             .room_shard_slot(9)
@@ -1250,7 +1601,7 @@ mod tests {
             .tcp_only()
             .without_ebpf();
 
-        assert_eq!(builder.workers, 4);
+        assert_eq!(builder.data_threads, 4);
         assert_eq!(builder.local_addr, Some(addr));
         assert_eq!(builder.external_addrs, vec![addr]);
         assert_eq!(builder.room_shard_slot, 9);
@@ -1260,6 +1611,18 @@ mod tests {
             builder.room_placement,
             crate::control::core::RoomPlacement::RoundRobin
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one data thread")]
+    fn a_node_must_have_a_data_thread() {
+        let _ = NodeBuilder::new().data_threads(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one shard")]
+    fn a_work_stealing_worker_must_have_a_shard() {
+        let _ = NodeBuilder::new().work_stealing(0);
     }
 
     /// A zero-participant slot would divide by zero when placement asks which slot a room is on.
@@ -1276,7 +1639,8 @@ mod tests {
     #[test]
     fn default_is_new() {
         let (a, b) = (NodeBuilder::default(), NodeBuilder::new());
-        assert_eq!(a.workers, b.workers);
+        assert_eq!(a.data_threads, b.data_threads);
+        assert_eq!(a.shard_runtime, b.shard_runtime);
         assert_eq!(a.room_shard_slot, b.room_shard_slot);
         assert_eq!(a.tcp_only, b.tcp_only);
     }
