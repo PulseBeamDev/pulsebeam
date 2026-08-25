@@ -187,6 +187,11 @@ libwebrtc's receive path, and the two differ in ways that decide designs - see "
 belongs to the slot" below. A plan can be green while Chrome renders nothing. Changes to stream
 identity, SSRCs or SDP need a manual browser check; the suite cannot stand in for one.
 
+The bench fixtures have a static compatibility gate: their SPS values must stay constrained
+baseline at or below level 3.1, and the recorded Chrome SDP must still offer the corresponding
+packetization mode. That rejects an incompatible fixture before it reaches a browser, but it does
+not replace the documented manual browser check after changes to media or signaling.
+
 **Audio quality.** Who is heard, who they are, and how many streams they arrive on are asserted
 now. How *well* they are heard is not: there is no audio continuity, gap or concealment figure
 scoped to a listener's experience, and a 200ms gap is a lost syllable where the same gap in video

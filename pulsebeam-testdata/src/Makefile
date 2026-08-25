@@ -68,6 +68,7 @@ $(OUT_DIR)/full_f_cbr.h264: $(INPUT_VIDEO)
 		filesrc location=$< ! \
 		qtdemux ! h264parse ! avdec_h264 ! \
 		videorate ! video/x-raw,framerate=$(FPS)/1 ! \
+		videoscale ! video/x-raw,height=720,pixel-aspect-ratio=1/1 ! \
 		x264enc $(BASE_COMMON) $(CBR_FLAGS) bitrate=$(BITRATE_F) ! \
 		video/x-h264,profile=baseline,stream-format=byte-stream ! \
 		filesink location=$@

@@ -225,7 +225,11 @@ async fn spawn_room(
 
         join_set.spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            let _ = spawn_agent(ctx, r_name, simulcast, session_duration).await;
+            let agent_id = ctx.agent_id;
+            if let Err(error) = spawn_agent(ctx, r_name.clone(), simulcast, session_duration).await
+            {
+                tracing::error!(room = %r_name, agent_id, %error, "bench agent stopped");
+            }
         });
     }
 }
@@ -238,8 +242,7 @@ async fn spawn_agent(
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &ctx.api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let mut builder =
-        AgentBuilder::new(api, socket).with_local_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    let mut builder = AgentBuilder::new(api, socket);
 
     if simulcast {
         builder = builder.video_upstream_slots(
@@ -309,7 +312,10 @@ async fn spawn_agent(
                     join_set.spawn(async move {
                         match participant.video().subscribe().await {
                             Ok(track) => handle_receiving(track, ctx).await,
-                            Err(error) => tracing::warn!(%error, "failed to subscribe to participant video"),
+                            Err(error) => {
+                                tracing::error!(%error, "failed to subscribe to participant video");
+                                false
+                            }
                         }
                     });
                 }
@@ -318,12 +324,33 @@ async fn spawn_agent(
     }
 
     agent.close().await?;
-    join_set.join_all().await;
+    let received_video = join_set
+        .join_all()
+        .await
+        .into_iter()
+        .any(|received| received);
+    if !subscribed_participants.is_empty() && !received_video {
+        tracing::error!(
+            room_id = ctx.room_id,
+            agent_id = ctx.agent_id,
+            subscriptions = subscribed_participants.len(),
+            "bench agent received no remote video frames"
+        );
+    }
     Ok(())
 }
 
-async fn handle_receiving(mut track: RemoteTrack, ctx: AgentContext) {
+async fn handle_receiving(mut track: RemoteTrack, ctx: AgentContext) -> bool {
+    let mut received = false;
     while let Ok(rtp) = track.recv().await {
+        if !received {
+            received = true;
+            tracing::info!(
+                room_id = ctx.room_id,
+                agent_id = ctx.agent_id,
+                "bench agent received remote video"
+            );
+        }
         if let Some(abs_capture_time) = rtp.ext_vals.abs_capture_time.map(|a| a.capture_time) {
             let wallclock = wallclock_at(Instant::now());
             if let Ok(latency) = wallclock.duration_since(abs_capture_time) {
@@ -336,6 +363,7 @@ async fn handle_receiving(mut track: RemoteTrack, ctx: AgentContext) {
             }
         }
     }
+    received
 }
 
 async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -> Result<()> {

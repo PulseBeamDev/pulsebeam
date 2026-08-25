@@ -118,6 +118,32 @@ pub fn frame_timestamps_micros(data: &str) -> Vec<u64> {
     timestamps
 }
 
+pub fn h264_sps_profile_level_id(data: &[u8]) -> Option<[u8; 3]> {
+    let mut i = 0usize;
+    while i.saturating_add(4) < data.len() {
+        let short =
+            data[i] == 0 && data[i.saturating_add(1)] == 0 && data[i.saturating_add(2)] == 1;
+        let long = data[i] == 0
+            && data[i.saturating_add(1)] == 0
+            && data[i.saturating_add(2)] == 0
+            && data[i.saturating_add(3)] == 1;
+        if short || long {
+            let header = i.saturating_add(if short { 3 } else { 4 });
+            if data.get(header).is_some_and(|byte| byte & 0x1f == 7) {
+                return Some([
+                    *data.get(header.saturating_add(1))?,
+                    *data.get(header.saturating_add(2))?,
+                    *data.get(header.saturating_add(3))?,
+                ]);
+            }
+            i = header.saturating_add(1);
+        } else {
+            i = i.saturating_add(1);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     // Tests assert by panicking; the process ending is the mechanism.
@@ -165,5 +191,31 @@ mod tests {
         static_window_rates.sort_unstable();
         let median = static_window_rates[static_window_rates.len() / 2];
         assert!(median <= 20, "f static median {median}kbps exceeds 20kbps");
+    }
+
+    #[test]
+    fn bench_h264_fixtures_fit_the_chrome_baseline_contract() {
+        assert!(
+            RAW_CHROME_SDP.contains("packetization-mode=1;profile-level-id=42e01f"),
+            "recorded Chrome SDP must offer constrained-baseline packetization mode 1 at level 3.1"
+        );
+        for (rid, fixture) in [
+            ("f", RAW_H264_FULL_CBR),
+            ("h", RAW_H264_HALF_CBR),
+            ("q", RAW_H264_QUARTER_CBR),
+        ] {
+            let [profile, constraints, level] = h264_sps_profile_level_id(fixture)
+                .unwrap_or_else(|| panic!("{rid} fixture has no SPS"));
+            assert_eq!(profile, 0x42, "{rid} must remain H.264 baseline");
+            assert_eq!(
+                constraints & 0xc0,
+                0xc0,
+                "{rid} must be constrained baseline"
+            );
+            assert!(
+                level <= 0x1f,
+                "{rid} level {level:#04x} exceeds Chrome's level 3.1 contract"
+            );
+        }
     }
 }

@@ -37,6 +37,135 @@ fn video_does_not_loop_back_to_publisher_test() {
         ]);
 }
 
+fn bench_participant(name: &'static str) -> Participant {
+    let mut participant = Participant::single_publisher(name).and_subscribes();
+    participant.slots = 7;
+    participant
+}
+
+#[test]
+fn remote_bench_room_joiners_render_every_other_participant() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("bench-room")
+                .with_participant(bench_participant("alice"))
+                .with_participant(Participant {
+                    starts_disconnected: true,
+                    ..bench_participant("bob")
+                })
+                .with_participant(Participant {
+                    starts_disconnected: true,
+                    ..bench_participant("carol")
+                })
+                .with_participant(Participant {
+                    starts_disconnected: true,
+                    ..bench_participant("dave")
+                }),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the first remote bench participant",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Bob joins within the bench join spread",
+                participant: "bob",
+            },
+            Step::Run {
+                description: "Let Bob publish and subscribe",
+                duration: Duration::from_secs(1),
+            },
+            Step::Join {
+                description: "Carol joins within the bench join spread",
+                participant: "carol",
+            },
+            Step::Run {
+                description: "Let Carol publish and subscribe",
+                duration: Duration::from_secs(1),
+            },
+            Step::Join {
+                description: "Dave joins within the bench join spread",
+                participant: "dave",
+            },
+            Step::Run {
+                description: "Converge the remote four-way bench room",
+                duration: Duration::from_secs(12),
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Alice renders Bob",
+                participant: "alice",
+                publisher: "bob",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Alice renders Carol",
+                participant: "alice",
+                publisher: "carol",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Alice renders Dave",
+                participant: "alice",
+                publisher: "dave",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Bob renders Alice",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Bob renders Carol",
+                participant: "bob",
+                publisher: "carol",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Bob renders Dave",
+                participant: "bob",
+                publisher: "dave",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Carol renders Alice",
+                participant: "carol",
+                publisher: "alice",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Carol renders Bob",
+                participant: "carol",
+                publisher: "bob",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Carol renders Dave",
+                participant: "carol",
+                publisher: "dave",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Dave renders Alice",
+                participant: "dave",
+                publisher: "alice",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Dave renders Bob",
+                participant: "dave",
+                publisher: "bob",
+                min_frames: 30,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Dave renders Carol",
+                participant: "dave",
+                publisher: "carol",
+                min_frames: 30,
+            },
+        ]);
+}
+
 #[test]
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
 fn cross_shard_stats_reach_the_subscriber_allocator() {
