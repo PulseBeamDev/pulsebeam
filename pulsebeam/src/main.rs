@@ -99,13 +99,7 @@ fn main() {
         .unwrap_or_else(|err| pulsebeam_runtime::fatal!("cannot build the node runtime: {err}"));
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    if let Err(err) = rt.block_on(run(
-        shutdown.clone(),
-        workers,
-        rtc_port,
-        args.iface,
-        args.dev,
-    )) {
+    if let Err(err) = rt.block_on(run(shutdown.clone(), workers, rtc_port, args.iface)) {
         pulsebeam_runtime::fatal!("server failed: {err:#}");
     }
     shutdown.cancel();
@@ -116,7 +110,6 @@ pub async fn run(
     workers: usize,
     rtc_port: u16,
     network_interface: Option<String>,
-    dev: bool,
 ) -> Result<()> {
     let external_ips =
         pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
@@ -142,11 +135,6 @@ pub async fn run(
         .rng(rng)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr);
-    let node_builder = if dev {
-        node_builder.without_ebpf()
-    } else {
-        node_builder
-    };
 
     let node = node_builder.run(shutdown.child_token());
     // Not `spawn`: under `--features sim` a bound socket belongs to a

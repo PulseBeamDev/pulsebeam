@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, io, time::Duration};
 
+use crate::control::steering::Steering;
 use crate::track::{SelectionPolicy, TrackSelector};
 use crate::{
     control::{
@@ -131,8 +132,7 @@ pub struct ControllerActor {
     egress_ready: bool,
     lifecycle: TrackLifecycle,
     command_backlog: VecDeque<(ShardId, ShardCommand)>,
-    #[cfg(not(feature = "sim"))]
-    steering: Option<crate::ebpf::Steering>,
+    steering: Option<Box<dyn Steering>>,
 }
 
 impl ControllerActor {
@@ -161,18 +161,14 @@ impl ControllerActor {
             updates,
             lifecycle: TrackLifecycle::new(shard_count),
             command_backlog: VecDeque::new(),
-            #[cfg(not(feature = "sim"))]
             steering: None,
         }
     }
 
-    #[cfg(not(feature = "sim"))]
-    pub(crate) fn set_steering(&mut self, steering: crate::ebpf::Steering) {
-        debug_assert!(self.steering.is_none());
-        self.steering = Some(steering);
+    pub(crate) fn set_steering(&mut self, steering: Option<Box<dyn Steering>>) {
+        self.steering = steering;
     }
 
-    #[cfg(not(feature = "sim"))]
     fn pin_flow_to_owner(
         &mut self,
         source: std::net::SocketAddr,
@@ -182,20 +178,7 @@ impl ControllerActor {
         let Some(steering) = self.steering.as_mut() else {
             return;
         };
-        let flow = crate::ebpf::flow_key(source, destination);
-        if let Err(error) = steering.install_flow(flow, shard) {
-            tracing::warn!(%error, shard, "failed to install authenticated eBPF flow");
-        }
-    }
-
-    #[cfg(feature = "sim")]
-    fn pin_flow_to_owner(
-        &mut self,
-        source: std::net::SocketAddr,
-        destination: std::net::SocketAddr,
-        shard: u16,
-    ) {
-        pulsebeam_runtime::net::install_steering_flow(source, destination, shard);
+        steering.pin_flow_to_owner(source, destination, shard);
     }
 
     pub(crate) async fn run(

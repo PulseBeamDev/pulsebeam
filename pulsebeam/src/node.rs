@@ -331,13 +331,20 @@ impl NodeBuilder {
 
         debug_assert!(!udp_sockets.is_empty());
 
-        #[cfg(not(feature = "sim"))]
-        let steering = if self.ebpf {
-            crate::ebpf::attach(&udp_sockets)?
-        } else {
-            metrics::gauge!("ebpf_steering_attached").set(0.0);
-            tracing::info!("eBPF UDP steering disabled; using userspace bootstrap forwarding");
-            None
+        let steering = match crate::control::steering::attach(&udp_sockets) {
+            Ok(steering) => {
+                metrics::gauge!("ebpf_steering_attached").set(1.0);
+                tracing::info!("attached eBPF UDP steering");
+                Some(steering)
+            }
+            Err(err) => {
+                metrics::gauge!("ebpf_steering_attached").set(0.0);
+                tracing::warn!(
+                    "eBPF UDP steering disabled; using userspace bootstrap forwarding: {:?}",
+                    err
+                );
+                None
+            }
         };
 
         let tcp_listener = bind_tcp_listener(local_addr)
@@ -552,7 +559,7 @@ impl NodeBuilder {
             tune_current_control_thread();
         }
 
-        let controller = ControllerActor::with_placement(
+        let mut controller = ControllerActor::with_placement(
             controller_rng,
             shard_contexts,
             candidates,
@@ -561,12 +568,7 @@ impl NodeBuilder {
             self.room_placement,
             view_writers,
         );
-        #[cfg(not(feature = "sim"))]
-        let mut controller = controller;
-        #[cfg(not(feature = "sim"))]
-        if let Some(steering) = steering {
-            controller.set_steering(steering);
-        }
+        controller.set_steering(steering);
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);

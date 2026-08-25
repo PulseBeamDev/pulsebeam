@@ -1,6 +1,9 @@
-use crate::classify::{self, DropReason, NodeVerdict};
+use crate::{
+    ROUTE_SHARD_BITS,
+    classify::{self, DropReason, NodeVerdict},
+};
 
-pub const MAX_SHARDS: u32 = 1024;
+pub const MAX_SHARDS: u32 = 1 << ROUTE_SHARD_BITS;
 pub const MAX_FLOWS: u32 = 131_072;
 pub const SIM_FLOW_CAPACITY: usize = 4096;
 

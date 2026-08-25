@@ -7,7 +7,7 @@ use std::{collections::VecDeque, pin::Pin};
     clippy::disallowed_types,
     reason = "Arc<ShardMetrics>, one per shard, see module note"
 )]
-use std::{marker::PhantomData, rc::Rc, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
 use crate::route::Envelope;
@@ -311,16 +311,10 @@ pub(crate) struct ShardWorker {
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
     metrics: Arc<ShardMetrics>,
-    /// This shard's own `metrics` recorder. `Rc` because it never leaves the
-    /// core; the handles it hands out are the only things that must be `Sync`,
-    /// and only because the `metrics` crate's signatures say so.
-    recorder: Rc<ShardRecorder>,
+    recorder: Arc<ShardRecorder>,
     stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
     stats_due: Instant,
     last_busy: Duration,
-
-    // Mark !Send
-    _marker: PhantomData<*mut ()>,
 }
 
 impl ShardWorker {
@@ -372,7 +366,7 @@ impl ShardWorker {
             router,
             metrics,
             recorder: {
-                let recorder = Rc::new(ShardRecorder::new());
+                let recorder = Arc::new(ShardRecorder::new());
                 metrics::with_local_recorder(&*recorder, describe_shard_metrics);
                 recorder
             },
@@ -381,7 +375,6 @@ impl ShardWorker {
                 .checked_add(STATS_REPORT_INTERVAL)
                 .unwrap_or_else(Instant::now),
             last_busy: Duration::ZERO,
-            _marker: PhantomData,
         }
     }
 
@@ -392,6 +385,7 @@ impl ShardWorker {
     }
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
+        let recorder = Arc::clone(&self.recorder);
         let sleep = tokio::time::sleep(tokio::time::Duration::MAX);
         tokio::pin!(sleep);
 
@@ -403,13 +397,6 @@ impl ShardWorker {
             self.metrics
                 .record_idle(busy_start.saturating_duration_since(loop_start));
 
-            // Every `metrics::*` call reached from here resolves against this
-            // shard's own recorder rather than the process-global one, so an
-            // increment touches memory no other core does. Installed per tick
-            // rather than per thread because under `SharedRuntime` every shard
-            // of a node shares one thread, and attribution must come from the
-            // installed recorder rather than from thread identity.
-            let recorder = Rc::clone(&self.recorder);
             let previous_busy = self.last_busy;
             metrics::with_local_recorder(&*recorder, || {
                 self.observe_health(previous_busy);

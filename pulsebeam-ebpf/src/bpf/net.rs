@@ -43,19 +43,24 @@ impl UdpPacket<'_> {
 fn packet_bytes(ctx: &SkReuseportContext) -> Option<(usize, usize)> {
     let start = ctx.data();
     let end = ctx.data_end();
+
     if end < start {
         return None;
     }
+
     Some((start, end))
 }
 
 fn read_at(start: usize, end: usize, offset: usize, buf: &mut [u8]) -> Option<()> {
-    let read_start = start.checked_add(offset)?;
-    let read_end = read_start.checked_add(buf.len())?;
+    let read_start = start + offset;
+    let read_end = read_start + buf.len();
+
     if read_end > end {
         return None;
     }
+
     let src = unsafe { core::slice::from_raw_parts(read_start as *const u8, buf.len()) };
+
     buf.copy_from_slice(src);
     Some(())
 }
@@ -192,16 +197,35 @@ fn finish_udp<'a>(
 ) -> Option<UdpPacket<'a>> {
     let mut ports = [0u8; 4];
     read_at(start, end, l4_offset, &mut ports)?;
+
     flow.src_port = u16::from_be_bytes([ports[0], ports[1]]);
     flow.dst_port = u16::from_be_bytes([ports[2], ports[3]]);
 
+    if end < start {
+        return None;
+    }
+
+    // From this point onward, keep everything as scalar offsets/lengths.
+    let packet_len = end - start;
+
     let payload_offset = l4_offset.checked_add(UDP_HEADER_LEN)?;
-    let available = end.checked_sub(start.checked_add(payload_offset)?)?;
+    if payload_offset > packet_len {
+        return None;
+    }
+
+    let available = packet_len - payload_offset;
     let payload_len = core::cmp::min(available, MAX_PAYLOAD);
 
-    let payload_start = start.checked_add(payload_offset)?;
-    let payload_end = payload_start.checked_add(payload_len)?;
-    debug_assert!(payload_end <= end);
+    // Only after proving the offset is inside the packet do we reconstruct
+    // the packet pointer.
+    let payload_start = start + payload_offset;
+
+    // Give the verifier an explicit direct-packet-access bound.
+    let payload_end = payload_start + payload_len;
+    if payload_end > end {
+        return None;
+    }
+
     let payload = unsafe { core::slice::from_raw_parts(payload_start as *const u8, payload_len) };
 
     Some(UdpPacket { flow, payload })
