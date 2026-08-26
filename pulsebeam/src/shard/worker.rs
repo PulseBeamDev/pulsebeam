@@ -311,6 +311,7 @@ pub(crate) struct ShardWorker {
         reason = "Arc<ShardMetrics>, one per shard, see module note"
     )]
     metrics: Arc<ShardMetrics>,
+    health_metrics: ShardHealthMetrics,
     #[allow(
         clippy::disallowed_types,
         reason = "Arc<ShardRecorder>, only cloned at init"
@@ -319,6 +320,37 @@ pub(crate) struct ShardWorker {
     stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
     stats_due: Instant,
     last_busy: Duration,
+}
+
+struct ShardHealthMetrics {
+    participants_live: metrics::Gauge,
+    busy_us: metrics::Counter,
+    idle_us: metrics::Counter,
+    tick_us: metrics::Histogram,
+    shard_long_tick: metrics::Counter,
+}
+
+impl ShardHealthMetrics {
+    fn register(recorder: &ShardRecorder) -> Self {
+        metrics::with_local_recorder(recorder, || Self {
+            participants_live: metrics::gauge!("participants_live"),
+            busy_us: metrics::counter!("busy_us"),
+            idle_us: metrics::counter!("idle_us"),
+            tick_us: metrics::histogram!("tick_us"),
+            shard_long_tick: metrics::counter!("shard_long_tick"),
+        })
+    }
+
+    fn observe(&self, participants: usize, busy_us: u64, idle_us: u64, previous_busy: Duration) {
+        self.participants_live.set(participants as f64);
+        self.busy_us.absolute(busy_us);
+        self.idle_us.absolute(idle_us);
+        self.tick_us
+            .record(u64::try_from(previous_busy.as_micros()).unwrap_or(u64::MAX) as f64);
+        if previous_busy >= LONG_TICK {
+            self.shard_long_tick.increment(1);
+        }
+    }
 }
 
 impl ShardWorker {
@@ -356,6 +388,9 @@ impl ShardWorker {
             shard_id,
             frame_txs,
         };
+        let recorder = ShardRecorder::shared();
+        metrics::with_local_recorder(&*recorder, describe_shard_metrics);
+        let health_metrics = ShardHealthMetrics::register(&recorder);
 
         Self {
             core,
@@ -369,11 +404,8 @@ impl ShardWorker {
             frame_batch: Vec::with_capacity(SHARD_FRAME_BUDGET),
             router,
             metrics,
-            recorder: {
-                let recorder = ShardRecorder::shared();
-                metrics::with_local_recorder(&*recorder, describe_shard_metrics);
-                recorder
-            },
+            health_metrics,
+            recorder,
             stats_tx,
             stats_due: Instant::now()
                 .checked_add(STATS_REPORT_INTERVAL)
@@ -427,15 +459,13 @@ impl ShardWorker {
     /// Recorded for the previous tick so it costs one recorder scope per loop
     /// rather than two.
     fn observe_health(&self, previous_busy: Duration) {
-        metrics::gauge!("participants_live").set(self.core.participant_count() as f64);
         let (busy_us, idle_us) = self.metrics.read_raw();
-        metrics::counter!("busy_us").absolute(busy_us);
-        metrics::counter!("idle_us").absolute(idle_us);
-        metrics::histogram!("tick_us")
-            .record(u64::try_from(previous_busy.as_micros()).unwrap_or(u64::MAX) as f64);
-        if previous_busy >= LONG_TICK {
-            metrics::counter!("shard_long_tick").increment(1);
-        }
+        self.health_metrics.observe(
+            self.core.participant_count(),
+            busy_us,
+            idle_us,
+            previous_busy,
+        );
     }
 
     /// Hand this shard's cumulative metrics to the control plane.
@@ -626,5 +656,47 @@ impl ShardWorker {
         metrics::counter!("shard_tick_budget_hit", "phase" => phase).increment(1);
         #[cfg(feature = "sim")]
         crate::sim_metrics::record_routing_counter("shard_tick_budget_hit");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::recorder::MetricKey;
+
+    fn find(keys: &[MetricKey], name: &str) -> usize {
+        for (idx, key) in keys.iter().enumerate() {
+            if key.name == name {
+                return idx;
+            }
+        }
+        panic!("missing metric {name}");
+    }
+
+    #[test]
+    fn cached_health_handles_preserve_observations() {
+        let recorder = ShardRecorder::new();
+        let health = ShardHealthMetrics::register(&recorder);
+
+        health.observe(4, 100, 200, Duration::from_micros(50));
+        health.observe(7, 300, 400, LONG_TICK);
+
+        let report = recorder.snapshot(ShardId::new(0));
+        let schema = report.schema.expect("first report carries schema");
+        let participants = find(&schema.gauges, "participants_live");
+        let busy = find(&schema.counters, "busy_us");
+        let idle = find(&schema.counters, "idle_us");
+        let long_tick = find(&schema.counters, "shard_long_tick");
+        let tick = find(&schema.histograms, "tick_us");
+
+        assert_eq!(report.gauges[participants], 7.0);
+        assert_eq!(report.counters[busy], 300);
+        assert_eq!(report.counters[idle], 400);
+        assert_eq!(report.counters[long_tick], 1);
+        assert_eq!(report.histograms[tick].count, 2);
+        assert_eq!(
+            report.histograms[tick].sum,
+            50 + u64::try_from(LONG_TICK.as_micros()).expect("long tick fits microseconds")
+        );
     }
 }
