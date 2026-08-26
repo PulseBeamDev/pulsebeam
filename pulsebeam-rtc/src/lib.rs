@@ -1,4 +1,5 @@
 mod data_channel;
+mod gcc;
 mod id;
 mod media;
 mod negotiation;
@@ -9,6 +10,10 @@ mod transport;
 pub use data_channel::{
     DataChannelAssociation, DataChannelError, DataChannelEvent, DataChannelOpen,
     DataChannelReliability,
+};
+pub use gcc::{
+    CongestionEstimate, EgressCongestion, Gcc, GccError, GccOutcome, ProbeDecision, TwccFeedback,
+    TwccStatus, parse_twcc,
 };
 pub use id::{ChannelId, ConnectionId, MediaSectionId, PacketId, SendId, StreamId};
 pub use media::{
