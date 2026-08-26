@@ -29,9 +29,9 @@ impl UpstreamAudio {
         index: usize,
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
-        rtp: &mut RtpPacket,
+        rtp: RtpPacket,
         sr: Option<SenderInfo>,
-    ) -> bool {
+    ) -> crate::track::ProcessedRtp {
         self.media.handle_incoming_rtp(index, mid, rid, rtp, sr)
     }
     pub(super) fn announce_state_mut(

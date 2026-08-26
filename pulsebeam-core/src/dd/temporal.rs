@@ -239,7 +239,7 @@ impl TemporalDdSource {
         &mut self,
         is_keyframe: bool,
         packet_count: usize,
-    ) -> Option<Vec<crate::dd::RawDependencyDescriptor>> {
+    ) -> Result<Vec<crate::dd::RawDependencyDescriptor>, crate::dd::DdWriteError> {
         debug_assert!(packet_count > 0, "an encoded frame needs an RTP packet");
         let dd = self.generator.next(is_keyframe);
         let mut packets = Vec::with_capacity(packet_count);
@@ -252,16 +252,20 @@ impl TemporalDdSource {
             }
 
             let mut buf = [0u8; crate::dd::model::MAX_DD_LEN];
-            let n = self.writer.write(&packet_dd, &mut buf).ok()?;
+            let n = self.writer.write(&packet_dd, &mut buf)?;
             packets.push(crate::dd::RawDependencyDescriptor(
-                buf.get(..n)?.iter().copied().collect(),
+                buf.get(..n)
+                    .ok_or(crate::dd::DdWriteError::Overflow)?
+                    .iter()
+                    .copied()
+                    .collect(),
             ));
         }
-        Some(packets)
+        Ok(packets)
     }
 
     pub fn next(&mut self, is_keyframe: bool) -> Option<crate::dd::RawDependencyDescriptor> {
-        self.next_frame(is_keyframe, 1)?.into_iter().next()
+        self.next_frame(is_keyframe, 1).ok()?.into_iter().next()
     }
 }
 

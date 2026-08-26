@@ -18,10 +18,12 @@ use str0m::rtp::SeqNo;
 /// retransmission, not a wrong packet.
 const EMPTY_SLOT: u64 = u64::MAX;
 
-/// Ring capacity. Must be a power of two so `seq & CACHE_MASK` indexes a slot.
-const STREAM_CACHE_CAPACITY: usize = 512;
-const CACHE_MASK: u64 = (STREAM_CACHE_CAPACITY - 1) as u64;
-const _: () = assert!(STREAM_CACHE_CAPACITY.is_power_of_two());
+/// Ring capacity. Must be a power of two so `seq & PACKET_WINDOW_MASK` indexes a slot.
+pub(crate) const PACKET_WINDOW_CAPACITY: usize = 512;
+const PACKET_WINDOW_MASK: u64 = (PACKET_WINDOW_CAPACITY - 1) as u64;
+const _: () = assert!(PACKET_WINDOW_CAPACITY.is_power_of_two());
+#[cfg(test)]
+const STREAM_CACHE_CAPACITY: usize = PACKET_WINDOW_CAPACITY;
 
 /// How many frames a switch segment may span.
 ///
@@ -70,25 +72,7 @@ const MAX_REPLAY_SPAN_MS: u64 = 400;
 /// on more than one packet without starting a new frame.
 #[derive(Debug)]
 pub struct StreamCache {
-    /// What each ring slot currently holds, or [`EMPTY_SLOT`] for none.
-    ///
-    /// Split out from `ring` because every probe reads this and nothing else.
-    /// A packet is 280 bytes — five cache lines — and answering "is sequence
-    /// number `n` still here" by reading one is what made a NACK walk stream
-    /// the whole 143KB ring to find a handful of packets. Eight bytes per slot
-    /// makes the same walk 4KB, sequential, and prefetchable.
-    ///
-    /// Index-aligned with `ring`: `seqs[i] != EMPTY_SLOT` exactly when
-    /// `ring[i].is_some()`, and then it is that packet's sequence number.
-    seqs: Box<[u64]>,
-    /// Direct-mapped ring indexed by `seq & CACHE_MASK`. Two sequence numbers
-    /// `CAPACITY` apart share a slot; a read verifies `seqs[slot] == wanted`, so
-    /// an evicted entry (overwritten by a newer packet at the same slot) reads as
-    /// absent.
-    ring: Box<[Option<RtpPacket>]>,
-    /// Highest sequence number stored — the write frontier. The live window is
-    /// `[newest_seq - CAPACITY + 1, newest_seq]`.
-    newest_seq: Option<u64>,
+    packets: PacketWindow,
     /// First sequence number of the current keyframe frame, and its RTP
     /// timestamp. The replay segment runs from here to the frontier.
     segment_start_seq: Option<u64>,
@@ -101,31 +85,35 @@ pub struct StreamCache {
     pps: Option<RtpPacket>,
 }
 
-impl Default for StreamCache {
+/// Fixed, sequence-addressed RTP storage shared by ingress reordering and
+/// subscriber replay.
+#[derive(Debug)]
+pub(crate) struct PacketWindow {
+    seqs: Box<[u64]>,
+    ring: Box<[Option<RtpPacket>]>,
+    newest_seq: Option<u64>,
+}
+
+impl Default for PacketWindow {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl StreamCache {
-    pub fn new() -> Self {
+impl PacketWindow {
+    pub(crate) fn new() -> Self {
         Self {
-            seqs: vec![EMPTY_SLOT; STREAM_CACHE_CAPACITY].into_boxed_slice(),
+            seqs: vec![EMPTY_SLOT; PACKET_WINDOW_CAPACITY].into_boxed_slice(),
             ring: std::iter::repeat_with(|| None)
-                .take(STREAM_CACHE_CAPACITY)
+                .take(PACKET_WINDOW_CAPACITY)
                 .collect(),
             newest_seq: None,
-            segment_start_seq: None,
-            segment_ts: None,
-            sps: None,
-            pps: None,
         }
     }
 
-    /// The packet occupying `seq`'s slot, if that slot actually holds `seq`.
     #[inline]
-    fn slot(&self, seq: u64) -> Option<&RtpPacket> {
-        let index = (seq & CACHE_MASK) as usize;
+    pub(crate) fn get(&self, seq: u64) -> Option<&RtpPacket> {
+        let index = (seq & PACKET_WINDOW_MASK) as usize;
         if self.seqs.get(index).copied() != Some(seq) {
             return None;
         }
@@ -135,6 +123,64 @@ impl StreamCache {
             "the sequence index and the ring disagree about slot {index}"
         );
         stored
+    }
+
+    pub(crate) fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
+        let seq = *pkt.seq_no;
+        if let Some(newest) = self.newest_seq
+            && seq.wrapping_add(PACKET_WINDOW_CAPACITY as u64) <= newest
+        {
+            return Some(pkt);
+        }
+
+        let index = (seq & PACKET_WINDOW_MASK) as usize;
+        let (Some(slot), Some(stored_seq)) = (self.ring.get_mut(index), self.seqs.get_mut(index))
+        else {
+            debug_assert!(false, "packet window index escaped its ring");
+            return Some(pkt);
+        };
+        *slot = Some(pkt);
+        *stored_seq = seq;
+        self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
+        None
+    }
+
+    pub(crate) fn newest_seq(&self) -> Option<u64> {
+        self.newest_seq
+    }
+
+    pub(crate) fn take_all_sorted(&mut self) -> Vec<RtpPacket> {
+        let mut packets: Vec<_> = self.ring.iter_mut().filter_map(Option::take).collect();
+        packets.sort_unstable_by_key(|pkt| *pkt.seq_no);
+        self.seqs.fill(EMPTY_SLOT);
+        self.newest_seq = None;
+        packets
+    }
+
+    pub(crate) fn clear(&mut self) {
+        for slot in &mut self.ring {
+            *slot = None;
+        }
+        self.seqs.fill(EMPTY_SLOT);
+        self.newest_seq = None;
+    }
+}
+
+impl Default for StreamCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamCache {
+    pub fn new() -> Self {
+        Self {
+            packets: PacketWindow::new(),
+            segment_start_seq: None,
+            segment_ts: None,
+            sps: None,
+            pps: None,
+        }
     }
 
     /// Take ownership of a packet, handing it back only when it was too old to
@@ -155,33 +201,14 @@ impl StreamCache {
 
         let seq = *pkt.seq_no;
 
-        // Reject a packet that has already slid out of the window: its slot now
-        // holds a newer packet, and overwriting that would corrupt the window.
-        if let Some(newest) = self.newest_seq
-            && seq.wrapping_add(STREAM_CACHE_CAPACITY as u64) <= newest
-        {
-            return Some(pkt);
-        }
-
         let frame_ts = pkt.rtp_ts.numer();
         // Anchoring needs the keyframe's *first* packet, not any packet of it.
-        // A Dependency Descriptor carries the template structure on every packet
-        // of a keyframe, so `is_keyframe` is true across the whole frame, and
-        // under reordering the one that arrives first is routinely not the head.
         let opens_segment = pkt.is_keyframe && pkt.is_frame_start;
 
-        // Placing the packet naturally evicts whatever occupied its slot
-        // `CAPACITY` positions ago — no eviction loop needed.
-        let index = (seq & CACHE_MASK) as usize;
-        if let (Some(slot), Some(stored_seq)) = (self.ring.get_mut(index), self.seqs.get_mut(index))
-        {
-            *slot = Some(pkt);
-            *stored_seq = seq;
-        } else {
-            debug_assert!(false, "CACHE_MASK produced an index outside the ring");
-            return None;
+        if let Some(pkt) = self.packets.push(pkt) {
+            return Some(pkt);
         }
-        self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
+        let newest = self.packets.newest_seq();
 
         // Re-anchor when the head of the same keyframe turns up late: a segment
         // opened on a later packet would replay a frame the receiver cannot
@@ -196,8 +223,8 @@ impl StreamCache {
 
         // Advancing the frontier may have overwritten the segment head; if so the
         // remaining segment would start mid-frame, so it is no longer replayable.
-        if let (Some(start), Some(newest)) = (self.segment_start_seq, self.newest_seq)
-            && start.wrapping_add(STREAM_CACHE_CAPACITY as u64) <= newest
+        if let (Some(start), Some(newest)) = (self.segment_start_seq, newest)
+            && start.wrapping_add(PACKET_WINDOW_CAPACITY as u64) <= newest
         {
             self.segment_ts = None;
             self.segment_start_seq = None;
@@ -211,11 +238,11 @@ impl StreamCache {
     fn open_segment(&mut self, kf_seq: u64, frame_ts: u64) {
         let mut start = kf_seq;
         // Walk back over packets of the same frame. Bounded by the window.
-        for _ in 0..STREAM_CACHE_CAPACITY {
+        for _ in 0..PACKET_WINDOW_CAPACITY {
             let Some(prev) = start.checked_sub(1) else {
                 break;
             };
-            match self.slot(prev) {
+            match self.packets.get(prev) {
                 Some(p) if p.rtp_ts.numer() == frame_ts => start = prev,
                 _ => break,
             }
@@ -238,7 +265,7 @@ impl StreamCache {
     pub fn replay(&self) -> Option<Vec<RtpPacket>> {
         let segment_ts = self.segment_ts?;
         let start = self.segment_start_seq?;
-        let newest = self.newest_seq?;
+        let newest = self.packets.newest_seq()?;
 
         // Walk the contiguous run of sequence numbers from the segment start and
         // stop at the first hole. Iterating by sequence number yields an ordered,
@@ -251,7 +278,7 @@ impl StreamCache {
         let mut segment: Vec<RtpPacket> = Vec::new();
         let mut seq = start;
         while seq <= newest {
-            match self.slot(seq) {
+            match self.packets.get(seq) {
                 Some(p) => segment.push(p.clone()),
                 None => break,
             }
@@ -355,15 +382,16 @@ impl StreamCache {
     /// current. O(k), no allocation.
     pub fn range_after(&self, cursor: SeqNo) -> impl Iterator<Item = &RtpPacket> + '_ {
         let cursor = *cursor;
-        let (lo, hi) = match self.newest_seq {
+        let (lo, hi) = match self.packets.newest_seq() {
             Some(newest) if newest > cursor => {
-                let floor = newest.saturating_sub((STREAM_CACHE_CAPACITY as u64).saturating_sub(1));
+                let floor =
+                    newest.saturating_sub((PACKET_WINDOW_CAPACITY as u64).saturating_sub(1));
                 (cursor.wrapping_add(1).max(floor), newest)
             }
             // Empty range: nothing newer than the cursor.
             _ => (1, 0),
         };
-        (lo..=hi).filter_map(move |seq| self.slot(seq))
+        (lo..=hi).filter_map(move |seq| self.packets.get(seq))
     }
 
     /// The buffered packet with this input sequence number, if still cached.
@@ -371,7 +399,7 @@ impl StreamCache {
     /// Used by the tail drain and reorder backfill to complete a frame from a
     /// known hole: O(1) index + tag check, no scan.
     pub fn get(&self, seq: SeqNo) -> Option<&RtpPacket> {
-        self.slot(*seq)
+        self.packets.get(*seq)
     }
 
     /// Parameter-set packets the segment is missing, restamped onto the
@@ -418,11 +446,7 @@ impl StreamCache {
     }
 
     pub fn clear(&mut self) {
-        for slot in &mut self.ring {
-            *slot = None;
-        }
-        self.seqs.fill(EMPTY_SLOT);
-        self.newest_seq = None;
+        self.packets.clear();
         self.segment_start_seq = None;
         self.segment_ts = None;
         self.sps = None;
@@ -581,8 +605,8 @@ mod test {
             }
         }
 
-        for (index, &stored) in cache.seqs.iter().enumerate() {
-            match cache.ring.get(index).and_then(Option::as_ref) {
+        for (index, &stored) in cache.packets.seqs.iter().enumerate() {
+            match cache.packets.ring.get(index).and_then(Option::as_ref) {
                 Some(packet) => assert_eq!(
                     stored, *packet.seq_no,
                     "slot {index} is indexed under a sequence number it does not hold"
@@ -613,7 +637,13 @@ mod test {
                 "clearing must empty the index too, or a probe trusts a stale slot"
             );
         }
-        assert!(cache.seqs.iter().all(|&stored| stored == EMPTY_SLOT));
+        assert!(
+            cache
+                .packets
+                .seqs
+                .iter()
+                .all(|&stored| stored == EMPTY_SLOT)
+        );
     }
 
     #[test]

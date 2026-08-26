@@ -1059,17 +1059,25 @@ impl Participant {
         incoming: crate::participant::transport::RtpIngress,
         events: &mut impl ParticipantSink,
     ) {
-        let mut rtp = incoming.packet;
-        if self.upstream.handle_incoming_rtp(
+        let processed = self.upstream.handle_incoming_rtp(
             route.upstream_slot,
             route.mid,
             route.rid.as_ref(),
-            &mut rtp,
+            incoming.packet,
             incoming.sender_info,
-        ) {
-            events.publish_track_packet(route.fanout, TrackPacket::Rtp(rtp));
-        } else {
+        );
+        if !processed.valid_route {
             self.upstream.remove_route(route.ssrc);
+            return;
+        }
+        if processed.request_keyframe {
+            self.enqueue_remote_keyframe((route.track_id, route.rid), KeyframeRequestKind::Pli);
+        }
+        if let Some(packet) = processed.first {
+            events.publish_track_packet(route.fanout, TrackPacket::Rtp(packet));
+        }
+        for packet in processed.remaining {
+            events.publish_track_packet(route.fanout, TrackPacket::Rtp(packet));
         }
     }
 

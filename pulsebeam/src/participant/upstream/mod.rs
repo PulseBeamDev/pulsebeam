@@ -158,18 +158,29 @@ impl UpstreamMedia {
         index: usize,
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
-        rtp: &mut RtpPacket,
+        rtp: RtpPacket,
         sr: Option<SenderInfo>,
-    ) -> bool {
+    ) -> crate::track::ProcessedRtp {
         let Some(slot) = self.published_tracks.get_mut(index) else {
             debug_assert!(false, "cached upstream slot index is out of bounds");
-            return false;
+            return crate::track::ProcessedRtp {
+                first: None,
+                remaining: Vec::new(),
+                request_keyframe: false,
+                valid_route: false,
+            };
         };
         debug_assert_eq!(slot.mid, mid);
         if slot.mid != mid {
             plog_warn!(self.ctx, %mid, ?rid, "Dropping incoming RTP packet; cached published track changed");
-            return false;
+            return crate::track::ProcessedRtp {
+                first: None,
+                remaining: Vec::new(),
+                request_keyframe: false,
+                valid_route: false,
+            };
         }
+        let mut rtp = rtp;
         rtp.ext_vals.rid = rid.cloned();
         slot.track.process(rid, rtp, sr)
     }
@@ -238,9 +249,9 @@ impl Upstream {
         slot: UpstreamSlotKey,
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
-        rtp: &mut RtpPacket,
+        rtp: RtpPacket,
         sr: Option<SenderInfo>,
-    ) -> bool {
+    ) -> crate::track::ProcessedRtp {
         match slot {
             UpstreamSlotKey::Audio(index) => {
                 self.audio.handle_incoming_rtp(index, mid, rid, rtp, sr)

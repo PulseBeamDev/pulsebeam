@@ -80,7 +80,7 @@ pub struct RtpPacket {
     /// Whether this packet is the first of its frame.
     ///
     /// A Dependency Descriptor rides on every packet of a frame and carries the
-    /// template structure on every packet of a *keyframe*, so `is_keyframe`
+    /// template structure on the first packet of a *keyframe*, so `is_keyframe`
     /// alone does not identify the packet a receiver can start assembling from.
     /// Replaying a keyframe from anywhere else hands over a frame with no
     /// beginning, which the receiver discards — along with the structure, which

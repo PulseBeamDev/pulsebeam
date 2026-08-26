@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::entity::TrackId;
 use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
-use crate::rtp::normalize::StreamNormalizer;
+use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamStats},
@@ -26,6 +26,13 @@ use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
 pub type StreamId = (TrackId, Option<Rid>);
+
+pub struct ProcessedRtp {
+    pub first: Option<RtpPacket>,
+    pub remaining: Vec<RtpPacket>,
+    pub request_keyframe: bool,
+    pub valid_route: bool,
+}
 
 /// Leading-edge debounce interval for keyframe requests forwarded upstream.
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -195,16 +202,28 @@ impl UpstreamTrackLayer {
         self.monitor.poll(now, is_any_sibling_active);
     }
 
-    pub fn process(&mut self, pkt: &mut RtpPacket) -> bool {
-        // Normalize first, measure second: only the first stage writes to the
-        // packet, and the monitor reads none of what it writes.
-        let facts = self.normalizer.normalize(pkt);
+    fn normalize(&mut self, pkt: RtpPacket) -> Normalization {
+        self.normalizer.normalize(pkt)
+    }
+
+    fn process_normalized(&mut self, pkt: &RtpPacket, facts: StreamFacts) {
         self.monitor.process_packet(pkt);
-        // A scalable keyframe teaches the structure; publish how many decode
-        // targets it offers so the allocator can reason about shedding to them.
         if let Some(count) = facts.decode_targets {
             self.monitor.set_decode_target_count(count);
         }
+    }
+
+    #[cfg(test)]
+    pub fn process(&mut self, pkt: &mut RtpPacket) -> bool {
+        let normalization = self.normalize(std::mem::take(pkt));
+        let Some((packet, facts)) = normalization.first else {
+            return false;
+        };
+        if !normalization.remaining.is_empty() {
+            return false;
+        }
+        self.process_normalized(&packet, facts);
+        *pkt = packet;
         true
     }
 
@@ -346,12 +365,12 @@ impl UpstreamTrack {
     pub fn process(
         &mut self,
         rid: Option<&Rid>,
-        packet: &mut RtpPacket,
+        mut packet: RtpPacket,
         sr: Option<SenderInfo>,
-    ) -> bool {
+    ) -> ProcessedRtp {
         // Stamp playout_time on the track's shared clock before the encoding's
         // monitor and the switcher downstream see it.
-        self.synchronizer.process(packet, sr);
+        self.synchronizer.process(&mut packet, sr);
         self.monitor.process(rid, packet)
     }
 
@@ -389,28 +408,71 @@ impl TrackMonitor {
         Self { encodings }
     }
 
-    pub fn process(&mut self, rid: Option<&Rid>, packet: &mut RtpPacket) -> bool {
-        // An unknown rid is a publisher sending an encoding it never declared;
-        // drop the packet rather than the process.
-        let Some(encoding) = self.encodings.iter_mut().find(|s| s.rid.as_ref() == rid) else {
-            return false;
+    pub fn process(&mut self, rid: Option<&Rid>, packet: RtpPacket) -> ProcessedRtp {
+        let Some(index) = self.encodings.iter().position(|s| s.rid.as_ref() == rid) else {
+            return ProcessedRtp {
+                first: None,
+                remaining: Vec::new(),
+                request_keyframe: false,
+                valid_route: false,
+            };
         };
-        let processed = encoding.process(packet);
+        let normalization = self
+            .encodings
+            .get_mut(index)
+            .map(|encoding| encoding.normalize(packet));
+        let Some(normalization) = normalization else {
+            debug_assert!(false, "located encoding disappeared before normalization");
+            return ProcessedRtp {
+                first: None,
+                remaining: Vec::new(),
+                request_keyframe: false,
+                valid_route: false,
+            };
+        };
 
-        // A VLA on any encoding's packet describes every simulcast stream; push
-        // it to every encoding whose stream index we've already learned. This is
-        // the canonical cross-encoding decision — only the whole-track monitor
-        // sees all the siblings a single VLA refers to.
+        let first = normalization
+            .first
+            .map(|(packet, facts)| self.process_normalized(index, packet, facts));
+        let remaining = normalization
+            .remaining
+            .into_iter()
+            .map(|(packet, facts)| self.process_normalized(index, packet, facts))
+            .collect();
+        ProcessedRtp {
+            first,
+            remaining,
+            request_keyframe: normalization.request_keyframe,
+            valid_route: true,
+        }
+    }
+
+    fn process_normalized(
+        &mut self,
+        index: usize,
+        packet: RtpPacket,
+        facts: StreamFacts,
+    ) -> RtpPacket {
+        let Some(encoding) = self.encodings.get_mut(index) else {
+            debug_assert!(
+                false,
+                "normalization selected an encoding outside the track"
+            );
+            return packet;
+        };
+        encoding.process_normalized(&packet, facts);
+
         if let Some(vla) = packet
             .ext_vals
             .user_values
             .get::<str0m::rtp::vla::VideoLayersAllocation>()
+            .cloned()
         {
             for encoding in &mut self.encodings {
-                encoding.apply_vla(vla);
+                encoding.apply_vla(&vla);
             }
         }
-        processed
+        packet
     }
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
@@ -1524,11 +1586,11 @@ mod dd_tests {
     }
 
     #[test]
-    fn forwards_packets_despite_malformed_descriptor() {
+    fn drops_a_malformed_descriptor_before_learning_a_template() {
         let mut layer = layer();
         let mut pkt = packet_carrying(&[0xff; 12]);
 
-        assert!(layer.process(&mut pkt));
+        assert!(!layer.process(&mut pkt));
         assert!(
             pkt.ext_vals
                 .user_values
@@ -1678,11 +1740,11 @@ mod simulcast_pause_tests {
     }
 
     fn feed(upstream: &mut UpstreamTrack, rid: &str, at: Instant) {
-        let mut pkt = RtpPacket {
+        let pkt = RtpPacket {
             arrival_ts: at,
             ..Default::default()
         };
-        upstream.monitor.process(Some(&Rid::from(rid)), &mut pkt);
+        let _ = upstream.monitor.process(Some(&Rid::from(rid)), pkt);
     }
 
     fn inactive(upstream: &UpstreamTrack) -> Vec<bool> {

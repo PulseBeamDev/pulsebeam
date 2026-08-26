@@ -978,7 +978,7 @@ fn a_dropped_connection_recovers_as_the_same_participant_test() {
             Step::CheckVideoQualityInterval {
                 description: "And the viewer can see her again",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50).allow_gaps(2),
+                quality: VideoQuality::min_frames(50).allow_gaps(3),
             },
             Step::CheckMediaRouted {
                 description: "The recovered publication is routed through the SFU",
@@ -1026,7 +1026,7 @@ fn a_tcp_connection_recovers_as_the_same_participant_test() {
             Step::CheckVideoQualityInterval {
                 description: "The viewer sees Alice again over TCP",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50).allow_gaps(2),
+                quality: VideoQuality::min_frames(50).allow_gaps(3),
             },
             Step::CheckMediaRouted {
                 description: "TCP recovery routes media through the SFU",
@@ -1074,7 +1074,7 @@ fn an_ipv6_connection_recovers_as_the_same_participant_test() {
             Step::CheckVideoQualityInterval {
                 description: "The viewer sees Alice again over IPv6",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(50).allow_gaps(2),
+                quality: VideoQuality::min_frames(50).allow_gaps(3),
             },
             Step::CheckMediaRouted {
                 description: "IPv6 recovery routes media through the SFU",

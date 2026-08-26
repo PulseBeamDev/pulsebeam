@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use pulsebeam_core::dd::temporal::TemporalDdSource;
-use pulsebeam_core::dd::{DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory};
+use pulsebeam_core::dd::{
+    DdWriteError, DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory,
+};
 use pulsebeam_core::{
     framing::{FrameDepacketizer, FramePacketizer},
     h264::Packetizer as H264Packetizer,
@@ -47,7 +49,7 @@ pub struct FrameSender {
     packetizer: FramePacketizer,
     h264_packetizer: Option<H264Packetizer>,
     next_seq: u64,
-    dd: TemporalDdSource,
+    dd: Option<TemporalDdSource>,
 }
 
 impl FrameSender {
@@ -60,7 +62,7 @@ impl FrameSender {
             packetizer: FramePacketizer::default(),
             h264_packetizer: None,
             next_seq: 0,
-            dd: TemporalDdSource::new(temporal_layers.max(1)),
+            dd: Some(TemporalDdSource::new(temporal_layers.max(1))),
         }
     }
 
@@ -69,6 +71,16 @@ impl FrameSender {
         sender.h264_packetizer = Some(H264Packetizer::new(
             pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD,
         ));
+        sender
+    }
+
+    pub fn without_dependency_descriptor(
+        mid: Mid,
+        rid: Option<Rid>,
+        encoding_count: usize,
+    ) -> Self {
+        let mut sender = Self::new(mid, rid, encoding_count, 1);
+        sender.dd = None;
         sender
     }
 
@@ -109,13 +121,22 @@ impl FrameSender {
         if chunks.is_empty() {
             return Vec::new();
         }
-        let Some(dd_bytes) = self.dd.next_frame(frame.is_keyframe, chunks.len()) else {
-            debug_assert!(false, "valid frame descriptors fit the RTP extension");
-            return Vec::new();
+        let dd_bytes = match self.dd.as_mut() {
+            Some(source) => match source.next_frame(frame.is_keyframe, chunks.len()) {
+                Ok(raws) => {
+                    debug_assert_eq!(raws.len(), chunks.len());
+                    Some(raws)
+                }
+                Err(DdWriteError::NoStructure) => return Vec::new(),
+                Err(error) => {
+                    debug_assert!(false, "dependency descriptor encoding failed: {error}");
+                    return Vec::new();
+                }
+            },
+            None => None,
         };
-        debug_assert_eq!(dd_bytes.len(), chunks.len());
         let mut packets = Vec::with_capacity(chunks.len());
-        for ((payload, start_of_frame, end_of_frame), raw) in chunks.into_iter().zip(dd_bytes) {
+        for (index, (payload, start_of_frame, end_of_frame)) in chunks.into_iter().enumerate() {
             // Audio level is not optional decoration: the SFU's speaker selector ranks by it and
             // drops any audio packet that arrives without one.
             let mut ext_vals = ExtensionValues {
@@ -123,15 +144,17 @@ impl FrameSender {
                 voice_activity: frame.voice_activity,
                 ..ExtensionValues::default()
             };
-            debug_assert_eq!(
-                raw.0.first().map(|first| first & START_OF_FRAME_BIT != 0),
-                Some(start_of_frame)
-            );
-            debug_assert_eq!(
-                raw.0.first().map(|first| first & END_OF_FRAME_BIT != 0),
-                Some(end_of_frame)
-            );
-            ext_vals.user_values.set(raw);
+            if let Some(raw) = dd_bytes.as_ref().and_then(|raws| raws.get(index)).cloned() {
+                debug_assert_eq!(
+                    raw.0.first().map(|first| first & START_OF_FRAME_BIT != 0),
+                    Some(start_of_frame)
+                );
+                debug_assert_eq!(
+                    raw.0.first().map(|first| first & END_OF_FRAME_BIT != 0),
+                    Some(end_of_frame)
+                );
+                ext_vals.user_values.set(raw);
+            }
             if let Some(vla) = vla.clone() {
                 ext_vals.user_values.set(vla);
             }
@@ -523,6 +546,45 @@ mod tests {
         );
         assert!(got.is_keyframe, "keyframe recovered from the DD");
         assert!(got.contiguous);
+    }
+
+    #[test]
+    fn dependency_descriptor_sender_waits_for_its_first_keyframe() {
+        let mid = Mid::from("v0");
+        let mut sender = FrameSender::new(mid, None, 1, 1);
+
+        assert!(
+            sender.packetize(&frame(vec![1; 100], false)).is_empty(),
+            "a delta frame cannot establish a DD template"
+        );
+        let keyframe = sender.packetize(&frame(vec![2; 100], true));
+        assert!(
+            !keyframe.is_empty(),
+            "a keyframe establishes the DD template"
+        );
+        assert!(keyframe.iter().all(|packet| {
+            packet
+                .ext_vals
+                .user_values
+                .get::<RawDependencyDescriptor>()
+                .is_some()
+        }));
+    }
+
+    #[test]
+    fn audio_sender_does_not_require_or_emit_a_dependency_descriptor() {
+        let mid = Mid::from("a0");
+        let mut sender = FrameSender::without_dependency_descriptor(mid, None, 1);
+
+        let packets = sender.packetize(&frame(vec![1; 100], false));
+        assert_eq!(packets.len(), 1);
+        assert!(
+            packets[0]
+                .ext_vals
+                .user_values
+                .get::<RawDependencyDescriptor>()
+                .is_none()
+        );
     }
 
     #[test]

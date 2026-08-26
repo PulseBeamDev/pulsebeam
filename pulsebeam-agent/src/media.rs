@@ -840,7 +840,8 @@ impl AudioLooper {
         const CLOCK_RATE: u64 = 48_000;
         let mid = sender.mid;
         let rid = sender.rid;
-        let mut frame_sender = crate::pipeline::FrameSender::new(mid, rid, 1, 0);
+        let mut frame_sender =
+            crate::pipeline::FrameSender::without_dependency_descriptor(mid, rid, 1);
         let mut interval = tokio::time::interval(Duration::from_millis(self.packet_ms));
         let mut packets: u64 = 0;
 

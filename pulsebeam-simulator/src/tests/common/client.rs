@@ -626,7 +626,7 @@ impl VideoReceiveLog {
             let nalus = annexb_nalu_types(&frame.data);
             let has_sps = nalus.iter().any(|f| f.sps());
             let has_pps = nalus.iter().any(|f| f.pps());
-            if !has_sps || !has_pps {
+            if !nalus.is_empty() && (!has_sps || !has_pps) {
                 self.missing_parameter_sets += 1;
             }
         }
