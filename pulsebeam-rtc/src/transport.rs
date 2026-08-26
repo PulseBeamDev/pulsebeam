@@ -12,8 +12,8 @@ use str0m::{
 };
 
 use crate::{
-    ConnectionId, IngressPacket, NegotiatedSession, PacketError, PacketProvenance, PacketView,
-    TransportMetadata, TransportProtocol,
+    ConnectionId, ForwardedRtp, IngressPacket, NegotiatedSession, PacketError, PacketProvenance,
+    PacketView, TransportMetadata, TransportProtocol,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +21,8 @@ pub struct EgressDatagram {
     bytes: Vec<u8>,
     transport: TransportMetadata,
 }
+
+const EGRESS_CAPACITY: usize = 256;
 
 impl EgressDatagram {
     pub fn bytes(&self) -> &[u8] {
@@ -114,6 +116,8 @@ pub enum LiveConnectionError {
     UnsupportedDatagram,
     #[error("transport is not ready for protected media")]
     CryptoNotReady,
+    #[error("egress datagram capacity is exhausted")]
+    EgressFull,
     #[error("invalid RTP header")]
     RtpHeader,
     #[error("SRTP authentication failed")]
@@ -234,7 +238,7 @@ impl LiveConnection {
             srtp_tx: None,
             rtp_rx: HashMap::new(),
             events: VecDeque::new(),
-            egress: VecDeque::new(),
+            egress: VecDeque::with_capacity(EGRESS_CAPACITY),
             authenticated: VecDeque::new(),
             dtls_buf: vec![0; 2048].into_boxed_slice(),
             next_dtls_deadline: None,
@@ -324,6 +328,10 @@ impl LiveConnection {
         self.egress.pop_front()
     }
 
+    pub fn egress_ready(&self) -> bool {
+        self.egress.len() < EGRESS_CAPACITY
+    }
+
     pub fn poll_authenticated(&mut self) -> Option<AuthenticatedPacket> {
         self.authenticated.pop_front()
     }
@@ -399,6 +407,10 @@ impl LiveConnection {
         self.push_protected_egress(encrypted)
     }
 
+    pub fn send_forwarded_rtp(&mut self, packet: &ForwardedRtp) -> Result<(), LiveConnectionError> {
+        self.send_rtp(packet.bytes(), packet.extended_sequence())
+    }
+
     pub fn send_rtcp(&mut self, bytes: &[u8]) -> Result<(), LiveConnectionError> {
         let encrypted = self
             .srtp_tx
@@ -410,12 +422,18 @@ impl LiveConnection {
 
     fn push_protected_egress(&mut self, bytes: Vec<u8>) -> Result<(), LiveConnectionError> {
         let transport = self.nominated.ok_or(LiveConnectionError::CryptoNotReady)?;
+        if !self.egress_ready() {
+            return Err(LiveConnectionError::EgressFull);
+        }
         self.egress.push_back(EgressDatagram { bytes, transport });
         Ok(())
     }
 
     fn drain(&mut self) {
-        while let Some(transmit) = self.ice.poll_transmit() {
+        while self.egress_ready() {
+            let Some(transmit) = self.ice.poll_transmit() else {
+                break;
+            };
             let protocol = match transmit.proto {
                 Protocol::Udp => TransportProtocol::Udp,
                 _ => TransportProtocol::Tcp,
@@ -482,7 +500,10 @@ impl LiveConnection {
                 }
                 _ => {}
             }
-            while let Some(packet) = self.dtls.poll_packet() {
+            while self.egress_ready() {
+                let Some(packet) = self.dtls.poll_packet() else {
+                    break;
+                };
                 if let Some(transport) = self.nominated {
                     self.egress.push_back(EgressDatagram {
                         bytes: packet.to_vec(),

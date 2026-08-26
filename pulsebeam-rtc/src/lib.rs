@@ -1,10 +1,15 @@
 mod id;
+mod media;
 mod negotiation;
 mod packet;
 mod session;
 mod transport;
 
 pub use id::{ChannelId, ConnectionId, MediaSectionId, PacketId, SendId, StreamId};
+pub use media::{
+    ExtensionRewrite, ForwardedRtp, MediaError, MediaEvent, MediaForwarder, MediaIngress,
+    ReceiveStream, SendStream,
+};
 pub use negotiation::{NegotiationError, NegotiationResult, ServerTransport, negotiate};
 pub use packet::{
     CompoundRtcpView, HeaderExtensionValue, IngressPacket, PacketError, PacketProvenance,

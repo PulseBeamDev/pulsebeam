@@ -320,6 +320,44 @@ impl<'a> RtpPacketView<'a> {
             _ => Ok(None),
         }
     }
+
+    pub fn rewrite_header_extension(
+        &self,
+        bytes: &mut [u8],
+        section: &NegotiatedMediaSection,
+        source_id: u8,
+        destination_id: u8,
+        value: Option<&[u8]>,
+    ) -> Result<(), PacketError> {
+        if bytes.len() != self.bytes.len()
+            || !section
+                .header_extensions()
+                .iter()
+                .any(|extension| extension.id() == source_id)
+        {
+            return Err(PacketError::InvalidRtpExtension);
+        }
+        let Some(location) = self.extension.as_ref() else {
+            return Ok(());
+        };
+        match location.profile {
+            0xbede => rewrite_one_byte_extension(
+                bytes,
+                location.data.clone(),
+                source_id,
+                destination_id,
+                value,
+            ),
+            0x1000..=0x10ff => rewrite_two_byte_extension(
+                bytes,
+                location.data.clone(),
+                source_id,
+                destination_id,
+                value,
+            ),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,6 +439,95 @@ fn two_byte_extension(
     Ok(None)
 }
 
+fn rewrite_one_byte_extension(
+    bytes: &mut [u8],
+    data: Range<usize>,
+    source_id: u8,
+    destination_id: u8,
+    value: Option<&[u8]>,
+) -> Result<(), PacketError> {
+    if !(1..15).contains(&destination_id) {
+        return Err(PacketError::InvalidRtpExtension);
+    }
+    let mut offset = data.start;
+    while offset < data.end {
+        let entry = *bytes.get(offset).ok_or(PacketError::InvalidRtpExtension)?;
+        offset = offset
+            .checked_add(1)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if entry == 0 {
+            continue;
+        }
+        let id = entry >> 4;
+        if id == 15 {
+            break;
+        }
+        let length = usize::from((entry & 0x0f).saturating_add(1));
+        let end = offset
+            .checked_add(length)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        let entry_value = bytes
+            .get_mut(offset..end)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if id == source_id {
+            if let Some(value) = value {
+                if value.len() != entry_value.len() {
+                    return Err(PacketError::InvalidRtpExtension);
+                }
+                entry_value.copy_from_slice(value);
+            }
+            bytes[offset - 1] = (destination_id << 4) | (entry & 0x0f);
+            return Ok(());
+        }
+        offset = end;
+    }
+    Ok(())
+}
+
+fn rewrite_two_byte_extension(
+    bytes: &mut [u8],
+    data: Range<usize>,
+    source_id: u8,
+    destination_id: u8,
+    value: Option<&[u8]>,
+) -> Result<(), PacketError> {
+    if destination_id == 0 {
+        return Err(PacketError::InvalidRtpExtension);
+    }
+    let mut offset = data.start;
+    while offset < data.end {
+        let id = *bytes.get(offset).ok_or(PacketError::InvalidRtpExtension)?;
+        offset = offset
+            .checked_add(1)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if id == 0 {
+            continue;
+        }
+        let length = usize::from(*bytes.get(offset).ok_or(PacketError::InvalidRtpExtension)?);
+        offset = offset
+            .checked_add(1)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        let entry_value = bytes
+            .get_mut(offset..end)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if id == source_id {
+            if let Some(value) = value {
+                if value.len() != entry_value.len() {
+                    return Err(PacketError::InvalidRtpExtension);
+                }
+                entry_value.copy_from_slice(value);
+            }
+            bytes[offset - 2] = destination_id;
+            return Ok(());
+        }
+        offset = end;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct CompoundRtcpView<'a> {
     bytes: &'a [u8],
@@ -449,11 +576,11 @@ impl<'a> RtcpPacketView<'a> {
         &self.bytes[self.range.clone()]
     }
 
-    pub const fn report_count(self) -> u8 {
+    pub const fn report_count(&self) -> u8 {
         self.report_count
     }
 
-    pub const fn packet_type(self) -> u8 {
+    pub const fn packet_type(&self) -> u8 {
         self.packet_type
     }
 }
@@ -608,7 +735,7 @@ mod tests {
         let PacketView::Rtcp(rtcp) = packet else {
             panic!("RTCP packet");
         };
-        let packet_types: Vec<_> = rtcp.packets().map(RtcpPacketView::packet_type).collect();
+        let packet_types: Vec<_> = rtcp.packets().map(|packet| packet.packet_type()).collect();
 
         assert_eq!(packet_types, [200, 201]);
     }
