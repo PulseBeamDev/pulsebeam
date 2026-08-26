@@ -12,8 +12,8 @@ use str0m::{
 };
 
 use crate::{
-    ConnectionId, ForwardedRtp, IngressPacket, NegotiatedSession, PacketError, PacketProvenance,
-    PacketView, TransportMetadata, TransportProtocol,
+    ConnectionId, DataChannelAssociation, ForwardedRtp, IngressPacket, NegotiatedSession,
+    PacketError, PacketProvenance, PacketView, TransportMetadata, TransportProtocol,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +136,7 @@ pub struct LiveConnection {
     dtls: Dtls,
     srtp_rx: Option<SrtpContext>,
     srtp_tx: Option<SrtpContext>,
+    data: Option<DataChannelAssociation>,
     rtp_rx: HashMap<u32, RtpReceiveIndex>,
     events: VecDeque<TransportEvent>,
     egress: VecDeque<EgressDatagram>,
@@ -228,6 +229,13 @@ impl LiveConnection {
         )
         .map_err(|error| LiveConnectionError::Dtls(error.to_string()))?;
         dtls.set_active(false);
+        let data = session
+            .media_sections()
+            .iter()
+            .find_map(|section| section.data_channel())
+            .map(|parameters| {
+                DataChannelAssociation::new("pulsebeam", parameters.sctp_port(), now, 64, 64)
+            });
         Ok(Self {
             id,
             session,
@@ -236,6 +244,7 @@ impl LiveConnection {
             dtls,
             srtp_rx: None,
             srtp_tx: None,
+            data,
             rtp_rx: HashMap::new(),
             events: VecDeque::new(),
             egress: VecDeque::with_capacity(EGRESS_CAPACITY),
@@ -262,7 +271,7 @@ impl LiveConnection {
         {
             let _ = self.dtls.handle_timeout(now);
         }
-        self.drain();
+        self.drive_data(now);
     }
 
     pub fn handle_datagram(
@@ -289,7 +298,7 @@ impl LiveConnection {
                     message,
                 },
             );
-            self.drain();
+            self.drive_data(now);
             return Ok(());
         }
 
@@ -297,7 +306,7 @@ impl LiveConnection {
             self.dtls
                 .handle_receive(bytes)
                 .map_err(|error| LiveConnectionError::Dtls(error.to_string()))?;
-            self.drain();
+            self.drive_data(now);
             return Ok(());
         }
 
@@ -334,6 +343,22 @@ impl LiveConnection {
 
     pub fn poll_authenticated(&mut self) -> Option<AuthenticatedPacket> {
         self.authenticated.pop_front()
+    }
+
+    pub fn data_association(&mut self) -> Option<&mut DataChannelAssociation> {
+        self.data.as_mut()
+    }
+
+    pub fn drive_data(&mut self, now: Instant) {
+        if let Some(data) = self.data.as_mut() {
+            while let Some(packet) = data.poll_egress() {
+                if self.dtls.handle_input(&packet).is_err() {
+                    self.events.push_back(TransportEvent::DtlsClosed);
+                    return;
+                }
+            }
+        }
+        self.drain(now);
     }
 
     pub fn receive_rtp(
@@ -429,7 +454,7 @@ impl LiveConnection {
         Ok(())
     }
 
-    fn drain(&mut self) {
+    fn drain(&mut self, now: Instant) {
         while self.egress_ready() {
             let Some(transmit) = self.ice.poll_transmit() else {
                 break;
@@ -497,6 +522,11 @@ impl LiveConnection {
                     self.srtp_rx =
                         Some(SrtpContext::new(&self.crypto, profile, &material, !active));
                     self.srtp_tx = Some(SrtpContext::new(&self.crypto, profile, &material, active));
+                }
+                DtlsOutput::ApplicationData(data) => {
+                    if let Some(association) = self.data.as_mut() {
+                        association.handle_input(now, data);
+                    }
                 }
                 _ => {}
             }

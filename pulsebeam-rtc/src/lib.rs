@@ -1,3 +1,4 @@
+mod data_channel;
 mod id;
 mod media;
 mod negotiation;
@@ -5,6 +6,10 @@ mod packet;
 mod session;
 mod transport;
 
+pub use data_channel::{
+    DataChannelAssociation, DataChannelError, DataChannelEvent, DataChannelOpen,
+    DataChannelReliability,
+};
 pub use id::{ChannelId, ConnectionId, MediaSectionId, PacketId, SendId, StreamId};
 pub use media::{
     ExtensionRewrite, ForwardedRtp, MediaError, MediaEvent, MediaForwarder, MediaIngress,
