@@ -1946,7 +1946,7 @@ dependencies = [
 [[package]]
 name = "is"
 version = "0.11.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#6cd0fb6aaedd3de3f8a064a7304b76c6ec68d2ea"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#33d52b842d03683147384b8ff09e4901d484bfd0"
 dependencies = [
  "crc",
  "serde",
@@ -3020,6 +3020,7 @@ version = "0.3.2"
 dependencies = [
  "is 0.11.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1)",
  "str0m 0.23.1",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -3927,7 +3928,7 @@ dependencies = [
 [[package]]
 name = "str0m"
 version = "0.23.1"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#6cd0fb6aaedd3de3f8a064a7304b76c6ec68d2ea"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#33d52b842d03683147384b8ff09e4901d484bfd0"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -3958,7 +3959,7 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.6.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#6cd0fb6aaedd3de3f8a064a7304b76c6ec68d2ea"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#33d52b842d03683147384b8ff09e4901d484bfd0"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -3982,7 +3983,7 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.7.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#6cd0fb6aaedd3de3f8a064a7304b76c6ec68d2ea"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1#33d52b842d03683147384b8ff09e4901d484bfd0"
 dependencies = [
  "base64ct",
  "dimpl",
