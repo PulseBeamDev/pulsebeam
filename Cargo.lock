@@ -3003,6 +3003,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-rtc"
+version = "0.3.2"
+
+[[package]]
 name = "pulsebeam-runtime"
 version = "0.3.2"
 dependencies = [
