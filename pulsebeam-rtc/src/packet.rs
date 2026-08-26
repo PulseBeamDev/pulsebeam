@@ -306,6 +306,18 @@ impl<'a> RtpPacketView<'a> {
             return Ok(None);
         }
 
+        self.header_extension_by_id(extension_id)
+    }
+
+    pub fn header_extension_by_id(
+        &self,
+        extension_id: u8,
+    ) -> Result<Option<HeaderExtensionValue<'a>>, PacketError> {
+        debug_assert_ne!(
+            extension_id, 0,
+            "RTP header extension identifiers start at one"
+        );
+
         let Some(location) = self.extension.as_ref() else {
             return Ok(None);
         };
@@ -570,6 +582,56 @@ pub struct RtcpPacketView<'a> {
     packet_type: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SenderReport {
+    ssrc: u32,
+    ntp_timestamp: u64,
+    rtp_timestamp: u32,
+    packet_count: u32,
+    octet_count: u32,
+}
+
+impl SenderReport {
+    pub const fn ssrc(self) -> u32 {
+        self.ssrc
+    }
+    pub const fn ntp_timestamp(self) -> u64 {
+        self.ntp_timestamp
+    }
+    pub const fn rtp_timestamp(self) -> u32 {
+        self.rtp_timestamp
+    }
+    pub const fn packet_count(self) -> u32 {
+        self.packet_count
+    }
+    pub const fn octet_count(self) -> u32 {
+        self.octet_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtcpFeedback {
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    packet_type: u8,
+    format: u8,
+}
+
+impl RtcpFeedback {
+    pub const fn sender_ssrc(self) -> u32 {
+        self.sender_ssrc
+    }
+    pub const fn media_ssrc(self) -> u32 {
+        self.media_ssrc
+    }
+    pub const fn packet_type(self) -> u8 {
+        self.packet_type
+    }
+    pub const fn format(self) -> u8 {
+        self.format
+    }
+}
+
 impl<'a> RtcpPacketView<'a> {
     pub fn bytes(&self) -> &'a [u8] {
         debug_assert!(self.range.end <= self.bytes.len());
@@ -583,6 +645,50 @@ impl<'a> RtcpPacketView<'a> {
     pub const fn packet_type(&self) -> u8 {
         self.packet_type
     }
+
+    pub fn sender_ssrc(&self) -> Result<u32, PacketError> {
+        read_u32(self.bytes(), 4)
+    }
+
+    pub fn sender_report(&self) -> Result<Option<SenderReport>, PacketError> {
+        if self.packet_type != 200 {
+            return Ok(None);
+        }
+        let bytes = self.bytes();
+        if bytes.len() < 28 {
+            return Err(PacketError::Truncated);
+        }
+        Ok(Some(SenderReport {
+            ssrc: read_u32(bytes, 4)?,
+            ntp_timestamp: (u64::from(read_u32(bytes, 8)?) << 32) | u64::from(read_u32(bytes, 12)?),
+            rtp_timestamp: read_u32(bytes, 16)?,
+            packet_count: read_u32(bytes, 20)?,
+            octet_count: read_u32(bytes, 24)?,
+        }))
+    }
+
+    pub fn feedback(&self) -> Result<Option<RtcpFeedback>, PacketError> {
+        if !matches!(self.packet_type, 205 | 206) {
+            return Ok(None);
+        }
+        let bytes = self.bytes();
+        if bytes.len() < 12 {
+            return Err(PacketError::Truncated);
+        }
+        Ok(Some(RtcpFeedback {
+            sender_ssrc: read_u32(bytes, 4)?,
+            media_ssrc: read_u32(bytes, 8)?,
+            packet_type: self.packet_type,
+            format: self.report_count,
+        }))
+    }
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PacketError> {
+    let end = offset.checked_add(4).ok_or(PacketError::Truncated)?;
+    let value = bytes.get(offset..end).ok_or(PacketError::Truncated)?;
+    debug_assert_eq!(value.len(), 4);
+    Ok(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 pub struct RtcpPacketIter<'a> {

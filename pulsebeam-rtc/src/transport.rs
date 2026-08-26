@@ -12,8 +12,9 @@ use str0m::{
 };
 
 use crate::{
-    ConnectionId, DataChannelAssociation, ForwardedRtp, IngressPacket, NegotiatedSession,
-    PacketError, PacketProvenance, PacketView, TransportMetadata, TransportProtocol,
+    ConnectionId, DataChannelAssociation, ForwardedRtp, IngressPacket, MediaSectionId,
+    NegotiatedMediaSection, NegotiatedSession, PacketError, PacketProvenance, PacketView,
+    TransportMetadata, TransportProtocol,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,6 +262,14 @@ impl LiveConnection {
 
     pub fn session(&self) -> &NegotiatedSession {
         &self.session
+    }
+
+    pub fn media_section(&self, id: MediaSectionId) -> Option<&NegotiatedMediaSection> {
+        self.session.media_section(id)
+    }
+
+    pub fn media_section_by_mid(&self, mid: &str) -> Option<&NegotiatedMediaSection> {
+        self.session.media_section_by_mid(mid)
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
