@@ -2921,6 +2921,7 @@ dependencies = [
  "pulsebeam-core",
  "pulsebeam-proto",
  "pulsebeam-routing",
+ "pulsebeam-rtc",
  "pulsebeam-runtime",
  "pulsebeam-testdata",
  "rand 0.10.2",
