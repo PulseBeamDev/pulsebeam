@@ -266,6 +266,7 @@ pub struct NegotiatedSession {
     local_candidates: Box<[IceCandidate]>,
     remote_ice: IceCredentials,
     remote_fingerprint: DtlsFingerprint,
+    remote_candidates: Box<[IceCandidate]>,
     media_sections: Box<[NegotiatedMediaSection]>,
 }
 
@@ -290,6 +291,10 @@ impl NegotiatedSession {
         &self.remote_fingerprint
     }
 
+    pub fn remote_candidates(&self) -> &[IceCandidate] {
+        &self.remote_candidates
+    }
+
     pub fn media_sections(&self) -> &[NegotiatedMediaSection] {
         &self.media_sections
     }
@@ -300,6 +305,7 @@ impl NegotiatedSession {
         local_candidates: Box<[IceCandidate]>,
         remote_ice: IceCredentials,
         remote_fingerprint: DtlsFingerprint,
+        remote_candidates: Box<[IceCandidate]>,
         media_sections: Box<[NegotiatedMediaSection]>,
     ) -> Self {
         Self {
@@ -308,6 +314,7 @@ impl NegotiatedSession {
             local_candidates,
             remote_ice,
             remote_fingerprint,
+            remote_candidates,
             media_sections,
         }
     }

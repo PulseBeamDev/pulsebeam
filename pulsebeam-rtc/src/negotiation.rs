@@ -99,6 +99,15 @@ pub fn negotiate(
             DtlsFingerprint::new(fingerprint.hash_func, fingerprint.bytes.into_boxed_slice())
         })
         .ok_or(NegotiationError::MissingFingerprint)?;
+    let mut remote_candidates = Vec::new();
+    for candidate in answer.ice_candidates() {
+        let value = candidate.to_sdp_string();
+        debug_assert!(!value.is_empty());
+        let candidate = IceCandidate::new(value).ok_or_else(|| {
+            NegotiationError::Sdp("formatted remote ICE candidate is empty".to_owned())
+        })?;
+        remote_candidates.push(candidate);
+    }
     let remote_setup = answer.setup().ok_or(NegotiationError::MissingSetup)?;
     let setup = Setup::Passive
         .compare_to_remote(remote_setup)
@@ -154,6 +163,7 @@ pub fn negotiate(
         server.candidates.clone(),
         remote_ice,
         remote_fingerprint,
+        remote_candidates.into_boxed_slice(),
         sections.into_boxed_slice(),
     );
 

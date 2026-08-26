@@ -100,6 +100,14 @@ impl<'a> IngressPacket<'a> {
         Self { bytes, provenance }
     }
 
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub const fn provenance(self) -> PacketProvenance {
+        self.provenance
+    }
+
     pub fn parse(self) -> Result<PacketView<'a>, PacketError> {
         let first = *self.bytes.first().ok_or(PacketError::Empty)?;
         if first >> 6 != 2 {
