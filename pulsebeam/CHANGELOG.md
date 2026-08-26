@@ -1,3 +1,14 @@
+## [unreleased]
+
+* feat: declarative signaling and media semantics
+* feat: deterministic route-addressed forwarding and cross-shard NTP timeline
+* refactor: unify routing and media lifecycle
+* feat: eBPF flow steering with automatic userspace fallback
+* feat: hybrid work-stealing with 16 shards per worker
+* feat: shard-local metrics
+* fix: Dependency Descriptor compliance and out-of-order fragments
+* more production-shaped browser, agent, eBPF, and simulation tests
+
 ## [pulsebeam-v0.4.8] - 2026-08-08
 
 * feat: update str0m fork based on 0.22.0
