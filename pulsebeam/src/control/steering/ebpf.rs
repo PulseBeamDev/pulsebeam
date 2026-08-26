@@ -147,15 +147,22 @@ mod tests {
         )
         .await
         .expect("first reuseport socket must bind");
+
         let address = first.local_addr();
+
         let second = net::bind_udp_socket(address, UdpMode::Batch, None, 1)
             .await
             .expect("second reuseport socket must join the group");
 
         let mut steering =
             attach(&[first, second]).expect("loading and attaching the eBPF object must succeed");
-        steering
-            .install_flow(flow_key("127.0.0.1:40000".parse().unwrap(), address), 1)
-            .expect("authenticated flow must be writable");
+
+        steering.pin_flow_to_owner(
+            "127.0.0.1:40000"
+                .parse()
+                .expect("source address must parse"),
+            address,
+            1,
+        );
     }
 }
