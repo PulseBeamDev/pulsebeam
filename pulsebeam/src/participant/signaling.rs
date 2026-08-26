@@ -275,6 +275,12 @@ impl Signaling {
         self.participants.clone()
     }
 
+    pub(crate) fn needs_poll(&self) -> bool {
+        self.cid.is_some()
+            && self.pending_commit.is_none()
+            && (self.dirty_roster || self.dirty_bindings)
+    }
+
     pub fn apply_participants(
         &mut self,
         added: impl IntoIterator<Item = crate::entity::ParticipantId>,
@@ -291,10 +297,7 @@ impl Signaling {
     }
 
     pub(crate) fn poll(&mut self, snapshot: &SignalingSnapshot) -> Option<SignalingOutput> {
-        if self.pending_commit.is_some() {
-            return None;
-        }
-        if !self.dirty_roster && !self.dirty_bindings {
+        if !self.needs_poll() {
             return None;
         }
 
@@ -539,5 +542,45 @@ mod tests {
         let intent = AudioIntent::default();
         assert!(intent.auto);
         assert!(intent.pinned.is_empty());
+    }
+
+    #[test]
+    fn snapshots_are_requested_only_while_signaling_can_emit() {
+        let room = crate::entity::ExternalRoomId::new("room").expect("valid room");
+        let ctx = LogCtx {
+            room_id: crate::entity::RoomId::from_external(&room),
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new(ctx);
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashSet::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert!(!signaling.needs_poll(), "a channel is required");
+
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        signaling.set_cid(cid);
+        assert!(signaling.needs_poll(), "a dirty channel needs a snapshot");
+
+        assert!(signaling.poll(&snapshot).is_some(), "initial state emits");
+        assert!(
+            !signaling.needs_poll(),
+            "the pending commit owns the snapshot"
+        );
+
+        signaling.retry_pending();
+        assert!(signaling.needs_poll(), "a failed write retries the state");
+
+        assert!(signaling.poll(&snapshot).is_some(), "first retry emits");
+        signaling.commit_sent();
+        assert!(signaling.needs_poll(), "full state is retried once more");
+
+        assert!(signaling.poll(&snapshot).is_some(), "second retry emits");
+        signaling.commit_sent();
+        assert!(!signaling.needs_poll(), "a clean state needs no snapshot");
     }
 }

@@ -617,19 +617,21 @@ impl Participant {
                 }
             }
 
-            let mut snapshot = self.downstream.signaling_snapshot();
-            snapshot.participants = self.signaling.participants_snapshot();
-            if let Some(output) = self.signaling.poll(&snapshot) {
-                if self
-                    .transport
-                    .write_channel(output.cid, true, &output.bytes)
-                {
-                    self.signaling.commit_sent();
-                } else {
-                    self.signaling.retry_pending();
+            if self.signaling.needs_poll() {
+                let mut snapshot = self.downstream.signaling_snapshot();
+                snapshot.participants = self.signaling.participants_snapshot();
+                if let Some(output) = self.signaling.poll(&snapshot) {
+                    if self
+                        .transport
+                        .write_channel(output.cid, true, &output.bytes)
+                    {
+                        self.signaling.commit_sent();
+                    } else {
+                        self.signaling.retry_pending();
+                    }
+                    self.transport.mark_needs_drain();
+                    continue;
                 }
-                self.transport.mark_needs_drain();
-                continue;
             }
 
             if self.downstream.dirty_allocation {
