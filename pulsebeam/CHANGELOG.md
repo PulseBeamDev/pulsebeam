@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.9] - 2026-08-26
 
 * feat: declarative signaling and media semantics
 * feat: deterministic route-addressed forwarding and cross-shard NTP timeline
