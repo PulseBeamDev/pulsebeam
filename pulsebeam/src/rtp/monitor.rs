@@ -6,7 +6,6 @@
 //! allocator sizes the ladder to it.
 
 use std::time::Duration;
-use str0m::bwe::Bitrate;
 use tokio::time::Instant;
 
 use crate::entity::TrackKind;
@@ -673,7 +672,7 @@ impl StreamMonitor {
                 interval_loss * 100.0,
                 expected,
                 actual,
-                Bitrate::from(self.nominal_bitrate_bps),
+                self.nominal_bitrate_bps,
             );
             self.current_quality = new_quality;
             self.quality_transition_since = None;
@@ -793,9 +792,9 @@ mod test {
     // Fixtures build timelines by hand; an overflow in one should fail the
     // test rather than clamp into a passing state.
     use super::*;
+    use crate::rtp::{Frequency, MediaTime};
     use more_asserts::{assert_ge, assert_le};
     use std::time::Duration;
-    use str0m::media::{Frequency, MediaTime};
     use tokio::time::Instant;
 
     fn packet(seq: u64, arrival_ts: Instant) -> RtpPacket {
@@ -1274,7 +1273,7 @@ mod test {
             ..Default::default()
         };
         let payload_len = size_bytes.saturating_sub(pkt.header_len);
-        pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
+        pkt.payload = vec![0; payload_len];
         pkt
     }
 

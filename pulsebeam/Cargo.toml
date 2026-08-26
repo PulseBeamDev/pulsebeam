@@ -40,7 +40,7 @@ pprof = { version = "0.15.0", features = [
   "prost-codec",
   "protobuf",
 ] }
-pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m"] }
+pulsebeam-core = { path = "../pulsebeam-core" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-routing = { path = "../pulsebeam-routing" }
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }

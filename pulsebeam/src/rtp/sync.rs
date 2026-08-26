@@ -9,13 +9,9 @@
 //! the correct answer.
 
 use crate::clock::NtpTime;
-use crate::rtp::RtpPacket;
+use crate::rtp::{Frequency, MediaTime, RtpPacket, SenderReport as SenderInfo, Ssrc};
 use ahash::HashMap;
 use std::time::Duration;
-use str0m::{
-    media::{Frequency, MediaTime},
-    rtp::{Ssrc, rtcp::SenderInfo},
-};
 use tokio::time::Instant;
 
 const MIN_SR_UPDATE_INTERVAL: Duration = Duration::from_millis(200);

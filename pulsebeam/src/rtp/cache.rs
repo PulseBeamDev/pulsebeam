@@ -5,9 +5,8 @@
 //! would replay the wrong window and hand the decoder a segment that does not
 //! start at a keyframe.
 
-use crate::rtp::RtpPacket;
-use str0m::media::{MediaTime, Rid};
-use str0m::rtp::SeqNo;
+use crate::rtp::{EncodingId as Rid, MediaTime, RtpPacket, SequenceNumber as SeqNo};
+use ahash::{HashMap, HashMapExt};
 
 /// No packet in this slot.
 ///
@@ -456,18 +455,18 @@ impl StreamCache {
 
 /// One track's worth of cache: a `StreamCache` per simulcast encoding, keyed by
 /// `rid`. The track is the routing unit; the encoding a packet belongs to is read
-/// from `pkt.ext_vals.rid`. A downstream forwarder holds the whole thing so it can
+/// from `pkt.extensions.rid`. A downstream forwarder holds the whole thing so it can
 /// replay a target encoding's keyframe segment while still forwarding the current
 /// one.
 #[derive(Debug, Default)]
 pub struct TrackStreamCache {
-    encodings: Vec<(Option<Rid>, StreamCache)>,
+    encodings: HashMap<Option<Rid>, StreamCache>,
 }
 
 impl TrackStreamCache {
     pub fn new() -> Self {
         Self {
-            encodings: Vec::with_capacity(MAX_SIMULCAST_ENCODINGS),
+            encodings: HashMap::new(),
         }
     }
 
@@ -476,38 +475,17 @@ impl TrackStreamCache {
     /// Returns the packet only when it was too old to store; otherwise the
     /// cache owns it and the caller reads it back with [`Self::get`].
     pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
-        self.encoding_mut(pkt.ext_vals.rid).push(pkt)
+        self.encoding_mut(pkt.extensions.rid).push(pkt)
     }
 
     pub fn encoding(&self, rid: Option<Rid>) -> Option<&StreamCache> {
-        self.encodings
-            .iter()
-            .find(|(r, _)| *r == rid)
-            .map(|(_, c)| c)
+        self.encodings.get(&rid)
     }
 
     fn encoding_mut(&mut self, rid: Option<Rid>) -> &mut StreamCache {
-        let pos = match self.encodings.iter().position(|(r, _)| *r == rid) {
-            Some(pos) => pos,
-            None => {
-                debug_assert!(
-                    self.encodings.len() < MAX_SIMULCAST_ENCODINGS,
-                    "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
-                );
-                self.encodings.push((rid, StreamCache::default()));
-                self.encodings.len().saturating_sub(1)
-            }
-        };
-        let Some((_, cache)) = self.encodings.get_mut(pos) else {
-            pulsebeam_runtime::fatal!("encoding slot {pos} vanished after being pushed")
-        };
-        cache
+        self.encodings.entry(rid).or_default()
     }
 }
-
-/// Simulcast tops out at three spatial layers; the `+1` leaves room for a
-/// non-rid encoding (`None`) coexisting during renegotiation without reallocating.
-const MAX_SIMULCAST_ENCODINGS: usize = 4;
 
 #[cfg(test)]
 mod test {
@@ -707,19 +685,14 @@ mod test {
         kf.rtp_ts = MediaTime::new(1000, kf.rtp_ts.frequency());
         kf.marker = true;
         kf.is_keyframe = true;
-        kf.ext_vals
-            .user_values
-            .set_arc(std::sync::Arc::new(g.next(true)));
+        kf.extensions.dependency_descriptor = Some(g.next(true));
         cache.push(kf.clone());
 
         let mut delta = RtpPacket::default();
         delta.seq_no = SeqNo::from(2u64);
         delta.rtp_ts = MediaTime::new(4000, delta.rtp_ts.frequency());
         delta.marker = true;
-        delta
-            .ext_vals
-            .user_values
-            .set_arc(std::sync::Arc::new(g.next(false)));
+        delta.extensions.dependency_descriptor = Some(g.next(false));
         cache.push(delta.clone());
 
         let replay = cache
@@ -749,9 +722,7 @@ mod test {
 
         let mut with_dd = |pkts: Vec<RtpPacket>, keyframe: bool| {
             for mut p in pkts {
-                p.ext_vals
-                    .user_values
-                    .set_arc(std::sync::Arc::new(g.next(keyframe && p.is_keyframe)));
+                p.extensions.dependency_descriptor = Some(g.next(keyframe && p.is_keyframe));
                 cache.push(p.clone());
             }
         };
@@ -780,6 +751,25 @@ mod test {
         }
         let replay = cache.replay().expect("replayable");
         assert_eq!(replay.len(), kf.len());
+    }
+
+    #[test]
+    fn many_encodings_resolve_without_scanning_unrelated_streams() {
+        let mut cache = TrackStreamCache::new();
+        for index in 0..256u16 {
+            let mut packet = RtpPacket::default();
+            packet.seq_no = u64::from(index).into();
+            packet.extensions.rid = Some(Rid::from(format!("r{index}").as_str()));
+            assert!(cache.push(packet).is_none());
+        }
+
+        let target = Rid::from("r255");
+        assert!(
+            cache
+                .encoding(Some(target))
+                .and_then(|stream| stream.get(255u64.into()))
+                .is_some()
+        );
     }
 
     /// Screen share sits still for long stretches: one keyframe, then nothing

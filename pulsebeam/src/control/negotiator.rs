@@ -7,7 +7,7 @@ use str0m::{
     change::{SdpAnswer, SdpOffer},
     format::{Codec, CodecConfig, FormatParams},
     media::{Direction, Frequency, MediaKind, Pt},
-    rtp::Extension,
+    rtp::{Extension, ExtensionSerializer, ExtensionValues},
 };
 use tokio::time::Instant;
 
@@ -112,7 +112,7 @@ impl Negotiator {
             // here; parsing needs per-stream template state (see rtp::dd).
             .set_extension(
                 rtp_extensions::DEPENDENCY_DESCRIPTOR,
-                Extension::with_serializer(pulsebeam_core::dd::URI, pulsebeam_core::dd::Serializer),
+                Extension::with_serializer(pulsebeam_core::dd::URI, DependencyDescriptorSerializer),
             )
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
@@ -225,6 +225,54 @@ impl Negotiator {
     }
 }
 
+#[derive(Debug)]
+struct DependencyDescriptorSerializer;
+
+impl ExtensionSerializer for DependencyDescriptorSerializer {
+    fn write_to(&self, buffer: &mut [u8], values: &ExtensionValues) -> usize {
+        let Some(raw) = values
+            .user_values
+            .get::<pulsebeam_core::dd::RawDependencyDescriptor>()
+        else {
+            return 0;
+        };
+        let Some(destination) = buffer.get_mut(..raw.0.len()) else {
+            return 0;
+        };
+        destination.copy_from_slice(&raw.0);
+        raw.0.len()
+    }
+
+    fn parse_value(&self, buffer: &[u8], values: &mut ExtensionValues) -> bool {
+        if !(pulsebeam_core::dd::MANDATORY_LEN..=pulsebeam_core::dd::MAX_DD_LEN)
+            .contains(&buffer.len())
+        {
+            return false;
+        }
+        values
+            .user_values
+            .set(pulsebeam_core::dd::RawDependencyDescriptor(
+                buffer.iter().copied().collect(),
+            ));
+        true
+    }
+
+    fn is_video(&self) -> bool {
+        true
+    }
+
+    fn is_audio(&self) -> bool {
+        false
+    }
+
+    fn requires_two_byte_form(&self, values: &ExtensionValues) -> bool {
+        values
+            .user_values
+            .get::<pulsebeam_core::dd::RawDependencyDescriptor>()
+            .is_some()
+    }
+}
+
 /// The codec set every room negotiates. Static for now: the same fixed codecs
 /// apply to all rooms — per-room selection is not yet plumbed through.
 ///
@@ -267,7 +315,7 @@ mod tests {
             // default video-orientation slot.
             .set_extension(
                 13,
-                Extension::with_serializer(pulsebeam_core::dd::URI, pulsebeam_core::dd::Serializer),
+                Extension::with_serializer(pulsebeam_core::dd::URI, DependencyDescriptorSerializer),
             )
             .set_extension(14, Extension::VideoOrientation);
         config.codec_config().enable_h264(true);

@@ -169,7 +169,7 @@ impl ShardRuntime {
             debug_assert!(false, "an RTP packet must resolve to a live track");
             return;
         };
-        let rid = pkt.ext_vals.rid;
+        let rid = pkt.extensions.rid;
         let seq = pkt.seq_no;
         let too_old;
         let (packet, cache) = if let Some(track_cache) = runtime.cache.as_mut() {

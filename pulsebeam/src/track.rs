@@ -14,7 +14,7 @@ use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::{
-    self, RtpPacket,
+    self, RtpPacket, SenderReport, VideoLayersAllocation,
     monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
@@ -22,10 +22,13 @@ pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
 use str0m::media::{Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::Ssrc;
-use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
 pub type StreamId = (TrackId, Option<Rid>);
+
+pub(crate) fn packet_encoding(rid: Option<Rid>) -> Option<rtp::EncodingId> {
+    rid.map(|rid| rtp::EncodingId::from(&*rid))
+}
 
 pub struct ProcessedRtp {
     pub first: Option<RtpPacket>,
@@ -230,7 +233,7 @@ impl UpstreamTrackLayer {
     /// Apply a (track-wide) Video Layers Allocation to this layer using its
     /// learned stream index: the sender's declared target bitrate, resolution,
     /// and active/inactive state.
-    fn apply_vla(&mut self, vla: &str0m::rtp::vla::VideoLayersAllocation) {
+    fn apply_vla(&mut self, vla: &VideoLayersAllocation) {
         let Some(idx) = self.normalizer.vla_index().map(usize::from) else {
             return;
         };
@@ -260,10 +263,7 @@ impl UpstreamTrackLayer {
 /// Declared target bitrate (bps) for simulcast stream `idx` in a Video Layers
 /// Allocation: the highest cumulative temporal bitrate across its spatial
 /// layers. `None` when the stream is absent or declared inactive.
-pub(crate) fn vla_stream_target_bps(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
-    idx: usize,
-) -> Option<u64> {
+pub(crate) fn vla_stream_target_bps(vla: &VideoLayersAllocation, idx: usize) -> Option<u64> {
     let stream = vla.simulcast_streams.get(idx)?;
     let kbps = stream
         .spatial_layers
@@ -275,10 +275,7 @@ pub(crate) fn vla_stream_target_bps(
 
 /// Declared frame height (px) for simulcast stream `idx`: the tallest spatial
 /// layer that carries a resolution. `None` when absent (VLA omits resolution).
-pub(crate) fn vla_stream_height_px(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
-    idx: usize,
-) -> Option<u16> {
+pub(crate) fn vla_stream_height_px(vla: &VideoLayersAllocation, idx: usize) -> Option<u16> {
     let stream = vla.simulcast_streams.get(idx)?;
     stream
         .spatial_layers
@@ -291,7 +288,7 @@ pub(crate) fn vla_stream_height_px(
 /// its first spatial layer's temporal ladder — the per-temporal costs the SFU
 /// allocates each decode target against. Empty when the sender declared none.
 pub(crate) fn vla_stream_temporal_cumulative_kbps(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    vla: &VideoLayersAllocation,
     idx: usize,
 ) -> Vec<u64> {
     vla.simulcast_streams
@@ -308,10 +305,7 @@ pub(crate) fn vla_stream_temporal_cumulative_kbps(
 
 /// Declared full frame rate for simulcast stream `idx`: the highest framerate any
 /// of its spatial layers reports. `None` when the VLA omits resolution/framerate.
-pub(crate) fn vla_stream_framerate(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
-    idx: usize,
-) -> Option<u32> {
+pub(crate) fn vla_stream_framerate(vla: &VideoLayersAllocation, idx: usize) -> Option<u32> {
     let stream = vla.simulcast_streams.get(idx)?;
     stream
         .spatial_layers
@@ -366,7 +360,7 @@ impl UpstreamTrack {
         &mut self,
         rid: Option<&Rid>,
         mut packet: RtpPacket,
-        sr: Option<SenderInfo>,
+        sr: Option<SenderReport>,
     ) -> ProcessedRtp {
         // Stamp playout_time on the track's shared clock before the encoding's
         // monitor and the switcher downstream see it.
@@ -462,12 +456,7 @@ impl TrackMonitor {
         };
         encoding.process_normalized(&packet, facts);
 
-        if let Some(vla) = packet
-            .ext_vals
-            .user_values
-            .get::<str0m::rtp::vla::VideoLayersAllocation>()
-            .cloned()
-        {
+        if let Some(vla) = packet.extensions.video_layers_allocation.as_ref() {
             for encoding in &mut self.encodings {
                 encoding.apply_vla(&vla);
             }
@@ -830,7 +819,7 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             mid,
             rid: None,
             quality: LayerQuality::Low,
-            normalizer: StreamNormalizer::new(mid, None),
+            normalizer: StreamNormalizer::new(rtp::MediaSectionId::from(&*mid), None),
             monitor,
         }]),
         stats: UpstreamStats::Audio(NullStats::new()),
@@ -879,7 +868,10 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             mid,
             rid,
             quality,
-            normalizer: StreamNormalizer::new(mid, rid),
+            normalizer: StreamNormalizer::new(
+                rtp::MediaSectionId::from(&*mid),
+                packet_encoding(rid),
+            ),
             monitor,
         });
         layers.push(TrackLayer {
@@ -1468,9 +1460,7 @@ mod dd_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
-    use pulsebeam_core::dd::{
-        DependencyDescriptor, DependencyDescriptorWriter, MAX_DD_LEN, test_utils,
-    };
+    use pulsebeam_core::dd::{DependencyDescriptorWriter, MAX_DD_LEN, test_utils};
 
     fn layer() -> UpstreamTrackLayer {
         let state = StreamStats::new(true, 500_000, 360);
@@ -1478,18 +1468,16 @@ mod dd_tests {
             mid: Mid::from("0"),
             rid: None,
             quality: LayerQuality::High,
-            normalizer: StreamNormalizer::new(Mid::from("0"), None),
+            normalizer: StreamNormalizer::new(rtp::MediaSectionId::from("0"), None),
             monitor: StreamMonitor::new(TrackKind::Video, "test".to_string(), state),
         }
     }
 
     fn packet_carrying(bytes: &[u8]) -> RtpPacket {
         let mut pkt = RtpPacket::default();
-        pkt.ext_vals
-            .user_values
-            .set(pulsebeam_core::dd::RawDependencyDescriptor(
-                bytes.iter().copied().collect(),
-            ));
+        pkt.extensions.raw_dependency_descriptor = Some(
+            pulsebeam_core::dd::RawDependencyDescriptor(bytes.iter().copied().collect()),
+        );
         pkt
     }
 
@@ -1505,12 +1493,7 @@ mod dd_tests {
             .unwrap();
         let mut pkt = packet_carrying(&buf[..len]);
         assert!(layer.process(&mut pkt));
-        assert!(
-            pkt.ext_vals
-                .user_values
-                .get::<DependencyDescriptor>()
-                .is_some()
-        );
+        assert!(pkt.extensions.dependency_descriptor.is_some());
 
         // A later delta frame carries only a template id, so it is decodable
         // only because the layer retained the structure.
@@ -1519,8 +1502,7 @@ mod dd_tests {
         let mut pkt = packet_carrying(&buf[..len]);
         assert!(layer.process(&mut pkt));
 
-        let got = pkt.ext_vals.user_values.get::<DependencyDescriptor>();
-        assert_eq!(got, Some(&sent));
+        assert_eq!(pkt.extensions.dependency_descriptor.as_ref(), Some(&sent));
         assert_eq!(layer.normalizer.dd_errors(), 0);
     }
 
@@ -1591,12 +1573,7 @@ mod dd_tests {
         let mut pkt = packet_carrying(&[0xff; 12]);
 
         assert!(!layer.process(&mut pkt));
-        assert!(
-            pkt.ext_vals
-                .user_values
-                .get::<DependencyDescriptor>()
-                .is_none()
-        );
+        assert!(pkt.extensions.dependency_descriptor.is_none());
         assert_eq!(layer.normalizer.dd_errors(), 1);
     }
 
@@ -1615,9 +1592,9 @@ mod vla_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::vla_stream_target_bps;
-    use str0m::rtp::vla::{
-        SimulcastStreamAllocation, SpatialLayerAllocation, TemporalLayerAllocation,
-        VideoLayersAllocation,
+    use crate::rtp::types::{
+        ResolutionAndFramerate, SimulcastStreamAllocation, SpatialLayerAllocation,
+        TemporalLayerAllocation, VideoLayersAllocation,
     };
 
     fn stream(cumulative_kbps: &[u64]) -> SimulcastStreamAllocation {
@@ -1646,7 +1623,6 @@ mod vla_tests {
     fn temporal_ladder_and_framerate_flow_into_stream_state() {
         use super::{vla_stream_framerate, vla_stream_temporal_cumulative_kbps};
         use crate::rtp::monitor::StreamStats;
-        use str0m::rtp::vla::ResolutionAndFramerate;
 
         let mut s = stream(&[300, 450, 600]);
         s.spatial_layers
@@ -1690,7 +1666,6 @@ mod vla_tests {
 
     #[test]
     fn height_is_tallest_declared_spatial_layer_or_none() {
-        use str0m::rtp::vla::ResolutionAndFramerate;
         let with_height = |h: u16| SimulcastStreamAllocation {
             spatial_layers: vec![SpatialLayerAllocation {
                 temporal_layers: vec![TemporalLayerAllocation {

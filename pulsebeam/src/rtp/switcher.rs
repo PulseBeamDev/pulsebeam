@@ -8,18 +8,16 @@
 use ahash::HashMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
-use str0m::media::{Frequency, MediaTime};
-use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::rtp::RtpPacket;
 use crate::rtp::cache::{StreamCache, TrackStreamCache};
 use crate::rtp::frame_selector::{
     DecodeTargetSelection, DependencyDescriptorSelector, FrameDecision, FrameSelector,
 };
 use crate::rtp::monitor::StreamStats;
 use crate::rtp::timeline::Timeline;
+use crate::rtp::{Frequency, MediaTime, RtpPacket, SequenceNumber as SeqNo};
 use crate::track::StreamId;
 
 pub(crate) type LayerStates = HashMap<StreamId, StreamStats>;
@@ -215,17 +213,17 @@ impl Switcher {
         emit: &mut impl FnMut(RtpPacket),
     ) {
         if let Some(active) = self.active.filter(|s| s.0 == track_id)
-            && let Some(encoding) = cache.encoding(active.1)
+            && let Some(encoding) = cache.encoding(crate::track::packet_encoding(active.1))
         {
             self.pull_active(encoding, emit);
         }
         if let Some(draining) = self.draining.filter(|s| s.0 == track_id)
-            && let Some(encoding) = cache.encoding(draining.1)
+            && let Some(encoding) = cache.encoding(crate::track::packet_encoding(draining.1))
         {
             self.drain_tail(encoding, now, emit);
         }
         if let Some(staging) = self.staging.filter(|s| s.0 == track_id)
-            && let Some(encoding) = cache.encoding(staging.1)
+            && let Some(encoding) = cache.encoding(crate::track::packet_encoding(staging.1))
         {
             self.try_switch(encoding, now, emit);
         }
@@ -656,7 +654,7 @@ mod test {
     ) {
         for p in packets {
             let mut p = p.clone();
-            p.ext_vals.rid = stream.1;
+            p.extensions.rid = crate::track::packet_encoding(stream.1);
             let now = p.arrival_ts;
             cache.push(p);
             switcher.feed(stream.0, cache, now, &mut |o| out.push(o));
@@ -820,7 +818,7 @@ mod test {
                 },
                 ..Default::default()
             };
-            p.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+            p.extensions.dependency_descriptor = Some(dd);
         }
     }
 
@@ -900,9 +898,7 @@ mod test {
     /// from a temporal generator onto every packet of `frame`.
     fn stamp_generated_dd(frame: &mut [RtpPacket], dd: &pulsebeam_core::dd::DependencyDescriptor) {
         for p in frame.iter_mut() {
-            p.ext_vals
-                .user_values
-                .set_arc(std::sync::Arc::new(dd.clone()));
+            p.extensions.dependency_descriptor = Some(dd.clone());
         }
     }
 
@@ -912,17 +908,16 @@ mod test {
     /// structure) is an entry point with no references. This proves the SFU shed a
     /// self-consistent set — not merely that egress RTP is well-formed.
     fn assert_dd_decodable(forwarded: &[RtpPacket]) {
-        use pulsebeam_core::dd::DependencyDescriptor;
         use std::collections::HashSet;
 
         let present: HashSet<u16> = forwarded
             .iter()
-            .filter_map(|p| p.ext_vals.user_values.get::<DependencyDescriptor>())
+            .filter_map(|p| p.extensions.dependency_descriptor.as_ref())
             .map(|dd| dd.frame_number)
             .collect();
 
         for p in forwarded {
-            let Some(dd) = p.ext_vals.user_values.get::<DependencyDescriptor>() else {
+            let Some(dd) = p.extensions.dependency_descriptor.as_ref() else {
                 continue;
             };
             if dd.attached_structure.is_some() {

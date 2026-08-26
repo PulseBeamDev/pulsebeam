@@ -6,7 +6,7 @@ use crate::keys::TrackKey;
 use crate::{
     entity::{TrackId, TrackKind},
     log::{LogCtx, plog_warn},
-    rtp::RtpPacket,
+    rtp::{RtpPacket, SenderReport},
     track::UpstreamTrack,
 };
 use ahash::{HashMap, HashMapExt};
@@ -14,7 +14,6 @@ pub(crate) use audio::UpstreamAudio;
 pub(crate) use data::UpstreamData;
 use str0m::media::Mid;
 use str0m::rtp::Ssrc;
-use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 pub(crate) use video::UpstreamVideo;
 
@@ -159,7 +158,7 @@ impl UpstreamMedia {
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
         rtp: RtpPacket,
-        sr: Option<SenderInfo>,
+        sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {
         let Some(slot) = self.published_tracks.get_mut(index) else {
             debug_assert!(false, "cached upstream slot index is out of bounds");
@@ -181,7 +180,7 @@ impl UpstreamMedia {
             };
         }
         let mut rtp = rtp;
-        rtp.ext_vals.rid = rid.cloned();
+        rtp.extensions.rid = rid.map(|rid| crate::rtp::EncodingId::from(&**rid));
         slot.track.process(rid, rtp, sr)
     }
     fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {
@@ -250,7 +249,7 @@ impl Upstream {
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
         rtp: RtpPacket,
-        sr: Option<SenderInfo>,
+        sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {
         match slot {
             UpstreamSlotKey::Audio(index) => {

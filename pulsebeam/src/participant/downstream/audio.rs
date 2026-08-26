@@ -274,7 +274,7 @@ impl AudioAllocator {
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) -> Option<()> {
-        let Some(level_dbov) = pkt.ext_vals.audio_level else {
+        let Some(level_dbov) = pkt.extensions.audio_level else {
             plog_warn!(
                 self.ctx,
                 target: crate::log::TARGET_AUDIO,
@@ -430,7 +430,7 @@ mod tests {
 
     fn speaking(level_dbov: i8) -> RtpPacket {
         let mut pkt = RtpPacket::default();
-        pkt.ext_vals.audio_level = Some(level_dbov);
+        pkt.extensions.audio_level = Some(level_dbov);
         pkt
     }
 

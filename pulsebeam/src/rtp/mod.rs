@@ -1,10 +1,3 @@
-//! Shared-state exception, imposed by str0m: `RtpWrite::new` takes
-//! `payload: Arc<[u8]>`, so a packet carries one, and its extension map
-//! stores `Arc<dyn Any>`. Neither can be removed without changing the fork.
-//! Both are kept core-local — `to_transit` copies the payload and
-//! `rehome_extensions` re-anchors the descriptor — so no refcount is ever
-//! shared across shards. See `docs/thread-per-core.md`.
-
 pub mod cache;
 #[cfg(debug_assertions)]
 pub mod egress_guard;
@@ -15,19 +8,17 @@ pub mod normalize;
 pub mod switcher;
 pub mod sync;
 pub mod timeline;
+pub mod types;
 
 #[cfg(test)]
 pub mod conformance;
 
-#[allow(
-    clippy::disallowed_types,
-    reason = "str0m's RtpWrite::new takes payload: Arc<[u8]>; kept core-local, see module note"
-)]
-use std::sync::Arc;
-use str0m::media::{Frequency, MediaTime};
-use str0m::rtp::rtcp::SenderInfo;
-use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use tokio::time::Instant;
+
+pub use types::{
+    EncodingId, Frequency, MediaKind, MediaSectionId, MediaTime, PacketExtensions,
+    PacketProvenance, PayloadType, SenderReport, SequenceNumber, Ssrc, VideoLayersAllocation,
+};
 
 use crate::entity::{ParticipantId, TrackId};
 
@@ -57,18 +48,15 @@ pub struct AudioRtpPacket {
 /// redundant header data (sequence_number, timestamp, csrc list, etc.) is dropped
 /// at ingress so every ring-slot stays as small as possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    clippy::disallowed_types,
-    reason = "str0m's RtpWrite::new takes payload: Arc<[u8]>; kept core-local, see module note"
-)]
 pub struct RtpPacket {
     pub ssrc: Ssrc,
     pub marker: bool,
-    pub ext_vals: ExtensionValues,
+    pub extensions: PacketExtensions,
     pub header_len: usize,
-    pub seq_no: SeqNo,
+    pub seq_no: SequenceNumber,
     pub rtp_ts: MediaTime,
     pub arrival_ts: Instant,
+    pub provenance: PacketProvenance,
 
     /// Scheduled playout time for the packet, in the server's monotonic clock domain.
     /// Since all streams in this process share the same monotonic clock, this time can
@@ -89,141 +77,210 @@ pub struct RtpPacket {
     /// Which switch-relevant H.264 NAL units this payload carries. Always empty
     /// for audio.
     pub nal: h264::NalFlags,
-    pub payload: Arc<[u8]>,
+    pub payload: Vec<u8>,
 }
 
 impl Default for RtpPacket {
-    #[allow(
-        clippy::disallowed_types,
-        reason = "str0m's RtpWrite::new takes payload: Arc<[u8]>; kept core-local, see module note"
-    )]
     fn default() -> Self {
         Self {
             ssrc: 1234.into(),
             marker: false,
-            ext_vals: ExtensionValues::default(),
+            extensions: PacketExtensions::default(),
             header_len: 12,
-            seq_no: SeqNo::from(1u64),
+            seq_no: SequenceNumber::from(1u64),
             rtp_ts: MediaTime::new(0, VIDEO_FREQUENCY),
             arrival_ts: Instant::now(),
+            provenance: PacketProvenance {
+                received_at: Instant::now(),
+                packet_id: 0,
+                stream_id: None,
+            },
             playout_time: Instant::now(),
             is_keyframe: false,
             is_frame_start: true,
             nal: h264::NalFlags::empty(),
-            payload: Arc::new([0u8; 1200]), // 1.2KB payload for test realism
+            payload: vec![0u8; 1200],
         }
     }
 }
 
 impl RtpPacket {
-    /// Converts a str0m `RtpPacket` into the internal representation.
-    ///
-    /// Returns `(packet, sr)` where `sr` is the most recent Sender Report piggybacked
-    /// on this packet by str0m (present on ~1/30 packets). The caller must thread `sr`
-    /// to the `Synchronizer` so it never has to live in the ring struct.
-    pub fn from_str0m(rtp: str0m::rtp::RtpPacket, codec: Codec) -> (Self, Option<SenderInfo>) {
+    pub(crate) fn from_ingress_parts(
+        ssrc: Ssrc,
+        marker: bool,
+        header_len: usize,
+        seq_no: SequenceNumber,
+        rtp_ts: MediaTime,
+        arrival_ts: Instant,
+        provenance: PacketProvenance,
+        extensions: PacketExtensions,
+        codec: Codec,
+        payload: Vec<u8>,
+    ) -> Self {
         let mut nal = h264::NalFlags::empty();
         let is_keyframe_start = match codec {
             Codec::H264 => {
-                nal = h264::classify(&rtp.payload);
+                nal = h264::classify(&payload);
                 nal.idr()
             }
-            Codec::VP8 => str0m::format::detect_vp8_keyframe(&rtp.payload),
-            Codec::VP9 => str0m::format::detect_vp9_keyframe(&rtp.payload),
-            Codec::Opus => true, // audio frame has not dependencies,
+            Codec::VP8 => vp8_keyframe(&payload),
+            Codec::VP9 => vp9_keyframe(&payload),
+            Codec::Opus => true,
         };
-
-        let sr = rtp.last_sender_info;
-        let pkt = Self {
-            ssrc: rtp.header.ssrc,
-            marker: rtp.header.marker,
-            ext_vals: rtp.header.ext_vals,
-            header_len: rtp.header.header_len,
-            seq_no: rtp.seq_no,
-            rtp_ts: rtp.time,
-            arrival_ts: rtp.timestamp.into(),
-            playout_time: rtp.timestamp.into(),
+        Self {
+            ssrc,
+            marker,
+            extensions,
+            header_len,
+            seq_no,
+            rtp_ts,
+            arrival_ts,
+            provenance,
+            playout_time: arrival_ts,
             is_keyframe: is_keyframe_start,
-            // Without a Dependency Descriptor a packet is its own frame, which
-            // is what the receiver assumes too. `normalize` corrects this from
-            // the descriptor when one is present.
             is_frame_start: true,
             nal,
-            payload: rtp.payload,
-        };
-        (pkt, sr)
+            payload,
+        }
     }
 
-    /// Copy for handoff to another core. The payload copy is deliberate: sharing
-    /// one `Arc` across shards would put the refcount header in the same cache
-    /// line as the payload head, so a remote drop invalidates a line other cores
-    /// are reading. Copying into a fresh `Arc` is also the *cheapest* option, not
-    /// a compromise — str0m's `RtpWrite::new` demands `Arc<[u8]>` at egress, so a
-    /// pooled block or `Rc<[u8]>` would cost a second copy on the way out.
-    /// Revisit only if the str0m fork stops requiring `Arc<[u8]>`.
-    #[allow(
-        clippy::disallowed_types,
-        reason = "copies into a fresh Arc<[u8]> rather than sharing, see module note"
-    )]
     pub fn to_transit(&self) -> Self {
-        let mut ext_vals = self.ext_vals.clone();
-
-        // The sender's Video Layers Allocation describes *its* simulcast set.
-        // The destination never reads it — normalization already ran, once, on
-        // this side — and egress strips it before writing. Carrying it across
-        // is dead weight and one more shared refcount.
-        ext_vals
-            .user_values
-            .remove::<str0m::rtp::vla::VideoLayersAllocation>();
+        let mut extensions = self.extensions.clone();
+        extensions.video_layers_allocation = None;
 
         Self {
             ssrc: self.ssrc,
             marker: self.marker,
-            ext_vals,
+            extensions,
             header_len: self.header_len,
             seq_no: self.seq_no,
             rtp_ts: self.rtp_ts,
             arrival_ts: self.arrival_ts,
+            provenance: self.provenance,
             playout_time: self.playout_time,
             is_keyframe: self.is_keyframe,
             is_frame_start: self.is_frame_start,
             nal: self.nal,
-            payload: Arc::from(&self.payload[..]),
+            payload: self.payload.clone(),
         }
     }
 
-    /// Move the parsed descriptor onto a fresh allocation owned by this core.
-    ///
-    /// Cloning the extension map clones the `Arc<dyn Any>` inside it, so an
-    /// arriving packet's descriptor is still refcounted against the publisher's
-    /// core. Both cores then touch that line on every packet — the publisher
-    /// when it clones for its own subscribers, this core when it clones for
-    /// each of ours — and it ping-pongs between them for as long as the stream
-    /// runs. Copying the payload in [`Self::to_transit`] exists to prevent
-    /// exactly that; the extensions were the hole in it.
-    ///
-    /// Done here rather than in `to_transit` because the publisher pays that
-    /// once per destination while a destination pays it once, and the publisher
-    /// is the busier core: it also normalizes, caches, and fans out locally.
-    #[allow(
-        clippy::disallowed_types,
-        reason = "re-anchors the Arc<dyn Any> extension map entry to this core, see module note"
-    )]
     pub fn rehome_extensions(&mut self) {
-        let Some(dd) = self
-            .ext_vals
-            .user_values
-            .get::<pulsebeam_core::dd::DependencyDescriptor>()
-        else {
-            return;
-        };
-        let owned = Arc::new(dd.clone());
-        self.ext_vals.user_values.set_arc(owned);
+        debug_assert!(
+            self.extensions.dependency_descriptor.is_none()
+                || self.extensions.raw_dependency_descriptor.is_some()
+        );
     }
 
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {
         self.playout_time = playout_time;
         self
+    }
+
+    pub fn from_packet_view(
+        packet: &pulsebeam_rtc::RtpPacketView<'_>,
+        codec: Codec,
+        extensions: PacketExtensions,
+        mut payload: Vec<u8>,
+    ) -> Self {
+        payload.clear();
+        payload.extend_from_slice(packet.payload());
+        let source = packet.provenance();
+        let received_at = Instant::from_std(source.received_at());
+        Self::from_ingress_parts(
+            packet.ssrc().into(),
+            packet.marker(),
+            packet.header().len(),
+            u64::from(packet.sequence_number()).into(),
+            MediaTime::new(u64::from(packet.timestamp()), VIDEO_FREQUENCY),
+            received_at,
+            PacketProvenance {
+                received_at,
+                packet_id: source.packet_id().get(),
+                stream_id: source.stream_id().map(|stream| stream.get()),
+            },
+            extensions,
+            codec,
+            payload,
+        )
+    }
+}
+
+fn vp8_keyframe(payload: &[u8]) -> bool {
+    let Some((&descriptor, body)) = payload.split_first() else {
+        return false;
+    };
+    let mut index = 1usize;
+    if descriptor & 0x80 != 0 {
+        let Some(&extension) = body.first() else {
+            return false;
+        };
+        index = index.saturating_add(1);
+        if extension & 0x80 != 0 {
+            index = index.saturating_add(1);
+        }
+        if extension & 0x40 != 0 {
+            index = index.saturating_add(1);
+        }
+        if extension & 0x20 != 0 || extension & 0x10 != 0 {
+            let Some(&layers) = payload.get(index) else {
+                return false;
+            };
+            index = index.saturating_add(1);
+            if extension & 0x10 != 0 && layers & 0x80 != 0 {
+                index = index.saturating_add(1);
+            }
+        }
+    }
+    descriptor & 0x10 != 0 && payload.get(index).is_some_and(|byte| byte & 1 == 0)
+}
+
+fn vp9_keyframe(payload: &[u8]) -> bool {
+    payload
+        .first()
+        .is_some_and(|descriptor| descriptor & 0x40 != 0 && descriptor & 0x08 == 0)
+}
+
+#[cfg(test)]
+mod structural_tests {
+    use super::*;
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Instant as StdInstant,
+    };
+
+    #[test]
+    fn packet_view_preserves_provenance_and_reuses_the_destination_buffer() {
+        let bytes = [
+            0x80, 0xe0, 0x00, 0x09, 0x00, 0x00, 0x0b, 0xb8, 0x00, 0x00, 0x00, 0x07, 0x65, 0x01,
+            0x02,
+        ];
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_001);
+        let provenance = pulsebeam_rtc::PacketProvenance::new(
+            StdInstant::now(),
+            pulsebeam_rtc::TransportMetadata::new(
+                pulsebeam_rtc::TransportProtocol::Udp,
+                address,
+                address,
+            ),
+            pulsebeam_rtc::PacketId::new(41),
+        );
+        let pulsebeam_rtc::PacketView::Rtp(view) =
+            pulsebeam_rtc::IngressPacket::new(&bytes, provenance)
+                .parse()
+                .expect("valid RTP")
+        else {
+            panic!("fixture is RTP");
+        };
+        let storage = Vec::with_capacity(1_500);
+        let capacity = storage.capacity();
+        let packet =
+            RtpPacket::from_packet_view(&view, Codec::H264, PacketExtensions::default(), storage);
+
+        assert_eq!(packet.payload, [0x65, 0x01, 0x02]);
+        assert_eq!(packet.provenance.packet_id, 41);
+        assert_eq!(packet.provenance.received_at, packet.arrival_ts);
+        assert_eq!(packet.payload.capacity(), capacity);
     }
 }
 
@@ -290,7 +347,7 @@ pub mod test_utils {
         Box::new(move |prev| {
             let mut prev = prev.clone();
             prev.ssrc = new_ssrc.into();
-            prev.seq_no = SeqNo::from(start_seq as u64);
+            prev.seq_no = SequenceNumber::from(start_seq as u64);
             prev.rtp_ts = MediaTime::new(start_ts as u64, Frequency::NINETY_KHZ);
             prev.marker = false;
             prev.is_keyframe = false;
@@ -390,14 +447,14 @@ pub mod test_utils {
             let pkt = RtpPacket {
                 ssrc: self.ssrc,
                 marker,
-                seq_no: SeqNo::from(self.seq),
+                seq_no: SequenceNumber::from(self.seq),
                 rtp_ts: MediaTime::new(self.rtp_ts, VIDEO_FREQUENCY),
                 arrival_ts: at,
                 playout_time: at,
                 is_keyframe: nal.idr(),
                 is_frame_start: true,
                 nal,
-                payload: Arc::from(payload.as_slice()),
+                payload,
                 ..Default::default()
             };
             self.seq += 1;

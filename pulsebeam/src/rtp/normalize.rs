@@ -9,14 +9,9 @@
 //! reads the result and never writes to it, so the two can run on different
 //! nodes without either duplicating the other's work.
 
-use str0m::media::{Mid, Rid};
-use str0m::rtp::vla::VideoLayersAllocation;
+use pulsebeam_core::dd::{DdReadError, DependencyDescriptorReader, read_mandatory};
 
-use pulsebeam_core::dd::{
-    DdReadError, DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory,
-};
-
-use crate::rtp::{RtpPacket, cache::PacketWindow};
+use crate::rtp::{EncodingId as Rid, MediaSectionId as Mid, RtpPacket, cache::PacketWindow};
 
 /// What normalizing a packet taught us about its stream.
 ///
@@ -75,11 +70,7 @@ impl StreamNormalizer {
 
     /// Bring `pkt` into the SFU's internal form and report what it declared.
     pub fn normalize(&mut self, mut pkt: RtpPacket) -> Normalization {
-        let carries_dd = pkt
-            .ext_vals
-            .user_values
-            .get::<RawDependencyDescriptor>()
-            .is_some();
+        let carries_dd = pkt.extensions.raw_dependency_descriptor.is_some();
         let cold = self.dd.structure().is_none();
         let mut parse_error = None;
         let Some(facts) = self.normalize_ready(&mut pkt, &mut parse_error) else {
@@ -134,34 +125,30 @@ impl StreamNormalizer {
     }
 
     fn learn_vla_index(&mut self, pkt: &RtpPacket) {
-        if let Some(vla) = pkt.ext_vals.user_values.get::<VideoLayersAllocation>() {
+        if let Some(vla) = &pkt.extensions.video_layers_allocation {
             self.vla_index = Some(vla.current_simulcast_stream_index);
         }
     }
 
-    #[allow(
-        clippy::disallowed_types,
-        reason = "parsed descriptor is anchored in an Arc<dyn Any> extension map entry, core-local; see rtp::mod"
-    )]
     fn normalize_ready(
         &mut self,
         pkt: &mut RtpPacket,
         parse_error: &mut Option<DdReadError>,
     ) -> Option<StreamFacts> {
         self.learn_vla_index(pkt);
-        let Some(raw) = pkt.ext_vals.user_values.get::<RawDependencyDescriptor>() else {
+        let Some(raw) = pkt.extensions.raw_dependency_descriptor.as_ref() else {
             return Some(StreamFacts::default());
         };
         match self.dd.read(&raw.0) {
             Ok(dd) => {
                 // Under SFrame/E2EE the media payload is opaque, so the H.264
-                // IDR probe in `from_str0m` sees nothing. The Dependency
+                // IDR probe sees nothing. The Dependency
                 // Descriptor rides in the clear and carries the template
                 // structure on a keyframe's first packet, so it is the authoritative
                 // keyframe signal whenever present.
                 pkt.is_keyframe |= dd.attached_structure.is_some();
                 pkt.is_frame_start = dd.start_of_frame;
-                pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+                pkt.extensions.dependency_descriptor = Some(dd);
                 Some(StreamFacts {
                     decode_targets: self.dd.structure().map(|s| s.decode_target_count),
                 })
@@ -175,9 +162,9 @@ impl StreamNormalizer {
 
     fn release_cold_start(&mut self, packet: RtpPacket, facts: StreamFacts) -> Normalization {
         let frame_number = packet
-            .ext_vals
-            .user_values
-            .get::<RawDependencyDescriptor>()
+            .extensions
+            .raw_dependency_descriptor
+            .as_ref()
             .and_then(|raw| read_mandatory(&raw.0).ok())
             .map(|mandatory| mandatory.frame_number);
         let Some(frame_number) = frame_number else {
@@ -192,9 +179,9 @@ impl StreamNormalizer {
         let mut packets = vec![(packet, facts)];
         for held in self.pending_dd.take_all_sorted() {
             let belongs_to_template = held
-                .ext_vals
-                .user_values
-                .get::<RawDependencyDescriptor>()
+                .extensions
+                .raw_dependency_descriptor
+                .as_ref()
                 .and_then(|raw| read_mandatory(&raw.0).ok())
                 .is_some_and(|mandatory| mandatory.frame_number == frame_number);
             if !belongs_to_template {
@@ -244,6 +231,7 @@ impl StreamNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsebeam_core::dd::RawDependencyDescriptor;
     use pulsebeam_core::dd::temporal::TemporalDdSource;
 
     fn packet(seq: u64, raw: RawDependencyDescriptor) -> RtpPacket {
@@ -251,7 +239,7 @@ mod tests {
             seq_no: seq.into(),
             ..RtpPacket::default()
         };
-        packet.ext_vals.user_values.set(raw);
+        packet.extensions.raw_dependency_descriptor = Some(raw);
         packet
     }
 

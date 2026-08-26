@@ -529,11 +529,13 @@ impl Participant {
                     let refreshed = self.downstream.refresh_ssrc(kind, mid, rid, ssrc);
                     debug_assert!(refreshed, "recovered stream has no downstream slot");
                     if playout_delay.is_some() {
-                        self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
+                        self.downstream
+                            .record_playout_delay_stamp(mid, rid, (*seq_no).into());
                     }
                 }
                 AppliedMutation::RtpWritten if playout_delay.is_some() => {
-                    self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
+                    self.downstream
+                        .record_playout_delay_stamp(mid, rid, (*seq_no).into());
                 }
                 AppliedMutation::Applied
                 | AppliedMutation::RtpNotWritten

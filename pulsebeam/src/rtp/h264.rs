@@ -103,14 +103,12 @@ mod test {
     }
 
     #[test]
-    fn parameter_sets_are_detected_where_str0m_keyframe_detection_is_blind() {
-        // The regression this whole module exists for: str0m's keyframe detector
-        // reports `false` for these, so a cache keyed on it alone loses them.
+    fn parameter_sets_are_classified_without_being_keyframes() {
         assert!(classify(&sps(20)).sps());
-        assert!(!str0m::format::detect_h264_keyframe(&sps(20)));
+        assert!(!classify(&sps(20)).idr());
 
         assert!(classify(&pps(8)).pps());
-        assert!(!str0m::format::detect_h264_keyframe(&pps(8)));
+        assert!(!classify(&pps(8)).idr());
     }
 
     #[test]
@@ -156,21 +154,20 @@ mod test {
     }
 
     #[test]
-    fn classification_agrees_with_str0m_on_idr_presence() {
-        for payload in [
-            single_nalu(IDR_NALU_TYPE, 300),
-            non_idr(300),
-            stap_a(&[(SPS_NALU_TYPE, 12), (PPS_NALU_TYPE, 5), (IDR_NALU_TYPE, 40)]),
-            stap_a(&[(SPS_NALU_TYPE, 12), (PPS_NALU_TYPE, 5)]),
-            idr_fu_a(true, false, 800),
-            idr_fu_a(false, false, 800),
+    fn classification_reports_idr_only_when_present() {
+        for (payload, expected) in [
+            (single_nalu(IDR_NALU_TYPE, 300), true),
+            (non_idr(300), false),
+            (
+                stap_a(&[(SPS_NALU_TYPE, 12), (PPS_NALU_TYPE, 5), (IDR_NALU_TYPE, 40)]),
+                true,
+            ),
+            (stap_a(&[(SPS_NALU_TYPE, 12), (PPS_NALU_TYPE, 5)]), false),
+            (idr_fu_a(true, false, 800), true),
+            (idr_fu_a(false, false, 800), false),
         ] {
-            assert_eq!(
-                classify(&payload).idr(),
-                str0m::format::detect_h264_keyframe(&payload),
-                "IDR detection must match str0m for payload {:02x?}",
-                &payload[..payload.len().min(4)]
-            );
+            let flags = classify(&payload);
+            assert_eq!(flags.idr(), expected);
         }
     }
 }

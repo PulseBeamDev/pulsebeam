@@ -1,7 +1,11 @@
 use super::UpstreamMedia;
-use crate::{entity::TrackId, log::LogCtx, rtp::RtpPacket, track::UpstreamTrack};
+use crate::{
+    entity::TrackId,
+    log::LogCtx,
+    rtp::{RtpPacket, SenderReport},
+    track::UpstreamTrack,
+};
 use str0m::media::Mid;
-use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
 pub(crate) struct UpstreamVideo {
@@ -30,7 +34,7 @@ impl UpstreamVideo {
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
         rtp: RtpPacket,
-        sr: Option<SenderInfo>,
+        sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {
         self.media.handle_incoming_rtp(index, mid, rid, rtp, sr)
     }

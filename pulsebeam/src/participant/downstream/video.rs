@@ -2717,7 +2717,7 @@ mod slot_switch_tests {
         fn ingest(&mut self, layer: &TrackLayer, pkt: &RtpPacket) -> bool {
             let track_id = layer.meta.id;
             let mut pkt = pkt.clone();
-            pkt.ext_vals.rid = layer.rid;
+            pkt.extensions.rid = layer.rid.map(|rid| crate::rtp::EncodingId::from(&*rid));
             self.cache.push(pkt.clone());
             let promoted = self.slot.on_rtp(
                 track_id,

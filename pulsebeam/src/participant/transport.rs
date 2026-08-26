@@ -2,13 +2,17 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 
 use crate::participant::batcher::{Batcher, NetworkEgress, OwnedPacketQueue};
-use crate::rtp::{Codec as RtpCodec, RtpPacket};
+use crate::rtp::{
+    Codec as RtpCodec, EncodingId, Frequency, MediaKind as PacketMediaKind, MediaSectionId,
+    MediaTime as PacketMediaTime, PacketExtensions, PacketProvenance, RtpPacket, SenderReport,
+    VideoLayersAllocation,
+};
 use pulsebeam_runtime::net::RecvPacketBatch;
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, MediaTime, Mid, Pt, Rid};
 use str0m::net::Protocol;
-use str0m::rtp::RtpWrite;
+use str0m::rtp::{ExtensionValues, RtpWrite};
 use str0m::{Event, Output, Rtc, RtcError};
 use tokio::time::Instant;
 
@@ -55,7 +59,7 @@ pub(crate) struct RtpIngress {
     pub(crate) mid: Mid,
     pub(crate) rid: Option<Rid>,
     pub(crate) packet: RtpPacket,
-    pub(crate) sender_info: Option<str0m::rtp::rtcp::SenderInfo>,
+    pub(crate) sender_info: Option<SenderReport>,
 }
 
 pub(crate) enum AppliedMutation {
@@ -265,7 +269,50 @@ impl Transport {
             MediaKind::Audio => RtpCodec::Opus,
             MediaKind::Video => RtpCodec::H264,
         };
-        let (packet, sender_info) = RtpPacket::from_str0m(rtp, codec);
+        let sender_info = rtp.last_sender_info.map(|sender| SenderReport {
+            ssrc: (*sender.ssrc).into(),
+            ntp_time: sender.ntp_time,
+            rtp_time: packet_media_time(sender.rtp_time),
+            sender_packet_count: sender.sender_packet_count,
+            sender_octet_count: sender.sender_octet_count,
+        });
+        let arrival_ts = rtp.timestamp.into();
+        let ext_vals = rtp.header.ext_vals;
+        let extensions = PacketExtensions {
+            mid: ext_vals.mid.map(|mid| MediaSectionId::from(&*mid)),
+            rid: ext_vals.rid.map(|rid| EncodingId::from(&*rid)),
+            audio_level: ext_vals.audio_level,
+            play_delay_min: ext_vals.play_delay_min.map(packet_media_time),
+            play_delay_max: ext_vals.play_delay_max.map(packet_media_time),
+            raw_dependency_descriptor: ext_vals
+                .user_values
+                .get::<pulsebeam_core::dd::RawDependencyDescriptor>()
+                .cloned(),
+            dependency_descriptor: ext_vals
+                .user_values
+                .get::<pulsebeam_core::dd::DependencyDescriptor>()
+                .cloned(),
+            video_layers_allocation: ext_vals
+                .user_values
+                .get::<str0m::rtp::vla::VideoLayersAllocation>()
+                .map(packet_video_layers_allocation),
+        };
+        let packet = RtpPacket::from_ingress_parts(
+            (*rtp.header.ssrc).into(),
+            rtp.header.marker,
+            rtp.header.header_len,
+            (*rtp.seq_no).into(),
+            packet_media_time(rtp.time),
+            arrival_ts,
+            PacketProvenance {
+                received_at: arrival_ts,
+                packet_id: 0,
+                stream_id: None,
+            },
+            extensions,
+            codec,
+            rtp.payload.to_vec(),
+        );
         Some(RtpIngress {
             mid,
             rid,
@@ -382,18 +429,27 @@ impl Transport {
         debug_assert_eq!(stream.rid(), rid);
         let ssrc = stream.ssrc();
         #[cfg(debug_assertions)]
-        if let Some(violation) =
-            self.egress_guard
-                .check(mid, rid, *pkt.seq_no, pkt.rtp_ts.numer(), pkt.marker, kind)
-        {
+        if let Some(violation) = self.egress_guard.check(
+            MediaSectionId::from(&*mid),
+            rid.map(|rid| EncodingId::from(&*rid)),
+            *pkt.seq_no,
+            pkt.rtp_ts.numer(),
+            pkt.marker,
+            match kind {
+                MediaKind::Audio => PacketMediaKind::Audio,
+                MediaKind::Video => PacketMediaKind::Video,
+            },
+        ) {
             tracing::error!(%mid, ?rid, %violation, "egress stream invariant violated");
             #[cfg(feature = "sim")]
             pulsebeam_runtime::fatal!("egress stream invariant violated: {violation}");
         }
-        let mut ext_vals = pkt.ext_vals;
-        ext_vals
-            .user_values
-            .remove::<str0m::rtp::vla::VideoLayersAllocation>();
+        let mut ext_vals = ExtensionValues::default();
+        ext_vals.rid = pkt.extensions.rid.map(|rid| str0m::media::Rid::from(&*rid));
+        ext_vals.audio_level = pkt.extensions.audio_level;
+        if let Some(raw) = pkt.extensions.raw_dependency_descriptor {
+            ext_vals.user_values.set(raw);
+        }
         if let Some((min, max)) = playout_delay {
             ext_vals.play_delay_min = Some(min);
             ext_vals.play_delay_max = Some(max);
@@ -424,7 +480,7 @@ impl Transport {
         }
         let rtp = RtpWrite::new(
             pt,
-            pkt.seq_no,
+            (*pkt.seq_no).into(),
             u32::try_from(pkt.rtp_ts.numer() & u64::from(u32::MAX)).unwrap_or(0),
             now.into(),
             pkt.payload,
@@ -490,5 +546,46 @@ impl Transport {
     pub(crate) fn disconnect(&mut self) {
         self.rtc.disconnect();
         self.rtc_needs_drain = true;
+    }
+}
+
+fn packet_media_time(value: MediaTime) -> PacketMediaTime {
+    PacketMediaTime::new(
+        value.numer(),
+        Frequency::new(value.frequency().get()).expect("RTP clock rates are non-zero"),
+    )
+}
+
+fn packet_video_layers_allocation(
+    value: &str0m::rtp::vla::VideoLayersAllocation,
+) -> VideoLayersAllocation {
+    VideoLayersAllocation {
+        current_simulcast_stream_index: value.current_simulcast_stream_index,
+        simulcast_streams: value
+            .simulcast_streams
+            .iter()
+            .map(|stream| crate::rtp::types::SimulcastStreamAllocation {
+                spatial_layers: stream
+                    .spatial_layers
+                    .iter()
+                    .map(|layer| crate::rtp::types::SpatialLayerAllocation {
+                        temporal_layers: layer
+                            .temporal_layers
+                            .iter()
+                            .map(|temporal| crate::rtp::types::TemporalLayerAllocation {
+                                cumulative_kbps: temporal.cumulative_kbps,
+                            })
+                            .collect(),
+                        resolution_and_framerate: layer.resolution_and_framerate.as_ref().map(
+                            |resolution| crate::rtp::types::ResolutionAndFramerate {
+                                width: resolution.width,
+                                height: resolution.height,
+                                framerate: resolution.framerate,
+                            },
+                        ),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }

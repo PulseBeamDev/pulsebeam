@@ -5,9 +5,9 @@
 //! checks turn that into a loud failure under `debug_assertions` and in
 //! simulation, where the switching paths are actually exercised.
 
+use crate::rtp::{EncodingId as Rid, MediaKind, MediaSectionId as Mid};
 use ahash::{HashMap, HashMapExt, HashSet};
 use std::collections::VecDeque;
-use str0m::media::{MediaKind, Mid, Rid};
 
 /// How many timestamps to remember per egress stream when looking for reuse.
 const HISTORY: usize = 1024;
