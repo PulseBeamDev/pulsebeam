@@ -92,6 +92,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -105,17 +108,6 @@ jobs:
 
       - name: Browser interoperability regression
         run: make test-browser
-
-      # bpfel-unknown-none is tier 3: there is no prebuilt std for it, so the
-      # eBPF crate always needs nightly's `-Z build-std=core`, not a target
-      # rustup can install (see Makefile's build-ebpf).
-      - name: Install nightly for eBPF build-std
-        if: steps.layout.outputs.has_ebpf == 'true'
-        run: rustup toolchain install nightly --component rust-src --profile minimal
-
-      - name: Build eBPF program
-        if: steps.layout.outputs.has_ebpf == 'true'
-        run: make build-ebpf
 
   # eBPF attach/load needs elevated kernel privileges, which the normal `build`
   # job does not have and should not gain. Keep the behavioural smoke test in
@@ -146,7 +138,10 @@ jobs:
       # eBPF attach; this job is the privileged execution path.
       - name: Attach/load smoke test (privileged)
         run: >
-          sudo -E env "PATH=$PATH"
+          sudo env
+          "PATH=$PATH"
+          RUSTC_WRAPPER=
+          SCCACHE_GHA_ENABLED=false
           cargo test
           -p pulsebeam
           --lib
