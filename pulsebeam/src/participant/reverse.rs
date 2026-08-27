@@ -1,6 +1,6 @@
+use crate::rtp::{EncodingId as Rid, KeyframeRequestKind};
 use sha3::{Digest, Sha3_256};
 use std::time::Duration;
-use crate::rtp::{EncodingId as Rid, KeyframeRequestKind};
 
 const KEYFRAME: u8 = 1;
 const RELIABLE_CONTROL: u8 = 2;

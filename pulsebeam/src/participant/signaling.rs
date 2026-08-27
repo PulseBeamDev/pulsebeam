@@ -3,10 +3,10 @@ use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use crate::entity::TrackId;
 use crate::log::{LogCtx, plog_info, plog_warn};
 use crate::participant::intent::{AudioIntent, VideoIntent as Intent};
+use crate::rtp::MediaSectionId as Mid;
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
-use str0m::channel::ChannelId;
-use crate::rtp::MediaSectionId as Mid;
+use pulsebeam_rtc::ChannelId;
 
 const MAX_SIGNALING_MSG_SIZE: usize = 16 * 1024; // 16 KB (Signaling shouldn't be huge)
 
@@ -561,9 +561,7 @@ mod tests {
 
         assert!(!signaling.needs_poll(), "a channel is required");
 
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        let cid = rtc.direct_api().create_data_channel(Default::default());
-        signaling.set_cid(cid);
+        signaling.set_cid(pulsebeam_rtc::ChannelId::new(1));
         assert!(signaling.needs_poll(), "a dirty channel needs a snapshot");
 
         assert!(signaling.poll(&snapshot).is_some(), "initial state emits");

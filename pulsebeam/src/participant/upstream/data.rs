@@ -1,6 +1,6 @@
 use ahash::{HashMap, HashMapExt};
+use pulsebeam_rtc::ChannelId;
 use slotmap::SecondaryMap;
-use str0m::channel::ChannelId;
 
 use crate::{entity::TrackId, keys::TrackKey, track::Track};
 

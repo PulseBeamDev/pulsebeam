@@ -1,6 +1,6 @@
+use pulsebeam_rtc::ChannelId;
 use slotmap::SecondaryMap;
 use std::collections::VecDeque;
-use str0m::channel::ChannelId;
 
 use crate::{
     keys::TrackKey,

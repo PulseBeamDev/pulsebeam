@@ -1,5 +1,5 @@
 use ahash::{HashMap, HashMapExt};
-use str0m::channel::ChannelId;
+use pulsebeam_rtc::ChannelId;
 
 use crate::track::{DataTopicChannel, DataTrackDirection, TrackSelector};
 

@@ -294,6 +294,15 @@ impl Upstream {
     pub(crate) fn route_for_ssrc(&self, ssrc: Ssrc) -> Option<IncomingRtpRoute> {
         self.routes.get(ssrc)
     }
+    pub(crate) fn route_for_track(
+        &self,
+        track_id: TrackId,
+        rid: Option<&Rid>,
+    ) -> Option<IncomingRtpRoute> {
+        self.routes.routes.iter().copied().find(|route| {
+            route.track_id == track_id && (rid.is_none() || route.rid.as_ref() == rid)
+        })
+    }
     pub(crate) fn cache_route(&mut self, route: IncomingRtpRoute) {
         self.routes.insert(route);
     }

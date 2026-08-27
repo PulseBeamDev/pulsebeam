@@ -114,6 +114,36 @@ impl DirectTransport {
             .send_rtp_with_congestion(bytes, extended_sequence, send_id)
     }
 
+    pub fn send_rtp_untracked(
+        &mut self,
+        bytes: &[u8],
+        extended_sequence: u64,
+    ) -> Result<(), LiveConnectionError> {
+        self.connection.send_rtp(bytes, extended_sequence)
+    }
+
+    pub fn assign_congestion(
+        &mut self,
+        send_id: SendId,
+        bytes: usize,
+    ) -> Result<pulsebeam_rtc::EgressCongestion, LiveConnectionError> {
+        self.connection.assign_congestion(send_id, bytes)
+    }
+
+    pub fn send_rtp_with_assigned_congestion(
+        &mut self,
+        bytes: &[u8],
+        extended_sequence: u64,
+        send_id: SendId,
+    ) -> Result<(), LiveConnectionError> {
+        self.connection
+            .send_rtp_with_assigned_congestion(bytes, extended_sequence, send_id)
+    }
+
+    pub fn send_rtcp(&mut self, bytes: &[u8]) -> Result<(), LiveConnectionError> {
+        self.connection.send_rtcp(bytes)
+    }
+
     pub fn congestion_estimate(&self, now: Instant) -> pulsebeam_rtc::CongestionEstimate {
         self.connection.congestion_estimate(now.into())
     }

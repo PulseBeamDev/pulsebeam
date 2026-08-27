@@ -1,3 +1,4 @@
+use arrayvec::ArrayVec;
 use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
@@ -12,7 +13,9 @@ use crate::{
     keys::ParticipantKey,
     participant::{
         ParticipantConfig,
-        batcher::{AppendStatus, Batcher, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
+        batcher::{
+            AppendStatus, Batcher, DepartureReceipt, GsoSendBatch, NetworkEgress, OwnedPacketQueue,
+        },
     },
     shard::{
         dirty::DirtyTracker,
@@ -28,6 +31,7 @@ pub(crate) use super::router::ShardTransport;
 use super::worker::{MediaPayload, ShardCommand, ShardEvent, ShardFrame};
 
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
+const MAX_DEPARTURES_PER_FLUSH: usize = net::BATCH_SIZE * 64;
 
 fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) {
     metrics::counter!(
@@ -46,6 +50,7 @@ struct ShardNetworkEgress<'a> {
     tcp: &'a mut Batcher,
     udp_socket: &'a mut UnifiedSocket,
     tcp_socket: &'a mut net::tcp::TcpTransport,
+    departures: &'a mut ArrayVec<DepartureReceipt, MAX_DEPARTURES_PER_FLUSH>,
 }
 
 impl NetworkEgress for ShardNetworkEgress<'_> {
@@ -73,8 +78,23 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
     }
 
     fn flush(&mut self) -> bool {
-        let udp_progress = self.udp.flush(self.udp_socket);
-        let tcp_progress = self.tcp.flush(self.tcp_socket);
+        let departures = &mut *self.departures;
+        let udp_progress = self.udp.flush(self.udp_socket, |receipt| {
+            if departures.try_push(receipt).is_err() {
+                debug_assert!(
+                    false,
+                    "one shard flush exceeded its departure receipt bound"
+                );
+            }
+        });
+        let tcp_progress = self.tcp.flush(self.tcp_socket, |receipt| {
+            if departures.try_push(receipt).is_err() {
+                debug_assert!(
+                    false,
+                    "one shard flush exceeded its departure receipt bound"
+                );
+            }
+        });
         udp_progress || tcp_progress
     }
 }
@@ -94,6 +114,7 @@ pub(crate) struct ShardExecution {
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
     tcp_send_batcher: Batcher,
+    departures: ArrayVec<DepartureReceipt, MAX_DEPARTURES_PER_FLUSH>,
     pipeline: EventPipeline,
     wall: WallAnchor,
 }
@@ -230,6 +251,7 @@ impl ShardExecution {
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
             tcp_send_batcher: Batcher::with_capacity(max_gso_segments),
+            departures: ArrayVec::new(),
             pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
             wall,
         }
@@ -244,6 +266,7 @@ impl ShardExecution {
         let registry = &mut self.registry;
         let udp = &mut self.udp_send_batch;
         let tcp = &mut self.tcp_send_batcher;
+        let departures = &mut self.departures;
         let Some(participant) = registry.resolve_mut(key) else {
             return;
         };
@@ -252,6 +275,7 @@ impl ShardExecution {
             tcp,
             udp_socket,
             tcp_socket,
+            departures,
         };
         participant.drain_network(&mut egress);
     }
@@ -697,6 +721,7 @@ impl ShardExecution {
     ) -> usize {
         debug_assert!(budget > 0);
         debug_assert!(self.udp_send_batch.is_empty());
+        debug_assert!(self.departures.is_empty());
         self.dirty.begin_phase();
         let mut processed = 0;
         while processed < budget {
@@ -724,8 +749,30 @@ impl ShardExecution {
         } else {
             self.dirty.finish_phase();
         }
-        self.udp_send_batch.flush(udp_socket);
-        self.tcp_send_batcher.flush(tcp_socket);
+        {
+            let departures = &mut self.departures;
+            self.udp_send_batch.flush(udp_socket, |receipt| {
+                if departures.try_push(receipt).is_err() {
+                    debug_assert!(
+                        false,
+                        "one shard flush exceeded its departure receipt bound"
+                    );
+                }
+            });
+            self.tcp_send_batcher.flush(tcp_socket, |receipt| {
+                if departures.try_push(receipt).is_err() {
+                    debug_assert!(
+                        false,
+                        "one shard flush exceeded its departure receipt bound"
+                    );
+                }
+            });
+        }
+        while let Some(receipt) = self.departures.pop() {
+            if let Some(participant) = self.registry.resolve_mut(receipt.participant) {
+                participant.report_departure(receipt.send_id, now);
+            }
+        }
         processed
     }
 

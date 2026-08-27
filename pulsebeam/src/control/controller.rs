@@ -6,7 +6,7 @@ use crate::{
     control::{
         core::{ControllerCore, RoomPlacement},
         lifecycle::{TrackLifecycle, TrackLifecycleOperation, TrackLifecycleOutcome},
-        negotiator::{Negotiator, NegotiatorError},
+        negotiator::{DirectNegotiation, Negotiator, NegotiatorError},
         tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
         ufrag::IceUfrag,
     },
@@ -19,10 +19,6 @@ use crate::{
     },
 };
 use pulsebeam_runtime::mailbox;
-use str0m::{
-    Candidate,
-    change::{SdpAnswer, SdpOffer},
-};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -51,12 +47,12 @@ pub enum ControllerCommand {
 #[derive(Debug)]
 pub struct CreateParticipant {
     pub state: ParticipantState,
-    pub offer: SdpOffer,
+    pub offer: String,
 }
 
 #[derive(Debug)]
 pub struct CreateParticipantReply {
-    pub answer: SdpAnswer,
+    pub answer: String,
 }
 
 #[derive(Debug)]
@@ -68,12 +64,12 @@ pub struct DeleteParticipant {
 #[derive(Debug)]
 pub struct PatchParticipant {
     pub state: ParticipantState,
-    pub offer: SdpOffer,
+    pub offer: String,
 }
 
 #[derive(Debug)]
 pub struct PatchParticipantReply {
-    pub answer: SdpAnswer,
+    pub answer: String,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -103,7 +99,7 @@ struct PendingMaterialization {
     ack: Option<oneshot::Receiver<bool>>,
     participant: ParticipantId,
     room_id: RoomId,
-    answer: SdpAnswer,
+    answer: String,
 }
 
 enum RequiredAction {
@@ -139,7 +135,7 @@ impl ControllerActor {
     pub(crate) fn with_placement(
         _rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
-        candidates: Vec<Candidate>,
+        candidates: Box<[pulsebeam_rtc::IceCandidate]>,
         tcp_listener: pulsebeam_core::net::TcpListener,
         room_shard_slot: usize,
         placement: RoomPlacement,
@@ -726,7 +722,7 @@ impl ControllerActor {
     fn begin_create_participant(
         &mut self,
         state: ParticipantState,
-        offer: SdpOffer,
+        offer: String,
     ) -> Result<PendingMaterialization, ControllerError> {
         let participant_id = state.participant_id;
         let (slot, placement) = self.core.room_slot(&state.room_id);
@@ -752,7 +748,14 @@ impl ControllerActor {
             .ok_or(ControllerError::ServiceUnavailable)?;
         let creds = IceUfrag::new(self.cluster_id, self.node_id, handle.route, handle.epoch)
             .into_ice_creds();
-        let (rtc, answer) = match self.negotiator.create_answer(offer, creds) {
+        let direct_id = pulsebeam_rtc::ConnectionId::new(
+            (u64::from(handle.route.get()) << 16) | u64::from(handle.epoch),
+        );
+        let DirectNegotiation {
+            answer,
+            session,
+            local,
+        } = match self.negotiator.create_answer(&offer, direct_id, creds) {
             Ok(value) => value,
             Err(error) => {
                 self.core.remove_participant_key(shard, key);
@@ -765,7 +768,9 @@ impl ControllerActor {
             self.core.release_transport(handle, now);
             return Err(ControllerError::ServiceUnavailable);
         }
-        let config = self.core.create_participant(rtc, state, shard, handle, key);
+        let config = self
+            .core
+            .create_participant(direct_id, session, local, state, shard, handle, key);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {
@@ -783,7 +788,7 @@ impl ControllerActor {
         })
     }
 
-    fn complete_materialization(&mut self, pending: PendingMaterialization) -> SdpAnswer {
+    fn complete_materialization(&mut self, pending: PendingMaterialization) -> String {
         let participant_id = pending.participant;
         let room_id = pending.room_id;
         let generation = self.lifecycle.next_generation();
@@ -832,7 +837,7 @@ impl ControllerActor {
     fn begin_patch_participant(
         &mut self,
         state: ParticipantState,
-        offer: SdpOffer,
+        offer: String,
     ) -> Result<PendingMaterialization, ControllerError> {
         let current = self
             .core

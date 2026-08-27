@@ -6,6 +6,7 @@
 //! and the peer receives datagrams that were never sent.
 
 use arrayvec::ArrayVec;
+use pulsebeam_rtc::SendId;
 use pulsebeam_runtime::net;
 use std::{
     collections::VecDeque,
@@ -13,6 +14,13 @@ use std::{
 };
 
 const MAX_FREE_STATES: usize = 3;
+const MAX_RECEIPTS_PER_BATCH: usize = 64;
+
+#[derive(Clone, Copy)]
+pub(crate) struct DepartureReceipt {
+    pub(crate) participant: crate::keys::ParticipantKey,
+    pub(crate) send_id: SendId,
+}
 
 pub struct OwnedPacketQueue {
     max_segments: usize,
@@ -33,6 +41,7 @@ pub trait NetworkEgress {
 struct OwnedPacket {
     dst: SocketAddr,
     contents: Vec<u8>,
+    receipt: Option<DepartureReceipt>,
 }
 
 impl OwnedPacketQueue {
@@ -45,12 +54,25 @@ impl OwnedPacketQueue {
     }
 
     pub fn push_back(&mut self, dst: SocketAddr, contents: Vec<u8>) {
+        self.push_back_with_receipt(dst, contents, None);
+    }
+
+    pub(crate) fn push_back_with_receipt(
+        &mut self,
+        dst: SocketAddr,
+        contents: Vec<u8>,
+        receipt: Option<DepartureReceipt>,
+    ) {
         debug_assert!(!contents.is_empty(), "Pushed content must not be empty");
         debug_assert!(
             contents.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE,
             "Packet exceeds the maximum framed payload"
         );
-        self.packets.push_back(OwnedPacket { dst, contents });
+        self.packets.push_back(OwnedPacket {
+            dst,
+            contents,
+            receipt,
+        });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -58,12 +80,12 @@ impl OwnedPacketQueue {
     }
 }
 
-#[derive(Clone, Copy)]
 struct GsoPacketMeta {
     dst: SocketAddr,
     segment_size: usize,
     start: usize,
     end: usize,
+    receipts: ArrayVec<DepartureReceipt, MAX_RECEIPTS_PER_BATCH>,
 }
 
 pub struct GsoSendBatch {
@@ -102,6 +124,7 @@ impl GsoSendBatch {
         let segment_size = first.contents.len();
         let start = self.arena.len();
         let mut segment_count = 0;
+        let mut receipts = ArrayVec::new();
 
         while let Some(packet) = queue.packets.front() {
             debug_assert!(!packet.contents.is_empty());
@@ -127,6 +150,13 @@ impl GsoSendBatch {
 
             let is_tail = packet.contents.len() < segment_size;
             self.arena.extend_from_slice(&packet.contents);
+            if let Some(receipt) = packet.receipt {
+                debug_assert!(receipts.len() < receipts.capacity());
+                if receipts.try_push(receipt).is_err() {
+                    debug_assert!(false, "GSO batch exceeded receipt capacity");
+                    break;
+                }
+            }
             segment_count = segment_count.saturating_add(1);
             queue.packets.pop_front();
             if is_tail {
@@ -143,11 +173,16 @@ impl GsoSendBatch {
             segment_size,
             start,
             end,
+            receipts,
         });
         true
     }
 
-    pub fn flush(&mut self, socket: &mut net::UnifiedSocket) -> bool {
+    pub fn flush(
+        &mut self,
+        socket: &mut net::UnifiedSocket,
+        mut departed: impl FnMut(DepartureReceipt),
+    ) -> bool {
         if self.packets.is_empty() {
             return false;
         }
@@ -175,6 +210,11 @@ impl GsoSendBatch {
         match result {
             Ok(sent) => {
                 debug_assert!(sent <= self.packets.len());
+                for packet in self.packets.iter().take(sent) {
+                    for receipt in &packet.receipts {
+                        departed(*receipt);
+                    }
+                }
                 self.packets.clear();
                 self.arena.clear();
                 sent != 0
@@ -218,15 +258,30 @@ impl Batcher {
     /// It attempts to find an existing batch for the same destination that is not yet sealed.
     /// If no suitable batch is found, it takes one from the free pool or allocates a new one.
     pub fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
-        let accepted = self.try_push_back(dst, content);
+        let accepted = self.try_push_back(dst, content, None);
         debug_assert!(accepted, "content is larger than the batcher's capacity");
     }
 
-    fn try_push_back(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
+    pub(crate) fn push_back_with_receipt(
+        &mut self,
+        dst: SocketAddr,
+        content: &[u8],
+        receipt: Option<DepartureReceipt>,
+    ) {
+        let accepted = self.try_push_back(dst, content, receipt);
+        debug_assert!(accepted, "content is larger than the batcher's capacity");
+    }
+
+    fn try_push_back(
+        &mut self,
+        dst: SocketAddr,
+        content: &[u8],
+        receipt: Option<DepartureReceipt>,
+    ) -> bool {
         debug_assert!(!content.is_empty(), "Pushed content must not be empty");
 
         if let Some(state) = self.active_states.back_mut()
-            && state.try_push(dst, content)
+            && state.try_push_with_receipt(dst, content, receipt)
         {
             return true;
         }
@@ -238,7 +293,7 @@ impl Batcher {
 
         new_state.reset(dst);
 
-        if new_state.try_push(dst, content) {
+        if new_state.try_push_with_receipt(dst, content, receipt) {
             self.active_states.push_back(new_state);
             true
         } else {
@@ -250,7 +305,7 @@ impl Batcher {
     pub fn append_from(&mut self, queue: &mut OwnedPacketQueue) -> bool {
         while let Some(packet) = queue.packets.front() {
             let before = self.active_states.len();
-            if !self.try_push_back(packet.dst, &packet.contents) {
+            if !self.try_push_back(packet.dst, &packet.contents, packet.receipt) {
                 return false;
             }
             let Some(_) = queue.packets.pop_front() else {
@@ -283,7 +338,11 @@ impl Batcher {
         }
     }
 
-    pub fn flush(&mut self, socket: &mut net::tcp::TcpTransport) -> bool {
+    pub fn flush(
+        &mut self,
+        socket: &mut net::tcp::TcpTransport,
+        mut departed: impl FnMut(DepartureReceipt),
+    ) -> bool {
         let mut progressed = false;
         while let Some(state) = self.front() {
             debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
@@ -309,6 +368,9 @@ impl Batcher {
                         debug_assert!(false, "a flushed batch must remain queued");
                         break;
                     };
+                    for receipt in &state.receipts {
+                        departed(*receipt);
+                    }
                     self.reclaim(state);
                     progressed = true;
                 }
@@ -336,6 +398,7 @@ pub struct BatcherState {
     max_segments: usize,
     sealed: bool,
     pub buf: Vec<u8>,
+    receipts: ArrayVec<DepartureReceipt, MAX_RECEIPTS_PER_BATCH>,
 }
 
 impl BatcherState {
@@ -358,11 +421,21 @@ impl BatcherState {
                 cap.saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE)
                     .min(net::MAX_UDP_GSO_PAYLOAD_SIZE),
             ),
+            receipts: ArrayVec::new(),
         }
     }
 
     /// Attempts to append a content slice to the buffer. Returns true on success.
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
+        self.try_push_with_receipt(dst, content, None)
+    }
+
+    fn try_push_with_receipt(
+        &mut self,
+        dst: SocketAddr,
+        content: &[u8],
+        receipt: Option<DepartureReceipt>,
+    ) -> bool {
         debug_assert!(!content.is_empty(), "Segment content must not be empty");
         debug_assert!(
             content.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE,
@@ -393,6 +466,11 @@ impl BatcherState {
             self.segment_size = content.len();
         }
 
+        if receipt.is_some() && self.receipts.len() == self.receipts.capacity() {
+            debug_assert!(false, "TCP batch exceeded receipt capacity");
+            return false;
+        }
+
         if content.len() == self.segment_size {
             debug_assert!(
                 self.buf.len().saturating_add(content.len())
@@ -401,6 +479,9 @@ impl BatcherState {
                         .saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE)
             );
             self.buf.extend_from_slice(content);
+            if let Some(receipt) = receipt {
+                self.receipts.push(receipt);
+            }
             self.segment_count = self.segment_count.saturating_add(1);
             debug_assert!(self.segment_count <= self.max_segments);
             debug_assert!(self.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
@@ -413,6 +494,9 @@ impl BatcherState {
                         .saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE)
             );
             self.buf.extend_from_slice(content);
+            if let Some(receipt) = receipt {
+                self.receipts.push(receipt);
+            }
             self.segment_count = self.segment_count.saturating_add(1);
             self.sealed = true;
             debug_assert!(self.segment_count <= self.max_segments);
@@ -430,6 +514,7 @@ impl BatcherState {
         self.segment_count = 0;
         self.sealed = false;
         self.buf.clear();
+        self.receipts.clear();
         debug_assert_eq!(self.segment_size, 0);
         debug_assert_eq!(self.segment_count, 0);
         debug_assert!(self.buf.is_empty());

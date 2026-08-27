@@ -10,9 +10,9 @@ use crate::entity::TrackId;
 use crate::entity::TrackKind;
 use crate::keys::TrackKey;
 use crate::log::LogCtx;
+use crate::participant::allocation::{AllocationInput, AllocationOutput, Bitrate};
 use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::event::ParticipantSink;
-use crate::participant::allocation::{AllocationInput, AllocationOutput, Bitrate};
 pub use crate::participant::intent::AudioIntent;
 use crate::rtp::{
     EncodingId as Rid, KeyframeRequest, MediaKind, MediaSectionId as Mid, MediaTime,
@@ -275,7 +275,7 @@ impl Downstream {
         &mut self,
         key: TrackKey,
         track: &Track,
-        channels: &[(str0m::channel::ChannelId, crate::track::DataTopicChannel)],
+        channels: &[(pulsebeam_rtc::ChannelId, crate::track::DataTopicChannel)],
     ) -> bool {
         let entry = TrackCatalogEntry {
             participant_id: track.meta().origin,

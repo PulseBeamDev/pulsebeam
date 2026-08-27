@@ -21,7 +21,6 @@ use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
-use str0m::Candidate;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
@@ -761,18 +760,15 @@ impl NodeBuilder {
             };
 
             for addr in tcp_candidate_addrs {
-                candidates.push(
-                    Candidate::builder()
-                        .tcp()
-                        .host(addr)
-                        .tcptype(str0m::net::TcpType::Passive)
-                        .build()
-                        .unwrap_or_else(|err| {
-                            pulsebeam_runtime::fatal!(
-                                "cannot advertise a TCP candidate for {addr}: {err}"
-                            )
-                        }),
+                let sdp = format!(
+                    "candidate:1 1 TCP 2130706431 {} {} typ host tcptype passive",
+                    addr.ip(),
+                    addr.port()
                 );
+                let Some(candidate) = pulsebeam_rtc::IceCandidate::new(sdp) else {
+                    pulsebeam_runtime::fatal!("cannot advertise a TCP candidate for {addr}");
+                };
+                candidates.push(candidate);
             }
         }
 
@@ -882,7 +878,7 @@ impl NodeBuilder {
         let mut controller = ControllerActor::with_placement(
             controller_rng,
             shard_contexts,
-            candidates,
+            candidates.into(),
             tcp_listener,
             self.room_shard_slot,
             self.room_placement,
@@ -1011,7 +1007,7 @@ async fn bind_udp_sockets(
 fn sockets_to_candidates(
     sockets: &[net::BoundUdpSocket],
     advertised_addrs: &[SocketAddr],
-) -> Vec<Candidate> {
+) -> Vec<pulsebeam_rtc::IceCandidate> {
     let candidate_addrs = if advertised_addrs.is_empty() {
         let mut unique = Vec::with_capacity(sockets.len());
         let mut seen = HashSet::with_capacity(sockets.len());
@@ -1028,13 +1024,14 @@ fn sockets_to_candidates(
 
     let mut candidates = Vec::with_capacity(candidate_addrs.len());
     for addr in candidate_addrs {
-        let candidate = Candidate::builder()
-            .udp()
-            .host(addr)
-            .build()
-            .unwrap_or_else(|err| {
-                pulsebeam_runtime::fatal!("cannot advertise a UDP candidate for {addr}: {err}")
-            });
+        let sdp = format!(
+            "candidate:1 1 UDP 2130706431 {} {} typ host",
+            addr.ip(),
+            addr.port()
+        );
+        let Some(candidate) = pulsebeam_rtc::IceCandidate::new(sdp) else {
+            pulsebeam_runtime::fatal!("cannot advertise a UDP candidate for {addr}");
+        };
         candidates.push(candidate);
     }
 

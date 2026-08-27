@@ -143,13 +143,32 @@ pub enum DataChannelError {
 }
 
 pub struct DataChannelAssociation {
-    socket: Box<dyn DcSctpSocket>,
+    socket: ShardSctpSocket,
     epoch: Instant,
     channels: HashMap<ChannelId, DataChannelOpen>,
     events: VecDeque<DataChannelEvent>,
     egress: VecDeque<Vec<u8>>,
     event_capacity: usize,
     egress_capacity: usize,
+}
+
+struct ShardSctpSocket(Box<dyn DcSctpSocket>);
+
+// A socket remains exclusively owned by its logical shard while Tokio moves that shard between workers.
+unsafe impl Send for ShardSctpSocket {}
+
+impl std::ops::Deref for ShardSctpSocket {
+    type Target = dyn DcSctpSocket;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::DerefMut for ShardSctpSocket {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut()
+    }
 }
 
 impl DataChannelAssociation {
@@ -163,7 +182,7 @@ impl DataChannelAssociation {
         let mut options = Options::default();
         options.local_port = port;
         options.remote_port = port;
-        let socket = dcsctp::new_socket(name, &options);
+        let socket = ShardSctpSocket(dcsctp::new_socket(name, &options));
         Self {
             socket,
             epoch: now,

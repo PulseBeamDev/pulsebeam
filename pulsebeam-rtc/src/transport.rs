@@ -12,10 +12,9 @@ use str0m::{
 };
 
 use crate::{
-    CongestionEstimate, ConnectionId, DataChannelAssociation, EgressCongestion, ForwardedRtp,
-    Gcc, GccError, GccOutcome, IngressPacket, MediaSectionId, NegotiatedMediaSection,
-    NegotiatedSession, PacketError, PacketProvenance, PacketView, SendId, TransportMetadata,
-    TransportProtocol,
+    CongestionEstimate, ConnectionId, DataChannelAssociation, EgressCongestion, ForwardedRtp, Gcc,
+    GccError, GccOutcome, IngressPacket, MediaSectionId, NegotiatedMediaSection, NegotiatedSession,
+    PacketError, PacketProvenance, PacketView, SendId, TransportMetadata, TransportProtocol,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +37,10 @@ impl EgressDatagram {
 
     pub const fn send_id(&self) -> Option<SendId> {
         self.send_id
+    }
+
+    pub fn into_parts(self) -> (Vec<u8>, TransportMetadata, Option<SendId>) {
+        (self.bytes, self.transport, self.send_id)
     }
 }
 
@@ -342,12 +345,18 @@ impl LiveConnection {
     }
 
     pub fn next_deadline(&mut self) -> Option<Instant> {
-        match (self.ice.poll_timeout(), self.next_dtls_deadline) {
-            (Some(ice), Some(dtls)) => Some(ice.min(dtls)),
-            (Some(ice), None) => Some(ice),
-            (None, Some(dtls)) => Some(dtls),
-            (None, None) => None,
+        let mut deadline = self.ice.poll_timeout();
+        if let Some(dtls) = self.next_dtls_deadline {
+            deadline = Some(deadline.map_or(dtls, |current| current.min(dtls)));
         }
+        if let Some(data) = self
+            .data
+            .as_ref()
+            .and_then(DataChannelAssociation::next_deadline)
+        {
+            deadline = Some(deadline.map_or(data, |current| current.min(data)));
+        }
+        deadline
     }
 
     pub fn poll_event(&mut self) -> Option<TransportEvent> {
@@ -374,7 +383,11 @@ impl LiveConnection {
         self.congestion.pop_front()
     }
 
-    pub fn report_departure(&mut self, send_id: SendId, now: Instant) -> Result<(), LiveConnectionError> {
+    pub fn report_departure(
+        &mut self,
+        send_id: SendId,
+        now: Instant,
+    ) -> Result<(), LiveConnectionError> {
         self.gcc.record_departure(send_id, now)?;
         Ok(())
     }
@@ -449,7 +462,10 @@ impl LiveConnection {
             provenance: packet.provenance(),
         };
         if let PacketView::Rtcp(rtcp) = authenticated.parse()? {
-            for outcome in self.gcc.process_rtcp(packet.provenance().received_at(), &rtcp)? {
+            for outcome in self
+                .gcc
+                .process_rtcp(packet.provenance().received_at(), &rtcp)?
+            {
                 if self.congestion.len() < self.congestion.capacity() {
                     self.congestion.push_back(outcome);
                 }
@@ -481,6 +497,24 @@ impl LiveConnection {
         send_id: SendId,
     ) -> Result<EgressCongestion, LiveConnectionError> {
         let congestion = self.gcc.assign(send_id, bytes.len())?;
+        self.send_rtp_with_assigned_congestion(bytes, extended_sequence, send_id)?;
+        Ok(congestion)
+    }
+
+    pub fn assign_congestion(
+        &mut self,
+        send_id: SendId,
+        bytes: usize,
+    ) -> Result<EgressCongestion, LiveConnectionError> {
+        Ok(self.gcc.assign(send_id, bytes)?)
+    }
+
+    pub fn send_rtp_with_assigned_congestion(
+        &mut self,
+        bytes: &[u8],
+        extended_sequence: u64,
+        send_id: SendId,
+    ) -> Result<(), LiveConnectionError> {
         let header = RtpHeader::parse(bytes, &ExtensionMap::empty())
             .ok_or(LiveConnectionError::RtpHeader)?;
         let encrypted = self
@@ -489,7 +523,7 @@ impl LiveConnection {
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .protect_rtp(bytes, &header, extended_sequence);
         self.push_protected_egress(encrypted, Some(send_id))?;
-        Ok(congestion)
+        Ok(())
     }
 
     pub fn send_forwarded_rtp(&mut self, packet: &ForwardedRtp) -> Result<(), LiveConnectionError> {

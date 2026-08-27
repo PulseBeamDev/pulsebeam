@@ -41,7 +41,7 @@ pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const MAX_SIMULCAST_LAYERS: usize = 3;
 
 /// Deferred outbound RTP write.  Applying it to `Rtc` is deliberately the
-/// participant core's responsibility so it can drain str0m between writes.
+/// participant core's responsibility so transport output remains bounded.
 pub enum StreamWrite {
     Video {
         pkt: RtpPacket,
@@ -947,7 +947,7 @@ mod data_track {
     use std::fmt::Display;
 
     use crate::entity::ParticipantId;
-    use str0m::channel::{ChannelConfig, Reliability};
+    use pulsebeam_rtc::DataChannelReliability;
 
     const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 96;
 
@@ -1103,7 +1103,7 @@ mod data_track {
         UnsupportedDataChannelConfig {
             label: String,
             ordered: bool,
-            reliability: Reliability,
+            reliability: DataChannelReliability,
         },
 
         #[error(
@@ -1121,11 +1121,12 @@ mod data_track {
         ScopeNotAllowedForReliableSubscribe,
     }
 
-    impl TryFrom<&ChannelConfig> for DataTrackIntent {
-        type Error = DataTrackIntentError;
-
-        fn try_from(cfg: &ChannelConfig) -> Result<Self, Self::Error> {
-            let s = &cfg.label;
+    impl DataTrackIntent {
+        pub fn from_channel(
+            label: &str,
+            reliability: DataChannelReliability,
+        ) -> Result<Self, DataTrackIntentError> {
+            let s = label;
             if s.len() > MAX_DATA_TRACK_NAMESPACE_LEN {
                 return Err(DataTrackIntentError::LabelTooLong);
             }
@@ -1154,19 +1155,21 @@ mod data_track {
                     let supported_delivery_guarantee = match lane {
                         DataLane::Realtime => {
                             matches!(
-                                cfg.reliability,
-                                Reliability::MaxRetransmits { retransmits: 0 }
-                            ) && !cfg.ordered
+                                reliability.max_retransmits_value(),
+                                Some(0)
+                            ) && !reliability.ordered()
                         }
                         DataLane::Reliable => {
-                            matches!(cfg.reliability, Reliability::Reliable) && cfg.ordered
+                            reliability.max_retransmits_value().is_none()
+                                && reliability.max_lifetime_value().is_none()
+                                && reliability.ordered()
                         }
                     };
                     if !supported_delivery_guarantee {
                         return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
-                            label: s.clone(),
-                            ordered: cfg.ordered,
-                            reliability: cfg.reliability,
+                            label: s.to_owned(),
+                            ordered: reliability.ordered(),
+                            reliability,
                         });
                     }
 
@@ -1236,6 +1239,19 @@ mod data_track {
         use super::*;
         use pulsebeam_runtime::rand::RngCore;
 
+        struct ChannelConfig {
+            label: String,
+            reliability: DataChannelReliability,
+        }
+
+        impl TryFrom<&ChannelConfig> for DataTrackIntent {
+            type Error = DataTrackIntentError;
+
+            fn try_from(value: &ChannelConfig) -> Result<Self, Self::Error> {
+                Self::from_channel(&value.label, value.reliability)
+            }
+        }
+
         fn test_rng() -> impl RngCore {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1245,20 +1261,14 @@ mod data_track {
         fn cfg(label: &str) -> ChannelConfig {
             ChannelConfig {
                 label: label.to_string(),
-                ordered: false,
-                reliability: Reliability::MaxRetransmits { retransmits: 0 },
-                negotiated: None,
-                protocol: "".to_string(),
+                reliability: DataChannelReliability::max_retransmits(false, 0),
             }
         }
 
         fn rel_cfg(label: &str) -> ChannelConfig {
             ChannelConfig {
                 label: label.to_string(),
-                ordered: true,
-                reliability: Reliability::Reliable,
-                negotiated: None,
-                protocol: "".to_string(),
+                reliability: DataChannelReliability::reliable_ordered(),
             }
         }
 

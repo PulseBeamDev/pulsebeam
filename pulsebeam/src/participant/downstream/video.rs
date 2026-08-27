@@ -1,4 +1,5 @@
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
+use crate::participant::allocation::Bitrate;
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
 use crate::rtp;
@@ -7,17 +8,16 @@ use crate::rtp::RtpPacket;
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
+use crate::rtp::{
+    EncodingId as Rid, KeyframeRequest, KeyframeRequestKind, MediaSectionId as Mid,
+    PayloadType as Pt, Ssrc,
+};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indexmap::IndexSet;
 use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
-use crate::participant::allocation::Bitrate;
-use crate::rtp::{
-    EncodingId as Rid, KeyframeRequest, KeyframeRequestKind, MediaSectionId as Mid,
-    PayloadType as Pt, Ssrc,
-};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
@@ -82,7 +82,7 @@ pub const START_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
-/// What the SFU announces to str0m as the starting estimate.
+/// The starting estimate applied by the SFU allocator.
 ///
 /// Deliberately above [`START_BANDWIDTH`]: the estimate this SFU starts its own
 /// allocator from is not the same number as the one it tells the transport to
@@ -1768,10 +1768,10 @@ mod alloc_test_support {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::ParticipantId;
+    use crate::rtp::SimulcastEncoding as SimulcastLayer;
     use crate::rtp::monitor::StreamStats;
     use crate::track::UpstreamTrack;
     use crate::track::test_utils::make_video_track;
-    use crate::rtp::SimulcastEncoding as SimulcastLayer;
 
     /// Measurement handles standing in for what the publisher's shard would
     /// have supplied. Seeded active, which is what the old `inactive(false)`

@@ -12,7 +12,6 @@ use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::{ETAG, IF_MATCH, LOCATION};
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::Serialize;
-use str0m::{change::SdpOffer, error::SdpError};
 use tokio::time::Instant;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -82,8 +81,6 @@ pub struct ApiConfig {
 pub enum ApiError {
     #[error("invalid entity id format: {0}")]
     IdValidation(#[from] IdValidationError),
-    #[error("sdp offer is invalid: {0}")]
-    OfferInvalid(#[from] SdpError),
     #[error("join failed: {0}")]
     JoinError(#[from] controller::ControllerError),
     #[error("too many requests, please try again later.")]
@@ -102,7 +99,6 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
             ApiError::IdValidation(_)
-            | ApiError::OfferInvalid(_)
             | ApiError::JoinError(controller::ControllerError::OfferRejected(_))
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
@@ -201,7 +197,7 @@ async fn create_participant(
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
     let room_id = RoomId::from_external(&external_room_id);
-    let offer = SdpOffer::from_sdp_string(&raw_offer)?;
+    let offer = raw_offer;
 
     let (participant_id, connection_id) = (ParticipantId::new(), ConnectionId::new());
 
@@ -242,7 +238,7 @@ async fn create_participant(
     Ok((
         StatusCode::CREATED,
         response_headers.to_header_map()?,
-        reply.answer.to_sdp_string(),
+        reply.answer,
     ))
 }
 
@@ -325,7 +321,7 @@ async fn patch_participant(
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
     let room_id = RoomId::from_external(&external_room_id);
-    let offer = SdpOffer::from_sdp_string(&raw_offer)?;
+    let offer = raw_offer;
 
     let old_connection_id: ConnectionId = headers
         .get(IF_MATCH)
@@ -370,7 +366,7 @@ async fn patch_participant(
     Ok((
         StatusCode::OK,
         response_headers.to_header_map()?,
-        reply.answer.to_sdp_string(),
+        reply.answer,
     ))
 }
 

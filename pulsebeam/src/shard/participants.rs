@@ -41,7 +41,7 @@ pub(crate) struct ParticipantRegistry {
     ///
     /// `SecondaryMap` is a dense `Vec` indexed by the key, so its element size
     /// is its stride. `ParticipantMeta` is ~10.9KB — three quarters of it
-    /// str0m's `Rtc` — and growing the map `Vec::extend`s, which reallocates
+    /// participant protocol state — and growing the map `Vec::extend`s, which reallocates
     /// and memcpies every participant already in it. On a shard filling to 500
     /// that is ~2.7MB copied in one go, on a `SCHED_FIFO` thread, while media
     /// is flowing. A pointer costs 16 bytes of stride instead of 10,904, so the
@@ -79,7 +79,20 @@ impl ParticipantRegistry {
     ) -> bool {
         debug_assert_eq!(ingress.shard(), self.shard_id);
         let participant_id = cfg.participant_id;
-        let core = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
+        let core = ParticipantCore::new(
+            cfg.connection_id,
+            cfg.session,
+            cfg.local,
+            cfg.participant_id,
+            cfg.room_id,
+            self.shard_id,
+            key,
+            cfg.manual_sub,
+            self.max_gso_segments,
+            1,
+            tokio::time::Instant::now(),
+        )
+        .expect("controller-validated direct transport facts must materialize in the owner shard");
         if self.participants.contains_key(key) {
             debug_assert!(false, "duplicate participant materialization");
             return false;

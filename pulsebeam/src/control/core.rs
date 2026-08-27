@@ -9,7 +9,6 @@ use crate::{
     route::{PackedRoute, SlotAllocator, TransportHandle, TransportRoute},
     shard::participants::ParticipantKey,
 };
-use str0m::Rtc;
 
 pub const DEFAULT_ROOM_SHARD_SLOT: usize = 16;
 
@@ -134,7 +133,9 @@ impl ControllerCore {
 
     pub fn create_participant(
         &mut self,
-        rtc: Rtc,
+        connection_id: pulsebeam_rtc::ConnectionId,
+        session: pulsebeam_rtc::NegotiatedSession,
+        local: pulsebeam_rtc::LocalTransport,
         state: ParticipantState,
         shard: ShardId,
         transport: TransportHandle,
@@ -149,7 +150,9 @@ impl ControllerCore {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
             participant_id: state.participant_id,
-            rtc,
+            connection_id,
+            session,
+            local,
         }
     }
 
