@@ -236,6 +236,10 @@ impl ShardExecution {
         shard_count: usize,
         wall: WallAnchor,
     ) -> Self {
+        debug_assert!(
+            std::mem::size_of::<Self>() < 16 * 1024,
+            "shard execution state must keep bounded packet buffers on the heap"
+        );
         debug_assert!(shard_count > 0);
         // A node cannot bind more sockets than `PackedRoute` can address, and
         // the route's shard field is 12 bits — so this cannot overflow. Clamp

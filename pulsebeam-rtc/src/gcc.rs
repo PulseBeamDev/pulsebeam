@@ -288,6 +288,10 @@ impl Gcc {
         self.maybe_probe(now, false)
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the saturating throughput calculation accepts only a nonzero interval"
+    )]
     fn update_estimate(
         &mut self,
         acknowledged: &[(Instant, Duration, usize)],
@@ -361,6 +365,12 @@ pub fn parse_twcc(rtcp: &CompoundRtcpView<'_>) -> Result<Vec<TwccFeedback>, GccE
     Ok(feedback)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_wrap,
+    reason = "each TWCC field is obtained from a bounds-checked structural slice"
+)]
 fn parse_twcc_packet(bytes: &[u8]) -> Result<TwccFeedback, GccError> {
     let fixed = bytes.get(..20).ok_or(GccError::MalformedTwcc)?;
     let base_sequence = u16::from_be_bytes([fixed[12], fixed[13]]);

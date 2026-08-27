@@ -132,6 +132,10 @@ impl Codec {
         self.fir
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a codec is a compact immutable negotiated value"
+    )]
     pub(crate) fn new(
         payload_type: u8,
         name: String,
@@ -245,6 +249,10 @@ impl NegotiatedMediaSection {
         self.data_channel.as_ref()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a media section is a compact immutable negotiated value"
+    )]
     pub(crate) fn new(
         id: MediaSectionId,
         mid: String,

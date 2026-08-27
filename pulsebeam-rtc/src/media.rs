@@ -274,6 +274,10 @@ impl MediaForwarder {
         self.sends_by_id.capacity()
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the RTCP fields are accessed only after their fixed ranges are obtained"
+    )]
     fn handle_rtcp(&mut self, packet: &CompoundRtcpView<'_>) {
         for item in packet.packets() {
             let bytes = item.bytes();
@@ -321,6 +325,10 @@ impl MediaForwarder {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the fixed RTP header is bounds-checked before its fields are rewritten"
+)]
 fn rewrite_fixed_header(
     bytes: &mut [u8],
     sequence: u16,

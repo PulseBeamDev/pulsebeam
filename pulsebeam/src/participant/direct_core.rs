@@ -58,7 +58,7 @@ impl OutgoingExtensions {
             .header_extensions()
             .iter()
             .find(|extension| extension.uri().contains(TWCC_EXTENSION_URI))
-            .map(|extension| extension.id())
+            .map(pulsebeam_rtc::HeaderExtension::id)
             .filter(|&id| id > 0 && id < 15);
         Self { mid, twcc }
     }
@@ -73,6 +73,7 @@ impl OutgoingExtensions {
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::expect_used, clippy::arithmetic_side_effects, reason = "negotiated RTP fields and extension lengths are validated before encoding")]
 fn encode_rtp(
     packet: &crate::rtp::RtpPacket,
     payload_type: PayloadType,
@@ -183,6 +184,7 @@ pub struct DirectParticipantCore {
 }
 
 impl DirectParticipantCore {
+    #[allow(clippy::too_many_arguments, reason = "participant materialization takes its complete owned shard configuration")]
     pub fn new(
         connection_id: ConnectionId,
         session: pulsebeam_rtc::NegotiatedSession,
@@ -226,7 +228,7 @@ impl DirectParticipantCore {
                 for codec in section.codecs() {
                     receive_sections
                         .entry(codec.payload_type())
-                        .or_insert(section.id());
+                        .or_insert_with(|| section.id());
                 }
                 let kind = match section.kind() {
                     RtcMediaKind::Audio => TrackKind::Audio,
@@ -268,7 +270,7 @@ impl DirectParticipantCore {
                     RtcMediaKind::Application => continue,
                 };
                 let ssrc = Ssrc::from(
-                    (connection_id.get() as u32)
+                    u32::try_from(connection_id.get()).unwrap_or(u32::MAX)
                         .wrapping_mul(0x9e37_79b9)
                         .wrapping_add(section.id().get() as u32)
                         .max(1),
@@ -289,9 +291,9 @@ impl DirectParticipantCore {
         let mut transport = DirectTransport::new(config, now)?;
         for (section, ssrc) in send_streams {
             let id = StreamId::new(ssrc.get());
-            transport
-                .register_send(SendStream::new(id, section, ssrc.get(), 0, 0))
-                .expect("one direct send stream per negotiated media section");
+            if transport.register_send(SendStream::new(id, section, ssrc.get(), 0, 0)).is_err() {
+                debug_assert!(false, "one direct send stream per negotiated media section");
+            }
         }
         let mut core = Self {
             transport,
@@ -517,7 +519,11 @@ impl DirectParticipantCore {
                 20
             }
         };
-        if self.transport.send_rtcp(&bytes[..length]).is_err() {
+        let Some(rtcp) = bytes.get(..length) else {
+            debug_assert!(false, "a fixed RTCP feedback buffer bounds its encoded length");
+            return;
+        };
+        if self.transport.send_rtcp(rtcp).is_err() {
             debug_assert!(false, "an active publisher must have an SRTCP egress path");
         }
     }
@@ -793,15 +799,14 @@ impl DirectParticipantCore {
                             mid,
                             active,
                         } = event;
-                        if active {
-                            if let Some((track, in_topology)) =
+                        if active
+                            && let Some((track, in_topology)) =
                                 self.upstream.announce_state_mut(mid)
                                 && !*in_topology
                             {
                                 *in_topology = true;
                                 events.publish_track(track.clone());
                             }
-                        }
                     }
                     self.downstream
                         .apply_signaling_intents(self.signaling.reconcile());
@@ -866,7 +871,7 @@ impl DirectParticipantCore {
         let route = IncomingRtpRoute {
             ssrc: Ssrc::from(stream.ssrc()),
             mid,
-            rid: packet.extensions.rid.clone(),
+            rid: packet.extensions.rid,
             upstream_slot: slot,
             track_id,
             fanout: self.upstream.track_fanout(track_id),

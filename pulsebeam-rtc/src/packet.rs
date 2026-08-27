@@ -178,6 +178,10 @@ pub struct RtpPacketView<'a> {
     extension: Option<HeaderExtensionLocation>,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "RTP structure is bounds-checked once before its fixed fields and ranges are accessed"
+)]
 impl<'a> RtpPacketView<'a> {
     fn parse(bytes: &'a [u8], provenance: PacketProvenance) -> Result<Self, PacketError> {
         let fixed = bytes.get(..12).ok_or(PacketError::Truncated)?;
@@ -451,6 +455,11 @@ fn two_byte_extension(
     Ok(None)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "extension ranges are structurally bounds-checked before every rewrite"
+)]
 fn rewrite_one_byte_extension(
     bytes: &mut [u8],
     data: Range<usize>,
@@ -496,6 +505,11 @@ fn rewrite_one_byte_extension(
     Ok(())
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "extension ranges are structurally bounds-checked before every rewrite"
+)]
 fn rewrite_two_byte_extension(
     bytes: &mut [u8],
     data: Range<usize>,
@@ -632,6 +646,10 @@ impl RtcpFeedback {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "RTCP packet ranges are structurally validated before access"
+)]
 impl<'a> RtcpPacketView<'a> {
     pub fn bytes(&self) -> &'a [u8] {
         debug_assert!(self.range.end <= self.bytes.len());
@@ -684,6 +702,10 @@ impl<'a> RtcpPacketView<'a> {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the four-byte field range is validated before conversion"
+)]
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PacketError> {
     let end = offset.checked_add(4).ok_or(PacketError::Truncated)?;
     let value = bytes.get(offset..end).ok_or(PacketError::Truncated)?;
@@ -709,6 +731,10 @@ impl<'a> Iterator for RtcpPacketIter<'a> {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the RTCP fixed header range is validated before fields are read"
+)]
 fn parse_rtcp_packet(bytes: &[u8], offset: usize) -> Result<RtcpPacketView<'_>, PacketError> {
     let header_end = offset
         .checked_add(4)
@@ -744,6 +770,10 @@ fn parse_rtcp_packet(bytes: &[u8], offset: usize) -> Result<RtcpPacketView<'_>, 
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test packet timestamps intentionally use checked small durations"
+)]
 mod tests {
     use std::{net::Ipv4Addr, time::Duration};
 

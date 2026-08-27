@@ -36,7 +36,7 @@ const MAX_REPLAY_FRAMES: usize = 3;
 /// Ceiling on the packets a switch may release at once when the segment spans
 /// more than one frame.
 ///
-/// str0m paces egress, so a burst handed over in one go is not sprayed at the
+/// Transport pacing keeps a burst handed over in one go from being sprayed at the
 /// network — it queues, and shows up as delay instead. Either way it is latency
 /// the subscriber pays, so the amount released at once is what needs bounding.
 const MAX_REPLAY_PACKETS: usize = 96;
@@ -686,14 +686,14 @@ mod test {
         kf.marker = true;
         kf.is_keyframe = true;
         kf.extensions.dependency_descriptor = Some(g.next(true));
-        cache.push(kf.clone());
+        cache.push(kf);
 
         let mut delta = RtpPacket::default();
         delta.seq_no = SeqNo::from(2u64);
         delta.rtp_ts = MediaTime::new(4000, delta.rtp_ts.frequency());
         delta.marker = true;
         delta.extensions.dependency_descriptor = Some(g.next(false));
-        cache.push(delta.clone());
+        cache.push(delta);
 
         let replay = cache
             .replay()

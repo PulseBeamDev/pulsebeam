@@ -62,8 +62,8 @@ impl MediaTime {
 pub struct SequenceNumber(u64);
 
 impl SequenceNumber {
-    pub const fn as_u16(self) -> u16 {
-        self.0 as u16
+    pub fn as_u16(self) -> u16 {
+        u16::try_from(self.0 & u64::from(u16::MAX)).unwrap_or(u16::MAX)
     }
 
     pub const fn wrapping_add(self, value: u64) -> Self {
@@ -134,6 +134,8 @@ impl fmt::Display for Ssrc {
 pub struct PayloadType(u8);
 
 impl PayloadType {
+    pub const DEFAULT: Self = Self(100);
+
     pub fn new(value: u8) -> Option<Self> {
         (value < 128).then_some(Self(value))
     }
@@ -188,7 +190,8 @@ macro_rules! fixed_id {
                     .iter()
                     .position(|byte| *byte == b' ')
                     .unwrap_or($length);
-                std::str::from_utf8(&self.0[..length]).expect("packet identifiers are ASCII")
+                let bytes = self.0.get(..length).unwrap_or_default();
+                std::str::from_utf8(bytes).unwrap_or_default()
             }
         }
 

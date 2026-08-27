@@ -187,8 +187,9 @@ impl RtpReceiveIndex {
     }
 
     fn accept(&mut self, extended_sequence: u64) {
-        let rollover_counter = (extended_sequence >> 16) as u32;
-        let sequence = extended_sequence as u16;
+        let rollover_counter = u32::try_from(extended_sequence >> 16).unwrap_or(u32::MAX);
+        let sequence = u16::try_from(extended_sequence & u64::from(u16::MAX))
+            .unwrap_or(u16::MAX);
         if !self.initialized
             || rollover_counter > self.rollover_counter
             || (rollover_counter == self.rollover_counter && sequence > self.highest_sequence)
@@ -442,7 +443,10 @@ impl LiveConnection {
             .unprotect_rtp(bytes, &header, extended_sequence)
             .ok_or(LiveConnectionError::SrtpAuthentication)?;
         let mut decrypted = Vec::with_capacity(header.header_len.saturating_add(plaintext.len()));
-        decrypted.extend_from_slice(&bytes[..header.header_len]);
+        let fixed_header = bytes
+            .get(..header.header_len)
+            .ok_or(LiveConnectionError::RtpHeader)?;
+        decrypted.extend_from_slice(fixed_header);
         decrypted.extend_from_slice(plaintext);
         self.authenticated.push_back(AuthenticatedPacket {
             bytes: decrypted,

@@ -139,8 +139,7 @@ impl Timeline {
         self.seq_base = self
             .max_output
             .wrapping_add(1)
-            .wrapping_sub(input_seq)
-            .into();
+            .wrapping_sub(input_seq);
 
         let input_ts = packet.rtp_ts.numer();
         self.ts_base = match self.epoch {
@@ -184,7 +183,7 @@ impl Timeline {
     /// deduplicated and which may carry synthesized parameter-set packets whose
     /// original sequence numbers are unrelated to the segment.
     pub fn rewrite_sequential(&mut self, pkt: &mut RtpPacket) {
-        let output_seq: SeqNo = self.max_output.wrapping_add(1).into();
+        let output_seq: SeqNo = self.max_output.wrapping_add(1);
         let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
         self.apply(pkt, output_seq, output_ts);
     }

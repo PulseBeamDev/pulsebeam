@@ -37,6 +37,7 @@ impl DirectTransportConfig {
     }
 }
 
+#[allow(clippy::large_enum_variant, reason = "boxing each RTP event would add a packet-path allocation")]
 pub enum DirectTransportOutput {
     Transport(TransportEvent),
     Data(DataChannelEvent),
@@ -229,7 +230,7 @@ impl DirectTransport {
         if let Some(data) = self
             .connection
             .data_association()
-            .and_then(|association| association.poll_event())
+            .and_then(pulsebeam_rtc::DataChannelAssociation::poll_event)
         {
             return Some(DirectTransportOutput::Data(data));
         }
@@ -275,11 +276,9 @@ impl DirectTransport {
             .iter()
             .find(|codec| codec.payload_type() == packet.payload_type())
             .map_or(Codec::H264, |codec| {
-                codec
+                if codec
                     .name()
-                    .eq_ignore_ascii_case("opus")
-                    .then_some(Codec::Opus)
-                    .unwrap_or(Codec::H264)
+                    .eq_ignore_ascii_case("opus") { Codec::Opus } else { Codec::H264 }
             });
         let mut extensions = PacketExtensions::default();
         let audio_level = section
@@ -294,7 +293,7 @@ impl DirectTransport {
             })
             .and_then(|value| value.value().first().copied())
             .and_then(|value| i8::try_from(value & 0x7f).ok())
-            .and_then(|value| value.checked_neg());
+            .and_then(i8::checked_neg);
         extensions.audio_level = audio_level;
         extensions.mid = section
             .header_extensions()

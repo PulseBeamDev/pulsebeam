@@ -106,6 +106,7 @@ impl Default for RtpPacket {
 }
 
 impl RtpPacket {
+    #[allow(clippy::too_many_arguments, reason = "structural parsing passes the already-validated RTP parts without reification")]
     pub(crate) fn from_ingress_parts(
         ssrc: Ssrc,
         marker: bool,
@@ -198,7 +199,7 @@ impl RtpPacket {
             PacketProvenance {
                 received_at,
                 packet_id: source.packet_id().get(),
-                stream_id: source.stream_id().map(|stream| stream.get()),
+                stream_id: source.stream_id().map(pulsebeam_rtc::StreamId::get),
             },
             extensions,
             codec,
@@ -297,7 +298,7 @@ pub mod test_utils {
     impl RtpPacket {
         fn next_seq(&self) -> Self {
             let mut new_packet = self.clone();
-            new_packet.seq_no = self.seq_no.wrapping_add(1).into();
+            new_packet.seq_no = self.seq_no.wrapping_add(1);
             new_packet
         }
 

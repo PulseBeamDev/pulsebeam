@@ -91,8 +91,11 @@ impl ParticipantRegistry {
             self.max_gso_segments,
             1,
             tokio::time::Instant::now(),
-        )
-        .expect("controller-validated direct transport facts must materialize in the owner shard");
+        );
+        let Ok(core) = core else {
+            debug_assert!(false, "controller-validated direct transport facts must materialize in the owner shard");
+            return false;
+        };
         if self.participants.contains_key(key) {
             debug_assert!(false, "duplicate participant materialization");
             return false;

@@ -211,6 +211,10 @@ impl DataChannelAssociation {
         self.drain();
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "dcsctp SocketTime is monotonic from its zero origin"
+    )]
     pub fn next_deadline(&self) -> Option<Instant> {
         let duration = self.socket.poll_timeout() - SocketTime::zero();
         if duration == Duration::MAX {
@@ -283,6 +287,10 @@ impl DataChannelAssociation {
         self.egress.len() < self.egress_capacity
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "dcsctp SocketTime is monotonic from its zero origin"
+    )]
     fn advance(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.epoch);
         self.socket.advance_time(SocketTime::zero() + elapsed);
@@ -300,11 +308,13 @@ impl DataChannelAssociation {
                     }
                 }
                 SocketEvent::OnConnected() => {
-                    self.push_event(DataChannelEvent::AssociationConnected)
+                    self.push_event(DataChannelEvent::AssociationConnected);
                 }
-                SocketEvent::OnClosed() => self.push_event(DataChannelEvent::AssociationClosed),
+                SocketEvent::OnClosed() => {
+                    self.push_event(DataChannelEvent::AssociationClosed);
+                }
                 SocketEvent::OnAborted(_, _) | SocketEvent::OnError(_, _) => {
-                    self.push_event(DataChannelEvent::Error)
+                    self.push_event(DataChannelEvent::Error);
                 }
                 SocketEvent::OnIncomingStreamReset(streams) => {
                     for stream in streams.into_iter().take(MAX_WORK_PER_TICK) {
@@ -417,6 +427,10 @@ fn encode_open(open: &DataChannelOpen) -> Result<Vec<u8>, DataChannelError> {
     Ok(payload)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the fixed DCEP header length is validated before its fields are read"
+)]
 fn decode_open(id: ChannelId, payload: &[u8]) -> Result<Option<DataChannelOpen>, DataChannelError> {
     let Some(message_type) = payload.first() else {
         return Err(DataChannelError::MalformedControl);

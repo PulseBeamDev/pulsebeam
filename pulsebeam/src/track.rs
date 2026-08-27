@@ -457,7 +457,7 @@ impl TrackMonitor {
 
         if let Some(vla) = packet.extensions.video_layers_allocation.as_ref() {
             for encoding in &mut self.encodings {
-                encoding.apply_vla(&vla);
+                encoding.apply_vla(vla);
             }
         }
         packet

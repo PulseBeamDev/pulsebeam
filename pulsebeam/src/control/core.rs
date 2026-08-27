@@ -131,6 +131,7 @@ impl ControllerCore {
         debug_assert!(removed.is_some(), "participant key must be live at removal");
     }
 
+    #[allow(clippy::too_many_arguments, reason = "this control-plane boundary materializes one complete participant configuration")]
     pub fn create_participant(
         &mut self,
         connection_id: pulsebeam_rtc::ConnectionId,

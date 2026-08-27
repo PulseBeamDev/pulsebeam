@@ -42,7 +42,7 @@ impl Default for SlotConfig {
             mid: Mid::from("0"),
             rid: None,
             ssrc: 0u32.into(),
-            pt: Pt::new(100).expect("default RTP payload type is valid"),
+            pt: Pt::DEFAULT,
             kind: MediaKind::Video,
         }
     }
@@ -522,16 +522,14 @@ impl Downstream {
         allocated: Bitrate,
     ) -> Option<Bitrate> {
         let estimate = self.available_bandwidth.current();
-        let Some(target) = starvation_reset_target(
+        let target = starvation_reset_target(
             &mut self.starved_since,
             now,
             desired,
             unfunded,
             allocated,
             estimate,
-        ) else {
-            return None;
-        };
+        )?;
         self.available_bandwidth = BweFilter::new(target);
         Some(target)
     }
