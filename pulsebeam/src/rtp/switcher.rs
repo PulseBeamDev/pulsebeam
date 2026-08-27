@@ -628,7 +628,7 @@ mod test {
     use crate::rtp;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 
-    use str0m::media::Rid;
+    use crate::rtp::EncodingId as Rid;
     use tokio::time::Instant;
 
     /// Two distinct streams (two simulcast layers of one track) to switch between.

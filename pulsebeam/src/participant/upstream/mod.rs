@@ -6,14 +6,12 @@ use crate::keys::TrackKey;
 use crate::{
     entity::{TrackId, TrackKind},
     log::{LogCtx, plog_warn},
-    rtp::{RtpPacket, SenderReport},
+    rtp::{EncodingId as Rid, MediaSectionId as Mid, RtpPacket, SenderReport, Ssrc},
     track::UpstreamTrack,
 };
 use ahash::{HashMap, HashMapExt};
 pub(crate) use audio::UpstreamAudio;
 pub(crate) use data::UpstreamData;
-use str0m::media::Mid;
-use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 pub(crate) use video::UpstreamVideo;
 
@@ -25,7 +23,7 @@ pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
 pub(crate) struct IncomingRtpRoute {
     pub(crate) ssrc: Ssrc,
     pub(crate) mid: Mid,
-    pub(crate) rid: Option<str0m::media::Rid>,
+    pub(crate) rid: Option<Rid>,
     pub(crate) upstream_slot: UpstreamSlotKey,
     pub(crate) track_id: TrackId,
     pub(crate) fanout: Option<TrackKey>,
@@ -156,7 +154,7 @@ impl UpstreamMedia {
         &mut self,
         index: usize,
         mid: Mid,
-        rid: Option<&str0m::media::Rid>,
+        rid: Option<&Rid>,
         rtp: RtpPacket,
         sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {
@@ -247,7 +245,7 @@ impl Upstream {
         &mut self,
         slot: UpstreamSlotKey,
         mid: Mid,
-        rid: Option<&str0m::media::Rid>,
+        rid: Option<&Rid>,
         rtp: RtpPacket,
         sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {

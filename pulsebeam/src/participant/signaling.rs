@@ -6,7 +6,7 @@ use crate::participant::intent::{AudioIntent, VideoIntent as Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
 use str0m::channel::ChannelId;
-use str0m::media::Mid;
+use crate::rtp::MediaSectionId as Mid;
 
 const MAX_SIGNALING_MSG_SIZE: usize = 16 * 1024; // 16 KB (Signaling shouldn't be huge)
 

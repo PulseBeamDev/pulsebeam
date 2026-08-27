@@ -16,8 +16,9 @@ pub mod conformance;
 use tokio::time::Instant;
 
 pub use types::{
-    EncodingId, Frequency, MediaKind, MediaSectionId, MediaTime, PacketExtensions,
-    PacketProvenance, PayloadType, SenderReport, SequenceNumber, Ssrc, VideoLayersAllocation,
+    EncodingId, Frequency, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId, MediaTime,
+    PacketExtensions, PacketProvenance, PayloadType, SenderReport, SequenceNumber,
+    SimulcastEncoding, Ssrc, VideoLayersAllocation,
 };
 
 use crate::entity::{ParticipantId, TrackId};

@@ -1,3 +1,4 @@
+pub(crate) mod allocation;
 pub(crate) mod batcher;
 mod core;
 mod data;

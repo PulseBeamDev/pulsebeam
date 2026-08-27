@@ -14,14 +14,13 @@ use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::{
-    self, RtpPacket, SenderReport, VideoLayersAllocation,
+    self, EncodingId as Rid, MediaSectionId as Mid, PayloadType as Pt, RtpPacket,
+    SenderReport, SimulcastEncoding, Ssrc, VideoLayersAllocation,
     monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
 pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
-use str0m::media::{Mid, Pt, Rid, SimulcastLayer};
-use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
 pub type StreamId = (TrackId, Option<Rid>);
@@ -845,12 +844,16 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 /// After initialization, both the internal `UpstreamTrack` and `Track` layers are
 /// **sorted in descending order** by their `LayerQuality` enum fields (`High -> Medium -> Low`),
 /// regardless of the order `layers` was supplied in.
-pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (UpstreamTrack, Track) {
+pub fn new_video(
+    mid: Mid,
+    meta: TrackMeta,
+    layers: Vec<SimulcastEncoding>,
+) -> (UpstreamTrack, Track) {
     debug_assert_eq!(meta.id.kind(), TrackKind::Video);
     let simulcast_rids: Vec<Option<Rid>> = if layers.is_empty() {
         vec![None]
     } else {
-        layers.iter().map(|l| Some(l.rid)).collect()
+        layers.iter().map(|layer| Some(layer.rid)).collect()
     };
 
     let mut senders = Vec::new();
@@ -912,7 +915,7 @@ pub mod test_utils {
     pub fn make_video_track(
         participant_id: ParticipantId,
         mid: Mid,
-        layers: Vec<SimulcastLayer>,
+        layers: Vec<SimulcastEncoding>,
     ) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
@@ -1696,7 +1699,7 @@ mod simulcast_pause_tests {
     use crate::entity::ParticipantId;
     use crate::rtp::RtpPacket;
     use std::time::Duration;
-    use str0m::media::SimulcastLayer;
+    use crate::rtp::SimulcastEncoding as SimulcastLayer;
 
     /// A three-encoding video track and a starting instant.
     fn track() -> (UpstreamTrack, Instant) {

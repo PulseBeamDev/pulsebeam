@@ -5,10 +5,9 @@ use pulsebeam_proto::reliable::{RelControl, rel_control};
 use pulsebeam_runtime::net::{self};
 use std::time::Duration;
 use str0m::bwe::BweKind;
-use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::{
     Event, Rtc, RtcError,
-    media::{Direction, MediaAdded, Pt},
+    media::{Direction, MediaAdded},
 };
 use tokio::time::Instant;
 
@@ -36,13 +35,15 @@ use crate::participant::{
     },
     upstream::{IncomingRtpRoute, UpstreamAllocator},
 };
+use crate::rtp::{
+    EncodingId as Rid, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId as Mid,
+    PayloadType as Pt, SequenceNumber, SimulcastEncoding, Ssrc,
+};
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
     KEYFRAME_DEBOUNCE, StreamId, StreamWrite, StreamWriter, Track,
 };
-#[cfg(test)]
-use str0m::rtp::Ssrc;
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POLL_WORK_BUDGET: usize = 256;
@@ -130,7 +131,7 @@ pub struct Participant {
     // Warm: touched per poll cycle
     upstream: UpstreamAllocator,
     pub(crate) participant_id: entity::ParticipantId,
-    last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
+    last_keyframe_request: HashMap<(Mid, Option<Rid>), Instant>,
 
     /// The compiled stream a published channel forwards into, recorded by the
     /// shard once it has minted one. Keyed by channel so an arriving SCTP
@@ -475,9 +476,7 @@ impl Participant {
         }
         self.last_keyframe_request.insert(key, now);
         self.enqueue_fanout(TransportMutation::Keyframe {
-            mid,
-            rid: stream_id.1,
-            kind,
+            request: KeyframeRequest { mid, rid: stream_id.1, kind },
         });
     }
 
@@ -485,9 +484,8 @@ impl Participant {
         // Measure before allocating: the monitors produce this tick's numbers,
         // and running the allocator first would decide against last tick's.
         self.upstream.poll_slow(now);
-        let assignments_changed = self
-            .transport
-            .with_bwe(|bwe| self.downstream.poll_slow(now, bwe, events));
+        let (assignments_changed, allocation) = self.downstream.poll_slow(now, events);
+        self.transport.apply_allocation(allocation);
         if assignments_changed {
             self.signaling.mark_assignments_dirty();
         }
@@ -637,9 +635,8 @@ impl Participant {
             }
 
             if self.downstream.dirty_allocation {
-                let assignments_changed = self
-                    .transport
-                    .with_bwe(|bwe| self.downstream.update_allocations(now, bwe));
+                let (assignments_changed, allocation) = self.downstream.update_allocations(now);
+                self.transport.apply_allocation(allocation);
                 if assignments_changed {
                     self.signaling.mark_assignments_dirty();
                 }
@@ -726,7 +723,15 @@ impl Participant {
             Event::MediaChanged(_) => self.upstream.clear_routes(),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => {
-                if let Some(layer) = self.downstream.handle_keyframe_request(req) {
+                let request = KeyframeRequest {
+                    mid: Mid::from(&*req.mid),
+                    rid: req.rid.map(|rid| Rid::from(&*rid)),
+                    kind: match req.kind {
+                        str0m::media::KeyframeRequestKind::Pli => KeyframeRequestKind::Pli,
+                        str0m::media::KeyframeRequestKind::Fir => KeyframeRequestKind::Fir,
+                    },
+                };
+                if let Some(layer) = self.downstream.handle_keyframe_request(request) {
                     let stream_id = layer.stream_id();
                     if let Some(fanout) = self.upstream.track_fanout(stream_id.0) {
                         events.request_reverse(
@@ -737,14 +742,20 @@ impl Participant {
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                self.downstream.update_bitrate(now, available);
+                self.downstream.update_allocation_input(
+                    now,
+                    crate::participant::allocation::AllocationInput {
+                        estimate: crate::participant::allocation::Bitrate::bps(available.as_u64()),
+                        application_limited: false,
+                    },
+                );
             }
             Event::MediaEgressStats(stats) => {
                 if let Some(remote) = stats.remote {
                     self.downstream.handle_egress_stats(
-                        stats.mid,
-                        stats.rid,
-                        remote.maximum_sequence_number,
+                        Mid::from(&*stats.mid),
+                        stats.rid.map(|rid| Rid::from(&*rid)),
+                        SequenceNumber::from(*remote.maximum_sequence_number),
                     );
                 }
             }
@@ -868,7 +879,7 @@ impl Participant {
                 }
             }
             Event::StreamPaused(stream) => {
-                self.handle_stream_paused(stream.mid, stream.paused, events);
+                self.handle_stream_paused(Mid::from(&*stream.mid), stream.paused, events);
             }
             _ => {
                 // tracing::warn!("unhandled event: {e:?}");
@@ -945,38 +956,51 @@ impl Participant {
     }
 
     fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
+        let mid = Mid::from(&*media.mid);
+        let kind = match media.kind {
+            str0m::media::MediaKind::Audio => MediaKind::Audio,
+            str0m::media::MediaKind::Video => MediaKind::Video,
+        };
         match media.direction {
             Direction::RecvOnly => {
                 let track_id = self
                     .participant_id
-                    .derive_track_id(media.kind.into(), &media.mid);
+                    .derive_track_id(
+                        match kind {
+                            MediaKind::Audio => TrackKind::Audio,
+                            MediaKind::Video => TrackKind::Video,
+                        },
+                        &mid,
+                    );
                 let track_meta = track::TrackMeta {
                     room_id: self.room_id,
                     shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,
                 };
-                match media.kind {
+                match kind {
                     MediaKind::Audio => {
-                        let (tx, track) = track::new_audio(media.mid, track_meta);
-                        if !self.upstream.add_published_track(media.mid, tx, track) {
+                        let (tx, track) = track::new_audio(mid, track_meta);
+                        if !self.upstream.add_published_track(mid, tx, track) {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                         }
                     }
                     MediaKind::Video => {
                         let (tx, track) = track::new_video(
-                            media.mid,
+                            mid,
                             track_meta,
-                            media.simulcast.map(|s| s.recv).unwrap_or_default(),
+                            media.simulcast.map(|s| s.recv.into_iter().map(|layer| {
+                                SimulcastEncoding::new(Rid::from(&*layer.rid))
+                            }).collect()).unwrap_or_default(),
                         );
-                        if !self.upstream.add_published_track(media.mid, tx, track) {
+                        if !self.upstream.add_published_track(mid, tx, track) {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                         }
                     }
                 }
             }
             Direction::SendOnly => {
-                self.try_add_downstream_slot(media.mid, media.kind);
+                self.try_add_downstream_slot(mid, kind);
                 // Update signaling slot count AFTER adding the slot so the
                 // server accepts ClientIntent requests up to the actual slot
                 // count (previously this was called before add_slot, so the
@@ -1026,10 +1050,14 @@ impl Participant {
         events: &mut impl ParticipantSink,
     ) {
         plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.seq_no);
-        let ssrc = rtp.header.ssrc;
+        let ssrc = Ssrc::from(*rtp.header.ssrc);
         let incoming = if let Some(route) = self.upstream.route_for_ssrc(ssrc) {
             self.transport
-                .convert_rtp(rtp, route.mid, route.rid)
+                .convert_rtp(
+                    rtp,
+                    str0m::media::Mid::from(&*route.mid),
+                    route.rid.map(|rid| str0m::media::Rid::from(&*rid)),
+                )
                 .map(|incoming| (route, incoming))
         } else {
             // Once per stream in a healthy participant. A rate proportional to

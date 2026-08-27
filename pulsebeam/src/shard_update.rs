@@ -7,7 +7,7 @@ use crate::id::ShardId;
 use crate::keys::{ParticipantKey, TrackKey};
 use crate::route::{RouteAction, RouteHandle, TransportHandle};
 use pulsebeam_runtime::mailbox;
-use str0m::media::Rid;
+use crate::rtp::EncodingId as Rid;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {

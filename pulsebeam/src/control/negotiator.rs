@@ -116,7 +116,7 @@ impl Negotiator {
             )
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
-            .enable_bwe(Some(INITIAL_BANDWIDTH))
+            .enable_bwe(Some(str0m::bwe::Bitrate::from(INITIAL_BANDWIDTH.get())))
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
             .set_ice_lite(true)

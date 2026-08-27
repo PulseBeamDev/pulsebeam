@@ -325,7 +325,7 @@ mod tests {
             runtime: crate::shard_update::TrackRuntime {
                 descriptor: Some(crate::shard_update::TrackDescriptor {
                     origin_key,
-                    encodings: vec![Some(str0m::media::Rid::from("q"))],
+                    encodings: vec![Some(crate::rtp::EncodingId::from("q"))],
                 }),
                 ..Default::default()
             },
@@ -336,7 +336,7 @@ mod tests {
             runtime: crate::shard_update::TrackRuntime {
                 descriptor: Some(crate::shard_update::TrackDescriptor {
                     origin_key,
-                    encodings: vec![Some(str0m::media::Rid::from("f"))],
+                    encodings: vec![Some(crate::rtp::EncodingId::from("f"))],
                 }),
                 ..Default::default()
             },

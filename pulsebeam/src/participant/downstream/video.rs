@@ -13,9 +13,11 @@ use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
-use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
-use str0m::rtp::Ssrc;
+use crate::participant::allocation::Bitrate;
+use crate::rtp::{
+    EncodingId as Rid, KeyframeRequest, KeyframeRequestKind, MediaSectionId as Mid,
+    PayloadType as Pt, Ssrc,
+};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
@@ -929,7 +931,7 @@ impl Slot {
             fanout,
             crate::participant::reverse::ReversePacket::keyframe(
                 staging.stream_id().1,
-                str0m::media::KeyframeRequestKind::Pli,
+                KeyframeRequestKind::Pli,
             ),
         );
     }
@@ -1769,7 +1771,7 @@ mod alloc_test_support {
     use crate::rtp::monitor::StreamStats;
     use crate::track::UpstreamTrack;
     use crate::track::test_utils::make_video_track;
-    use str0m::media::SimulcastLayer;
+    use crate::rtp::SimulcastEncoding as SimulcastLayer;
 
     /// Measurement handles standing in for what the publisher's shard would
     /// have supplied. Seeded active, which is what the old `inactive(false)`
@@ -1825,8 +1827,8 @@ mod assignment_tests {
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack};
 
-    use str0m::bwe::Bitrate;
-    use str0m::media::{Mid, SimulcastLayer};
+    use crate::participant::allocation::Bitrate;
+    use crate::rtp::{MediaSectionId as Mid, SimulcastEncoding as SimulcastLayer};
 
     struct TestTracks {
         pub senders: Vec<UpstreamTrack>,
@@ -2664,7 +2666,7 @@ mod slot_switch_tests {
 
     use crate::track::{StreamWrite, StreamWriter};
 
-    use str0m::media::SimulcastLayer;
+    use crate::rtp::SimulcastEncoding as SimulcastLayer;
 
     fn test_ctx() -> LogCtx {
         use crate::entity::{ExternalRoomId, RoomId};

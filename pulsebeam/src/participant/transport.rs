@@ -4,13 +4,14 @@ use std::net::SocketAddr;
 use crate::participant::batcher::{Batcher, NetworkEgress, OwnedPacketQueue};
 use crate::rtp::{
     Codec as RtpCodec, EncodingId, Frequency, MediaKind as PacketMediaKind, MediaSectionId,
-    MediaTime as PacketMediaTime, PacketExtensions, PacketProvenance, RtpPacket, SenderReport,
-    VideoLayersAllocation,
+    MediaTime as PacketMediaTime, PacketExtensions, PacketProvenance, PayloadType, RtpPacket,
+    SenderReport, Ssrc, VideoLayersAllocation,
 };
+use crate::participant::allocation::AllocationOutput;
 use pulsebeam_runtime::net::RecvPacketBatch;
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, MediaTime, Mid, Pt, Rid};
+use str0m::media::{MediaKind, MediaTime, Mid, Pt, Rid};
 use str0m::net::Protocol;
 use str0m::rtp::{ExtensionValues, RtpWrite};
 use str0m::{Event, Output, Rtc, RtcError};
@@ -38,26 +39,24 @@ pub(crate) enum TransportMutation {
         bytes: Vec<u8>,
     },
     Keyframe {
-        mid: Mid,
-        rid: Option<Rid>,
-        kind: KeyframeRequestKind,
+        request: crate::rtp::KeyframeRequest,
     },
 }
 
 pub(crate) struct RtpWriteCommand {
     pub(crate) pkt: RtpPacket,
-    pub(crate) mid: Mid,
-    pub(crate) rid: Option<Rid>,
-    pub(crate) ssrc: str0m::rtp::Ssrc,
-    pub(crate) pt: Pt,
-    pub(crate) kind: MediaKind,
+    pub(crate) mid: MediaSectionId,
+    pub(crate) rid: Option<EncodingId>,
+    pub(crate) ssrc: Ssrc,
+    pub(crate) pt: PayloadType,
+    pub(crate) kind: PacketMediaKind,
     pub(crate) now: Instant,
-    pub(crate) playout_delay: Option<(MediaTime, MediaTime)>,
+    pub(crate) playout_delay: Option<(PacketMediaTime, PacketMediaTime)>,
 }
 
 pub(crate) struct RtpIngress {
-    pub(crate) mid: Mid,
-    pub(crate) rid: Option<Rid>,
+    pub(crate) mid: MediaSectionId,
+    pub(crate) rid: Option<EncodingId>,
     pub(crate) packet: RtpPacket,
     pub(crate) sender_info: Option<SenderReport>,
 }
@@ -67,10 +66,10 @@ pub(crate) enum AppliedMutation {
     RtpNotWritten,
     RtpWritten,
     RecoveredStream {
-        kind: MediaKind,
-        mid: Mid,
-        rid: Option<Rid>,
-        ssrc: str0m::rtp::Ssrc,
+        kind: PacketMediaKind,
+        mid: MediaSectionId,
+        rid: Option<EncodingId>,
+        ssrc: Ssrc,
     },
 }
 
@@ -154,8 +153,8 @@ impl Transport {
                 let _ = self.write_channel(channel, true, &bytes);
                 AppliedMutation::Applied
             }
-            TransportMutation::Keyframe { mid, rid, kind } => {
-                let _ = self.request_keyframe(KeyframeRequest { mid, rid, kind });
+            TransportMutation::Keyframe { request } => {
+                let _ = self.request_keyframe(request);
                 AppliedMutation::Applied
             }
         };
@@ -213,15 +212,19 @@ impl Transport {
         self.rtc.channel(cid)?.config().cloned()
     }
 
-    pub(crate) fn preferred_send_pt(&self, mid: Mid, kind: MediaKind) -> Option<Pt> {
-        let media = self.rtc.media(mid)?;
+    pub(crate) fn preferred_send_pt(
+        &self,
+        mid: MediaSectionId,
+        kind: PacketMediaKind,
+    ) -> Option<PayloadType> {
+        let media = self.rtc.media(Mid::from(&*mid))?;
         let remote_pts = media.remote_pts();
         if remote_pts.is_empty() {
             return None;
         }
         let expected_codec = match kind {
-            MediaKind::Audio => Codec::Opus,
-            MediaKind::Video => Codec::H264,
+            PacketMediaKind::Audio => Codec::Opus,
+            PacketMediaKind::Video => Codec::H264,
         };
         let codec_config = self.rtc.codec_config();
         remote_pts
@@ -234,17 +237,18 @@ impl Transport {
                     .any(|params| params.pt() == *pt && params.spec().codec == expected_codec)
             })
             .or_else(|| {
-                kind.is_video()
+                matches!(kind, PacketMediaKind::Video)
                     .then(|| remote_pts.first().copied())
                     .flatten()
             })
+            .and_then(|pt| PayloadType::new(*pt))
     }
 
-    pub(crate) fn stream_tx_ssrc(&mut self, mid: Mid) -> Option<str0m::rtp::Ssrc> {
+    pub(crate) fn stream_tx_ssrc(&mut self, mid: MediaSectionId) -> Option<Ssrc> {
         self.rtc
             .direct_api()
-            .stream_tx_by_mid(mid, None)
-            .map(|stream| stream.ssrc())
+            .stream_tx_by_mid(Mid::from(&*mid), None)
+            .map(|stream| Ssrc::from(*stream.ssrc()))
     }
 
     pub(crate) fn lookup_rtp(&mut self, rtp: str0m::rtp::RtpPacket) -> Option<RtpIngress> {
@@ -314,15 +318,20 @@ impl Transport {
             rtp.payload.to_vec(),
         );
         Some(RtpIngress {
-            mid,
-            rid,
+            mid: MediaSectionId::from(&*mid),
+            rid: rid.map(|rid| EncodingId::from(&*rid)),
             packet,
             sender_info,
         })
     }
 
-    pub(crate) fn with_bwe<R>(&mut self, f: impl FnOnce(&mut str0m::bwe::Bwe) -> R) -> R {
-        f(&mut self.rtc.bwe())
+    pub(crate) fn apply_allocation(&mut self, output: AllocationOutput) {
+        let bwe = &mut self.rtc.bwe();
+        bwe.set_current_bitrate(str0m::bwe::Bitrate::from(output.allocated.get()));
+        bwe.set_desired_bitrate(str0m::bwe::Bitrate::from(output.desired.get()));
+        if let Some(recovery) = output.recovery {
+            bwe.reset(str0m::bwe::Bitrate::from(recovery.get()));
+        }
     }
 
     pub(crate) fn connection_context(
@@ -387,12 +396,18 @@ impl Transport {
         self.exited
     }
 
-    pub(crate) fn request_keyframe(&mut self, request: KeyframeRequest) -> bool {
+    pub(crate) fn request_keyframe(&mut self, request: crate::rtp::KeyframeRequest) -> bool {
+        let mid = Mid::from(&*request.mid);
+        let rid = request.rid.map(|rid| Rid::from(&*rid));
+        let kind = match request.kind {
+            crate::rtp::KeyframeRequestKind::Pli => str0m::media::KeyframeRequestKind::Pli,
+            crate::rtp::KeyframeRequestKind::Fir => str0m::media::KeyframeRequestKind::Fir,
+        };
         let mut api = self.rtc.direct_api();
-        let Some(stream) = api.stream_rx_by_mid(request.mid, request.rid) else {
+        let Some(stream) = api.stream_rx_by_mid(mid, rid) else {
             return false;
         };
-        stream.request_keyframe(request.kind);
+        stream.request_keyframe(kind);
         true
     }
 
@@ -407,15 +422,19 @@ impl Transport {
             now,
             playout_delay,
         } = command;
-        let nackable = kind == MediaKind::Video;
+        let nackable = kind == PacketMediaKind::Video;
+        let str0m_mid = Mid::from(&*mid);
+        let str0m_rid = rid.map(|rid| Rid::from(&*rid));
+        let str0m_ssrc = str0m::rtp::Ssrc::from(requested_ssrc.get());
+        let str0m_pt = Pt::from(pt.get());
         let mut api = self.rtc.direct_api();
-        let (stream, recovered) = match api.stream_tx(&requested_ssrc) {
-            Some(stream) if stream.mid() == mid && stream.rid() == rid => (Some(stream), false),
+        let (stream, recovered) = match api.stream_tx(&str0m_ssrc) {
+            Some(stream) if stream.mid() == str0m_mid && stream.rid() == str0m_rid => (Some(stream), false),
             Some(stream) => {
-                debug_assert!(stream.mid() != mid || stream.rid() != rid);
-                (api.stream_tx_by_mid(mid, rid), true)
+                debug_assert!(stream.mid() != str0m_mid || stream.rid() != str0m_rid);
+                (api.stream_tx_by_mid(str0m_mid, str0m_rid), true)
             }
-            None => (api.stream_tx_by_mid(mid, rid), true),
+            None => (api.stream_tx_by_mid(str0m_mid, str0m_rid), true),
         };
         let Some(stream) = stream else {
             if nackable {
@@ -425,20 +444,17 @@ impl Transport {
             }
             return AppliedMutation::RtpNotWritten;
         };
-        debug_assert_eq!(stream.mid(), mid);
-        debug_assert_eq!(stream.rid(), rid);
-        let ssrc = stream.ssrc();
+        debug_assert_eq!(stream.mid(), str0m_mid);
+        debug_assert_eq!(stream.rid(), str0m_rid);
+        let ssrc = Ssrc::from(*stream.ssrc());
         #[cfg(debug_assertions)]
         if let Some(violation) = self.egress_guard.check(
-            MediaSectionId::from(&*mid),
-            rid.map(|rid| EncodingId::from(&*rid)),
+            mid,
+            rid,
             *pkt.seq_no,
             pkt.rtp_ts.numer(),
             pkt.marker,
-            match kind {
-                MediaKind::Audio => PacketMediaKind::Audio,
-                MediaKind::Video => PacketMediaKind::Video,
-            },
+            kind,
         ) {
             tracing::error!(%mid, ?rid, %violation, "egress stream invariant violated");
             #[cfg(feature = "sim")]
@@ -451,8 +467,8 @@ impl Transport {
             ext_vals.user_values.set(raw);
         }
         if let Some((min, max)) = playout_delay {
-            ext_vals.play_delay_min = Some(min);
-            ext_vals.play_delay_max = Some(max);
+            ext_vals.play_delay_min = Some(str0m_media_time(min));
+            ext_vals.play_delay_max = Some(str0m_media_time(max));
         }
         if nackable {
             tracing::trace!(
@@ -479,7 +495,7 @@ impl Transport {
             );
         }
         let rtp = RtpWrite::new(
-            pt,
+            str0m_pt,
             (*pkt.seq_no).into(),
             u32::try_from(pkt.rtp_ts.numer() & u64::from(u32::MAX)).unwrap_or(0),
             now.into(),
@@ -554,6 +570,12 @@ fn packet_media_time(value: MediaTime) -> PacketMediaTime {
         value.numer(),
         Frequency::new(value.frequency().get()).expect("RTP clock rates are non-zero"),
     )
+}
+
+fn str0m_media_time(value: PacketMediaTime) -> MediaTime {
+    let frequency = str0m::media::Frequency::new(value.frequency().get())
+        .expect("PulseBeam media time has a non-zero frequency");
+    MediaTime::new(value.numer(), frequency)
 }
 
 fn packet_video_layers_allocation(

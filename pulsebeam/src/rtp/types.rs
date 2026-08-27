@@ -52,6 +52,10 @@ impl MediaTime {
     pub const fn from_90khz(numer: u64) -> Self {
         Self::new(numer, Frequency::NINETY_KHZ)
     }
+
+    pub const fn from_hundredths(numer: u64) -> Self {
+        Self::new(numer, Frequency::HUNDREDTHS)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -139,6 +143,20 @@ impl PayloadType {
     }
 }
 
+impl Deref for PayloadType {
+    type Target = u8;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Display for PayloadType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MediaSectionId([u8; 16]);
 
@@ -198,6 +216,30 @@ fixed_id!(EncodingId, 8);
 pub enum MediaKind {
     Audio,
     Video,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyframeRequestKind {
+    Pli,
+    Fir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyframeRequest {
+    pub mid: MediaSectionId,
+    pub rid: Option<EncodingId>,
+    pub kind: KeyframeRequestKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SimulcastEncoding {
+    pub rid: EncodingId,
+}
+
+impl SimulcastEncoding {
+    pub fn new(rid: impl Into<EncodingId>) -> Self {
+        Self { rid: rid.into() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

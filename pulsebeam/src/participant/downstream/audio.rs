@@ -1,8 +1,7 @@
 use std::array;
 use std::time::Duration;
 
-use str0m::media::{Mid, Pt};
-use str0m::rtp::Ssrc;
+use crate::rtp::{MediaSectionId as Mid, PayloadType as Pt, Ssrc};
 use tokio::time::Instant;
 
 use crate::control::MAX_SEND_AUDIO_SLOTS;
@@ -407,8 +406,7 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::participant::downstream::SlotConfig;
-    use str0m::media::{MediaKind, Mid, Pt};
-    use str0m::rtp::Ssrc;
+    use crate::rtp::{MediaKind, MediaSectionId as Mid, PayloadType as Pt, Ssrc};
 
     fn test_ctx() -> LogCtx {
         use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
@@ -445,7 +443,7 @@ mod tests {
             mid: Mid::from(mid),
             rid: None,
             ssrc: Ssrc::from(ssrc),
-            pt: Pt::from(111_u8),
+            pt: Pt::new(111).expect("test payload type is valid"),
             kind: MediaKind::Audio,
         }
     }

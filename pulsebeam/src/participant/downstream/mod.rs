@@ -12,17 +12,18 @@ use crate::keys::TrackKey;
 use crate::log::LogCtx;
 use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::event::ParticipantSink;
+use crate::participant::allocation::{AllocationInput, AllocationOutput, Bitrate};
 pub use crate::participant::intent::AudioIntent;
-use crate::rtp::RtpPacket;
+use crate::rtp::{
+    EncodingId as Rid, KeyframeRequest, MediaKind, MediaSectionId as Mid, MediaTime,
+    PayloadType as Pt, RtpPacket, SequenceNumber as SeqNo, Ssrc,
+};
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
 use ahash::HashSetExt;
 pub use audio::DownstreamAudio;
 pub(crate) use data::DownstreamData;
 use indexmap::IndexMap;
 use slotmap::SecondaryMap;
-use str0m::bwe::{Bitrate, Bwe};
-use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
-use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 pub use video::{DownstreamVideo, INITIAL_BANDWIDTH};
 
@@ -41,7 +42,7 @@ impl Default for SlotConfig {
             mid: Mid::from("0"),
             rid: None,
             ssrc: 0u32.into(),
-            pt: 100u8.into(),
+            pt: Pt::new(100).expect("default RTP payload type is valid"),
             kind: MediaKind::Video,
         }
     }
@@ -231,6 +232,7 @@ pub struct Downstream {
     audio_tracks: IndexMap<TrackId, TrackMeta>,
 
     available_bandwidth: BweFilter,
+    application_limited: bool,
     last_desired: Bitrate,
     /// When forwarding fell below the rate needed to keep measuring the link, while demand
     /// exists, and the estimate it was at then.
@@ -260,6 +262,7 @@ impl Downstream {
             dirty_allocation: false,
 
             available_bandwidth: BweFilter::new(START_BANDWIDTH),
+            application_limited: false,
             last_desired: video::START_BANDWIDTH,
             starved_since: None,
             playout_delay: None,
@@ -480,25 +483,30 @@ impl Downstream {
         }
     }
 
-    pub fn update_bitrate(&mut self, now: Instant, available_bandwidth: Bitrate) {
-        self.available_bandwidth.update(now, available_bandwidth);
+    pub fn update_allocation_input(&mut self, now: Instant, input: AllocationInput) {
+        self.available_bandwidth.update(now, input.estimate);
+        self.application_limited = input.application_limited;
         self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(&mut self, now: Instant, bwe: &mut Bwe) -> bool {
+    pub fn update_allocations(&mut self, now: Instant) -> (bool, AllocationOutput) {
         self.available_bandwidth.tick(now);
         self.dirty_allocation = false;
         let (desired, assignments_changed, unfunded) = self
             .video
             .update_allocations(self.available_bandwidth.current());
         let allocated = self.video.current_allocation();
-        bwe.set_current_bitrate(allocated);
-        if self.last_desired != desired {
-            bwe.set_desired_bitrate(desired);
-            self.last_desired = desired;
-        }
-        self.break_starvation_deadlock(now, desired, unfunded, allocated, bwe);
-        assignments_changed
+        let recovery = self.break_starvation_deadlock(now, desired, unfunded, allocated);
+        self.last_desired = desired;
+        (
+            assignments_changed,
+            AllocationOutput {
+                desired,
+                allocated,
+                recovery,
+                probe: self.application_limited.then_some(recovery).flatten(),
+            },
+        )
     }
 
     /// Escape the state where too little is forwarded to sustain useful feedback.
@@ -512,8 +520,7 @@ impl Downstream {
         desired: Bitrate,
         unfunded: Option<Bitrate>,
         allocated: Bitrate,
-        bwe: &mut Bwe,
-    ) {
+    ) -> Option<Bitrate> {
         let estimate = self.available_bandwidth.current();
         let Some(target) = starvation_reset_target(
             &mut self.starved_since,
@@ -523,10 +530,10 @@ impl Downstream {
             allocated,
             estimate,
         ) else {
-            return;
+            return None;
         };
-        bwe.reset(target);
         self.available_bandwidth = BweFilter::new(target);
+        Some(target)
     }
 
     pub(crate) fn reconcile_routes(&mut self, now: Instant, events: &mut impl ParticipantSink) {
@@ -537,13 +544,12 @@ impl Downstream {
     pub(crate) fn poll_slow(
         &mut self,
         now: Instant,
-        bwe: &mut Bwe,
         events: &mut impl ParticipantSink,
-    ) -> bool {
-        let assignments_changed = self.update_allocations(now, bwe);
+    ) -> (bool, AllocationOutput) {
+        let (assignments_changed, output) = self.update_allocations(now);
         self.video
             .poll_slow(now, self.available_bandwidth.current(), events);
-        assignments_changed
+        (assignments_changed, output)
     }
 
     pub fn on_forward_rtp(

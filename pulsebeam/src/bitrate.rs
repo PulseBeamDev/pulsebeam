@@ -1,4 +1,4 @@
-use str0m::bwe::Bitrate;
+use crate::participant::allocation::Bitrate;
 
 /// Convert a computed bitrate to an integer without letting a NaN or a negative
 /// silently become a plausible rate — `as u64` yields 0 for both, which the
@@ -99,7 +99,7 @@ impl BitrateController {
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
-        Bitrate::from(current_bitrate)
+        Bitrate::from(saturating_bps(current_bitrate))
     }
 }
 
