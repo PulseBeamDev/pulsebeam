@@ -149,6 +149,10 @@ pub struct Gcc {
 
 impl Gcc {
     pub fn new(history_capacity: usize) -> Self {
+        Self::with_initial_bitrate(history_capacity, INITIAL_BITRATE_BPS)
+    }
+
+    pub fn with_initial_bitrate(history_capacity: usize, initial_bitrate_bps: u64) -> Self {
         let history_capacity = history_capacity.max(1);
         Self {
             next_transport_sequence: 0,
@@ -156,7 +160,7 @@ impl Gcc {
             sequence_index: HashMap::with_capacity(history_capacity),
             history_order: VecDeque::with_capacity(history_capacity),
             history_capacity,
-            bitrate_bps: INITIAL_BITRATE_BPS,
+            bitrate_bps: initial_bitrate_bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS),
             last_departure: None,
             last_feedback: None,
             last_probe: None,
@@ -495,6 +499,14 @@ mod tests {
             gcc.estimate(now + OUTAGE + Duration::from_secs(1))
                 .application_limited()
         );
+    }
+
+    #[test]
+    fn gcc_accepts_a_policy_selected_initial_bitrate() {
+        let now = Instant::now();
+        let gcc = Gcc::with_initial_bitrate(8, 2_000_000);
+
+        assert_eq!(gcc.estimate(now).bitrate_bps(), 2_000_000);
     }
 
     #[test]

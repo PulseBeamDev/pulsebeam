@@ -207,6 +207,16 @@ impl LiveConnection {
         local: LocalTransport,
         now: Instant,
     ) -> Result<Self, LiveConnectionError> {
+        Self::with_initial_bitrate(id, session, local, now, 300_000)
+    }
+
+    pub fn with_initial_bitrate(
+        id: ConnectionId,
+        session: NegotiatedSession,
+        local: LocalTransport,
+        now: Instant,
+        initial_bitrate_bps: u64,
+    ) -> Result<Self, LiveConnectionError> {
         let crypto = from_feature_flags();
         if local.ice != *session.local_ice() || local.fingerprint != *session.local_fingerprint() {
             return Err(LiveConnectionError::LocalTransportMismatch);
@@ -267,7 +277,10 @@ impl LiveConnection {
             dtls_buf: vec![0; 2048].into_boxed_slice(),
             next_dtls_deadline: None,
             nominated: None,
-            gcc: Gcc::new(EGRESS_CAPACITY.saturating_mul(4)),
+            gcc: Gcc::with_initial_bitrate(
+                EGRESS_CAPACITY.saturating_mul(4),
+                initial_bitrate_bps,
+            ),
             congestion: VecDeque::with_capacity(64),
         })
     }
