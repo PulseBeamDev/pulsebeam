@@ -3,7 +3,7 @@ use derive_more::{AsRef, Display};
 use pulsebeam_runtime::rand::RngCore;
 use sha3::{Digest, Sha3_256};
 use std::{fmt, str::FromStr};
-use str0m::media::MediaKind;
+use crate::rtp::MediaKind;
 use utoipa::ToSchema;
 use uuid::Uuid;
 

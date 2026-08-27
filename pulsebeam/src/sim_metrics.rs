@@ -41,7 +41,7 @@ struct Samples {
     /// Number of allocation passes observed. Distinguishes "estimate stayed high" from
     /// "nothing was ever recorded", which would otherwise both satisfy a minimum.
     count: u64,
-    /// Media payload bytes the SFU handed to str0m for forwarding, keyed by the *subscriber*
+    /// Media payload bytes the SFU handed to transport forwarding, keyed by the *subscriber*
     /// receiving them.
     ///
     /// Per subscriber because the only use is comparing it against what one participant received.
@@ -215,7 +215,7 @@ pub fn reset() {
     SAMPLES.with_borrow_mut(|s| *s = Samples::default());
 }
 
-/// Record media payload handed to str0m for forwarding.
+/// Record media payload handed to transport forwarding.
 ///
 /// Everything else that reaches the subscriber - RTX, padding, probe bursts, RTCP - is generated
 /// below this point, so comparing this against what the subscriber actually received measures how

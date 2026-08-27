@@ -38,7 +38,6 @@ pub mod entity;
 pub mod id;
 pub(crate) mod keys;
 pub(crate) mod log;
-pub mod message;
 pub mod node;
 pub mod participant;
 pub mod route;

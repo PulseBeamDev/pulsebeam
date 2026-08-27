@@ -52,7 +52,6 @@ serde_json = "1.0.150"
 sha3 = "0.12.0"
 slotmap = "1.1.1"
 socket2 = "0.6.4"
-str0m = { workspace = true }
 thiserror = { workspace = true }
 thread-priority = "3.0.0"
 tokio = { workspace = true }
@@ -74,10 +73,7 @@ zerocopy = { version = "0.8.56", features = ["derive"] }
 parking_lot = "0.12.5"
 
 [dev-dependencies]
-pulsebeam-core = { path = "../pulsebeam-core", features = [
-  "str0m",
-  "test-utils",
-] }
+pulsebeam-core = { path = "../pulsebeam-core", features = ["test-utils"] }
 ctor = "1.0.10"
 hex = "0.4.3"
 more-asserts = { workspace = true }
@@ -92,10 +88,6 @@ turmoil = { workspace = true }
 #   "profiling",
 #   "unprefixed_malloc_on_supported_platforms"
 # ] }
-
-# Windows-specific str0m override
-[target.'cfg(windows)'.dependencies]
-str0m = { workspace = true, features = ["wincrypto"] }
 
 [features]
 default = []

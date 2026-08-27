@@ -198,7 +198,7 @@ macro_rules! route_family {
 
 route_family!(
     /// A client's WebRTC transport association, addressing the shard that owns
-    /// its `str0m::Rtc`. Travels on the wire inside the ICE ufrag, which is
+    /// its shard-owned transport. Travels on the wire inside the ICE ufrag, which is
     /// what lets the kernel steer a client's very first STUN packet to the
     /// owning shard before any userspace lookup exists.
     TransportRoute,

@@ -2931,7 +2931,6 @@ dependencies = [
  "sha3",
  "slotmap",
  "socket2",
- "str0m 0.22.0",
  "thiserror 2.0.19",
  "thread-priority",
  "tokio",
@@ -3932,7 +3931,6 @@ dependencies = [
  "serde",
  "str0m-aws-lc-rs 0.6.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
  "str0m-proto 0.7.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
- "str0m-wincrypto",
  "subtle",
  "time",
  "tracing",
@@ -4004,16 +4002,6 @@ dependencies = [
  "serde",
  "subtle",
  "time",
-]
-
-[[package]]
-name = "str0m-wincrypto"
-version = "0.8.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6#2c55e7a07864649fef84a9ee0c3f6d4f287b37e0"
-dependencies = [
- "str0m-proto 0.7.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
- "tracing",
- "windows 0.62.2",
 ]
 
 [[package]]

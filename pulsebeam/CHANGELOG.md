@@ -11,7 +11,7 @@
 
 ## [pulsebeam-v0.4.8] - 2026-08-08
 
-* feat: update str0m fork based on 0.22.0
+* feat: update the RTC protocol fork based on 0.22.0
 * feat: tighter allocation QoS
 * feat: Dependency Descriptor e2e
 * more simulation tests
@@ -44,8 +44,8 @@
 ## [pulsebeam-v0.4.5] - 2026-07-09
 
 * Increase pacer headroom to 1.5
-* Bump str0m to 0.21.0
-* Centralized str0m polling to always happen after mutation
+* Bump the RTC protocol fork to 0.21.0
+* Centralized RTC polling to always happen after mutation
 * Revert to metrics-exporter-prometheus
 * Remove metrics-rs from data plane (for now), <https://github.com/PulseBeamDev/pulsebeam/issues/154>
 * Added core pinning and RT_FIFO 50 when allowed
@@ -114,7 +114,7 @@
 
 ### Dependencies
 
-* Updated **str0m** to v0.19.0.
+* Updated the RTC protocol dependency to v0.19.0.
 * Updated **rand**, **indexmap**, and other core cargo dependencies.
 
 ## [pulsebeam-v0.3.5] - 2026-03-18
@@ -206,7 +206,7 @@
 
 ### ⚙️ Miscellaneous Tasks
 
-* Update str0m to 0.14
+* Update the RTC protocol dependency to 0.14
 * More consistent pprof endpoints
 * Bump to 0.3.0
 * Bump to 0.3.1

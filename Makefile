@@ -106,6 +106,7 @@ lint:
 # be linted; naming it here means that stays true if the simulator ever leaves
 # the default members.
 lint-check:
+	@! rg -n '\\bstr0m\\b' pulsebeam --glob '!target/**'
 	cargo clippy --all-targets --workspace --features pulsebeam/sim
 
 flamegraph: profile
