@@ -1,4 +1,3 @@
-use arrayvec::ArrayVec;
 use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
@@ -50,7 +49,7 @@ struct ShardNetworkEgress<'a> {
     tcp: &'a mut Batcher,
     udp_socket: &'a mut UnifiedSocket,
     tcp_socket: &'a mut net::tcp::TcpTransport,
-    departures: &'a mut ArrayVec<DepartureReceipt, MAX_DEPARTURES_PER_FLUSH>,
+    departures: &'a mut Vec<DepartureReceipt>,
 }
 
 impl NetworkEgress for ShardNetworkEgress<'_> {
@@ -80,19 +79,23 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
     fn flush(&mut self) -> bool {
         let departures = &mut *self.departures;
         let udp_progress = self.udp.flush(self.udp_socket, |receipt| {
-            if departures.try_push(receipt).is_err() {
+            if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
                 debug_assert!(
                     false,
                     "one shard flush exceeded its departure receipt bound"
                 );
+            } else {
+                departures.push(receipt);
             }
         });
         let tcp_progress = self.tcp.flush(self.tcp_socket, |receipt| {
-            if departures.try_push(receipt).is_err() {
+            if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
                 debug_assert!(
                     false,
                     "one shard flush exceeded its departure receipt bound"
                 );
+            } else {
+                departures.push(receipt);
             }
         });
         udp_progress || tcp_progress
@@ -114,7 +117,7 @@ pub(crate) struct ShardExecution {
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
     tcp_send_batcher: Batcher,
-    departures: ArrayVec<DepartureReceipt, MAX_DEPARTURES_PER_FLUSH>,
+    departures: Vec<DepartureReceipt>,
     pipeline: EventPipeline,
     wall: WallAnchor,
 }
@@ -251,7 +254,7 @@ impl ShardExecution {
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
             tcp_send_batcher: Batcher::with_capacity(max_gso_segments),
-            departures: ArrayVec::new(),
+            departures: Vec::with_capacity(MAX_DEPARTURES_PER_FLUSH),
             pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
             wall,
         }
@@ -752,19 +755,23 @@ impl ShardExecution {
         {
             let departures = &mut self.departures;
             self.udp_send_batch.flush(udp_socket, |receipt| {
-                if departures.try_push(receipt).is_err() {
+                if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
                     debug_assert!(
                         false,
                         "one shard flush exceeded its departure receipt bound"
                     );
+                } else {
+                    departures.push(receipt);
                 }
             });
             self.tcp_send_batcher.flush(tcp_socket, |receipt| {
-                if departures.try_push(receipt).is_err() {
+                if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
                     debug_assert!(
                         false,
                         "one shard flush exceeded its departure receipt bound"
                     );
+                } else {
+                    departures.push(receipt);
                 }
             });
         }

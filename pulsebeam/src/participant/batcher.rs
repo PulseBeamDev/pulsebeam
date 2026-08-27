@@ -85,24 +85,24 @@ struct GsoPacketMeta {
     segment_size: usize,
     start: usize,
     end: usize,
-    receipts: ArrayVec<DepartureReceipt, MAX_RECEIPTS_PER_BATCH>,
+    receipts: Vec<DepartureReceipt>,
 }
 
 pub struct GsoSendBatch {
     arena: Vec<u8>,
-    packets: ArrayVec<GsoPacketMeta, { net::BATCH_SIZE }>,
+    packets: Vec<GsoPacketMeta>,
 }
 
 impl GsoSendBatch {
     pub fn preallocated() -> Self {
         Self {
             arena: Vec::with_capacity(net::BATCH_SIZE * net::MAX_UDP_GSO_PAYLOAD_SIZE),
-            packets: ArrayVec::new(),
+            packets: Vec::with_capacity(net::BATCH_SIZE),
         }
     }
 
     pub fn is_full(&self) -> bool {
-        self.packets.len() == self.packets.capacity()
+        self.packets.len() >= net::BATCH_SIZE
     }
 
     pub fn is_empty(&self) -> bool {
@@ -124,7 +124,7 @@ impl GsoSendBatch {
         let segment_size = first.contents.len();
         let start = self.arena.len();
         let mut segment_count = 0;
-        let mut receipts = ArrayVec::new();
+        let mut receipts = Vec::with_capacity(MAX_RECEIPTS_PER_BATCH);
 
         while let Some(packet) = queue.packets.front() {
             debug_assert!(!packet.contents.is_empty());
@@ -148,14 +148,15 @@ impl GsoSendBatch {
                 break;
             }
 
+            if packet.receipt.is_some() && receipts.len() >= MAX_RECEIPTS_PER_BATCH {
+                debug_assert!(false, "GSO batch exceeded receipt capacity");
+                break;
+            }
+
             let is_tail = packet.contents.len() < segment_size;
             self.arena.extend_from_slice(&packet.contents);
             if let Some(receipt) = packet.receipt {
-                debug_assert!(receipts.len() < receipts.capacity());
-                if receipts.try_push(receipt).is_err() {
-                    debug_assert!(false, "GSO batch exceeded receipt capacity");
-                    break;
-                }
+                receipts.push(receipt);
             }
             segment_count = segment_count.saturating_add(1);
             queue.packets.pop_front();
@@ -398,7 +399,7 @@ pub struct BatcherState {
     max_segments: usize,
     sealed: bool,
     pub buf: Vec<u8>,
-    receipts: ArrayVec<DepartureReceipt, MAX_RECEIPTS_PER_BATCH>,
+    receipts: Vec<DepartureReceipt>,
 }
 
 impl BatcherState {
@@ -421,7 +422,7 @@ impl BatcherState {
                 cap.saturating_mul(net::MAX_UDP_GSO_PAYLOAD_SIZE)
                     .min(net::MAX_UDP_GSO_PAYLOAD_SIZE),
             ),
-            receipts: ArrayVec::new(),
+            receipts: Vec::with_capacity(MAX_RECEIPTS_PER_BATCH),
         }
     }
 
@@ -466,7 +467,7 @@ impl BatcherState {
             self.segment_size = content.len();
         }
 
-        if receipt.is_some() && self.receipts.len() == self.receipts.capacity() {
+        if receipt.is_some() && self.receipts.len() >= MAX_RECEIPTS_PER_BATCH {
             debug_assert!(false, "TCP batch exceeded receipt capacity");
             return false;
         }

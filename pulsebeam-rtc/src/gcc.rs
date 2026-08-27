@@ -248,8 +248,9 @@ impl Gcc {
         let total = acknowledged_count.saturating_add(lost);
         let congested = lost.saturating_mul(2) > total;
         if total > 0 {
+            let first_feedback = self.last_feedback.is_none();
             self.last_feedback = Some(now);
-            self.update_estimate(&acknowledged, lost, congested);
+            self.update_estimate(&acknowledged, lost, congested, first_feedback);
         }
         let probe = self.maybe_probe(now, congested);
         GccOutcome {
@@ -292,6 +293,7 @@ impl Gcc {
         acknowledged: &[(Instant, Duration, usize)],
         lost: usize,
         congested: bool,
+        first_feedback: bool,
     ) {
         if acknowledged.len() >= 2 {
             let Some(first) = acknowledged.first() else {
@@ -314,7 +316,9 @@ impl Gcc {
                             .unwrap_or(u64::MAX)
                             .max(1),
                     );
-                if received > departed.saturating_add(Duration::from_millis(15)) {
+                if first_feedback && lost == 0 && !congested {
+                    self.bitrate_bps = throughput;
+                } else if received > departed.saturating_add(Duration::from_millis(15)) {
                     self.bitrate_bps = self.bitrate_bps.saturating_mul(85).saturating_div(100);
                 } else if !self.application_limited {
                     let increased = self.bitrate_bps.saturating_mul(105).saturating_div(100);
@@ -507,6 +511,28 @@ mod tests {
         let gcc = Gcc::with_initial_bitrate(8, 2_000_000);
 
         assert_eq!(gcc.estimate(now).bitrate_bps(), 2_000_000);
+    }
+
+    #[test]
+    fn gcc_promotes_its_first_clean_throughput_sample() {
+        let now = Instant::now();
+        let mut gcc = Gcc::new(8);
+        let first = gcc.assign(SendId::new(1), 1200).expect("first send");
+        let second = gcc.assign(SendId::new(2), 1200).expect("second send");
+        gcc.record_departure(first.send_id(), now)
+            .expect("first departure");
+        gcc.record_departure(second.send_id(), now + Duration::from_millis(10))
+            .expect("second departure");
+
+        let outcome = gcc.process_feedback(
+            now + Duration::from_millis(20),
+            &feedback(&[
+                (first.transport_sequence(), Some(Duration::from_millis(1))),
+                (second.transport_sequence(), Some(Duration::from_millis(11))),
+            ]),
+        );
+
+        assert!(outcome.estimate().bitrate_bps() > INITIAL_BITRATE_BPS);
     }
 
     #[test]

@@ -58,12 +58,11 @@ pub struct DirectTransport {
 impl DirectTransport {
     pub fn new(config: DirectTransportConfig, now: Instant) -> Result<Self, LiveConnectionError> {
         Ok(Self {
-            connection: LiveConnection::with_initial_bitrate(
+            connection: LiveConnection::new(
                 config.connection_id,
                 config.session,
                 config.local,
                 now.into(),
-                crate::participant::downstream::INITIAL_BANDWIDTH.get(),
             )?,
             media: MediaForwarder::with_capacity(64, 64, 128),
             ingress: VecDeque::with_capacity(MAX_INGRESS_PER_TICK),
