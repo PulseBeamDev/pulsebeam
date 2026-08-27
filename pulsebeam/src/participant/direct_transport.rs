@@ -13,6 +13,9 @@ use tokio::time::Instant;
 use crate::rtp::{Codec, PacketExtensions, RtpPacket};
 
 const MAX_INGRESS_PER_TICK: usize = 64;
+const AUDIO_LEVEL_EXTENSION_URI: &str = "ssrc-audio-level";
+const MID_EXTENSION_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+const RID_EXTENSION_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
 
 pub struct DirectTransportConfig {
     pub connection_id: ConnectionId,
@@ -144,10 +147,6 @@ impl DirectTransport {
         self.connection.send_rtcp(bytes)
     }
 
-    pub fn congestion_estimate(&self, now: Instant) -> pulsebeam_rtc::CongestionEstimate {
-        self.connection.congestion_estimate(now.into())
-    }
-
     pub fn poll_congestion(&mut self) -> Option<pulsebeam_rtc::GccOutcome> {
         self.connection.poll_congestion()
     }
@@ -213,8 +212,14 @@ impl DirectTransport {
         self.connection.handle_timeout(now.into());
     }
 
-    pub fn next_deadline(&mut self) -> Option<Instant> {
-        self.connection.next_deadline().map(Into::into)
+    pub fn next_deadline(&mut self, now: Instant) -> Option<Instant> {
+        let minimum = now
+            .checked_add(std::time::Duration::from_millis(1))
+            .unwrap_or(now);
+        self.connection
+            .next_deadline()
+            .map(Into::into)
+            .map(|deadline: Instant| deadline.max(minimum))
     }
 
     pub fn poll_output(&mut self) -> Option<DirectTransportOutput> {
@@ -232,12 +237,13 @@ impl DirectTransport {
         let packet = authenticated.parse().ok()?;
         match self.media.handle_authenticated(packet).ok()? {
             Some(pulsebeam_rtc::MediaIngress::Rtp { stream, packet }) => {
+                let (codec, extensions) = self.rtp_metadata(stream, &packet);
                 Some(DirectTransportOutput::Rtp {
                     stream,
                     packet: RtpPacket::from_packet_view(
                         &packet,
-                        Codec::H264,
-                        PacketExtensions::default(),
+                        codec,
+                        extensions,
                         Vec::with_capacity(packet.payload().len()),
                     ),
                 })
@@ -250,6 +256,73 @@ impl DirectTransport {
 
     pub fn poll_egress(&mut self) -> Option<EgressDatagram> {
         self.connection.poll_egress()
+    }
+
+    fn rtp_metadata(
+        &self,
+        stream: ReceiveStream,
+        packet: &pulsebeam_rtc::RtpPacketView<'_>,
+    ) -> (Codec, PacketExtensions) {
+        let Some(section) = self.connection.media_section(stream.media_section()) else {
+            debug_assert!(
+                false,
+                "a registered receive stream has negotiated media facts"
+            );
+            return (Codec::H264, PacketExtensions::default());
+        };
+        let codec = section
+            .codecs()
+            .iter()
+            .find(|codec| codec.payload_type() == packet.payload_type())
+            .map_or(Codec::H264, |codec| {
+                codec
+                    .name()
+                    .eq_ignore_ascii_case("opus")
+                    .then_some(Codec::Opus)
+                    .unwrap_or(Codec::H264)
+            });
+        let mut extensions = PacketExtensions::default();
+        let audio_level = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri().contains(AUDIO_LEVEL_EXTENSION_URI))
+            .and_then(|extension| {
+                packet
+                    .header_extension(section, extension.id())
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|value| value.value().first().copied())
+            .and_then(|value| i8::try_from(value & 0x7f).ok())
+            .and_then(|value| value.checked_neg());
+        extensions.audio_level = audio_level;
+        extensions.mid = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == MID_EXTENSION_URI)
+            .and_then(|extension| {
+                packet
+                    .header_extension(section, extension.id())
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|value| std::str::from_utf8(value.value()).ok())
+            .filter(|mid| !mid.is_empty())
+            .map(Into::into);
+        extensions.rid = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == RID_EXTENSION_URI)
+            .and_then(|extension| {
+                packet
+                    .header_extension(section, extension.id())
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|value| std::str::from_utf8(value.value()).ok())
+            .filter(|rid| !rid.is_empty())
+            .map(Into::into);
+        (codec, extensions)
     }
 }
 

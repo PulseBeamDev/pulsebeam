@@ -413,6 +413,7 @@ mod tests {
             crate::MediaDirection::ReceiveOnly,
             Box::new([]),
             Box::new([]),
+            Box::new([]),
             None,
         );
 
@@ -497,6 +498,7 @@ mod tests {
             crate::MediaDirection::ReceiveOnly,
             Box::new([]),
             Box::new([crate::HeaderExtension::new(3, "urn:test".to_owned())]),
+            Box::new([]),
             None,
         );
 

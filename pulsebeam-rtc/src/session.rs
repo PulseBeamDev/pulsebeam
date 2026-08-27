@@ -208,6 +208,7 @@ pub struct NegotiatedMediaSection {
     direction: MediaDirection,
     codecs: Box<[Codec]>,
     header_extensions: Box<[HeaderExtension]>,
+    receive_rids: Box<[String]>,
     data_channel: Option<DataChannelParameters>,
 }
 
@@ -236,6 +237,10 @@ impl NegotiatedMediaSection {
         &self.header_extensions
     }
 
+    pub fn receive_rids(&self) -> &[String] {
+        &self.receive_rids
+    }
+
     pub fn data_channel(&self) -> Option<&DataChannelParameters> {
         self.data_channel.as_ref()
     }
@@ -247,6 +252,7 @@ impl NegotiatedMediaSection {
         direction: MediaDirection,
         codecs: Box<[Codec]>,
         header_extensions: Box<[HeaderExtension]>,
+        receive_rids: Box<[String]>,
         data_channel: Option<DataChannelParameters>,
     ) -> Self {
         Self {
@@ -256,6 +262,7 @@ impl NegotiatedMediaSection {
             direction,
             codecs,
             header_extensions,
+            receive_rids,
             data_channel,
         }
     }

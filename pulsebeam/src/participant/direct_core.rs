@@ -172,7 +172,6 @@ pub struct DirectParticipantCore {
     participant_key: crate::keys::ParticipantKey,
     next_send_id: u64,
     next_fir_sequence: u8,
-    publications: Vec<Track>,
     ingress_shard: Option<ShardId>,
     udp_packets: OwnedPacketQueue,
     tcp_batcher: Batcher,
@@ -199,7 +198,6 @@ impl DirectParticipantCore {
     ) -> Result<Self, pulsebeam_rtc::LiveConnectionError> {
         let mut sections = HashMap::with_capacity(session.media_sections().len());
         let mut receive_sections = HashMap::with_capacity(session.media_sections().len());
-        let mut published = Vec::new();
         let mut upstream = UpstreamAllocator::new(crate::log::LogCtx {
             room_id,
             participant_id,
@@ -210,6 +208,13 @@ impl DirectParticipantCore {
                 participant_id,
             },
             manual_sub,
+        );
+        downstream.update_allocation_input(
+            now,
+            crate::participant::allocation::AllocationInput {
+                estimate: crate::participant::downstream::INITIAL_BANDWIDTH,
+                application_limited: true,
+            },
         );
         let mut send_streams = Vec::new();
         let mut send_sections = HashMap::with_capacity(session.media_sections().len());
@@ -236,12 +241,18 @@ impl DirectParticipantCore {
                 };
                 let (sender, track) = match kind {
                     TrackKind::Audio => track::new_audio(mid, meta),
-                    TrackKind::Video => track::new_video(mid, meta, Vec::new()),
+                    TrackKind::Video => track::new_video(
+                        mid,
+                        meta,
+                        section
+                            .receive_rids()
+                            .iter()
+                            .map(|rid| crate::rtp::SimulcastEncoding::new(rid.as_str()))
+                            .collect(),
+                    ),
                     TrackKind::Data => continue,
                 };
-                if upstream.add_published_track(mid, sender, track.clone()) {
-                    published.push(track);
-                }
+                let _ = upstream.add_published_track(mid, sender, track);
             }
             if section.direction() == MediaDirection::SendOnly {
                 let Some(codec) = section.codecs().first() else {
@@ -297,7 +308,6 @@ impl DirectParticipantCore {
             participant_key,
             next_send_id: 0,
             next_fir_sequence: 0,
-            publications: published,
             ingress_shard: None,
             udp_packets: OwnedPacketQueue::with_capacity(udp_gso_size),
             tcp_batcher: Batcher::with_capacity(tcp_gso_size),
@@ -349,10 +359,6 @@ impl DirectParticipantCore {
         if self.transport.report_departure(send_id, now).is_err() {
             debug_assert!(false, "every accepted media packet has one GCC send record");
         }
-    }
-
-    pub fn take_publications(&mut self) -> Vec<Track> {
-        std::mem::take(&mut self.publications)
     }
 
     pub(crate) fn apply(&mut self, effect: ParticipantEffect) {
@@ -550,6 +556,21 @@ impl DirectParticipantCore {
                 MediaEvent::SenderReport { .. } | MediaEvent::Feedback { .. } => {}
             }
         }
+        let mut congestion = None;
+        while let Some(outcome) = self.transport.poll_congestion() {
+            if outcome.acknowledged().saturating_add(outcome.lost()) > 0 {
+                congestion = Some(outcome.estimate());
+            }
+        }
+        if let Some(estimate) = congestion {
+            self.downstream.update_allocation_input(
+                now,
+                crate::participant::allocation::AllocationInput {
+                    estimate: crate::participant::allocation::Bitrate::bps(estimate.bitrate_bps()),
+                    application_limited: estimate.application_limited(),
+                },
+            );
+        }
         Ok(processed)
     }
 
@@ -566,19 +587,8 @@ impl DirectParticipantCore {
             events.exit();
             return None;
         }
-        for track in self.take_publications() {
-            events.publish_track(track);
-        }
         if now.saturating_duration_since(self.last_slow_poll) >= SLOW_POLL_INTERVAL {
             self.upstream.poll_slow(now);
-            let estimate = self.transport.congestion_estimate(now);
-            self.downstream.update_allocation_input(
-                now,
-                crate::participant::allocation::AllocationInput {
-                    estimate: crate::participant::allocation::Bitrate::bps(estimate.bitrate_bps()),
-                    application_limited: estimate.application_limited(),
-                },
-            );
             let (assignments_changed, _) = self.downstream.poll_slow(now, events);
             if assignments_changed {
                 self.signaling.mark_assignments_dirty();
@@ -607,7 +617,7 @@ impl DirectParticipantCore {
             .checked_add(SLOW_POLL_INTERVAL)
             .unwrap_or(self.last_slow_poll);
         self.transport
-            .next_deadline()
+            .next_deadline(now)
             .map_or(Some(slow), |deadline| Some(deadline.min(slow)))
     }
 
@@ -856,7 +866,7 @@ impl DirectParticipantCore {
         let route = IncomingRtpRoute {
             ssrc: Ssrc::from(stream.ssrc()),
             mid,
-            rid: None,
+            rid: packet.extensions.rid.clone(),
             upstream_slot: slot,
             track_id,
             fanout: self.upstream.track_fanout(track_id),

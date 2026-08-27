@@ -132,6 +132,7 @@ pub fn negotiate(
         let direction = negotiated_direction(kind, line.direction(), &mid)?;
         let codecs = codecs(line);
         let header_extensions = header_extensions(line, &mid)?;
+        let receive_rids = receive_rids(line, kind, direction);
         let data_channel = data_channel_parameters(line, kind, &mid)?;
 
         filter_answer_attributes(line, direction);
@@ -142,6 +143,7 @@ pub fn negotiate(
             direction,
             codecs.into_boxed_slice(),
             header_extensions.into_boxed_slice(),
+            receive_rids.into_boxed_slice(),
             data_channel,
         ));
     }
@@ -258,6 +260,27 @@ fn header_extensions(
     }
 
     Ok(extensions)
+}
+
+fn receive_rids(
+    line: &str0m::sdp::MediaLine,
+    kind: MediaKind,
+    direction: MediaDirection,
+) -> Vec<String> {
+    if kind != MediaKind::Video || direction != MediaDirection::ReceiveOnly {
+        return Vec::new();
+    }
+    line.simulcast()
+        .map(|simulcast| {
+            simulcast
+                .send
+                .iter()
+                .filter(|layer| layer.restriction_id.1)
+                .map(|layer| layer.restriction_id.0.clone())
+                .filter(|rid| !rid.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn data_channel_parameters(
@@ -418,6 +441,26 @@ mod tests {
         assert_eq!(
             error,
             NegotiationError::UnsupportedDirection("0".to_owned())
+        );
+    }
+
+    #[test]
+    fn negotiated_session_keeps_remote_send_simulcast_rids() {
+        let offer = format!(
+            "{}a=simulcast:send q;h;f\r\n",
+            offer("sendonly")
+                .replace(
+                    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+                    "m=video 9 UDP/TLS/RTP/SAVPF 96"
+                )
+                .replace("a=rtpmap:111 opus/48000/2", "a=rtpmap:96 H264/90000")
+        );
+
+        let result = negotiate(&offer, &server()).expect("accepted simulcast offer");
+
+        assert_eq!(
+            result.session().media_sections()[0].receive_rids(),
+            ["q", "h", "f"]
         );
     }
 }

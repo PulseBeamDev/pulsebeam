@@ -241,11 +241,13 @@ impl Gcc {
             }
         }
         let acknowledged_count = acknowledged.len();
-        if acknowledged_count.saturating_add(lost) > 0 {
+        let total = acknowledged_count.saturating_add(lost);
+        let congested = lost.saturating_mul(2) > total;
+        if total > 0 {
             self.last_feedback = Some(now);
-            self.update_estimate(&acknowledged, lost);
+            self.update_estimate(&acknowledged, lost, congested);
         }
-        let probe = self.maybe_probe(now, lost > 0);
+        let probe = self.maybe_probe(now, congested);
         GccOutcome {
             estimate: self.estimate(now),
             acknowledged: acknowledged_count,
@@ -281,7 +283,12 @@ impl Gcc {
         self.maybe_probe(now, false)
     }
 
-    fn update_estimate(&mut self, acknowledged: &[(Instant, Duration, usize)], lost: usize) {
+    fn update_estimate(
+        &mut self,
+        acknowledged: &[(Instant, Duration, usize)],
+        lost: usize,
+        congested: bool,
+    ) {
         if acknowledged.len() >= 2 {
             let Some(first) = acknowledged.first() else {
                 return;
@@ -312,7 +319,7 @@ impl Gcc {
             }
         }
         let total = acknowledged.len().saturating_add(lost);
-        if total > 0 && lost.saturating_mul(10) > total {
+        if total > 0 && congested {
             self.bitrate_bps = self.bitrate_bps.saturating_mul(85).saturating_div(100);
         }
         self.bitrate_bps = self.bitrate_bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS);
@@ -488,6 +495,39 @@ mod tests {
             gcc.estimate(now + OUTAGE + Duration::from_secs(1))
                 .application_limited()
         );
+    }
+
+    #[test]
+    fn gcc_does_not_treat_a_reordered_feedback_gap_as_congestion() {
+        let now = Instant::now();
+        let mut gcc = Gcc::new(8);
+        let mut sequences = Vec::new();
+        for index in 0..5 {
+            let send = gcc
+                .assign(SendId::new(index), 1200)
+                .expect("unique send identity");
+            gcc.record_departure(
+                send.send_id(),
+                now + Duration::from_millis(u64::from(index) * 10),
+            )
+            .expect("authoritative departure");
+            sequences.push(send.transport_sequence());
+        }
+
+        let outcome = gcc.process_feedback(
+            now + Duration::from_millis(60),
+            &feedback(&[
+                (sequences[0], Some(Duration::from_millis(1))),
+                (sequences[1], Some(Duration::from_millis(11))),
+                (sequences[2], None),
+                (sequences[3], Some(Duration::from_millis(31))),
+                (sequences[4], Some(Duration::from_millis(41))),
+            ]),
+        );
+
+        assert_eq!(outcome.lost(), 1);
+        assert!(outcome.estimate().bitrate_bps() >= INITIAL_BITRATE_BPS);
+        assert!(outcome.probe().is_some());
     }
 
     #[test]

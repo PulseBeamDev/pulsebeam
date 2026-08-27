@@ -25,6 +25,7 @@ pub struct EgressDatagram {
 }
 
 const EGRESS_CAPACITY: usize = 256;
+const DTLS_OUTPUT_BUDGET: usize = 64;
 
 impl EgressDatagram {
     pub fn bytes(&self) -> &[u8] {
@@ -599,14 +600,20 @@ impl LiveConnection {
                 self.events.push_back(event);
             }
         }
-        loop {
-            match self.dtls.poll_output(&mut self.dtls_buf) {
+        for _ in 0..DTLS_OUTPUT_BUDGET {
+            let stop = match self.dtls.poll_output(&mut self.dtls_buf) {
                 DtlsOutput::Timeout(deadline) => {
                     self.next_dtls_deadline = Some(deadline);
-                    break;
+                    true
                 }
-                DtlsOutput::Connected => self.events.push_back(TransportEvent::DtlsConnected),
-                DtlsOutput::CloseNotify => self.events.push_back(TransportEvent::DtlsClosed),
+                DtlsOutput::Connected => {
+                    self.events.push_back(TransportEvent::DtlsConnected);
+                    false
+                }
+                DtlsOutput::CloseNotify => {
+                    self.events.push_back(TransportEvent::DtlsClosed);
+                    false
+                }
                 DtlsOutput::PeerCert(peer) => {
                     let actual = Fingerprint {
                         hash_func: "sha-256".to_owned(),
@@ -619,20 +626,23 @@ impl LiveConnection {
                         self.events.push_back(TransportEvent::DtlsClosed);
                         let _ = self.dtls.close();
                     }
+                    false
                 }
                 DtlsOutput::KeyingMaterial(material, profile) => {
                     let active = self.dtls.is_active().unwrap_or(false);
                     self.srtp_rx =
                         Some(SrtpContext::new(&self.crypto, profile, &material, !active));
                     self.srtp_tx = Some(SrtpContext::new(&self.crypto, profile, &material, active));
+                    false
                 }
                 DtlsOutput::ApplicationData(data) => {
                     if let Some(association) = self.data.as_mut() {
                         association.handle_input(now, data);
                     }
+                    false
                 }
-                _ => {}
-            }
+                _ => false,
+            };
             while self.egress_ready() {
                 let Some(packet) = self.dtls.poll_packet() else {
                     break;
@@ -645,7 +655,14 @@ impl LiveConnection {
                     });
                 }
             }
+            if stop {
+                return;
+            }
         }
+        debug_assert!(
+            false,
+            "one DTLS drive pass exceeded its bounded output budget"
+        );
     }
 }
 
