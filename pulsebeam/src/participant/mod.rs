@@ -2,6 +2,7 @@ pub(crate) mod allocation;
 pub(crate) mod batcher;
 mod core;
 mod data;
+pub mod direct_core;
 pub mod direct_transport;
 pub(crate) mod downstream;
 pub mod effect;

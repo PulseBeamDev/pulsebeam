@@ -294,7 +294,14 @@ impl MediaForwarder {
                 }),
                 206 => {
                     if matches!(format, 1 | 4) {
-                        self.push_event(MediaEvent::KeyframeRequest { ssrc });
+                        let media_ssrc = bytes
+                            .get(8..12)
+                            .map(|value| {
+                                debug_assert_eq!(value.len(), 4);
+                                u32::from_be_bytes([value[0], value[1], value[2], value[3]])
+                            })
+                            .unwrap_or(ssrc);
+                        self.push_event(MediaEvent::KeyframeRequest { ssrc: media_ssrc });
                     } else {
                         self.push_event(MediaEvent::Feedback {
                             packet_type: 206,

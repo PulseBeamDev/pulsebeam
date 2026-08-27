@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 
 use pulsebeam_rtc::{
     AuthenticatedPacket, ConnectionId, DataChannelEvent, EgressDatagram, IngressPacket,
     LiveConnection, LiveConnectionError, LocalTransport, MediaError, MediaEvent, MediaForwarder,
-    ReceiveStream, SendStream, NegotiatedSession, PacketId, PacketProvenance, SendId,
+    NegotiatedSession, PacketId, PacketProvenance, ReceiveStream, SendId, SendStream,
     TransportEvent, TransportMetadata, TransportProtocol,
 };
 use pulsebeam_runtime::net::{RecvPacketBatch, Transport};
@@ -36,7 +37,10 @@ impl DirectTransportConfig {
 pub enum DirectTransportOutput {
     Transport(TransportEvent),
     Data(DataChannelEvent),
-    Rtp { stream: ReceiveStream, packet: RtpPacket },
+    Rtp {
+        stream: ReceiveStream,
+        packet: RtpPacket,
+    },
     Rtcp(AuthenticatedPacket),
 }
 
@@ -45,13 +49,11 @@ pub struct DirectTransport {
     media: MediaForwarder,
     ingress: VecDeque<RecvPacketBatch>,
     next_packet_id: u64,
+    last_ingress: Option<(SocketAddr, SocketAddr)>,
 }
 
 impl DirectTransport {
-    pub fn new(
-        config: DirectTransportConfig,
-        now: Instant,
-    ) -> Result<Self, LiveConnectionError> {
+    pub fn new(config: DirectTransportConfig, now: Instant) -> Result<Self, LiveConnectionError> {
         Ok(Self {
             connection: LiveConnection::new(
                 config.connection_id,
@@ -62,6 +64,7 @@ impl DirectTransport {
             media: MediaForwarder::with_capacity(64, 64, 128),
             ingress: VecDeque::with_capacity(MAX_INGRESS_PER_TICK),
             next_packet_id: 0,
+            last_ingress: None,
         })
     }
 
@@ -119,12 +122,32 @@ impl DirectTransport {
         self.connection.poll_congestion()
     }
 
+    pub fn send_data(
+        &mut self,
+        channel: pulsebeam_rtc::ChannelId,
+        binary: bool,
+        bytes: Vec<u8>,
+        now: Instant,
+    ) -> Result<(), pulsebeam_rtc::DataChannelError> {
+        let Some(association) = self.connection.data_association() else {
+            return Err(pulsebeam_rtc::DataChannelError::UnknownChannel(channel));
+        };
+        association.send(channel, binary, bytes)?;
+        self.connection.handle_timeout(now.into());
+        Ok(())
+    }
+
     pub fn enqueue(&mut self, batch: RecvPacketBatch) {
+        self.last_ingress = Some((batch.src, batch.dst));
         if self.ingress.len() >= MAX_INGRESS_PER_TICK {
             let _ = self.ingress.pop_front();
             metrics::counter!("participant_ingress_shed").increment(1);
         }
         self.ingress.push_back(batch);
+    }
+
+    pub fn ingress_context(&self) -> Option<(SocketAddr, SocketAddr)> {
+        self.last_ingress
     }
 
     pub fn process_ingress(&mut self, now: Instant) -> Result<usize, LiveConnectionError> {
@@ -205,18 +228,15 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use pulsebeam_rtc::{
-        IceCandidate, IceCredentials, ServerTransport, negotiate,
-    };
+    use pulsebeam_rtc::{IceCandidate, IceCredentials, ServerTransport, negotiate};
 
     fn config(now: Instant) -> DirectTransportConfig {
         let ice = IceCredentials::new("localufrag".to_owned(), "localpassword".to_owned())
             .expect("valid local ICE credentials");
         let local = LocalTransport::generate(ice).expect("local transport");
-        let candidate = IceCandidate::new(
-            "candidate:1 1 UDP 2130706431 127.0.0.1 9000 typ host".to_owned(),
-        )
-        .expect("valid ICE candidate");
+        let candidate =
+            IceCandidate::new("candidate:1 1 UDP 2130706431 127.0.0.1 9000 typ host".to_owned())
+                .expect("valid ICE candidate");
         let server = ServerTransport::new(
             7,
             local.ice().clone(),
