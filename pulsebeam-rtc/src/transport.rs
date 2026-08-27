@@ -12,15 +12,17 @@ use str0m::{
 };
 
 use crate::{
-    ConnectionId, DataChannelAssociation, ForwardedRtp, IngressPacket, MediaSectionId,
-    NegotiatedMediaSection, NegotiatedSession, PacketError, PacketProvenance, PacketView,
-    TransportMetadata, TransportProtocol,
+    CongestionEstimate, ConnectionId, DataChannelAssociation, EgressCongestion, ForwardedRtp,
+    Gcc, GccError, GccOutcome, IngressPacket, MediaSectionId, NegotiatedMediaSection,
+    NegotiatedSession, PacketError, PacketProvenance, PacketView, SendId, TransportMetadata,
+    TransportProtocol,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EgressDatagram {
     bytes: Vec<u8>,
     transport: TransportMetadata,
+    send_id: Option<SendId>,
 }
 
 const EGRESS_CAPACITY: usize = 256;
@@ -32,6 +34,10 @@ impl EgressDatagram {
 
     pub const fn transport(&self) -> TransportMetadata {
         self.transport
+    }
+
+    pub const fn send_id(&self) -> Option<SendId> {
+        self.send_id
     }
 }
 
@@ -127,6 +133,8 @@ pub enum LiveConnectionError {
     SrtcpAuthentication,
     #[error("invalid datagram: {0}")]
     Datagram(#[from] PacketError),
+    #[error("congestion control error: {0}")]
+    Congestion(#[from] GccError),
 }
 
 pub struct LiveConnection {
@@ -145,6 +153,8 @@ pub struct LiveConnection {
     dtls_buf: Box<[u8]>,
     next_dtls_deadline: Option<Instant>,
     nominated: Option<TransportMetadata>,
+    gcc: Gcc,
+    congestion: VecDeque<GccOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -253,6 +263,8 @@ impl LiveConnection {
             dtls_buf: vec![0; 2048].into_boxed_slice(),
             next_dtls_deadline: None,
             nominated: None,
+            gcc: Gcc::new(EGRESS_CAPACITY.saturating_mul(4)),
+            congestion: VecDeque::with_capacity(64),
         })
     }
 
@@ -354,6 +366,19 @@ impl LiveConnection {
         self.authenticated.pop_front()
     }
 
+    pub fn congestion_estimate(&self, now: Instant) -> CongestionEstimate {
+        self.gcc.estimate(now)
+    }
+
+    pub fn poll_congestion(&mut self) -> Option<GccOutcome> {
+        self.congestion.pop_front()
+    }
+
+    pub fn report_departure(&mut self, send_id: SendId, now: Instant) -> Result<(), LiveConnectionError> {
+        self.gcc.record_departure(send_id, now)?;
+        Ok(())
+    }
+
     pub fn data_association(&mut self) -> Option<&mut DataChannelAssociation> {
         self.data.as_mut()
     }
@@ -419,10 +444,18 @@ impl LiveConnection {
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .unprotect_rtcp(packet.bytes())
             .ok_or(LiveConnectionError::SrtcpAuthentication)?;
-        self.authenticated.push_back(AuthenticatedPacket {
+        let authenticated = AuthenticatedPacket {
             bytes: plaintext,
             provenance: packet.provenance(),
-        });
+        };
+        if let PacketView::Rtcp(rtcp) = authenticated.parse()? {
+            for outcome in self.gcc.process_rtcp(packet.provenance().received_at(), &rtcp)? {
+                if self.congestion.len() < self.congestion.capacity() {
+                    self.congestion.push_back(outcome);
+                }
+            }
+        }
+        self.authenticated.push_back(authenticated);
         Ok(())
     }
 
@@ -438,7 +471,25 @@ impl LiveConnection {
             .as_mut()
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .protect_rtp(bytes, &header, extended_sequence);
-        self.push_protected_egress(encrypted)
+        self.push_protected_egress(encrypted, None)
+    }
+
+    pub fn send_rtp_with_congestion(
+        &mut self,
+        bytes: &[u8],
+        extended_sequence: u64,
+        send_id: SendId,
+    ) -> Result<EgressCongestion, LiveConnectionError> {
+        let congestion = self.gcc.assign(send_id, bytes.len())?;
+        let header = RtpHeader::parse(bytes, &ExtensionMap::empty())
+            .ok_or(LiveConnectionError::RtpHeader)?;
+        let encrypted = self
+            .srtp_tx
+            .as_mut()
+            .ok_or(LiveConnectionError::CryptoNotReady)?
+            .protect_rtp(bytes, &header, extended_sequence);
+        self.push_protected_egress(encrypted, Some(send_id))?;
+        Ok(congestion)
     }
 
     pub fn send_forwarded_rtp(&mut self, packet: &ForwardedRtp) -> Result<(), LiveConnectionError> {
@@ -451,15 +502,23 @@ impl LiveConnection {
             .as_mut()
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .protect_rtcp(bytes);
-        self.push_protected_egress(encrypted)
+        self.push_protected_egress(encrypted, None)
     }
 
-    fn push_protected_egress(&mut self, bytes: Vec<u8>) -> Result<(), LiveConnectionError> {
+    fn push_protected_egress(
+        &mut self,
+        bytes: Vec<u8>,
+        send_id: Option<SendId>,
+    ) -> Result<(), LiveConnectionError> {
         let transport = self.nominated.ok_or(LiveConnectionError::CryptoNotReady)?;
         if !self.egress_ready() {
             return Err(LiveConnectionError::EgressFull);
         }
-        self.egress.push_back(EgressDatagram { bytes, transport });
+        self.egress.push_back(EgressDatagram {
+            bytes,
+            transport,
+            send_id,
+        });
         Ok(())
     }
 
@@ -475,6 +534,7 @@ impl LiveConnection {
             self.egress.push_back(EgressDatagram {
                 bytes: transmit.contents.to_vec(),
                 transport: TransportMetadata::new(protocol, transmit.source, transmit.destination),
+                send_id: None,
             });
         }
         while let Some(event) = self.ice.poll_event() {
@@ -547,6 +607,7 @@ impl LiveConnection {
                     self.egress.push_back(EgressDatagram {
                         bytes: packet.to_vec(),
                         transport,
+                        send_id: None,
                     });
                 }
             }
