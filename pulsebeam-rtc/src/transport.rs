@@ -166,6 +166,7 @@ struct RtpReceiveIndex {
     rollover_counter: u32,
     highest_sequence: u16,
     initialized: bool,
+    replay_window: u64,
 }
 
 impl RtpReceiveIndex {
@@ -186,18 +187,43 @@ impl RtpReceiveIndex {
         (u64::from(rollover_counter) << 16) | u64::from(sequence)
     }
 
-    fn accept(&mut self, extended_sequence: u64) {
+    fn accept(&mut self, extended_sequence: u64) -> bool {
         let rollover_counter = u32::try_from(extended_sequence >> 16).unwrap_or(u32::MAX);
-        let sequence = u16::try_from(extended_sequence & u64::from(u16::MAX))
-            .unwrap_or(u16::MAX);
-        if !self.initialized
-            || rollover_counter > self.rollover_counter
-            || (rollover_counter == self.rollover_counter && sequence > self.highest_sequence)
-        {
+        let sequence = u16::try_from(extended_sequence & u64::from(u16::MAX)).unwrap_or(u16::MAX);
+        if !self.initialized {
             self.rollover_counter = rollover_counter;
             self.highest_sequence = sequence;
             self.initialized = true;
+            self.replay_window = 1;
+            return true;
         }
+        let highest = (u64::from(self.rollover_counter) << 16) | u64::from(self.highest_sequence);
+        if extended_sequence > highest {
+            let advance = extended_sequence.saturating_sub(highest);
+            self.replay_window = if advance >= u64::BITS.into() {
+                1
+            } else {
+                self.replay_window
+                    .checked_shl(u32::try_from(advance).unwrap_or(u32::MAX))
+                    .unwrap_or(0)
+                    | 1
+            };
+            self.rollover_counter = rollover_counter;
+            self.highest_sequence = sequence;
+            return true;
+        }
+        let behind = highest.saturating_sub(extended_sequence);
+        if behind >= u64::BITS.into() {
+            return false;
+        }
+        let mask = 1u64
+            .checked_shl(u32::try_from(behind).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        if self.replay_window & mask != 0 {
+            return false;
+        }
+        self.replay_window |= mask;
+        true
     }
 }
 
@@ -278,10 +304,7 @@ impl LiveConnection {
             dtls_buf: vec![0; 2048].into_boxed_slice(),
             next_dtls_deadline: None,
             nominated: None,
-            gcc: Gcc::with_initial_bitrate(
-                EGRESS_CAPACITY.saturating_mul(4),
-                initial_bitrate_bps,
-            ),
+            gcc: Gcc::with_initial_bitrate(EGRESS_CAPACITY.saturating_mul(4), initial_bitrate_bps),
             congestion: VecDeque::with_capacity(64),
         })
     }
@@ -448,10 +471,17 @@ impl LiveConnection {
             .ok_or(LiveConnectionError::RtpHeader)?;
         decrypted.extend_from_slice(fixed_header);
         decrypted.extend_from_slice(plaintext);
-        self.authenticated.push_back(AuthenticatedPacket {
-            bytes: decrypted,
-            provenance: packet.provenance(),
-        });
+        if self
+            .rtp_rx
+            .entry(*header.ssrc)
+            .or_default()
+            .accept(extended_sequence)
+        {
+            self.authenticated.push_back(AuthenticatedPacket {
+                bytes: decrypted,
+                provenance: packet.provenance(),
+            });
+        }
         Ok(())
     }
 
@@ -466,10 +496,6 @@ impl LiveConnection {
             .unwrap_or_default()
             .extended_sequence(header.sequence_number);
         self.receive_rtp(packet, extended_sequence)?;
-        self.rtp_rx
-            .entry(ssrc)
-            .or_default()
-            .accept(extended_sequence);
         Ok(())
     }
 
@@ -771,6 +797,28 @@ mod tests {
         ));
         assert!(connection.poll_egress().is_none());
         assert!(connection.poll_authenticated().is_none());
+    }
+
+    #[test]
+    fn rtp_receive_index_accepts_one_copy_of_each_recent_sequence() {
+        let mut index = RtpReceiveIndex::default();
+        let first = index.extended_sequence(65_534);
+        assert!(index.accept(first));
+        assert!(!index.accept(first));
+
+        let last_before_wrap = index.extended_sequence(65_535);
+        assert!(index.accept(last_before_wrap));
+        let first_after_wrap = index.extended_sequence(0);
+        assert!(index.accept(first_after_wrap));
+        let second_after_wrap = index.extended_sequence(1);
+        assert!(index.accept(second_after_wrap));
+
+        let reordered = index.extended_sequence(65_533);
+        assert!(index.accept(reordered));
+        assert!(!index.accept(reordered));
+
+        let too_old = index.extended_sequence(65_470);
+        assert!(!index.accept(too_old));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub struct DirectTransportConfig {
     pub connection_id: ConnectionId,
     pub session: NegotiatedSession,
     pub local: LocalTransport,
+    pub initial_bitrate_bps: u64,
 }
 
 impl DirectTransportConfig {
@@ -33,11 +34,15 @@ impl DirectTransportConfig {
             connection_id,
             session,
             local,
+            initial_bitrate_bps: crate::participant::downstream::INITIAL_BANDWIDTH.get(),
         }
     }
 }
 
-#[allow(clippy::large_enum_variant, reason = "boxing each RTP event would add a packet-path allocation")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing each RTP event would add a packet-path allocation"
+)]
 pub enum DirectTransportOutput {
     Transport(TransportEvent),
     Data(DataChannelEvent),
@@ -59,11 +64,12 @@ pub struct DirectTransport {
 impl DirectTransport {
     pub fn new(config: DirectTransportConfig, now: Instant) -> Result<Self, LiveConnectionError> {
         Ok(Self {
-            connection: LiveConnection::new(
+            connection: LiveConnection::with_initial_bitrate(
                 config.connection_id,
                 config.session,
                 config.local,
                 now.into(),
+                config.initial_bitrate_bps,
             )?,
             media: MediaForwarder::with_capacity(64, 64, 128),
             ingress: VecDeque::with_capacity(MAX_INGRESS_PER_TICK),
@@ -276,9 +282,11 @@ impl DirectTransport {
             .iter()
             .find(|codec| codec.payload_type() == packet.payload_type())
             .map_or(Codec::H264, |codec| {
-                if codec
-                    .name()
-                    .eq_ignore_ascii_case("opus") { Codec::Opus } else { Codec::H264 }
+                if codec.name().eq_ignore_ascii_case("opus") {
+                    Codec::Opus
+                } else {
+                    Codec::H264
+                }
             });
         let mut extensions = PacketExtensions::default();
         let audio_level = section
@@ -321,6 +329,23 @@ impl DirectTransport {
             .and_then(|value| std::str::from_utf8(value.value()).ok())
             .filter(|rid| !rid.is_empty())
             .map(Into::into);
+        extensions.raw_dependency_descriptor = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == pulsebeam_core::dd::URI)
+            .and_then(|extension| {
+                packet
+                    .header_extension(section, extension.id())
+                    .ok()
+                    .flatten()
+            })
+            .map(pulsebeam_rtc::HeaderExtensionValue::value)
+            .filter(|value| {
+                !value.is_empty() && value.len() <= pulsebeam_core::dd::model::MAX_DD_LEN
+            })
+            .map(|value| {
+                pulsebeam_core::dd::RawDependencyDescriptor(value.iter().copied().collect())
+            });
         (codec, extensions)
     }
 }
@@ -389,5 +414,19 @@ a=rtpmap:111 opus/48000/2\r\n";
 
         assert!(transport.process_ingress(now).is_err());
         assert!(transport.poll_output().is_none());
+    }
+
+    #[test]
+    fn direct_transport_uses_the_pulsebeam_initial_allocation_policy() {
+        let now = Instant::now();
+        let transport = DirectTransport::new(config(now), now).expect("direct transport");
+
+        assert_eq!(
+            transport
+                .connection()
+                .congestion_estimate(now.into())
+                .bitrate_bps(),
+            crate::participant::downstream::INITIAL_BANDWIDTH.get()
+        );
     }
 }

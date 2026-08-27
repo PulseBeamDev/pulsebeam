@@ -8,6 +8,8 @@ use pulsebeam_rtc::{
 use pulsebeam_runtime::net::RecvPacketBatch;
 use tokio::time::Instant;
 
+#[cfg(debug_assertions)]
+use crate::rtp::egress_guard::EgressGuard;
 use crate::{
     entity::{ParticipantId, RoomId, TrackKind},
     id::ShardId,
@@ -41,6 +43,7 @@ const TWCC_EXTENSION_URI: &str = "transport-wide-cc";
 struct OutgoingExtensions {
     mid: Option<(u8, Box<[u8]>)>,
     twcc: Option<u8>,
+    dependency_descriptor: Option<u8>,
 }
 
 impl OutgoingExtensions {
@@ -51,7 +54,7 @@ impl OutgoingExtensions {
             .find(|extension| extension.uri() == MID_EXTENSION_URI)
             .and_then(|extension| {
                 let id = extension.id();
-                (id > 0 && id < 15 && section.mid().len() <= 16)
+                (id > 0 && section.mid().len() <= usize::from(u8::MAX))
                     .then(|| (id, section.mid().as_bytes().into()))
             });
         let twcc = section
@@ -59,28 +62,52 @@ impl OutgoingExtensions {
             .iter()
             .find(|extension| extension.uri().contains(TWCC_EXTENSION_URI))
             .map(pulsebeam_rtc::HeaderExtension::id)
-            .filter(|&id| id > 0 && id < 15);
-        Self { mid, twcc }
-    }
-
-    fn extension_data_len(&self) -> usize {
-        let mid = self
-            .mid
-            .as_ref()
-            .map_or(0, |(_, value)| 1usize.saturating_add(value.len()));
-        let twcc = usize::from(self.twcc.is_some()).saturating_mul(3);
-        mid.saturating_add(twcc)
+            .filter(|&id| id > 0);
+        let dependency_descriptor = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == pulsebeam_core::dd::URI)
+            .map(pulsebeam_rtc::HeaderExtension::id)
+            .filter(|&id| id > 0);
+        Self {
+            mid,
+            twcc,
+            dependency_descriptor,
+        }
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::expect_used, clippy::arithmetic_side_effects, reason = "negotiated RTP fields and extension lengths are validated before encoding")]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects,
+    reason = "negotiated RTP fields and extension lengths are validated before encoding"
+)]
 fn encode_rtp(
     packet: &crate::rtp::RtpPacket,
     payload_type: PayloadType,
     ssrc: Ssrc,
     extensions: Option<&OutgoingExtensions>,
 ) -> (Vec<u8>, Option<usize>) {
-    let extension_data_len = extensions.map_or(0, OutgoingExtensions::extension_data_len);
+    let mid = extensions.and_then(|extensions| extensions.mid.as_ref());
+    let twcc = extensions.and_then(|extensions| extensions.twcc);
+    let dependency_descriptor = extensions
+        .and_then(|extensions| extensions.dependency_descriptor)
+        .zip(packet.extensions.raw_dependency_descriptor.as_ref())
+        .map(|(id, descriptor)| (id, descriptor.0.as_slice()))
+        .filter(|(_, descriptor)| !descriptor.is_empty());
+    let two_byte_extensions = mid.is_some_and(|(id, _)| *id > 14)
+        || twcc.is_some_and(|id| id > 14)
+        || dependency_descriptor.is_some_and(|(id, descriptor)| id > 14 || descriptor.len() > 16);
+    let extension_header_len = if two_byte_extensions { 2usize } else { 1usize };
+    let extension_data_len = mid
+        .map_or(0, |(_, value)| {
+            extension_header_len.saturating_add(value.len())
+        })
+        .saturating_add(twcc.map_or(0, |_| extension_header_len.saturating_add(2)))
+        .saturating_add(dependency_descriptor.map_or(0, |(_, descriptor)| {
+            extension_header_len.saturating_add(descriptor.len())
+        }));
     let extension_bytes = if extension_data_len == 0 {
         0
     } else {
@@ -97,23 +124,50 @@ fn encode_rtp(
     bytes.extend_from_slice(&ssrc.get().to_be_bytes());
     let mut twcc_offset = None;
     if extension_bytes != 0 {
-        bytes.extend_from_slice(&0xbedeu16.to_be_bytes());
+        bytes.extend_from_slice(
+            &(if two_byte_extensions {
+                0x1000u16
+            } else {
+                0xbedeu16
+            })
+            .to_be_bytes(),
+        );
         bytes.extend_from_slice(
             &u16::try_from(extension_bytes.saturating_sub(4).saturating_div(4))
                 .expect("RTP header extension must fit its 16-bit word length")
                 .to_be_bytes(),
         );
-        if let Some((id, mid)) = extensions.and_then(|extensions| extensions.mid.as_ref()) {
-            debug_assert!(*id > 0 && *id < 15);
-            debug_assert!(!mid.is_empty() && mid.len() <= 16);
-            bytes.push((*id << 4) | u8::try_from(mid.len() - 1).unwrap_or_default());
+        if let Some((id, mid)) = mid {
+            debug_assert!(*id > 0);
+            debug_assert!(!mid.is_empty() && mid.len() <= usize::from(u8::MAX));
+            if two_byte_extensions {
+                bytes.extend_from_slice(&[*id, u8::try_from(mid.len()).unwrap_or_default()]);
+            } else {
+                debug_assert!(*id < 15 && mid.len() <= 16);
+                bytes.push((*id << 4) | u8::try_from(mid.len() - 1).unwrap_or_default());
+            }
             bytes.extend_from_slice(mid);
         }
-        if let Some(id) = extensions.and_then(|extensions| extensions.twcc) {
-            debug_assert!(id > 0 && id < 15);
-            bytes.push((id << 4) | 1);
+        if let Some(id) = twcc {
+            debug_assert!(id > 0);
+            if two_byte_extensions {
+                bytes.extend_from_slice(&[id, 2]);
+            } else {
+                debug_assert!(id < 15);
+                bytes.push((id << 4) | 1);
+            }
             twcc_offset = Some(bytes.len());
             bytes.extend_from_slice(&[0, 0]);
+        }
+        if let Some((id, descriptor)) = dependency_descriptor {
+            debug_assert!(id > 0 && descriptor.len() <= usize::from(u8::MAX));
+            if two_byte_extensions {
+                bytes.extend_from_slice(&[id, u8::try_from(descriptor.len()).unwrap_or_default()]);
+            } else {
+                debug_assert!(id < 15 && descriptor.len() <= 16);
+                bytes.push((id << 4) | u8::try_from(descriptor.len() - 1).unwrap_or_default());
+            }
+            bytes.extend_from_slice(descriptor);
         }
         bytes.resize(12usize.saturating_add(extension_bytes), 0);
     }
@@ -159,7 +213,7 @@ pub enum DisconnectReason {
 }
 
 pub struct DirectParticipantCore {
-    transport: DirectTransport,
+    transport: Box<DirectTransport>,
     sections: HashMap<pulsebeam_rtc::MediaSectionId, MediaSectionId>,
     receive_sections: HashMap<u8, pulsebeam_rtc::MediaSectionId>,
     send_sections: HashMap<u32, MediaSectionId>,
@@ -173,6 +227,8 @@ pub struct DirectParticipantCore {
     participant_key: crate::keys::ParticipantKey,
     next_send_id: u64,
     next_fir_sequence: u8,
+    #[cfg(debug_assertions)]
+    egress_guard: EgressGuard,
     ingress_shard: Option<ShardId>,
     udp_packets: OwnedPacketQueue,
     tcp_batcher: Batcher,
@@ -184,7 +240,10 @@ pub struct DirectParticipantCore {
 }
 
 impl DirectParticipantCore {
-    #[allow(clippy::too_many_arguments, reason = "participant materialization takes its complete owned shard configuration")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "participant materialization takes its complete owned shard configuration"
+    )]
     pub fn new(
         connection_id: ConnectionId,
         session: pulsebeam_rtc::NegotiatedSession,
@@ -198,6 +257,10 @@ impl DirectParticipantCore {
         tcp_gso_size: usize,
         now: Instant,
     ) -> Result<Self, pulsebeam_rtc::LiveConnectionError> {
+        debug_assert!(
+            std::mem::size_of::<Self>() < 4096,
+            "participant core must keep live protocol components on the heap"
+        );
         let mut sections = HashMap::with_capacity(session.media_sections().len());
         let mut receive_sections = HashMap::with_capacity(session.media_sections().len());
         let mut upstream = UpstreamAllocator::new(crate::log::LogCtx {
@@ -270,7 +333,8 @@ impl DirectParticipantCore {
                     RtcMediaKind::Application => continue,
                 };
                 let ssrc = Ssrc::from(
-                    u32::try_from(connection_id.get()).unwrap_or(u32::MAX)
+                    u32::try_from(connection_id.get())
+                        .unwrap_or(u32::MAX)
                         .wrapping_mul(0x9e37_79b9)
                         .wrapping_add(section.id().get() as u32)
                         .max(1),
@@ -288,10 +352,13 @@ impl DirectParticipantCore {
             }
         }
         let config = DirectTransportConfig::new(connection_id, session, local);
-        let mut transport = DirectTransport::new(config, now)?;
+        let mut transport = Box::new(DirectTransport::new(config, now)?);
         for (section, ssrc) in send_streams {
             let id = StreamId::new(ssrc.get());
-            if transport.register_send(SendStream::new(id, section, ssrc.get(), 0, 0)).is_err() {
+            if transport
+                .register_send(SendStream::new(id, section, ssrc.get(), 0, 0))
+                .is_err()
+            {
                 debug_assert!(false, "one direct send stream per negotiated media section");
             }
         }
@@ -310,6 +377,8 @@ impl DirectParticipantCore {
             participant_key,
             next_send_id: 0,
             next_fir_sequence: 0,
+            #[cfg(debug_assertions)]
+            egress_guard: EgressGuard::new(),
             ingress_shard: None,
             udp_packets: OwnedPacketQueue::with_capacity(udp_gso_size),
             tcp_batcher: Batcher::with_capacity(tcp_gso_size),
@@ -520,7 +589,10 @@ impl DirectParticipantCore {
             }
         };
         let Some(rtcp) = bytes.get(..length) else {
-            debug_assert!(false, "a fixed RTCP feedback buffer bounds its encoded length");
+            debug_assert!(
+                false,
+                "a fixed RTCP feedback buffer bounds its encoded length"
+            );
             return;
         };
         if self.transport.send_rtcp(rtcp).is_err() {
@@ -634,10 +706,31 @@ impl DirectParticipantCore {
             }
         }
         while let Some(write) = self.stream_writer.pop() {
-            let (packet, payload_type, ssrc) = match write {
-                StreamWrite::Video { pkt, pt, ssrc, .. }
-                | StreamWrite::Audio { pkt, pt, ssrc, .. } => (pkt, pt, ssrc),
+            let (packet, mid, rid, payload_type, ssrc, kind) = match write {
+                StreamWrite::Video {
+                    pkt,
+                    mid,
+                    rid,
+                    pt,
+                    ssrc,
+                } => (pkt, mid, rid, pt, ssrc, MediaKind::Video),
+                StreamWrite::Audio { pkt, mid, pt, ssrc } => {
+                    (pkt, mid, None, pt, ssrc, MediaKind::Audio)
+                }
             };
+            #[cfg(debug_assertions)]
+            if let Some(violation) = self.egress_guard.check(
+                mid,
+                rid,
+                u64::from(packet.seq_no),
+                packet.rtp_ts.numer(),
+                packet.marker,
+                kind,
+            ) {
+                tracing::error!(%mid, ?rid, %violation, "egress stream invariant violated");
+                #[cfg(feature = "sim")]
+                pulsebeam_runtime::fatal!("egress stream invariant violated: {violation}");
+            }
             let extensions = self.send_extensions.get(&ssrc.get());
             let (mut bytes, twcc_offset) = encode_rtp(&packet, payload_type, ssrc, extensions);
             let send_id = self.next_send_id();
@@ -666,6 +759,11 @@ impl DirectParticipantCore {
             if result.is_err() {
                 break;
             }
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::record_forwarded_media_for(
+                self.participant_id,
+                u64::try_from(packet.payload.len()).unwrap_or(u64::MAX),
+            );
         }
     }
 
@@ -802,11 +900,11 @@ impl DirectParticipantCore {
                         if active
                             && let Some((track, in_topology)) =
                                 self.upstream.announce_state_mut(mid)
-                                && !*in_topology
-                            {
-                                *in_topology = true;
-                                events.publish_track(track.clone());
-                            }
+                            && !*in_topology
+                        {
+                            *in_topology = true;
+                            events.publish_track(track.clone());
+                        }
                     }
                     self.downstream
                         .apply_signaling_intents(self.signaling.reconcile());
@@ -994,6 +1092,7 @@ mod tests {
         let extensions = OutgoingExtensions {
             mid: Some((3, Box::from(*b"video"))),
             twcc: Some(5),
+            dependency_descriptor: None,
         };
         let packet = crate::rtp::RtpPacket {
             payload: vec![1, 2, 3],
@@ -1014,5 +1113,45 @@ mod tests {
         assert_eq!(bytes[offset - 1], 0x51);
         assert_eq!(&bytes[offset..offset + 2], &[0, 0]);
         assert_eq!(&bytes[bytes.len() - 3..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn outgoing_rtp_preserves_long_dependency_descriptor() {
+        let extensions = OutgoingExtensions {
+            mid: None,
+            twcc: None,
+            dependency_descriptor: Some(4),
+        };
+        let descriptor = (0u8..17).collect();
+        let packet = crate::rtp::RtpPacket {
+            extensions: crate::rtp::PacketExtensions {
+                raw_dependency_descriptor: Some(pulsebeam_core::dd::RawDependencyDescriptor(
+                    descriptor,
+                )),
+                ..Default::default()
+            },
+            payload: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let (bytes, twcc_offset) = encode_rtp(
+            &packet,
+            PayloadType::new(96).expect("valid RTP payload type"),
+            Ssrc::from(17),
+            Some(&extensions),
+        );
+
+        assert_eq!(&bytes[12..16], &[0x10, 0, 0, 5]);
+        assert_eq!(&bytes[16..18], &[4, 17]);
+        assert_eq!(&bytes[18..35], &(0u8..17).collect::<Vec<_>>());
+        assert!(twcc_offset.is_none());
+        assert_eq!(&bytes[bytes.len() - 3..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn direct_participant_core_keeps_live_protocol_state_off_the_stack() {
+        assert!(
+            std::mem::size_of::<DirectParticipantCore>() < 4096,
+            "participant core must keep live protocol components on the heap"
+        );
     }
 }

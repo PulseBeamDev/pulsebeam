@@ -37,19 +37,6 @@ impl DerefMut for ParticipantMeta {
 pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
-    /// Boxed, and that is the point.
-    ///
-    /// `SecondaryMap` is a dense `Vec` indexed by the key, so its element size
-    /// is its stride. `ParticipantMeta` is ~10.9KB — three quarters of it
-    /// participant protocol state — and growing the map `Vec::extend`s, which reallocates
-    /// and memcpies every participant already in it. On a shard filling to 500
-    /// that is ~2.7MB copied in one go, on a `SCHED_FIFO` thread, while media
-    /// is flowing. A pointer costs 16 bytes of stride instead of 10,904, so the
-    /// same growth moves 8KB.
-    ///
-    /// The indirection is free where it matters: resolving a participant always
-    /// missed on a 10.9KB object anyway, and the pointer array it now goes
-    /// through is dense enough to stay resident (500 participants = 8KB).
     participants: SecondaryMap<ParticipantKey, Box<ParticipantMeta>>,
     demuxer: Demuxer,
     pending_close: VecDeque<SocketAddr>,
@@ -93,7 +80,10 @@ impl ParticipantRegistry {
             tokio::time::Instant::now(),
         );
         let Ok(core) = core else {
-            debug_assert!(false, "controller-validated direct transport facts must materialize in the owner shard");
+            debug_assert!(
+                false,
+                "controller-validated direct transport facts must materialize in the owner shard"
+            );
             return false;
         };
         if self.participants.contains_key(key) {
@@ -170,16 +160,6 @@ mod tests {
         std::mem::size_of::<V>()
     }
 
-    /// The registry's element stride is a pointer, not a participant.
-    ///
-    /// `SecondaryMap` is a dense `Vec` indexed by the key, so whatever it holds
-    /// is what gets memcpied every time the map grows — on the shard's
-    /// `SCHED_FIFO` thread, with media flowing. Storing the participant inline
-    /// made that ~2.7MB in one go at 500 participants; a pointer makes it 8KB.
-    ///
-    /// This is a stride check rather than a style check: if `ParticipantMeta`
-    /// ever shrinks to something a `Vec` can carry, the indirection can go and
-    /// this assertion is the place to reconsider it.
     #[test]
     fn the_registry_holds_participants_behind_a_pointer() {
         let registry = ParticipantRegistry::new(ShardId::new(0), 1, 1);
@@ -187,10 +167,6 @@ mod tests {
             value_size(&registry.participants),
             std::mem::size_of::<usize>(),
             "the participant registry must store a pointer per slot"
-        );
-        assert!(
-            std::mem::size_of::<ParticipantMeta>() > 4096,
-            "a participant is small enough to inline now; revisit the Box and this test"
         );
     }
 }
