@@ -1546,10 +1546,6 @@ mod dd_tests {
 
     #[test]
     fn derives_the_keyframe_flag_from_the_descriptor_under_an_opaque_payload() {
-        // packet_carrying starts from an opaque payload (is_keyframe = false, empty
-        // NAL flags) — the SFrame/E2EE case where from_str0m's H.264 probe sees
-        // nothing. The descriptor's attached structure is then the only keyframe
-        // signal, so ingress must set is_keyframe from it.
         let structure = test_utils::structure_l1t3();
         let mut writer = DependencyDescriptorWriter::new();
         let mut buf = [0u8; MAX_DD_LEN];

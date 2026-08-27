@@ -37,13 +37,20 @@ use super::{ParticipantEffect, ParticipantInput, TrackPacketRef};
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MID_EXTENSION_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+const RID_EXTENSION_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
 const TWCC_EXTENSION_URI: &str = "transport-wide-cc";
+const RTP_HISTORY_CAPACITY: usize = 512;
+const MAX_RETRANSMISSIONS_PER_PACKET: u8 = 2;
+const RETRANSMISSION_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_RETRANSMISSIONS_PER_TICK: usize = 64;
 
 #[derive(Clone)]
 struct OutgoingExtensions {
     mid: Option<(u8, Box<[u8]>)>,
+    rid: Option<u8>,
     twcc: Option<u8>,
     dependency_descriptor: Option<u8>,
+    nackable: bool,
 }
 
 impl OutgoingExtensions {
@@ -63,17 +70,96 @@ impl OutgoingExtensions {
             .find(|extension| extension.uri().contains(TWCC_EXTENSION_URI))
             .map(pulsebeam_rtc::HeaderExtension::id)
             .filter(|&id| id > 0);
+        let rid = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == RID_EXTENSION_URI)
+            .map(pulsebeam_rtc::HeaderExtension::id)
+            .filter(|&id| id > 0);
         let dependency_descriptor = section
             .header_extensions()
             .iter()
             .find(|extension| extension.uri() == pulsebeam_core::dd::URI)
             .map(pulsebeam_rtc::HeaderExtension::id)
             .filter(|&id| id > 0);
+        let nackable = section.kind() == RtcMediaKind::Video
+            && section.codecs().iter().any(pulsebeam_rtc::Codec::nack);
         Self {
             mid,
+            rid,
             twcc,
             dependency_descriptor,
+            nackable,
         }
+    }
+}
+
+struct SentRtp {
+    sequence: u16,
+    bytes: Vec<u8>,
+    extended_sequence: u64,
+    twcc_offset: Option<usize>,
+    retransmissions: u8,
+    last_retransmission: Option<Instant>,
+}
+
+struct RtpHistory {
+    entries: Box<[Option<SentRtp>]>,
+}
+
+impl RtpHistory {
+    fn new() -> Self {
+        debug_assert!(RTP_HISTORY_CAPACITY.is_power_of_two());
+        let entries = std::iter::repeat_with(|| None)
+            .take(RTP_HISTORY_CAPACITY)
+            .collect();
+        Self { entries }
+    }
+
+    fn store(
+        &mut self,
+        sequence: u16,
+        bytes: Vec<u8>,
+        extended_sequence: u64,
+        twcc_offset: Option<usize>,
+    ) {
+        let index = usize::from(sequence) & (RTP_HISTORY_CAPACITY - 1);
+        let Some(entry) = self.entries.get_mut(index) else {
+            debug_assert!(false, "RTP history index escapes its fixed ring");
+            return;
+        };
+        *entry = Some(SentRtp {
+            sequence,
+            bytes,
+            extended_sequence,
+            twcc_offset,
+            retransmissions: 0,
+            last_retransmission: None,
+        });
+    }
+
+    fn prepare_retransmission(
+        &mut self,
+        sequence: u16,
+        now: Instant,
+    ) -> Option<(Vec<u8>, u64, Option<usize>)> {
+        let index = usize::from(sequence) & (RTP_HISTORY_CAPACITY - 1);
+        let entry = self.entries.get_mut(index)?.as_mut()?;
+        if entry.sequence != sequence
+            || entry.retransmissions >= MAX_RETRANSMISSIONS_PER_PACKET
+            || entry
+                .last_retransmission
+                .is_some_and(|last| now.saturating_duration_since(last) < RETRANSMISSION_INTERVAL)
+        {
+            return None;
+        }
+        entry.retransmissions = entry.retransmissions.saturating_add(1);
+        entry.last_retransmission = Some(now);
+        Some((
+            entry.bytes.clone(),
+            entry.extended_sequence,
+            entry.twcc_offset,
+        ))
     }
 }
 
@@ -90,6 +176,11 @@ fn encode_rtp(
     extensions: Option<&OutgoingExtensions>,
 ) -> (Vec<u8>, Option<usize>) {
     let mid = extensions.and_then(|extensions| extensions.mid.as_ref());
+    let rid = extensions
+        .and_then(|extensions| extensions.rid)
+        .zip(packet.extensions.rid.as_ref())
+        .map(|(id, rid)| (id, rid.as_bytes()))
+        .filter(|(_, rid)| !rid.is_empty());
     let twcc = extensions.and_then(|extensions| extensions.twcc);
     let dependency_descriptor = extensions
         .and_then(|extensions| extensions.dependency_descriptor)
@@ -97,6 +188,7 @@ fn encode_rtp(
         .map(|(id, descriptor)| (id, descriptor.0.as_slice()))
         .filter(|(_, descriptor)| !descriptor.is_empty());
     let two_byte_extensions = mid.is_some_and(|(id, _)| *id > 14)
+        || rid.is_some_and(|(id, rid)| id > 14 || rid.len() > 16)
         || twcc.is_some_and(|id| id > 14)
         || dependency_descriptor.is_some_and(|(id, descriptor)| id > 14 || descriptor.len() > 16);
     let extension_header_len = if two_byte_extensions { 2usize } else { 1usize };
@@ -104,6 +196,9 @@ fn encode_rtp(
         .map_or(0, |(_, value)| {
             extension_header_len.saturating_add(value.len())
         })
+        .saturating_add(rid.map_or(0, |(_, value)| {
+            extension_header_len.saturating_add(value.len())
+        }))
         .saturating_add(twcc.map_or(0, |_| extension_header_len.saturating_add(2)))
         .saturating_add(dependency_descriptor.map_or(0, |(_, descriptor)| {
             extension_header_len.saturating_add(descriptor.len())
@@ -147,6 +242,16 @@ fn encode_rtp(
                 bytes.push((*id << 4) | u8::try_from(mid.len() - 1).unwrap_or_default());
             }
             bytes.extend_from_slice(mid);
+        }
+        if let Some((id, rid)) = rid {
+            debug_assert!(id > 0 && !rid.is_empty() && rid.len() <= usize::from(u8::MAX));
+            if two_byte_extensions {
+                bytes.extend_from_slice(&[id, u8::try_from(rid.len()).unwrap_or_default()]);
+            } else {
+                debug_assert!(id < 15 && rid.len() <= 16);
+                bytes.push((id << 4) | u8::try_from(rid.len() - 1).unwrap_or_default());
+            }
+            bytes.extend_from_slice(rid);
         }
         if let Some(id) = twcc {
             debug_assert!(id > 0);
@@ -218,6 +323,7 @@ pub struct DirectParticipantCore {
     receive_sections: HashMap<u8, pulsebeam_rtc::MediaSectionId>,
     send_sections: HashMap<u32, MediaSectionId>,
     send_extensions: HashMap<u32, OutgoingExtensions>,
+    rtp_history: HashMap<u32, RtpHistory>,
     upstream: UpstreamAllocator,
     downstream: DownstreamAllocator,
     stream_writer: StreamWriter,
@@ -368,6 +474,7 @@ impl DirectParticipantCore {
             receive_sections,
             send_sections,
             send_extensions,
+            rtp_history: HashMap::with_capacity(8),
             upstream,
             downstream,
             stream_writer: StreamWriter::new(),
@@ -620,7 +727,7 @@ impl DirectParticipantCore {
                     self.handle_transport_event(event, events);
                 }
                 DirectTransportOutput::Data(event) => self.handle_data_event(event, events),
-                DirectTransportOutput::Rtcp(_) => {}
+                DirectTransportOutput::Rtcp { nacks } => self.retransmit(&nacks, now),
             }
         }
         while let Some(event) = self.transport.poll_media_event() {
@@ -637,15 +744,21 @@ impl DirectParticipantCore {
         let mut congestion = None;
         while let Some(outcome) = self.transport.poll_congestion() {
             if outcome.acknowledged().saturating_add(outcome.lost()) > 0 {
-                congestion = Some(outcome.estimate());
+                let estimate = outcome.estimate();
+                congestion = Some((estimate.bitrate_bps(), estimate.application_limited()));
+            }
+            if let Some(probe) = outcome.probe() {
+                let estimate = outcome.estimate();
+                let target = probe.target_bitrate_bps().max(estimate.bitrate_bps());
+                congestion = Some((target, estimate.application_limited()));
             }
         }
-        if let Some(estimate) = congestion {
+        if let Some((estimate, application_limited)) = congestion {
             self.downstream.update_allocation_input(
                 now,
                 crate::participant::allocation::AllocationInput {
-                    estimate: crate::participant::allocation::Bitrate::bps(estimate.bitrate_bps()),
-                    application_limited: estimate.application_limited(),
+                    estimate: crate::participant::allocation::Bitrate::bps(estimate),
+                    application_limited,
                 },
             );
         }
@@ -732,6 +845,7 @@ impl DirectParticipantCore {
                 pulsebeam_runtime::fatal!("egress stream invariant violated: {violation}");
             }
             let extensions = self.send_extensions.get(&ssrc.get());
+            let nackable = extensions.is_some_and(|extensions| extensions.nackable);
             let (mut bytes, twcc_offset) = encode_rtp(&packet, payload_type, ssrc, extensions);
             let send_id = self.next_send_id();
             let result = if let Some(twcc_offset) = twcc_offset {
@@ -759,11 +873,64 @@ impl DirectParticipantCore {
             if result.is_err() {
                 break;
             }
+            if nackable {
+                self.rtp_history
+                    .entry(ssrc.get())
+                    .or_insert_with(RtpHistory::new)
+                    .store(
+                        packet.seq_no.as_u16(),
+                        bytes,
+                        u64::from(packet.seq_no),
+                        twcc_offset,
+                    );
+            }
             #[cfg(feature = "sim")]
             crate::sim_metrics::record_forwarded_media_for(
                 self.participant_id,
                 u64::try_from(packet.payload.len()).unwrap_or(u64::MAX),
             );
+        }
+    }
+
+    fn retransmit(&mut self, nacks: &[pulsebeam_rtc::RtcpNack], now: Instant) {
+        let mut remaining = MAX_RETRANSMISSIONS_PER_TICK;
+        for nack in nacks {
+            for &sequence in nack.sequences() {
+                if remaining == 0 {
+                    return;
+                }
+                let Some((mut bytes, extended_sequence, twcc_offset)) = self
+                    .rtp_history
+                    .get_mut(&nack.media_ssrc())
+                    .and_then(|history| history.prepare_retransmission(sequence, now))
+                else {
+                    continue;
+                };
+                let send_id = self.next_send_id();
+                let result = if let Some(twcc_offset) = twcc_offset {
+                    let Ok(congestion) = self.transport.assign_congestion(send_id, bytes.len())
+                    else {
+                        continue;
+                    };
+                    let Some(slot) = bytes.get_mut(twcc_offset..twcc_offset.saturating_add(2))
+                    else {
+                        debug_assert!(false, "TWCC extension must fit retransmitted RTP");
+                        continue;
+                    };
+                    slot.copy_from_slice(&congestion.transport_sequence().to_be_bytes());
+                    self.transport.send_rtp_with_assigned_congestion(
+                        &bytes,
+                        extended_sequence,
+                        send_id,
+                    )
+                } else {
+                    self.transport.send_rtp_untracked(&bytes, extended_sequence)
+                };
+                if result.is_err() {
+                    return;
+                }
+                remaining = remaining.saturating_sub(1);
+            }
         }
     }
 
@@ -1091,8 +1258,10 @@ mod tests {
     fn outgoing_rtp_carries_negotiated_mid_and_twcc_fields() {
         let extensions = OutgoingExtensions {
             mid: Some((3, Box::from(*b"video"))),
+            rid: None,
             twcc: Some(5),
             dependency_descriptor: None,
+            nackable: true,
         };
         let packet = crate::rtp::RtpPacket {
             payload: vec![1, 2, 3],
@@ -1116,11 +1285,42 @@ mod tests {
     }
 
     #[test]
+    fn outgoing_rtp_carries_the_selected_simulcast_rid() {
+        let extensions = OutgoingExtensions {
+            mid: None,
+            rid: Some(4),
+            twcc: None,
+            dependency_descriptor: None,
+            nackable: true,
+        };
+        let packet = crate::rtp::RtpPacket {
+            extensions: crate::rtp::PacketExtensions {
+                rid: Some(crate::rtp::EncodingId::from("f")),
+                ..Default::default()
+            },
+            payload: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let (bytes, twcc_offset) = encode_rtp(
+            &packet,
+            PayloadType::new(96).expect("valid RTP payload type"),
+            Ssrc::from(17),
+            Some(&extensions),
+        );
+
+        assert_eq!(&bytes[12..16], &[0xbe, 0xde, 0, 1]);
+        assert_eq!(&bytes[16..18], &[0x40, b'f']);
+        assert!(twcc_offset.is_none());
+    }
+
+    #[test]
     fn outgoing_rtp_preserves_long_dependency_descriptor() {
         let extensions = OutgoingExtensions {
             mid: None,
+            rid: None,
             twcc: None,
             dependency_descriptor: Some(4),
+            nackable: true,
         };
         let descriptor = (0u8..17).collect();
         let packet = crate::rtp::RtpPacket {

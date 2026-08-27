@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 
 use pulsebeam_rtc::{
-    AuthenticatedPacket, ConnectionId, DataChannelEvent, EgressDatagram, IngressPacket,
-    LiveConnection, LiveConnectionError, LocalTransport, MediaError, MediaEvent, MediaForwarder,
-    NegotiatedSession, PacketId, PacketProvenance, ReceiveStream, SendId, SendStream,
-    TransportEvent, TransportMetadata, TransportProtocol,
+    ConnectionId, DataChannelEvent, EgressDatagram, IngressPacket, LiveConnection,
+    LiveConnectionError, LocalTransport, MediaError, MediaEvent, MediaForwarder, NegotiatedSession,
+    PacketId, PacketProvenance, ReceiveStream, SendId, SendStream, TransportEvent,
+    TransportMetadata, TransportProtocol,
 };
 use pulsebeam_runtime::net::{RecvPacketBatch, Transport};
 use tokio::time::Instant;
@@ -50,7 +50,9 @@ pub enum DirectTransportOutput {
         stream: ReceiveStream,
         packet: RtpPacket,
     },
-    Rtcp(AuthenticatedPacket),
+    Rtcp {
+        nacks: Box<[pulsebeam_rtc::RtcpNack]>,
+    },
 }
 
 pub struct DirectTransport {
@@ -255,9 +257,11 @@ impl DirectTransport {
                     ),
                 })
             }
-            Some(pulsebeam_rtc::MediaIngress::Rtcp(_)) | None => {
-                Some(DirectTransportOutput::Rtcp(authenticated))
+            Some(pulsebeam_rtc::MediaIngress::Rtcp(rtcp)) => {
+                let nacks = rtcp.nacks().ok()?.into_boxed_slice();
+                Some(DirectTransportOutput::Rtcp { nacks })
             }
+            None => None,
         }
     }
 

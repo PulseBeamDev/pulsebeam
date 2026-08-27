@@ -23,8 +23,8 @@ pub use media::{
 pub use negotiation::{NegotiationError, NegotiationResult, ServerTransport, negotiate};
 pub use packet::{
     CompoundRtcpView, HeaderExtensionValue, IngressPacket, PacketError, PacketProvenance,
-    PacketView, RtcpFeedback, RtcpPacketView, RtpPacketView, SenderReport, TransportMetadata,
-    TransportProtocol,
+    PacketView, RtcpFeedback, RtcpNack, RtcpPacketView, RtpPacketView, SenderReport,
+    TransportMetadata, TransportProtocol,
 };
 pub use session::{
     Codec, DataChannelParameters, DtlsFingerprint, HeaderExtension, IceCandidate, IceCredentials,

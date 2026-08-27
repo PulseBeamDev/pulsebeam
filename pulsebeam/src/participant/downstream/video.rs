@@ -282,11 +282,30 @@ impl VideoAllocator {
                 target
             } else {
                 let states = track_states(track_state);
-                let Some(layer) = track_state.lowest_healthy_quality(|l| {
-                    states
-                        .get(&l.stream_id())
-                        .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
-                }) else {
+                let ceiling = track_state
+                    .layers()
+                    .iter()
+                    .map(|layer| layer.quality.fallback_height())
+                    .filter(|&height| height >= intent.target_height)
+                    .min()
+                    .unwrap_or(intent.target_height);
+                let layer = track_state
+                    .layers()
+                    .iter()
+                    .filter(|layer| layer.quality.fallback_height() <= ceiling)
+                    .find(|layer| {
+                        states
+                            .get(&layer.stream_id())
+                            .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
+                    })
+                    .or_else(|| {
+                        track_state
+                            .layers()
+                            .iter()
+                            .filter(|layer| layer.quality.fallback_height() <= ceiling)
+                            .min_by_key(|layer| layer.quality)
+                    });
+                let Some(layer) = layer else {
                     slot.stop();
                     return None;
                 };
@@ -1429,23 +1448,24 @@ impl AllocationEngine {
         self.snap(layer).stable_bitrate_bps
     }
 
-    /// Lowest healthy layer ignoring the spatial constraint. Used as a
-    /// last-resort fallback when all spatially-allowed layers are inactive
-    /// (e.g. "f"/"h"/"q" negotiated but only "f" and "h" are active and the
-    /// client requests a height that only "q" would satisfy).
     fn closest_healthy<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
             .layers()
             .iter()
-            .filter(|layer| self.snap(layer).healthy && self.cost(layer) > 0.0)
+            .filter(|layer| {
+                self.spatially_allowed(slot, layer)
+                    && self.snap(layer).healthy
+                    && self.cost(layer) > 0.0
+            })
             .min_by_key(|l| l.quality)
     }
 
-    /// No encoding of this track currently measures healthy — the publisher's
-    /// uplink is in trouble, as distinct from the subscriber's downlink being
-    /// short of budget or an encoding simply carrying no bytes.
-    fn nothing_healthy(&self, slot: &SlotView<'_>) -> bool {
-        !slot.track.layers().iter().any(|l| self.snap(l).healthy)
+    fn nothing_spatially_healthy(&self, slot: &SlotView<'_>) -> bool {
+        !slot
+            .track
+            .layers()
+            .iter()
+            .any(|layer| self.spatially_allowed(slot, layer) && self.snap(layer).healthy)
     }
 
     /// The bottom rung of the ladder the client's spatial request allows,
@@ -1541,11 +1561,8 @@ impl AllocationEngine {
             .filter(|layer| self.eligible(slot, layer))
             .max_by(|a, b| self.cost(a).total_cmp(&self.cost(b)))
             .or_else(|| self.closest_healthy(slot))
-            // Matches the allocator's last resort: an all-unhealthy track is
-            // still forwarded at its lowest rung, so the demand it places on BWE
-            // must be declared rather than silently dropped from the sum.
             .or_else(|| {
-                self.nothing_healthy(slot)
+                self.nothing_spatially_healthy(slot)
                     .then(|| self.lowest_ladder(slot))?
             })
     }
@@ -1689,16 +1706,8 @@ impl AllocationEngine {
                 }
             }
 
-            // Nothing measured healthy. Health describes the publisher's uplink,
-            // not permission to forward, so an assigned slot still tries the
-            // bottom of the ladder: a struggling publisher must read as
-            // bandwidth-limited, not as a blank tile the SFU never explains.
-            // Budget still governs — a link that cannot carry the lowest rung
-            // pauses exactly as before, and a slot that declined a layer for
-            // budget or `min_fps` reasons is untouched because something was
-            // healthy there.
             if cur.is_none()
-                && self.nothing_healthy(slot)
+                && self.nothing_spatially_healthy(slot)
                 && let Some(lowest) = self.lowest_ladder(slot)
             {
                 let cost = self.stable_cost(lowest);
@@ -1960,6 +1969,44 @@ mod assignment_tests {
         assert!(!matches!(
             downgraded.get(key),
             Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
+        ));
+    }
+
+    #[test]
+    fn unmeasured_requested_layer_starts_forwarding_for_keyframe_recovery() {
+        let pid = ParticipantId::new();
+        let (tx, built, mut states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let low = track.by_quality(LayerQuality::Low).unwrap();
+        state_of_mut(&mut states, low).set_inactive(true);
+
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let key = keys.insert(());
+        let view = SlotView {
+            key,
+            mid: Mid::from("s0"),
+            max_height: low.quality.fallback_height(),
+            min_height: 0,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::Low,
+            forwarding: false,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        let decisions = engine.run_compute(Bitrate::mbps(2), std::slice::from_ref(&view));
+
+        assert!(matches!(
+            decisions.get(key),
+            Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::Low
         ));
     }
 

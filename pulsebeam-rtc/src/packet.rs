@@ -586,6 +586,15 @@ impl<'a> CompoundRtcpView<'a> {
             offset: 0,
         }
     }
+
+    pub fn nacks(&self) -> Result<Vec<RtcpNack>, PacketError> {
+        self.packets().try_fold(Vec::new(), |mut nacks, packet| {
+            if let Some(nack) = packet.nack()? {
+                nacks.push(nack);
+            }
+            Ok(nacks)
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -629,6 +638,22 @@ pub struct RtcpFeedback {
     media_ssrc: u32,
     packet_type: u8,
     format: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtcpNack {
+    media_ssrc: u32,
+    sequences: Box<[u16]>,
+}
+
+impl RtcpNack {
+    pub const fn media_ssrc(&self) -> u32 {
+        self.media_ssrc
+    }
+
+    pub fn sequences(&self) -> &[u16] {
+        &self.sequences
+    }
 }
 
 impl RtcpFeedback {
@@ -698,6 +723,33 @@ impl<'a> RtcpPacketView<'a> {
             media_ssrc: read_u32(bytes, 8)?,
             packet_type: self.packet_type,
             format: self.report_count,
+        }))
+    }
+
+    pub fn nack(&self) -> Result<Option<RtcpNack>, PacketError> {
+        if self.packet_type != 205 || self.report_count != 1 {
+            return Ok(None);
+        }
+        let bytes = self.bytes();
+        let media_ssrc = read_u32(bytes, 8)?;
+        let fci = bytes.get(12..).ok_or(PacketError::Truncated)?;
+        if !fci.len().is_multiple_of(4) {
+            return Err(PacketError::InvalidRtcpLength);
+        }
+        let mut sequences = Vec::with_capacity(fci.len().saturating_mul(17).saturating_div(4));
+        for chunk in fci.chunks_exact(4) {
+            let pid = u16::from_be_bytes([chunk[0], chunk[1]]);
+            let blp = u16::from_be_bytes([chunk[2], chunk[3]]);
+            sequences.push(pid);
+            for bit in 0..16u16 {
+                if blp & (1u16 << bit) != 0 {
+                    sequences.push(pid.wrapping_add(bit.wrapping_add(1)));
+                }
+            }
+        }
+        Ok(Some(RtcpNack {
+            media_ssrc,
+            sequences: sequences.into_boxed_slice(),
         }))
     }
 }
@@ -874,5 +926,39 @@ mod tests {
         let packet_types: Vec<_> = rtcp.packets().map(|packet| packet.packet_type()).collect();
 
         assert_eq!(packet_types, [200, 201]);
+    }
+
+    #[test]
+    fn compound_rtcp_exposes_nack_sequences_structurally() {
+        let bytes = [
+            0x81,
+            205,
+            0,
+            3,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            9,
+            0,
+            10,
+            0,
+            0b0000_0101,
+        ];
+        let packet = IngressPacket::new(&bytes, provenance())
+            .parse()
+            .expect("RTCP packet");
+        let PacketView::Rtcp(rtcp) = packet else {
+            panic!("RTCP packet");
+        };
+
+        let nacks = rtcp.nacks().expect("NACK feedback");
+
+        assert_eq!(nacks.len(), 1);
+        assert_eq!(nacks[0].media_ssrc(), 9);
+        assert_eq!(nacks[0].sequences(), [10, 11, 13]);
     }
 }

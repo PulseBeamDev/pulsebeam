@@ -90,8 +90,7 @@ pub fn negotiate(
 
     let remote_ice = answer
         .ice_creds()
-        .map(|credentials| IceCredentials::new(credentials.ufrag, credentials.pass))
-        .flatten()
+        .and_then(|credentials| IceCredentials::new(credentials.ufrag, credentials.pass))
         .ok_or(NegotiationError::MissingIceCredentials)?;
     let remote_fingerprint = answer
         .fingerprint()

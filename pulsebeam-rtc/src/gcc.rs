@@ -322,7 +322,7 @@ impl Gcc {
                     );
                 if first_feedback && lost == 0 && !congested {
                     self.bitrate_bps = throughput;
-                } else if received > departed.saturating_add(Duration::from_millis(15)) {
+                } else if received > departed.saturating_add(Duration::from_millis(50)) {
                     self.bitrate_bps = self.bitrate_bps.saturating_mul(85).saturating_div(100);
                 } else if !self.application_limited {
                     let increased = self.bitrate_bps.saturating_mul(105).saturating_div(100);
@@ -554,11 +554,8 @@ mod tests {
             let send = gcc
                 .assign(SendId::new(index), 1200)
                 .expect("unique send identity");
-            gcc.record_departure(
-                send.send_id(),
-                now + Duration::from_millis(u64::from(index) * 10),
-            )
-            .expect("authoritative departure");
+            gcc.record_departure(send.send_id(), now + Duration::from_millis(index * 10))
+                .expect("authoritative departure");
             sequences.push(send.transport_sequence());
         }
 
@@ -639,7 +636,10 @@ mod tests {
             now + Duration::from_millis(100),
             &feedback(&[
                 (third.transport_sequence(), Some(Duration::from_millis(30))),
-                (fourth.transport_sequence(), Some(Duration::from_millis(90))),
+                (
+                    fourth.transport_sequence(),
+                    Some(Duration::from_millis(100)),
+                ),
             ]),
         );
 
