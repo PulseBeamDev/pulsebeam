@@ -339,6 +339,7 @@ impl DataChannelAssociation {
                         self.push_event(DataChannelEvent::Error);
                         return;
                     }
+                    self.drain();
                     self.channels.insert(id, open.clone());
                     self.push_event(DataChannelEvent::Open(open));
                 }

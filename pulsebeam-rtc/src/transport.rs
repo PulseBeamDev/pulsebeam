@@ -398,15 +398,20 @@ impl LiveConnection {
     }
 
     pub fn drive_data(&mut self, now: Instant) {
-        if let Some(data) = self.data.as_mut() {
-            while let Some(packet) = data.poll_egress() {
-                if self.dtls.handle_input(&packet).is_err() {
-                    self.events.push_back(TransportEvent::DtlsClosed);
-                    return;
-                }
+        self.drive_data_egress();
+        self.drain(now);
+    }
+
+    fn drive_data_egress(&mut self) {
+        let Some(data) = self.data.as_mut() else {
+            return;
+        };
+        while let Some(packet) = data.poll_egress() {
+            if self.dtls.handle_input(&packet).is_err() {
+                self.events.push_back(TransportEvent::DtlsClosed);
+                return;
             }
         }
-        self.drain(now);
     }
 
     pub fn receive_rtp(
@@ -601,18 +606,15 @@ impl LiveConnection {
             }
         }
         for _ in 0..DTLS_OUTPUT_BUDGET {
-            let stop = match self.dtls.poll_output(&mut self.dtls_buf) {
-                DtlsOutput::Timeout(deadline) => {
-                    self.next_dtls_deadline = Some(deadline);
-                    true
-                }
+            let timeout = match self.dtls.poll_output(&mut self.dtls_buf) {
+                DtlsOutput::Timeout(deadline) => Some(deadline),
                 DtlsOutput::Connected => {
                     self.events.push_back(TransportEvent::DtlsConnected);
-                    false
+                    None
                 }
                 DtlsOutput::CloseNotify => {
                     self.events.push_back(TransportEvent::DtlsClosed);
-                    false
+                    None
                 }
                 DtlsOutput::PeerCert(peer) => {
                     let actual = Fingerprint {
@@ -626,28 +628,31 @@ impl LiveConnection {
                         self.events.push_back(TransportEvent::DtlsClosed);
                         let _ = self.dtls.close();
                     }
-                    false
+                    None
                 }
                 DtlsOutput::KeyingMaterial(material, profile) => {
                     let active = self.dtls.is_active().unwrap_or(false);
                     self.srtp_rx =
                         Some(SrtpContext::new(&self.crypto, profile, &material, !active));
                     self.srtp_tx = Some(SrtpContext::new(&self.crypto, profile, &material, active));
-                    false
+                    None
                 }
                 DtlsOutput::ApplicationData(data) => {
                     if let Some(association) = self.data.as_mut() {
                         association.handle_input(now, data);
                     }
-                    false
+                    self.drive_data_egress();
+                    None
                 }
-                _ => false,
+                _ => None,
             };
-            while self.egress_ready() {
-                let Some(packet) = self.dtls.poll_packet() else {
-                    break;
-                };
-                if let Some(transport) = self.nominated {
+            let mut emitted_packet = false;
+            if let Some(transport) = self.nominated {
+                while self.egress_ready() {
+                    let Some(packet) = self.dtls.poll_packet() else {
+                        break;
+                    };
+                    emitted_packet = true;
                     self.egress.push_back(EgressDatagram {
                         bytes: packet.to_vec(),
                         transport,
@@ -655,7 +660,10 @@ impl LiveConnection {
                     });
                 }
             }
-            if stop {
+            if let Some(deadline) = timeout
+                && !emitted_packet
+            {
+                self.next_dtls_deadline = Some(deadline);
                 return;
             }
         }
