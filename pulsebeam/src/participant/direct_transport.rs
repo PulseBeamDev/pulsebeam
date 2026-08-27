@@ -2,11 +2,14 @@ use std::collections::VecDeque;
 
 use pulsebeam_rtc::{
     AuthenticatedPacket, ConnectionId, DataChannelEvent, EgressDatagram, IngressPacket,
-    LiveConnection, LiveConnectionError, LocalTransport, NegotiatedSession, PacketId,
-    PacketProvenance, TransportEvent, TransportMetadata, TransportProtocol,
+    LiveConnection, LiveConnectionError, LocalTransport, MediaError, MediaEvent, MediaForwarder,
+    ReceiveStream, SendStream, NegotiatedSession, PacketId, PacketProvenance, SendId,
+    TransportEvent, TransportMetadata, TransportProtocol,
 };
 use pulsebeam_runtime::net::{RecvPacketBatch, Transport};
 use tokio::time::Instant;
+
+use crate::rtp::{Codec, PacketExtensions, RtpPacket};
 
 const MAX_INGRESS_PER_TICK: usize = 64;
 
@@ -33,11 +36,13 @@ impl DirectTransportConfig {
 pub enum DirectTransportOutput {
     Transport(TransportEvent),
     Data(DataChannelEvent),
-    Authenticated(AuthenticatedPacket),
+    Rtp { stream: ReceiveStream, packet: RtpPacket },
+    Rtcp(AuthenticatedPacket),
 }
 
 pub struct DirectTransport {
     connection: LiveConnection,
+    media: MediaForwarder,
     ingress: VecDeque<RecvPacketBatch>,
     next_packet_id: u64,
 }
@@ -54,6 +59,7 @@ impl DirectTransport {
                 config.local,
                 now.into(),
             )?,
+            media: MediaForwarder::with_capacity(64, 64, 128),
             ingress: VecDeque::with_capacity(MAX_INGRESS_PER_TICK),
             next_packet_id: 0,
         })
@@ -65,6 +71,52 @@ impl DirectTransport {
 
     pub fn connection_mut(&mut self) -> &mut LiveConnection {
         &mut self.connection
+    }
+
+    pub fn register_receive(&mut self, stream: ReceiveStream) -> Result<(), MediaError> {
+        self.media.register_receive(stream)
+    }
+
+    pub fn register_send(&mut self, stream: SendStream) -> Result<(), MediaError> {
+        self.media.register_send(stream)
+    }
+
+    pub fn unregister_receive(&mut self, id: pulsebeam_rtc::StreamId) -> Option<ReceiveStream> {
+        self.media.unregister_receive(id)
+    }
+
+    pub fn unregister_send(&mut self, id: pulsebeam_rtc::StreamId) -> Option<SendStream> {
+        self.media.unregister_send(id)
+    }
+
+    pub fn poll_media_event(&mut self) -> Option<MediaEvent> {
+        self.media.poll_event()
+    }
+
+    pub fn report_departure(
+        &mut self,
+        send_id: SendId,
+        now: Instant,
+    ) -> Result<(), LiveConnectionError> {
+        self.connection.report_departure(send_id, now.into())
+    }
+
+    pub fn send_rtp(
+        &mut self,
+        bytes: &[u8],
+        extended_sequence: u64,
+        send_id: SendId,
+    ) -> Result<pulsebeam_rtc::EgressCongestion, LiveConnectionError> {
+        self.connection
+            .send_rtp_with_congestion(bytes, extended_sequence, send_id)
+    }
+
+    pub fn congestion_estimate(&self, now: Instant) -> pulsebeam_rtc::CongestionEstimate {
+        self.connection.congestion_estimate(now.into())
+    }
+
+    pub fn poll_congestion(&mut self) -> Option<pulsebeam_rtc::GccOutcome> {
+        self.connection.poll_congestion()
     }
 
     pub fn enqueue(&mut self, batch: RecvPacketBatch) {
@@ -123,9 +175,24 @@ impl DirectTransport {
         {
             return Some(DirectTransportOutput::Data(data));
         }
-        self.connection
-            .poll_authenticated()
-            .map(DirectTransportOutput::Authenticated)
+        let authenticated = self.connection.poll_authenticated()?;
+        let packet = authenticated.parse().ok()?;
+        match self.media.handle_authenticated(packet).ok()? {
+            Some(pulsebeam_rtc::MediaIngress::Rtp { stream, packet }) => {
+                Some(DirectTransportOutput::Rtp {
+                    stream,
+                    packet: RtpPacket::from_packet_view(
+                        &packet,
+                        Codec::H264,
+                        PacketExtensions::default(),
+                        Vec::with_capacity(packet.payload().len()),
+                    ),
+                })
+            }
+            Some(pulsebeam_rtc::MediaIngress::Rtcp(_)) | None => {
+                Some(DirectTransportOutput::Rtcp(authenticated))
+            }
+        }
     }
 
     pub fn poll_egress(&mut self) -> Option<EgressDatagram> {
