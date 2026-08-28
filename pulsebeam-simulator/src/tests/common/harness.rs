@@ -63,6 +63,7 @@ pub struct Participant {
     /// Model a legacy peer that never negotiates the Dependency Descriptor
     /// extension, exercising the marker/deep-inspection fallback for mixed rooms.
     pub marker_only: bool,
+    pub prefer_vp8: bool,
 }
 
 impl Participant {
@@ -82,6 +83,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
+            prefer_vp8: false,
         }
     }
 
@@ -101,6 +103,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
+            prefer_vp8: false,
         }
     }
 
@@ -120,6 +123,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
+            prefer_vp8: false,
         }
     }
 
@@ -140,6 +144,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
+            prefer_vp8: false,
         }
     }
 
@@ -168,6 +173,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             marker_only: false,
+            prefer_vp8: false,
         }
     }
 
@@ -1030,6 +1036,9 @@ async fn run_participant(
 
         if config.marker_only {
             builder = builder.without_dependency_descriptor();
+        }
+        if config.prefer_vp8 {
+            builder = builder.prefer_vp8();
         }
 
         match config.role {
@@ -2912,6 +2921,11 @@ fn assert_video_quality(
         log.missing_parameter_sets,
         log.ts_regression_count,
         log.non_contiguous,
+    );
+    assert_eq!(
+        log.unexpected_vp8_packets, 0,
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     H.264 RTP to retain its negotiated H.264 payload type\n  actual:       {} packet(s) labelled as VP8",
+        log.unexpected_vp8_packets,
     );
 }
 

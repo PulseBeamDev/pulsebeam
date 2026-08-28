@@ -41,6 +41,7 @@ pub struct SimClientBuilder {
     receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
+    reject_vp8: bool,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -78,6 +79,7 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
+            reject_vp8: false,
         })
     }
 
@@ -106,6 +108,7 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
+            reject_vp8: false,
         })
     }
 
@@ -165,6 +168,12 @@ impl SimClientBuilder {
     /// Model a marker/deep-inspection-only peer that never negotiates DD.
     pub fn without_dependency_descriptor(mut self) -> Self {
         self.agent_builder = self.agent_builder.without_dependency_descriptor();
+        self
+    }
+
+    pub fn prefer_vp8(mut self) -> Self {
+        self.agent_builder = self.agent_builder.prefer_vp8();
+        self.reject_vp8 = true;
         self
     }
 
@@ -238,6 +247,7 @@ impl SimClientBuilder {
             paused_publishers: ctx_paused_publishers,
             requested_tracks: HashSet::new(),
             received_data: Vec::new(),
+            reject_vp8: self.reject_vp8,
             video_rx,
             audio_rx,
             local_publications: local_video.into_iter().collect(),
@@ -343,6 +353,7 @@ pub struct VideoReceiveLog {
     /// every simulcast layer has its own SPS.
     pub missing_parameter_sets: u64,
     pub bytes: u64,
+    pub unexpected_vp8_packets: u64,
     /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
     /// against the moment the viewer subscribed, which only the harness knows.
     pub first_frame_at: Option<Instant>,
@@ -687,6 +698,7 @@ pub struct ClientContext {
     /// Data channel payloads received by topic.
     #[allow(dead_code)]
     pub received_data: Vec<(String, Vec<u8>)>,
+    reject_vp8: bool,
 }
 
 pub struct SimClient {
@@ -828,11 +840,15 @@ impl SimClient {
                             .insert(publication_id.clone(), publication_id);
                         let publisher_id = track.publisher_id().to_owned();
                         let log = self.ctx.video_rx.clone();
+                        let reject_vp8 = self.ctx.reject_vp8;
                         self.join_set.spawn(async move {
                             // The agent forwards RTP; reassemble frames here (the
                             // "higher layer") before logging QoE.
                             let mut receiver = pulsebeam_agent::FrameReceiver::new();
                             while let Ok(rtp) = track.recv().await {
+                                if reject_vp8 && rtp.payload_type == Some(96) {
+                                    log.lock().unwrap().unexpected_vp8_packets += 1;
+                                }
                                 for frame in receiver.push(rtp) {
                                     log.lock().unwrap().record(&publisher_id, &frame);
                                 }

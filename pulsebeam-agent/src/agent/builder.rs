@@ -26,6 +26,7 @@ pub struct AgentBuilder {
     tcp_server_addr: Option<SocketAddr>,
     manual_sub: bool,
     negotiate_dependency_descriptor: bool,
+    prefer_vp8: bool,
 }
 
 impl AgentBuilder {
@@ -38,6 +39,7 @@ impl AgentBuilder {
             tcp_server_addr: None,
             manual_sub: false,
             negotiate_dependency_descriptor: true,
+            prefer_vp8: false,
         }
     }
 
@@ -45,6 +47,11 @@ impl AgentBuilder {
     /// marker/deep-inspection-only peer that predates DD support.
     pub fn without_dependency_descriptor(mut self) -> Self {
         self.negotiate_dependency_descriptor = false;
+        self
+    }
+
+    pub fn prefer_vp8(mut self) -> Self {
+        self.prefer_vp8 = true;
         self
     }
 
@@ -166,6 +173,9 @@ impl AgentBuilder {
 
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
+        if self.prefer_vp8 {
+            codec_config.enable_vp8(true);
+        }
         codec_config.enable_h264(true);
         //
         // let baseline_levels = [0x34];

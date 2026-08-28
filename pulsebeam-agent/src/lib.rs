@@ -56,6 +56,7 @@ pub struct RtpPacket {
     pub seq: SeqNo,
     pub ts: MediaTime,
     pub marker: bool,
+    pub payload_type: Option<u8>,
     /// The RTP stream this packet arrived on. `None` before it has been on the wire.
     ///
     /// A slot carries one stream for the whole session and whoever the SFU puts in it, so this

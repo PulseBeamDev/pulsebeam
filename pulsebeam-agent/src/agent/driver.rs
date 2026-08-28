@@ -1267,6 +1267,7 @@ impl AgentDriver {
                                 seq: rtp.seq_no,
                                 ts: rtp.time,
                                 marker: rtp.header.marker,
+                                payload_type: Some(*rtp.header.payload_type),
                                 ssrc: Some(ssrc),
                                 payload: rtp.payload,
                                 ext_vals: rtp.header.ext_vals,
