@@ -16,5 +16,8 @@ is = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1
 str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1", default-features = false, features = ["aws-lc-rs"] }
 thiserror.workspace = true
 
+[dev-dependencies]
+proptest = "1.11.0"
+
 [lints]
 workspace = true

@@ -1,0 +1,16 @@
+v=0
+o=- 1 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=group:BUNDLE 0
+a=ice-ufrag:remoteufrag
+a=ice-pwd:remotepassword
+a=fingerprint:sha-256 01:02:03:04
+a=setup:actpass
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 0.0.0.0
+a=mid:0
+a=sendonly
+a=rtcp-mux
+a=rtpmap:111 opus/48000/2
+a=candidate:1 1 udp 2122260223 5b4c1e2d-3c04-4ad0-b76b.local 52345 typ host
