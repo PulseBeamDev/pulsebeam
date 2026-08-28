@@ -117,6 +117,8 @@
 
   function sdp() {
     return {
+      local: peer.localDescription?.sdp ?? null,
+      remote: peer.remoteDescription?.sdp ?? null,
       remoteVideo: (peer.remoteDescription?.sdp ?? "")
         .split("m=video")
         .slice(1)

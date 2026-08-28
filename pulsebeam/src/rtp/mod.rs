@@ -274,7 +274,13 @@ fn vp8_keyframe(payload: &[u8]) -> bool {
         };
         index = index.saturating_add(1);
         if extension & 0x80 != 0 {
+            let Some(&picture_id) = payload.get(index) else {
+                return false;
+            };
             index = index.saturating_add(1);
+            if picture_id & 0x80 != 0 {
+                index = index.saturating_add(1);
+            }
         }
         if extension & 0x40 != 0 {
             index = index.saturating_add(1);
@@ -338,6 +344,12 @@ mod structural_tests {
         assert_eq!(packet.provenance.packet_id, 41);
         assert_eq!(packet.provenance.received_at, packet.arrival_ts);
         assert_eq!(packet.payload.capacity(), capacity);
+    }
+
+    #[test]
+    fn vp8_keyframe_skips_a_long_picture_id() {
+        assert!(vp8_keyframe(&[0x90, 0x80, 0x80, 0x02, 0x00]));
+        assert!(!vp8_keyframe(&[0x90, 0x80, 0x80, 0x02, 0x01]));
     }
 }
 

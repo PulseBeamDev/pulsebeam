@@ -106,11 +106,13 @@ async function startPulseBeam() {
   return { apiUrl, pulsebeam };
 }
 
-function selectCodec(publisher, viewer) {
-  for (const codec of ["video/h264", "video/vp8"]) {
-    if (publisher.includes(codec) && viewer.includes(codec)) return codec;
+function commonCodecs(publisher, viewer) {
+  const codecs = ["video/h264", "video/vp8"].filter((codec) =>
+    publisher.includes(codec) && viewer.includes(codec));
+  if (codecs.length === 0) {
+    throw new Error(`browser pair has no supported H.264 or VP8 codec: publisher=${publisher} viewer=${viewer}`);
   }
-  throw new Error(`browser pair has no supported H.264 or VP8 codec: publisher=${publisher} viewer=${viewer}`);
+  return codecs;
 }
 
 test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) => {
@@ -180,7 +182,7 @@ test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) =>
 for (const [publisherName, publisherType] of Object.entries(engines)) {
   for (const [viewerName, viewerType] of Object.entries(engines)) {
     test(`${publisherName} publisher renders on ${viewerName}`, async () => {
-      test.setTimeout(60_000);
+      test.setTimeout(120_000);
       const fixtureServer = await startStaticServer();
       const port = fixtureServer.address().port;
       const publisherBrowser = await publisherType.launch({ headless: true });
@@ -197,36 +199,47 @@ for (const [publisherName, publisherType] of Object.entries(engines)) {
           publisherPage.evaluate(() => window.pulsebeamPublisher.codecs()),
           viewerPage.evaluate(() => window.pulsebeamViewer.codecs()),
         ]);
-        const codec = selectCodec(publisherCodecs, viewerCodecs);
-        const started = await startPulseBeam();
-        pulsebeam = started.pulsebeam;
-        await publisherPage.evaluate(({ apiUrl, codec }) => window.pulsebeamPublisher.connect({
-          apiUrl,
-          room: "browser-matrix",
-          codec,
-        }), { apiUrl: started.apiUrl, codec });
-        await expect.poll(async () => {
-          const stats = await publisherPage.evaluate(() => window.pulsebeamPublisher.stats());
-          return stats.connectionState === "connected" &&
-            stats.outbound.some((stream) => stream.bytesSent > 0 && stream.packetsSent > 0);
-        }, { timeout: 20_000, message: "browser publisher never sent RTP" }).toBe(true);
-        await viewerPage.evaluate(({ apiUrl, codec }) => window.pulsebeamViewer.connect({
-          apiUrl,
-          room: "browser-matrix",
-          codec,
-        }), { apiUrl: started.apiUrl, codec });
-        await expect.poll(async () => {
-          const stats = await viewerPage.evaluate(() => window.pulsebeamViewer.stats());
-          return stats.connectionState === "connected" &&
-            stats.inbound.some((stream) => stream.codec?.toLowerCase() === codec && stream.framesDecoded > 0) &&
-            stats.rendered.some((video) => video.width > 0 && video.height > 0);
-        }, { timeout: 20_000, message: `browser viewer never decoded ${codec}` }).toBe(true);
+        for (const codec of commonCodecs(publisherCodecs, viewerCodecs)) {
+          await Promise.all([
+            publisherPage.goto(`http://127.0.0.1:${port}/publisher.html`),
+            viewerPage.goto(`http://127.0.0.1:${port}/viewer.html`),
+          ]);
+          const started = await startPulseBeam();
+          pulsebeam = started.pulsebeam;
+          await publisherPage.evaluate(({ apiUrl, codec }) => window.pulsebeamPublisher.connect({
+            apiUrl,
+            room: "browser-matrix",
+            codec,
+          }), { apiUrl: started.apiUrl, codec });
+          await expect.poll(async () => {
+            const stats = await publisherPage.evaluate(() => window.pulsebeamPublisher.stats());
+            return stats.connectionState === "connected" &&
+              stats.outbound.some((stream) => stream.bytesSent > 0 && stream.packetsSent > 0);
+          }, { timeout: 20_000, message: `browser publisher never sent ${codec} RTP` }).toBe(true);
+          await viewerPage.evaluate(({ apiUrl, codec }) => window.pulsebeamViewer.connect({
+            apiUrl,
+            room: "browser-matrix",
+            codec,
+          }), { apiUrl: started.apiUrl, codec });
+          await expect.poll(async () => {
+            const stats = await viewerPage.evaluate(() => window.pulsebeamViewer.stats());
+            return stats.connectionState === "connected" &&
+              stats.inbound.some((stream) => stream.codec?.toLowerCase() === codec && stream.framesDecoded > 0) &&
+              stats.rendered.some((video) => video.width > 0 && video.height > 0);
+          }, { timeout: 20_000, message: `browser viewer never decoded ${codec}` }).toBe(true);
+          await stop(pulsebeam.child);
+          pulsebeam = undefined;
+        }
       } catch (error) {
         const [publisherStats, viewerStats] = await Promise.all([
           publisherPage.evaluate(() => window.pulsebeamPublisher?.stats?.()).catch(() => null),
           viewerPage.evaluate(() => window.pulsebeamViewer?.stats?.()).catch(() => null),
         ]);
-        throw new Error(`${error.message}\nPublisher: ${JSON.stringify(publisherStats)}\nViewer: ${JSON.stringify(viewerStats)}\nPulseBeam:\n${pulsebeam?.output() ?? "not started"}`);
+        const [publisherSdp, viewerSdp] = await Promise.all([
+          publisherPage.evaluate(() => window.pulsebeamPublisher?.sdp?.()).catch(() => null),
+          viewerPage.evaluate(() => window.pulsebeamViewer?.sdp?.()).catch(() => null),
+        ]);
+        throw new Error(`${error.message}\nPublisher: ${JSON.stringify(publisherStats)}\nViewer: ${JSON.stringify(viewerStats)}\nPublisher SDP: ${JSON.stringify(publisherSdp)}\nViewer SDP: ${JSON.stringify(viewerSdp)}\nPulseBeam:\n${pulsebeam?.output() ?? "not started"}`);
       } finally {
         fixtureServer.close();
         await stop(pulsebeam?.child);

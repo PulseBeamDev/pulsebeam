@@ -75,5 +75,12 @@
     return { connectionState: peer.connectionState, outbound };
   }
 
-  window.pulsebeamPublisher = { codecs, connect, stats };
+  function sdp() {
+    return {
+      local: peer.localDescription?.sdp ?? null,
+      remote: peer.remoteDescription?.sdp ?? null,
+    };
+  }
+
+  window.pulsebeamPublisher = { codecs, connect, stats, sdp };
 </script>
