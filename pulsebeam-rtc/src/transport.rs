@@ -369,6 +369,9 @@ impl LiveConnection {
 
         if (20..64).contains(&first) {
             self.dtls
+                .handle_timeout(now)
+                .map_err(|error| LiveConnectionError::Dtls(error.to_string()))?;
+            self.dtls
                 .handle_receive(bytes)
                 .map_err(|error| LiveConnectionError::Dtls(error.to_string()))?;
             self.drive_data(now);
