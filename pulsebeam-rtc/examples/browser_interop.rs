@@ -5,8 +5,9 @@ use std::{
 };
 
 use pulsebeam_rtc::{
-    ConnectionId, IceCandidate, IceCredentials, IngressPacket, LocalTransport, PacketId,
-    PacketProvenance, ServerTransport, TransportMetadata, TransportProtocol, negotiate,
+    ConnectionId, IceCandidate, IceCredentials, IngressPacket, LocalTransport, MediaDirection,
+    MediaKind, PacketId, PacketProvenance, ServerTransport, TransportEvent, TransportMetadata,
+    TransportProtocol, negotiate,
 };
 
 #[allow(
@@ -16,6 +17,7 @@ use pulsebeam_rtc::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_address = argument("--http-address")?;
     let udp_address = argument("--udp-address")?;
+    let send_h264 = std::env::args().any(|argument| argument == "--send-h264");
     let listener = TcpListener::bind(http_address)?;
     let udp = UdpSocket::bind(udp_address)?;
     udp.set_read_timeout(Some(Duration::from_millis(10)))?;
@@ -28,6 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("browser interoperability deadline overflow")?;
     let mut packet_id = 0u64;
     let mut buffer = [0u8; 2048];
+    let mut h264 = send_h264
+        .then(|| H264Source::new(&connection))
+        .transpose()?;
+    let mut next_frame = Instant::now();
+    let mut media_ready = false;
 
     while Instant::now() < deadline {
         let now = Instant::now();
@@ -45,11 +52,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             connection.handle_datagram(now, IngressPacket::new(bytes, provenance))?;
         }
         connection.handle_timeout(now);
-        while let Some(datagram) = connection.poll_egress() {
-            udp.send_to(datagram.bytes(), datagram.transport().destination())?;
-        }
         while let Some(event) = connection.poll_event() {
             println!("EVENT {event:?}");
+            if matches!(event, TransportEvent::DtlsConnected) {
+                media_ready = true;
+                next_frame = now;
+            }
+        }
+        if let Some(source) = h264.as_mut().filter(|_| media_ready && now >= next_frame) {
+            source.send(&mut connection)?;
+            next_frame = now
+                .checked_add(Duration::from_millis(100))
+                .ok_or("browser interoperability frame deadline overflow")?;
+        }
+        while let Some(datagram) = connection.poll_egress() {
+            udp.send_to(datagram.bytes(), datagram.transport().destination())?;
         }
         while let Some(packet) = connection.poll_authenticated() {
             println!("AUTHENTICATED {}", packet.bytes().len());
@@ -57,6 +74,161 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+struct H264Source {
+    payload_type: u8,
+    mid_extension: Option<(u8, Box<[u8]>)>,
+    packets: Box<[Box<[u8]>]>,
+    sequence: u16,
+    timestamp: u32,
+}
+
+impl H264Source {
+    fn new(connection: &pulsebeam_rtc::LiveConnection) -> Result<Self, Box<dyn std::error::Error>> {
+        let section = connection
+            .session()
+            .media_sections()
+            .iter()
+            .find(|section| {
+                section.kind() == MediaKind::Video
+                    && section.direction() == MediaDirection::SendOnly
+            })
+            .ok_or("browser receiver did not negotiate a server video send section")?;
+        let payload_type = section
+            .codecs()
+            .iter()
+            .find(|codec| codec.name().eq_ignore_ascii_case("h264"))
+            .map(|codec| codec.payload_type())
+            .ok_or("browser receiver did not negotiate H.264")?;
+        let mid_extension = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == "urn:ietf:params:rtp-hdrext:sdes:mid")
+            .map(|extension| (extension.id(), section.mid().as_bytes().into()));
+        let frame = first_h264_access_unit(pulsebeam_testdata::RAW_H264_QUARTER_CBR)
+            .ok_or("H.264 fixture has no access unit")?;
+        let packets = pulsebeam_core::h264::Packetizer::new(1_100)
+            .packetize(frame)
+            .into_iter()
+            .map(|chunk| chunk.payload.into_boxed_slice())
+            .collect();
+        Ok(Self {
+            payload_type,
+            mid_extension,
+            packets,
+            sequence: 1,
+            timestamp: 1,
+        })
+    }
+
+    fn send(
+        &mut self,
+        connection: &mut pulsebeam_rtc::LiveConnection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (index, payload) in self.packets.iter().enumerate() {
+            let marker = index.saturating_add(1) == self.packets.len();
+            let packet = rtp_packet(
+                self.payload_type,
+                self.sequence,
+                self.timestamp,
+                0x5042_0001,
+                marker,
+                self.mid_extension
+                    .as_ref()
+                    .map(|(id, value)| (*id, &**value)),
+                payload,
+            );
+            connection.send_rtp(&packet, u64::from(self.sequence))?;
+            self.sequence = self.sequence.wrapping_add(1);
+        }
+        self.timestamp = self.timestamp.wrapping_add(9_000);
+        Ok(())
+    }
+}
+
+fn rtp_packet(
+    payload_type: u8,
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+    marker: bool,
+    mid_extension: Option<(u8, &[u8])>,
+    payload: &[u8],
+) -> Vec<u8> {
+    let extension_bytes = mid_extension.map_or(0, |(_, value)| {
+        4usize.saturating_add(value.len().saturating_add(1).div_ceil(4).saturating_mul(4))
+    });
+    let mut packet = Vec::with_capacity(
+        12usize
+            .saturating_add(extension_bytes)
+            .saturating_add(payload.len()),
+    );
+    packet.push(if mid_extension.is_some() { 0x90 } else { 0x80 });
+    packet.push((u8::from(marker) << 7) | payload_type);
+    packet.extend_from_slice(&sequence.to_be_bytes());
+    packet.extend_from_slice(&timestamp.to_be_bytes());
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    if let Some((id, value)) = mid_extension {
+        let words = u16::try_from(value.len().saturating_add(1).div_ceil(4)).unwrap_or(u16::MAX);
+        debug_assert!(
+            matches!(id, 1..=14),
+            "MID uses the one-byte RTP extension form"
+        );
+        debug_assert!(
+            value.len() <= 16,
+            "MID fits the one-byte RTP extension form"
+        );
+        packet.extend_from_slice(&0xbede_u16.to_be_bytes());
+        packet.extend_from_slice(&words.to_be_bytes());
+        packet.push((id << 4) | u8::try_from(value.len().saturating_sub(1)).unwrap_or(u8::MAX));
+        packet.extend_from_slice(value);
+        let padding = value
+            .len()
+            .saturating_add(1)
+            .div_ceil(4)
+            .saturating_mul(4)
+            .saturating_sub(value.len().saturating_add(1));
+        packet.resize(packet.len().saturating_add(padding), 0);
+    }
+    packet.extend_from_slice(payload);
+    packet
+}
+
+fn first_h264_access_unit(data: &[u8]) -> Option<&[u8]> {
+    let mut start = None;
+    let mut saw_vcl = false;
+    let mut position = 0usize;
+    while position.saturating_add(3) < data.len() {
+        let header = start_code(data, position)?;
+        let nalu_start = position;
+        let nalu_type = data.get(header).map(|byte| byte & 0x1f)?;
+        let first_slice = matches!(nalu_type, 1 | 5)
+            && data
+                .get(header.saturating_add(1))
+                .is_some_and(|byte| byte & 0x80 != 0);
+        if saw_vcl && (matches!(nalu_type, 6..=9) || first_slice) {
+            return start.and_then(|start| data.get(start..nalu_start));
+        }
+        start.get_or_insert(nalu_start);
+        saw_vcl |= matches!(nalu_type, 1 | 5);
+        position = header;
+        while position.saturating_add(3) < data.len() && start_code(data, position).is_none() {
+            position = position.saturating_add(1);
+        }
+    }
+    start.and_then(|start| data.get(start..))
+}
+
+fn start_code(data: &[u8], offset: usize) -> Option<usize> {
+    if data.get(offset) != Some(&0) || data.get(offset.saturating_add(1)) != Some(&0) {
+        return None;
+    }
+    match data.get(offset.saturating_add(2)) {
+        Some(1) => Some(offset.saturating_add(3)),
+        Some(0) if data.get(offset.saturating_add(3)) == Some(&1) => Some(offset.saturating_add(4)),
+        _ => None,
+    }
 }
 
 fn argument(name: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {

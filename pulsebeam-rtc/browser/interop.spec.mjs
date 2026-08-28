@@ -59,26 +59,49 @@ async function stop(process) {
   if (process.exitCode === null) process.kill("SIGKILL");
 }
 
-test("browser publisher completes non-trickle ICE, DTLS, and RTP", async ({ page }) => {
+function servePage(request, response) {
+  const pages = {
+    "/publisher.html": "publisher.html",
+    "/receiver.html": "receiver.html",
+  };
+  const page = pages[request.url];
+  if (!page) {
+    response.writeHead(404).end();
+    return;
+  }
+  response.writeHead(200, { "content-type": "text/html" });
+  response.end(readFileSync(path.join(root, "pulsebeam-rtc", "browser", page)));
+}
+
+async function withRtc(page, path, args, verify) {
   const host = localAddress();
-  const staticServer = createServer((request, response) => {
-    if (request.url !== "/publisher.html") {
-      response.writeHead(404).end();
-      return;
-    }
-    response.writeHead(200, { "content-type": "text/html" });
-    response.end(readFileSync(path.join(root, "pulsebeam-rtc", "browser", "publisher.html")));
-  });
+  const staticServer = createServer(servePage);
   staticServer.listen(0, host);
   await once(staticServer, "listening");
   const staticAddress = staticServer.address();
   const httpAddress = await unusedAddress();
   const udpAddress = await unusedAddress();
-  const rtc = run(serverBin, ["--http-address", httpAddress, "--udp-address", udpAddress]);
+  const rtc = run(serverBin, ["--http-address", httpAddress, "--udp-address", udpAddress, ...args]);
 
   try {
     await waitForReady(rtc);
-    await page.goto(`http://${host}:${staticAddress.port}/publisher.html`);
+    await page.goto(`http://${host}:${staticAddress.port}${path}`);
+    await verify(httpAddress, rtc);
+  } catch (error) {
+    const stats = await page.evaluate(async () => ({
+      publisher: await window.pulsebeamRtcPublisher?.stats?.(),
+      receiver: await window.pulsebeamRtcReceiver?.stats?.(),
+    })).catch(() => null);
+    const sdp = await page.evaluate(() => window.pulsebeamRtcPublisher?.sdp?.() ?? window.pulsebeamRtcReceiver?.sdp?.()).catch(() => null);
+    throw new Error(`${error.message}\nBrowser stats: ${JSON.stringify(stats)}\nSDP: ${JSON.stringify(sdp)}\nRTC server log:\n${rtc.output()}`);
+  } finally {
+    staticServer.close();
+    await stop(rtc.child);
+  }
+}
+
+test("browser publisher completes non-trickle ICE, DTLS, and RTP", async ({ page }) => {
+  await withRtc(page, "/publisher.html", [], async (httpAddress, rtc) => {
     await page.evaluate((url) => window.pulsebeamRtcPublisher.connect(url), `http://${httpAddress}`);
     await expect.poll(async () => {
       const stats = await page.evaluate(() => window.pulsebeamRtcPublisher.stats());
@@ -89,12 +112,18 @@ test("browser publisher completes non-trickle ICE, DTLS, and RTP", async ({ page
       timeout: 10_000,
       message: "RTC server never authenticated browser RTP",
     }).toBe(true);
-  } catch (error) {
-    const stats = await page.evaluate(() => window.pulsebeamRtcPublisher?.stats?.()).catch(() => null);
-    const sdp = await page.evaluate(() => window.pulsebeamRtcPublisher?.sdp?.()).catch(() => null);
-    throw new Error(`${error.message}\nBrowser stats: ${JSON.stringify(stats)}\nSDP: ${JSON.stringify(sdp)}\nRTC server log:\n${rtc.output()}`);
-  } finally {
-    staticServer.close();
-    await stop(rtc.child);
-  }
+  });
+});
+
+test("browser receiver decodes server H.264 RTP", async ({ page, browserName }) => {
+  test.skip(browserName === "firefox", "this Firefox build does not advertise H.264");
+  await withRtc(page, "/receiver.html", ["--send-h264"], async (httpAddress) => {
+    await page.evaluate((url) => window.pulsebeamRtcReceiver.connect(url), `http://${httpAddress}`);
+    await expect.poll(async () => {
+      const stats = await page.evaluate(() => window.pulsebeamRtcReceiver.stats());
+      return stats.connectionState === "connected" &&
+        stats.inbound.some((stream) => stream.packetsReceived > 0 && stream.framesDecoded > 0) &&
+        stats.video?.width > 0 && stats.video?.height > 0;
+    }, { timeout: 20_000, message: "browser never decoded server H.264 RTP" }).toBe(true);
+  });
 });

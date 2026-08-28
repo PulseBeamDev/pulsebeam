@@ -8,13 +8,22 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+browser-test = ["dep:pulsebeam-core", "dep:pulsebeam-testdata"]
+
 [dependencies]
 dcsctp = "0.1.14"
 is = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1", default-features = false }
+pulsebeam-core = { path = "../pulsebeam-core", optional = true }
+pulsebeam-testdata = { path = "../pulsebeam-testdata", optional = true }
 # TODO: Replace str0m's allocating SRTP/SRTCP output APIs with the reviewed
 # caller-buffer API when the fork can maintain that semantic delta safely.
 str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1", default-features = false, features = ["aws-lc-rs"] }
 thiserror.workspace = true
+
+[[example]]
+name = "browser_interop"
+required-features = ["browser-test"]
 
 [lints]
 workspace = true

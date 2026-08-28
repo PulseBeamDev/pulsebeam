@@ -31,13 +31,13 @@ test: test-unit test-sim
 test-browser: test-rtc-browser test-browser-bench
 
 test-rtc-browser:
-	cargo build --release -p pulsebeam-rtc --example browser_interop
+	cargo build --release -p pulsebeam-rtc --features browser-test --example browser_interop
 	npm ci --prefix pulsebeam-rtc/browser
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright install chromium
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs --project chromium
 
 test-rtc-browser-all:
-	cargo build --release -p pulsebeam-rtc --example browser_interop
+	cargo build --release -p pulsebeam-rtc --features browser-test --example browser_interop
 	npm ci --prefix pulsebeam-rtc/browser
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright install chromium firefox webkit
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs

@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PulseBeam RTC browser compatibility receiver</title>
+<script type="module">
+  let peer;
+  let video;
+
+  async function gatherCandidates(connection) {
+    if (connection.iceGatheringState === "complete") return;
+    await new Promise((resolve) => {
+      const complete = () => {
+        if (connection.iceGatheringState === "complete") {
+          connection.removeEventListener("icegatheringstatechange", complete);
+          resolve();
+        }
+      };
+      connection.addEventListener("icegatheringstatechange", complete);
+    });
+  }
+
+  async function connect(signalingUrl) {
+    peer = new RTCPeerConnection({ iceServers: [] });
+    peer.addTransceiver("video", { direction: "recvonly" });
+    peer.addEventListener("track", (event) => {
+      video = document.createElement("video");
+      video.autoplay = true;
+      video.muted = true;
+      video.srcObject = new MediaStream([event.track]);
+      document.body.append(video);
+    });
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    await gatherCandidates(peer);
+    const response = await fetch(signalingUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: peer.localDescription.sdp,
+    });
+    if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
+    await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
+  }
+
+  async function stats() {
+    const report = await peer.getStats();
+    const inbound = [];
+    for (const value of report.values()) {
+      if (value.type === "inbound-rtp" && value.kind === "video") {
+        inbound.push({
+          bytesReceived: value.bytesReceived ?? 0,
+          packetsReceived: value.packetsReceived ?? 0,
+          framesDecoded: value.framesDecoded ?? 0,
+        });
+      }
+    }
+    return {
+      connectionState: peer.connectionState,
+      iceConnectionState: peer.iceConnectionState,
+      inbound,
+      video: video ? { width: video.videoWidth, height: video.videoHeight } : null,
+    };
+  }
+
+  function sdp() {
+    return {
+      local: peer.localDescription?.sdp ?? null,
+      remote: peer.remoteDescription?.sdp ?? null,
+    };
+  }
+
+  window.pulsebeamRtcReceiver = { connect, stats, sdp };
+</script>
