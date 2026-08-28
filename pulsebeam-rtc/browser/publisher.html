@@ -1,0 +1,66 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PulseBeam RTC browser compatibility publisher</title>
+<script type="module">
+  let peer;
+  let canvas;
+
+  async function gatherCandidates(connection) {
+    if (connection.iceGatheringState === "complete") return;
+    await new Promise((resolve) => {
+      const complete = () => {
+        if (connection.iceGatheringState === "complete") {
+          connection.removeEventListener("icegatheringstatechange", complete);
+          resolve();
+        }
+      };
+      connection.addEventListener("icegatheringstatechange", complete);
+    });
+  }
+
+  function videoTrack() {
+    canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 180;
+    const context = canvas.getContext("2d");
+    let frame = 0;
+    const draw = () => {
+      context.fillStyle = `hsl(${frame % 360} 80% 50%)`;
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = "white";
+      context.fillText(String(frame), 16, 24);
+      frame += 1;
+      requestAnimationFrame(draw);
+    };
+    draw();
+    return canvas.captureStream(30).getVideoTracks()[0];
+  }
+
+  async function connect(signalingUrl) {
+    peer = new RTCPeerConnection({ iceServers: [] });
+    peer.addTransceiver(videoTrack(), { direction: "sendonly" });
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    await gatherCandidates(peer);
+    const response = await fetch(signalingUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: peer.localDescription.sdp,
+    });
+    if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
+    await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
+  }
+
+  async function stats() {
+    const report = await peer.getStats();
+    const outbound = [];
+    for (const value of report.values()) {
+      if (value.type === "outbound-rtp" && value.kind === "video") {
+        outbound.push({ bytesSent: value.bytesSent ?? 0, packetsSent: value.packetsSent ?? 0 });
+      }
+    }
+    return { connectionState: peer.connectionState, outbound };
+  }
+
+  window.pulsebeamRtcPublisher = { connect, stats };
+</script>

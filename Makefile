@@ -8,7 +8,7 @@ SIM := sim
 TARGET = pulsebeam
 TEST =
 
-.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing
+.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing test-browser test-rtc-browser test-rtc-browser-all test-browser-bench
 all: build
 
 dev:
@@ -29,6 +29,21 @@ run-profile: profile
 test: test-unit test-sim
 
 test-browser:
+	$(MAKE) test-rtc-browser
+
+test-rtc-browser:
+	cargo build --release -p pulsebeam-rtc --example browser_interop
+	npm ci --prefix browser
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs --project chromium
+
+test-rtc-browser-all:
+	cargo build --release -p pulsebeam-rtc --example browser_interop
+	npm ci --prefix browser
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium firefox webkit
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs
+
+test-browser-bench:
 	cargo build --release -p pulsebeam -p pulsebeam-cli
 	npm ci --prefix browser
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium
