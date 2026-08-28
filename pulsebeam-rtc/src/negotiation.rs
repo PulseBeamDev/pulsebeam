@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt::Write, num::NonZeroU32};
+use std::{collections::HashSet, num::NonZeroU32};
 
 use str0m::{
     Candidate,
@@ -107,7 +107,7 @@ pub fn negotiate(
         .compare_to_remote(remote_setup)
         .ok_or_else(|| NegotiationError::Sdp("incompatible DTLS setup roles".to_owned()))?;
 
-    validate_local_candidates(&server.candidates)?;
+    let local_candidates = parse_local_candidates(&server.candidates)?;
     let bundle = bundle(&parsed)?;
     let bundle_tag = bundle_tag(&bundle)?;
     let mut mids = HashSet::with_capacity(parsed.media_lines.len());
@@ -139,6 +139,7 @@ pub fn negotiate(
                 direction,
                 server,
                 setup,
+                &local_candidates,
                 mid == bundle_tag,
             ),
         });
@@ -170,12 +171,14 @@ pub fn negotiate(
     })
 }
 
-fn validate_local_candidates(candidates: &[IceCandidate]) -> Result<(), NegotiationError> {
-    candidates.iter().try_for_each(|candidate| {
-        Candidate::from_sdp_string(candidate.as_sdp())
-            .map(|_| ())
-            .map_err(|error| NegotiationError::Candidate(error.to_string()))
-    })
+fn parse_local_candidates(candidates: &[IceCandidate]) -> Result<Vec<Candidate>, NegotiationError> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            Candidate::from_sdp_string(candidate.as_sdp())
+                .map_err(|error| NegotiationError::Candidate(error.to_string()))
+        })
+        .collect()
 }
 
 fn remote_candidates(offer: &str) -> Result<Box<[IceCandidate]>, NegotiationError> {
@@ -344,6 +347,7 @@ fn answer_attributes_for_media(
     direction: MediaDirection,
     server: &ServerTransport,
     setup: Setup,
+    local_candidates: &[Candidate],
     bundle_tag: bool,
 ) -> Vec<MediaAttribute> {
     let rtcp_mux = line.attrs.iter().any(|attribute| {
@@ -404,13 +408,9 @@ fn answer_attributes_for_media(
     });
     if bundle_tag {
         attributes.extend(
-            server
-                .candidates
+            local_candidates
                 .iter()
-                .map(|candidate| {
-                    Candidate::from_sdp_string(candidate.as_sdp())
-                        .expect("local candidates are validated before answer formatting")
-                })
+                .cloned()
                 .map(MediaAttribute::Candidate),
         );
         attributes.push(MediaAttribute::EndOfCandidates);
@@ -424,19 +424,18 @@ fn format_answer(
     answer_media: Vec<AnswerMedia>,
 ) -> String {
     let mut answer = String::with_capacity(1024);
-    write!(
-        answer,
-        "v=0\r\no=- {} 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n{bundle}a=ice-lite\r\n",
-        server.session_id
-    )
-    .expect("writing an SDP answer to a string cannot fail");
+    answer.push_str("v=0\r\no=- ");
+    answer.push_str(&server.session_id.to_string());
+    answer.push_str(" 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n");
+    answer.push_str(&bundle.to_string());
+    answer.push_str("a=ice-lite\r\n");
     for AnswerMedia {
         mut line,
         attributes,
     } in answer_media
     {
         line.attrs = attributes;
-        write!(answer, "{line}").expect("writing an SDP answer to a string cannot fail");
+        answer.push_str(&line.to_string());
     }
     answer
 }
