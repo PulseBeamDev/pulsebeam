@@ -2055,6 +2055,11 @@ async fn execute_plan(
                     stats.ts_regression_count, 0,
                     "step {n}/{total} {kind}: {description} ({participant}) regressed RTP timestamps in the interval"
                 );
+                assert_eq!(
+                    stats.browser_packet_errors, 0,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} browser-invalid RTP packet(s) in the interval",
+                    stats.browser_packet_errors,
+                );
             }
 
             Step::CheckVideoNotReceivedFrom {
@@ -2926,6 +2931,16 @@ fn assert_video_quality(
         log.unexpected_vp8_packets, 0,
         "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     H.264 RTP to retain its negotiated H.264 payload type\n  actual:       {} packet(s) labelled as VP8",
         log.unexpected_vp8_packets,
+    );
+    assert_eq!(
+        log.browser_packet_errors(),
+        0,
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     browser-valid RTP identity\n  actual:       missing_mid={}, missing_ssrc={}, missing_payload_type={}, changed_ssrc={}, changed_payload_type={}",
+        log.missing_mid_packets,
+        log.missing_ssrc_packets,
+        log.missing_payload_type_packets,
+        log.changed_ssrc_packets,
+        log.changed_payload_type_packets,
     );
 }
 

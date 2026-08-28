@@ -354,6 +354,13 @@ pub struct VideoReceiveLog {
     pub missing_parameter_sets: u64,
     pub bytes: u64,
     pub unexpected_vp8_packets: u64,
+    pub missing_mid_packets: u64,
+    pub missing_ssrc_packets: u64,
+    pub missing_payload_type_packets: u64,
+    pub changed_ssrc_packets: u64,
+    pub changed_payload_type_packets: u64,
+    pub crossed_frame_boundaries: u64,
+    pub unterminated_frames: u64,
     /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
     /// against the moment the viewer subscribed, which only the harness knows.
     pub first_frame_at: Option<Instant>,
@@ -372,6 +379,78 @@ pub struct VideoReceiveLog {
     last_frame_at: Option<Instant>,
     last_ts: Option<u64>,
     seen_ts: HashSet<u64>,
+}
+
+struct BrowserVideoReceiver {
+    receiver: pulsebeam_agent::FrameReceiver,
+    expected_ssrc: Option<u32>,
+    expected_payload_type: Option<u8>,
+    open_frame_timestamp: Option<u64>,
+    rejects_vp8_payload_type: bool,
+}
+
+impl BrowserVideoReceiver {
+    fn new(rejects_vp8_payload_type: bool) -> Self {
+        Self {
+            receiver: pulsebeam_agent::FrameReceiver::new(),
+            expected_ssrc: None,
+            expected_payload_type: None,
+            open_frame_timestamp: None,
+            rejects_vp8_payload_type,
+        }
+    }
+
+    fn push(
+        &mut self,
+        rtp: pulsebeam_agent::RtpPacket,
+        log: &mut VideoReceiveLog,
+    ) -> Vec<pulsebeam_agent::MediaFrame> {
+        if rtp.mid.to_string().is_empty() {
+            log.missing_mid_packets = log.missing_mid_packets.saturating_add(1);
+        }
+        let ssrc = rtp.ssrc.map(|ssrc| *ssrc);
+        match (self.expected_ssrc, ssrc) {
+            (_, None) => {
+                log.missing_ssrc_packets = log.missing_ssrc_packets.saturating_add(1);
+            }
+            (Some(expected), Some(actual)) if expected != actual => {
+                log.changed_ssrc_packets = log.changed_ssrc_packets.saturating_add(1);
+            }
+            (None, Some(actual)) => self.expected_ssrc = Some(actual),
+            _ => {}
+        }
+        match (self.expected_payload_type, rtp.payload_type) {
+            (_, None) => {
+                log.missing_payload_type_packets =
+                    log.missing_payload_type_packets.saturating_add(1);
+            }
+            (Some(expected), Some(actual)) if expected != actual => {
+                log.changed_payload_type_packets =
+                    log.changed_payload_type_packets.saturating_add(1);
+            }
+            (None, Some(actual)) => self.expected_payload_type = Some(actual),
+            _ => {}
+        }
+        if self.rejects_vp8_payload_type && rtp.payload_type == Some(96) {
+            log.unexpected_vp8_packets = log.unexpected_vp8_packets.saturating_add(1);
+        }
+        let timestamp = rtp.ts.numer();
+        if self
+            .open_frame_timestamp
+            .is_some_and(|open| open != timestamp)
+        {
+            log.crossed_frame_boundaries = log.crossed_frame_boundaries.saturating_add(1);
+        }
+        self.open_frame_timestamp = (!rtp.marker).then_some(timestamp);
+        self.receiver.push(rtp)
+    }
+
+    fn flush(&mut self, log: &mut VideoReceiveLog) -> Vec<pulsebeam_agent::MediaFrame> {
+        if self.open_frame_timestamp.take().is_some() {
+            log.unterminated_frames = log.unterminated_frames.saturating_add(1);
+        }
+        self.receiver.flush()
+    }
 }
 
 /// What arrived from one speaker, as the listener heard it.
@@ -546,6 +625,7 @@ pub struct VideoReceiveStats {
     pub first_frame_at: Option<Instant>,
     pub last_frame_at: Option<Instant>,
     pub frozen_time: Duration,
+    pub browser_packet_errors: u64,
 }
 
 impl VideoReceiveStats {
@@ -568,6 +648,9 @@ impl VideoReceiveStats {
             first_frame_at: self.first_frame_at.or(baseline.first_frame_at),
             last_frame_at: self.last_frame_at,
             frozen_time: self.frozen_time.saturating_sub(baseline.frozen_time),
+            browser_packet_errors: self
+                .browser_packet_errors
+                .saturating_sub(baseline.browser_packet_errors),
         }
     }
 }
@@ -615,6 +698,7 @@ impl VideoReceiveLog {
             first_frame_at: self.first_frame_at,
             last_frame_at: self.last_frame_at,
             frozen_time: self.frozen_time,
+            browser_packet_errors: self.browser_packet_errors(),
         }
     }
 
@@ -661,6 +745,14 @@ impl VideoReceiveLog {
             }
         }
         self.last_ts = Some(ts);
+    }
+
+    pub fn browser_packet_errors(&self) -> u64 {
+        self.missing_mid_packets
+            .saturating_add(self.missing_ssrc_packets)
+            .saturating_add(self.missing_payload_type_packets)
+            .saturating_add(self.changed_ssrc_packets)
+            .saturating_add(self.changed_payload_type_packets)
     }
 }
 
@@ -842,19 +934,16 @@ impl SimClient {
                         let log = self.ctx.video_rx.clone();
                         let reject_vp8 = self.ctx.reject_vp8;
                         self.join_set.spawn(async move {
-                            // The agent forwards RTP; reassemble frames here (the
-                            // "higher layer") before logging QoE.
-                            let mut receiver = pulsebeam_agent::FrameReceiver::new();
+                            let mut receiver = BrowserVideoReceiver::new(reject_vp8);
                             while let Ok(rtp) = track.recv().await {
-                                if reject_vp8 && rtp.payload_type == Some(96) {
-                                    log.lock().unwrap().unexpected_vp8_packets += 1;
-                                }
-                                for frame in receiver.push(rtp) {
-                                    log.lock().unwrap().record(&publisher_id, &frame);
+                                let mut log = log.lock().unwrap();
+                                for frame in receiver.push(rtp, &mut log) {
+                                    log.record(&publisher_id, &frame);
                                 }
                             }
-                            for frame in receiver.flush() {
-                                log.lock().unwrap().record(&publisher_id, &frame);
+                            let mut log = log.lock().unwrap();
+                            for frame in receiver.flush(&mut log) {
+                                log.record(&publisher_id, &frame);
                             }
                         });
 
