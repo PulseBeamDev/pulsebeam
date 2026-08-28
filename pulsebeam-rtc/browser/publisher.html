@@ -59,8 +59,20 @@
         outbound.push({ bytesSent: value.bytesSent ?? 0, packetsSent: value.packetsSent ?? 0 });
       }
     }
-    return { connectionState: peer.connectionState, outbound };
+    return {
+      connectionState: peer.connectionState,
+      iceConnectionState: peer.iceConnectionState,
+      iceGatheringState: peer.iceGatheringState,
+      outbound,
+    };
   }
 
-  window.pulsebeamRtcPublisher = { connect, stats };
+  function sdp() {
+    return {
+      local: peer.localDescription?.sdp ?? null,
+      remote: peer.remoteDescription?.sdp ?? null,
+    };
+  }
+
+  window.pulsebeamRtcPublisher = { connect, stats, sdp };
 </script>

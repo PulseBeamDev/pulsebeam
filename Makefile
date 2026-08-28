@@ -33,15 +33,15 @@ test-browser:
 
 test-rtc-browser:
 	cargo build --release -p pulsebeam-rtc --example browser_interop
-	npm ci --prefix browser
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs --project chromium
+	npm ci --prefix pulsebeam-rtc/browser
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright install chromium
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs --project chromium
 
 test-rtc-browser-all:
 	cargo build --release -p pulsebeam-rtc --example browser_interop
-	npm ci --prefix browser
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium firefox webkit
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs
+	npm ci --prefix pulsebeam-rtc/browser
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright install chromium firefox webkit
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs
 
 test-browser-bench:
 	cargo build --release -p pulsebeam -p pulsebeam-cli
