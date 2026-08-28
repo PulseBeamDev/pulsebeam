@@ -1,21 +1,27 @@
 mod effect;
 mod event;
 
-use alloc::vec::Vec;
+use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 pub use effect::*;
 pub use event::*;
 
-use crate::{host::Instant, http::HttpRequest, id::*};
+use crate::{http::HttpRequest, id::*};
 
-pub(crate) struct AgentContext<'a> {
-    pub ids: &'a mut IdGenerator,
-    pub now: Instant,
-    pub effects: &'a mut Effects,
+pub(crate) struct AgentContext {
+    pub ids: IdGenerator,
+    pub effects: Effects,
 }
 
-impl AgentContext<'_> {
-    pub(crate) fn now(&self) -> Instant {
-        self.now
+impl AgentContext {
+    pub(super) fn new() -> Self {
+        Self {
+            ids: IdGenerator::new(),
+            effects: Effects::new(),
+        }
+    }
+
+    pub(super) fn next_effect(&mut self) -> Option<AgentEffect> {
+        self.effects.next_effect()
     }
 
     pub(crate) fn generation(&mut self) -> Generation {
@@ -59,30 +65,21 @@ impl AgentContext<'_> {
 }
 
 pub(crate) struct Effects {
-    inner: Vec<AgentEffect>,
+    inner: VecDeque<AgentEffect>,
 }
 
 impl Effects {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Vec::with_capacity(64),
+            inner: VecDeque::with_capacity(64),
         }
     }
 
     pub(crate) fn emit(&mut self, effect: AgentEffect) {
-        self.inner.push(effect);
+        self.inner.push_back(effect);
     }
 
-    pub(crate) fn extend(&mut self, effects: impl IntoIterator<Item = AgentEffect>) {
-        self.inner.extend(effects);
-    }
-}
-
-impl IntoIterator for Effects {
-    type Item = AgentEffect;
-    type IntoIter = alloc::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.inner.into_iter()
+    pub(crate) fn next_effect(&mut self) -> Option<AgentEffect> {
+        self.inner.pop_front()
     }
 }

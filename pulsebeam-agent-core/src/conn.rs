@@ -8,11 +8,12 @@ use crate::{
     id::Generation,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum State {
     New(New),
     WaitingOffer(WaitingOffer),
     Connecting(Connecting),
+    Connected(Connected),
     Disconnected(Disconnected),
 }
 
@@ -42,10 +43,22 @@ impl Connection {
         self.state = new_state;
     }
 
+    pub(super) fn reached(&self, desired: &ClientConnectionState) -> bool {
+        match desired {
+            ClientConnectionState::Connected => {
+                matches!(self.state, State::Connected(_))
+            }
+
+            ClientConnectionState::Disconnected => {
+                matches!(self.state, State::Disconnected(_))
+            }
+        }
+    }
+
     pub(super) fn handle(&mut self, ev: &AgentEvent, cx: &mut AgentContext) {}
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct New {}
 
 impl New {
@@ -63,7 +76,7 @@ impl New {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct WaitingOffer {
     generation: Generation,
 }
@@ -80,7 +93,7 @@ impl WaitingOffer {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Connecting {
     generation: Generation,
 }
@@ -98,6 +111,7 @@ impl Connecting {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Connected {
     generation: Generation,
 }
@@ -108,6 +122,7 @@ impl Connected {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct ReconnectWait {}
 
 impl ReconnectWait {
@@ -118,13 +133,13 @@ impl ReconnectWait {
     }
 }
 
-#[derive(thiserror::Error, Debug, Clone, Copy)]
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum DisconnectedReason {
     #[error("user initiated")]
     UserInitiated,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Disconnected {
     reason: DisconnectedReason,
 }
