@@ -125,7 +125,7 @@ perf-server:
 		-F 999 \
 		-m 256M \
 		-o perf.data \
-		-- sleep 15
+		-- sleep 60
 	# @echo "Launching UI..."
 	# hotspot perf.data
 
