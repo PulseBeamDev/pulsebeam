@@ -2,6 +2,7 @@ import { test, expect } from "@playwright/test";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
+import dgram from "node:dgram";
 import { readFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -20,6 +21,24 @@ function run(command, args) {
     });
   }
   return { child, output: () => output };
+}
+
+async function freePort() {
+  const server = net.createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+async function freeUdpPort() {
+  const socket = dgram.createSocket("udp4");
+  socket.bind(0, "127.0.0.1");
+  await once(socket, "listening");
+  const { port } = socket.address();
+  await new Promise((resolve) => socket.close(resolve));
+  return port;
 }
 
 async function waitForPort(port) {
@@ -65,15 +84,26 @@ test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) =>
   await once(staticServer, "listening");
   const viewerPort = staticServer.address().port;
 
-  const pulsebeam = run(serverBin, ["--dev"]);
+  const [apiPort, metricsPort, rtcPort] = await Promise.all([
+    freePort(),
+    freePort(),
+    freeUdpPort(),
+  ]);
+  const apiUrl = `http://127.0.0.1:${apiPort}`;
+  const pulsebeam = run(serverBin, [
+    "--dev",
+    "--api-port", String(apiPort),
+    "--metrics-port", String(metricsPort),
+    "--rtc-port", String(rtcPort),
+  ]);
   let bench;
   try {
-    await waitForPort(7070);
+    await waitForPort(apiPort);
     if (pulsebeam.child.exitCode !== null) {
       throw new Error(`pulsebeam exited before the browser joined: ${pulsebeam.child.exitCode}`);
     }
     bench = run(cliBin, [
-      "--api-url", "http://127.0.0.1:7070",
+      "--api-url", apiUrl,
       "bench",
       "--rooms", "1",
       "--users-per-room", "4",
@@ -87,11 +117,11 @@ test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) =>
     await new Promise((resolve) => setTimeout(resolve, 3_000));
 
     await page.goto(`http://127.0.0.1:${viewerPort}/viewer.html`);
-    await page.evaluate(() => window.pulsebeamViewer.connect({
-      apiUrl: "http://127.0.0.1:7070",
+    await page.evaluate((apiUrl) => window.pulsebeamViewer.connect({
+      apiUrl,
       room: "bench-room-0",
       meetShape: true,
-    }));
+    }), apiUrl);
 
     await expect.poll(async () => {
       const stats = await page.evaluate(() => window.pulsebeamViewer.stats());
@@ -100,7 +130,8 @@ test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) =>
     }, { timeout: 20_000, message: "browser never decoded bench video" }).toBe(true);
   } catch (error) {
     const browserStats = await page.evaluate(() => window.pulsebeamViewer?.stats?.()).catch(() => null);
-    throw new Error(`${error.message}\nBrowser stats: ${JSON.stringify(browserStats)}\nBrowser console:\n${browserConsole.join("\n")}\nServer log:\n${pulsebeam.output()}\nBench log:\n${bench?.output() ?? "not started"}`);
+    const sdp = await page.evaluate(() => window.pulsebeamViewer?.sdp?.()).catch(() => null);
+    throw new Error(`${error.message}\nBrowser stats: ${JSON.stringify(browserStats)}\nSDP: ${JSON.stringify(sdp)}\nBrowser console:\n${browserConsole.join("\n")}\nServer log:\n${pulsebeam.output()}\nBench log:\n${bench?.output() ?? "not started"}`);
   } finally {
     staticServer.close();
     await stop(bench?.child);

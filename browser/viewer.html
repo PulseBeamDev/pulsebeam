@@ -90,6 +90,8 @@
     }
     return {
       connectionState: peer.connectionState,
+      iceConnectionState: peer.iceConnectionState,
+      iceGatheringState: peer.iceGatheringState,
       inbound,
       rendered: videos.map((video) => ({
         height: video.videoHeight,
@@ -99,5 +101,16 @@
     };
   }
 
-  window.pulsebeamViewer = { connect, stats };
+  function sdp() {
+    return {
+      remoteVideo: (peer.remoteDescription?.sdp ?? "")
+        .split("m=video")
+        .slice(1)
+        .slice(0, 2)
+        .map((section) => section.split("m=")[0])
+        .map((section) => section.split("\r\n").filter((line) => line.startsWith("a=rtpmap:") || line.startsWith("a=fmtp:") || line.startsWith("a=send") || line.startsWith("a=recv")).join("\n")),
+    };
+  }
+
+  window.pulsebeamViewer = { connect, stats, sdp };
 </script>

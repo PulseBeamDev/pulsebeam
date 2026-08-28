@@ -28,8 +28,7 @@ run-profile: profile
 
 test: test-unit test-sim
 
-test-browser:
-	$(MAKE) test-rtc-browser
+test-browser: test-rtc-browser test-browser-bench
 
 test-rtc-browser:
 	cargo build --release -p pulsebeam-rtc --example browser_interop

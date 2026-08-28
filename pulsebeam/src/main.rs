@@ -62,6 +62,12 @@ struct Args {
     iface: Option<String>,
     #[arg(short, long, default_value_t = 16)]
     shards: usize,
+    #[arg(long, default_value_t = 7070)]
+    api_port: u16,
+    #[arg(long, default_value_t = 6060)]
+    metrics_port: u16,
+    #[arg(long)]
+    rtc_port: Option<u16>,
 }
 
 fn main() {
@@ -99,12 +105,14 @@ fn main() {
         .enable_alt_timer()
         .build_local(LocalOptions::default())
         .unwrap_or_else(|err| pulsebeam_runtime::fatal!("cannot build the node runtime: {err}"));
-    let rtc_port: u16 = if args.dev { 3478 } else { 443 };
+    let rtc_port = args.rtc_port.unwrap_or(if args.dev { 3478 } else { 443 });
     let shutdown = CancellationToken::new();
     if let Err(err) = rt.block_on(run(
         shutdown.clone(),
         workers,
         rtc_port,
+        args.api_port,
+        args.metrics_port,
         args.iface,
         args.shards,
     )) {
@@ -117,6 +125,8 @@ pub async fn run(
     shutdown: CancellationToken,
     workers: usize,
     rtc_port: u16,
+    api_port: u16,
+    metrics_port: u16,
     network_interface: Option<String>,
     shards_per_worker: usize,
 ) -> Result<()> {
@@ -129,8 +139,8 @@ pub async fn run(
         .collect();
     let unspecified_v6 = |port| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     let local_addr = unspecified_v6(rtc_port);
-    let http_api_addr = unspecified_v6(7070);
-    let metrics_addr = unspecified_v6(6060);
+    let http_api_addr = unspecified_v6(api_port);
+    let metrics_addr = unspecified_v6(metrics_port);
 
     tracing::info!(
         ?external_addrs,
