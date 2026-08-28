@@ -40,6 +40,14 @@
     await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
   }
 
+  async function supportsH264() {
+    const probe = new RTCPeerConnection({ iceServers: [] });
+    probe.addTransceiver("video", { direction: "recvonly" });
+    const offer = await probe.createOffer();
+    probe.close();
+    return offer.sdp.includes("H264/90000");
+  }
+
   async function stats() {
     const report = await peer.getStats();
     const inbound = [];
@@ -67,5 +75,5 @@
     };
   }
 
-  window.pulsebeamRtcReceiver = { connect, stats, sdp };
+  window.pulsebeamRtcReceiver = { connect, stats, sdp, supportsH264 };
 </script>

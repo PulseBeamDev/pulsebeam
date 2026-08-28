@@ -115,8 +115,10 @@ test("browser publisher completes non-trickle ICE, DTLS, and RTP", async ({ page
   });
 });
 
-test("browser receiver decodes server H.264 RTP", async ({ page, browserName }) => {
-  test.skip(browserName === "firefox", "this Firefox build does not advertise H.264");
+test("browser receiver decodes server H.264 RTP", async ({ page }) => {
+  await page.setContent(readFileSync(path.join(root, "pulsebeam-rtc", "browser", "receiver.html"), "utf8"));
+  const h264Available = await page.evaluate(() => window.pulsebeamRtcReceiver.supportsH264());
+  test.skip(!h264Available, "browser does not advertise H.264");
   await withRtc(page, "/receiver.html", ["--send-h264"], async (httpAddress) => {
     await page.evaluate((url) => window.pulsebeamRtcReceiver.connect(url), `http://${httpAddress}`);
     await expect.poll(async () => {
