@@ -3,31 +3,40 @@ use core::time::Duration;
 use crate::{http::HttpRequest, id::*};
 use alloc::{string::String, vec::Vec};
 
-pub(crate) struct Effects<E> {
-    inner: Vec<E>,
+pub(crate) struct Effects {
+    inner: Vec<AgentEffect>,
 }
 
-impl<E> Effects<E> {
-    pub(crate) const fn new() -> Self {
-        Self { inner: Vec::new() }
+impl Effects {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Vec::with_capacity(64),
+        }
     }
 
-    pub(crate) fn emit(&mut self, effect: E) {
+    pub(crate) fn emit(&mut self, effect: AgentEffect) {
         self.inner.push(effect);
     }
 
-    pub(crate) fn extend(&mut self, effects: impl IntoIterator<Item = E>) {
+    pub(crate) fn extend(&mut self, effects: impl IntoIterator<Item = AgentEffect>) {
         self.inner.extend(effects);
     }
 }
 
-impl<E> IntoIterator for Effects<E> {
-    type Item = E;
-    type IntoIter = alloc::vec::IntoIter<E>;
+impl IntoIterator for Effects {
+    type Item = AgentEffect;
+    type IntoIter = alloc::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.inner.into_iter()
     }
+}
+
+pub enum AgentEffect {
+    Rtc(RtcEffect),
+    Http(HttpEffect),
+    Timer(TimerEffect),
+    DataChannel(DataChannelEffect),
 }
 
 pub enum RtcEffect {
@@ -44,7 +53,7 @@ pub enum RtcEffect {
 }
 
 pub enum DataChannelEffect {
-    Create {
+    Open {
         generation: Generation,
         config: DataChannelConfig,
     },

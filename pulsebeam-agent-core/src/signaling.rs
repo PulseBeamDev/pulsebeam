@@ -1,4 +1,5 @@
 use crate::{
+    context::AgentContext,
     effect::{DataChannelConfig, DataChannelEffect, Effects},
     id::Generation,
 };
@@ -15,22 +16,14 @@ pub(super) struct Signaling<S> {
 pub(super) struct WaitingTransport {}
 
 impl Signaling<WaitingTransport> {
-    fn transport_connected(
-        self,
-        effects: &mut Effects<SignalingEffect>,
-    ) -> Signaling<WaitingChannel> {
-        effects.emit(SignalingEffect::Data(DataChannelEffect::Create {
-            generation: self.generation,
-            config: DataChannelConfig::reliable(
-                pulsebeam_proto::namespace::Signaling::Reliable
-                    .as_str()
-                    .into(),
-            ),
-        }));
+    fn transport_connected(self, cx: &mut AgentContext) -> Signaling<WaitingChannel> {
+        let generation = cx.dc_open(DataChannelConfig::reliable(
+            proto::namespace::Signaling::Reliable.as_str().into(),
+        ));
 
         Signaling {
             state: WaitingChannel {},
-            generation: self.generation,
+            generation,
         }
     }
 }

@@ -1,10 +1,12 @@
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 use crate::{
     conn::{self, Connection, ConnectionState},
-    effect::{HttpEffect, RtcEffect, TimerEffect},
+    context::AgentContext,
+    effect::{AgentEffect, Effects, HttpEffect, RtcEffect, TimerEffect},
+    host::{self, Instant},
     http::HttpResponse,
-    id::{Generation, OperationId, RequestId},
+    id::{Generation, IdGenerator, OperationId, RequestId},
 };
 
 pub struct ClientState {
@@ -56,22 +58,28 @@ pub enum TimerEvent {
     Fired { id: OperationId },
 }
 
-pub enum AgentEffect {
-    Rtc(RtcEffect),
-    Http(HttpEffect),
-    Timer(TimerEffect),
-}
-
 pub struct AgentConfig {}
 
 pub struct Agent {
     state: ErasedAgentState,
+    id_generator: IdGenerator,
+    effects: Effects,
 }
 
 impl Agent {
     pub fn new(config: AgentConfig) -> Self {
         Self {
             state: ErasedAgentState::new(),
+            id_generator: IdGenerator::new(),
+            effects: Effects::new(),
+        }
+    }
+
+    pub fn context(&mut self) -> AgentContext {
+        AgentContext {
+            now: host::now(),
+            ids: &mut self.id_generator,
+            effects: &mut self.effects,
         }
     }
 
@@ -109,7 +117,7 @@ impl AgentState<conn::New> {
         }
     }
 
-    fn connect(self) -> AgentState<conn::Connecting> {
+    fn connect(self, cx: &mut AgentContext) -> AgentState<conn::Connecting> {
         AgentState {
             conn: self.conn.connect(),
         }

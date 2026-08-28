@@ -1,13 +1,13 @@
 use core::time::Duration;
 
-use crate::effect::Effects;
+use alloc::string::String;
 
-pub(super) enum ConnectionEffect {
-    ConnectTransport,
-    DisconnectTransport,
-    ScheduleReconnect { after: Duration },
-    Synchronize,
-}
+use crate::{
+    context::AgentContext,
+    effect::{Effects, HttpEffect, RtcEffect},
+    http::HttpRequest,
+    id::Generation,
+};
 
 pub struct Connection<C: ConnectionState> {
     state: C,
@@ -26,8 +26,7 @@ impl Closable for Connecting {}
 impl Closable for Connected {}
 impl Closable for ReconnectWait {}
 impl<C: Closable + ConnectionState> Connection<C> {
-    fn close(self, effects: &mut Effects<ConnectionEffect>) -> Disconnected {
-        effects.emit(ConnectionEffect::DisconnectTransport);
+    fn close(self, cx: &mut AgentContext) -> Disconnected {
         Disconnected {
             reason: DisconnectedReason::UserInitiated,
         }
@@ -61,10 +60,7 @@ impl Connection<Connecting> {
 pub(super) struct Connected {}
 
 impl Connection<Connected> {
-    fn disconnected(self, effects: &mut Effects<ConnectionEffect>) -> Connection<ReconnectWait> {
-        effects.emit(ConnectionEffect::ScheduleReconnect {
-            after: Duration::from_millis(100),
-        });
+    fn disconnected(self, cx: &mut AgentContext) -> Connection<ReconnectWait> {
         Connection {
             state: ReconnectWait {},
         }
