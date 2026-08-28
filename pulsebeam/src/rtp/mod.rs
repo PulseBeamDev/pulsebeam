@@ -16,8 +16,8 @@ pub mod conformance;
 use tokio::time::Instant;
 
 pub use types::{
-    EncodingId, Frequency, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId, MediaTime,
-    PacketExtensions, PacketProvenance, PayloadType, SenderReport, SequenceNumber,
+    EncodingId, Frequency, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId,
+    MediaTime, PacketExtensions, PacketProvenance, PayloadType, SenderReport, SequenceNumber,
     SimulcastEncoding, Ssrc, VideoLayersAllocation,
 };
 
@@ -28,12 +28,60 @@ use crate::entity::{ParticipantId, TrackId};
 pub const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
 pub const AUDIO_FREQUENCY: Frequency = Frequency::FORTY_EIGHT_KHZ;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
     H264,
     VP8,
     VP9,
     Opus,
+}
+
+impl Codec {
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("h264") {
+            Some(Self::H264)
+        } else if name.eq_ignore_ascii_case("vp8") {
+            Some(Self::VP8)
+        } else if name.eq_ignore_ascii_case("vp9") {
+            Some(Self::VP9)
+        } else if name.eq_ignore_ascii_case("opus") {
+            Some(Self::Opus)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodecPayloadTypes {
+    h264: Option<PayloadType>,
+    vp8: Option<PayloadType>,
+    vp9: Option<PayloadType>,
+    opus: Option<PayloadType>,
+}
+
+impl CodecPayloadTypes {
+    pub fn insert(&mut self, codec: Codec, payload_type: PayloadType) {
+        match codec {
+            Codec::H264 => self.h264 = Some(payload_type),
+            Codec::VP8 => self.vp8 = Some(payload_type),
+            Codec::VP9 => self.vp9 = Some(payload_type),
+            Codec::Opus => self.opus = Some(payload_type),
+        }
+    }
+
+    pub fn get(self, codec: Codec) -> Option<PayloadType> {
+        match codec {
+            Codec::H264 => self.h264,
+            Codec::VP8 => self.vp8,
+            Codec::VP9 => self.vp9,
+            Codec::Opus => self.opus,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.h264.is_none() && self.vp8.is_none() && self.vp9.is_none() && self.opus.is_none()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +98,7 @@ pub struct AudioRtpPacket {
 /// at ingress so every ring-slot stays as small as possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpPacket {
+    pub codec: Codec,
     pub ssrc: Ssrc,
     pub marker: bool,
     pub extensions: PacketExtensions,
@@ -84,6 +133,7 @@ pub struct RtpPacket {
 impl Default for RtpPacket {
     fn default() -> Self {
         Self {
+            codec: Codec::H264,
             ssrc: 1234.into(),
             marker: false,
             extensions: PacketExtensions::default(),
@@ -106,7 +156,10 @@ impl Default for RtpPacket {
 }
 
 impl RtpPacket {
-    #[allow(clippy::too_many_arguments, reason = "structural parsing passes the already-validated RTP parts without reification")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "structural parsing passes the already-validated RTP parts without reification"
+    )]
     pub(crate) fn from_ingress_parts(
         ssrc: Ssrc,
         marker: bool,
@@ -130,6 +183,7 @@ impl RtpPacket {
             Codec::Opus => true,
         };
         Self {
+            codec,
             ssrc,
             marker,
             extensions,
@@ -151,6 +205,7 @@ impl RtpPacket {
         extensions.video_layers_allocation = None;
 
         Self {
+            codec: self.codec,
             ssrc: self.ssrc,
             marker: self.marker,
             extensions,

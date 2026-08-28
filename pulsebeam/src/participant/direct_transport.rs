@@ -246,7 +246,7 @@ impl DirectTransport {
         let packet = authenticated.parse().ok()?;
         match self.media.handle_authenticated(packet).ok()? {
             Some(pulsebeam_rtc::MediaIngress::Rtp { stream, packet }) => {
-                let (codec, extensions) = self.rtp_metadata(stream, &packet);
+                let (codec, extensions) = self.rtp_metadata(stream, &packet)?;
                 Some(DirectTransportOutput::Rtp {
                     stream,
                     packet: RtpPacket::from_packet_view(
@@ -273,25 +273,19 @@ impl DirectTransport {
         &self,
         stream: ReceiveStream,
         packet: &pulsebeam_rtc::RtpPacketView<'_>,
-    ) -> (Codec, PacketExtensions) {
+    ) -> Option<(Codec, PacketExtensions)> {
         let Some(section) = self.connection.media_section(stream.media_section()) else {
             debug_assert!(
                 false,
                 "a registered receive stream has negotiated media facts"
             );
-            return (Codec::H264, PacketExtensions::default());
+            return None;
         };
         let codec = section
             .codecs()
             .iter()
             .find(|codec| codec.payload_type() == packet.payload_type())
-            .map_or(Codec::H264, |codec| {
-                if codec.name().eq_ignore_ascii_case("opus") {
-                    Codec::Opus
-                } else {
-                    Codec::H264
-                }
-            });
+            .and_then(|codec| Codec::from_name(codec.name()))?;
         let mut extensions = PacketExtensions::default();
         let audio_level = section
             .header_extensions()
@@ -350,7 +344,7 @@ impl DirectTransport {
             .map(|value| {
                 pulsebeam_core::dd::RawDependencyDescriptor(value.iter().copied().collect())
             });
-        (codec, extensions)
+        Some((codec, extensions))
     }
 }
 

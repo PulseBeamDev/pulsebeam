@@ -26,7 +26,10 @@ use crate::{
         upstream::{IncomingRtpRoute, UpstreamAllocator},
     },
     rtp::cache::TrackStreamCache,
-    rtp::{KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId, PayloadType, Ssrc},
+    rtp::{
+        Codec, CodecPayloadTypes, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId,
+        PayloadType, Ssrc,
+    },
     track::{
         self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent,
         DataTrackIntentError, StreamWrite, StreamWriter, Track, TrackMeta,
@@ -395,9 +398,11 @@ impl DirectParticipantCore {
             sections.insert(section.id(), mid);
             if section.direction() == MediaDirection::ReceiveOnly {
                 for codec in section.codecs() {
-                    receive_sections
-                        .entry(codec.payload_type())
-                        .or_insert_with(|| section.id());
+                    if Codec::from_name(codec.name()).is_some() {
+                        receive_sections
+                            .entry(codec.payload_type())
+                            .or_insert_with(|| section.id());
+                    }
                 }
                 let kind = match section.kind() {
                     RtcMediaKind::Audio => TrackKind::Audio,
@@ -426,13 +431,20 @@ impl DirectParticipantCore {
                 let _ = upstream.add_published_track(mid, sender, track);
             }
             if section.direction() == MediaDirection::SendOnly {
-                let Some(codec) = section.codecs().first() else {
+                let mut payload_types = CodecPayloadTypes::default();
+                for codec in section.codecs() {
+                    let Some(codec_kind) = Codec::from_name(codec.name()) else {
+                        continue;
+                    };
+                    let Some(payload_type) = PayloadType::new(codec.payload_type()) else {
+                        debug_assert!(false, "negotiated RTP payload type must be valid");
+                        continue;
+                    };
+                    payload_types.insert(codec_kind, payload_type);
+                }
+                if payload_types.is_empty() {
                     continue;
-                };
-                let Some(pt) = PayloadType::new(codec.payload_type()) else {
-                    debug_assert!(false, "negotiated RTP payload type must be valid");
-                    continue;
-                };
+                }
                 let kind = match section.kind() {
                     RtcMediaKind::Audio => MediaKind::Audio,
                     RtcMediaKind::Video => MediaKind::Video,
@@ -449,7 +461,7 @@ impl DirectParticipantCore {
                     mid,
                     rid: None,
                     ssrc,
-                    pt,
+                    payload_types,
                     kind,
                 });
                 send_streams.push((section.id(), ssrc));
@@ -819,7 +831,7 @@ impl DirectParticipantCore {
             }
         }
         while let Some(write) = self.stream_writer.pop() {
-            let (packet, mid, rid, payload_type, ssrc, kind) = match write {
+            let (packet, _mid, _rid, payload_type, ssrc, _kind) = match write {
                 StreamWrite::Video {
                     pkt,
                     mid,
@@ -833,14 +845,14 @@ impl DirectParticipantCore {
             };
             #[cfg(debug_assertions)]
             if let Some(violation) = self.egress_guard.check(
-                mid,
-                rid,
+                _mid,
+                _rid,
                 u64::from(packet.seq_no),
                 packet.rtp_ts.numer(),
                 packet.marker,
-                kind,
+                _kind,
             ) {
-                tracing::error!(%mid, ?rid, %violation, "egress stream invariant violated");
+                tracing::error!(%_mid, ?_rid, %violation, "egress stream invariant violated");
                 #[cfg(feature = "sim")]
                 pulsebeam_runtime::fatal!("egress stream invariant violated: {violation}");
             }

@@ -1,7 +1,7 @@
 use std::array;
 use std::time::Duration;
 
-use crate::rtp::{MediaSectionId as Mid, PayloadType as Pt, Ssrc};
+use crate::rtp::{CodecPayloadTypes, MediaSectionId as Mid, Ssrc};
 use tokio::time::Instant;
 
 use crate::control::MAX_SEND_AUDIO_SLOTS;
@@ -70,7 +70,7 @@ impl DerefMut for DownstreamAudio {
 
 /// A subscriber's audio selection policy.
 pub struct Slot {
-    pt: Pt,
+    payload_types: CodecPayloadTypes,
     mid: Mid,
     ssrc: Ssrc,
     /// Set to `true` when the slot is first provisioned for this subscriber so the
@@ -165,7 +165,7 @@ impl AudioAllocator {
             if entry.is_none() {
                 *entry = Some(Slot {
                     mid: slot.mid,
-                    pt: slot.pt,
+                    payload_types: slot.payload_types,
                     ssrc: slot.ssrc,
                     pending_marker: true,
                     occupant: None,
@@ -181,7 +181,7 @@ impl AudioAllocator {
             self.ctx,
             target: crate::log::TARGET_AUDIO,
             mid = %slot.mid,
-            pt = %slot.pt,
+            payload_types = ?slot.payload_types,
             ssrc = %slot.ssrc,
             slots = SELECTOR_SLOTS,
             "audio allocator has no free slot; dropping slot provisioning"
@@ -322,7 +322,14 @@ impl AudioAllocator {
             pkt.marker = true;
             slot.pending_marker = false;
         }
-        writer.write_audio_owned(pkt, slot.mid, slot.ssrc, slot.pt);
+        let Some(pt) = slot.payload_types.get(pkt.codec) else {
+            debug_assert!(
+                false,
+                "forwarded audio codec must be negotiated by the egress slot"
+            );
+            return None;
+        };
+        writer.write_audio_owned(pkt, slot.mid, slot.ssrc, pt);
         Some(())
     }
 
@@ -406,7 +413,7 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::participant::downstream::SlotConfig;
-    use crate::rtp::{MediaKind, MediaSectionId as Mid, PayloadType as Pt, Ssrc};
+    use crate::rtp::{MediaKind, MediaSectionId as Mid, Ssrc};
 
     fn test_ctx() -> LogCtx {
         use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
@@ -428,6 +435,7 @@ mod tests {
 
     fn speaking(level_dbov: i8) -> RtpPacket {
         let mut pkt = RtpPacket::default();
+        pkt.codec = crate::rtp::Codec::Opus;
         pkt.extensions.audio_level = Some(level_dbov);
         pkt
     }
@@ -439,11 +447,16 @@ mod tests {
     }
 
     fn slot_config(mid: &'static str, ssrc: u32) -> SlotConfig {
+        let mut payload_types = CodecPayloadTypes::default();
+        payload_types.insert(
+            crate::rtp::Codec::Opus,
+            crate::rtp::PayloadType::new(111).expect("test payload type is valid"),
+        );
         SlotConfig {
             mid: Mid::from(mid),
             rid: None,
             ssrc: Ssrc::from(ssrc),
-            pt: Pt::new(111).expect("test payload type is valid"),
+            payload_types,
             kind: MediaKind::Audio,
         }
     }

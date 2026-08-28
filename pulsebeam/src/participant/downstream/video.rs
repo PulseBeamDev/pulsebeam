@@ -4,13 +4,15 @@ use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
 use crate::rtp;
 #[cfg(test)]
+use crate::rtp::PayloadType as Pt;
+#[cfg(test)]
 use crate::rtp::RtpPacket;
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
 use crate::rtp::{
-    EncodingId as Rid, KeyframeRequest, KeyframeRequestKind, MediaSectionId as Mid,
-    PayloadType as Pt, Ssrc,
+    CodecPayloadTypes, EncodingId as Rid, KeyframeRequest, KeyframeRequestKind,
+    MediaSectionId as Mid, Ssrc,
 };
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indexmap::IndexSet;
@@ -806,7 +808,7 @@ enum SlotState {
 struct Slot {
     ctx: LogCtx,
     ssrc: Ssrc,
-    pt: Pt,
+    payload_types: CodecPayloadTypes,
 
     /// The layer this slot is assigned to serve — the most recent BWE choice.
     /// This is policy: it carries the quality/height the allocator reasons about.
@@ -839,7 +841,7 @@ impl Slot {
             mid: cfg.mid,
             rid: cfg.rid,
             ssrc: cfg.ssrc,
-            pt: cfg.pt,
+            payload_types: cfg.payload_types,
 
             desired: None,
 
@@ -1066,9 +1068,16 @@ impl Slot {
         // The switcher owns the entire switching state machine; hand it the
         // whole track cache and let it emit whatever the subscriber should see. A
         // change in the active stream means a switch was promoted this tick.
-        let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
+        let (mid, rid, ssrc, payload_types) = (self.mid, self.rid, self.ssrc, self.payload_types);
         let before = self.switcher.active_stream();
         self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
+            let Some(pt) = payload_types.get(out.codec) else {
+                debug_assert!(
+                    false,
+                    "forwarded video codec must be negotiated by the egress slot"
+                );
+                return;
+            };
             writer.write_video_owned(out, mid, rid, ssrc, pt);
         });
         self.switcher.active_stream() != before
@@ -1118,6 +1127,10 @@ impl Slot {
     /// Simulate the burst landing: the staged stream becomes active.
     fn test_promote(&mut self) {
         self.switcher.test_promote();
+    }
+
+    fn test_payload_type(&self, codec: crate::rtp::Codec) -> Option<Pt> {
+        self.payload_types.get(codec)
     }
 }
 
@@ -2721,6 +2734,32 @@ mod slot_switch_tests {
             room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
             participant_id: ParticipantId::new(),
         }
+    }
+
+    #[test]
+    fn egress_slot_uses_the_payload_type_for_the_forwarded_codec() {
+        let mut payload_types = CodecPayloadTypes::default();
+        payload_types.insert(
+            crate::rtp::Codec::VP8,
+            Pt::new(96).expect("test payload type is valid"),
+        );
+        payload_types.insert(
+            crate::rtp::Codec::H264,
+            Pt::new(102).expect("test payload type is valid"),
+        );
+        let slot = Slot::new(
+            test_ctx(),
+            SlotConfig {
+                payload_types,
+                ..SlotConfig::default()
+            },
+        );
+
+        assert_eq!(
+            slot.test_payload_type(crate::rtp::Codec::H264),
+            Pt::new(102)
+        );
+        assert_eq!(slot.test_payload_type(crate::rtp::Codec::VP8), Pt::new(96));
     }
 
     /// A slot with two simulcast layers of one track available to switch between.

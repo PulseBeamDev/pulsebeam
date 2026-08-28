@@ -15,8 +15,8 @@ use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::event::ParticipantSink;
 pub use crate::participant::intent::AudioIntent;
 use crate::rtp::{
-    EncodingId as Rid, KeyframeRequest, MediaKind, MediaSectionId as Mid, MediaTime,
-    PayloadType as Pt, RtpPacket, SequenceNumber as SeqNo, Ssrc,
+    Codec, CodecPayloadTypes, EncodingId as Rid, KeyframeRequest, MediaKind, MediaSectionId as Mid,
+    MediaTime, PayloadType as Pt, RtpPacket, SequenceNumber as SeqNo, Ssrc,
 };
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
 use ahash::HashSetExt;
@@ -32,17 +32,19 @@ pub struct SlotConfig {
     pub mid: Mid,
     pub rid: Option<Rid>,
     pub ssrc: Ssrc,
-    pub pt: Pt,
+    pub payload_types: CodecPayloadTypes,
     pub kind: MediaKind,
 }
 
 impl Default for SlotConfig {
     fn default() -> Self {
+        let mut payload_types = CodecPayloadTypes::default();
+        payload_types.insert(Codec::H264, Pt::DEFAULT);
         Self {
             mid: Mid::from("0"),
             rid: None,
             ssrc: 0u32.into(),
-            pt: Pt::DEFAULT,
+            payload_types,
             kind: MediaKind::Video,
         }
     }
