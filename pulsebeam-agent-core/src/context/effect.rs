@@ -1,36 +1,7 @@
+use crate::http::*;
+use crate::id::*;
+use alloc::string::String;
 use core::time::Duration;
-
-use crate::{http::HttpRequest, id::*};
-use alloc::{string::String, vec::Vec};
-
-pub(crate) struct Effects {
-    inner: Vec<AgentEffect>,
-}
-
-impl Effects {
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: Vec::with_capacity(64),
-        }
-    }
-
-    pub(crate) fn emit(&mut self, effect: AgentEffect) {
-        self.inner.push(effect);
-    }
-
-    pub(crate) fn extend(&mut self, effects: impl IntoIterator<Item = AgentEffect>) {
-        self.inner.extend(effects);
-    }
-}
-
-impl IntoIterator for Effects {
-    type Item = AgentEffect;
-    type IntoIter = alloc::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.inner.into_iter()
-    }
-}
 
 pub enum AgentEffect {
     Rtc(RtcEffect),

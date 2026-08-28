@@ -8,7 +8,6 @@ pub mod id;
 mod agent;
 mod conn;
 mod context;
-mod effect;
 mod signaling;
 
 pub use agent::*;

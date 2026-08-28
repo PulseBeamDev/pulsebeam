@@ -1,6 +1,5 @@
 use crate::{
-    context::AgentContext,
-    effect::{DataChannelConfig, DataChannelEffect, Effects},
+    context::{AgentContext, DataChannelConfig, DataChannelEffect},
     id::Generation,
 };
 
@@ -17,13 +16,14 @@ pub(super) struct WaitingTransport {}
 
 impl Signaling<WaitingTransport> {
     fn transport_connected(self, cx: &mut AgentContext) -> Signaling<WaitingChannel> {
-        let generation = cx.dc_open(DataChannelConfig::reliable(
-            proto::namespace::Signaling::Reliable.as_str().into(),
-        ));
+        cx.dc_open(
+            self.generation,
+            DataChannelConfig::reliable(proto::namespace::Signaling::Reliable.as_str().into()),
+        );
 
         Signaling {
             state: WaitingChannel {},
-            generation,
+            generation: self.generation,
         }
     }
 }
