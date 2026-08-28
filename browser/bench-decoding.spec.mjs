@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, chromium, firefox, webkit } from "@playwright/test";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const serverBin = path.join(root, "target", "release", "pulsebeam");
 const cliBin = path.join(root, "target", "release", "pulsebeam-cli");
+const engines = { chromium, firefox, webkit };
 
 function run(command, args) {
   const child = spawn(command, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
@@ -66,22 +67,59 @@ async function stop(process) {
   if (process.exitCode === null) process.kill("SIGKILL");
 }
 
+async function startStaticServer() {
+  const server = createServer((request, response) => {
+    const pages = {
+      "/publisher.html": "publisher.html",
+      "/viewer.html": "viewer.html",
+    };
+    const page = pages[request.url];
+    if (!page) {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end(readFileSync(path.join(root, "browser", page)));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  return server;
+}
+
+async function startPulseBeam() {
+  const [apiPort, metricsPort, rtcPort] = await Promise.all([
+    freePort(),
+    freePort(),
+    freeUdpPort(),
+  ]);
+  const apiUrl = `http://127.0.0.1:${apiPort}`;
+  const pulsebeam = run(serverBin, [
+    "--dev",
+    "--api-port", String(apiPort),
+    "--metrics-port", String(metricsPort),
+    "--rtc-port", String(rtcPort),
+  ]);
+  await waitForPort(apiPort);
+  if (pulsebeam.child.exitCode !== null) {
+    throw new Error(`pulsebeam exited before browser join: ${pulsebeam.child.exitCode}`);
+  }
+  return { apiUrl, pulsebeam };
+}
+
+function selectCodec(publisher, viewer) {
+  for (const codec of ["video/h264", "video/vp8"]) {
+    if (publisher.includes(codec) && viewer.includes(codec)) return codec;
+  }
+  throw new Error(`browser pair has no supported H.264 or VP8 codec: publisher=${publisher} viewer=${viewer}`);
+}
+
 test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) => {
   const browserConsole = [];
   page.on("console", (message) => {
     browserConsole.push(`${message.type()}: ${message.text()}`);
     if (browserConsole.length > 100) browserConsole.shift();
   });
-  const staticServer = createServer((request, response) => {
-    if (request.url !== "/viewer.html") {
-      response.writeHead(404).end();
-      return;
-    }
-    response.writeHead(200, { "content-type": "text/html" });
-    response.end(readFileSync(path.join(root, "browser", "viewer.html")));
-  });
-  staticServer.listen(0, "127.0.0.1");
-  await once(staticServer, "listening");
+  const staticServer = await startStaticServer();
   const viewerPort = staticServer.address().port;
 
   const [apiPort, metricsPort, rtcPort] = await Promise.all([
@@ -138,3 +176,63 @@ test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) =>
     await stop(pulsebeam.child);
   }
 });
+
+for (const [publisherName, publisherType] of Object.entries(engines)) {
+  for (const [viewerName, viewerType] of Object.entries(engines)) {
+    test(`${publisherName} publisher renders on ${viewerName}`, async () => {
+      test.setTimeout(60_000);
+      const fixtureServer = await startStaticServer();
+      const port = fixtureServer.address().port;
+      const publisherBrowser = await publisherType.launch({ headless: true });
+      const viewerBrowser = await viewerType.launch({ headless: true });
+      const publisherPage = await publisherBrowser.newPage();
+      const viewerPage = await viewerBrowser.newPage();
+      let pulsebeam;
+      try {
+        await Promise.all([
+          publisherPage.goto(`http://127.0.0.1:${port}/publisher.html`),
+          viewerPage.goto(`http://127.0.0.1:${port}/viewer.html`),
+        ]);
+        const [publisherCodecs, viewerCodecs] = await Promise.all([
+          publisherPage.evaluate(() => window.pulsebeamPublisher.codecs()),
+          viewerPage.evaluate(() => window.pulsebeamViewer.codecs()),
+        ]);
+        const codec = selectCodec(publisherCodecs, viewerCodecs);
+        const started = await startPulseBeam();
+        pulsebeam = started.pulsebeam;
+        await publisherPage.evaluate(({ apiUrl, codec }) => window.pulsebeamPublisher.connect({
+          apiUrl,
+          room: "browser-matrix",
+          codec,
+        }), { apiUrl: started.apiUrl, codec });
+        await expect.poll(async () => {
+          const stats = await publisherPage.evaluate(() => window.pulsebeamPublisher.stats());
+          return stats.connectionState === "connected" &&
+            stats.outbound.some((stream) => stream.bytesSent > 0 && stream.packetsSent > 0);
+        }, { timeout: 20_000, message: "browser publisher never sent RTP" }).toBe(true);
+        await viewerPage.evaluate(({ apiUrl, codec }) => window.pulsebeamViewer.connect({
+          apiUrl,
+          room: "browser-matrix",
+          codec,
+        }), { apiUrl: started.apiUrl, codec });
+        await expect.poll(async () => {
+          const stats = await viewerPage.evaluate(() => window.pulsebeamViewer.stats());
+          return stats.connectionState === "connected" &&
+            stats.inbound.some((stream) => stream.codec?.toLowerCase() === codec && stream.framesDecoded > 0) &&
+            stats.rendered.some((video) => video.width > 0 && video.height > 0);
+        }, { timeout: 20_000, message: `browser viewer never decoded ${codec}` }).toBe(true);
+      } catch (error) {
+        const [publisherStats, viewerStats] = await Promise.all([
+          publisherPage.evaluate(() => window.pulsebeamPublisher?.stats?.()).catch(() => null),
+          viewerPage.evaluate(() => window.pulsebeamViewer?.stats?.()).catch(() => null),
+        ]);
+        throw new Error(`${error.message}\nPublisher: ${JSON.stringify(publisherStats)}\nViewer: ${JSON.stringify(viewerStats)}\nPulseBeam:\n${pulsebeam?.output() ?? "not started"}`);
+      } finally {
+        fixtureServer.close();
+        await stop(pulsebeam?.child);
+        await publisherBrowser.close();
+        await viewerBrowser.close();
+      }
+    });
+  }
+}

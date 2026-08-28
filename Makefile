@@ -33,20 +33,15 @@ test-browser: test-rtc-browser test-browser-bench
 test-rtc-browser:
 	cargo build --release -p pulsebeam-rtc --features browser-test --example browser_interop
 	npm ci --prefix pulsebeam-rtc/browser
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright install chromium
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs --project chromium
-
-test-rtc-browser-all:
-	cargo build --release -p pulsebeam-rtc --features browser-test --example browser_interop
-	npm ci --prefix pulsebeam-rtc/browser
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright install chromium firefox webkit
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/pulsebeam-rtc/browser/.playwright npx --prefix pulsebeam-rtc/browser playwright test --config $(CURDIR)/pulsebeam-rtc/browser/playwright.config.mjs
+
+test-rtc-browser-all: test-rtc-browser
 
 test-browser-bench:
 	cargo build --release -p pulsebeam -p pulsebeam-cli
 	npm ci --prefix browser
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install --only-shell chromium
+	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium firefox webkit
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npm test --prefix browser
 
 # `sim` is on because the shaper lives behind it, and the shaper is the authority on what a

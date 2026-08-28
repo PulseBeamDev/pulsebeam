@@ -1165,6 +1165,13 @@ impl DirectParticipantCore {
             self.upstream.remove_route(route.ssrc);
             return;
         }
+        if route.fanout.is_none()
+            && let Some((track, in_topology)) = self.upstream.announce_state_mut(route.mid)
+            && !*in_topology
+        {
+            *in_topology = true;
+            events.publish_track(track.clone());
+        }
         if processed.request_keyframe {
             self.request_upstream_keyframe(route, events);
         }

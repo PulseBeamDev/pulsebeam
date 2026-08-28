@@ -17,6 +17,19 @@
     videos.push(video);
   }
 
+  function codecs() {
+    return RTCRtpReceiver.getCapabilities("video")?.codecs
+      ?.filter((codec) => codec.mimeType.startsWith("video/"))
+      .map((codec) => codec.mimeType.toLowerCase()) ?? [];
+  }
+
+  function setCodec(transceiver, codec) {
+    if (!codec || !transceiver.setCodecPreferences) return;
+    const available = RTCRtpReceiver.getCapabilities("video")?.codecs ?? [];
+    const selected = available.filter((candidate) => candidate.mimeType.toLowerCase() === codec);
+    if (selected.length > 0) transceiver.setCodecPreferences(selected);
+  }
+
   async function gatherCandidates(peer) {
     if (peer.iceGatheringState === "complete") return;
     await new Promise((resolve) => {
@@ -30,7 +43,7 @@
     });
   }
 
-  async function connect({ apiUrl, room, meetShape = false }) {
+  async function connect({ apiUrl, room, meetShape = false, codec = null }) {
     peer = new RTCPeerConnection();
     if (meetShape) {
       peer.createDataChannel("v1/sys/signaling", { ordered: true });
@@ -52,7 +65,8 @@
       }
     }
     for (let slot = 0; slot < 7; slot += 1) {
-      peer.addTransceiver("video", { direction: "recvonly" });
+      const transceiver = peer.addTransceiver("video", { direction: "recvonly" });
+      setCodec(transceiver, codec);
     }
     peer.ontrack = ({ track }) => {
       if (track.kind === "video") addVideo(track);
@@ -112,5 +126,5 @@
     };
   }
 
-  window.pulsebeamViewer = { connect, stats, sdp };
+  window.pulsebeamViewer = { codecs, connect, stats, sdp };
 </script>
