@@ -267,6 +267,9 @@ impl LiveConnection {
             let _ = ice.add_local_candidate(candidate);
         }
         for candidate in session.remote_candidates() {
+            if candidate.is_mdns() {
+                continue;
+            }
             let candidate = Candidate::from_sdp_string(candidate.as_sdp())
                 .map_err(|error| LiveConnectionError::Candidate(error.to_string()))?;
             ice.add_remote_candidate(candidate);
@@ -835,6 +838,35 @@ mod tests {
         assert_eq!(connection.poll_event(), Some(TransportEvent::IceChecking));
         assert!(connection.poll_egress().is_none());
         assert!(connection.poll_authenticated().is_none());
+    }
+
+    #[test]
+    fn live_transport_keeps_mdns_candidates_for_authenticated_peer_reflexive_discovery() {
+        let now = Instant::now();
+        let local = LocalTransport::generate(
+            IceCredentials::new("localufrag".to_owned(), "localpassword".to_owned())
+                .expect("valid local credentials"),
+        )
+        .expect("local transport");
+        let candidate =
+            IceCandidate::new("candidate:1 1 UDP 2130706431 127.0.0.1 9000 typ host".to_owned())
+                .expect("valid candidate");
+        let server = ServerTransport::new(
+            7,
+            local.ice().clone(),
+            local.fingerprint().clone(),
+            Box::new([candidate]),
+        );
+        let offer = offer().replace("127.0.0.1 9001", "4db4c1e2-3c04-4ad0-b76b.local 9001");
+        let session = negotiate(&offer, &server)
+            .expect("negotiated mDNS session")
+            .session()
+            .clone();
+
+        let mut connection = LiveConnection::new(ConnectionId::new(7), session, local, now)
+            .expect("live connection");
+
+        assert!(connection.poll_event().is_none());
     }
 
     #[test]

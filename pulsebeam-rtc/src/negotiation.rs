@@ -1,10 +1,9 @@
-use std::{collections::HashSet, num::NonZeroU32};
+use std::{collections::HashSet, fmt::Write, num::NonZeroU32};
 
 use str0m::{
     Candidate,
-    crypto::Fingerprint,
     rtp_::Direction,
-    sdp::{MediaAttribute, MediaType, Sdp, SessionAttribute, Setup},
+    sdp::{MediaAttribute, MediaLine, MediaType, Sdp, SessionAttribute, Setup},
 };
 
 use crate::{
@@ -49,6 +48,10 @@ pub enum NegotiationError {
     MissingSetup,
     #[error("invalid local candidate: {0}")]
     Candidate(String),
+    #[error("invalid remote ICE candidate: {0}")]
+    RemoteCandidate(String),
+    #[error("the offer does not contain a BUNDLE group")]
+    MissingBundle,
     #[error("duplicate media section identifier: {0}")]
     DuplicateMid(String),
     #[error("unsupported media direction for {0}")]
@@ -83,40 +86,35 @@ pub fn negotiate(
     offer: &str,
     server: &ServerTransport,
 ) -> Result<NegotiationResult, NegotiationError> {
-    let mut answer = Sdp::parse(offer).map_err(|error| NegotiationError::Sdp(error.to_string()))?;
-    answer
+    let parsed = Sdp::parse(offer).map_err(|error| NegotiationError::Sdp(error.to_string()))?;
+    parsed
         .assert_consistency()
         .map_err(|error| NegotiationError::Sdp(error.to_string()))?;
 
-    let remote_ice = answer
+    let remote_ice = parsed
         .ice_creds()
         .and_then(|credentials| IceCredentials::new(credentials.ufrag, credentials.pass))
         .ok_or(NegotiationError::MissingIceCredentials)?;
-    let remote_fingerprint = answer
+    let remote_fingerprint = parsed
         .fingerprint()
         .and_then(|fingerprint| {
             DtlsFingerprint::new(fingerprint.hash_func, fingerprint.bytes.into_boxed_slice())
         })
         .ok_or(NegotiationError::MissingFingerprint)?;
-    let mut remote_candidates = Vec::new();
-    for candidate in answer.ice_candidates() {
-        let value = candidate.to_sdp_string();
-        debug_assert!(!value.is_empty());
-        let candidate = IceCandidate::new(value).ok_or_else(|| {
-            NegotiationError::Sdp("formatted remote ICE candidate is empty".to_owned())
-        })?;
-        remote_candidates.push(candidate);
-    }
-    let remote_setup = answer.setup().ok_or(NegotiationError::MissingSetup)?;
+    let remote_candidates = remote_candidates(offer)?;
+    let remote_setup = parsed.setup().ok_or(NegotiationError::MissingSetup)?;
     let setup = Setup::Passive
         .compare_to_remote(remote_setup)
         .ok_or_else(|| NegotiationError::Sdp("incompatible DTLS setup roles".to_owned()))?;
 
-    let local_candidates = parse_candidates(&server.candidates)?;
-    let mut mids = HashSet::with_capacity(answer.media_lines.len());
-    let mut sections = Vec::with_capacity(answer.media_lines.len());
+    validate_local_candidates(&server.candidates)?;
+    let bundle = bundle(&parsed)?;
+    let bundle_tag = bundle_tag(&bundle)?;
+    let mut mids = HashSet::with_capacity(parsed.media_lines.len());
+    let mut sections = Vec::with_capacity(parsed.media_lines.len());
+    let mut answer_media = Vec::with_capacity(parsed.media_lines.len());
 
-    for (index, line) in answer.media_lines.iter_mut().enumerate() {
+    for (index, line) in parsed.media_lines.iter().enumerate() {
         if let Some(error) = line.check_consistent() {
             return Err(NegotiationError::Sdp(error));
         }
@@ -134,7 +132,16 @@ pub fn negotiate(
         let receive_rids = receive_rids(line, kind, direction);
         let data_channel = data_channel_parameters(line, kind, &mid)?;
 
-        filter_answer_attributes(line, direction);
+        answer_media.push(AnswerMedia {
+            line: line.clone(),
+            attributes: answer_attributes_for_media(
+                line,
+                direction,
+                server,
+                setup,
+                mid == bundle_tag,
+            ),
+        });
         sections.push(NegotiatedMediaSection::new(
             MediaSectionId::new(id),
             mid,
@@ -147,41 +154,63 @@ pub fn negotiate(
         ));
     }
 
-    let bundle = answer
-        .session
-        .attrs
-        .iter()
-        .find(
-            |attribute| matches!(attribute, SessionAttribute::Group { typ, .. } if typ == "BUNDLE"),
-        )
-        .cloned();
-    answer.session.id = server.session_id.into();
-    answer.session.attrs = answer_attributes(server, setup, local_candidates, bundle);
-
     let session = NegotiatedSession::new(
         server.ice.clone(),
         server.fingerprint.clone(),
         server.candidates.clone(),
         remote_ice,
         remote_fingerprint,
-        remote_candidates.into_boxed_slice(),
+        remote_candidates,
         sections.into_boxed_slice(),
     );
 
     Ok(NegotiationResult {
-        answer: SdpAnswer::new(answer.to_string()),
+        answer: SdpAnswer::new(format_answer(server, &bundle, answer_media)),
         session,
     })
 }
 
-fn parse_candidates(candidates: &[IceCandidate]) -> Result<Vec<Candidate>, NegotiationError> {
-    candidates
-        .iter()
-        .map(|candidate| {
-            Candidate::from_sdp_string(candidate.as_sdp())
-                .map_err(|error| NegotiationError::Candidate(error.to_string()))
+fn validate_local_candidates(candidates: &[IceCandidate]) -> Result<(), NegotiationError> {
+    candidates.iter().try_for_each(|candidate| {
+        Candidate::from_sdp_string(candidate.as_sdp())
+            .map(|_| ())
+            .map_err(|error| NegotiationError::Candidate(error.to_string()))
+    })
+}
+
+fn remote_candidates(offer: &str) -> Result<Box<[IceCandidate]>, NegotiationError> {
+    offer
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("a=candidate:"))
+        .map(|value| {
+            let candidate = IceCandidate::new(format!("candidate:{value}"))
+                .ok_or_else(|| NegotiationError::RemoteCandidate(value.to_owned()))?;
+            if Candidate::from_sdp_string(candidate.as_sdp()).is_err() && !candidate.is_mdns() {
+                return Err(NegotiationError::RemoteCandidate(value.to_owned()));
+            }
+            Ok(candidate)
         })
         .collect()
+}
+
+fn bundle(sdp: &Sdp) -> Result<SessionAttribute, NegotiationError> {
+    sdp.session
+        .attrs
+        .iter()
+        .find(
+            |attribute| matches!(attribute, SessionAttribute::Group { typ, .. } if typ == "BUNDLE"),
+        )
+        .cloned()
+        .ok_or(NegotiationError::MissingBundle)
+}
+
+fn bundle_tag(bundle: &SessionAttribute) -> Result<String, NegotiationError> {
+    let SessionAttribute::Group { mids, .. } = bundle else {
+        return Err(NegotiationError::MissingBundle);
+    };
+    mids.first()
+        .map(ToString::to_string)
+        .ok_or(NegotiationError::MissingBundle)
 }
 
 fn media_kind(media_type: &MediaType) -> Result<MediaKind, NegotiationError> {
@@ -305,76 +334,111 @@ fn data_channel_parameters(
         .ok_or_else(|| NegotiationError::MissingSctpPort(mid.to_owned()))
 }
 
-fn filter_answer_attributes(line: &mut str0m::sdp::MediaLine, direction: MediaDirection) {
+struct AnswerMedia {
+    line: MediaLine,
+    attributes: Vec<MediaAttribute>,
+}
+
+fn answer_attributes_for_media(
+    line: &MediaLine,
+    direction: MediaDirection,
+    server: &ServerTransport,
+    setup: Setup,
+    bundle_tag: bool,
+) -> Vec<MediaAttribute> {
     let rtcp_mux = line.attrs.iter().any(|attribute| {
         matches!(
             attribute,
             MediaAttribute::RtcpMux | MediaAttribute::RtcpMuxOnly
         )
     });
-    line.attrs.retain(|attribute| {
-        matches!(
-            attribute,
-            MediaAttribute::Mid(_)
-                | MediaAttribute::SctpPort(_)
-                | MediaAttribute::MaxMessageSize(_)
-                | MediaAttribute::SctpInit(_)
-                | MediaAttribute::ExtMap { .. }
-                | MediaAttribute::RtcpMux
-                | MediaAttribute::RtcpRsize
-                | MediaAttribute::RtpMap { .. }
-                | MediaAttribute::RtcpFb { .. }
-                | MediaAttribute::Fmtp { .. }
-        )
-    });
-    if line
+    let mut attributes: Vec<_> = line
         .attrs
+        .iter()
+        .filter(|attribute| {
+            matches!(
+                attribute,
+                MediaAttribute::Mid(_)
+                    | MediaAttribute::SctpPort(_)
+                    | MediaAttribute::MaxMessageSize(_)
+                    | MediaAttribute::SctpInit(_)
+                    | MediaAttribute::ExtMap { .. }
+                    | MediaAttribute::RtcpMux
+                    | MediaAttribute::RtcpRsize
+                    | MediaAttribute::RtpMap { .. }
+                    | MediaAttribute::RtcpFb { .. }
+                    | MediaAttribute::Fmtp { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    if attributes
         .iter()
         .any(|attribute| matches!(attribute, MediaAttribute::RtcpMux))
     {
         debug_assert!(
-            line.attrs
+            attributes
                 .iter()
                 .all(|attribute| !matches!(attribute, MediaAttribute::RtcpMuxOnly))
         );
     }
     if rtcp_mux
-        && !line
-            .attrs
+        && !attributes
             .iter()
             .any(|attribute| matches!(attribute, MediaAttribute::RtcpMux))
     {
-        line.attrs.push(MediaAttribute::RtcpMux);
+        attributes.push(MediaAttribute::RtcpMux);
     }
-    line.attrs.push(match direction {
+    attributes.push(MediaAttribute::IceUfrag(server.ice.ufrag().to_owned()));
+    attributes.push(MediaAttribute::IcePwd(server.ice.password().to_owned()));
+    attributes.push(MediaAttribute::Fingerprint(str0m::crypto::Fingerprint {
+        hash_func: server.fingerprint.algorithm().to_owned(),
+        bytes: server.fingerprint.value().to_vec(),
+    }));
+    attributes.push(MediaAttribute::Setup(setup));
+    attributes.push(match direction {
         MediaDirection::SendOnly => MediaAttribute::SendOnly,
         MediaDirection::ReceiveOnly => MediaAttribute::RecvOnly,
         MediaDirection::Inactive => MediaAttribute::Inactive,
         MediaDirection::Bidirectional => MediaAttribute::SendRecv,
     });
+    if bundle_tag {
+        attributes.extend(
+            server
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    Candidate::from_sdp_string(candidate.as_sdp())
+                        .expect("local candidates are validated before answer formatting")
+                })
+                .map(MediaAttribute::Candidate),
+        );
+        attributes.push(MediaAttribute::EndOfCandidates);
+    }
+    attributes
 }
 
-fn answer_attributes(
+fn format_answer(
     server: &ServerTransport,
-    setup: Setup,
-    candidates: Vec<Candidate>,
-    bundle: Option<SessionAttribute>,
-) -> Vec<SessionAttribute> {
-    let mut attributes = Vec::with_capacity(candidates.len().saturating_add(7));
-    if let Some(group) = bundle {
-        attributes.push(group);
+    bundle: &SessionAttribute,
+    answer_media: Vec<AnswerMedia>,
+) -> String {
+    let mut answer = String::with_capacity(1024);
+    write!(
+        answer,
+        "v=0\r\no=- {} 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n{bundle}a=ice-lite\r\n",
+        server.session_id
+    )
+    .expect("writing an SDP answer to a string cannot fail");
+    for AnswerMedia {
+        mut line,
+        attributes,
+    } in answer_media
+    {
+        line.attrs = attributes;
+        write!(answer, "{line}").expect("writing an SDP answer to a string cannot fail");
     }
-    attributes.push(SessionAttribute::IceLite);
-    attributes.push(SessionAttribute::IceUfrag(server.ice.ufrag().to_owned()));
-    attributes.push(SessionAttribute::IcePwd(server.ice.password().to_owned()));
-    attributes.push(SessionAttribute::Fingerprint(Fingerprint {
-        hash_func: server.fingerprint.algorithm().to_owned(),
-        bytes: server.fingerprint.value().to_vec(),
-    }));
-    attributes.push(SessionAttribute::Setup(setup));
-    attributes.extend(candidates.into_iter().map(SessionAttribute::Candidate));
-    attributes.push(SessionAttribute::EndOfCandidates);
-    attributes
+    answer
 }
 
 #[cfg(test)]
@@ -431,6 +495,10 @@ mod tests {
         assert!(result.answer().as_str().contains("a=recvonly"));
         assert!(result.answer().as_str().contains("a=group:BUNDLE 0"));
         assert!(result.answer().as_str().contains("a=rtcp-mux"));
+        let answer = Sdp::parse(result.answer().as_str()).expect("valid answer SDP");
+        assert_eq!(answer.session.ice_candidates().count(), 0);
+        assert_eq!(answer.media_lines[0].ice_candidates().count(), 1);
+        assert!(answer.media_lines[0].end_of_candidates());
     }
 
     #[test]
@@ -461,5 +529,71 @@ mod tests {
             result.session().media_sections()[0].receive_rids(),
             ["q", "h", "f"]
         );
+    }
+
+    #[test]
+    fn answer_places_transport_facts_on_each_media_section_and_candidates_on_bundle_tag() {
+        let offer = format!(
+            "{}m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=mid:1\r\n\
+             a=sendonly\r\n\
+             a=rtcp-mux\r\n\
+             a=rtpmap:96 VP8/90000\r\n",
+            offer("sendonly").replace("a=group:BUNDLE 0", "a=group:BUNDLE 0 1")
+        );
+
+        let result = negotiate(&offer, &server()).expect("accepted bundle offer");
+        let answer = result.answer().as_str();
+        let media: Vec<_> = answer.split("m=").skip(1).collect();
+
+        assert_eq!(media.len(), 2);
+        assert!(
+            media
+                .iter()
+                .all(|section| section.contains("a=ice-ufrag:localufrag"))
+        );
+        assert!(
+            media
+                .iter()
+                .all(|section| section.contains("a=ice-pwd:localpassword"))
+        );
+        assert!(
+            media
+                .iter()
+                .all(|section| section.contains("a=fingerprint:sha-256"))
+        );
+        assert!(
+            media
+                .iter()
+                .all(|section| section.contains("a=setup:passive"))
+        );
+        assert!(media[0].contains("a=candidate:1 1 udp 2130706431 127.0.0.1 9000 typ host"));
+        assert!(media[0].contains("a=end-of-candidates"));
+        assert!(!media[1].contains("a=candidate:"));
+        assert!(!media[1].contains("a=end-of-candidates"));
+    }
+
+    #[test]
+    fn negotiated_session_preserves_mdns_candidates_for_peer_reflexive_ice() {
+        let offer = format!(
+            "{}a=candidate:1 1 UDP 2122260223 4db4c1e2-3c04-4ad0-b76b.local 52345 typ host\r\n",
+            offer("sendonly")
+        );
+
+        let result = negotiate(&offer, &server()).expect("accepted mDNS offer");
+
+        assert_eq!(result.session().remote_candidates().len(), 1);
+        assert!(result.session().remote_candidates()[0].is_mdns());
+    }
+
+    #[test]
+    fn negotiation_rejects_unparseable_non_mdns_candidate() {
+        let offer = format!("{}a=candidate:not-a-candidate\r\n", offer("sendonly"));
+
+        assert!(matches!(
+            negotiate(&offer, &server()),
+            Err(NegotiationError::RemoteCandidate(_))
+        ));
     }
 }

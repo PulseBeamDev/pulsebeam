@@ -78,11 +78,17 @@ transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
 
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
+await new Promise((resolve) => {
+  if (pc.iceGatheringState === "complete") return resolve();
+  pc.addEventListener("icegatheringstatechange", () => {
+    if (pc.iceGatheringState === "complete") resolve();
+  }, { once: true });
+});
 
 const res = await fetch("http://localhost:7070/api/v1/rooms/demo/participants", {
   method: "POST",
   headers: { "Content-Type": "application/sdp" },
-  body: offer.sdp,
+  body: pc.localDescription.sdp,
 });
 
 await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });

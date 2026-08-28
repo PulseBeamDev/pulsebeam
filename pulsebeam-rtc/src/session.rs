@@ -65,6 +65,22 @@ impl IceCandidate {
     pub fn as_sdp(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn is_mdns(&self) -> bool {
+        let Some((_, value)) = self.0.split_once(':') else {
+            return false;
+        };
+        let mut fields = value.split_ascii_whitespace();
+        let _foundation = fields.next();
+        let _component = fields.next();
+        let _protocol = fields.next();
+        let _priority = fields.next();
+        let address = fields.next();
+        let _port = fields.next();
+        let typ = fields.next();
+        let _kind = fields.next();
+        matches!(typ, Some("typ")) && address.is_some_and(|address| address.ends_with(".local"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

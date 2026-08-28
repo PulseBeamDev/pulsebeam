@@ -17,6 +17,19 @@
     videos.push(video);
   }
 
+  async function gatherCandidates(peer) {
+    if (peer.iceGatheringState === "complete") return;
+    await new Promise((resolve) => {
+      const onStateChange = () => {
+        if (peer.iceGatheringState === "complete") {
+          peer.removeEventListener("icegatheringstatechange", onStateChange);
+          resolve();
+        }
+      };
+      peer.addEventListener("icegatheringstatechange", onStateChange);
+    });
+  }
+
   async function connect({ apiUrl, room, meetShape = false }) {
     peer = new RTCPeerConnection();
     if (meetShape) {
@@ -47,10 +60,11 @@
 
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
+    await gatherCandidates(peer);
     const response = await fetch(`${apiUrl}/api/v1/rooms/${room}/participants`, {
       method: "POST",
       headers: { "Content-Type": "application/sdp" },
-      body: offer.sdp,
+      body: peer.localDescription.sdp,
     });
     if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
     await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
