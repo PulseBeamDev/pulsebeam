@@ -9,6 +9,10 @@ use pulsebeam_rtc::{
     PacketProvenance, ServerTransport, TransportMetadata, TransportProtocol, negotiate,
 };
 
+#[allow(
+    clippy::print_stdout,
+    reason = "the Playwright harness observes the fixture server lifecycle"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_address = argument("--http-address")?;
     let udp_address = argument("--udp-address")?;
@@ -19,7 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut connection = accept_connection(&listener, &udp)?;
     let local = udp.local_addr()?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or("browser interoperability deadline overflow")?;
     let mut packet_id = 0u64;
     let mut buffer = [0u8; 2048];
 
@@ -32,7 +38,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TransportMetadata::new(TransportProtocol::Udp, remote, local),
                 PacketId::new(packet_id),
             );
-            connection.handle_datagram(now, IngressPacket::new(&buffer[..len], provenance))?;
+            debug_assert!(len <= buffer.len(), "UDP receive length fits its buffer");
+            let bytes = buffer
+                .get(..len)
+                .ok_or("UDP receive length exceeds its buffer")?;
+            connection.handle_datagram(now, IngressPacket::new(bytes, provenance))?;
         }
         connection.handle_timeout(now);
         while let Some(datagram) = connection.poll_egress() {
@@ -50,14 +60,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn argument(name: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let value = std::env::args()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find_map(|values| (values[0] == name).then(|| values[1].parse()))
-        .transpose()?
-        .ok_or_else(|| format!("missing {name}"))?;
-    Ok(value)
+    let mut arguments = std::env::args().skip(1);
+    while let Some(flag) = arguments.next() {
+        if flag == name {
+            return arguments
+                .next()
+                .ok_or_else(|| format!("missing value for {name}"))?
+                .parse()
+                .map_err(Into::into);
+        }
+    }
+    Err(format!("missing {name}").into())
 }
 
 fn accept_connection(
@@ -98,12 +111,20 @@ fn read_offer(stream: &mut TcpStream) -> Result<String, Box<dyn std::error::Erro
         if len == 0 {
             return Err("signaling connection closed before request body".into());
         }
-        bytes.extend_from_slice(&buffer[..len]);
+        debug_assert!(len <= buffer.len(), "TCP read length fits its buffer");
+        let received = buffer
+            .get(..len)
+            .ok_or("TCP read length exceeds its buffer")?;
+        bytes.extend_from_slice(received);
         if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            break end + 4;
+            break end.checked_add(4).ok_or("HTTP header length overflow")?;
         }
     };
-    let headers = std::str::from_utf8(&bytes[..header_end])?;
+    let headers = std::str::from_utf8(
+        bytes
+            .get(..header_end)
+            .ok_or("HTTP header length exceeds request")?,
+    )?;
     let length = headers
         .lines()
         .find_map(|line| line.strip_prefix("Content-Length: "))
@@ -114,10 +135,19 @@ fn read_offer(stream: &mut TcpStream) -> Result<String, Box<dyn std::error::Erro
         if len == 0 {
             return Err("signaling connection closed before complete request body".into());
         }
-        bytes.extend_from_slice(&buffer[..len]);
+        debug_assert!(len <= buffer.len(), "TCP read length fits its buffer");
+        let received = buffer
+            .get(..len)
+            .ok_or("TCP read length exceeds its buffer")?;
+        bytes.extend_from_slice(received);
     }
-    let body_end = header_end.saturating_add(length);
-    Ok(std::str::from_utf8(&bytes[header_end..body_end])?.to_owned())
+    let body_end = header_end
+        .checked_add(length)
+        .ok_or("HTTP request body length overflow")?;
+    let body = bytes
+        .get(header_end..body_end)
+        .ok_or("HTTP request body exceeds received bytes")?;
+    Ok(std::str::from_utf8(body)?.to_owned())
 }
 
 fn write_answer(stream: &mut TcpStream, answer: &str) -> std::io::Result<()> {

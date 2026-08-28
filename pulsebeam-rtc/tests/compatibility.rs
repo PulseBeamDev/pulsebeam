@@ -1,4 +1,3 @@
-use proptest::prelude::*;
 use pulsebeam_rtc::{
     DtlsFingerprint, IceCandidate, IceCredentials, MediaDirection, MediaKind, ServerTransport,
     negotiate,
@@ -43,27 +42,32 @@ const FIXTURES: &[Fixture] = &[
     },
 ];
 
-fn server() -> ServerTransport {
+fn server() -> Result<ServerTransport, &'static str> {
     let ice = IceCredentials::new("localufrag".to_owned(), "localpassword".to_owned())
-        .expect("valid local ICE credentials");
+        .ok_or("valid local ICE credentials")?;
     let fingerprint = DtlsFingerprint::new("sha-256".to_owned(), Box::new([9; 32]))
-        .expect("valid local fingerprint");
+        .ok_or("valid local fingerprint")?;
     let candidate =
         IceCandidate::new("candidate:1 1 UDP 2130706431 127.0.0.1 9000 typ host".to_owned())
-            .expect("valid candidate");
-    ServerTransport::new(7, ice, fingerprint, Box::new([candidate]))
+            .ok_or("valid candidate")?;
+    Ok(ServerTransport::new(
+        7,
+        ice,
+        fingerprint,
+        Box::new([candidate]),
+    ))
 }
 
 #[test]
-fn client_offer_corpus_produces_web_rtc_1_compatible_answers() {
+fn client_offer_corpus_produces_web_rtc_1_compatible_answers() -> Result<(), String> {
     for fixture in FIXTURES {
-        let result = negotiate(fixture.offer, &server())
-            .unwrap_or_else(|error| panic!("{}: {error}", fixture.name));
+        let result = negotiate(fixture.offer, &server().map_err(str::to_owned)?)
+            .map_err(|error| format!("{}: {error}", fixture.name))?;
         let answer = Sdp::parse(result.answer().as_str())
-            .unwrap_or_else(|error| panic!("{}: invalid answer: {error}", fixture.name));
+            .map_err(|error| format!("{}: invalid answer: {error}", fixture.name))?;
         answer
             .assert_consistency()
-            .unwrap_or_else(|error| panic!("{}: inconsistent answer: {error}", fixture.name));
+            .map_err(|error| format!("{}: inconsistent answer: {error}", fixture.name))?;
 
         assert_eq!(
             result.session().remote_candidates().len(),
@@ -120,22 +124,21 @@ fn client_offer_corpus_produces_web_rtc_1_compatible_answers() {
             assert_eq!(media.end_of_candidates(), index == 0);
         }
     }
+    Ok(())
 }
 
-proptest! {
-    #[test]
-    fn supported_offer_shapes_always_produce_consistent_answers(
-        direction in prop_oneof![Just("sendonly"), Just("recvonly"), Just("inactive")],
-        extension_id in 1u8..15,
-        candidate in prop::bool::ANY,
-    ) {
-        let candidate = if candidate {
-            "a=candidate:1 1 udp 2130706431 127.0.0.1 5000 typ host\r\n"
-        } else {
-            ""
-        };
-        let offer = format!(
-            "v=0\r\n\
+#[test]
+fn supported_offer_shapes_always_produce_consistent_answers() -> Result<(), String> {
+    for direction in ["sendonly", "recvonly", "inactive"] {
+        for extension_id in 1u8..15 {
+            for candidate in [false, true] {
+                let candidate = if candidate {
+                    "a=candidate:1 1 udp 2130706431 127.0.0.1 5000 typ host\r\n"
+                } else {
+                    ""
+                };
+                let offer = format!(
+                    "v=0\r\n\
              o=- 1 2 IN IP4 127.0.0.1\r\n\
              s=-\r\n\
              t=0 0\r\n\
@@ -152,11 +155,21 @@ proptest! {
              a=rtpmap:111 opus/48000/2\r\n\
              a=extmap:{extension_id} urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
              {candidate}"
-        );
-        let result = negotiate(&offer, &server()).expect("supported offer");
-        let answer = Sdp::parse(result.answer().as_str()).expect("answer parses");
+                );
+                let result =
+                    negotiate(&offer, &server().map_err(str::to_owned)?).map_err(|error| {
+                        format!(
+                            "{direction} extension {extension_id} candidate {candidate:?}: {error}"
+                        )
+                    })?;
+                let answer = Sdp::parse(result.answer().as_str()).map_err(|error| {
+                    format!("{direction} extension {extension_id} candidate {candidate:?}: {error}")
+                })?;
 
-        prop_assert!(answer.assert_consistency().is_ok());
-        prop_assert_eq!(answer.media_lines[0].ice_candidates().count(), 1);
+                assert!(answer.assert_consistency().is_ok());
+                assert_eq!(answer.media_lines[0].ice_candidates().count(), 1);
+            }
+        }
     }
+    Ok(())
 }
