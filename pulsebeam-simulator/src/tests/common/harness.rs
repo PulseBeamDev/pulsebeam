@@ -151,6 +151,14 @@ impl Participant {
         }
     }
 
+    pub fn manual_publisher_and_subscriber(name: &'static str, slots: usize) -> Self {
+        Self {
+            auto_subscribe: false,
+            slots,
+            ..Self::single_publisher(name).and_subscribes()
+        }
+    }
+
     /// Data-channel-only participant: connects but adds no video tracks.
     pub fn data_participant(name: &'static str) -> Self {
         Self {
@@ -295,6 +303,7 @@ pub struct VideoQuality {
     pub max_undecodable_keyframes: u64,
     pub max_non_contiguous: u64,
     pub max_capture_to_decode_latency: Option<Duration>,
+    pub max_frame_gap: Option<Duration>,
 }
 
 impl VideoQuality {
@@ -305,6 +314,7 @@ impl VideoQuality {
             max_undecodable_keyframes: 0,
             max_non_contiguous: 0,
             max_capture_to_decode_latency: None,
+            max_frame_gap: None,
         }
     }
 
@@ -325,6 +335,11 @@ impl VideoQuality {
 
     pub fn max_capture_to_decode_latency(mut self, latency: Duration) -> Self {
         self.max_capture_to_decode_latency = Some(latency);
+        self
+    }
+
+    pub fn max_frame_gap(mut self, gap: Duration) -> Self {
+        self.max_frame_gap = Some(gap);
         self
     }
 }
@@ -2058,6 +2073,26 @@ async fn execute_plan(
                     "step {n}/{total} {kind}: {description} ({participant}) observed {} browser-invalid RTP packet(s) in the interval",
                     stats.browser_packet_errors,
                 );
+                assert_eq!(
+                    stats.decoder_errors, 0,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} decoder error(s) in the interval",
+                    stats.decoder_errors,
+                );
+                if let Some(max_latency) = quality.max_capture_to_decode_latency {
+                    assert_eq!(
+                        stats.capture_timed_frames,
+                        stats.frames,
+                        "step {n}/{total} {kind}: {description} ({participant}) lost Absolute Capture Time on {}/{} decoded frame(s) in the interval",
+                        stats.frames.saturating_sub(stats.capture_timed_frames),
+                        stats.frames,
+                    );
+                    assert!(
+                        stats.max_capture_to_decode_latency <= max_latency,
+                        "step {n}/{total} {kind}: {description} ({participant}) capture-to-decode latency {:?} exceeded {max_latency:?} in the interval",
+                        stats.max_capture_to_decode_latency,
+                    );
+                }
+                assert_video_frame_gap(n, total, kind, description, participant, quality, stats);
             }
 
             Step::CheckVideoNotReceivedFrom {
@@ -2958,6 +2993,39 @@ fn assert_video_quality(
         log.missing_payload_type_packets,
         log.changed_ssrc_packets,
         log.changed_payload_type_packets,
+    );
+    assert_video_frame_gap(
+        n,
+        total,
+        kind,
+        description,
+        participant,
+        quality,
+        log.stats(),
+    );
+}
+
+fn assert_video_frame_gap(
+    n: usize,
+    total: usize,
+    kind: &str,
+    description: &str,
+    participant: &str,
+    quality: &VideoQuality,
+    stats: VideoReceiveStats,
+) {
+    let Some(maximum) = quality.max_frame_gap else {
+        return;
+    };
+    let now = Instant::now();
+    let terminal = stats
+        .last_frame_at
+        .map(|last| now.saturating_duration_since(last))
+        .unwrap_or(Duration::MAX);
+    let observed = stats.longest_frame_gap.max(terminal);
+    assert!(
+        observed <= maximum,
+        "step {n}/{total} {kind}: {description} ({participant}) had a {observed:?} decoded-frame gap, maximum {maximum:?}"
     );
 }
 

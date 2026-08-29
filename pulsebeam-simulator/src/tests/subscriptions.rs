@@ -1,5 +1,63 @@
-use super::common::{LocalNodeSim, Participant, Room, Step};
+use super::common::{LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
+
+#[test]
+fn reciprocal_manual_subscriptions_decode_with_interactive_latency_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("reciprocal-manual-subscriptions")
+                .with_participant(Participant::manual_publisher_and_subscriber("alice", 1))
+                .with_participant(Participant::manual_publisher_and_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Both conference participants publish and discover each other",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeTo {
+                description: "Alice explicitly subscribes to Bob",
+                participant: "alice",
+                targets: &[("bob", 1080)],
+            },
+            Step::SubscribeTo {
+                description: "Bob explicitly subscribes to Alice",
+                participant: "bob",
+                targets: &[("alice", 1080)],
+            },
+            Step::Run {
+                description: "Explicit reciprocal assignments sustain decoded video",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Alice continuously renders Bob without a queueing delay",
+                participant: "alice",
+                quality: VideoQuality::min_frames(50)
+                    .allow_gaps(5)
+                    .max_capture_to_decode_latency(Duration::from_millis(250))
+                    .max_frame_gap(Duration::from_millis(500)),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Bob continuously renders Alice without a queueing delay",
+                participant: "bob",
+                quality: VideoQuality::min_frames(50)
+                    .allow_gaps(5)
+                    .max_capture_to_decode_latency(Duration::from_millis(250))
+                    .max_frame_gap(Duration::from_millis(500)),
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Alice's decoded frames originate with Bob",
+                participant: "alice",
+                publisher: "bob",
+                min_frames: 50,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Bob's decoded frames originate with Alice",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 50,
+            },
+        ]);
+}
 
 /// Validates the declarative subscription API end-to-end:
 /// subscriber discovers the publisher's track via signaling, `set_subscriptions()`
