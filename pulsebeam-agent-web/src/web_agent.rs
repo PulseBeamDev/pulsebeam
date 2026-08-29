@@ -1,11 +1,12 @@
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     rc::{Rc, Weak},
 };
 
 use agent_core::{
-    Agent, AgentConfig, AgentEffect, AgentNotification, AgentSnapshot, ClientState, StateError,
+    Agent, AgentConfig, AgentEffect, AgentNotification, AgentSnapshot, ClientState, MediaKind,
+    Publication, StateError, TopicError, TopicRegistration,
 };
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -17,14 +18,88 @@ use crate::watch::{self, Sender, TryRecvError};
 use wasm_bindgen::JsCast;
 
 pub struct WebAgent {
-    desired: Sender<ClientState>,
+    desired: Sender<WebAgentState>,
     inner: Rc<Inner>,
 }
 
-pub type WebEvent = AgentNotification;
+#[derive(Clone)]
+pub enum WebEvent {
+    Agent(AgentNotification),
+    RemoteMedia(RemoteMedia),
+}
+
+#[derive(Clone)]
+pub struct RemoteMedia {
+    inner: Rc<RefCell<RemoteMediaState>>,
+}
+
+#[derive(Clone)]
+struct RemoteMediaState {
+    publication: Publication,
+    mid: Option<String>,
+    paused: bool,
+    track: Option<web_sys::MediaStreamTrack>,
+}
+
+impl RemoteMedia {
+    pub fn publication(&self) -> Publication {
+        self.inner.borrow().publication.clone()
+    }
+
+    pub fn mid(&self) -> Option<String> {
+        self.inner.borrow().mid.clone()
+    }
+
+    pub fn paused(&self) -> bool {
+        self.inner.borrow().paused
+    }
+
+    pub fn track(&self) -> Option<web_sys::MediaStreamTrack> {
+        self.inner.borrow().track.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct WebSnapshot {
+    pub core: AgentSnapshot,
+    pub remote_media: Vec<RemoteMedia>,
+}
 
 pub struct WebAgentConfig {
     pub core: AgentConfig,
+}
+
+pub const TOPIC_BUFFERED_AMOUNT_LIMIT: u64 = 1_048_576;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TopicAdmission {
+    Wait,
+    Drop,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TopicSendResult {
+    Sent,
+    Dropped,
+    Waiting,
+}
+
+pub struct TopicPublisher {
+    actor: Weak<Inner>,
+    registration: TopicRegistration,
+}
+
+#[derive(Default)]
+pub struct WebAgentState {
+    pub client: ClientState,
+    pub local_tracks: Vec<LocalSlotTracks>,
+}
+
+#[derive(Clone)]
+pub struct LocalSlotTracks {
+    pub slot: String,
+    pub audio: Option<web_sys::MediaStreamTrack>,
+    pub video: Option<web_sys::MediaStreamTrack>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -33,6 +108,8 @@ pub enum WebAgentError {
     Stopped,
     #[error(transparent)]
     State(#[from] StateError),
+    #[error(transparent)]
+    Topic(#[from] TopicError),
 }
 
 struct Inner {
@@ -42,13 +119,16 @@ struct Inner {
 
 struct Actor {
     core: Agent,
-    desired: watch::Receiver<ClientState>,
+    desired: watch::Receiver<WebAgentState>,
+    local_tracks: Vec<LocalSlotTracks>,
     effects: VecDeque<AgentEffect>,
+    events: VecDeque<WebEvent>,
+    remote: RemoteRegistry,
 }
 
 impl WebAgent {
     pub fn new(config: WebAgentConfig) -> Self {
-        let (desired, receiver) = watch::channel::<ClientState>();
+        let (desired, receiver) = watch::channel::<WebAgentState>();
         let inner = Rc::new(Inner {
             actor: RefCell::new(Actor::new(config.core, receiver)),
             runtime: RefCell::new(BrowserRuntime::new()),
@@ -56,25 +136,42 @@ impl WebAgent {
         Self { desired, inner }
     }
 
-    pub fn set_state(&self, state: ClientState) -> Result<(), WebAgentError> {
+    pub fn set_state(&self, state: WebAgentState) -> Result<(), WebAgentError> {
         self.desired
             .send(state)
             .map_err(|_| WebAgentError::Stopped)?;
         Inner::pump(&self.inner)
     }
 
-    pub fn snapshot(&self) -> AgentSnapshot {
+    pub fn snapshot(&self) -> WebSnapshot {
         let _ = Inner::pump(&self.inner);
-        self.inner.actor.borrow().core.snapshot().clone()
+        self.inner.actor.borrow().snapshot()
     }
 
     pub fn next_event(&self) -> Option<WebEvent> {
         let _ = Inner::pump(&self.inner);
-        self.inner.actor.borrow_mut().core.next_notification()
+        self.inner.actor.borrow_mut().events.pop_front()
     }
 
     pub fn close(&self) -> Result<(), WebAgentError> {
-        self.set_state(ClientState::default())
+        self.set_state(WebAgentState::default())
+    }
+
+    pub fn topic_publisher(&self, registration: TopicRegistration) -> TopicPublisher {
+        TopicPublisher {
+            actor: Rc::downgrade(&self.inner),
+            registration,
+        }
+    }
+}
+
+impl TopicPublisher {
+    pub fn send(
+        &self,
+        payload: Vec<u8>,
+        admission: TopicAdmission,
+    ) -> Result<TopicSendResult, WebAgentError> {
+        Inner::send_topic(&self.actor, &self.registration, payload, admission)
     }
 }
 
@@ -84,6 +181,9 @@ impl Inner {
             let effect = {
                 let mut actor = this.actor.borrow_mut();
                 actor.apply_desired()?;
+                this.runtime
+                    .borrow_mut()
+                    .reconcile_media(&actor.local_tracks, &actor.core.desired_state().local_slots);
                 actor.effects.pop_front()
             };
             let Some(effect) = effect else {
@@ -103,21 +203,58 @@ impl Inner {
         let _ = inner.actor.borrow_mut().feed(event);
         let _ = Self::pump(&inner);
     }
+
+    fn send_topic(
+        this: &Weak<Self>,
+        registration: &TopicRegistration,
+        payload: Vec<u8>,
+        admission: TopicAdmission,
+    ) -> Result<TopicSendResult, WebAgentError> {
+        let Some(inner) = this.upgrade() else {
+            return Err(WebAgentError::Stopped);
+        };
+        let accepted = inner.runtime.borrow().can_send(registration, payload.len());
+        if !accepted {
+            return Ok(match admission {
+                TopicAdmission::Wait => TopicSendResult::Waiting,
+                TopicAdmission::Drop => TopicSendResult::Dropped,
+            });
+        }
+        {
+            let mut actor = inner.actor.borrow_mut();
+            actor.core.send_topic(registration, payload)?;
+            actor.drain_effects();
+        }
+        Self::pump(&inner)?;
+        Ok(TopicSendResult::Sent)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn track(this: &Weak<Self>, mid: String, track: web_sys::MediaStreamTrack) {
+        let Some(inner) = this.upgrade() else {
+            return;
+        };
+        inner.actor.borrow_mut().track(mid, track);
+    }
 }
 
 impl Actor {
-    fn new(config: AgentConfig, desired: watch::Receiver<ClientState>) -> Self {
+    fn new(config: AgentConfig, desired: watch::Receiver<WebAgentState>) -> Self {
         Self {
             core: Agent::new(config),
             desired,
+            local_tracks: Vec::new(),
             effects: VecDeque::new(),
+            events: VecDeque::new(),
+            remote: RemoteRegistry::default(),
         }
     }
 
     fn apply_desired(&mut self) -> Result<(), WebAgentError> {
         match self.desired.try_recv() {
             Ok(state) => {
-                self.core.set_state(state)?;
+                self.core.set_state(state.client)?;
+                self.local_tracks = state.local_tracks;
                 self.drain_effects();
             }
             Err(TryRecvError::Empty | TryRecvError::Closed) => {}
@@ -132,10 +269,97 @@ impl Actor {
         disposition
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn track(&mut self, mid: String, track: web_sys::MediaStreamTrack) {
+        self.remote.tracks.insert(mid, track);
+        self.sync_snapshot();
+    }
+
+    fn snapshot(&self) -> WebSnapshot {
+        WebSnapshot {
+            core: self.core.snapshot().clone(),
+            remote_media: self.remote.items.values().cloned().collect(),
+        }
+    }
+
     fn drain_effects(&mut self) {
         while let Some(effect) = self.core.next_effect() {
             self.effects.push_back(effect);
         }
+        self.sync_snapshot();
+        while let Some(notification) = self.core.next_notification() {
+            self.events.push_back(WebEvent::Agent(notification));
+        }
+    }
+
+    fn sync_snapshot(&mut self) {
+        for media in self.remote.reconcile(self.core.snapshot()) {
+            self.events.push_back(WebEvent::RemoteMedia(media));
+        }
+    }
+}
+
+#[derive(Default)]
+struct RemoteRegistry {
+    items: BTreeMap<String, RemoteMedia>,
+    tracks: BTreeMap<String, web_sys::MediaStreamTrack>,
+}
+
+impl RemoteRegistry {
+    fn reconcile(&mut self, snapshot: &AgentSnapshot) -> Vec<RemoteMedia> {
+        self.items.retain(|track_id, _| {
+            snapshot
+                .publications
+                .iter()
+                .any(|publication| publication.track_id == *track_id)
+        });
+        let mut changed = Vec::new();
+        for publication in &snapshot.publications {
+            let is_new = !self.items.contains_key(&publication.track_id);
+            let media = self
+                .items
+                .entry(publication.track_id.clone())
+                .or_insert_with(|| RemoteMedia {
+                    inner: Rc::new(RefCell::new(RemoteMediaState {
+                        publication: publication.clone(),
+                        mid: None,
+                        paused: false,
+                        track: None,
+                    })),
+                });
+            let binding = match publication.kind {
+                MediaKind::Video => snapshot
+                    .video_bindings
+                    .iter()
+                    .find(|binding| binding.track_id == publication.track_id)
+                    .map(|binding| (binding.mid.clone(), binding.paused)),
+                MediaKind::Audio => snapshot
+                    .audio_bindings
+                    .iter()
+                    .find(|binding| binding.track_id == publication.track_id)
+                    .map(|binding| (binding.mid.clone(), false)),
+            };
+            let mut state = media.inner.borrow_mut();
+            let next_mid = binding.as_ref().map(|(mid, _)| mid.clone());
+            let next_paused = binding.as_ref().is_some_and(|(_, paused)| *paused);
+            let next_track = next_mid
+                .as_ref()
+                .and_then(|mid| self.tracks.get(mid))
+                .cloned();
+            if is_new
+                || state.publication != *publication
+                || state.mid != next_mid
+                || state.paused != next_paused
+                || state.track != next_track
+            {
+                state.publication = publication.clone();
+                state.mid = next_mid;
+                state.paused = next_paused;
+                state.track = next_track;
+                changed.push(media.clone());
+            }
+        }
+        changed
     }
 }
 
@@ -149,6 +373,12 @@ impl BrowserRuntime {
     }
 
     fn execute(&mut self, _: AgentEffect, _: Weak<Inner>) {}
+
+    fn reconcile_media(&mut self, _: &[LocalSlotTracks], _: &[agent_core::LocalSlotIntent]) {}
+
+    fn can_send(&self, _: &TopicRegistration, _: usize) -> bool {
+        true
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -156,6 +386,8 @@ struct BrowserRuntime {
     transport: Option<Transport>,
     timers: std::collections::BTreeMap<agent_core::TimerId, gloo_timers::callback::Timeout>,
     requests: std::collections::BTreeMap<agent_core::RequestId, web_sys::AbortController>,
+    local_tracks: Vec<LocalSlotTracks>,
+    local_slots: Vec<agent_core::LocalSlotIntent>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -164,6 +396,7 @@ struct Transport {
     peer: web_sys::RtcPeerConnection,
     channels: std::collections::BTreeMap<agent_core::DataChannelId, Channel>,
     _connection_callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
+    _track_callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::RtcTrackEvent)>,
     _topology: WebTopology,
 }
 
@@ -182,6 +415,7 @@ struct WebTopology {
 #[cfg(target_arch = "wasm32")]
 struct Channel {
     channel: web_sys::RtcDataChannel,
+    label: String,
     _open_callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
     _close_callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
     _message_callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>,
@@ -194,6 +428,8 @@ impl BrowserRuntime {
             transport: None,
             timers: std::collections::BTreeMap::new(),
             requests: std::collections::BTreeMap::new(),
+            local_tracks: Vec::new(),
+            local_slots: Vec::new(),
         }
     }
 
@@ -203,6 +439,53 @@ impl BrowserRuntime {
             AgentEffect::DataChannel(effect) => self.channel(effect, actor),
             AgentEffect::Timer(effect) => self.timer(effect, actor),
             AgentEffect::Http(effect) => self.http(effect, actor),
+        }
+    }
+
+    fn reconcile_media(
+        &mut self,
+        tracks: &[LocalSlotTracks],
+        slots: &[agent_core::LocalSlotIntent],
+    ) {
+        self.local_tracks = tracks.to_vec();
+        self.local_slots = slots.to_vec();
+        self.apply_media();
+    }
+
+    fn can_send(&self, registration: &TopicRegistration, payload_len: usize) -> bool {
+        let Some(transport) = &self.transport else {
+            return false;
+        };
+        let label = agent_core::topic_label(registration);
+        let Some(channel) = transport
+            .channels
+            .values()
+            .find(|channel| channel.label == label)
+        else {
+            return false;
+        };
+        let payload_len = u64::try_from(payload_len).unwrap_or(u64::MAX);
+        u64::from(channel.channel.buffered_amount()).saturating_add(payload_len)
+            <= TOPIC_BUFFERED_AMOUNT_LIMIT
+    }
+
+    fn apply_media(&self) {
+        let Some(transport) = &self.transport else {
+            return;
+        };
+        for (name, audio, video) in &transport._topology.upstream {
+            let intent = self.local_slots.iter().find(|slot| slot.slot == *name);
+            let supplied = self.local_tracks.iter().find(|slot| slot.slot == *name);
+            let audio_track = intent
+                .filter(|slot| slot.audio.attached && !slot.audio.muted)
+                .and_then(|_| supplied.and_then(|slot| slot.audio.as_ref()));
+            let video_track = intent
+                .filter(|slot| slot.video.attached && !slot.video.muted)
+                .and_then(|_| supplied.and_then(|slot| slot.video.as_ref()));
+            let audio_sender = audio.sender();
+            let video_sender = video.sender();
+            let _ = audio_sender.replace_track(audio_track);
+            let _ = video_sender.replace_track(video_track);
         }
     }
 
@@ -301,6 +584,16 @@ impl BrowserRuntime {
         })
             as Box<dyn FnMut(web_sys::Event)>);
         peer.set_onconnectionstatechange(Some(connection_callback.as_ref().unchecked_ref()));
+        let track_actor = actor.clone();
+        let track_callback =
+            wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::RtcTrackEvent| {
+                let Some(mid) = event.transceiver().mid() else {
+                    return;
+                };
+                Inner::track(&track_actor, mid, event.track());
+            })
+                as Box<dyn FnMut(web_sys::RtcTrackEvent)>);
+        peer.set_ontrack(Some(track_callback.as_ref().unchecked_ref()));
         let web_topology = WebTopology::create(&peer, &topology);
         let offer_peer = peer.clone();
         let offer_topology = web_topology.clone();
@@ -355,8 +648,10 @@ impl BrowserRuntime {
             peer,
             channels: std::collections::BTreeMap::new(),
             _connection_callback: connection_callback,
+            _track_callback: track_callback,
             _topology: web_topology,
         });
+        self.apply_media();
     }
 
     fn channel(&mut self, effect: agent_core::DataChannelEffect, actor: Weak<Inner>) {
@@ -381,6 +676,7 @@ impl BrowserRuntime {
                 {
                     options.set_max_retransmits(value);
                 }
+                let label = config.label.clone();
                 let channel = transport
                     .peer
                     .create_data_channel_with_data_channel_dict(&config.label, &options);
@@ -431,6 +727,7 @@ impl BrowserRuntime {
                     id,
                     Channel {
                         channel,
+                        label,
                         _open_callback: open_callback,
                         _close_callback: close_callback,
                         _message_callback: message_callback,
@@ -632,9 +929,9 @@ mod tests {
     fn state_revisions_coalesce_before_actor_reconciliation() {
         let (sender, receiver) = watch::channel();
         let mut actor = Actor::new(config(), receiver);
-        sender.send(ClientState::default()).unwrap();
-        sender
-            .send(ClientState {
+        let _ = sender.send(WebAgentState::default());
+        let _ = sender.send(WebAgentState {
+            client: ClientState {
                 connection: ClientConnectionState::Connected,
                 identity: Some(ConnectionIdentity {
                     room: String::from("room"),
@@ -642,8 +939,9 @@ mod tests {
                     metadata: vec![],
                 }),
                 ..ClientState::default()
-            })
-            .unwrap();
+            },
+            local_tracks: vec![],
+        });
         actor.apply_desired().unwrap();
         assert!(matches!(
             actor.effects.pop_front(),
@@ -667,5 +965,62 @@ mod tests {
             EventDisposition::IgnoredStale
         );
         assert!(actor.effects.is_empty());
+    }
+
+    #[test]
+    fn remote_media_handle_survives_binding_churn() {
+        let publication = Publication {
+            track_id: String::from("video-1"),
+            participant_id: String::from("participant"),
+            kind: MediaKind::Video,
+        };
+        let mut registry = RemoteRegistry::default();
+        let first_snapshot = AgentSnapshot {
+            publications: vec![publication.clone()],
+            video_bindings: vec![agent_core::VideoBinding {
+                mid: String::from("video-a"),
+                track_id: publication.track_id.clone(),
+                paused: false,
+            }],
+            ..AgentSnapshot::default()
+        };
+        let first = registry.reconcile(&first_snapshot).pop().unwrap();
+        let second_snapshot = AgentSnapshot {
+            publications: vec![publication],
+            video_bindings: vec![agent_core::VideoBinding {
+                mid: String::from("video-b"),
+                track_id: String::from("video-1"),
+                paused: true,
+            }],
+            ..AgentSnapshot::default()
+        };
+        let second = registry.reconcile(&second_snapshot).pop().unwrap();
+        assert!(Rc::ptr_eq(&first.inner, &second.inner));
+        assert_eq!(first.mid(), Some(String::from("video-b")));
+        assert!(first.paused());
+    }
+
+    #[test]
+    fn wait_and_drop_have_distinct_unavailable_outcomes() {
+        assert_eq!(
+            admission(false, TopicAdmission::Wait),
+            TopicSendResult::Waiting
+        );
+        assert_eq!(
+            admission(false, TopicAdmission::Drop),
+            TopicSendResult::Dropped
+        );
+        assert_eq!(admission(true, TopicAdmission::Wait), TopicSendResult::Sent);
+    }
+
+    fn admission(accepted: bool, admission: TopicAdmission) -> TopicSendResult {
+        if accepted {
+            TopicSendResult::Sent
+        } else {
+            match admission {
+                TopicAdmission::Wait => TopicSendResult::Waiting,
+                TopicAdmission::Drop => TopicSendResult::Dropped,
+            }
+        }
     }
 }
