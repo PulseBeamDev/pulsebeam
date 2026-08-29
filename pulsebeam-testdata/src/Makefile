@@ -21,6 +21,15 @@ BITRATE_F = 1250
 BITRATE_H = 400
 BITRATE_Q = 150
 
+QUALITY_WIDTH = 320
+QUALITY_HEIGHT = 180
+QUALITY_FPS = 30
+QUALITY_SECONDS = 3
+QUALITY_VIDEO = quality_320x180_30.h264
+QUALITY_VIDEO_REFERENCE = quality_320x180_30.yuv
+QUALITY_AUDIO = quality_48k_mono.opus
+QUALITY_AUDIO_REFERENCE = quality_48k_mono.s16le
+
 # Core structural settings shared across CBR profile
 BASE_COMMON = tune=zerolatency \
               bframes=0 \
@@ -43,12 +52,39 @@ BASE_COMMON = tune=zerolatency \
 # Specific rate-control modifiers
 CBR_FLAGS = pass=cbr vbv-buf-capacity=200
 
-.PHONY: all clean prepare estimate download distclean screenshare screenshare-analyze
+.PHONY: all clean prepare estimate download distclean screenshare screenshare-analyze quality-fixtures verify-quality-fixtures
 
 all: prepare $(INPUT_VIDEO) \
      $(OUT_DIR)/full_f_cbr.h264 \
      $(OUT_DIR)/half_h_cbr.h264 \
      $(OUT_DIR)/quarter_q_cbr.h264
+
+quality-fixtures: $(OUT_DIR)/$(QUALITY_VIDEO) \
+                  $(OUT_DIR)/$(QUALITY_VIDEO_REFERENCE) \
+                  $(OUT_DIR)/$(QUALITY_AUDIO) \
+                  $(OUT_DIR)/$(QUALITY_AUDIO_REFERENCE)
+
+$(OUT_DIR)/$(QUALITY_VIDEO):
+	ffmpeg -y -f lavfi -i testsrc2=size=$(QUALITY_WIDTH)x$(QUALITY_HEIGHT):rate=$(QUALITY_FPS) \
+		-t $(QUALITY_SECONDS) -pix_fmt yuv420p -c:v libx264 -profile:v baseline -level:v 3.0 \
+		-preset ultrafast -tune zerolatency -x264-params keyint=$(QUALITY_FPS):min-keyint=$(QUALITY_FPS):scenecut=0:repeat-headers=1 \
+		-f h264 $@
+
+$(OUT_DIR)/$(QUALITY_VIDEO_REFERENCE):
+	ffmpeg -y -f lavfi -i testsrc2=size=$(QUALITY_WIDTH)x$(QUALITY_HEIGHT):rate=$(QUALITY_FPS) \
+		-t $(QUALITY_SECONDS) -pix_fmt yuv420p -f rawvideo $@
+
+$(OUT_DIR)/$(QUALITY_AUDIO):
+	ffmpeg -y -f lavfi -i sine=frequency=997:sample_rate=48000:duration=$(QUALITY_SECONDS) \
+		-ac 1 -c:a libopus -application lowdelay -frame_duration 20 -vbr off -b:a 48k -frames:a 150 -f opus $@
+
+$(OUT_DIR)/$(QUALITY_AUDIO_REFERENCE):
+	ffmpeg -y -f lavfi -i sine=frequency=997:sample_rate=48000:duration=$(QUALITY_SECONDS) \
+		-ac 1 -ar 48000 -f s16le $@
+
+verify-quality-fixtures: quality-fixtures
+	@test $$(wc -c < $(OUT_DIR)/$(QUALITY_VIDEO_REFERENCE)) -eq $$(( $(QUALITY_WIDTH) * $(QUALITY_HEIGHT) * 3 / 2 * $(QUALITY_FPS) * $(QUALITY_SECONDS) ))
+	@test $$(wc -c < $(OUT_DIR)/$(QUALITY_AUDIO_REFERENCE)) -eq $$(( 48000 * 2 * $(QUALITY_SECONDS) ))
 
 prepare:
 	mkdir -p $(OUT_DIR)

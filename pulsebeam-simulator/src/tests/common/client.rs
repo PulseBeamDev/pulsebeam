@@ -1236,7 +1236,11 @@ mod decoder_tests {
     fn bundled_openh264_decodes_the_h264_fixture() {
         let mut decoder = H264Decoder::new().unwrap();
         let image = decoder
-            .decode(pulsebeam_testdata::RAW_H264_QUARTER_CBR)
+            .decode(
+                pulsebeam_testdata::quality_video_frame(0)
+                    .expect("quality fixture frame")
+                    .encoded,
+            )
             .unwrap();
         assert!(image.is_some());
     }
@@ -1245,8 +1249,13 @@ mod decoder_tests {
     fn bundled_opus_decodes_the_audio_fixture() {
         let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
         let mut pcm = Box::<[i16]>::from([0; 5_760]);
+        let fixture = pulsebeam_testdata::quality_audio_fixture();
         let samples = decoder
-            .decode(pulsebeam_testdata::RAW_OPUS_20MS_MONO, &mut pcm, false)
+            .decode(
+                fixture.frame(0).expect("quality fixture frame").opus_packet,
+                &mut pcm,
+                false,
+            )
             .unwrap();
         assert_eq!(samples, 960);
         assert!(pcm[..samples].iter().any(|sample| *sample != 0));

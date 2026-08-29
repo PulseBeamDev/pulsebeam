@@ -4,7 +4,7 @@ use str0m::media::MediaTime;
 use tokio::sync::watch;
 
 use crate::{MediaFrame, agent::LocalEncoding};
-use pulsebeam_testdata::RAW_OPUS_20MS_MONO;
+use pulsebeam_testdata::quality_audio_fixture;
 
 #[derive(Clone)]
 pub struct KeyframeNotifier(watch::Sender<u64>);
@@ -831,6 +831,11 @@ impl AudioLooper {
             crate::pipeline::FrameSender::without_dependency_descriptor(mid, rid, 1);
         let mut interval = tokio::time::interval(Duration::from_millis(self.packet_ms));
         let mut packets: u64 = 0;
+        let fixture = quality_audio_fixture();
+        if fixture.is_empty() {
+            return;
+        }
+        let fixture_len = u64::try_from(fixture.len()).unwrap_or(u64::MAX);
 
         loop {
             let tick_time = interval.tick().await;
@@ -842,11 +847,21 @@ impl AudioLooper {
             packets = packets.saturating_add(1);
 
             let (level_dbov, speech) = self.at(packets);
+            let fixture_index = usize::try_from(
+                packets
+                    .saturating_sub(1)
+                    .checked_rem(fixture_len)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0);
+            let Some(fixture_frame) = fixture.frame(fixture_index) else {
+                return;
+            };
             let frame = MediaFrame {
                 audio_level: Some(level_dbov),
                 voice_activity: Some(speech),
                 ts: MediaTime::new(ts, str0m::media::Frequency::FORTY_EIGHT_KHZ),
-                data: Arc::from(RAW_OPUS_20MS_MONO),
+                data: Arc::from(fixture_frame.opus_packet),
                 capture_time: tick_time,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,

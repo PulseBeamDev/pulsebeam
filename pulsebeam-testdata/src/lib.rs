@@ -25,10 +25,109 @@ pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");
 pub const RAW_H264_QUARTER_CBR: &[u8] = include_bytes!("quarter_q_cbr.h264");
 pub const RAW_H264_SCREEN_FULL_VBR: &[u8] = include_bytes!("screen_f_vbr.h264");
 pub const RAW_H264_SCREEN_FULL_TIMING: &str = include_str!("screen_f_vbr.timing");
+pub const QUALITY_H264_320X180_30: &[u8] = include_bytes!("quality_320x180_30.h264");
+pub const QUALITY_H264_320X180_30_YUV420P: &[u8] = include_bytes!("quality_320x180_30.yuv");
+pub const QUALITY_OPUS_48K_MONO: &[u8] = include_bytes!("quality_48k_mono.opus");
+pub const QUALITY_OPUS_48K_MONO_PCM_S16LE: &[u8] = include_bytes!("quality_48k_mono.s16le");
+
+pub const QUALITY_VIDEO_WIDTH: usize = 320;
+pub const QUALITY_VIDEO_HEIGHT: usize = 180;
+pub const QUALITY_VIDEO_FPS: u32 = 30;
+pub const QUALITY_VIDEO_FRAME_COUNT: usize = 90;
+pub const QUALITY_VIDEO_RTP_CLOCK_RATE: u64 = 90_000;
+pub const QUALITY_AUDIO_SAMPLE_RATE: usize = 48_000;
+pub const QUALITY_AUDIO_FRAME_SAMPLES: usize = 960;
+pub const QUALITY_AUDIO_FRAME_COUNT: usize = 150;
+pub const QUALITY_AUDIO_RTP_CLOCK_RATE: u64 = 48_000;
 pub const RAW_OPUS_20MS_MONO: &[u8] = &[
     0x08, 0x83, 0x6d, 0x82, 0xd0, 0x1c, 0xfd, 0xed, 0xc4, 0xec, 0xe7, 0xf3, 0x8f, 0xa4, 0x92, 0x47,
     0x98,
 ];
+
+#[derive(Clone, Copy, Debug)]
+pub struct QualityVideoFrame<'a> {
+    pub index: usize,
+    pub rtp_timestamp: u64,
+    pub encoded: &'a [u8],
+    pub reference_yuv420p: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct QualityAudioFrame<'a> {
+    pub index: usize,
+    pub rtp_timestamp: u64,
+    pub opus_packet: &'a [u8],
+    pub reference_pcm_s16le: &'a [u8],
+    pub sample_rate: usize,
+    pub samples: usize,
+}
+
+#[derive(Debug)]
+pub struct QualityAudioFixture {
+    packets: Vec<&'static [u8]>,
+}
+
+impl QualityAudioFixture {
+    pub fn frame(&self, index: usize) -> Option<QualityAudioFrame<'static>> {
+        let opus_packet = *self.packets.get(index)?;
+        let pcm_bytes = QUALITY_AUDIO_FRAME_SAMPLES.checked_mul(2)?;
+        let pcm_start = index.checked_mul(pcm_bytes)?;
+        let pcm_end = pcm_start.checked_add(pcm_bytes)?;
+        let reference_pcm_s16le = QUALITY_OPUS_48K_MONO_PCM_S16LE.get(pcm_start..pcm_end)?;
+        let rtp_timestamp = u64::try_from(index)
+            .ok()?
+            .checked_mul(u64::try_from(QUALITY_AUDIO_FRAME_SAMPLES).ok()?)?;
+        Some(QualityAudioFrame {
+            index,
+            rtp_timestamp,
+            opus_packet,
+            reference_pcm_s16le,
+            sample_rate: QUALITY_AUDIO_SAMPLE_RATE,
+            samples: QUALITY_AUDIO_FRAME_SAMPLES,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+}
+
+pub fn quality_video_frame(index: usize) -> Option<QualityVideoFrame<'static>> {
+    let encoded = *h264_access_units(QUALITY_H264_320X180_30).get(index)?;
+    let frame_bytes = QUALITY_VIDEO_WIDTH
+        .checked_mul(QUALITY_VIDEO_HEIGHT)?
+        .checked_mul(3)?
+        .checked_div(2)?;
+    let reference_start = index.checked_mul(frame_bytes)?;
+    let reference_end = reference_start.checked_add(frame_bytes)?;
+    let reference_yuv420p = QUALITY_H264_320X180_30_YUV420P.get(reference_start..reference_end)?;
+    let rtp_timestamp = u64::try_from(index)
+        .ok()?
+        .checked_mul(QUALITY_VIDEO_RTP_CLOCK_RATE)?
+        .checked_div(u64::from(QUALITY_VIDEO_FPS))?;
+    Some(QualityVideoFrame {
+        index,
+        rtp_timestamp,
+        encoded,
+        reference_yuv420p,
+        width: QUALITY_VIDEO_WIDTH,
+        height: QUALITY_VIDEO_HEIGHT,
+    })
+}
+
+pub fn quality_audio_fixture() -> QualityAudioFixture {
+    let mut packets = ogg_opus_packets(QUALITY_OPUS_48K_MONO);
+    debug_assert!(packets.len() >= QUALITY_AUDIO_FRAME_COUNT);
+    packets.truncate(QUALITY_AUDIO_FRAME_COUNT);
+    debug_assert_eq!(packets.len(), QUALITY_AUDIO_FRAME_COUNT);
+    QualityAudioFixture { packets }
+}
 
 // 16 video and 5 audio downstream slots
 pub const RAW_CHROME_SDP: &str = include_str!("chrome.sdp");
@@ -110,6 +209,116 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
         frames.push(current_frame_bytes);
     }
     frames
+}
+
+fn h264_access_units(data: &'static [u8]) -> Vec<&'static [u8]> {
+    let mut start_codes = Vec::new();
+    let mut index = 0usize;
+    while index.saturating_add(3) < data.len() {
+        let start_code_len = if data[index] == 0
+            && data[index.saturating_add(1)] == 0
+            && data[index.saturating_add(2)] == 0
+            && data[index.saturating_add(3)] == 1
+        {
+            Some(4usize)
+        } else if data[index] == 0
+            && data[index.saturating_add(1)] == 0
+            && data[index.saturating_add(2)] == 1
+        {
+            Some(3usize)
+        } else {
+            None
+        };
+        if let Some(start_code_len) = start_code_len {
+            start_codes.push((index, start_code_len));
+            index = index.saturating_add(start_code_len);
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+
+    let mut units = Vec::new();
+    let mut access_unit_start = start_codes.first().map(|(offset, _)| *offset).unwrap_or(0);
+    let mut seen_vcl = false;
+    for (position, (offset, start_code_len)) in start_codes.iter().enumerate() {
+        let header = offset.saturating_add(*start_code_len);
+        let next_offset = start_codes
+            .get(position.saturating_add(1))
+            .map(|(next, _)| *next)
+            .unwrap_or(data.len());
+        let Some(&nal_header) = data.get(header) else {
+            continue;
+        };
+        let nal_type = nal_header & 0x1f;
+        let starts_new_access_unit = matches!(nal_type, 1..=5)
+            && data
+                .get(header.saturating_add(1))
+                .is_some_and(|byte| byte & 0x80 != 0);
+        if starts_new_access_unit && seen_vcl {
+            let Some(access_unit) = data.get(access_unit_start..*offset) else {
+                continue;
+            };
+            if !access_unit.is_empty() {
+                units.push(access_unit);
+            }
+            access_unit_start = *offset;
+        }
+        if matches!(nal_type, 1..=5) {
+            seen_vcl = true;
+        }
+        debug_assert!(header < next_offset || header == data.len());
+    }
+    if seen_vcl
+        && let Some(access_unit) = data.get(access_unit_start..)
+        && !access_unit.is_empty()
+    {
+        units.push(access_unit);
+    }
+    units
+}
+
+fn ogg_opus_packets(data: &'static [u8]) -> Vec<&'static [u8]> {
+    let mut packets = Vec::new();
+    let mut page = 0usize;
+    while page < data.len() {
+        let Some(header) = data.get(page..page.saturating_add(27)) else {
+            break;
+        };
+        if header.get(..4) != Some(b"OggS") {
+            break;
+        }
+        let segment_count = usize::from(*header.get(26).unwrap_or(&0));
+        let lacing_start = page.saturating_add(27);
+        let Some(lacing) = data.get(lacing_start..lacing_start.saturating_add(segment_count))
+        else {
+            break;
+        };
+        let mut packet_start = lacing_start.saturating_add(segment_count);
+        let mut packet_len = 0usize;
+        for &segment_len in lacing {
+            let segment_len = usize::from(segment_len);
+            let Some(_) = data.get(packet_start..packet_start.saturating_add(segment_len)) else {
+                return packets;
+            };
+            packet_len = packet_len.saturating_add(segment_len);
+            packet_start = packet_start.saturating_add(segment_len);
+            if segment_len < 255 {
+                let start = packet_start.saturating_sub(packet_len);
+                let Some(packet) = data.get(start..packet_start) else {
+                    return packets;
+                };
+                if !packet.starts_with(b"OpusHead") && !packet.starts_with(b"OpusTags") {
+                    packets.push(packet);
+                }
+                packet_len = 0;
+            }
+        }
+        if packet_len != 0 {
+            return packets;
+        }
+        page = packet_start;
+    }
+    packets
 }
 
 pub fn frame_timestamps_micros(data: &str) -> Vec<u64> {
@@ -221,5 +430,58 @@ mod tests {
                 "{rid} level {level:#04x} exceeds Chrome's level 3.1 contract"
             );
         }
+    }
+
+    #[test]
+    fn quality_video_references_match_the_encoded_sequence() {
+        assert_eq!(
+            h264_access_units(QUALITY_H264_320X180_30).len(),
+            QUALITY_VIDEO_FRAME_COUNT
+        );
+        let first = quality_video_frame(0).expect("first quality video frame");
+        let last = quality_video_frame(QUALITY_VIDEO_FRAME_COUNT.saturating_sub(1))
+            .expect("last quality video frame");
+        assert_eq!(first.rtp_timestamp, 0);
+        assert_eq!(
+            last.rtp_timestamp,
+            QUALITY_VIDEO_RTP_CLOCK_RATE
+                .saturating_mul(QUALITY_VIDEO_FRAME_COUNT.saturating_sub(1) as u64)
+                / u64::from(QUALITY_VIDEO_FPS)
+        );
+        assert_eq!(first.width, QUALITY_VIDEO_WIDTH);
+        assert_eq!(first.height, QUALITY_VIDEO_HEIGHT);
+        assert_eq!(
+            first.reference_yuv420p.len(),
+            QUALITY_VIDEO_WIDTH
+                .saturating_mul(QUALITY_VIDEO_HEIGHT)
+                .saturating_mul(3)
+                / 2
+        );
+        assert!(!first.encoded.is_empty());
+        assert!(quality_video_frame(QUALITY_VIDEO_FRAME_COUNT).is_none());
+    }
+
+    #[test]
+    fn quality_audio_references_match_the_opus_sequence() {
+        let fixture = quality_audio_fixture();
+        assert_eq!(fixture.len(), QUALITY_AUDIO_FRAME_COUNT);
+        let first = fixture.frame(0).expect("first quality audio frame");
+        let last = fixture
+            .frame(QUALITY_AUDIO_FRAME_COUNT.saturating_sub(1))
+            .expect("last quality audio frame");
+        assert_eq!(first.rtp_timestamp, 0);
+        assert_eq!(
+            last.rtp_timestamp,
+            QUALITY_AUDIO_FRAME_SAMPLES.saturating_mul(QUALITY_AUDIO_FRAME_COUNT.saturating_sub(1))
+                as u64
+        );
+        assert_eq!(first.sample_rate, QUALITY_AUDIO_SAMPLE_RATE);
+        assert_eq!(first.samples, QUALITY_AUDIO_FRAME_SAMPLES);
+        assert_eq!(
+            first.reference_pcm_s16le.len(),
+            QUALITY_AUDIO_FRAME_SAMPLES.saturating_mul(2)
+        );
+        assert!(!first.opus_packet.is_empty());
+        assert!(fixture.frame(QUALITY_AUDIO_FRAME_COUNT).is_none());
     }
 }
