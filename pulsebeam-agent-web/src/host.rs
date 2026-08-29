@@ -1,4 +1,4 @@
-use alloc::format;
+use std::format;
 
 static LOGGER: WebLogger = WebLogger;
 

@@ -1,21 +1,14 @@
-#![no_std]
-
 extern crate alloc;
 
+#[cfg(target_arch = "wasm32")]
 mod host;
-mod watch;
+pub mod watch;
 mod web_agent;
-use wasm_bindgen::prelude::*;
 
-#[wasm_bindgen]
-extern "C" {
-    pub fn alert(s: &str);
-}
+pub use web_agent::*;
 
-#[wasm_bindgen(start)]
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start() {
     host::install();
 }
-
-#[wasm_bindgen]
-pub fn greet(_name: &str) {}

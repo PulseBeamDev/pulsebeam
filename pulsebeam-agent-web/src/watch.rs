@@ -194,7 +194,8 @@ impl<T> Future for Recv<'_, T> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.done {
-            panic!("Recv polled after completion");
+            debug_assert!(!self.done, "Recv polled after completion");
+            return Poll::Pending;
         }
 
         let this = &mut *self;
@@ -255,6 +256,11 @@ impl<T> Drop for Recv<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_types,
+        reason = "Wake requires Arc and the test counter requires atomic visibility to its Waker"
+    )]
+
     extern crate std;
 
     use super::*;

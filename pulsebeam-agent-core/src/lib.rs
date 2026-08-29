@@ -12,7 +12,7 @@ mod topic;
 pub use agent::*;
 pub use context::{
     AgentEffect, AgentEvent, DataChannelConfig, DataChannelEffect, DataChannelEvent,
-    DataChannelReliability, HttpEffect, RtcEffect, TimerEffect,
+    DataChannelReliability, HttpEffect, HttpEvent, RtcEffect, RtcEvent, TimerEffect, TimerEvent,
 };
 pub use id::{DataChannelId, Generation, RequestId, TimerId};
 pub use model::*;
