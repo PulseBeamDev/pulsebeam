@@ -108,8 +108,8 @@ pub fn negotiate(
         .ok_or_else(|| NegotiationError::Sdp("incompatible DTLS setup roles".to_owned()))?;
 
     let local_candidates = parse_local_candidates(&server.candidates)?;
-    let bundle = bundle(&parsed)?;
-    let bundle_tag = bundle_tag(&bundle)?;
+    let _ = bundle(&parsed)?;
+    let bundle_tag = answer_bundle_tag(&parsed)?;
     let mut mids = HashSet::with_capacity(parsed.media_lines.len());
     let mut sections = Vec::with_capacity(parsed.media_lines.len());
     let mut answer_media = Vec::with_capacity(parsed.media_lines.len());
@@ -153,7 +153,7 @@ pub fn negotiate(
                 server,
                 setup,
                 &local_candidates,
-                mid == bundle_tag,
+                bundle_tag.as_deref() == Some(mid.as_str()),
                 &accepted_payload_types,
             ),
         });
@@ -180,7 +180,7 @@ pub fn negotiate(
     );
 
     Ok(NegotiationResult {
-        answer: SdpAnswer::new(format_answer(server, &bundle, answer_media)),
+        answer: SdpAnswer::new(format_answer(server, answer_media)),
         session,
     })
 }
@@ -221,13 +221,14 @@ fn bundle(sdp: &Sdp) -> Result<SessionAttribute, NegotiationError> {
         .ok_or(NegotiationError::MissingBundle)
 }
 
-fn bundle_tag(bundle: &SessionAttribute) -> Result<String, NegotiationError> {
-    let SessionAttribute::Group { mids, .. } = bundle else {
-        return Err(NegotiationError::MissingBundle);
-    };
-    mids.first()
-        .map(ToString::to_string)
-        .ok_or(NegotiationError::MissingBundle)
+fn answer_bundle_tag(sdp: &Sdp) -> Result<Option<String>, NegotiationError> {
+    for line in &sdp.media_lines {
+        let kind = media_kind(&line.typ)?;
+        if kind == MediaKind::Application || !codecs(kind, line).is_empty() {
+            return Ok(Some(line.mid().to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn media_kind(media_type: &MediaType) -> Result<MediaKind, NegotiationError> {
@@ -454,16 +455,24 @@ fn answer_attributes_for_media(
     attributes
 }
 
-fn format_answer(
-    server: &ServerTransport,
-    bundle: &SessionAttribute,
-    answer_media: Vec<AnswerMedia>,
-) -> String {
+fn format_answer(server: &ServerTransport, answer_media: Vec<AnswerMedia>) -> String {
     let mut answer = String::with_capacity(1024);
     answer.push_str("v=0\r\no=- ");
     answer.push_str(&server.session_id.to_string());
     answer.push_str(" 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n");
-    answer.push_str(&bundle.to_string());
+    let bundle_mids: Vec<_> = answer_media
+        .iter()
+        .filter(|media| !media.line.disabled)
+        .map(|media| media.line.mid().to_owned())
+        .collect();
+    if !bundle_mids.is_empty() {
+        answer.push_str("a=group:BUNDLE");
+        for mid in bundle_mids {
+            answer.push(' ');
+            answer.push_str(&mid);
+        }
+        answer.push_str("\r\n");
+    }
     answer.push_str("a=ice-lite\r\n");
     for AnswerMedia {
         mut line,
@@ -583,6 +592,8 @@ mod tests {
         let media: Vec<_> = answer.split("m=").skip(1).collect();
 
         assert_eq!(media.len(), 2);
+        assert!(answer.contains("a=group:BUNDLE 0\r\n"));
+        assert!(!answer.contains("a=group:BUNDLE 0 1\r\n"));
         assert!(
             media
                 .iter()

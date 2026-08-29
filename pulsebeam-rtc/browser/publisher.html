@@ -38,7 +38,8 @@
 
   async function connect(signalingUrl) {
     peer = new RTCPeerConnection({ iceServers: [] });
-    peer.addTransceiver(videoTrack(), { direction: "sendonly" });
+    const transceiver = peer.addTransceiver(videoTrack(), { direction: "sendonly" });
+    transceiver.setCodecPreferences(h264Codecs());
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
     await gatherCandidates(peer);
@@ -49,6 +50,12 @@
     });
     if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
     await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
+  }
+
+  function h264Codecs() {
+    return RTCRtpSender.getCapabilities("video")?.codecs.filter((codec) =>
+      codec.mimeType.toLowerCase() === "video/h264"
+    ) ?? [];
   }
 
   async function stats() {
@@ -74,5 +81,5 @@
     };
   }
 
-  window.pulsebeamRtcPublisher = { connect, stats, sdp };
+  window.pulsebeamRtcPublisher = { connect, stats, sdp, supportsH264: () => h264Codecs().length > 0 };
 </script>
