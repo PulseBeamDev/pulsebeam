@@ -6,6 +6,7 @@ pub use effect::*;
 pub use event::*;
 
 use crate::{http::HttpRequest, id::*};
+use core::time::Duration;
 
 #[allow(
     dead_code,
@@ -50,6 +51,17 @@ impl AgentContext {
         Some(timer)
     }
 
+    pub(crate) fn schedule_timer(&mut self, after: Duration) -> Option<TimerId> {
+        let id = self.timer_id()?;
+        self.emit(AgentEffect::Timer(TimerEffect::Schedule { id, after }));
+        Some(id)
+    }
+
+    pub(crate) fn cancel_timer(&mut self, id: TimerId) {
+        self.correlations.timers.remove(&id);
+        self.emit(AgentEffect::Timer(TimerEffect::Cancel { id }));
+    }
+
     pub(crate) fn emit(&mut self, effect: AgentEffect) {
         self.effects.emit(effect);
     }
@@ -59,6 +71,10 @@ impl AgentContext {
         self.correlations.requests.insert(id);
         self.emit(AgentEffect::Http(HttpEffect::Request { id, request: req }));
         Some(id)
+    }
+
+    pub(crate) fn complete_request(&mut self, id: RequestId) {
+        self.correlations.requests.remove(&id);
     }
 
     pub(crate) fn rtc_open(&mut self) -> Option<Generation> {

@@ -1,4 +1,5 @@
 use crate::{
+    NegotiatedTopology,
     http::HttpResponse,
     id::{DataChannelId, Generation, RequestId, TimerId},
 };
@@ -15,6 +16,7 @@ pub enum RtcEvent {
     OfferCreated {
         generation: Generation,
         offer: String,
+        topology: NegotiatedTopology,
     },
 
     AnswerApplied {

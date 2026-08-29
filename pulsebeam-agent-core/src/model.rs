@@ -371,6 +371,8 @@ pub enum StateError {
     EmptyPinnedAudioTrack,
     #[error("latency minimum exceeds maximum")]
     LatencyMinimumAboveMaximum,
+    #[error("fixed latency cannot return to adaptive during a session")]
+    LatencyCannotReturnAdaptive,
     #[error("topic must not be empty")]
     EmptyTopic,
     #[error("topic scope is valid only for latest subscribers")]
@@ -453,4 +455,49 @@ pub struct TransportDescription {
     pub generation: Generation,
     pub topology: Topology,
     pub signaling_channel: DataChannelId,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NegotiatedTopology {
+    pub upstream_slots: Vec<NegotiatedUpstreamSlot>,
+    pub video_receive_mids: Vec<String>,
+    pub audio_receive_mids: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NegotiatedUpstreamSlot {
+    pub slot: String,
+    pub audio_mid: String,
+    pub video_mid: String,
+}
+
+impl NegotiatedTopology {
+    pub fn validate(&self, topology: &Topology) -> Result<(), AgentError> {
+        if self.upstream_slots.len() != topology.upstream_slots().len()
+            || self.video_receive_mids.len() != usize::from(topology.video_receive_slots())
+            || self.audio_receive_mids.len() != usize::from(topology.audio_receive_slots())
+        {
+            return Err(AgentError::Protocol(String::from(
+                "negotiated topology shape changed",
+            )));
+        }
+        for (expected, actual) in topology.upstream_slots().iter().zip(&self.upstream_slots) {
+            if expected.name() != actual.slot
+                || actual.audio_mid.is_empty()
+                || actual.video_mid.is_empty()
+            {
+                return Err(AgentError::Protocol(String::from(
+                    "invalid negotiated upstream slot",
+                )));
+            }
+        }
+        if self.video_receive_mids.iter().any(String::is_empty)
+            || self.audio_receive_mids.iter().any(String::is_empty)
+        {
+            return Err(AgentError::Protocol(String::from(
+                "empty negotiated receive mid",
+            )));
+        }
+        Ok(())
+    }
 }
