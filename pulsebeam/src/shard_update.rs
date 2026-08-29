@@ -6,8 +6,8 @@ use std::collections::{HashSet, VecDeque};
 use crate::id::ShardId;
 use crate::keys::{ParticipantKey, TrackKey};
 use crate::route::{RouteAction, RouteHandle, TransportHandle};
-use pulsebeam_runtime::mailbox;
 use crate::rtp::EncodingId as Rid;
+use pulsebeam_runtime::mailbox;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {

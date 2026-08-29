@@ -118,7 +118,10 @@ impl IceUfrag {
         Some(Self::from_shared(shared))
     }
 
-    #[allow(clippy::expect_used, reason = "the encoder creates a non-empty ICE ufrag and password")]
+    #[allow(
+        clippy::expect_used,
+        reason = "the encoder creates a non-empty ICE ufrag and password"
+    )]
     pub fn into_ice_creds(self) -> IceCredentials {
         // The ICE password is the only thing authenticating a peer against this
         // route, so it comes from OS entropy directly. Under simulation the

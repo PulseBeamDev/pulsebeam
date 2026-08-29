@@ -14,8 +14,8 @@ use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::{
-    self, EncodingId as Rid, MediaSectionId as Mid, PayloadType as Pt, RtpPacket,
-    SenderReport, SimulcastEncoding, Ssrc, VideoLayersAllocation,
+    self, EncodingId as Rid, MediaSectionId as Mid, PayloadType as Pt, RtpPacket, SenderReport,
+    SimulcastEncoding, Ssrc, VideoLayersAllocation,
     monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
@@ -1154,10 +1154,8 @@ mod data_track {
 
                     let supported_delivery_guarantee = match lane {
                         DataLane::Realtime => {
-                            matches!(
-                                reliability.max_retransmits_value(),
-                                Some(0)
-                            ) && !reliability.ordered()
+                            matches!(reliability.max_retransmits_value(), Some(0))
+                                && !reliability.ordered()
                         }
                         DataLane::Reliable => {
                             reliability.max_retransmits_value().is_none()
@@ -1704,8 +1702,8 @@ mod simulcast_pause_tests {
     use super::*;
     use crate::entity::ParticipantId;
     use crate::rtp::RtpPacket;
-    use std::time::Duration;
     use crate::rtp::SimulcastEncoding as SimulcastLayer;
+    use std::time::Duration;
 
     /// A three-encoding video track and a starting instant.
     fn track() -> (UpstreamTrack, Instant) {

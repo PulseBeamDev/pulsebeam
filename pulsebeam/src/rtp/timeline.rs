@@ -136,10 +136,7 @@ impl Timeline {
 
     fn rebase_inner(&mut self, packet: &RtpPacket) {
         let input_seq = *packet.seq_no;
-        self.seq_base = self
-            .max_output
-            .wrapping_add(1)
-            .wrapping_sub(input_seq);
+        self.seq_base = self.max_output.wrapping_add(1).wrapping_sub(input_seq);
 
         let input_ts = packet.rtp_ts.numer();
         self.ts_base = match self.epoch {
