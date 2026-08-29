@@ -102,6 +102,20 @@ impl StreamWriter {
     pub fn pop(&mut self) -> Option<StreamWrite> {
         self.pending.pop_front()
     }
+
+    pub(crate) fn front_pacing_size(&self) -> Option<usize> {
+        self.pending.front().map(StreamWrite::pacing_size)
+    }
+}
+
+impl StreamWrite {
+    fn pacing_size(&self) -> usize {
+        match self {
+            Self::Video { pkt, .. } | Self::Audio { pkt, .. } => {
+                pkt.payload.len().saturating_add(64)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]

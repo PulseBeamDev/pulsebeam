@@ -21,6 +21,7 @@ use crate::{
         direct_transport::{DirectTransport, DirectTransportConfig, DirectTransportOutput},
         downstream::{DownstreamAllocator, SlotConfig},
         event::ParticipantSink,
+        pacer::PacketPacer,
         reverse::ReversePacket,
         signaling::Signaling,
         upstream::{IncomingRtpRoute, UpstreamAllocator},
@@ -357,6 +358,7 @@ pub struct DirectParticipantCore {
     upstream: UpstreamAllocator,
     downstream: DownstreamAllocator,
     stream_writer: StreamWriter,
+    pacer: PacketPacer,
     pub(crate) participant_id: ParticipantId,
     pub(crate) room_id: RoomId,
     pub(crate) shard_id: ShardId,
@@ -517,6 +519,7 @@ impl DirectParticipantCore {
             upstream,
             downstream,
             stream_writer: StreamWriter::new(),
+            pacer: PacketPacer::new(now, crate::participant::downstream::INITIAL_BANDWIDTH.get()),
             participant_id,
             room_id,
             shard_id,
@@ -846,9 +849,14 @@ impl DirectParticipantCore {
             .last_slow_poll
             .checked_add(SLOW_POLL_INTERVAL)
             .unwrap_or(self.last_slow_poll);
+        let pacer = self
+            .stream_writer
+            .front_pacing_size()
+            .map(|bytes| self.pacer.next_ready(now, bytes));
         self.transport
             .next_deadline(now)
             .map_or(Some(slow), |deadline| Some(deadline.min(slow)))
+            .map(|deadline| pacer.map_or(deadline, |pacer| deadline.min(pacer)))
     }
 
     fn write_pending(&mut self, now: Instant) {
@@ -857,7 +865,16 @@ impl DirectParticipantCore {
                 break;
             }
         }
-        while let Some(write) = self.stream_writer.pop() {
+        self.pacer
+            .set_rate(now, self.transport.congestion_bitrate_bps(now));
+        while let Some(estimated_size) = self.stream_writer.front_pacing_size() {
+            if !self.pacer.permits(now, estimated_size) {
+                break;
+            }
+            let Some(write) = self.stream_writer.pop() else {
+                debug_assert!(false, "a paced stream write must remain queued");
+                break;
+            };
             let (packet, _mid, _rid, payload_type, ssrc, _kind) = match write {
                 StreamWrite::Video {
                     pkt,

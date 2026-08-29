@@ -116,6 +116,12 @@ impl DirectTransport {
         self.connection.report_departure(send_id, now.into())
     }
 
+    pub fn congestion_bitrate_bps(&self, now: Instant) -> u64 {
+        self.connection
+            .congestion_estimate(now.into())
+            .bitrate_bps()
+    }
+
     pub fn send_rtp(
         &mut self,
         bytes: &[u8],
@@ -286,8 +292,7 @@ impl DirectTransport {
             .iter()
             .find(|codec| codec.payload_type() == packet.payload_type())
             .and_then(|codec| Codec::from_name(codec.name()))?;
-        let mut extensions = PacketExtensions::default();
-        extensions.absolute_capture_time = section
+        let absolute_capture_time = section
             .header_extensions()
             .iter()
             .find(|extension| extension.uri() == ABS_CAPTURE_TIME_EXTENSION_URI)
@@ -300,6 +305,10 @@ impl DirectTransport {
             .map(pulsebeam_rtc::HeaderExtensionValue::value)
             .filter(|value| matches!(value.len(), 8 | 16))
             .map(Into::into);
+        let mut extensions = PacketExtensions {
+            absolute_capture_time,
+            ..PacketExtensions::default()
+        };
         let audio_level = section
             .header_extensions()
             .iter()

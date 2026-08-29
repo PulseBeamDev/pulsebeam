@@ -1565,6 +1565,39 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
         ]);
 }
 
+#[test]
+fn pacing_bounds_latency_on_a_near_capacity_link_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(1_350_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::multi_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and discover the track",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeTo {
+                description: "Bob asks for the top layer on a link that only narrowly fits it",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Run through startup probing and sustained near-capacity forwarding",
+                duration: Duration::from_secs(70),
+            },
+            Step::CheckVideoQuality {
+                description: "Pacing prevents a live stream from accumulating queueing delay",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100)
+                    .allow_gaps(8)
+                    .max_capture_to_decode_latency(Duration::from_millis(250)),
+            },
+        ]);
+}
+
 /// A subscription squeezed onto a low layer must climb back when the link recovers.
 ///
 /// The link starts at 500 kbps, which only affords `q`, then widens to 3 Mbps. The viewer asked

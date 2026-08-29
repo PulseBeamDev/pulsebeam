@@ -7,6 +7,7 @@ pub(crate) mod downstream;
 pub mod effect;
 pub(crate) mod event;
 pub(crate) mod intent;
+mod pacer;
 pub mod packet;
 pub(crate) mod reverse;
 mod signaling;
