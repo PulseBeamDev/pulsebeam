@@ -17,7 +17,7 @@ use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::task::JoinSet;
 // The process-wide shimmed clock, not tokio's: turmoil virtualises `tokio::time::Instant` per
 // host, so a timestamp taken here cannot be compared with one taken on the coordinator. See
@@ -370,6 +370,8 @@ pub struct VideoReceiveLog {
     /// freeze inside one still leaves bytes in the window: sampled at step boundaries this reads
     /// zero however badly the stream stalled. A viewer notices the gap, not the total.
     pub longest_frame_gap: Duration,
+    pub capture_timed_frames: u64,
+    pub max_capture_to_decode_latency: Duration,
     last_frame_at: Option<Instant>,
     last_ts: Option<u64>,
     seen_ts: HashSet<u64>,
@@ -381,6 +383,7 @@ struct BrowserVideoReceiver {
     expected_ssrc: Option<u32>,
     expected_payload_type: Option<u8>,
     open_frame_timestamp: Option<u64>,
+    frame_capture_time: Option<SystemTime>,
     rejects_vp8_payload_type: bool,
     expected_seq: Option<u64>,
     access_unit: Vec<u8>,
@@ -401,6 +404,7 @@ impl BrowserVideoReceiver {
             expected_ssrc: None,
             expected_payload_type: None,
             open_frame_timestamp: None,
+            frame_capture_time: None,
             rejects_vp8_payload_type,
             expected_seq: None,
             access_unit: Vec::with_capacity(16 * 1024),
@@ -481,6 +485,12 @@ impl BrowserVideoReceiver {
             .is_some_and(|open| open != timestamp)
         {
             self.finish(log, publisher, timestamp);
+        }
+        if self.open_frame_timestamp.is_none() {
+            self.frame_capture_time = rtp
+                .ext_vals
+                .abs_capture_time
+                .map(|value| value.capture_time);
         }
         self.open_frame_timestamp = Some(timestamp);
 
@@ -600,7 +610,12 @@ impl BrowserVideoReceiver {
                         }
                         self.pending_gap = false;
                         self.has_rendered = true;
-                        log.record_decoded(publisher, timestamp, self.frame_is_keyframe);
+                        log.record_decoded(
+                            publisher,
+                            timestamp,
+                            self.frame_is_keyframe,
+                            self.frame_capture_time,
+                        );
                     }
                 }
                 Ok(None) => {}
@@ -615,6 +630,7 @@ impl BrowserVideoReceiver {
         self.fu_header = None;
         self.frame_is_keyframe = false;
         self.frame_damaged = false;
+        self.frame_capture_time = None;
     }
 
     fn record_undecodable_keyframe(&self, log: &mut VideoReceiveLog) {
@@ -874,6 +890,8 @@ pub struct VideoReceiveStats {
     pub ts_regression_count: u64,
     pub max_ts_regression: u64,
     pub longest_frame_gap: Duration,
+    pub capture_timed_frames: u64,
+    pub max_capture_to_decode_latency: Duration,
     pub first_frame_at: Option<Instant>,
     pub last_frame_at: Option<Instant>,
     pub frozen_time: Duration,
@@ -898,6 +916,12 @@ impl VideoReceiveStats {
                 .saturating_sub(baseline.ts_regression_count),
             max_ts_regression: self.max_ts_regression.max(baseline.max_ts_regression),
             longest_frame_gap: self.longest_frame_gap.max(baseline.longest_frame_gap),
+            capture_timed_frames: self
+                .capture_timed_frames
+                .saturating_sub(baseline.capture_timed_frames),
+            max_capture_to_decode_latency: self
+                .max_capture_to_decode_latency
+                .max(baseline.max_capture_to_decode_latency),
             first_frame_at: self.first_frame_at.or(baseline.first_frame_at),
             last_frame_at: self.last_frame_at,
             frozen_time: self.frozen_time.saturating_sub(baseline.frozen_time),
@@ -926,6 +950,8 @@ impl VideoReceiveLog {
             ts_regression_count: self.ts_regression_count,
             max_ts_regression: self.max_ts_regression,
             longest_frame_gap: self.longest_frame_gap,
+            capture_timed_frames: self.capture_timed_frames,
+            max_capture_to_decode_latency: self.max_capture_to_decode_latency,
             first_frame_at: self.first_frame_at,
             last_frame_at: self.last_frame_at,
             frozen_time: self.frozen_time,
@@ -934,8 +960,21 @@ impl VideoReceiveLog {
         }
     }
 
-    fn record_decoded(&mut self, publisher: &str, ts: u64, is_keyframe: bool) {
+    fn record_decoded(
+        &mut self,
+        publisher: &str,
+        ts: u64,
+        is_keyframe: bool,
+        capture_time: Option<SystemTime>,
+    ) {
         let now = Instant::now();
+        if let Some(capture_time) = capture_time
+            && let Ok(latency) =
+                pulsebeam_agent::clock::wallclock_at(now.into()).duration_since(capture_time)
+        {
+            self.capture_timed_frames = self.capture_timed_frames.saturating_add(1);
+            self.max_capture_to_decode_latency = self.max_capture_to_decode_latency.max(latency);
+        }
         if let Some(previous) = self.last_frame_at {
             let gap = now.saturating_duration_since(previous);
             self.longest_frame_gap = self.longest_frame_gap.max(gap);

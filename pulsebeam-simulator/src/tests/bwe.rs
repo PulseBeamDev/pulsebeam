@@ -1510,6 +1510,13 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
                 description: "Measurement window",
                 duration: Duration::from_secs(30),
             },
+            Step::CheckVideoQuality {
+                description: "Rendered frames remain close to their capture time",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100)
+                    .allow_gaps(5)
+                    .max_capture_to_decode_latency(Duration::from_millis(250)),
+            },
             // 30s of f is ~4.7 MB; of h, ~1.5 MB. 3 MB cleanly separates "reached the top layer"
             // from "stuck partway up the ladder".
             Step::CheckForwardedQuality {

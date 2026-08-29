@@ -27,6 +27,8 @@ use crate::entity::{ParticipantId, TrackId};
 /// TODO: get these clocks from SDP instead.
 pub const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
 pub const AUDIO_FREQUENCY: Frequency = Frequency::FORTY_EIGHT_KHZ;
+pub const ABS_CAPTURE_TIME_EXTENSION_URI: &str =
+    "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {

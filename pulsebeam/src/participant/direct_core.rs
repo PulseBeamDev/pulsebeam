@@ -27,8 +27,8 @@ use crate::{
     },
     rtp::cache::TrackStreamCache,
     rtp::{
-        Codec, CodecPayloadTypes, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId,
-        PayloadType, Ssrc,
+        ABS_CAPTURE_TIME_EXTENSION_URI, Codec, CodecPayloadTypes, KeyframeRequest,
+        KeyframeRequestKind, MediaKind, MediaSectionId, PayloadType, Ssrc,
     },
     track::{
         self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent,
@@ -49,6 +49,7 @@ const MAX_RETRANSMISSIONS_PER_TICK: usize = 64;
 
 #[derive(Clone)]
 struct OutgoingExtensions {
+    absolute_capture_time: Option<u8>,
     mid: Option<(u8, Box<[u8]>)>,
     rid: Option<u8>,
     twcc: Option<u8>,
@@ -58,6 +59,12 @@ struct OutgoingExtensions {
 
 impl OutgoingExtensions {
     fn from_section(section: &pulsebeam_rtc::NegotiatedMediaSection) -> Self {
+        let absolute_capture_time = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == ABS_CAPTURE_TIME_EXTENSION_URI)
+            .map(pulsebeam_rtc::HeaderExtension::id)
+            .filter(|&id| id > 0);
         let mid = section
             .header_extensions()
             .iter()
@@ -88,6 +95,7 @@ impl OutgoingExtensions {
         let nackable = section.kind() == RtcMediaKind::Video
             && section.codecs().iter().any(pulsebeam_rtc::Codec::nack);
         Self {
+            absolute_capture_time,
             mid,
             rid,
             twcc,
@@ -178,6 +186,10 @@ fn encode_rtp(
     ssrc: Ssrc,
     extensions: Option<&OutgoingExtensions>,
 ) -> (Vec<u8>, Option<usize>) {
+    let absolute_capture_time = extensions
+        .and_then(|extensions| extensions.absolute_capture_time)
+        .zip(packet.extensions.absolute_capture_time.as_deref())
+        .filter(|(_, value)| matches!(value.len(), 8 | 16));
     let mid = extensions.and_then(|extensions| extensions.mid.as_ref());
     let rid = extensions
         .and_then(|extensions| extensions.rid)
@@ -190,15 +202,20 @@ fn encode_rtp(
         .zip(packet.extensions.raw_dependency_descriptor.as_ref())
         .map(|(id, descriptor)| (id, descriptor.0.as_slice()))
         .filter(|(_, descriptor)| !descriptor.is_empty());
-    let two_byte_extensions = mid.is_some_and(|(id, _)| *id > 14)
+    let two_byte_extensions = absolute_capture_time
+        .is_some_and(|(id, value)| id > 14 || value.len() > 16)
+        || mid.is_some_and(|(id, _)| *id > 14)
         || rid.is_some_and(|(id, rid)| id > 14 || rid.len() > 16)
         || twcc.is_some_and(|id| id > 14)
         || dependency_descriptor.is_some_and(|(id, descriptor)| id > 14 || descriptor.len() > 16);
     let extension_header_len = if two_byte_extensions { 2usize } else { 1usize };
-    let extension_data_len = mid
+    let extension_data_len = absolute_capture_time
         .map_or(0, |(_, value)| {
             extension_header_len.saturating_add(value.len())
         })
+        .saturating_add(mid.map_or(0, |(_, value)| {
+            extension_header_len.saturating_add(value.len())
+        }))
         .saturating_add(rid.map_or(0, |(_, value)| {
             extension_header_len.saturating_add(value.len())
         }))
@@ -235,6 +252,16 @@ fn encode_rtp(
                 .expect("RTP header extension must fit its 16-bit word length")
                 .to_be_bytes(),
         );
+        if let Some((id, value)) = absolute_capture_time {
+            debug_assert!(id > 0 && matches!(value.len(), 8 | 16));
+            if two_byte_extensions {
+                bytes.extend_from_slice(&[id, u8::try_from(value.len()).unwrap_or_default()]);
+            } else {
+                debug_assert!(id < 15 && value.len() <= 16);
+                bytes.push((id << 4) | u8::try_from(value.len() - 1).unwrap_or_default());
+            }
+            bytes.extend_from_slice(value);
+        }
         if let Some((id, mid)) = mid {
             debug_assert!(*id > 0);
             debug_assert!(!mid.is_empty() && mid.len() <= usize::from(u8::MAX));
@@ -1276,6 +1303,7 @@ mod tests {
     #[test]
     fn outgoing_rtp_carries_negotiated_mid_and_twcc_fields() {
         let extensions = OutgoingExtensions {
+            absolute_capture_time: None,
             mid: Some((3, Box::from(*b"video"))),
             rid: None,
             twcc: Some(5),
@@ -1306,6 +1334,7 @@ mod tests {
     #[test]
     fn outgoing_rtp_carries_the_selected_simulcast_rid() {
         let extensions = OutgoingExtensions {
+            absolute_capture_time: None,
             mid: None,
             rid: Some(4),
             twcc: None,
@@ -1335,6 +1364,7 @@ mod tests {
     #[test]
     fn outgoing_rtp_preserves_long_dependency_descriptor() {
         let extensions = OutgoingExtensions {
+            absolute_capture_time: None,
             mid: None,
             rid: None,
             twcc: None,
@@ -1364,6 +1394,36 @@ mod tests {
         assert_eq!(&bytes[18..35], &(0u8..17).collect::<Vec<_>>());
         assert!(twcc_offset.is_none());
         assert_eq!(&bytes[bytes.len() - 3..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn outgoing_rtp_preserves_absolute_capture_time() {
+        let extensions = OutgoingExtensions {
+            absolute_capture_time: Some(3),
+            mid: None,
+            rid: None,
+            twcc: None,
+            dependency_descriptor: None,
+            nackable: false,
+        };
+        let packet = crate::rtp::RtpPacket {
+            extensions: crate::rtp::PacketExtensions {
+                absolute_capture_time: Some(Box::new([1, 2, 3, 4, 5, 6, 7, 8])),
+                ..Default::default()
+            },
+            payload: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let (bytes, twcc_offset) = encode_rtp(
+            &packet,
+            PayloadType::new(96).expect("valid RTP payload type"),
+            Ssrc::from(17),
+            Some(&extensions),
+        );
+
+        assert_eq!(&bytes[12..16], &[0xbe, 0xde, 0, 3]);
+        assert_eq!(&bytes[16..25], &[0x37, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(twcc_offset.is_none());
     }
 
     #[test]

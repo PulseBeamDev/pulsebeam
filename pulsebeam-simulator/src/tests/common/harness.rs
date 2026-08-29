@@ -300,6 +300,7 @@ pub struct VideoQuality {
     pub min_frames: u64,
     pub max_undecodable_keyframes: u64,
     pub max_non_contiguous: u64,
+    pub max_capture_to_decode_latency: Option<Duration>,
 }
 
 impl VideoQuality {
@@ -309,6 +310,7 @@ impl VideoQuality {
             min_frames: n,
             max_undecodable_keyframes: 0,
             max_non_contiguous: 0,
+            max_capture_to_decode_latency: None,
         }
     }
 
@@ -324,6 +326,11 @@ impl VideoQuality {
     /// a publisher partition, reconnect, or abrupt exit.
     pub fn allow_gaps(mut self, n: u64) -> Self {
         self.max_non_contiguous = n;
+        self
+    }
+
+    pub fn max_capture_to_decode_latency(mut self, latency: Duration) -> Self {
+        self.max_capture_to_decode_latency = Some(latency);
         self
     }
 }
@@ -2939,6 +2946,18 @@ fn assert_video_quality(
         log.ts_regression_count,
         log.non_contiguous,
     );
+    if let Some(max_latency) = quality.max_capture_to_decode_latency {
+        assert_eq!(
+            log.capture_timed_frames, log.frames,
+            "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     every decoded frame to retain Absolute Capture Time\n  actual:       {}/{} frame(s) carried a usable timestamp",
+            log.capture_timed_frames, log.frames,
+        );
+        assert!(
+            log.max_capture_to_decode_latency <= max_latency,
+            "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     capture-to-decode latency ≤ {max_latency:?}\n  actual:       {:?}",
+            log.max_capture_to_decode_latency,
+        );
+    }
     assert_eq!(
         log.unexpected_vp8_packets, 0,
         "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     H.264 RTP to retain its negotiated H.264 payload type\n  actual:       {} packet(s) labelled as VP8",
@@ -3487,8 +3506,9 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
     }
 
     let offered = stats.delivered + stats.dropped_overflow;
+    let capture_to_decode_latency = handle.video_rx().max_capture_to_decode_latency;
     out.push_str(&format!(
-        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
+        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} capture-to-decode={capture_to_decode_latency:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
         qoe_now.frames,
         qoe_now.mean_fps,
         qoe_now.keyframes,

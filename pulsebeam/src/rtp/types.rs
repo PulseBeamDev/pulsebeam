@@ -256,6 +256,7 @@ pub struct SenderReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PacketExtensions {
+    pub absolute_capture_time: Option<Box<[u8]>>,
     pub mid: Option<MediaSectionId>,
     pub rid: Option<EncodingId>,
     pub audio_level: Option<i8>,

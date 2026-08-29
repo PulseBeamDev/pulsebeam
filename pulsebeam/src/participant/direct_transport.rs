@@ -10,7 +10,7 @@ use pulsebeam_rtc::{
 use pulsebeam_runtime::net::{RecvPacketBatch, Transport};
 use tokio::time::Instant;
 
-use crate::rtp::{Codec, PacketExtensions, RtpPacket};
+use crate::rtp::{ABS_CAPTURE_TIME_EXTENSION_URI, Codec, PacketExtensions, RtpPacket};
 
 const MAX_INGRESS_PER_TICK: usize = 64;
 const AUDIO_LEVEL_EXTENSION_URI: &str = "ssrc-audio-level";
@@ -287,6 +287,19 @@ impl DirectTransport {
             .find(|codec| codec.payload_type() == packet.payload_type())
             .and_then(|codec| Codec::from_name(codec.name()))?;
         let mut extensions = PacketExtensions::default();
+        extensions.absolute_capture_time = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri() == ABS_CAPTURE_TIME_EXTENSION_URI)
+            .and_then(|extension| {
+                packet
+                    .header_extension(section, extension.id())
+                    .ok()
+                    .flatten()
+            })
+            .map(pulsebeam_rtc::HeaderExtensionValue::value)
+            .filter(|value| matches!(value.len(), 8 | 16))
+            .map(Into::into);
         let audio_level = section
             .header_extensions()
             .iter()
