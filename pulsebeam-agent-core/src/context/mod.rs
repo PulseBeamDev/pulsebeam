@@ -91,6 +91,10 @@ impl AgentContext {
         Some(id)
     }
 
+    pub(crate) fn forget_data_channel(&mut self, id: DataChannelId) {
+        self.correlations.channels.remove(&id);
+    }
+
     pub(crate) fn dc_open(
         &mut self,
         generation: Generation,

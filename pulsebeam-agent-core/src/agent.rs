@@ -1,9 +1,10 @@
-use alloc::{collections::VecDeque, format, string::String, vec};
+use alloc::{collections::VecDeque, format, string::String, vec, vec::Vec};
 use core::time::Duration;
 
 use crate::{
     AgentConfig, AgentError, AgentNotification, AgentSnapshot, ClientConnectionState, ClientState,
     ConnectionPhase, DataChannelEvent, EventDisposition, NegotiatedTopology, RtcEffect, StateError,
+    TopicError, TopicReceive, TopicRegistration, TopicRegistry,
     context::{
         AgentContext, AgentEffect, AgentEvent, DataChannelConfig, HttpEvent, RtcEvent, TimerEvent,
     },
@@ -26,6 +27,7 @@ pub struct Agent {
     retries: u8,
     negotiated: Option<NegotiatedTopology>,
     latency_fixed: bool,
+    topics: TopicRegistry,
 }
 
 #[derive(Clone, Copy)]
@@ -77,6 +79,7 @@ impl Agent {
             retries: 0,
             negotiated: None,
             latency_fixed: false,
+            topics: TopicRegistry::new(),
         }
     }
     pub fn config(&self) -> &AgentConfig {
@@ -101,12 +104,28 @@ impl Agent {
         }
         self.latency_fixed |= matches!(state.latency, crate::LatencyIntent::Fixed { .. });
         self.desired = state;
+        let removed_topics = self.topics.reconcile(&self.desired.topics);
         self.reconcile();
+        let active_generation = match self.session {
+            Session::Active { generation, .. } => Some(generation),
+            _ => None,
+        };
+        for id in removed_topics {
+            if let Some(generation) = active_generation {
+                self.cx
+                    .emit(AgentEffect::DataChannel(crate::DataChannelEffect::Close {
+                        generation,
+                        id,
+                    }));
+            }
+            self.cx.forget_data_channel(id);
+        }
         if let Session::Active {
             generation,
             channel,
         } = self.session
         {
+            self.activate_topics(generation);
             self.cx
                 .emit(AgentEffect::Rtc(RtcEffect::ReconcileLocalSlots {
                     generation,
@@ -114,6 +133,16 @@ impl Agent {
                 }));
             self.emit_intent(generation, channel);
         }
+        Ok(())
+    }
+
+    pub fn send_topic(
+        &mut self,
+        registration: &TopicRegistration,
+        payload: Vec<u8>,
+    ) -> Result<(), TopicError> {
+        let effect = self.topics.send(registration, payload)?;
+        self.cx.emit(effect);
         Ok(())
     }
     pub fn handle(&mut self, event: AgentEvent) -> EventDisposition {
@@ -181,7 +210,10 @@ impl Agent {
                     };
                     self.retries = 0;
                     self.phase(ConnectionPhase::Connected);
+                    self.activate_topics(generation);
                     self.emit_intent(generation, id);
+                } else {
+                    let _ = self.topics.opened(generation, id);
                 }
             }
             AgentEvent::DataChannel(DataChannelEvent::Message {
@@ -192,6 +224,9 @@ impl Agent {
                 if matches!(self.session, Session::Active { generation: current, channel } if current == generation && channel == id)
                 {
                     self.apply_signal(&payload);
+                } else if matches!(self.session, Session::Active { generation: current, .. } if current == generation)
+                {
+                    self.apply_topic(generation, id, &payload);
                 }
             }
             _ => {}
@@ -358,6 +393,52 @@ impl Agent {
                 id: channel,
                 payload: message.encode_to_vec(),
             }));
+    }
+    fn activate_topics(&mut self, generation: Generation) {
+        if self.topics.activate(generation, &mut self.cx).is_err() {
+            self.terminal("unable to activate topic channels");
+        }
+    }
+    fn apply_topic(&mut self, generation: Generation, id: DataChannelId, payload: &[u8]) {
+        match self.topics.receive(id, payload) {
+            TopicReceive::Ignored => {}
+            TopicReceive::Delivery(delivery) => {
+                self.notifications
+                    .push_back(AgentNotification::Topic(delivery));
+            }
+            TopicReceive::Replay(frames) => {
+                for payload in frames {
+                    self.cx
+                        .emit(AgentEffect::DataChannel(crate::DataChannelEffect::Send {
+                            generation,
+                            id,
+                            payload,
+                        }));
+                }
+            }
+            TopicReceive::Ordered {
+                registration,
+                deliveries,
+                nack,
+            } => {
+                for delivery in deliveries {
+                    self.notifications.push_back(AgentNotification::Topic(
+                        crate::TopicDelivery::Ordered {
+                            registration: registration.clone(),
+                            delivery,
+                        },
+                    ));
+                }
+                if let Some(payload) = nack {
+                    self.cx
+                        .emit(AgentEffect::DataChannel(crate::DataChannelEffect::Send {
+                            generation,
+                            id,
+                            payload,
+                        }));
+                }
+            }
+        }
     }
     fn reconcile(&mut self) {
         match (self.desired.connection, self.session) {
@@ -541,6 +622,7 @@ impl Agent {
         if let Some(generation) = generation_of(self.session) {
             self.cx.rtc_close(generation);
         }
+        self.invalidate_topics();
         let factor = 1_u32
             .checked_shl(u32::from(self.retries.min(4)))
             .unwrap_or(16);
@@ -565,10 +647,12 @@ impl Agent {
         if let Some(generation) = generation_of(self.session) {
             self.cx.rtc_close(generation);
         }
+        self.invalidate_topics();
         self.session = Session::Idle;
         self.phase(ConnectionPhase::Disconnected);
     }
     fn terminal(&mut self, reason: &str) {
+        self.invalidate_topics();
         self.session = Session::Terminal;
         self.phase(ConnectionPhase::Failed);
         self.notifications
@@ -581,6 +665,11 @@ impl Agent {
             self.snapshot.connection = phase.clone();
             self.notifications
                 .push_back(AgentNotification::Connection(phase));
+        }
+    }
+    fn invalidate_topics(&mut self) {
+        for id in self.topics.invalidate_generation() {
+            self.cx.forget_data_channel(id);
         }
     }
 }
@@ -690,6 +779,75 @@ mod tests {
     }
 
     #[test]
+    fn topic_channels_rebind_after_a_new_transport_generation() {
+        let mut agent = agent();
+        let registration = crate::TopicRegistration {
+            topic: String::from("chat"),
+            kind: crate::TopicKind::Ordered,
+            direction: crate::TopicDirection::Publish,
+            publisher_id: None,
+        };
+        agent
+            .set_state(ClientState {
+                connection: ClientConnectionState::Connected,
+                identity: Some(crate::ConnectionIdentity {
+                    room: String::from("room"),
+                    token: None,
+                    metadata: vec![],
+                }),
+                topics: vec![registration.clone()],
+                ..ClientState::default()
+            })
+            .unwrap();
+        let (generation, signaling_channel) = connect(&mut agent);
+        let AgentEffect::DataChannel(crate::DataChannelEffect::Open {
+            id: topic_channel,
+            config,
+            ..
+        }) = agent.next_effect().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(config.label, "v1/rel/pub/chat");
+        let _ = agent.next_effect();
+        agent.handle(AgentEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            id: topic_channel,
+        }));
+        agent.send_topic(&registration, vec![5]).unwrap();
+        let AgentEffect::DataChannel(crate::DataChannelEffect::Send { payload, .. }) =
+            agent.next_effect().unwrap()
+        else {
+            panic!()
+        };
+        let message = proto::reliable::RelMsg::decode(payload.as_slice()).unwrap();
+        assert_eq!(message.stream_id, generation.get());
+        assert_eq!(message.seq, 0);
+
+        agent.handle(AgentEvent::Rtc(RtcEvent::Disconnected { generation }));
+        let AgentEffect::Rtc(RtcEffect::CloseTransport { .. }) = agent.next_effect().unwrap()
+        else {
+            panic!()
+        };
+        let AgentEffect::Timer(crate::TimerEffect::Schedule { id, .. }) =
+            agent.next_effect().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            agent.handle(AgentEvent::DataChannel(DataChannelEvent::Opened {
+                generation,
+                id: topic_channel,
+            })),
+            EventDisposition::IgnoredStale
+        );
+        agent.handle(AgentEvent::Timer(TimerEvent::Fired { id }));
+        let (next_generation, _) = create_transport(&mut agent);
+        assert_ne!(next_generation, generation);
+        let _ = signaling_channel;
+    }
+
+    #[test]
     fn fixed_latency_cannot_return_to_adaptive() {
         let mut agent = agent();
         agent
@@ -733,5 +891,59 @@ mod tests {
 
         assert_eq!(agent.snapshot.publications.len(), 1);
         assert_eq!(agent.snapshot.video_bindings.len(), 1);
+    }
+
+    fn connect(agent: &mut Agent) -> (Generation, DataChannelId) {
+        let (generation, signaling_channel) = create_transport(agent);
+        agent.handle(AgentEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: String::from("offer"),
+            topology: crate::NegotiatedTopology {
+                upstream_slots: vec![],
+                video_receive_mids: vec![],
+                audio_receive_mids: vec![],
+            },
+        }));
+        let AgentEffect::Http(crate::HttpEffect::Request { id, .. }) = agent.next_effect().unwrap()
+        else {
+            panic!()
+        };
+        agent.handle(AgentEvent::Http(HttpEvent::Response {
+            id,
+            response: HttpResponse {
+                status: 201,
+                headers: vec![
+                    HttpHeader {
+                        name: String::from("Location"),
+                        value: String::from("https://example.test/resource"),
+                    },
+                    HttpHeader {
+                        name: String::from("ETag"),
+                        value: String::from("tag"),
+                    },
+                ],
+                body: String::from("answer").into_bytes(),
+            },
+        }));
+        let _ = agent.next_effect();
+        agent.handle(AgentEvent::Rtc(RtcEvent::AnswerApplied { generation }));
+        agent.handle(AgentEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            id: signaling_channel,
+        }));
+        (generation, signaling_channel)
+    }
+
+    fn create_transport(agent: &mut Agent) -> (Generation, DataChannelId) {
+        let AgentEffect::Rtc(RtcEffect::CreateTransport {
+            generation,
+            signaling_channel,
+            ..
+        }) = agent.next_effect().unwrap()
+        else {
+            panic!()
+        };
+        let _ = agent.next_effect();
+        (generation, signaling_channel)
     }
 }

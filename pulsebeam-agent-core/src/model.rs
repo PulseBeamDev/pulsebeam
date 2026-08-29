@@ -1,6 +1,9 @@
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 
-use crate::id::{DataChannelId, Generation};
+use crate::{
+    TopicDelivery,
+    id::{DataChannelId, Generation},
+};
 
 pub const MAX_UPSTREAM_SLOTS: usize = 2;
 pub const MAX_VIDEO_RECEIVE_SLOTS: u8 = 7;
@@ -331,6 +334,8 @@ impl TopicRegistration {
         {
             return Err(StateError::InvalidTopicScope);
         }
+        crate::validate_registration(self)
+            .map_err(|_| StateError::InvalidTopicRegistration(self.topic.clone()))?;
         Ok(())
     }
 }
@@ -379,6 +384,8 @@ pub enum StateError {
     InvalidTopicScope,
     #[error("duplicate topic registration for {0}")]
     DuplicateTopicRegistration(String),
+    #[error("invalid topic registration for {0}")]
+    InvalidTopicRegistration(String),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -434,6 +441,7 @@ pub enum AgentNotification {
     PublicationRemoved { track_id: String },
     VideoBindingsChanged,
     AudioBindingsChanged,
+    Topic(TopicDelivery),
     Error(AgentError),
 }
 
