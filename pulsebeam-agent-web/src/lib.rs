@@ -12,3 +12,9 @@ pub use web_agent::*;
 pub fn start() {
     host::install();
 }
+
+#[cfg(feature = "browser-test-harness")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn browser_test_harness_ready() -> bool {
+    true
+}

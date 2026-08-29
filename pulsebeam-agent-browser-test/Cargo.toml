@@ -1,0 +1,13 @@
+[package]
+name = "pulsebeam-agent-browser-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+anyhow = "1"
+thirtyfour = "0.36"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }

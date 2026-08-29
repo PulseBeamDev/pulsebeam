@@ -5,6 +5,7 @@ members = [
   "pulsebeam-agent",
   "pulsebeam-agent-core",
   "pulsebeam-agent-web",
+  "pulsebeam-agent-browser-test",
   "pulsebeam-cli",
   "pulsebeam-core",
   "pulsebeam-ebpf",

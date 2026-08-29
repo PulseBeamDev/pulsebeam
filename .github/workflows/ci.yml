@@ -84,13 +84,13 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
 
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.11
@@ -100,14 +100,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler clang nasm pkg-config
 
-      - name: Install Chromium
+      - name: Install browser and WebDriver
         run: |
-          npm ci --prefix browser
-          PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/browser/.playwright npx --prefix browser playwright install --with-deps chromium
-          PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/browser/.playwright npx --prefix browser playwright install --only-shell chromium
+          sudo apt-get install -y chromium-chromedriver firefox-geckodriver
 
       - name: Browser interoperability regression
-        run: make test-browser
+        env:
+          BROWSER: ${{ matrix.browser }}
+        run: |
+          if [ "$BROWSER" = chromium ]; then chromedriver --port=9515 & else geckodriver --port 9515 & fi
+          make test-browser
+
+  browser-safari:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Enable Safari WebDriver
+        run: safaridriver --enable
+
+      - name: Safari interoperability regression
+        env:
+          BROWSER: safari
+          WEBDRIVER_URL: http://127.0.0.1:4444
+        run: |
+          safaridriver --port 4444 &
+          make test-browser
 
   # eBPF attach/load needs elevated kernel privileges, which the normal `build`
   # job does not have and should not gain. Keep the behavioural smoke test in

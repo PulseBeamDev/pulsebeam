@@ -29,11 +29,7 @@ run-profile: profile
 test: test-unit test-sim
 
 test-browser:
-	cargo build --release -p pulsebeam -p pulsebeam-cli
-	npm ci --prefix browser
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install --only-shell chromium
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npm test --prefix browser
+	scripts/test-browser-rust.sh
 
 # `sim` is on because the shaper lives behind it, and the shaper is the authority on what a
 # simulated link can carry. Without the feature its tests are not compiled, so they never ran
