@@ -2740,10 +2740,6 @@ mod slot_switch_tests {
     fn egress_slot_uses_the_payload_type_for_the_forwarded_codec() {
         let mut payload_types = CodecPayloadTypes::default();
         payload_types.insert(
-            crate::rtp::Codec::VP8,
-            Pt::new(96).expect("test payload type is valid"),
-        );
-        payload_types.insert(
             crate::rtp::Codec::H264,
             Pt::new(102).expect("test payload type is valid"),
         );
@@ -2759,7 +2755,6 @@ mod slot_switch_tests {
             slot.test_payload_type(crate::rtp::Codec::H264),
             Pt::new(102)
         );
-        assert_eq!(slot.test_payload_type(crate::rtp::Codec::VP8), Pt::new(96));
     }
 
     /// A slot with two simulcast layers of one track available to switch between.

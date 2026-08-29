@@ -336,8 +336,8 @@ impl StreamCache {
         }
 
         // Only a keyframe the H.264 probe could actually read needs a
-        // parameter-set prefix. Everything else — VP8/VP9/AV1, or H.264 under
-        // SFrame/E2EE — leaves the NAL flags empty, has a self-sufficient
+        // parameter-set prefix. H.264 under SFrame/E2EE leaves the NAL flags
+        // empty, has a self-sufficient
         // keyframe, and offers no parameter sets to synthesize from.
         //
         // Do not key this off the Dependency Descriptor: plain readable H.264

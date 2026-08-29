@@ -33,8 +33,6 @@ pub const ABS_CAPTURE_TIME_EXTENSION_URI: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
     H264,
-    VP8,
-    VP9,
     Opus,
 }
 
@@ -42,10 +40,6 @@ impl Codec {
     pub fn from_name(name: &str) -> Option<Self> {
         if name.eq_ignore_ascii_case("h264") {
             Some(Self::H264)
-        } else if name.eq_ignore_ascii_case("vp8") {
-            Some(Self::VP8)
-        } else if name.eq_ignore_ascii_case("vp9") {
-            Some(Self::VP9)
         } else if name.eq_ignore_ascii_case("opus") {
             Some(Self::Opus)
         } else {
@@ -57,8 +51,6 @@ impl Codec {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodecPayloadTypes {
     h264: Option<PayloadType>,
-    vp8: Option<PayloadType>,
-    vp9: Option<PayloadType>,
     opus: Option<PayloadType>,
 }
 
@@ -66,8 +58,6 @@ impl CodecPayloadTypes {
     pub fn insert(&mut self, codec: Codec, payload_type: PayloadType) {
         match codec {
             Codec::H264 => self.h264 = Some(payload_type),
-            Codec::VP8 => self.vp8 = Some(payload_type),
-            Codec::VP9 => self.vp9 = Some(payload_type),
             Codec::Opus => self.opus = Some(payload_type),
         }
     }
@@ -75,14 +65,12 @@ impl CodecPayloadTypes {
     pub fn get(self, codec: Codec) -> Option<PayloadType> {
         match codec {
             Codec::H264 => self.h264,
-            Codec::VP8 => self.vp8,
-            Codec::VP9 => self.vp9,
             Codec::Opus => self.opus,
         }
     }
 
     pub fn is_empty(self) -> bool {
-        self.h264.is_none() && self.vp8.is_none() && self.vp9.is_none() && self.opus.is_none()
+        self.h264.is_none() && self.opus.is_none()
     }
 }
 
@@ -180,8 +168,6 @@ impl RtpPacket {
                 nal = h264::classify(&payload);
                 nal.idr()
             }
-            Codec::VP8 => vp8_keyframe(&payload),
-            Codec::VP9 => vp9_keyframe(&payload),
             Codec::Opus => true,
         };
         Self {
@@ -265,47 +251,6 @@ impl RtpPacket {
     }
 }
 
-fn vp8_keyframe(payload: &[u8]) -> bool {
-    let Some((&descriptor, body)) = payload.split_first() else {
-        return false;
-    };
-    let mut index = 1usize;
-    if descriptor & 0x80 != 0 {
-        let Some(&extension) = body.first() else {
-            return false;
-        };
-        index = index.saturating_add(1);
-        if extension & 0x80 != 0 {
-            let Some(&picture_id) = payload.get(index) else {
-                return false;
-            };
-            index = index.saturating_add(1);
-            if picture_id & 0x80 != 0 {
-                index = index.saturating_add(1);
-            }
-        }
-        if extension & 0x40 != 0 {
-            index = index.saturating_add(1);
-        }
-        if extension & 0x20 != 0 || extension & 0x10 != 0 {
-            let Some(&layers) = payload.get(index) else {
-                return false;
-            };
-            index = index.saturating_add(1);
-            if extension & 0x10 != 0 && layers & 0x80 != 0 {
-                index = index.saturating_add(1);
-            }
-        }
-    }
-    descriptor & 0x10 != 0 && payload.get(index).is_some_and(|byte| byte & 1 == 0)
-}
-
-fn vp9_keyframe(payload: &[u8]) -> bool {
-    payload
-        .first()
-        .is_some_and(|descriptor| descriptor & 0x40 != 0 && descriptor & 0x08 == 0)
-}
-
 #[cfg(test)]
 mod structural_tests {
     use super::*;
@@ -313,6 +258,15 @@ mod structural_tests {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         time::Instant as StdInstant,
     };
+
+    #[test]
+    fn codec_lookup_accepts_only_h264_and_opus() {
+        assert_eq!(Codec::from_name("h264"), Some(Codec::H264));
+        assert_eq!(Codec::from_name("opus"), Some(Codec::Opus));
+        assert_eq!(Codec::from_name("vp8"), None);
+        assert_eq!(Codec::from_name("vp9"), None);
+        assert_eq!(Codec::from_name("av1"), None);
+    }
 
     #[test]
     fn packet_view_preserves_provenance_and_reuses_the_destination_buffer() {
@@ -346,12 +300,6 @@ mod structural_tests {
         assert_eq!(packet.provenance.packet_id, 41);
         assert_eq!(packet.provenance.received_at, packet.arrival_ts);
         assert_eq!(packet.payload.capacity(), capacity);
-    }
-
-    #[test]
-    fn vp8_keyframe_skips_a_long_picture_id() {
-        assert!(vp8_keyframe(&[0x90, 0x80, 0x80, 0x02, 0x00]));
-        assert!(!vp8_keyframe(&[0x90, 0x80, 0x80, 0x02, 0x01]));
     }
 }
 

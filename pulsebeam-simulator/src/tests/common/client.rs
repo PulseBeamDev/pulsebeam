@@ -43,7 +43,6 @@ pub struct SimClientBuilder {
     receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
-    reject_vp8: bool,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -81,7 +80,6 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
-            reject_vp8: false,
         })
     }
 
@@ -110,7 +108,6 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
-            reject_vp8: false,
         })
     }
 
@@ -170,12 +167,6 @@ impl SimClientBuilder {
     /// Model a marker/deep-inspection-only peer that never negotiates DD.
     pub fn without_dependency_descriptor(mut self) -> Self {
         self.agent_builder = self.agent_builder.without_dependency_descriptor();
-        self
-    }
-
-    pub fn prefer_vp8(mut self) -> Self {
-        self.agent_builder = self.agent_builder.prefer_vp8();
-        self.reject_vp8 = true;
         self
     }
 
@@ -249,7 +240,6 @@ impl SimClientBuilder {
             paused_publishers: ctx_paused_publishers,
             requested_tracks: HashSet::new(),
             received_data: Vec::new(),
-            reject_vp8: self.reject_vp8,
             video_rx,
             audio_rx,
             local_publications: local_video.into_iter().collect(),
@@ -347,7 +337,6 @@ pub struct VideoReceiveLog {
     pub max_ts_regression: u64,
     pub undecodable_keyframes: u64,
     pub decoder_errors: u64,
-    pub unexpected_vp8_packets: u64,
     pub missing_mid_packets: u64,
     pub missing_ssrc_packets: u64,
     pub missing_payload_type_packets: u64,
@@ -384,7 +373,6 @@ struct BrowserVideoReceiver {
     expected_payload_type: Option<u8>,
     open_frame_timestamp: Option<u64>,
     frame_capture_time: Option<SystemTime>,
-    rejects_vp8_payload_type: bool,
     expected_seq: Option<u64>,
     access_unit: Vec<u8>,
     fu_header: Option<u8>,
@@ -395,7 +383,7 @@ struct BrowserVideoReceiver {
 }
 
 impl BrowserVideoReceiver {
-    fn new(rejects_vp8_payload_type: bool) -> Self {
+    fn new() -> Self {
         Self {
             decoder: H264Decoder::new().expect("bundled OpenH264 decoder initializes"),
             jitter: pulsebeam_agent::JitterBuffer::new(
@@ -405,7 +393,6 @@ impl BrowserVideoReceiver {
             expected_payload_type: None,
             open_frame_timestamp: None,
             frame_capture_time: None,
-            rejects_vp8_payload_type,
             expected_seq: None,
             access_unit: Vec::with_capacity(16 * 1024),
             fu_header: None,
@@ -447,9 +434,6 @@ impl BrowserVideoReceiver {
             }
             (None, Some(actual)) => self.expected_payload_type = Some(actual),
             _ => {}
-        }
-        if self.rejects_vp8_payload_type && rtp.payload_type == Some(96) {
-            log.unexpected_vp8_packets = log.unexpected_vp8_packets.saturating_add(1);
         }
         self.jitter.push(rtp);
         while let Some(rtp) = self.jitter.pop() {
@@ -1050,7 +1034,6 @@ pub struct ClientContext {
     /// Data channel payloads received by topic.
     #[allow(dead_code)]
     pub received_data: Vec<(String, Vec<u8>)>,
-    reject_vp8: bool,
 }
 
 pub struct SimClient {
@@ -1192,9 +1175,8 @@ impl SimClient {
                             .insert(publication_id.clone(), publication_id);
                         let publisher_id = track.publisher_id().to_owned();
                         let log = self.ctx.video_rx.clone();
-                        let reject_vp8 = self.ctx.reject_vp8;
                         self.join_set.spawn(async move {
-                            let mut receiver = BrowserVideoReceiver::new(reject_vp8);
+                            let mut receiver = BrowserVideoReceiver::new();
                             while let Ok(rtp) = track.recv().await {
                                 let mut log = log.lock().unwrap();
                                 receiver.push(rtp, &mut log, &publisher_id);

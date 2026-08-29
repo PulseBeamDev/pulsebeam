@@ -37,30 +37,6 @@ fn video_does_not_loop_back_to_publisher_test() {
         ]);
 }
 
-#[test]
-fn h264_stays_decodable_when_the_subscriber_prefers_vp8_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("h264-vp8-preference")
-                .with_participant(Participant::single_publisher("publisher"))
-                .with_participant(Participant {
-                    prefer_vp8: true,
-                    ..Participant::subscriber("viewer")
-                }),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish the H.264 publisher and VP8-first subscriber",
-                duration: Duration::from_secs(5),
-            },
-            Step::CheckVideoQuality {
-                description: "Viewer decodes H.264 despite preferring VP8 in SDP",
-                participant: "viewer",
-                quality: VideoQuality::min_frames(50).allow_gaps(5),
-            },
-        ]);
-}
-
 fn bench_participant(name: &'static str) -> Participant {
     let mut participant = Participant::single_publisher(name).and_subscribes();
     participant.slots = 7;
