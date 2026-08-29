@@ -273,6 +273,12 @@
           mid: value.mid ?? null,
           rid: value.rid ?? null,
           payloadType: value.payloadType ?? null,
+          frameWidth: value.frameWidth ?? null,
+          frameHeight: value.frameHeight ?? null,
+          framesEncoded: value.framesEncoded ?? 0,
+          targetBitrate: value.targetBitrate ?? null,
+          qualityLimitationReason: value.qualityLimitationReason ?? null,
+          qualityLimitationDurations: value.qualityLimitationDurations ?? null,
         });
       }
       if (value.type === "inbound-rtp" && value.kind === "video") {
@@ -286,16 +292,37 @@
         });
       }
     }
+    const sendEncodings = peer.getTransceivers()
+      .filter((transceiver) => transceiver.sender.track?.kind === "video")
+      .map((transceiver) => ({
+        mid: transceiver.mid,
+        encodings: transceiver.sender.getParameters().encodings.map((encoding) => ({
+          rid: encoding.rid ?? null,
+          active: encoding.active ?? true,
+          scaleResolutionDownBy: encoding.scaleResolutionDownBy ?? null,
+          maxBitrate: encoding.maxBitrate ?? null,
+          maxFramerate: encoding.maxFramerate ?? null,
+        })),
+      }));
+    const selectedCandidatePair = [...report.values()].find((value) =>
+      value.type === "candidate-pair" && value.nominated && value.state === "succeeded");
     return {
       connectionState: peer.connectionState,
       inbound,
       outbound,
+      sendEncodings,
+      availableOutgoingBitrate: selectedCandidatePair?.availableOutgoingBitrate ?? null,
       rendered: videos.map((video) => ({ width: video.videoWidth, height: video.videoHeight })),
     };
   }
 
   function sdp() {
-    return { local: peer?.localDescription?.sdp ?? null, remote: peer?.remoteDescription?.sdp ?? null };
+    const facts = (description) => description?.split("\r\n")
+      .filter((line) => line.startsWith("a=rid:") || line.startsWith("a=simulcast:")) ?? [];
+    return {
+      local: facts(peer?.localDescription?.sdp),
+      remote: facts(peer?.remoteDescription?.sdp),
+    };
   }
 
   window.pulsebeamManual = { connect, sdp, stats };

@@ -12,6 +12,226 @@ const MAX_BITRATE_BPS: u64 = 50_000_000;
 const INITIAL_BITRATE_BPS: u64 = 300_000;
 const OUTAGE: Duration = Duration::from_secs(2);
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const TWCC_FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
+const TWCC_HISTORY_CAPACITY: usize = 8192;
+const TWCC_MAX_STATUS_COUNT: usize = 512;
+
+pub(crate) struct TwccReceiver {
+    epoch: Instant,
+    base_sequence: Option<u64>,
+    highest_sequence: Option<u64>,
+    received: VecDeque<Option<Instant>>,
+    next_feedback: Option<Instant>,
+    feedback_count: u8,
+    media_ssrc: Option<u32>,
+    symbols: Vec<u8>,
+    deltas: Vec<i16>,
+    encoded: Vec<u8>,
+}
+
+impl TwccReceiver {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            epoch: now,
+            base_sequence: None,
+            highest_sequence: None,
+            received: VecDeque::with_capacity(TWCC_HISTORY_CAPACITY),
+            next_feedback: None,
+            feedback_count: 0,
+            media_ssrc: None,
+            symbols: Vec::with_capacity(TWCC_MAX_STATUS_COUNT),
+            deltas: Vec::with_capacity(TWCC_MAX_STATUS_COUNT),
+            encoded: Vec::with_capacity(1200),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, sequence: u16, received_at: Instant, media_ssrc: u32) {
+        self.media_ssrc = Some(media_ssrc);
+        let sequence = self.extend_sequence(sequence);
+        let Some(base) = self.base_sequence else {
+            self.base_sequence = Some(sequence);
+            self.highest_sequence = Some(sequence);
+            self.received.push_back(Some(received_at));
+            self.next_feedback = received_at.checked_add(TWCC_FEEDBACK_INTERVAL);
+            return;
+        };
+        if sequence < base {
+            return;
+        }
+        let offset = sequence.saturating_sub(base);
+        let Ok(offset) = usize::try_from(offset) else {
+            self.reset(sequence, received_at);
+            return;
+        };
+        if offset >= TWCC_HISTORY_CAPACITY {
+            self.reset(sequence, received_at);
+            return;
+        }
+        while self.received.len() <= offset {
+            self.received.push_back(None);
+        }
+        let Some(slot) = self.received.get_mut(offset) else {
+            debug_assert!(
+                false,
+                "the bounded TWCC receive history indexes its packet range"
+            );
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(received_at);
+        self.highest_sequence = Some(self.highest_sequence.unwrap_or(sequence).max(sequence));
+        if self.next_feedback.is_none() {
+            self.next_feedback = received_at.checked_add(TWCC_FEEDBACK_INTERVAL);
+        }
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.next_feedback
+    }
+
+    pub(crate) fn build_feedback(&mut self, now: Instant, sender_ssrc: u32) -> Option<&[u8]> {
+        if self.next_feedback.is_some_and(|deadline| now < deadline) {
+            return None;
+        }
+        let first_received = self.received.iter().position(Option::is_some)?;
+        if first_received > 0 {
+            self.discard(first_received);
+        }
+        let count = self.received.len().min(TWCC_MAX_STATUS_COUNT);
+        if count == 0 {
+            self.next_feedback = None;
+            return None;
+        }
+        let first_at = self.received.front().and_then(|received| *received)?;
+        let reference_ticks = self.micros_since_epoch(first_at).saturating_div(64_000);
+        let reference_at = self.epoch.checked_add(Duration::from_micros(
+            reference_ticks.saturating_mul(64_000),
+        ))?;
+        self.symbols.clear();
+        self.deltas.clear();
+        let mut previous = reference_at;
+        for received_at in self.received.iter().take(count) {
+            let Some(received_at) = received_at else {
+                self.symbols.push(0);
+                continue;
+            };
+            let delta = signed_delta_250us(*received_at, previous)?;
+            let symbol = if (0..=255).contains(&delta) { 1 } else { 2 };
+            self.symbols.push(symbol);
+            self.deltas.push(delta);
+            previous = *received_at;
+        }
+        self.encoded.clear();
+        self.encoded.resize(20, 0);
+        self.encoded[0] = 0x8f;
+        self.encoded[1] = TWCC_PACKET_TYPE;
+        self.encoded[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+        self.encoded[8..12].copy_from_slice(&self.media_ssrc?.to_be_bytes());
+        let base = self.base_sequence?;
+        self.encoded[12..14].copy_from_slice(&(base as u16).to_be_bytes());
+        self.encoded[14..16].copy_from_slice(
+            &u16::try_from(count)
+                .expect("bounded TWCC feedback status count fits a u16")
+                .to_be_bytes(),
+        );
+        self.encoded[16] = u8::try_from((reference_ticks >> 16) & 0xff).ok()?;
+        self.encoded[17] = u8::try_from((reference_ticks >> 8) & 0xff).ok()?;
+        self.encoded[18] = u8::try_from(reference_ticks & 0xff).ok()?;
+        self.encoded[19] = self.feedback_count;
+        self.feedback_count = self.feedback_count.wrapping_add(1);
+        for symbols in self.symbols.chunks(7) {
+            let mut chunk = 0xc000u16;
+            for (index, symbol) in symbols.iter().enumerate() {
+                let shift = 12u32.saturating_sub(u32::try_from(index).ok()?.saturating_mul(2));
+                chunk |= u16::from(*symbol) << shift;
+            }
+            self.encoded.extend_from_slice(&chunk.to_be_bytes());
+        }
+        let mut deltas = self.deltas.iter();
+        for symbol in &self.symbols {
+            match *symbol {
+                0 => {}
+                1 => self.encoded.push(u8::try_from(*deltas.next()?).ok()?),
+                2 => self
+                    .encoded
+                    .extend_from_slice(&deltas.next()?.to_be_bytes()),
+                _ => {
+                    debug_assert!(false, "TWCC status symbols are generated locally");
+                    return None;
+                }
+            }
+        }
+        debug_assert!(deltas.next().is_none());
+        while !self.encoded.len().is_multiple_of(4) {
+            self.encoded.push(0);
+        }
+        let words = self.encoded.len().checked_div(4)?;
+        let length = u16::try_from(words.checked_sub(1)?).ok()?;
+        self.encoded[2..4].copy_from_slice(&length.to_be_bytes());
+        self.discard(count);
+        self.next_feedback = if self.received.is_empty() {
+            None
+        } else {
+            now.checked_add(TWCC_FEEDBACK_INTERVAL)
+        };
+        Some(&self.encoded)
+    }
+
+    fn reset(&mut self, sequence: u64, received_at: Instant) {
+        self.base_sequence = Some(sequence);
+        self.highest_sequence = Some(sequence);
+        self.received.clear();
+        self.received.push_back(Some(received_at));
+        self.next_feedback = received_at.checked_add(TWCC_FEEDBACK_INTERVAL);
+    }
+
+    fn discard(&mut self, count: usize) {
+        let count = count.min(self.received.len());
+        self.received.drain(..count);
+        self.base_sequence = self
+            .base_sequence
+            .map(|base| base.saturating_add(u64::try_from(count).unwrap_or(u64::MAX)));
+        if self.received.is_empty() {
+            self.base_sequence = None;
+            self.highest_sequence = None;
+            self.media_ssrc = None;
+        }
+    }
+
+    fn extend_sequence(&self, sequence: u16) -> u64 {
+        let Some(highest) = self.highest_sequence else {
+            return u64::from(sequence);
+        };
+        let highest_low = highest as u16;
+        let rollover = highest >> 16;
+        let rollover = if sequence < highest_low
+            && highest_low.wrapping_sub(sequence) > (u16::MAX / 2)
+        {
+            rollover.saturating_add(1)
+        } else if sequence > highest_low && sequence.wrapping_sub(highest_low) > (u16::MAX / 2) {
+            rollover.saturating_sub(1)
+        } else {
+            rollover
+        };
+        (rollover << 16) | u64::from(sequence)
+    }
+
+    fn micros_since_epoch(&self, instant: Instant) -> u64 {
+        u64::try_from(instant.saturating_duration_since(self.epoch).as_micros()).unwrap_or(u64::MAX)
+    }
+}
+
+fn signed_delta_250us(received_at: Instant, previous: Instant) -> Option<i16> {
+    let micros = if received_at >= previous {
+        i64::try_from(received_at.duration_since(previous).as_micros()).ok()?
+    } else {
+        -i64::try_from(previous.duration_since(received_at).as_micros()).ok()?
+    };
+    let units = micros / 250;
+    i16::try_from(units).ok()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CongestionEstimate {
@@ -649,6 +869,72 @@ mod tests {
 
         assert_eq!(parsed[0].statuses()[0].sequence(), 7);
         assert_eq!(parsed[0].statuses()[1].sequence(), 8);
+    }
+
+    #[test]
+    fn twcc_receiver_reports_reordered_packets_and_loss() {
+        let now = Instant::now();
+        let mut receiver = TwccReceiver::new(now);
+        receiver.observe(20, now, 9);
+        receiver.observe(22, now + Duration::from_millis(10), 9);
+        receiver.observe(21, now + Duration::from_millis(5), 9);
+        let bytes = receiver
+            .build_feedback(now + TWCC_FEEDBACK_INTERVAL, 7)
+            .expect("due TWCC feedback")
+            .to_vec();
+        let source = SocketAddr::from(([127, 0, 0, 1], 5000));
+        let destination = SocketAddr::from(([127, 0, 0, 1], 6000));
+        let packet = IngressPacket::new(
+            &bytes,
+            PacketProvenance::new(
+                now,
+                TransportMetadata::new(TransportProtocol::Udp, source, destination),
+                PacketId::new(1),
+            ),
+        )
+        .parse()
+        .expect("generated RTCP");
+        let crate::PacketView::Rtcp(rtcp) = packet else {
+            panic!("generated TWCC must be RTCP");
+        };
+        let report = parse_twcc(&rtcp).expect("generated TWCC is structurally valid");
+        let statuses = report[0].statuses();
+
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses[0].sequence(), 20);
+        assert_eq!(statuses[1].sequence(), 21);
+        assert_eq!(statuses[2].sequence(), 22);
+        assert!(statuses.iter().all(|status| status.received_at().is_some()));
+
+        receiver.observe(23, now + Duration::from_millis(60), 9);
+        receiver.observe(25, now + Duration::from_millis(70), 9);
+        let bytes = receiver
+            .build_feedback(now + Duration::from_millis(110), 7)
+            .expect("second TWCC feedback")
+            .to_vec();
+        let packet = IngressPacket::new(
+            &bytes,
+            PacketProvenance::new(
+                now,
+                TransportMetadata::new(TransportProtocol::Udp, source, destination),
+                PacketId::new(2),
+            ),
+        )
+        .parse()
+        .expect("generated RTCP");
+        let crate::PacketView::Rtcp(rtcp) = packet else {
+            panic!("generated TWCC must be RTCP");
+        };
+        let report = parse_twcc(&rtcp).expect("generated TWCC is structurally valid");
+        let statuses = report[0].statuses();
+
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses[0].sequence(), 23);
+        assert!(statuses[0].received_at().is_some());
+        assert_eq!(statuses[1].sequence(), 24);
+        assert!(statuses[1].received_at().is_none());
+        assert_eq!(statuses[2].sequence(), 25);
+        assert!(statuses[2].received_at().is_some());
     }
 
     #[test]

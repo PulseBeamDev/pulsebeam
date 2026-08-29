@@ -220,7 +220,8 @@ test("manual browser subscriptions sustain decoded H.264 in both directions", as
       ]);
       return [leftStats, rightStats].every((stats) =>
         stats.connectionState === "connected" &&
-        stats.outbound.some((stream) => stream.packetsSent > 0) &&
+        ["q", "h", "f"].every((rid) =>
+          stats.outbound.some((stream) => stream.rid === rid && stream.packetsSent > 0)) &&
         decodedFrames(stats) >= 20 &&
         stats.rendered.some((video) => video.width > 0 && video.height > 0));
     }, { timeout: 20_000, message: "manual browser subscriptions never produced rendered video" }).toBe(true);

@@ -429,6 +429,11 @@ fn answer_attributes_for_media(
     {
         attributes.push(MediaAttribute::RtcpMux);
     }
+    attributes.extend(answer_simulcast_attributes(
+        line,
+        direction,
+        accepted_payload_types,
+    ));
     attributes.push(MediaAttribute::IceUfrag(server.ice.ufrag().to_owned()));
     attributes.push(MediaAttribute::IcePwd(server.ice.password().to_owned()));
     attributes.push(MediaAttribute::Fingerprint(str0m::crypto::Fingerprint {
@@ -451,6 +456,78 @@ fn answer_attributes_for_media(
         );
         attributes.push(MediaAttribute::EndOfCandidates);
     }
+    attributes
+}
+
+fn answer_simulcast_attributes(
+    line: &MediaLine,
+    direction: MediaDirection,
+    accepted_payload_types: &HashSet<u8>,
+) -> Vec<MediaAttribute> {
+    if direction != MediaDirection::ReceiveOnly {
+        return Vec::new();
+    }
+
+    let mut accepted_rids = HashSet::new();
+    let mut attributes = Vec::new();
+    for attribute in &line.attrs {
+        let MediaAttribute::Rid {
+            id,
+            direction: rid_direction,
+            pt,
+            restriction,
+        } = attribute
+        else {
+            continue;
+        };
+        if *rid_direction != "send" {
+            continue;
+        }
+        let accepted_pts: Vec<_> = pt
+            .iter()
+            .copied()
+            .filter(|payload_type| accepted_payload_types.contains(&**payload_type))
+            .collect();
+        if !pt.is_empty() && accepted_pts.is_empty() {
+            continue;
+        }
+        if accepted_rids.insert(id.0.clone()) {
+            attributes.push(MediaAttribute::Rid {
+                id: id.clone(),
+                direction: "recv",
+                pt: accepted_pts,
+                restriction: restriction.clone(),
+            });
+        }
+    }
+    for attribute in &line.attrs {
+        let MediaAttribute::Simulcast(simulcast) = attribute else {
+            continue;
+        };
+        let receive = str0m::sdp::SimulcastGroups(
+            simulcast
+                .send
+                .iter()
+                .filter(|layer| accepted_rids.contains(&layer.restriction_id.0))
+                .map(|layer| str0m::sdp::SimulcastLayer {
+                    restriction_id: str0m::sdp::RestrictionId::new(
+                        layer.restriction_id.0.clone(),
+                        true,
+                    ),
+                    attributes: layer.attributes.clone(),
+                })
+                .collect(),
+        );
+        if receive.0.is_empty() {
+            continue;
+        }
+        attributes.push(MediaAttribute::Simulcast(str0m::sdp::Simulcast {
+            send: str0m::sdp::SimulcastGroups(Vec::new()),
+            recv: receive,
+            is_munged: false,
+        }));
+    }
+
     attributes
 }
 
@@ -557,7 +634,10 @@ mod tests {
     #[test]
     fn negotiated_session_keeps_remote_send_simulcast_rids() {
         let offer = format!(
-            "{}a=simulcast:send ~q;~h;~f\r\n",
+            "{}a=rid:q send\r\n\
+             a=rid:h send\r\n\
+             a=rid:f send\r\n\
+             a=simulcast:send ~q;~h;~f\r\n",
             offer("sendonly")
                 .replace(
                     "m=audio 9 UDP/TLS/RTP/SAVPF 111",
@@ -572,6 +652,11 @@ mod tests {
             result.session().media_sections()[0].receive_rids(),
             ["q", "h", "f"]
         );
+        let answer = result.answer().as_str();
+        assert!(answer.contains("a=rid:q recv\r\n"), "{answer}");
+        assert!(answer.contains("a=rid:h recv\r\n"), "{answer}");
+        assert!(answer.contains("a=rid:f recv\r\n"), "{answer}");
+        assert!(answer.contains("a=simulcast:recv q;h;f\r\n"), "{answer}");
     }
 
     #[test]

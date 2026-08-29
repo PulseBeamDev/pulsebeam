@@ -14,7 +14,8 @@ use str0m::{
 use crate::{
     CongestionEstimate, ConnectionId, DataChannelAssociation, EgressCongestion, ForwardedRtp, Gcc,
     GccError, GccOutcome, IngressPacket, MediaSectionId, NegotiatedMediaSection, NegotiatedSession,
-    PacketError, PacketProvenance, PacketView, SendId, TransportMetadata, TransportProtocol,
+    PacketError, PacketProvenance, PacketView, RtpPacketView, SendId, TransportMetadata,
+    TransportProtocol,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +159,7 @@ pub struct LiveConnection {
     next_dtls_deadline: Option<Instant>,
     nominated: Option<TransportMetadata>,
     gcc: Gcc,
+    twcc_rx: Option<crate::gcc::TwccReceiver>,
     congestion: VecDeque<GccOutcome>,
 }
 
@@ -167,6 +169,17 @@ struct RtpReceiveIndex {
     highest_sequence: u16,
     initialized: bool,
     replay_window: u64,
+}
+
+fn negotiated_twcc(session: &NegotiatedSession) -> bool {
+    session.media_sections().iter().any(|section| {
+        section.direction() == crate::MediaDirection::ReceiveOnly
+            && section.codecs().iter().any(crate::Codec::transport_cc)
+            && section
+                .header_extensions()
+                .iter()
+                .any(|extension| extension.uri().contains("transport-wide-cc"))
+    })
 }
 
 impl RtpReceiveIndex {
@@ -291,6 +304,7 @@ impl LiveConnection {
             .map(|parameters| {
                 DataChannelAssociation::new("pulsebeam", parameters.sctp_port(), now, 64, 64)
             });
+        let twcc_rx = negotiated_twcc(&session).then(|| crate::gcc::TwccReceiver::new(now));
         Ok(Self {
             id,
             session,
@@ -308,6 +322,7 @@ impl LiveConnection {
             next_dtls_deadline: None,
             nominated: None,
             gcc: Gcc::with_initial_bitrate(EGRESS_CAPACITY.saturating_mul(4), initial_bitrate_bps),
+            twcc_rx,
             congestion: VecDeque::with_capacity(64),
         })
     }
@@ -341,6 +356,7 @@ impl LiveConnection {
         {
             self.congestion.push_back(outcome);
         }
+        self.emit_twcc_feedback(now);
         self.drive_data(now);
     }
 
@@ -408,6 +424,13 @@ impl LiveConnection {
         if let Some(gcc) = self.gcc.next_deadline() {
             deadline = Some(deadline.map_or(gcc, |current| current.min(gcc)));
         }
+        if let Some(twcc) = self
+            .twcc_rx
+            .as_ref()
+            .and_then(crate::gcc::TwccReceiver::next_deadline)
+        {
+            deadline = Some(deadline.map_or(twcc, |current| current.min(twcc)));
+        }
         deadline
     }
 
@@ -441,6 +464,45 @@ impl LiveConnection {
         now: Instant,
     ) -> Result<(), LiveConnectionError> {
         self.gcc.record_departure(send_id, now)?;
+        Ok(())
+    }
+
+    pub fn observe_rtp(
+        &mut self,
+        section_id: MediaSectionId,
+        packet: &RtpPacketView<'_>,
+    ) -> Result<(), PacketError> {
+        let Some(receiver) = self.twcc_rx.as_mut() else {
+            return Ok(());
+        };
+        let Some(section) = self.session.media_section(section_id) else {
+            debug_assert!(
+                false,
+                "registered receive streams retain negotiated media sections"
+            );
+            return Ok(());
+        };
+        let transport_cc = section
+            .codecs()
+            .iter()
+            .any(|codec| codec.payload_type() == packet.payload_type() && codec.transport_cc());
+        if !transport_cc {
+            return Ok(());
+        }
+        let Some(extension) = section
+            .header_extensions()
+            .iter()
+            .find(|extension| extension.uri().contains("transport-wide-cc"))
+        else {
+            return Ok(());
+        };
+        let Some(value) = packet.header_extension(section, extension.id())? else {
+            return Ok(());
+        };
+        let Some(sequence) = value.value().try_into().ok().map(u16::from_be_bytes) else {
+            return Ok(());
+        };
+        receiver.observe(sequence, packet.provenance().received_at(), packet.ssrc());
         Ok(())
     }
 
@@ -600,6 +662,27 @@ impl LiveConnection {
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .protect_rtcp(bytes);
         self.push_protected_egress(encrypted, None)
+    }
+
+    fn emit_twcc_feedback(&mut self, now: Instant) {
+        if !self.egress_ready() || self.srtp_tx.is_none() || self.nominated.is_none() {
+            return;
+        }
+        let sender_ssrc = u32::try_from(self.id.get()).unwrap_or(u32::MAX).max(1);
+        let Some(bytes) = self
+            .twcc_rx
+            .as_mut()
+            .and_then(|receiver| receiver.build_feedback(now, sender_ssrc))
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
+        if self.send_rtcp(&bytes).is_err() {
+            debug_assert!(
+                false,
+                "a negotiated TWCC receiver has protected RTCP egress"
+            );
+        }
     }
 
     fn push_protected_egress(

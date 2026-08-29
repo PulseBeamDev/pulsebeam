@@ -252,6 +252,9 @@ impl DirectTransport {
         let packet = authenticated.parse().ok()?;
         match self.media.handle_authenticated(packet).ok()? {
             Some(pulsebeam_rtc::MediaIngress::Rtp { stream, packet }) => {
+                self.connection
+                    .observe_rtp(stream.media_section(), &packet)
+                    .ok()?;
                 let (codec, extensions) = self.rtp_metadata(stream, &packet)?;
                 Some(DirectTransportOutput::Rtp {
                     stream,
