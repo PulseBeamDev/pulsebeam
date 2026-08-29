@@ -17,7 +17,7 @@ const FIXTURES: &[Fixture] = &[
         offer: include_str!("fixtures/chrome-127-meet.sdp"),
         media: &[
             (MediaKind::Audio, MediaDirection::ReceiveOnly),
-            (MediaKind::Video, MediaDirection::ReceiveOnly),
+            (MediaKind::Video, MediaDirection::Inactive),
             (MediaKind::Application, MediaDirection::Bidirectional),
         ],
         remote_candidates: 1,
@@ -27,7 +27,7 @@ const FIXTURES: &[Fixture] = &[
         offer: include_str!("fixtures/firefox-128-publisher.sdp"),
         media: &[
             (MediaKind::Audio, MediaDirection::ReceiveOnly),
-            (MediaKind::Video, MediaDirection::ReceiveOnly),
+            (MediaKind::Video, MediaDirection::Inactive),
         ],
         remote_candidates: 1,
     },
@@ -82,6 +82,19 @@ fn client_offer_corpus_produces_web_rtc_1_compatible_answers() -> Result<(), Str
                 fixture.name
             );
         }
+        for (section, media) in result
+            .session()
+            .media_sections()
+            .iter()
+            .zip(answer.media_lines.iter())
+        {
+            assert_eq!(
+                media.disabled,
+                section.kind() != MediaKind::Application && section.codecs().is_empty(),
+                "{}",
+                fixture.name
+            );
+        }
 
         assert!(
             answer
@@ -122,6 +135,45 @@ fn client_offer_corpus_produces_web_rtc_1_compatible_answers() -> Result<(), Str
             );
             assert_eq!(media.ice_candidates().count(), usize::from(index == 0));
             assert_eq!(media.end_of_candidates(), index == 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn browser_offer_corpus_negotiates_only_pulsebeam_codecs() -> Result<(), String> {
+    for fixture in FIXTURES {
+        let result = negotiate(fixture.offer, &server().map_err(str::to_owned)?)
+            .map_err(|error| format!("{}: {error}", fixture.name))?;
+        let answer = Sdp::parse(result.answer().as_str())
+            .map_err(|error| format!("{}: invalid answer: {error}", fixture.name))?;
+
+        for (section, answer_section) in result
+            .session()
+            .media_sections()
+            .iter()
+            .zip(answer.media_lines.iter())
+        {
+            let supported = match section.kind() {
+                MediaKind::Audio => "opus",
+                MediaKind::Video => "h264",
+                MediaKind::Application => continue,
+            };
+            assert!(
+                section
+                    .codecs()
+                    .iter()
+                    .all(|codec| codec.name().eq_ignore_ascii_case(supported))
+            );
+            if !section.codecs().is_empty() {
+                assert!(
+                    answer_section.rtp_params().iter().all(|codec| codec
+                        .spec
+                        .codec
+                        .to_string()
+                        .eq_ignore_ascii_case(supported))
+                );
+            }
         }
     }
     Ok(())

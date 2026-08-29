@@ -126,14 +126,27 @@ pub fn negotiate(
 
         let id = u16::try_from(index).map_err(|_| NegotiationError::TooManyMediaSections)?;
         let kind = media_kind(&line.typ)?;
-        let direction = negotiated_direction(kind, line.direction(), &mid)?;
-        let codecs = codecs(line);
+        let codecs = codecs(kind, line);
+        let media_supported = kind == MediaKind::Application || !codecs.is_empty();
+        let direction = if media_supported {
+            negotiated_direction(kind, line.direction(), &mid)?
+        } else {
+            MediaDirection::Inactive
+        };
         let header_extensions = header_extensions(line, &mid)?;
         let receive_rids = receive_rids(line, kind, direction);
         let data_channel = data_channel_parameters(line, kind, &mid)?;
+        let accepted_payload_types = accepted_payload_types(&codecs);
+        let mut answer_line = line.clone();
+        answer_line.disabled = !media_supported;
+        if media_supported {
+            answer_line
+                .pts
+                .retain(|payload_type| accepted_payload_types.contains(&**payload_type));
+        }
 
         answer_media.push(AnswerMedia {
-            line: line.clone(),
+            line: answer_line,
             attributes: answer_attributes_for_media(
                 line,
                 direction,
@@ -141,6 +154,7 @@ pub fn negotiate(
                 setup,
                 &local_candidates,
                 mid == bundle_tag,
+                &accepted_payload_types,
             ),
         });
         sections.push(NegotiatedMediaSection::new(
@@ -245,9 +259,10 @@ fn negotiated_direction(
     Ok(direction)
 }
 
-fn codecs(line: &str0m::sdp::MediaLine) -> Vec<Codec> {
+fn codecs(kind: MediaKind, line: &str0m::sdp::MediaLine) -> Vec<Codec> {
     line.rtp_params()
         .into_iter()
+        .filter(|params| supports_codec(kind, &params.spec.codec.to_string()))
         .map(|params| {
             let clock_rate = u32::from(NonZeroU32::from(params.spec.clock_rate));
             Codec::new(
@@ -261,6 +276,23 @@ fn codecs(line: &str0m::sdp::MediaLine) -> Vec<Codec> {
                 params.fb_pli,
                 params.fb_fir,
             )
+        })
+        .collect()
+}
+
+fn supports_codec(kind: MediaKind, name: &str) -> bool {
+    match kind {
+        MediaKind::Audio => name.eq_ignore_ascii_case("opus"),
+        MediaKind::Video => name.eq_ignore_ascii_case("h264"),
+        MediaKind::Application => false,
+    }
+}
+
+fn accepted_payload_types(codecs: &[Codec]) -> HashSet<u8> {
+    codecs
+        .iter()
+        .flat_map(|codec| {
+            std::iter::once(codec.payload_type()).chain(codec.retransmission_payload_type())
         })
         .collect()
 }
@@ -349,6 +381,7 @@ fn answer_attributes_for_media(
     setup: Setup,
     local_candidates: &[Candidate],
     bundle_tag: bool,
+    accepted_payload_types: &HashSet<u8>,
 ) -> Vec<MediaAttribute> {
     let rtcp_mux = line.attrs.iter().any(|attribute| {
         matches!(
@@ -369,9 +402,12 @@ fn answer_attributes_for_media(
                     | MediaAttribute::ExtMap { .. }
                     | MediaAttribute::RtcpMux
                     | MediaAttribute::RtcpRsize
-                    | MediaAttribute::RtpMap { .. }
-                    | MediaAttribute::RtcpFb { .. }
-                    | MediaAttribute::Fmtp { .. }
+            ) || matches!(
+                attribute,
+                MediaAttribute::RtpMap { pt, .. }
+                        | MediaAttribute::RtcpFb { pt, .. }
+                        | MediaAttribute::Fmtp { pt, .. }
+                        if accepted_payload_types.is_empty() || accepted_payload_types.contains(&**pt)
             )
         })
         .cloned()
