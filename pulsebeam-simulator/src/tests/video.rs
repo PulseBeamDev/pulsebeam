@@ -713,6 +713,7 @@ fn cross_shard_stream_survives_congestion_test() {
 #[test]
 fn cross_shard_simulcast_switching_stays_decodable_test() {
     LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["f", "h", "q"]))
@@ -741,14 +742,18 @@ fn cross_shard_simulcast_switching_stays_decodable_test() {
                 description: "Settle on a higher layer",
                 duration: Duration::from_secs(10),
             },
+            Step::Run {
+                description: "Prove that decoding has recovered after the constrained interval",
+                duration: Duration::from_secs(5),
+            },
             Step::CheckCrossShardMedia {
                 description: "the switching stream crossed a shard boundary",
                 min_frames: 100,
             },
-            Step::CheckVideoQuality {
-                description: "Bob decodes across every switch",
+            Step::CheckVideoQualityInterval {
+                description: "Bob returns to continuous decodable output after every capacity switch",
                 participant: "bob",
-                quality: VideoQuality::min_frames(100).allow_gaps(30),
+                quality: VideoQuality::min_frames(100).min_decoded_resolution((1280, 720)),
             },
         ]);
 }

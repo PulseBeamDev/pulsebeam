@@ -288,6 +288,17 @@ impl StreamCache {
             return None;
         }
 
+        if !segment
+            .iter()
+            .any(|p| p.rtp_ts.numer() == segment_ts && p.marker)
+        {
+            return None;
+        }
+
+        if !segment.last().is_some_and(|p| p.marker) {
+            return None;
+        }
+
         // The burst has to begin where a receiver can begin. Handing over a
         // frame with no start costs more than the frame: the receiver discards
         // it, and with it the template structure that only keyframes carry, so
@@ -559,6 +570,51 @@ mod test {
         assert!(
             cache.replay().is_none(),
             "a keyframe whose first packet was lost is not a switch target"
+        );
+    }
+
+    #[test]
+    fn a_partial_keyframe_is_not_replayed() {
+        let mut b = builder(ParameterSetStyle::AggregatedWithIdr);
+        let frame = b.keyframe(4);
+        assert!(frame.len() >= 2, "need a multi-packet keyframe");
+
+        let mut cache = StreamCache::new();
+        for pkt in frame.iter().take(frame.len().saturating_sub(1)) {
+            cache.push(pkt.clone());
+        }
+        assert!(
+            cache.replay().is_none(),
+            "a switch must wait for the keyframe's final packet"
+        );
+
+        cache.push(frame.last().cloned().expect("keyframe has a final packet"));
+        assert!(
+            cache.replay().is_some(),
+            "the complete keyframe becomes switchable"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_followed_by_a_partial_delta_frame_is_not_replayed() {
+        let mut b = builder(ParameterSetStyle::AggregatedWithIdr);
+        let keyframe = b.keyframe(2);
+        let delta = b.delta_frame(4);
+        assert!(delta.len() >= 2, "need a multi-packet delta frame");
+
+        let mut cache = StreamCache::new();
+        for pkt in keyframe.iter().chain(delta.iter().take(delta.len() - 1)) {
+            cache.push(pkt.clone());
+        }
+        assert!(
+            cache.replay().is_none(),
+            "a switch must not advance past an open delta frame"
+        );
+
+        cache.push(delta.last().cloned().expect("delta has a final packet"));
+        assert!(
+            cache.replay().is_some(),
+            "the complete frame makes the replay switchable"
         );
     }
 

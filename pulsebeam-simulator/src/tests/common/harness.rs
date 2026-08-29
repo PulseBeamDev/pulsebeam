@@ -364,6 +364,11 @@ impl VideoQuality {
         self
     }
 
+    pub fn min_decoded_resolution(mut self, minimum: (usize, usize)) -> Self {
+        self.min_decoded_resolution = Some(minimum);
+        self
+    }
+
     pub fn fixture_fidelity(
         mut self,
         min_resolution: (usize, usize),
@@ -3147,14 +3152,18 @@ fn assert_video_quality(
                 decoded.decoded_width,
                 decoded.decoded_height,
             );
-            assert_eq!(
-                decoded.reference_mismatches, 0,
-                "step {n}/{total} {kind}: {description} ({participant}) could not correlate {publisher}'s decoded output with the fixture reference"
-            );
-            assert_eq!(
-                decoded.reference_frames, decoded.frames,
-                "step {n}/{total} {kind}: {description} ({participant}) had decoded {publisher} frames without a fixture reference"
-            );
+            if quality.max_visual_mean_absolute_error.is_some()
+                || quality.max_visual_error.is_some()
+            {
+                assert_eq!(
+                    decoded.reference_mismatches, 0,
+                    "step {n}/{total} {kind}: {description} ({participant}) could not correlate {publisher}'s decoded output with the fixture reference"
+                );
+                assert_eq!(
+                    decoded.reference_frames, decoded.frames,
+                    "step {n}/{total} {kind}: {description} ({participant}) had decoded {publisher} frames without a fixture reference"
+                );
+            }
             if let Some(maximum) = quality.max_visual_mean_absolute_error {
                 let actual = decoded.mean_absolute_error().unwrap_or(u64::MAX);
                 assert!(

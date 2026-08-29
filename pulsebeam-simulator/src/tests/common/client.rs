@@ -1511,6 +1511,47 @@ mod decoder_tests {
     }
 
     #[test]
+    fn bundled_openh264_decodes_the_full_simulcast_fixture_continuously() {
+        let mut decoder = H264Decoder::new().unwrap();
+        for (index, frame) in
+            pulsebeam_agent::media::H264FrameSlicer::new(pulsebeam_testdata::RAW_H264_FULL_CBR)
+                .take(1_000)
+                .enumerate()
+        {
+            assert!(
+                decoder.decode(frame).is_ok(),
+                "OpenH264 rejected full-resolution source frame {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn h264_packetization_preserves_the_full_simulcast_fixture() {
+        let packetizer =
+            pulsebeam_core::h264::Packetizer::new(pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD);
+        let mut receiver = BrowserVideoReceiver::new();
+        for (index, frame) in
+            pulsebeam_agent::media::H264FrameSlicer::new(pulsebeam_testdata::RAW_H264_FULL_CBR)
+                .take(1_000)
+                .enumerate()
+        {
+            receiver.access_unit.clear();
+            receiver.fu_header = None;
+            for packet in packetizer.packetize(frame) {
+                assert!(
+                    receiver.append_rtp_payload(&packet.payload),
+                    "could not depacketize full-resolution source frame {index}"
+                );
+            }
+            assert!(receiver.fu_header.is_none());
+            assert!(
+                receiver.decoder.decode(&receiver.access_unit).is_ok(),
+                "OpenH264 rejected packetized full-resolution source frame {index}"
+            );
+        }
+    }
+
+    #[test]
     fn bundled_opus_decodes_the_audio_fixture() {
         let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
         let mut pcm = Box::<[i16]>::from([0; 5_760]);
