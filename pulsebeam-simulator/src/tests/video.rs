@@ -37,6 +37,33 @@ fn video_does_not_loop_back_to_publisher_test() {
         ]);
 }
 
+#[test]
+fn quality_fixture_is_proven_from_each_viewers_decoded_output_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("decoded-quality-fixture")
+                .with_participant(Participant::quality_publisher("publisher"))
+                .with_participant(Participant::subscriber("viewer-a"))
+                .with_participant(Participant::subscriber("viewer-b")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the quality publisher and both viewers",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoQuality {
+                description: "First viewer decodes fixture pixels at source resolution",
+                participant: "viewer-a",
+                quality: VideoQuality::min_frames(30).fixture_fidelity((320, 180), 12, 240),
+            },
+            Step::CheckVideoQuality {
+                description: "Second viewer independently decodes fixture pixels at source resolution",
+                participant: "viewer-b",
+                quality: VideoQuality::min_frames(30).fixture_fidelity((320, 180), 12, 240),
+            },
+        ]);
+}
+
 fn bench_participant(name: &'static str) -> Participant {
     let mut participant = Participant::single_publisher(name).and_subscribes();
     participant.slots = 7;

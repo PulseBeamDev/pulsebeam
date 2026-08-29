@@ -1,5 +1,6 @@
 use crate::tests::common::client::{
-    AudioReceiveLog, MAX_CONCEALABLE_GAP, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+    AudioReceiveLog, MAX_CONCEALABLE_GAP, MAX_FIXTURE_PCM_MEAN_ABSOLUTE_ERROR, SimClientBuilder,
+    VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::{
     DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
@@ -60,6 +61,8 @@ pub struct Participant {
     /// Make the published payload opaque (simulating SFrame/E2EE), forcing the SFU
     /// to forward on the Dependency Descriptor alone.
     pub opaque_payload: bool,
+    /// Publish the decoder-quality fixture instead of a legacy benchmark encoding.
+    pub quality_fixture: bool,
     /// Model a legacy peer that never negotiates the Dependency Descriptor
     /// extension, exercising the marker/deep-inspection fallback for mixed rooms.
     pub marker_only: bool,
@@ -81,6 +84,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            quality_fixture: false,
             marker_only: false,
         }
     }
@@ -100,7 +104,15 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            quality_fixture: false,
             marker_only: false,
+        }
+    }
+
+    pub fn quality_publisher(name: &'static str) -> Self {
+        Self {
+            quality_fixture: true,
+            ..Self::single_publisher(name)
         }
     }
 
@@ -119,6 +131,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            quality_fixture: false,
             marker_only: false,
         }
     }
@@ -139,6 +152,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            quality_fixture: false,
             marker_only: false,
         }
     }
@@ -175,6 +189,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            quality_fixture: false,
             marker_only: false,
         }
     }
@@ -304,6 +319,9 @@ pub struct VideoQuality {
     pub max_non_contiguous: u64,
     pub max_capture_to_decode_latency: Option<Duration>,
     pub max_frame_gap: Option<Duration>,
+    pub min_decoded_resolution: Option<(usize, usize)>,
+    pub max_visual_mean_absolute_error: Option<u64>,
+    pub max_visual_error: Option<u8>,
 }
 
 impl VideoQuality {
@@ -315,6 +333,9 @@ impl VideoQuality {
             max_non_contiguous: 0,
             max_capture_to_decode_latency: None,
             max_frame_gap: None,
+            min_decoded_resolution: None,
+            max_visual_mean_absolute_error: None,
+            max_visual_error: None,
         }
     }
 
@@ -340,6 +361,18 @@ impl VideoQuality {
 
     pub fn max_frame_gap(mut self, gap: Duration) -> Self {
         self.max_frame_gap = Some(gap);
+        self
+    }
+
+    pub fn fixture_fidelity(
+        mut self,
+        min_resolution: (usize, usize),
+        max_mean_absolute_error: u64,
+        max_visual_error: u8,
+    ) -> Self {
+        self.min_decoded_resolution = Some(min_resolution);
+        self.max_visual_mean_absolute_error = Some(max_mean_absolute_error);
+        self.max_visual_error = Some(max_visual_error);
         self
     }
 }
@@ -1070,6 +1103,9 @@ async fn run_participant(
                 }
                 if config.opaque_payload {
                     builder = builder.with_opaque_payload();
+                }
+                if config.quality_fixture {
+                    builder = builder.with_quality_fixture();
                 }
                 if config.subscribes {
                     builder = builder.receive_video(config.slots.max(1));
@@ -2419,6 +2455,25 @@ async fn execute_plan(
                         stream.concealed_samples,
                     );
                 }
+                for (publisher, decoded) in &audio.quality_by_publisher {
+                    assert!(
+                        decoded.reference_packets > 0,
+                        "step {n}/{total} {kind}: {description} ({participant}) decoded no fixture-correlated PCM for {publisher}"
+                    );
+                    assert_eq!(
+                        decoded.reference_mismatches, 0,
+                        "step {n}/{total} {kind}: {description} ({participant}) decoded {publisher} PCM without a matching fixture interval"
+                    );
+                    assert!(
+                        decoded.mean_absolute_error().is_some(),
+                        "step {n}/{total} {kind}: {description} ({participant}) has no PCM-fidelity samples for {publisher}"
+                    );
+                    let mean_error = decoded.mean_absolute_error().unwrap_or(u64::MAX);
+                    assert!(
+                        mean_error <= MAX_FIXTURE_PCM_MEAN_ABSOLUTE_ERROR,
+                        "step {n}/{total} {kind}: {description} ({participant}) decoded {publisher} PCM with mean error {mean_error}, maximum {MAX_FIXTURE_PCM_MEAN_ABSOLUTE_ERROR}"
+                    );
+                }
             }
 
             Step::CheckSpeakerRank {
@@ -2994,6 +3049,42 @@ fn assert_video_quality(
         log.changed_ssrc_packets,
         log.changed_payload_type_packets,
     );
+    if let Some((minimum_width, minimum_height)) = quality.min_decoded_resolution {
+        assert!(
+            !log.quality_by_publisher.is_empty(),
+            "step {n}/{total} {kind}: {description} ({participant}) decoded no publisher output"
+        );
+        for (publisher, decoded) in &log.quality_by_publisher {
+            assert!(
+                decoded.decoded_width >= minimum_width && decoded.decoded_height >= minimum_height,
+                "step {n}/{total} {kind}: {description} ({participant}) decoded {publisher} at {}x{}, minimum {minimum_width}x{minimum_height}",
+                decoded.decoded_width,
+                decoded.decoded_height,
+            );
+            assert_eq!(
+                decoded.reference_mismatches, 0,
+                "step {n}/{total} {kind}: {description} ({participant}) could not correlate {publisher}'s decoded output with the fixture reference"
+            );
+            assert_eq!(
+                decoded.reference_frames, decoded.frames,
+                "step {n}/{total} {kind}: {description} ({participant}) had decoded {publisher} frames without a fixture reference"
+            );
+            if let Some(maximum) = quality.max_visual_mean_absolute_error {
+                let actual = decoded.mean_absolute_error().unwrap_or(u64::MAX);
+                assert!(
+                    actual <= maximum,
+                    "step {n}/{total} {kind}: {description} ({participant}) decoded {publisher} with mean visual error {actual}, maximum {maximum}"
+                );
+            }
+            if let Some(maximum) = quality.max_visual_error {
+                assert!(
+                    decoded.visual_max_error <= maximum,
+                    "step {n}/{total} {kind}: {description} ({participant}) decoded {publisher} with peak visual error {}, maximum {maximum}",
+                    decoded.visual_max_error
+                );
+            }
+        }
+    }
     assert_video_frame_gap(
         n,
         total,

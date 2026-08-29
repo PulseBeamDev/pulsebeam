@@ -96,6 +96,14 @@ impl QualityAudioFixture {
     pub fn is_empty(&self) -> bool {
         self.packets.is_empty()
     }
+
+    pub fn frame_for_rtp_timestamp(&self, timestamp: u64) -> Option<QualityAudioFrame<'static>> {
+        let frame_samples = u64::try_from(QUALITY_AUDIO_FRAME_SAMPLES).ok()?;
+        let index = timestamp.checked_div(frame_samples)?;
+        let frame_count = u64::try_from(self.len()).ok()?;
+        let index = usize::try_from(index.checked_rem(frame_count)?).ok()?;
+        self.frame(index)
+    }
 }
 
 pub fn quality_video_frame(index: usize) -> Option<QualityVideoFrame<'static>> {
@@ -119,6 +127,16 @@ pub fn quality_video_frame(index: usize) -> Option<QualityVideoFrame<'static>> {
         width: QUALITY_VIDEO_WIDTH,
         height: QUALITY_VIDEO_HEIGHT,
     })
+}
+
+pub fn quality_video_frame_for_rtp_timestamp(timestamp: u64) -> Option<QualityVideoFrame<'static>> {
+    let numerator = timestamp.checked_mul(u64::from(QUALITY_VIDEO_FPS))?;
+    if numerator.checked_rem(QUALITY_VIDEO_RTP_CLOCK_RATE)? != 0 {
+        return None;
+    }
+    let index = numerator.checked_div(QUALITY_VIDEO_RTP_CLOCK_RATE)?;
+    let index = index.checked_rem(u64::try_from(QUALITY_VIDEO_FRAME_COUNT).ok()?)?;
+    quality_video_frame(usize::try_from(index).ok()?)
 }
 
 pub fn quality_audio_fixture() -> QualityAudioFixture {
@@ -459,6 +477,16 @@ mod tests {
         );
         assert!(!first.encoded.is_empty());
         assert!(quality_video_frame(QUALITY_VIDEO_FRAME_COUNT).is_none());
+        assert_eq!(
+            quality_video_frame_for_rtp_timestamp(
+                QUALITY_VIDEO_RTP_CLOCK_RATE
+                    .checked_mul(3)
+                    .expect("quality video loop timestamp"),
+            )
+            .expect("quality video loop frame")
+            .index,
+            0
+        );
     }
 
     #[test]
@@ -483,5 +511,17 @@ mod tests {
         );
         assert!(!first.opus_packet.is_empty());
         assert!(fixture.frame(QUALITY_AUDIO_FRAME_COUNT).is_none());
+        assert_eq!(
+            fixture
+                .frame_for_rtp_timestamp(
+                    u64::try_from(QUALITY_AUDIO_FRAME_COUNT)
+                        .expect("quality audio frame count")
+                        .checked_mul(u64::try_from(QUALITY_AUDIO_FRAME_SAMPLES).expect("samples"))
+                        .expect("quality audio loop timestamp"),
+                )
+                .expect("quality audio loop frame")
+                .index,
+            0
+        );
     }
 }

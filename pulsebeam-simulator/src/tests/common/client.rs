@@ -14,6 +14,7 @@ use pulsebeam_agent::{
 };
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
+use pulsebeam_testdata::{quality_audio_fixture, quality_video_frame_for_rtp_timestamp};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,8 @@ use tokio::task::JoinSet;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+pub const MAX_FIXTURE_PCM_MEAN_ABSOLUTE_ERROR: u64 = 5_500;
 
 pub struct SimClientBuilder {
     ip: IpAddr,
@@ -43,6 +46,7 @@ pub struct SimClientBuilder {
     receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
+    quality_fixture: bool,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -80,6 +84,7 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
+            quality_fixture: false,
         })
     }
 
@@ -108,6 +113,7 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
+            quality_fixture: false,
         })
     }
 
@@ -151,6 +157,11 @@ impl SimClientBuilder {
     /// Make the published payload opaque, simulating SFrame/E2EE.
     pub fn with_opaque_payload(mut self) -> Self {
         self.opaque_payload = true;
+        self
+    }
+
+    pub fn with_quality_fixture(mut self) -> Self {
+        self.quality_fixture = true;
         self
     }
 
@@ -283,7 +294,15 @@ impl SimClientBuilder {
                         join_set.spawn(looper.run(sender));
                     }
                     None => {
-                        let mut looper = create_h264_looper_for_rid(rid);
+                        let mut looper = if self.quality_fixture {
+                            debug_assert!(rid.is_none());
+                            H264Looper::new(
+                                pulsebeam_testdata::QUALITY_H264_320X180_30,
+                                pulsebeam_testdata::QUALITY_VIDEO_FPS,
+                            )
+                        } else {
+                            create_h264_looper_for_rid(rid)
+                        };
                         if let Some(layers) = self.temporal_dd {
                             looper = looper.with_temporal_layers(layers);
                         }
@@ -320,9 +339,141 @@ impl SimClientBuilder {
 /// was preceded by a sequence-number hole, which is exactly what a botched
 /// switch produces. `is_keyframe` lets a test assert that each switch actually
 /// delivered a decodable entry point.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedVideoQuality {
+    pub frames: u64,
+    pub reference_frames: u64,
+    pub reference_mismatches: u64,
+    pub decoded_width: usize,
+    pub decoded_height: usize,
+    pub visual_error_sum: u64,
+    pub visual_samples: u64,
+    pub visual_max_error: u8,
+    pub longest_frame_gap: Duration,
+    first_frame_at: Option<Instant>,
+    last_frame_at: Option<Instant>,
+}
+
+impl DecodedVideoQuality {
+    pub fn mean_absolute_error(self) -> Option<u64> {
+        self.visual_error_sum.checked_div(self.visual_samples)
+    }
+
+    fn record_frame(&mut self, width: usize, height: usize, error: Option<PlaneError>) {
+        let now = Instant::now();
+        if let Some(last_frame_at) = self.last_frame_at {
+            self.longest_frame_gap = self
+                .longest_frame_gap
+                .max(now.saturating_duration_since(last_frame_at));
+        }
+        self.first_frame_at.get_or_insert(now);
+        self.last_frame_at = Some(now);
+        self.frames = self.frames.saturating_add(1);
+        self.decoded_width = width;
+        self.decoded_height = height;
+        match error {
+            Some(error) => {
+                self.reference_frames = self.reference_frames.saturating_add(1);
+                self.visual_error_sum = self.visual_error_sum.saturating_add(error.sum);
+                self.visual_samples = self.visual_samples.saturating_add(error.samples);
+                self.visual_max_error = self.visual_max_error.max(error.max);
+            }
+            None => self.reference_mismatches = self.reference_mismatches.saturating_add(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PlaneError {
+    sum: u64,
+    samples: u64,
+    max: u8,
+}
+
+fn plane_error(
+    reference: &[u8],
+    decoded: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Option<PlaneError> {
+    debug_assert!(width <= stride);
+    let expected_len = width.checked_mul(height)?;
+    if reference.len() != expected_len {
+        return None;
+    }
+    let mut sum = 0u64;
+    let mut max = 0u8;
+    for row in 0..height {
+        let decoded_start = row.checked_mul(stride)?;
+        let decoded_end = decoded_start.checked_add(width)?;
+        let reference_start = row.checked_mul(width)?;
+        let reference_end = reference_start.checked_add(width)?;
+        let decoded_row = decoded.get(decoded_start..decoded_end)?;
+        let reference_row = reference.get(reference_start..reference_end)?;
+        for (&expected, &actual) in reference_row.iter().zip(decoded_row) {
+            let error = expected.abs_diff(actual);
+            sum = sum.saturating_add(u64::from(error));
+            max = max.max(error);
+        }
+    }
+    Some(PlaneError {
+        sum,
+        samples: u64::try_from(expected_len).ok()?,
+        max,
+    })
+}
+
+fn decoded_video_error(image: &impl YUVSource, timestamp: u64) -> Option<PlaneError> {
+    let reference = quality_video_frame_for_rtp_timestamp(timestamp)?;
+    let (width, height) = image.dimensions();
+    if width != reference.width || height != reference.height {
+        return None;
+    }
+    let y_len = width.checked_mul(height)?;
+    let chroma_len = y_len.checked_div(4)?;
+    let y_reference = reference.reference_yuv420p.get(..y_len)?;
+    let u_start = y_len;
+    let u_end = u_start.checked_add(chroma_len)?;
+    let u_reference = reference.reference_yuv420p.get(u_start..u_end)?;
+    let v_end = u_end.checked_add(chroma_len)?;
+    let v_reference = reference.reference_yuv420p.get(u_end..v_end)?;
+    debug_assert_eq!(v_end, reference.reference_yuv420p.len());
+    let (y_stride, u_stride, v_stride) = image.strides();
+    let y_error = plane_error(y_reference, image.y(), y_stride, width, height)?;
+    let chroma_width = width.checked_div(2)?;
+    let chroma_height = height.checked_div(2)?;
+    let u_error = plane_error(
+        u_reference,
+        image.u(),
+        u_stride,
+        chroma_width,
+        chroma_height,
+    )?;
+    let v_error = plane_error(
+        v_reference,
+        image.v(),
+        v_stride,
+        chroma_width,
+        chroma_height,
+    )?;
+    Some(PlaneError {
+        sum: y_error
+            .sum
+            .saturating_add(u_error.sum)
+            .saturating_add(v_error.sum),
+        samples: y_error
+            .samples
+            .saturating_add(u_error.samples)
+            .saturating_add(v_error.samples),
+        max: y_error.max.max(u_error.max).max(v_error.max),
+    })
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct VideoReceiveLog {
     pub by_publisher: BTreeMap<String, u64>,
+    pub quality_by_publisher: BTreeMap<String, DecodedVideoQuality>,
     pub frames: u64,
     pub keyframes: u64,
     pub non_contiguous: u64,
@@ -599,6 +750,7 @@ impl BrowserVideoReceiver {
                             timestamp,
                             self.frame_is_keyframe,
                             self.frame_capture_time,
+                            &image,
                         );
                     }
                 }
@@ -628,6 +780,7 @@ struct BrowserAudioReceiver {
     decoder: opus::Decoder,
     pcm: Box<[i16]>,
     expected_seq: Option<u64>,
+    fixture: pulsebeam_testdata::QualityAudioFixture,
 }
 
 impl BrowserAudioReceiver {
@@ -637,6 +790,7 @@ impl BrowserAudioReceiver {
                 .expect("bundled Opus decoder initializes"),
             pcm: vec![0; 5_760].into_boxed_slice(),
             expected_seq: None,
+            fixture: quality_audio_fixture(),
         }
     }
 
@@ -648,21 +802,30 @@ impl BrowserAudioReceiver {
     ) {
         let ssrc = rtp.ssrc.map_or(0, |value| *value);
         let sequence = *rtp.seq;
+        let timestamp = rtp.ts.numer();
         log.record(publisher, ssrc, sequence, rtp.payload.len(), Instant::now());
         if let Some(expected) = self.expected_seq {
             let missing = sequence.saturating_sub(expected);
             for _ in 0..missing.min(64) {
-                self.decode(ssrc, &[], true, log);
+                self.decode(publisher, ssrc, None, &[], true, log);
             }
             if missing > 64 {
                 log.record_decoder_error(ssrc);
             }
         }
         self.expected_seq = Some(sequence.wrapping_add(1));
-        self.decode(ssrc, &rtp.payload, false, log);
+        self.decode(publisher, ssrc, Some(timestamp), &rtp.payload, false, log);
     }
 
-    fn decode(&mut self, ssrc: u32, packet: &[u8], concealed: bool, log: &mut AudioReceiveLog) {
+    fn decode(
+        &mut self,
+        publisher: &str,
+        ssrc: u32,
+        timestamp: Option<u64>,
+        packet: &[u8],
+        concealed: bool,
+        log: &mut AudioReceiveLog,
+    ) {
         match self.decoder.decode(packet, &mut self.pcm, false) {
             Ok(samples) => {
                 let Some(pcm) = self.pcm.get(..samples) else {
@@ -672,7 +835,10 @@ impl BrowserAudioReceiver {
                 let energy = pcm.iter().fold(0u64, |total, sample| {
                     total.saturating_add(u64::from(sample.unsigned_abs()))
                 });
-                log.record_pcm(ssrc, samples, energy, concealed);
+                let reference = timestamp
+                    .and_then(|timestamp| self.fixture.frame_for_rtp_timestamp(timestamp))
+                    .map(|frame| frame.reference_pcm_s16le);
+                log.record_pcm(publisher, ssrc, pcm, energy, concealed, reference);
             }
             Err(_) => log.record_decoder_error(ssrc),
         }
@@ -733,6 +899,7 @@ impl AudioStream {
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct AudioReceiveLog {
     pub by_publisher: std::collections::BTreeMap<String, AudioStream>,
+    pub quality_by_publisher: std::collections::BTreeMap<String, DecodedAudioQuality>,
     /// Every RTP stream this listener was sent, and whether each stayed whole.
     ///
     /// Keyed by SSRC rather than by speaker on purpose. Several speakers share a slot's stream
@@ -754,6 +921,79 @@ pub struct AudioStreamContinuity {
     /// network caused it or the SFU spliced two speakers together badly.
     pub max_seq_gap: u64,
     last_seq: Option<u64>,
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedAudioQuality {
+    pub packets: u64,
+    pub reference_packets: u64,
+    pub reference_mismatches: u64,
+    pub concealed_packets: u64,
+    pub pcm_error_sum: u64,
+    pub pcm_samples: u64,
+    pub pcm_max_error: u16,
+    pub longest_packet_gap: Duration,
+    last_packet_at: Option<Instant>,
+}
+
+impl DecodedAudioQuality {
+    pub fn mean_absolute_error(self) -> Option<u64> {
+        self.pcm_error_sum.checked_div(self.pcm_samples)
+    }
+
+    fn record_pcm(&mut self, pcm: &[i16], concealed: bool, reference: Option<&[u8]>) {
+        let now = Instant::now();
+        if let Some(last_packet_at) = self.last_packet_at {
+            self.longest_packet_gap = self
+                .longest_packet_gap
+                .max(now.saturating_duration_since(last_packet_at));
+        }
+        self.last_packet_at = Some(now);
+        self.packets = self.packets.saturating_add(1);
+        if concealed {
+            self.concealed_packets = self.concealed_packets.saturating_add(1);
+            return;
+        }
+        let Some(reference) = reference else {
+            self.reference_mismatches = self.reference_mismatches.saturating_add(1);
+            return;
+        };
+        let Some(error) = pcm_error(pcm, reference) else {
+            self.reference_mismatches = self.reference_mismatches.saturating_add(1);
+            return;
+        };
+        self.reference_packets = self.reference_packets.saturating_add(1);
+        self.pcm_error_sum = self.pcm_error_sum.saturating_add(error.sum);
+        self.pcm_samples = self.pcm_samples.saturating_add(error.samples);
+        self.pcm_max_error = self.pcm_max_error.max(error.max);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PcmError {
+    sum: u64,
+    samples: u64,
+    max: u16,
+}
+
+fn pcm_error(pcm: &[i16], reference: &[u8]) -> Option<PcmError> {
+    let expected_len = pcm.len().checked_mul(2)?;
+    if reference.len() != expected_len {
+        return None;
+    }
+    let mut sum = 0u64;
+    let mut max = 0u16;
+    for (actual, bytes) in pcm.iter().zip(reference.chunks_exact(2)) {
+        let expected = i16::from_le_bytes(<[u8; 2]>::try_from(bytes).ok()?);
+        let error = actual.abs_diff(expected);
+        sum = sum.saturating_add(u64::from(error));
+        max = max.max(error);
+    }
+    Some(PcmError {
+        sum,
+        samples: u64::try_from(pcm.len()).ok()?,
+        max,
+    })
 }
 
 impl AudioStreamContinuity {
@@ -784,11 +1024,23 @@ impl AudioReceiveLog {
         }
     }
 
-    fn record_pcm(&mut self, ssrc: u32, samples: usize, energy: u64, concealed: bool) {
+    fn record_pcm(
+        &mut self,
+        publisher: &str,
+        ssrc: u32,
+        pcm: &[i16],
+        energy: u64,
+        concealed: bool,
+        reference: Option<&[u8]>,
+    ) {
         self.by_stream
             .entry(ssrc)
             .or_default()
-            .record_pcm(samples, energy, concealed);
+            .record_pcm(pcm.len(), energy, concealed);
+        self.quality_by_publisher
+            .entry(publisher.to_owned())
+            .or_default()
+            .record_pcm(pcm, concealed, reference);
     }
 
     fn record_decoder_error(&mut self, ssrc: u32) {
@@ -950,6 +1202,7 @@ impl VideoReceiveLog {
         ts: u64,
         is_keyframe: bool,
         capture_time: Option<SystemTime>,
+        image: &impl YUVSource,
     ) {
         let now = Instant::now();
         if let Some(capture_time) = capture_time
@@ -969,6 +1222,12 @@ impl VideoReceiveLog {
         self.first_frame_at.get_or_insert(now);
         self.last_frame_at = Some(now);
         *self.by_publisher.entry(publisher.to_owned()).or_default() += 1;
+        let (width, height) = image.dimensions();
+        let reference_error = decoded_video_error(image, ts);
+        self.quality_by_publisher
+            .entry(publisher.to_owned())
+            .or_default()
+            .record_frame(width, height, reference_error);
         self.frames += 1;
         if is_keyframe {
             self.keyframes += 1;
@@ -1250,15 +1509,54 @@ mod decoder_tests {
         let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
         let mut pcm = Box::<[i16]>::from([0; 5_760]);
         let fixture = pulsebeam_testdata::quality_audio_fixture();
-        let samples = decoder
-            .decode(
-                fixture.frame(0).expect("quality fixture frame").opus_packet,
-                &mut pcm,
-                false,
-            )
-            .unwrap();
+        let frame = fixture.frame(0).expect("quality fixture frame");
+        let samples = decoder.decode(frame.opus_packet, &mut pcm, false).unwrap();
         assert_eq!(samples, 960);
         assert!(pcm[..samples].iter().any(|sample| *sample != 0));
+        let error =
+            pcm_error(&pcm[..samples], frame.reference_pcm_s16le).expect("fixture PCM reference");
+        assert!(error.samples > 0);
+        assert!(
+            error.sum.checked_div(error.samples).unwrap_or(u64::MAX)
+                <= MAX_FIXTURE_PCM_MEAN_ABSOLUTE_ERROR
+        );
+    }
+
+    #[test]
+    fn decoded_video_records_fixture_fidelity_and_resolution() {
+        let frame = pulsebeam_testdata::quality_video_frame(0).expect("quality fixture frame");
+        let mut decoder = H264Decoder::new().unwrap();
+        let image = decoder
+            .decode(frame.encoded)
+            .unwrap()
+            .expect("decoded frame");
+        let mut log = VideoReceiveLog::default();
+        log.record_decoded("publisher", frame.rtp_timestamp, true, None, &image);
+        let quality = log
+            .quality_by_publisher
+            .get("publisher")
+            .copied()
+            .expect("publisher quality");
+        assert_eq!(quality.frames, 1);
+        assert_eq!(quality.reference_frames, 1);
+        assert_eq!(quality.reference_mismatches, 0);
+        assert_eq!(quality.decoded_width, frame.width);
+        assert_eq!(quality.decoded_height, frame.height);
+        assert!(quality.mean_absolute_error().is_some());
+    }
+
+    #[test]
+    fn fidelity_metrics_reject_missing_or_wrong_references() {
+        assert!(plane_error(&[0, 0], &[0, 0], 2, 2, 1).is_some());
+        assert!(plane_error(&[0], &[0, 0], 2, 2, 1).is_none());
+        assert!(pcm_error(&[1], &[1]).is_none());
+        let mut video = DecodedVideoQuality::default();
+        video.record_frame(1, 1, None);
+        assert_eq!(video.reference_mismatches, 1);
+        let mut audio = DecodedAudioQuality::default();
+        audio.record_pcm(&[1], false, Some(&[0, 0]));
+        assert_eq!(audio.reference_packets, 1);
+        assert!(audio.mean_absolute_error().is_some());
     }
 }
 
