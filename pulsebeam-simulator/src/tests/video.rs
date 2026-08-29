@@ -71,6 +71,64 @@ fn quality_fixture_is_proven_from_each_viewers_decoded_output_test() {
         ]);
 }
 
+#[test]
+fn subscription_activation_delivers_a_decoded_fixture_frame_without_slow_poll_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("immediate-decoder-activation")
+                .with_participant(Participant::quality_publisher("publisher"))
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the publisher and discover its fixture track",
+                duration: Duration::from_secs(1),
+            },
+            Step::SubscribeTo {
+                description: "Activate the viewer route",
+                participant: "viewer",
+                targets: &[("publisher", 720)],
+            },
+            Step::Run {
+                description: "Deliver the controlled source keyframe",
+                duration: Duration::from_secs(1),
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "Initial activation reaches a real decoder promptly",
+                participant: "viewer",
+                max_latency: Duration::from_millis(150),
+            },
+            Step::SubscribeTo {
+                description: "Deactivate the viewer route",
+                participant: "viewer",
+                targets: &[("publisher", 0)],
+            },
+            Step::Run {
+                description: "Settle after deactivation",
+                duration: Duration::from_millis(200),
+            },
+            Step::SubscribeTo {
+                description: "Reactivate the viewer route",
+                participant: "viewer",
+                targets: &[("publisher", 720)],
+            },
+            Step::Run {
+                description: "Deliver the next controlled source keyframe",
+                duration: Duration::from_secs(1),
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "Reactivation reaches a real decoder promptly",
+                participant: "viewer",
+                max_latency: Duration::from_millis(150),
+            },
+            Step::CheckVideoQuality {
+                description: "The reactivated viewer decodes source-resolution fixture pixels",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(15).fixture_fidelity((320, 180), 12, 240),
+            },
+        ]);
+}
+
 fn bench_participant(name: &'static str) -> Participant {
     let mut participant = Participant::single_publisher(name).and_subscribes();
     participant.slots = 7;

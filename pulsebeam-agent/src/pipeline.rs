@@ -207,7 +207,7 @@ pub const DEFAULT_JITTER_MAX_WAIT: Duration = Duration::from_secs(5);
 /// Sharing one constant made every stream pay the gap budget before its first frame: measured at a
 /// 5.1s median time-to-first-frame across the simulation suite, with variance far too tight to be
 /// anything but a fixed wait. A viewer joins a call and the tile is blank for five seconds.
-pub const DEFAULT_INITIAL_COMMIT_WAIT: Duration = Duration::from_millis(100);
+pub const DEFAULT_INITIAL_COMMIT_WAIT: Duration = Duration::from_millis(40);
 
 /// A time-bounded reorder / jitter buffer.
 ///
@@ -743,9 +743,9 @@ mod tests {
 
     /// The shorter opening window must still absorb the reordering it exists for.
     ///
-    /// Simulated paths push a reordered packet back by 30ms, and real ones are comparable, so the
-    /// window has room to spare. If it were tightened below that, a stream that merely opened out
-    /// of order would commit to the wrong first sequence and drop the true first packet as late.
+    /// Simulated paths push a reordered packet back by 30ms, so the default window leaves a small
+    /// margin. If it were tightened below that, a stream that merely opened out of order would
+    /// commit to the wrong first sequence and drop the true first packet as late.
     #[test]
     fn the_opening_window_still_absorbs_reordering() {
         use tokio::time::Instant;

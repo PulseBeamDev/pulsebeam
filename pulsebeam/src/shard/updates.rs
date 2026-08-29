@@ -66,13 +66,6 @@ impl ShardUpdateApplication {
                 {
                     self.apply_lifecycle_op(execution, op);
                 }
-                self.apply_pending_participant_effects(execution);
-                for (participant, effect) in &delta.participant_effects {
-                    if !execution.apply_participant_effect(*participant, effect.clone()) {
-                        self.pending_participant_effects
-                            .push_back((*participant, effect.clone()));
-                    }
-                }
                 for op in delta
                     .lifecycle
                     .iter()
@@ -101,6 +94,13 @@ impl ShardUpdateApplication {
             if self.pending_plan_index < delta.plans.len() {
                 self.pending_update = Some(delta);
                 break;
+            }
+            self.apply_pending_participant_effects(execution);
+            for (participant, effect) in &delta.participant_effects {
+                if !execution.apply_participant_effect(*participant, effect.clone()) {
+                    self.pending_participant_effects
+                        .push_back((*participant, effect.clone()));
+                }
             }
             for op in delta.lifecycle.iter().filter(|op| is_retire(op)) {
                 self.apply_lifecycle_op(execution, op);

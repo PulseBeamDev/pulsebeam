@@ -382,6 +382,7 @@ pub struct DirectParticipantCore {
     next_send_id: u64,
     forwarded_timing: HashMap<SendId, ForwardTiming>,
     pacer_wait: Option<PacerWait>,
+    activation_pending: bool,
     next_fir_sequence: u8,
     #[cfg(debug_assertions)]
     egress_guard: EgressGuard,
@@ -545,6 +546,7 @@ impl DirectParticipantCore {
             next_send_id: 0,
             forwarded_timing: HashMap::new(),
             pacer_wait: None,
+            activation_pending: false,
             next_fir_sequence: 0,
             #[cfg(debug_assertions)]
             egress_guard: EgressGuard::new(),
@@ -650,9 +652,11 @@ impl DirectParticipantCore {
             }
             ParticipantEffect::TrackSubscribed { key, track_id } => {
                 self.downstream.activate_track_binding(key, track_id);
+                self.activation_pending = true;
             }
             ParticipantEffect::TrackUnsubscribed { key, track_id } => {
                 self.downstream.deactivate_track_binding(key, track_id);
+                self.activation_pending = true;
             }
             ParticipantEffect::TrackPublished { key, track_id } => {
                 self.upstream.bind_track_key(track_id, key);
@@ -858,6 +862,13 @@ impl DirectParticipantCore {
             self.disconnect_reason = Some(DisconnectReason::IceDisconnected);
             events.exit();
             return None;
+        }
+        if self.activation_pending {
+            let (assignments_changed, _) = self.downstream.poll_slow(now, events);
+            if assignments_changed {
+                self.signaling.mark_assignments_dirty();
+            }
+            self.activation_pending = false;
         }
         if now.saturating_duration_since(self.last_slow_poll) >= SLOW_POLL_INTERVAL {
             self.upstream.poll_slow(now);
@@ -1220,6 +1231,7 @@ impl DirectParticipantCore {
                     }
                     self.downstream
                         .apply_signaling_intents(self.signaling.reconcile());
+                    self.activation_pending = true;
                 }
                 Err(error) => {
                     self.disconnect_reason = Some(error.into());

@@ -498,6 +498,7 @@ pub struct VideoReceiveLog {
     /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
     /// against the moment the viewer subscribed, which only the harness knows.
     pub first_frame_at: Option<Instant>,
+    pub first_frame_since_measurement: Option<Instant>,
     /// Time spent in stretches longer than [`FREEZE_THRESHOLD`] with no frame.
     ///
     /// Distinct from the longest gap: one ten-second freeze and fifty two-hundred-millisecond
@@ -1172,6 +1173,10 @@ impl VideoReceiveStats {
 /// Scans an Annex-B frame for the H.264 NAL unit types it contains, using the
 /// same `pulsebeam_core::h264::classify()` classifier as the production SFU forwarder.
 impl VideoReceiveLog {
+    pub fn begin_first_frame_measurement(&mut self) {
+        self.first_frame_since_measurement = None;
+    }
+
     pub fn frames_from(&self, publisher: &str) -> u64 {
         self.by_publisher.get(publisher).copied().unwrap_or(0)
     }
@@ -1220,6 +1225,7 @@ impl VideoReceiveLog {
             }
         }
         self.first_frame_at.get_or_insert(now);
+        self.first_frame_since_measurement.get_or_insert(now);
         self.last_frame_at = Some(now);
         *self.by_publisher.entry(publisher.to_owned()).or_default() += 1;
         let (width, height) = image.dimensions();

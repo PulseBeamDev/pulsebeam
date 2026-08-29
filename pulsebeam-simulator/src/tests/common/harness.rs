@@ -573,6 +573,11 @@ pub enum Step {
         publisher: &'static str,
         min_frames: u64,
     },
+    CheckFirstDecodedFrame {
+        description: &'static str,
+        participant: &'static str,
+        max_latency: Duration,
+    },
     CheckForwardingLatency {
         description: &'static str,
         min_samples: usize,
@@ -1031,6 +1036,15 @@ impl ParticipantHandle {
     }
     fn video_rx(&self) -> VideoReceiveLog {
         self.shared.video_rx.lock().unwrap().clone()
+    }
+
+    fn begin_first_frame_measurement(&mut self) {
+        self.subscribed_at = Some(Instant::now());
+        self.shared
+            .video_rx
+            .lock()
+            .unwrap()
+            .begin_first_frame_measurement();
     }
 
     fn audio_rx(&self) -> AudioReceiveLog {
@@ -1508,6 +1522,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
         Step::CheckVideoReceivedFrom { .. } => "CheckVideoReceivedFrom",
+        Step::CheckFirstDecodedFrame { .. } => "CheckFirstDecodedFrame",
         Step::CheckForwardingLatency { .. } => "CheckForwardingLatency",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
@@ -1794,7 +1809,7 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
                 // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
-                handle.subscribed_at.get_or_insert_with(Instant::now);
+                handle.begin_first_frame_measurement();
                 handle
                     .shared
                     .pending_ops
@@ -1829,7 +1844,7 @@ async fn execute_plan(
                 }
                 let handle = get_handle(handles, participant, description)?;
                 // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
-                handle.subscribed_at.get_or_insert_with(Instant::now);
+                handle.begin_first_frame_measurement();
                 handle
                     .shared
                     .pending_ops
@@ -1864,7 +1879,7 @@ async fn execute_plan(
                 }
                 let handle = get_handle(handles, participant, description)?;
                 // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
-                handle.subscribed_at.get_or_insert_with(Instant::now);
+                handle.begin_first_frame_measurement();
                 handle
                     .shared
                     .pending_ops
@@ -1912,7 +1927,7 @@ async fn execute_plan(
                 );
                 let handle = get_handle(handles, participant, description)?;
                 // Time-to-first-frame runs from the moment the viewer asked, not from plan start.
-                handle.subscribed_at.get_or_insert_with(Instant::now);
+                handle.begin_first_frame_measurement();
                 let mut tracks: Vec<String> = handle
                     .shared
                     .discovered_tracks
@@ -2075,6 +2090,29 @@ async fn execute_plan(
                 let handle = get_handle(handles, participant, description)?;
                 let log = handle.video_rx();
                 assert_video_quality(n, total, description, participant, quality, &log);
+            }
+
+            Step::CheckFirstDecodedFrame {
+                description,
+                participant,
+                max_latency,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let Some(subscribed_at) = handle.subscribed_at else {
+                    anyhow::bail!(
+                        "step {n}/{total} {kind}: {description} ({participant}) has no subscription measurement"
+                    );
+                };
+                let Some(first_frame_at) = handle.video_rx().first_frame_since_measurement else {
+                    anyhow::bail!(
+                        "step {n}/{total} {kind}: {description} ({participant}) decoded no frame after subscription"
+                    );
+                };
+                let latency = first_frame_at.saturating_duration_since(subscribed_at);
+                assert!(
+                    latency <= *max_latency,
+                    "step {n}/{total} {kind}: {description} ({participant}) first decoded frame took {latency:?}, maximum {max_latency:?}",
+                );
             }
 
             Step::CheckVideoQualityInterval {
