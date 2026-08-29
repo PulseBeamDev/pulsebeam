@@ -41,7 +41,6 @@ use super::{ParticipantEffect, ParticipantInput, TrackPacketRef};
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MID_EXTENSION_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
-const RID_EXTENSION_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
 const TWCC_EXTENSION_URI: &str = "transport-wide-cc";
 const RTP_HISTORY_CAPACITY: usize = 512;
 const MAX_RETRANSMISSIONS_PER_PACKET: u8 = 2;
@@ -52,7 +51,6 @@ const MAX_RETRANSMISSIONS_PER_TICK: usize = 64;
 struct OutgoingExtensions {
     absolute_capture_time: Option<u8>,
     mid: Option<(u8, Box<[u8]>)>,
-    rid: Option<u8>,
     twcc: Option<u8>,
     dependency_descriptor: Option<u8>,
     nackable: bool,
@@ -81,12 +79,6 @@ impl OutgoingExtensions {
             .find(|extension| extension.uri().contains(TWCC_EXTENSION_URI))
             .map(pulsebeam_rtc::HeaderExtension::id)
             .filter(|&id| id > 0);
-        let rid = section
-            .header_extensions()
-            .iter()
-            .find(|extension| extension.uri() == RID_EXTENSION_URI)
-            .map(pulsebeam_rtc::HeaderExtension::id)
-            .filter(|&id| id > 0);
         let dependency_descriptor = section
             .header_extensions()
             .iter()
@@ -98,7 +90,6 @@ impl OutgoingExtensions {
         Self {
             absolute_capture_time,
             mid,
-            rid,
             twcc,
             dependency_descriptor,
             nackable,
@@ -192,11 +183,6 @@ fn encode_rtp(
         .zip(packet.extensions.absolute_capture_time.as_deref())
         .filter(|(_, value)| matches!(value.len(), 8 | 16));
     let mid = extensions.and_then(|extensions| extensions.mid.as_ref());
-    let rid = extensions
-        .and_then(|extensions| extensions.rid)
-        .zip(packet.extensions.rid.as_ref())
-        .map(|(id, rid)| (id, rid.as_bytes()))
-        .filter(|(_, rid)| !rid.is_empty());
     let twcc = extensions.and_then(|extensions| extensions.twcc);
     let dependency_descriptor = extensions
         .and_then(|extensions| extensions.dependency_descriptor)
@@ -206,7 +192,6 @@ fn encode_rtp(
     let two_byte_extensions = absolute_capture_time
         .is_some_and(|(id, value)| id > 14 || value.len() > 16)
         || mid.is_some_and(|(id, _)| *id > 14)
-        || rid.is_some_and(|(id, rid)| id > 14 || rid.len() > 16)
         || twcc.is_some_and(|id| id > 14)
         || dependency_descriptor.is_some_and(|(id, descriptor)| id > 14 || descriptor.len() > 16);
     let extension_header_len = if two_byte_extensions { 2usize } else { 1usize };
@@ -215,9 +200,6 @@ fn encode_rtp(
             extension_header_len.saturating_add(value.len())
         })
         .saturating_add(mid.map_or(0, |(_, value)| {
-            extension_header_len.saturating_add(value.len())
-        }))
-        .saturating_add(rid.map_or(0, |(_, value)| {
             extension_header_len.saturating_add(value.len())
         }))
         .saturating_add(twcc.map_or(0, |_| extension_header_len.saturating_add(2)))
@@ -273,16 +255,6 @@ fn encode_rtp(
                 bytes.push((*id << 4) | u8::try_from(mid.len() - 1).unwrap_or_default());
             }
             bytes.extend_from_slice(mid);
-        }
-        if let Some((id, rid)) = rid {
-            debug_assert!(id > 0 && !rid.is_empty() && rid.len() <= usize::from(u8::MAX));
-            if two_byte_extensions {
-                bytes.extend_from_slice(&[id, u8::try_from(rid.len()).unwrap_or_default()]);
-            } else {
-                debug_assert!(id < 15 && rid.len() <= 16);
-                bytes.push((id << 4) | u8::try_from(rid.len() - 1).unwrap_or_default());
-            }
-            bytes.extend_from_slice(rid);
         }
         if let Some(id) = twcc {
             debug_assert!(id > 0);
@@ -1319,7 +1291,6 @@ mod tests {
         let extensions = OutgoingExtensions {
             absolute_capture_time: None,
             mid: Some((3, Box::from(*b"video"))),
-            rid: None,
             twcc: Some(5),
             dependency_descriptor: None,
             nackable: true,
@@ -1346,11 +1317,10 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_rtp_carries_the_selected_simulcast_rid() {
+    fn outgoing_rtp_never_forwards_the_source_rid() {
         let extensions = OutgoingExtensions {
             absolute_capture_time: None,
             mid: None,
-            rid: Some(4),
             twcc: None,
             dependency_descriptor: None,
             nackable: true,
@@ -1370,8 +1340,8 @@ mod tests {
             Some(&extensions),
         );
 
-        assert_eq!(&bytes[12..16], &[0xbe, 0xde, 0, 1]);
-        assert_eq!(&bytes[16..18], &[0x40, b'f']);
+        assert_eq!(bytes[0], 0x80);
+        assert_eq!(&bytes[12..], &[1, 2, 3]);
         assert!(twcc_offset.is_none());
     }
 
@@ -1380,7 +1350,6 @@ mod tests {
         let extensions = OutgoingExtensions {
             absolute_capture_time: None,
             mid: None,
-            rid: None,
             twcc: None,
             dependency_descriptor: Some(4),
             nackable: true,
@@ -1415,7 +1384,6 @@ mod tests {
         let extensions = OutgoingExtensions {
             absolute_capture_time: Some(3),
             mid: None,
-            rid: None,
             twcc: None,
             dependency_descriptor: None,
             nackable: false,

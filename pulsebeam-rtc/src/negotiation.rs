@@ -339,7 +339,6 @@ fn receive_rids(
             simulcast
                 .send
                 .iter()
-                .filter(|layer| layer.restriction_id.1)
                 .map(|layer| layer.restriction_id.0.clone())
                 .filter(|rid| !rid.is_empty())
                 .collect()
@@ -558,7 +557,7 @@ mod tests {
     #[test]
     fn negotiated_session_keeps_remote_send_simulcast_rids() {
         let offer = format!(
-            "{}a=simulcast:send q;h;f\r\n",
+            "{}a=simulcast:send ~q;~h;~f\r\n",
             offer("sendonly")
                 .replace(
                     "m=audio 9 UDP/TLS/RTP/SAVPF 111",
