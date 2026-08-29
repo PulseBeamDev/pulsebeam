@@ -785,12 +785,9 @@ impl DirectParticipantCore {
         }
         let mut congestion = None;
         while let Some(outcome) = self.transport.poll_congestion() {
-            if outcome.acknowledged().saturating_add(outcome.lost()) > 0 {
-                let estimate = outcome.estimate();
-                congestion = Some((estimate.bitrate_bps(), estimate.application_limited()));
-            }
+            let estimate = outcome.estimate();
+            congestion = Some((estimate.bitrate_bps(), estimate.application_limited()));
             if let Some(probe) = outcome.probe() {
-                let estimate = outcome.estimate();
                 let target = probe.target_bitrate_bps().max(estimate.bitrate_bps());
                 congestion = Some((target, estimate.application_limited()));
             }

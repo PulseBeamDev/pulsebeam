@@ -336,6 +336,11 @@ impl LiveConnection {
         {
             let _ = self.dtls.handle_timeout(now);
         }
+        if let Some(outcome) = self.gcc.handle_timeout(now)
+            && self.congestion.len() < self.congestion.capacity()
+        {
+            self.congestion.push_back(outcome);
+        }
         self.drive_data(now);
     }
 
@@ -399,6 +404,9 @@ impl LiveConnection {
             .and_then(DataChannelAssociation::next_deadline)
         {
             deadline = Some(deadline.map_or(data, |current| current.min(data)));
+        }
+        if let Some(gcc) = self.gcc.next_deadline() {
+            deadline = Some(deadline.map_or(gcc, |current| current.min(gcc)));
         }
         deadline
     }

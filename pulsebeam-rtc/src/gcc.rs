@@ -143,6 +143,7 @@ pub struct Gcc {
     bitrate_bps: u64,
     last_departure: Option<Instant>,
     last_feedback: Option<Instant>,
+    last_outage_decay: Option<Instant>,
     last_probe: Option<Instant>,
     application_limited: bool,
 }
@@ -163,6 +164,7 @@ impl Gcc {
             bitrate_bps: initial_bitrate_bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS),
             last_departure: None,
             last_feedback: None,
+            last_outage_decay: None,
             last_probe: None,
             application_limited: true,
         }
@@ -250,6 +252,7 @@ impl Gcc {
         if total > 0 {
             let first_feedback = self.last_feedback.is_none();
             self.last_feedback = Some(now);
+            self.last_outage_decay = None;
             self.update_estimate(&acknowledged, lost, congested, first_feedback);
         }
         let probe = self.maybe_probe(now, congested);
@@ -273,19 +276,35 @@ impl Gcc {
             .collect())
     }
 
-    pub fn handle_timeout(&mut self, now: Instant) -> Option<ProbeDecision> {
-        if self
-            .last_feedback
-            .is_some_and(|feedback| now.saturating_duration_since(feedback) > OUTAGE)
-        {
-            self.bitrate_bps = self
-                .bitrate_bps
-                .saturating_mul(4)
-                .saturating_div(5)
-                .max(MIN_BITRATE_BPS);
-            self.application_limited = true;
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let feedback = self.last_feedback?;
+        let base = self.last_outage_decay.unwrap_or(feedback);
+        base.checked_add(OUTAGE)
+    }
+
+    pub fn handle_timeout(&mut self, now: Instant) -> Option<GccOutcome> {
+        let feedback = self.last_feedback?;
+        let first_decay = feedback.checked_add(OUTAGE).unwrap_or(feedback);
+        let due = self
+            .last_outage_decay
+            .and_then(|decay| decay.checked_add(OUTAGE))
+            .unwrap_or(first_decay);
+        if now < due {
+            return None;
         }
-        self.maybe_probe(now, false)
+        self.bitrate_bps = self
+            .bitrate_bps
+            .saturating_mul(4)
+            .saturating_div(5)
+            .max(MIN_BITRATE_BPS);
+        self.application_limited = true;
+        self.last_outage_decay = Some(now);
+        Some(GccOutcome {
+            estimate: self.estimate(now),
+            acknowledged: 0,
+            lost: 0,
+            probe: None,
+        })
     }
 
     #[allow(
@@ -512,6 +531,36 @@ mod tests {
         assert!(
             gcc.estimate(now + OUTAGE + Duration::from_secs(1))
                 .application_limited()
+        );
+    }
+
+    #[test]
+    fn gcc_schedules_one_decay_per_feedback_outage() {
+        let now = Instant::now();
+        let mut gcc = Gcc::new(8);
+        let send = gcc.assign(SendId::new(1), 1200).expect("send");
+        gcc.record_departure(send.send_id(), now)
+            .expect("departure");
+        let feedback_at = now + Duration::from_millis(10);
+        gcc.process_feedback(
+            feedback_at,
+            &feedback(&[(send.transport_sequence(), Some(Duration::from_millis(1)))]),
+        );
+
+        let first_deadline = feedback_at + OUTAGE;
+        assert_eq!(gcc.next_deadline(), Some(first_deadline));
+        assert!(
+            gcc.handle_timeout(first_deadline - Duration::from_nanos(1))
+                .is_none()
+        );
+
+        let first = gcc.handle_timeout(first_deadline).expect("outage decay");
+        assert!(first.estimate().application_limited());
+        assert!(first.estimate().bitrate_bps() < INITIAL_BITRATE_BPS);
+        assert_eq!(gcc.next_deadline(), Some(first_deadline + OUTAGE));
+        assert!(
+            gcc.handle_timeout(first_deadline + Duration::from_millis(1))
+                .is_none()
         );
     }
 
