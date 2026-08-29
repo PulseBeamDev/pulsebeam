@@ -24,6 +24,9 @@ http-body-util = "0.1"  # Crucial for .collect().await
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
 libc = "0.2"
+openh264.workspace = true
+opus.workspace = true
+opusic-sys.workspace = true
 pin-project-lite = "0.2.17"
 rand.workspace = true
 proptest = "1.11.0"

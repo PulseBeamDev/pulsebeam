@@ -33,6 +33,9 @@ derive_more = { version = "2.1.1", features = ["full"] }
 fastrand = "2.3.0"
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"
+openh264 = "=0.9.8"
+opus = "=0.4.0"
+opusic-sys = { version = "=0.7.3", default-features = false, features = ["bundled"] }
 rand = "0.10.1"
 serde = { version = "1", features = ["derive"] }
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/overusing-readiness" }
