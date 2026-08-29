@@ -16,12 +16,12 @@ use crate::{
     keys::TrackKey,
     participant::{
         TrackPacket,
-        batcher::{Batcher, NetworkEgress, OwnedPacketQueue},
+        batcher::{Batcher, ForwardTiming, NetworkEgress, OwnedPacketQueue},
         data::{DataOpenError, DataState},
         direct_transport::{DirectTransport, DirectTransportConfig, DirectTransportOutput},
         downstream::{DownstreamAllocator, SlotConfig},
         event::ParticipantSink,
-        pacer::PacketPacer,
+        pacer::{PacerDecision, PacketPacer},
         reverse::ReversePacket,
         signaling::Signaling,
         upstream::{IncomingRtpRoute, UpstreamAllocator},
@@ -46,6 +46,50 @@ const RTP_HISTORY_CAPACITY: usize = 512;
 const MAX_RETRANSMISSIONS_PER_PACKET: u8 = 2;
 const RETRANSMISSION_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_RETRANSMISSIONS_PER_TICK: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForwardingLatency {
+    service: Duration,
+    pacing: Duration,
+    egress_lateness: Duration,
+    total: Duration,
+}
+
+impl ForwardTiming {
+    fn departed(self, now: Instant) -> ForwardingLatency {
+        debug_assert!(self.ingress_at <= self.pacer_admitted_at);
+        debug_assert!(self.pacer_admitted_at <= self.paced_eligible_at);
+        debug_assert!(self.paced_eligible_at <= now);
+        let service = self
+            .pacer_admitted_at
+            .saturating_duration_since(self.ingress_at);
+        let pacing = self
+            .paced_eligible_at
+            .saturating_duration_since(self.pacer_admitted_at);
+        let egress_lateness = now.saturating_duration_since(self.paced_eligible_at);
+        let total = now.saturating_duration_since(self.ingress_at);
+        debug_assert_eq!(
+            total,
+            service
+                .saturating_add(pacing)
+                .saturating_add(egress_lateness),
+            "forwarding latency components must exactly decompose total latency"
+        );
+        ForwardingLatency {
+            service,
+            pacing,
+            egress_lateness,
+            total,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PacerWait {
+    provenance: crate::rtp::PacketProvenance,
+    admitted_at: Instant,
+    eligible_at: Instant,
+}
 
 #[derive(Clone)]
 struct OutgoingExtensions {
@@ -336,6 +380,8 @@ pub struct DirectParticipantCore {
     pub(crate) shard_id: ShardId,
     participant_key: crate::keys::ParticipantKey,
     next_send_id: u64,
+    forwarded_timing: HashMap<SendId, ForwardTiming>,
+    pacer_wait: Option<PacerWait>,
     next_fir_sequence: u8,
     #[cfg(debug_assertions)]
     egress_guard: EgressGuard,
@@ -497,6 +543,8 @@ impl DirectParticipantCore {
             shard_id,
             participant_key,
             next_send_id: 0,
+            forwarded_timing: HashMap::new(),
+            pacer_wait: None,
             next_fir_sequence: 0,
             #[cfg(debug_assertions)]
             egress_guard: EgressGuard::new(),
@@ -547,10 +595,32 @@ impl DirectParticipantCore {
         self.shard_id
     }
 
-    pub(crate) fn report_departure(&mut self, send_id: pulsebeam_rtc::SendId, now: Instant) {
-        if self.transport.report_departure(send_id, now).is_err() {
+    pub(crate) fn report_departure(
+        &mut self,
+        send_id: pulsebeam_rtc::SendId,
+        congestion_tracked: bool,
+        timing: Option<ForwardTiming>,
+        now: Instant,
+    ) {
+        if congestion_tracked && self.transport.report_departure(send_id, now).is_err() {
             debug_assert!(false, "every accepted media packet has one GCC send record");
         }
+        let Some(timing) = timing else {
+            return;
+        };
+        let latency = timing.departed(now);
+        metrics::histogram!("forwarding_service_us").record(latency.service.as_micros() as f64);
+        metrics::histogram!("forwarding_pacing_us").record(latency.pacing.as_micros() as f64);
+        metrics::histogram!("forwarding_egress_lateness_us")
+            .record(latency.egress_lateness.as_micros() as f64);
+        metrics::histogram!("forwarding_total_us").record(latency.total.as_micros() as f64);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_forwarding_latency(
+            latency.service,
+            latency.pacing,
+            latency.egress_lateness,
+            latency.total,
+        );
     }
 
     pub(crate) fn apply(&mut self, effect: ParticipantEffect) {
@@ -836,10 +906,46 @@ impl DirectParticipantCore {
         }
         self.pacer
             .set_rate(now, self.transport.congestion_bitrate_bps(now));
-        while let Some(estimated_size) = self.stream_writer.front_pacing_size() {
-            if !self.pacer.permits(now, estimated_size) {
-                break;
-            }
+        while let Some((estimated_size, provenance)) = self.stream_writer.front_pacing() {
+            let (pacer_admitted_at, paced_eligible_at) = match self.pacer.admit(now, estimated_size)
+            {
+                PacerDecision::Admitted { eligible_at } => match self.pacer_wait.take() {
+                    Some(wait) if wait.provenance == provenance => {
+                        debug_assert_eq!(wait.provenance, provenance);
+                        debug_assert!(wait.admitted_at <= wait.eligible_at);
+                        (wait.admitted_at, wait.eligible_at)
+                    }
+                    Some(wait) => {
+                        debug_assert_eq!(wait.provenance, provenance);
+                        (now, eligible_at)
+                    }
+                    None => (now, eligible_at),
+                },
+                PacerDecision::Deferred { eligible_at } => {
+                    match self.pacer_wait.as_mut() {
+                        Some(wait) if wait.provenance == provenance => {
+                            debug_assert_eq!(wait.provenance, provenance);
+                            wait.eligible_at = eligible_at;
+                        }
+                        Some(wait) => {
+                            debug_assert_eq!(wait.provenance, provenance);
+                            *wait = PacerWait {
+                                provenance,
+                                admitted_at: now,
+                                eligible_at,
+                            };
+                        }
+                        None => {
+                            self.pacer_wait = Some(PacerWait {
+                                provenance,
+                                admitted_at: now,
+                                eligible_at,
+                            });
+                        }
+                    }
+                    break;
+                }
+            };
             let Some(write) = self.stream_writer.pop() else {
                 debug_assert!(false, "a paced stream write must remain queued");
                 break;
@@ -893,11 +999,21 @@ impl DirectParticipantCore {
                 }
             } else {
                 self.transport
-                    .send_rtp_untracked(&bytes, u64::from(packet.seq_no))
+                    .send_rtp_untracked(&bytes, u64::from(packet.seq_no), send_id)
             };
             if result.is_err() {
                 break;
             }
+            let timing = ForwardTiming {
+                ingress_at: packet.provenance.received_at,
+                pacer_admitted_at,
+                paced_eligible_at,
+            };
+            debug_assert!(timing.ingress_at <= timing.pacer_admitted_at);
+            debug_assert!(
+                self.forwarded_timing.insert(send_id, timing).is_none(),
+                "each forwarded packet must retain one timing record until egress batching"
+            );
             if nackable {
                 self.rtp_history
                     .entry(ssrc.get())
@@ -949,7 +1065,8 @@ impl DirectParticipantCore {
                         send_id,
                     )
                 } else {
-                    self.transport.send_rtp_untracked(&bytes, extended_sequence)
+                    self.transport
+                        .send_rtp_untracked(&bytes, extended_sequence, send_id)
                 };
                 if result.is_err() {
                     return;
@@ -961,11 +1078,14 @@ impl DirectParticipantCore {
 
     fn drain_transport_egress(&mut self) {
         while let Some(datagram) = self.transport.poll_egress() {
-            let (bytes, transport, send_id) = datagram.into_parts();
+            let (bytes, transport, send_id, congestion_tracked) = datagram.into_parts();
             let destination = transport.destination();
+            let timing = send_id.and_then(|send_id| self.forwarded_timing.remove(&send_id));
             let receipt = send_id.map(|send_id| crate::participant::batcher::DepartureReceipt {
                 participant: self.participant_key,
                 send_id,
+                congestion_tracked,
+                timing,
             });
             match transport.protocol() {
                 pulsebeam_rtc::TransportProtocol::Udp => {
@@ -1285,6 +1405,26 @@ impl DirectParticipantCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarding_latency_components_exactly_decompose_departure() {
+        let ingress_at = Instant::now();
+        let timing = ForwardTiming {
+            ingress_at,
+            pacer_admitted_at: ingress_at + Duration::from_millis(2),
+            paced_eligible_at: ingress_at + Duration::from_millis(7),
+        };
+
+        assert_eq!(
+            timing.departed(ingress_at + Duration::from_millis(11)),
+            ForwardingLatency {
+                service: Duration::from_millis(2),
+                pacing: Duration::from_millis(5),
+                egress_lateness: Duration::from_millis(4),
+                total: Duration::from_millis(11),
+            }
+        );
+    }
 
     #[test]
     fn outgoing_rtp_carries_negotiated_mid_and_twcc_fields() {

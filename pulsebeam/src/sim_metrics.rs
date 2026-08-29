@@ -32,6 +32,16 @@ use tokio::time::Instant;
 
 use crate::entity::ParticipantId;
 
+const MAX_FORWARDING_LATENCY_SAMPLES: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ForwardingLatencySample {
+    pub service: Duration,
+    pub pacing: Duration,
+    pub egress_lateness: Duration,
+    pub total: Duration,
+}
+
 /// Downstream bandwidth estimate observations, since the last [`reset`].
 #[derive(Debug, Default, Clone)]
 struct Samples {
@@ -106,6 +116,7 @@ struct Samples {
     bwe_series: HashMap<ParticipantId, Vec<(Duration, u64, u64)>>,
     /// Reference point for series timestamps, set on the first sample after a reset.
     series_origin: Option<Instant>,
+    forwarding_latency: Vec<ForwardingLatencySample>,
 }
 
 thread_local! {
@@ -213,6 +224,39 @@ pub fn routing_drop(lane: &'static str, stage: &'static str, origin: &'static st
 /// describe the window just run, matching the byte-counter semantics.
 pub fn reset() {
     SAMPLES.with_borrow_mut(|s| *s = Samples::default());
+}
+
+pub fn record_forwarding_latency(
+    service: Duration,
+    pacing: Duration,
+    egress_lateness: Duration,
+    total: Duration,
+) {
+    debug_assert_eq!(
+        total,
+        service
+            .saturating_add(pacing)
+            .saturating_add(egress_lateness),
+        "forwarding latency sample must exactly decompose its total"
+    );
+    SAMPLES.with_borrow_mut(|s| {
+        debug_assert!(
+            s.forwarding_latency.len() < MAX_FORWARDING_LATENCY_SAMPLES,
+            "one simulation assertion window exceeded its forwarding latency sample bound"
+        );
+        if s.forwarding_latency.len() < MAX_FORWARDING_LATENCY_SAMPLES {
+            s.forwarding_latency.push(ForwardingLatencySample {
+                service,
+                pacing,
+                egress_lateness,
+                total,
+            });
+        }
+    });
+}
+
+pub fn forwarding_latency_samples() -> Vec<ForwardingLatencySample> {
+    SAMPLES.with_borrow(|s| s.forwarding_latency.clone())
 }
 
 /// Record media payload handed to transport forwarding.

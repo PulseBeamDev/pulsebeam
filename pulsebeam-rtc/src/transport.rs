@@ -23,6 +23,7 @@ pub struct EgressDatagram {
     bytes: Vec<u8>,
     transport: TransportMetadata,
     send_id: Option<SendId>,
+    congestion_tracked: bool,
 }
 
 const EGRESS_CAPACITY: usize = 256;
@@ -41,8 +42,17 @@ impl EgressDatagram {
         self.send_id
     }
 
-    pub fn into_parts(self) -> (Vec<u8>, TransportMetadata, Option<SendId>) {
-        (self.bytes, self.transport, self.send_id)
+    pub const fn congestion_tracked(&self) -> bool {
+        self.congestion_tracked
+    }
+
+    pub fn into_parts(self) -> (Vec<u8>, TransportMetadata, Option<SendId>, bool) {
+        (
+            self.bytes,
+            self.transport,
+            self.send_id,
+            self.congestion_tracked,
+        )
     }
 }
 
@@ -612,7 +622,7 @@ impl LiveConnection {
             .as_mut()
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .protect_rtp(bytes, &header, extended_sequence);
-        self.push_protected_egress(encrypted, None)
+        self.push_protected_egress(encrypted, None, false)
     }
 
     pub fn send_rtp_with_congestion(
@@ -647,8 +657,24 @@ impl LiveConnection {
             .as_mut()
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .protect_rtp(bytes, &header, extended_sequence);
-        self.push_protected_egress(encrypted, Some(send_id))?;
+        self.push_protected_egress(encrypted, Some(send_id), true)?;
         Ok(())
+    }
+
+    pub fn send_rtp_with_departure_id(
+        &mut self,
+        bytes: &[u8],
+        extended_sequence: u64,
+        send_id: SendId,
+    ) -> Result<(), LiveConnectionError> {
+        let header = RtpHeader::parse(bytes, &ExtensionMap::empty())
+            .ok_or(LiveConnectionError::RtpHeader)?;
+        let encrypted = self
+            .srtp_tx
+            .as_mut()
+            .ok_or(LiveConnectionError::CryptoNotReady)?
+            .protect_rtp(bytes, &header, extended_sequence);
+        self.push_protected_egress(encrypted, Some(send_id), false)
     }
 
     pub fn send_forwarded_rtp(&mut self, packet: &ForwardedRtp) -> Result<(), LiveConnectionError> {
@@ -661,7 +687,7 @@ impl LiveConnection {
             .as_mut()
             .ok_or(LiveConnectionError::CryptoNotReady)?
             .protect_rtcp(bytes);
-        self.push_protected_egress(encrypted, None)
+        self.push_protected_egress(encrypted, None, false)
     }
 
     fn emit_twcc_feedback(&mut self, now: Instant) {
@@ -689,6 +715,7 @@ impl LiveConnection {
         &mut self,
         bytes: Vec<u8>,
         send_id: Option<SendId>,
+        congestion_tracked: bool,
     ) -> Result<(), LiveConnectionError> {
         let transport = self.nominated.ok_or(LiveConnectionError::CryptoNotReady)?;
         if !self.egress_ready() {
@@ -698,6 +725,7 @@ impl LiveConnection {
             bytes,
             transport,
             send_id,
+            congestion_tracked,
         });
         Ok(())
     }
@@ -715,6 +743,7 @@ impl LiveConnection {
                 bytes: transmit.contents.to_vec(),
                 transport: TransportMetadata::new(protocol, transmit.source, transmit.destination),
                 send_id: None,
+                congestion_tracked: false,
             });
         }
         while let Some(event) = self.ice.poll_event() {
@@ -797,6 +826,7 @@ impl LiveConnection {
                         bytes: packet.to_vec(),
                         transport,
                         send_id: None,
+                        congestion_tracked: false,
                     });
                 }
             }

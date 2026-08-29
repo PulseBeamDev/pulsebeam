@@ -12,14 +12,24 @@ use std::{
     collections::VecDeque,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
+use tokio::time::Instant;
 
 const MAX_FREE_STATES: usize = 3;
 const MAX_RECEIPTS_PER_BATCH: usize = 64;
 
 #[derive(Clone, Copy)]
+pub(crate) struct ForwardTiming {
+    pub(crate) ingress_at: Instant,
+    pub(crate) pacer_admitted_at: Instant,
+    pub(crate) paced_eligible_at: Instant,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct DepartureReceipt {
     pub(crate) participant: crate::keys::ParticipantKey,
     pub(crate) send_id: SendId,
+    pub(crate) congestion_tracked: bool,
+    pub(crate) timing: Option<ForwardTiming>,
 }
 
 pub struct OwnedPacketQueue {

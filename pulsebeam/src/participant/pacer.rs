@@ -11,6 +11,12 @@ pub(crate) struct PacketPacer {
     last_updated: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PacerDecision {
+    Admitted { eligible_at: Instant },
+    Deferred { eligible_at: Instant },
+}
+
 impl PacketPacer {
     pub(crate) fn new(now: Instant, rate_bps: u64) -> Self {
         Self {
@@ -25,14 +31,18 @@ impl PacketPacer {
         self.rate_bps = rate_bps.max(MIN_RATE_BPS);
     }
 
-    pub(crate) fn permits(&mut self, now: Instant, bytes: usize) -> bool {
+    pub(crate) fn admit(&mut self, now: Instant, bytes: usize) -> PacerDecision {
+        let eligible_at = self.next_ready(now, bytes);
+        if eligible_at > now {
+            return PacerDecision::Deferred { eligible_at };
+        }
         self.replenish(now);
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         if bytes > self.credit_bytes {
-            return false;
+            return PacerDecision::Deferred { eligible_at };
         }
         self.credit_bytes = self.credit_bytes.saturating_sub(bytes);
-        true
+        PacerDecision::Admitted { eligible_at }
     }
 
     pub(crate) fn next_ready(&mut self, now: Instant, bytes: usize) -> Instant {
@@ -74,10 +84,21 @@ mod tests {
         let now = Instant::now();
         let mut pacer = PacketPacer::new(now, 1_000_000);
 
-        assert!(pacer.permits(now, 1_600));
-        assert!(!pacer.permits(now, 1_250));
+        assert_eq!(
+            pacer.admit(now, 1_600),
+            PacerDecision::Admitted { eligible_at: now }
+        );
+        assert_eq!(
+            pacer.admit(now, 1_250),
+            PacerDecision::Deferred {
+                eligible_at: now + Duration::from_millis(10)
+            }
+        );
         let ready = pacer.next_ready(now, 1_250);
         assert_eq!(ready.duration_since(now), Duration::from_millis(10));
-        assert!(pacer.permits(ready, 1_250));
+        assert_eq!(
+            pacer.admit(ready, 1_250),
+            PacerDecision::Admitted { eligible_at: ready }
+        );
     }
 }

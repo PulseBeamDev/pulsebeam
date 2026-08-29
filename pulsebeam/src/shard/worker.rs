@@ -115,6 +115,26 @@ fn describe_shard_metrics() {
         metrics::Unit::Microseconds,
         "how long one shard loop iteration took"
     );
+    metrics::describe_histogram!(
+        "forwarding_service_us",
+        metrics::Unit::Microseconds,
+        "ingress to pacer admission for forwarded media"
+    );
+    metrics::describe_histogram!(
+        "forwarding_pacing_us",
+        metrics::Unit::Microseconds,
+        "required pacing between admission and earliest eligible departure"
+    );
+    metrics::describe_histogram!(
+        "forwarding_egress_lateness_us",
+        metrics::Unit::Microseconds,
+        "eligible departure to authoritative socket departure for forwarded media"
+    );
+    metrics::describe_histogram!(
+        "forwarding_total_us",
+        metrics::Unit::Microseconds,
+        "ingress to authoritative socket departure for forwarded media"
+    );
     metrics::describe_counter!(
         "routing_drop",
         "recoverable packet or topology drops by lane, stage, and origin"

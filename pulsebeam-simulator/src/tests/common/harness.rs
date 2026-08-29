@@ -573,6 +573,13 @@ pub enum Step {
         publisher: &'static str,
         min_frames: u64,
     },
+    CheckForwardingLatency {
+        description: &'static str,
+        min_samples: usize,
+        max_service: Duration,
+        max_egress_lateness: Duration,
+        max_total: Duration,
+    },
     /// This participant is still the same participant it was - it reconnected, it did not rejoin.
     ///
     /// A reconnect keeps the participant id and changes only the connection generation. If the
@@ -1501,6 +1508,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
         Step::CheckVideoReceivedFrom { .. } => "CheckVideoReceivedFrom",
+        Step::CheckForwardingLatency { .. } => "CheckForwardingLatency",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
         Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
@@ -2129,6 +2137,46 @@ async fn execute_plan(
                     );
                 }
                 assert_video_frame_gap(n, total, kind, description, participant, quality, stats);
+            }
+
+            Step::CheckForwardingLatency {
+                description,
+                min_samples,
+                max_service,
+                max_egress_lateness,
+                max_total,
+            } => {
+                let samples = pulsebeam::sim_metrics::forwarding_latency_samples();
+                assert!(
+                    samples.len() >= *min_samples,
+                    "step {n}/{total} {kind}: {description} captured {} forwarding departures, minimum {min_samples}; no samples means the packet path was not exercised",
+                    samples.len(),
+                );
+                for sample in samples {
+                    assert_eq!(
+                        sample.total,
+                        sample
+                            .service
+                            .saturating_add(sample.pacing)
+                            .saturating_add(sample.egress_lateness),
+                        "step {n}/{total} {kind}: {description} forwarding latency did not decompose causally",
+                    );
+                    assert!(
+                        sample.service <= *max_service,
+                        "step {n}/{total} {kind}: {description} forwarding service latency {:?} exceeded {max_service:?}",
+                        sample.service,
+                    );
+                    assert!(
+                        sample.egress_lateness <= *max_egress_lateness,
+                        "step {n}/{total} {kind}: {description} forwarding egress lateness {:?} exceeded {max_egress_lateness:?}",
+                        sample.egress_lateness,
+                    );
+                    assert!(
+                        sample.total <= *max_total,
+                        "step {n}/{total} {kind}: {description} total SFU forwarding latency {:?} exceeded {max_total:?}",
+                        sample.total,
+                    );
+                }
             }
 
             Step::CheckVideoNotReceivedFrom {

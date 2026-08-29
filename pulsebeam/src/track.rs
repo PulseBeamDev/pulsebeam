@@ -14,8 +14,8 @@ use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::{
-    self, EncodingId as Rid, MediaSectionId as Mid, PayloadType as Pt, RtpPacket, SenderReport,
-    SimulcastEncoding, Ssrc, VideoLayersAllocation,
+    self, EncodingId as Rid, MediaSectionId as Mid, PacketProvenance, PayloadType as Pt, RtpPacket,
+    SenderReport, SimulcastEncoding, Ssrc, VideoLayersAllocation,
     monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
@@ -106,9 +106,22 @@ impl StreamWriter {
     pub(crate) fn front_pacing_size(&self) -> Option<usize> {
         self.pending.front().map(StreamWrite::pacing_size)
     }
+
+    pub(crate) fn front_pacing(&self) -> Option<(usize, PacketProvenance)> {
+        self.pending.front().map(|write| {
+            let packet = write.packet();
+            (write.pacing_size(), packet.provenance)
+        })
+    }
 }
 
 impl StreamWrite {
+    fn packet(&self) -> &RtpPacket {
+        match self {
+            Self::Video { pkt, .. } | Self::Audio { pkt, .. } => pkt,
+        }
+    }
+
     fn pacing_size(&self) -> usize {
         match self {
             Self::Video { pkt, .. } | Self::Audio { pkt, .. } => {

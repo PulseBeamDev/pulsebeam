@@ -61,6 +61,13 @@ fn quality_fixture_is_proven_from_each_viewers_decoded_output_test() {
                 participant: "viewer-b",
                 quality: VideoQuality::min_frames(30).fixture_fidelity((320, 180), 12, 240),
             },
+            Step::CheckForwardingLatency {
+                description: "Forwarding completes at the same logical instant outside required pacing",
+                min_samples: 30,
+                max_service: Duration::from_millis(20),
+                max_egress_lateness: Duration::from_millis(1),
+                max_total: Duration::from_millis(50),
+            },
         ]);
 }
 

@@ -781,7 +781,12 @@ impl ShardExecution {
         }
         while let Some(receipt) = self.departures.pop() {
             if let Some(participant) = self.registry.resolve_mut(receipt.participant) {
-                participant.report_departure(receipt.send_id, now);
+                participant.report_departure(
+                    receipt.send_id,
+                    receipt.congestion_tracked,
+                    receipt.timing,
+                    now,
+                );
             }
         }
         processed

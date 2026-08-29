@@ -136,8 +136,10 @@ impl DirectTransport {
         &mut self,
         bytes: &[u8],
         extended_sequence: u64,
+        send_id: SendId,
     ) -> Result<(), LiveConnectionError> {
-        self.connection.send_rtp(bytes, extended_sequence)
+        self.connection
+            .send_rtp_with_departure_id(bytes, extended_sequence, send_id)
     }
 
     pub fn assign_congestion(
