@@ -1,6 +1,9 @@
-use crate::http::*;
-use crate::id::*;
-use alloc::string::String;
+use crate::{
+    LocalSlotIntent, Topology,
+    http::HttpRequest,
+    id::{DataChannelId, Generation, RequestId, TimerId},
+};
+use alloc::{string::String, vec::Vec};
 use core::time::Duration;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -13,15 +16,21 @@ pub enum AgentEffect {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum RtcEffect {
-    CreateOffer {
+    CreateTransport {
         generation: Generation,
+        topology: Topology,
+        signaling_channel: DataChannelId,
     },
     ApplyAnswer {
         generation: Generation,
         answer: String,
     },
-    Close {
+    CloseTransport {
         generation: Generation,
+    },
+    ReconcileLocalSlots {
+        generation: Generation,
+        slots: Vec<LocalSlotIntent>,
     },
 }
 
@@ -29,11 +38,17 @@ pub enum RtcEffect {
 pub enum DataChannelEffect {
     Open {
         generation: Generation,
+        id: DataChannelId,
         config: DataChannelConfig,
     },
     Close {
         generation: Generation,
-        label: DataChannelLabel,
+        id: DataChannelId,
+    },
+    Send {
+        generation: Generation,
+        id: DataChannelId,
+        payload: Vec<u8>,
     },
 }
 
@@ -49,12 +64,12 @@ pub struct DataChannelConfig {
     pub label: String,
     pub protocol: String,
     pub ordered: bool,
-    pub negotiated: Option<DataChannelId>,
+    pub negotiated: Option<u16>,
     pub reliability: DataChannelReliability,
 }
 
 impl DataChannelConfig {
-    pub(crate) fn reliable(label: String) -> Self {
+    pub fn reliable(label: String) -> Self {
         Self {
             label,
             protocol: "pulsebeam/v1".into(),
@@ -72,7 +87,7 @@ pub enum HttpEffect {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum TimerEffect {
-    Schedule { id: OperationId, after: Duration },
+    Schedule { id: TimerId, after: Duration },
 
-    Cancel { id: OperationId },
+    Cancel { id: TimerId },
 }

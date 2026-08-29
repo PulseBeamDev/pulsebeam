@@ -15,7 +15,7 @@ impl WebAgent {
 
     /// Replace the complete browser-side desired state.
     pub fn set_state(&mut self, state: WebAgentState) {
-        self.core.set_state(state.into());
+        let _ = self.core.set_state(state.into());
     }
 
     /// Current externally observable state.
@@ -43,7 +43,10 @@ impl From<WebAgentState> for agent_core::ClientState {
             ConnectionState::Connected { .. } => agent_core::ClientConnectionState::Connected,
             ConnectionState::Disconnected => agent_core::ClientConnectionState::Disconnected,
         };
-        agent_core::ClientState { connection }
+        agent_core::ClientState {
+            connection,
+            ..agent_core::ClientState::default()
+        }
     }
 }
 

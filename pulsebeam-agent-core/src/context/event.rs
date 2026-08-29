@@ -1,11 +1,14 @@
-use crate::http::*;
-use crate::id::*;
+use crate::{
+    http::HttpResponse,
+    id::{DataChannelId, Generation, RequestId, TimerId},
+};
 use alloc::string::String;
 
 pub enum AgentEvent {
     Rtc(RtcEvent),
     Http(HttpEvent),
     Timer(TimerEvent),
+    DataChannel(DataChannelEvent),
 }
 
 pub enum RtcEvent {
@@ -39,5 +42,26 @@ pub enum HttpEvent {
 }
 
 pub enum TimerEvent {
-    Fired { id: OperationId },
+    Fired { id: TimerId },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DataChannelEvent {
+    Opened {
+        generation: Generation,
+        id: DataChannelId,
+    },
+    Message {
+        generation: Generation,
+        id: DataChannelId,
+        payload: alloc::vec::Vec<u8>,
+    },
+    Closed {
+        generation: Generation,
+        id: DataChannelId,
+    },
+    WriteFailed {
+        generation: Generation,
+        id: DataChannelId,
+    },
 }

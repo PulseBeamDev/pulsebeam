@@ -1,20 +1,28 @@
-use agent_core::host::{Host, Instant, timestamp};
 use alloc::format;
 
-fn now() -> Instant {
-    let ms = web_sys::window().unwrap().performance().unwrap().now();
+static LOGGER: WebLogger = WebLogger;
 
-    Instant::from_micros((ms * 1_000.0) as u64)
+struct WebLogger;
+
+impl log::Log for WebLogger {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        log_record(record);
+    }
+
+    fn flush(&self) {}
 }
 
-fn log(record: &log::Record<'_>) {
+fn log_record(record: &log::Record<'_>) {
     let module = record.module_path().unwrap_or(record.target());
     let file = record.file().unwrap_or("?");
     let line = record.line().unwrap_or(0);
 
     let msg = format!(
-        "{} {:<5} {} {}:{}: {}",
-        timestamp().as_millis(),
+        "{:<5} {} {}:{}: {}",
         record.level(),
         module,
         file,
@@ -34,10 +42,6 @@ fn log(record: &log::Record<'_>) {
 }
 
 pub fn install() {
-    let host = Host {
-        now,
-        log,
-        installed_at: now(),
-    };
-    agent_core::host::install(host, log::LevelFilter::Debug);
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Debug);
 }
