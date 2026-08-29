@@ -1,10 +1,15 @@
 #![cfg(test)]
 
 use anyhow::{Context, Result, bail};
-use thirtyfour::{By, DesiredCapabilities, WebDriver, prelude::ElementQueryable};
+use thirtyfour::{
+    By, CapabilitiesHelper, DesiredCapabilities, WebDriver,
+    bidi::BiDi,
+    prelude::ElementQueryable,
+};
 
 struct BrowserHarness {
     driver: WebDriver,
+    _bidi: BiDi,
 }
 
 impl BrowserHarness {
@@ -16,12 +21,31 @@ impl BrowserHarness {
         let endpoint = std::env::var("WEBDRIVER_URL")
             .context("WEBDRIVER_URL must point at chromedriver, geckodriver, or safaridriver")?;
         let driver = match browser.as_str() {
-            "chromium" => WebDriver::new(&endpoint, DesiredCapabilities::chrome()).await?,
-            "firefox" => WebDriver::new(&endpoint, DesiredCapabilities::firefox()).await?,
-            "safari" => WebDriver::new(&endpoint, DesiredCapabilities::safari()).await?,
+            "chromium" => {
+                let mut capabilities = DesiredCapabilities::chrome();
+                capabilities.enable_bidi()?;
+                WebDriver::new(&endpoint, capabilities).await?
+            }
+            "firefox" => {
+                let mut capabilities = DesiredCapabilities::firefox();
+                capabilities.enable_bidi()?;
+                WebDriver::new(&endpoint, capabilities).await?
+            }
+            "safari" => {
+                let mut capabilities = DesiredCapabilities::safari();
+                capabilities.enable_bidi()?;
+                WebDriver::new(&endpoint, capabilities).await?
+            }
             _ => bail!("BROWSER must be chromium, firefox, or safari"),
         };
-        Ok(Self { driver })
+        let bidi = driver.bidi().await?;
+        if !bidi.session().status().await?.ready {
+            bail!("WebDriver BiDi session is not ready");
+        }
+        Ok(Self {
+            driver,
+            _bidi: bidi,
+        })
     }
 
     async fn open_harness(&self) -> Result<()> {

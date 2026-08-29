@@ -9,5 +9,5 @@ workspace = true
 
 [dev-dependencies]
 anyhow = "1"
-thirtyfour = "0.36"
+thirtyfour = { version = "0.37.5", default-features = false, features = ["bidi", "component", "manager", "reqwest", "rustls"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
