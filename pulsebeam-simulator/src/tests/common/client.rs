@@ -230,6 +230,7 @@ impl SimClientBuilder {
         let video_rx = self
             .video_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
+        let video_receivers = Arc::new(Mutex::new(BTreeMap::new()));
         let audio_rx = self
             .audio_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
@@ -252,6 +253,7 @@ impl SimClientBuilder {
             requested_tracks: HashSet::new(),
             received_data: Vec::new(),
             video_rx,
+            video_receivers,
             audio_rx,
             local_publications: local_video.into_iter().collect(),
         };
@@ -494,7 +496,6 @@ pub struct VideoReceiveLog {
     pub changed_ssrc_packets: u64,
     pub changed_payload_type_packets: u64,
     pub crossed_frame_boundaries: u64,
-    pub unterminated_frames: u64,
     /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
     /// against the moment the viewer subscribed, which only the harness knows.
     pub first_frame_at: Option<Instant>,
@@ -635,17 +636,6 @@ impl BrowserVideoReceiver {
             log.decoder_errors = log.decoder_errors.saturating_add(1);
         }
         if rtp.marker {
-            self.finish(log, publisher, timestamp);
-        }
-    }
-
-    fn flush(&mut self, log: &mut VideoReceiveLog, publisher: &str) {
-        let remaining: Vec<_> = self.jitter.drain().collect();
-        for rtp in remaining {
-            self.process(rtp, log, publisher);
-        }
-        if let Some(timestamp) = self.open_frame_timestamp.take() {
-            log.unterminated_frames = log.unterminated_frames.saturating_add(1);
             self.finish(log, publisher, timestamp);
         }
     }
@@ -1134,6 +1124,8 @@ pub struct VideoReceiveStats {
     pub frozen_time: Duration,
     pub browser_packet_errors: u64,
     pub decoder_errors: u64,
+    pub min_decoded_width: usize,
+    pub min_decoded_height: usize,
 }
 
 impl VideoReceiveStats {
@@ -1166,6 +1158,8 @@ impl VideoReceiveStats {
                 .browser_packet_errors
                 .saturating_sub(baseline.browser_packet_errors),
             decoder_errors: self.decoder_errors.saturating_sub(baseline.decoder_errors),
+            min_decoded_width: self.min_decoded_width,
+            min_decoded_height: self.min_decoded_height,
         }
     }
 }
@@ -1182,6 +1176,18 @@ impl VideoReceiveLog {
     }
 
     pub fn stats(&self) -> VideoReceiveStats {
+        let min_decoded_width = self
+            .quality_by_publisher
+            .values()
+            .map(|quality| quality.decoded_width)
+            .min()
+            .unwrap_or(0);
+        let min_decoded_height = self
+            .quality_by_publisher
+            .values()
+            .map(|quality| quality.decoded_height)
+            .min()
+            .unwrap_or(0);
         VideoReceiveStats {
             frames: self.frames,
             keyframes: self.keyframes,
@@ -1198,6 +1204,8 @@ impl VideoReceiveLog {
             frozen_time: self.frozen_time,
             browser_packet_errors: self.browser_packet_errors(),
             decoder_errors: self.decoder_errors,
+            min_decoded_width,
+            min_decoded_height,
         }
     }
 
@@ -1275,6 +1283,7 @@ pub struct ClientContext {
     participants: Participants,
     /// Aggregated decode-side view of every remote video track.
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
+    video_receivers: Arc<Mutex<BTreeMap<String, BrowserVideoReceiver>>>,
     /// What this listener heard, per speaker. Shared with the harness like `video_rx`.
     pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
     local_publications: Vec<LocalTrack>,
@@ -1437,17 +1446,19 @@ impl SimClient {
                         let publication_id = track.publisher_id().to_owned();
                         self.ctx
                             .remote_tracks
-                            .insert(publication_id.clone(), publication_id);
+                            .insert(publication_id.clone(), publication_id.clone());
                         let publisher_id = track.publisher_id().to_owned();
                         let log = self.ctx.video_rx.clone();
+                        let receivers = self.ctx.video_receivers.clone();
                         self.join_set.spawn(async move {
-                            let mut receiver = BrowserVideoReceiver::new();
                             while let Ok(rtp) = track.recv().await {
+                                let mut receivers = receivers.lock().unwrap();
+                                let receiver = receivers
+                                    .entry(publisher_id.clone())
+                                    .or_insert_with(BrowserVideoReceiver::new);
                                 let mut log = log.lock().unwrap();
                                 receiver.push(rtp, &mut log, &publisher_id);
                             }
-                            let mut log = log.lock().unwrap();
-                            receiver.flush(&mut log, &publisher_id);
                         });
 
                         // Re-check the predicate after processing an event, since a new
@@ -1526,6 +1537,26 @@ mod decoder_tests {
     }
 
     #[test]
+    fn bundled_openh264_decodes_a_full_half_full_idr_sequence() {
+        let mut decoder = H264Decoder::new().unwrap();
+        for (label, fixture) in [
+            ("full", pulsebeam_testdata::RAW_H264_FULL_CBR),
+            ("half", pulsebeam_testdata::RAW_H264_HALF_CBR),
+            ("full", pulsebeam_testdata::RAW_H264_FULL_CBR),
+        ] {
+            for (index, frame) in pulsebeam_agent::media::H264FrameSlicer::new(fixture)
+                .take(300)
+                .enumerate()
+            {
+                assert!(
+                    decoder.decode(frame).is_ok(),
+                    "OpenH264 rejected {label} source frame {index} after a simulcast switch"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn h264_packetization_preserves_the_full_simulcast_fixture() {
         let packetizer =
             pulsebeam_core::h264::Packetizer::new(pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD);
@@ -1548,6 +1579,34 @@ mod decoder_tests {
                 receiver.decoder.decode(&receiver.access_unit).is_ok(),
                 "OpenH264 rejected packetized full-resolution source frame {index}"
             );
+        }
+    }
+
+    #[test]
+    fn h264_packetization_preserves_a_full_half_full_sequence() {
+        let packetizer =
+            pulsebeam_core::h264::Packetizer::new(pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD);
+        let mut receiver = BrowserVideoReceiver::new();
+        for (label, fixture) in [
+            ("full", pulsebeam_testdata::RAW_H264_FULL_CBR),
+            ("half", pulsebeam_testdata::RAW_H264_HALF_CBR),
+            ("full", pulsebeam_testdata::RAW_H264_FULL_CBR),
+        ] {
+            for (index, frame) in pulsebeam_agent::media::H264FrameSlicer::new(fixture)
+                .take(300)
+                .enumerate()
+            {
+                receiver.access_unit.clear();
+                receiver.fu_header = None;
+                for packet in packetizer.packetize(frame) {
+                    assert!(receiver.append_rtp_payload(&packet.payload));
+                }
+                assert!(receiver.fu_header.is_none());
+                assert!(
+                    receiver.decoder.decode(&receiver.access_unit).is_ok(),
+                    "OpenH264 rejected packetized {label} source frame {index} after a simulcast switch"
+                );
+            }
         }
     }
 

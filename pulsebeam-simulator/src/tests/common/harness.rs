@@ -2165,6 +2165,15 @@ async fn execute_plan(
                     "step {n}/{total} {kind}: {description} ({participant}) observed {} decoder error(s) in the interval",
                     stats.decoder_errors,
                 );
+                if let Some((minimum_width, minimum_height)) = quality.min_decoded_resolution {
+                    assert!(
+                        stats.min_decoded_width >= minimum_width
+                            && stats.min_decoded_height >= minimum_height,
+                        "step {n}/{total} {kind}: {description} ({participant}) decoded {}x{}, minimum {minimum_width}x{minimum_height}",
+                        stats.min_decoded_width,
+                        stats.min_decoded_height,
+                    );
+                }
                 if let Some(max_latency) = quality.max_capture_to_decode_latency {
                     assert_eq!(
                         stats.capture_timed_frames,

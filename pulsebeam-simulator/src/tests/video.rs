@@ -552,6 +552,7 @@ fn fast_initial_ramp_up_on_good_network_test() {
 #[test]
 fn repeated_simulcast_switching_stays_decodable_test() {
     LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
@@ -604,13 +605,13 @@ fn repeated_simulcast_switching_stays_decodable_test() {
                 heights: &[720],
             },
             Step::Run {
-                description: "Settle",
-                duration: Duration::from_millis(2500),
+                description: "Prove the final high-resolution switch stays continuously decodable",
+                duration: Duration::from_secs(5),
             },
-            Step::CheckVideoQuality {
-                description: "Frames remain decodable across 4 simulcast switches",
+            Step::CheckVideoQualityInterval {
+                description: "Frames remain continuously decodable at the requested high resolution",
                 participant: "bob",
-                quality: VideoQuality::min_frames(100).allow_gaps(4),
+                quality: VideoQuality::min_frames(100).min_decoded_resolution((1280, 720)),
             },
         ]);
 }
