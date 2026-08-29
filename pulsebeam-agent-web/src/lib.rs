@@ -3,6 +3,7 @@
 extern crate alloc;
 
 mod host;
+mod watch;
 mod web_agent;
 use wasm_bindgen::prelude::*;
 

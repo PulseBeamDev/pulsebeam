@@ -83,34 +83,67 @@ impl Agent {
 
 #[cfg(test)]
 mod test {
-    use alloc::vec::Vec;
+    use alloc::{string::String, vec::Vec};
 
-    use crate::context::RtcEffect;
+    use crate::{
+        context::{AgentEffect::Http, HttpEffect, RtcEffect, RtcEvent},
+        id::Generation,
+    };
 
     use super::*;
 
-    fn collect_effects(agent: &mut Agent) -> Vec<AgentEffect> {
-        let mut effects = Vec::new();
-        while let Some(ef) = agent.next_effect() {
-            effects.push(ef);
+    struct AgentHarness {
+        agent: Agent,
+    }
+
+    impl AgentHarness {
+        fn new() -> Self {
+            Self {
+                agent: Agent::default(),
+            }
         }
-        effects
+
+        fn set_state(&mut self, state: ClientState) {
+            self.agent.set_state(state);
+        }
+
+        fn effect(&mut self) -> AgentEffect {
+            self.agent.next_effect().expect("expected effect")
+        }
+
+        fn event(&mut self, event: AgentEvent) {
+            self.agent.handle(event);
+        }
+
+        fn no_effect(&mut self) {
+            assert!(self.agent.next_effect().is_none());
+        }
+
+        fn rtc_create_offer(&mut self) -> Generation {
+            match self.effect() {
+                AgentEffect::Rtc(RtcEffect::CreateOffer { generation }) => generation,
+                effect => panic!("expected CreateOffer, got {effect:?}"),
+            }
+        }
+
+        fn rtc_offer_created(&mut self, generation: Generation, offer: impl Into<String>) {
+            self.event(AgentEvent::Rtc(RtcEvent::OfferCreated {
+                generation,
+                offer: offer.into(),
+            }));
+        }
     }
 
     #[test]
     fn create_connection() {
-        let mut agent = Agent::default();
+        let mut agent = AgentHarness::new();
         let mut state = ClientState::default();
-
         agent.set_state(state);
 
         state.connection = ClientConnectionState::Connected;
         agent.set_state(state);
 
-        assert!(
-            collect_effects(&mut agent)
-                .iter()
-                .any(|e| matches!(e, AgentEffect::Rtc(RtcEffect::CreateOffer { .. })))
-        );
+        let id = agent.rtc_create_offer();
+        agent.rtc_offer_created(id, "test");
     }
 }

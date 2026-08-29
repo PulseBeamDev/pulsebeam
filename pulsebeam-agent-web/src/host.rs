@@ -1,4 +1,4 @@
-use agent::host::{Host, Instant, timestamp};
+use agent_core::host::{Host, Instant, timestamp};
 use alloc::format;
 
 fn now() -> Instant {
@@ -39,5 +39,5 @@ pub fn install() {
         log,
         installed_at: now(),
     };
-    agent::host::install(host, log::LevelFilter::Debug);
+    agent_core::host::install(host, log::LevelFilter::Debug);
 }

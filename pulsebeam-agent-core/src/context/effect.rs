@@ -3,6 +3,7 @@ use crate::id::*;
 use alloc::string::String;
 use core::time::Duration;
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum AgentEffect {
     Rtc(RtcEffect),
     Http(HttpEffect),
@@ -10,6 +11,7 @@ pub enum AgentEffect {
     DataChannel(DataChannelEffect),
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum RtcEffect {
     CreateOffer {
         generation: Generation,
@@ -23,6 +25,7 @@ pub enum RtcEffect {
     },
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum DataChannelEffect {
     Open {
         generation: Generation,
@@ -34,12 +37,14 @@ pub enum DataChannelEffect {
     },
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum DataChannelReliability {
     Reliable,
     MaxRetransmits(u16),
     MaxPacketLifetime(u16),
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct DataChannelConfig {
     pub label: String,
     pub protocol: String,
@@ -60,10 +65,12 @@ impl DataChannelConfig {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum HttpEffect {
     Request { id: RequestId, request: HttpRequest },
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum TimerEffect {
     Schedule { id: OperationId, after: Duration },
 
