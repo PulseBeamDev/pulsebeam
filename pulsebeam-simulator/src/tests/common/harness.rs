@@ -8,6 +8,7 @@ use crate::tests::common::{
 };
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
+use pulsebeam_runtime::net::shaper::SharedBottleneck;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
@@ -790,6 +791,19 @@ pub enum Step {
         participant: &'static str,
         capacity: Capacity,
     },
+    /// Put these participants' SFU egress paths behind one serialized bottleneck queue.
+    SetSharedBottleneck {
+        description: &'static str,
+        participants: &'static [&'static str],
+        capacity: Capacity,
+        max_backlog: Duration,
+        background_bits_per_sec: Option<u64>,
+    },
+    CheckBackgroundTraffic {
+        description: &'static str,
+        participant: &'static str,
+        min_packets: u64,
+    },
     /// Configure the loss model for a participant's downlink.
     SetLoss {
         description: &'static str,
@@ -1550,6 +1564,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
         Step::SetBandwidth { .. } => "SetBandwidth",
         Step::SetCapacity { .. } => "SetCapacity",
+        Step::SetSharedBottleneck { .. } => "SetSharedBottleneck",
+        Step::CheckBackgroundTraffic { .. } => "CheckBackgroundTraffic",
         Step::SetLoss { .. } => "SetLoss",
         Step::SetReorder { .. } => "SetReorder",
         Step::Expect { .. } => "Expect",
@@ -1661,6 +1677,50 @@ async fn execute_plan(
                     ip,
                     *capacity,
                     Duration::from_millis(200),
+                );
+            }
+
+            Step::SetSharedBottleneck {
+                description,
+                participants,
+                capacity,
+                max_backlog,
+                background_bits_per_sec,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participants:?}, {capacity:?})"
+                );
+                let destinations: Vec<_> = participants
+                    .iter()
+                    .map(|participant| resolve(name_to_ip, participant, description))
+                    .collect::<Result<_, _>>()?;
+                let bottleneck = shared_bottleneck_for(&destinations);
+                pulsebeam_runtime::net::shaper::set_shared_capacity(
+                    bottleneck,
+                    destinations,
+                    *capacity,
+                    *max_backlog,
+                );
+                if let Some(bits_per_sec) = background_bits_per_sec {
+                    pulsebeam_runtime::net::shaper::set_shared_background(
+                        bottleneck,
+                        *bits_per_sec,
+                        1200,
+                    );
+                }
+            }
+
+            Step::CheckBackgroundTraffic {
+                description,
+                participant,
+                min_packets,
+            } => {
+                let ip = resolve(name_to_ip, participant, description)?;
+                let stats = pulsebeam_runtime::net::shaper::stats(ip);
+                assert!(
+                    stats.background_packets >= *min_packets,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} background packet(s), minimum {min_packets}",
+                    stats.background_packets,
                 );
             }
 
@@ -2944,6 +3004,26 @@ fn resolve(map: &PlanIps, name: &str, step_desc: &str) -> anyhow::Result<IpAddr>
     })
 }
 
+fn shared_bottleneck_for(destinations: &[IpAddr]) -> SharedBottleneck {
+    debug_assert!(!destinations.is_empty());
+    let mut id = 0xcbf2_9ce4_8422_2325u64;
+    for destination in destinations {
+        id = match destination {
+            IpAddr::V4(ip) => hash_bottleneck_octets(id, ip.octets()),
+            IpAddr::V6(ip) => hash_bottleneck_octets(id, ip.octets()),
+        };
+    }
+    SharedBottleneck::new(id)
+}
+
+fn hash_bottleneck_octets(mut id: u64, octets: impl IntoIterator<Item = u8>) -> u64 {
+    for byte in octets {
+        id ^= u64::from(byte);
+        id = id.wrapping_mul(0x1000_0000_01b3);
+    }
+    id
+}
+
 fn get_handle<'a>(
     handles: &'a mut PlanHandles,
     name: &str,
@@ -3533,6 +3613,8 @@ pub struct LinkReport {
     pub delivered_packets: u64,
     pub congestion_drops: u64,
     pub link_loss_drops: u64,
+    pub background_packets: u64,
+    pub background_congestion_drops: u64,
     /// How many times each publisher's forwarded layer changed during the window.
     ///
     /// The measure that catches instability. Every other figure here is an average or an
@@ -3671,6 +3753,8 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
+        background_packets: stats.background_packets,
+        background_congestion_drops: stats.background_dropped_overflow,
         forwarded_quality: BTreeMap::new(),
         quality_changes: BTreeMap::new(),
         quality_reversals: BTreeMap::new(),

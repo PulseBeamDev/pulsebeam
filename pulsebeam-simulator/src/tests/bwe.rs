@@ -19,6 +19,105 @@ use std::time::Duration;
 /// of the implementation rather than of a lucky schedule.
 const QOS_SEEDS: [u64; 4] = [0xDEAD_BEEF, 0x1234_5678, 0x0BAD_F00D, 0xFEED_FACE];
 
+#[test]
+fn two_sfu_egress_paths_share_one_deterministic_bottleneck_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("shared-bottleneck-cooperative-flows")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("carol", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("bob", 1))
+                .with_participant(Participant::manual_subscriber("dave", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish two independent SFU egress paths",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetSharedBottleneck {
+                description: "Both viewer downlinks contend on one 3Mbps access bottleneck",
+                participants: &["bob", "dave"],
+                capacity: Capacity::Fixed(3_000_000),
+                max_backlog: Duration::from_millis(100),
+                background_bits_per_sec: None,
+            },
+            Step::SubscribeTo {
+                description: "First viewer requests Alice at full quality",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::SubscribeTo {
+                description: "Second viewer requests Carol at full quality",
+                participant: "dave",
+                targets: &[("carol", 720)],
+            },
+            Step::Run {
+                description: "Carry both real SFU paths through the shared queue",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "First shared-bottleneck flow remains continuously decodable",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100)
+                    .min_decoded_resolution((1280, 720))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Second shared-bottleneck flow remains continuously decodable",
+                participant: "dave",
+                quality: VideoQuality::min_frames(100)
+                    .min_decoded_resolution((1280, 720))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+        ]);
+}
+
+#[test]
+fn non_responsive_background_traffic_uses_the_viewers_bottleneck_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("shared-bottleneck-background-traffic")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("bob", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the publisher and viewer",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetSharedBottleneck {
+                description: "A fixed-rate background flow occupies the viewer access queue",
+                participants: &["bob"],
+                capacity: Capacity::Fixed(2_000_000),
+                max_backlog: Duration::from_millis(100),
+                background_bits_per_sec: Some(500_000),
+            },
+            Step::SubscribeTo {
+                description: "Viewer requests full quality beside the non-responsive traffic",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Drive real media alongside deterministic background arrivals",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckBackgroundTraffic {
+                description: "The configured non-responsive traffic consumed the shared queue",
+                participant: "bob",
+                min_packets: 100,
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The background model leaves a real decoder-facing media path",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100)
+                    .min_decoded_resolution((1280, 720))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+        ]);
+}
+
 /// Upgrading after a long stretch at low quality must not break the stream.
 ///
 /// This is an end-to-end anchor for the transition from a long low-quality period to an explicit

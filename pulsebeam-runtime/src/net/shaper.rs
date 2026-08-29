@@ -20,8 +20,9 @@
 //! leave the interesting signal missing. Packets are held and released on a schedule instead, and
 //! dropped only once the backlog exceeds the bottleneck's buffer.
 //!
-//! Shaping is applied on egress, keyed by destination IP, so one SFU socket gives every client its
-//! own downlink. Production builds never see this: the module is compiled only under `sim`.
+//! Shaping is applied on egress. Destinations are isolated by default and can be assigned to a
+//! shared bottleneck when a scenario models a common access link. Production builds never see
+//! this: the module is compiled only under `sim`.
 //!
 //! # Ground truth
 //!
@@ -31,7 +32,7 @@
 //! bytes". The latter silently encodes link rate, codec, fixture length and current behaviour all
 //! at once, and stops meaning anything the moment any of them changes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use tokio::time::{Duration, Instant};
@@ -42,6 +43,36 @@ use tokio::time::{Duration, Instant};
 /// actually behaves and keeps the figure meaningful across rates. 200ms is a typical
 /// consumer-router buffer - deep enough to show real bufferbloat before loss sets in.
 const DEFAULT_MAX_BACKLOG: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SharedBottleneck(u64);
+
+impl SharedBottleneck {
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Bottleneck {
+    Destination(IpAddr),
+    Shared(SharedBottleneck),
+}
+
+fn bottlenecks() -> &'static Mutex<HashMap<IpAddr, SharedBottleneck>> {
+    static BOTTLENECKS: std::sync::OnceLock<Mutex<HashMap<IpAddr, SharedBottleneck>>> =
+        std::sync::OnceLock::new();
+    BOTTLENECKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bottleneck_for(ip: IpAddr) -> Bottleneck {
+    bottlenecks()
+        .lock()
+        .expect("shaper bottlenecks poisoned")
+        .get(&ip)
+        .copied()
+        .map_or(Bottleneck::Destination(ip), Bottleneck::Shared)
+}
 
 /// How a link's capacity behaves over time.
 ///
@@ -165,10 +196,23 @@ struct Limit {
     since: Option<Instant>,
 }
 
-/// Per-destination limits. Keyed by IP so a single SFU socket shapes each client separately.
-fn limits() -> &'static Mutex<HashMap<IpAddr, Limit>> {
-    static LIMITS: std::sync::OnceLock<Mutex<HashMap<IpAddr, Limit>>> = std::sync::OnceLock::new();
+/// Per-bottleneck limits. An unassigned destination is its own bottleneck.
+fn limits() -> &'static Mutex<HashMap<Bottleneck, Limit>> {
+    static LIMITS: std::sync::OnceLock<Mutex<HashMap<Bottleneck, Limit>>> =
+        std::sync::OnceLock::new();
     LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BackgroundTraffic {
+    bits_per_sec: u64,
+    packet_size: usize,
+}
+
+fn background_traffic() -> &'static Mutex<HashMap<SharedBottleneck, BackgroundTraffic>> {
+    static BACKGROUND: std::sync::OnceLock<Mutex<HashMap<SharedBottleneck, BackgroundTraffic>>> =
+        std::sync::OnceLock::new();
+    BACKGROUND.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// How often a packet is delivered out of order, and by how much.
@@ -308,13 +352,19 @@ pub struct Stats {
     pub reordered: u64,
     /// Delivered a second time by the duplication model.
     pub duplicated: u64,
+    /// Packets from the configured non-responsive background source which occupied this queue.
+    pub background_packets: u64,
+    /// Background packets dropped because they would exceed the bottleneck buffer.
+    pub background_dropped_overflow: u64,
     /// Deepest queue occupancy seen, as time. A transient spike, so it says what the worst
     /// moment was and nothing about whether the controller lives there.
     pub max_backlog: Duration,
-    /// Queue occupancy summed over delivered packets, so `mean_backlog` can report the queue a
+    /// Queue occupancy summed over queue arrivals, so `mean_backlog` can report the queue a
     /// controller actually sits behind. Weighted by packet rather than by time: on a link worth
     /// measuring the two agree closely, and per-packet needs no timer.
     pub backlog_sum: Duration,
+    /// Number of foreground and background queue arrivals included in `backlog_sum`.
+    pub backlog_samples: u64,
 }
 
 pub fn record_gso_batch(ip: IpAddr, segments: usize) {
@@ -346,13 +396,14 @@ impl Stats {
     /// that ever filled has a high one.
     pub fn mean_backlog(&self) -> Duration {
         self.backlog_sum
-            .checked_div(u32::try_from(self.delivered).unwrap_or(u32::MAX))
+            .checked_div(u32::try_from(self.backlog_samples).unwrap_or(u32::MAX))
             .unwrap_or_default()
     }
 }
 
-fn stats_map() -> &'static Mutex<HashMap<IpAddr, Stats>> {
-    static STATS: std::sync::OnceLock<Mutex<HashMap<IpAddr, Stats>>> = std::sync::OnceLock::new();
+fn stats_map() -> &'static Mutex<HashMap<Bottleneck, Stats>> {
+    static STATS: std::sync::OnceLock<Mutex<HashMap<Bottleneck, Stats>>> =
+        std::sync::OnceLock::new();
     STATS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -367,8 +418,12 @@ pub fn set_downlink_with_backlog(ip: IpAddr, bits_per_sec: u64, max_backlog: Dur
 
 /// Apply a capacity schedule to `ip`. Resets the schedule's clock.
 pub fn set_capacity(ip: IpAddr, capacity: Capacity, max_backlog: Duration) {
+    bottlenecks()
+        .lock()
+        .expect("shaper bottlenecks poisoned")
+        .remove(&ip);
     limits().lock().expect("shaper limits poisoned").insert(
-        ip,
+        Bottleneck::Destination(ip),
         Limit {
             capacity,
             max_backlog,
@@ -377,12 +432,57 @@ pub fn set_capacity(ip: IpAddr, capacity: Capacity, max_backlog: Duration) {
     );
 }
 
+pub fn set_shared_capacity(
+    bottleneck: SharedBottleneck,
+    destinations: impl IntoIterator<Item = IpAddr>,
+    capacity: Capacity,
+    max_backlog: Duration,
+) {
+    let destinations: Vec<_> = destinations.into_iter().collect();
+    assert!(
+        !destinations.is_empty(),
+        "a shared bottleneck needs at least one destination"
+    );
+    let mut assignments = bottlenecks().lock().expect("shaper bottlenecks poisoned");
+    for destination in destinations {
+        assignments.insert(destination, bottleneck);
+    }
+    drop(assignments);
+    limits().lock().expect("shaper limits poisoned").insert(
+        Bottleneck::Shared(bottleneck),
+        Limit {
+            capacity,
+            max_backlog,
+            since: None,
+        },
+    );
+}
+
+pub fn set_shared_background(bottleneck: SharedBottleneck, bits_per_sec: u64, packet_size: usize) {
+    assert!(bits_per_sec > 0, "background traffic rate must be non-zero");
+    assert!(
+        packet_size > 0,
+        "background traffic packet size must be non-zero"
+    );
+    background_traffic()
+        .lock()
+        .expect("shaper background traffic poisoned")
+        .insert(
+            bottleneck,
+            BackgroundTraffic {
+                bits_per_sec,
+                packet_size,
+            },
+        );
+}
+
 /// The link's capacity right now, in bits per second. `None` when unshaped.
 ///
 /// This is the ground truth an assertion should compare against.
 pub fn capacity_at(ip: IpAddr, now: Instant) -> Option<u64> {
+    let bottleneck = bottleneck_for(ip);
     let mut guard = limits().lock().expect("shaper limits poisoned");
-    let limit = guard.get_mut(&ip)?;
+    let limit = guard.get_mut(&bottleneck)?;
     let since = *limit.since.get_or_insert(now);
     Some(
         limit
@@ -397,19 +497,28 @@ pub fn capacity_at(ip: IpAddr, now: Instant) -> Option<u64> {
 /// oscillation, so callers use this to refuse rather than silently compare against whatever the
 /// instantaneous value happened to be.
 pub fn capacity_is_fixed(ip: IpAddr) -> bool {
+    let bottleneck = bottleneck_for(ip);
     limits()
         .lock()
         .expect("shaper limits poisoned")
-        .get(&ip)
+        .get(&bottleneck)
         .is_some_and(|l| matches!(l.capacity, Capacity::Fixed(_)))
 }
 
 /// Observed link behaviour for `ip` since the last [`reset_stats`].
 pub fn stats(ip: IpAddr) -> Stats {
+    stats_for(bottleneck_for(ip))
+}
+
+pub fn shared_stats(bottleneck: SharedBottleneck) -> Stats {
+    stats_for(Bottleneck::Shared(bottleneck))
+}
+
+fn stats_for(bottleneck: Bottleneck) -> Stats {
     stats_map()
         .lock()
         .expect("shaper stats poisoned")
-        .get(&ip)
+        .get(&bottleneck)
         .copied()
         .unwrap_or_default()
 }
@@ -423,8 +532,12 @@ pub fn stats(ip: IpAddr) -> Stats {
 /// wrong moment.
 pub fn reset_stats_for(ips: impl IntoIterator<Item = IpAddr>) {
     let mut guard = stats_map().lock().expect("shaper stats poisoned");
+    let mut seen = HashSet::new();
     for ip in ips {
-        guard.remove(&ip);
+        let bottleneck = bottleneck_for(ip);
+        if seen.insert(bottleneck) {
+            guard.remove(&bottleneck);
+        }
     }
 }
 
@@ -432,6 +545,14 @@ pub fn reset_stats_for(ips: impl IntoIterator<Item = IpAddr>) {
 /// clear them or leak them into whatever runs next.
 pub fn clear() {
     limits().lock().expect("shaper limits poisoned").clear();
+    bottlenecks()
+        .lock()
+        .expect("shaper bottlenecks poisoned")
+        .clear();
+    background_traffic()
+        .lock()
+        .expect("shaper background traffic poisoned")
+        .clear();
     losses().lock().expect("shaper losses poisoned").clear();
     reorders().lock().expect("shaper reorders poisoned").clear();
     duplicates()
@@ -519,7 +640,8 @@ pub fn seed_impairments(seed: u64) {
 
 struct ShaperState {
     /// When the link to a destination next falls idle. The backlog is this minus now.
-    next_free: HashMap<IpAddr, Instant>,
+    next_free: HashMap<Bottleneck, Instant>,
+    background_next: HashMap<SharedBottleneck, Instant>,
     queue: VecDeque<Queued>,
     loss_counter: u64,
     /// Gilbert-Elliott position per destination: true while in the bad state.
@@ -530,6 +652,7 @@ impl Default for ShaperState {
     fn default() -> Self {
         Self {
             next_free: HashMap::new(),
+            background_next: HashMap::new(),
             queue: VecDeque::new(),
             loss_counter: IMPAIRMENT_SEED.load(std::sync::atomic::Ordering::Relaxed),
             in_bad_state: HashMap::new(),
@@ -553,7 +676,20 @@ impl Shaper {
 
     /// Offer a packet to the bottleneck.
     pub fn offer(&mut self, now: Instant, dst: SocketAddr, buf: &[u8]) -> Shaped {
-        let Some(bits_per_sec) = capacity_at(dst.ip(), now) else {
+        let bottleneck = bottleneck_for(dst.ip());
+        let limit = {
+            let mut limits = limits().lock().expect("shaper limits poisoned");
+            limits.get_mut(&bottleneck).map(|limit| {
+                let since = *limit.since.get_or_insert(now);
+                (
+                    limit
+                        .capacity
+                        .bits_per_sec_at(now.saturating_duration_since(since)),
+                    limit.max_backlog,
+                )
+            })
+        };
+        let Some((bits_per_sec, max_backlog)) = limit else {
             // No capacity to model, but reordering is a property of the path rather than of its
             // rate: an uncapped link still delivers out of order. Hold the sampled packet in the
             // queue so the ones offered behind it genuinely leave first.
@@ -576,14 +712,30 @@ impl Shaper {
             }
             return Shaped::PassThrough;
         };
-        let max_backlog = limits()
-            .lock()
-            .expect("shaper limits poisoned")
-            .get(&dst.ip())
-            .map(|l| l.max_backlog)
-            .unwrap_or(DEFAULT_MAX_BACKLOG);
         let reorder = reorder_for(&dst.ip());
-        self.with(|st| st.offer(now, dst, buf, bits_per_sec, max_backlog, reorder))
+        let background = match bottleneck {
+            Bottleneck::Destination(_) => None,
+            Bottleneck::Shared(id) => background_traffic()
+                .lock()
+                .expect("shaper background traffic poisoned")
+                .get(&id)
+                .copied()
+                .map(|background| (id, background)),
+        };
+        self.with(|st| {
+            if let Some((id, background)) = background {
+                st.offer_background(now, id, background, bits_per_sec, max_backlog);
+            }
+            st.offer(
+                now,
+                dst,
+                buf,
+                bottleneck,
+                bits_per_sec,
+                max_backlog,
+                reorder,
+            )
+        })
     }
 
     /// Take every packet whose turn on the wire has come.
@@ -634,8 +786,12 @@ impl Shaper {
 }
 
 fn record(ip: IpAddr, f: impl FnOnce(&mut Stats)) {
+    record_for(bottleneck_for(ip), f);
+}
+
+fn record_for(bottleneck: Bottleneck, f: impl FnOnce(&mut Stats)) {
     let mut guard = stats_map().lock().expect("shaper stats poisoned");
-    f(guard.entry(ip).or_default());
+    f(guard.entry(bottleneck).or_default());
 }
 
 impl ShaperState {
@@ -672,6 +828,7 @@ impl ShaperState {
         now: Instant,
         dst: SocketAddr,
         buf: &[u8],
+        bottleneck: Bottleneck,
         bits_per_sec: u64,
         max_backlog: Duration,
         reorder: Reorder,
@@ -680,22 +837,23 @@ impl ShaperState {
         let on_wire =
             Duration::from_secs_f64((buf.len() as f64 * 8.0) / bits_per_sec.max(1) as f64);
 
-        let idle_at = self.next_free.entry(dst.ip()).or_insert(now);
+        let idle_at = self.next_free.entry(bottleneck).or_insert(now);
         // A link idle in the past is idle now; it does not accrue credit.
         let release_at = (*idle_at).max(now);
         let backlog = release_at.saturating_duration_since(now);
 
         if backlog > max_backlog {
             // Buffer full. Tail drop, exactly as a bottleneck queue does.
-            record(dst.ip(), |s| s.dropped_overflow += 1);
+            record_for(bottleneck, |s| s.dropped_overflow += 1);
             return Shaped::Absorbed;
         }
 
         *idle_at = release_at + on_wire;
-        record(dst.ip(), |s| {
+        record_for(bottleneck, |s| {
             s.delivered += 1;
             s.max_backlog = s.max_backlog.max(backlog);
             s.backlog_sum = s.backlog_sum.saturating_add(backlog);
+            s.backlog_samples = s.backlog_samples.saturating_add(1);
         });
 
         // Reordering is applied to the release time, not by shuffling the queue, so the packet
@@ -719,6 +877,50 @@ impl ShaperState {
             .make_contiguous()
             .sort_by_key(|q: &Queued| q.release_at);
         Shaped::Absorbed
+    }
+
+    fn offer_background(
+        &mut self,
+        now: Instant,
+        bottleneck: SharedBottleneck,
+        background: BackgroundTraffic,
+        capacity_bps: u64,
+        max_backlog: Duration,
+    ) {
+        let packet_bits = u64::try_from(background.packet_size)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8);
+        let interval = Duration::from_secs_f64(packet_bits as f64 / background.bits_per_sec as f64);
+        debug_assert!(
+            !interval.is_zero(),
+            "background arrival interval must advance time"
+        );
+        let mut arrivals = 0u64;
+        let next_at = self.background_next.entry(bottleneck).or_insert(now);
+        while *next_at <= now {
+            arrivals = arrivals.saturating_add(1);
+            debug_assert!(arrivals < 1_000_000, "background generator did not advance");
+            let on_wire = Duration::from_secs_f64(packet_bits as f64 / capacity_bps.max(1) as f64);
+            let shared = Bottleneck::Shared(bottleneck);
+            let idle_at = self.next_free.entry(shared).or_insert(*next_at);
+            let release_at = (*idle_at).max(*next_at);
+            let backlog = release_at.saturating_duration_since(*next_at);
+            if backlog > max_backlog {
+                record_for(shared, |stats| {
+                    stats.background_dropped_overflow =
+                        stats.background_dropped_overflow.saturating_add(1)
+                });
+            } else {
+                *idle_at = release_at + on_wire;
+                record_for(shared, |stats| {
+                    stats.background_packets = stats.background_packets.saturating_add(1);
+                    stats.max_backlog = stats.max_backlog.max(backlog);
+                    stats.backlog_sum = stats.backlog_sum.saturating_add(backlog);
+                    stats.backlog_samples = stats.backlog_samples.saturating_add(1);
+                });
+            }
+            *next_at += interval;
+        }
     }
 
     fn drain_due(&mut self, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
@@ -930,5 +1132,115 @@ mod tests {
         assert!(s.delivered > 0, "some packets should be queued");
         assert!(s.dropped_overflow > 0, "the buffer should have overflowed");
         assert_eq!(s.dropped_loss, 0, "no loss model was configured");
+    }
+
+    #[test]
+    fn flows_assigned_to_one_shared_bottleneck_contend() {
+        let first: IpAddr = "10.0.0.1".parse().unwrap();
+        let second: IpAddr = "10.0.0.2".parse().unwrap();
+        let shared = SharedBottleneck::new(101);
+        set_shared_capacity(
+            shared,
+            [first, second],
+            Capacity::Fixed(1_000_000),
+            Duration::from_secs(5),
+        );
+
+        let mut shaper = Shaper::default();
+        let start = Instant::now();
+        for _ in 0..10 {
+            shaper.offer(start, SocketAddr::new(first, 9000), &[0; 1000]);
+            shaper.offer(start, SocketAddr::new(second, 9000), &[0; 1000]);
+        }
+
+        let one_flow = Duration::from_millis(80);
+        let released_after_one_flow = shaper
+            .drain_due(start + one_flow + Duration::from_millis(1))
+            .len();
+        assert!(
+            released_after_one_flow < 20,
+            "two flows sharing a 1Mbps bottleneck must take longer than either flow alone"
+        );
+        assert_eq!(
+            released_after_one_flow
+                + shaper
+                    .drain_due(start + one_flow.saturating_mul(2) + Duration::from_millis(1))
+                    .len(),
+            20,
+            "the shared queue should release the complete combined burst"
+        );
+        assert_eq!(shared_stats(shared).delivered, 20);
+        assert_eq!(stats(first), stats(second));
+    }
+
+    #[test]
+    fn flows_on_separate_bottlenecks_do_not_contend() {
+        let first: IpAddr = "10.0.1.1".parse().unwrap();
+        let second: IpAddr = "10.0.1.2".parse().unwrap();
+        set_downlink_with_backlog(first, 1_000_000, Duration::from_secs(5));
+        set_downlink_with_backlog(second, 1_000_000, Duration::from_secs(5));
+
+        let mut shaper = Shaper::default();
+        let start = Instant::now();
+        for _ in 0..10 {
+            shaper.offer(start, SocketAddr::new(first, 9000), &[0; 1000]);
+            shaper.offer(start, SocketAddr::new(second, 9000), &[0; 1000]);
+        }
+
+        assert_eq!(
+            shaper.drain_due(start + Duration::from_millis(81)).len(),
+            20,
+            "independent links should each finish their own ten-packet burst"
+        );
+        assert_eq!(stats(first).delivered, 10);
+        assert_eq!(stats(second).delivered, 10);
+    }
+
+    #[test]
+    fn background_traffic_occupies_only_its_shared_bottleneck() {
+        let shared_ip: IpAddr = "10.0.2.1".parse().unwrap();
+        let isolated_ip: IpAddr = "10.0.2.2".parse().unwrap();
+        let shared = SharedBottleneck::new(102);
+        set_shared_capacity(
+            shared,
+            [shared_ip],
+            Capacity::Fixed(1_000_000),
+            Duration::from_secs(5),
+        );
+        set_shared_background(shared, 500_000, 1200);
+        set_downlink_with_backlog(isolated_ip, 1_000_000, Duration::from_secs(5));
+
+        let mut shaper = Shaper::default();
+        let start = Instant::now();
+        shaper.offer(start, SocketAddr::new(shared_ip, 9000), &[0; 1200]);
+        shaper.drain_due(start + Duration::from_millis(20));
+        shaper.offer(
+            start + Duration::from_millis(200),
+            SocketAddr::new(shared_ip, 9000),
+            &[0; 1200],
+        );
+        shaper.offer(
+            start + Duration::from_millis(200),
+            SocketAddr::new(isolated_ip, 9000),
+            &[0; 1200],
+        );
+
+        assert!(
+            shared_stats(shared).background_packets > 1,
+            "background arrivals must be recorded on the configured shared queue"
+        );
+        let due = shaper.drain_due(start + Duration::from_millis(200));
+        assert_eq!(
+            due.iter().filter(|(dst, _)| dst.ip() == shared_ip).count(),
+            0,
+            "background traffic should still occupy the shared queue at the second offer"
+        );
+        assert_eq!(
+            due.iter()
+                .filter(|(dst, _)| dst.ip() == isolated_ip)
+                .count(),
+            1,
+            "background traffic must not delay an unassigned destination"
+        );
     }
 }
