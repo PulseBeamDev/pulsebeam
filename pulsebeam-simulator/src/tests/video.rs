@@ -72,6 +72,57 @@ fn quality_fixture_is_proven_from_each_viewers_decoded_output_test() {
 }
 
 #[test]
+fn independent_viewer_capacities_keep_their_requested_simulcast_quality_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("independent-viewer-simulcast-quality")
+                .with_participant(Participant::publisher("publisher", &["q", "h", "f"]))
+                .with_participant(Participant::manual_subscriber("high-viewer", 1))
+                .with_participant(Participant::manual_subscriber("low-viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the publisher and both independent viewers",
+                duration: Duration::from_secs(5),
+            },
+            Step::SetBandwidth {
+                description: "Constrain only the low-resolution viewer",
+                participant: "low-viewer",
+                bits_per_sec: 350_000,
+            },
+            Step::SubscribeTo {
+                description: "High-capacity viewer requests the full encoding",
+                participant: "high-viewer",
+                targets: &[("publisher", 720)],
+            },
+            Step::SubscribeTo {
+                description: "Constrained viewer requests the quarter encoding",
+                participant: "low-viewer",
+                targets: &[("publisher", 180)],
+            },
+            Step::Run {
+                description: "Let each viewer settle on its independently allocated encoding",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "High-capacity viewer continuously decodes full-resolution video",
+                participant: "high-viewer",
+                quality: VideoQuality::min_frames(100)
+                    .min_decoded_resolution((1280, 720))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Constrained viewer continuously decodes its requested low-resolution video",
+                participant: "low-viewer",
+                quality: VideoQuality::min_frames(100)
+                    .min_decoded_resolution((320, 180))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+        ]);
+}
+
+#[test]
 fn subscription_activation_delivers_a_decoded_fixture_frame_without_slow_poll_test() {
     LocalNodeSim::new()
         .with_room(
