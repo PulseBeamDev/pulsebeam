@@ -1,0 +1,241 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PulseBeam Manual Subscriber</title>
+<div id="videos"></div>
+<script type="module">
+  const videoRoot = document.querySelector("#videos");
+  const videos = [];
+  const text = new TextEncoder();
+  const textDecoder = new TextDecoder();
+  let peer;
+  let signal;
+  let senderMid;
+  let receiverMid;
+  let remoteTrackId;
+
+  function concat(parts) {
+    const length = parts.reduce((sum, part) => sum + part.length, 0);
+    const result = new Uint8Array(length);
+    let offset = 0;
+    for (const part of parts) {
+      result.set(part, offset);
+      offset += part.length;
+    }
+    return result;
+  }
+
+  function varint(value) {
+    const bytes = [];
+    do {
+      let byte = value & 0x7f;
+      value >>>= 7;
+      if (value !== 0) byte |= 0x80;
+      bytes.push(byte);
+    } while (value !== 0);
+    return Uint8Array.from(bytes);
+  }
+
+  function field(number, payload) {
+    return concat([varint(number << 3 | 2), varint(payload.length), payload]);
+  }
+
+  function stringField(number, value) {
+    return field(number, text.encode(value));
+  }
+
+  function boolField(number, value) {
+    return concat([varint(number << 3), varint(value ? 1 : 0)]);
+  }
+
+  function numberField(number, value) {
+    return concat([varint(number << 3), varint(value)]);
+  }
+
+  function readVarint(bytes, offset) {
+    let value = 0;
+    let shift = 0;
+    while (offset < bytes.length && shift < 35) {
+      const byte = bytes[offset++];
+      value |= (byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) return [value, offset];
+      shift += 7;
+    }
+    throw new Error("invalid protobuf varint");
+  }
+
+  function fields(bytes, visit) {
+    let offset = 0;
+    while (offset < bytes.length) {
+      let tag;
+      [tag, offset] = readVarint(bytes, offset);
+      const number = tag >>> 3;
+      const wire = tag & 7;
+      if (wire === 0) {
+        let value;
+        [value, offset] = readVarint(bytes, offset);
+        visit(number, wire, value);
+      } else if (wire === 2) {
+        let length;
+        [length, offset] = readVarint(bytes, offset);
+        const end = offset + length;
+        if (end > bytes.length) throw new Error("truncated protobuf field");
+        visit(number, wire, bytes.slice(offset, end));
+        offset = end;
+      } else {
+        throw new Error(`unsupported protobuf wire type ${wire}`);
+      }
+    }
+  }
+
+  function publication(bytes) {
+    let trackId = null;
+    let kind = 0;
+    fields(bytes, (number, wire, value) => {
+      if (number === 1 && wire === 2) trackId = textDecoder.decode(value);
+      if (number === 3 && wire === 0) kind = value;
+    });
+    return { trackId, kind };
+  }
+
+  function consumeState(bytes) {
+    fields(bytes, (outerNumber, outerWire, outerValue) => {
+      if (outerNumber !== 1 || outerWire !== 2) return;
+      fields(outerValue, (number, wire, value) => {
+        if (number !== 4 || wire !== 2) return;
+        const item = publication(value);
+        if (item.kind === 1 && item.trackId !== null) remoteTrackId = item.trackId;
+      });
+    });
+  }
+
+  function sendIntent() {
+    if (signal?.readyState !== "open" || !senderMid || !receiverMid) return;
+    const publish = field(3, concat([stringField(1, senderMid), boolField(2, true)]));
+    const video = remoteTrackId === null ? [] : [field(1, concat([
+      stringField(1, receiverMid),
+      stringField(2, remoteTrackId),
+      numberField(3, 1080),
+      numberField(4, 360),
+      numberField(6, 200),
+    ]))];
+    signal.send(field(1, concat([...video, publish])));
+  }
+
+  function canvasTrack() {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 180;
+    const context = canvas.getContext("2d");
+    let frame = 0;
+    const draw = () => {
+      context.fillStyle = `hsl(${frame % 360} 80% 50%)`;
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = "white";
+      context.fillText(String(frame), 16, 24);
+      frame += 1;
+      requestAnimationFrame(draw);
+    };
+    draw();
+    return canvas.captureStream(30).getVideoTracks()[0];
+  }
+
+  function setH264(transceiver, capability) {
+    if (!transceiver.setCodecPreferences) return;
+    const codecs = capability("video")?.codecs ?? [];
+    const h264 = codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/h264");
+    if (h264.length === 0) throw new Error("browser does not support H.264");
+    transceiver.setCodecPreferences(h264);
+  }
+
+  function mids(sdp) {
+    const sections = sdp.split(/^m=/m).slice(1);
+    return sections.map((section) => {
+      const kind = section.split(/\r?\n/, 1)[0].split(" ", 1)[0];
+      const mid = section.match(/^a=mid:(.+)$/m)?.[1];
+      return { kind, mid };
+    });
+  }
+
+  async function gatherCandidates(connection) {
+    if (connection.iceGatheringState === "complete") return;
+    await new Promise((resolve) => {
+      const complete = () => {
+        if (connection.iceGatheringState === "complete") {
+          connection.removeEventListener("icegatheringstatechange", complete);
+          resolve();
+        }
+      };
+      connection.addEventListener("icegatheringstatechange", complete);
+    });
+  }
+
+  async function connect({ apiUrl, room }) {
+    remoteTrackId = null;
+    peer = new RTCPeerConnection();
+    signal = peer.createDataChannel("v1/sys/signaling", { ordered: true });
+    signal.binaryType = "arraybuffer";
+    signal.onopen = sendIntent;
+    signal.onmessage = ({ data }) => {
+      consumeState(new Uint8Array(data));
+      sendIntent();
+    };
+    const sender = peer.addTransceiver(canvasTrack(), { direction: "sendonly" });
+    const receiver = peer.addTransceiver("video", { direction: "recvonly" });
+    setH264(sender, RTCRtpSender.getCapabilities);
+    setH264(receiver, RTCRtpReceiver.getCapabilities);
+    peer.ontrack = ({ track }) => {
+      if (track.kind !== "video") return;
+      const video = document.createElement("video");
+      video.autoplay = true;
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = new MediaStream([track]);
+      videoRoot.append(video);
+      videos.push(video);
+    };
+    await peer.setLocalDescription(await peer.createOffer());
+    ({ senderMid, receiverMid } = (() => {
+      const video = mids(peer.localDescription.sdp).filter((section) => section.kind === "video");
+      if (video.length !== 2 || !video[0].mid || !video[1].mid) throw new Error("expected send and receive video mids");
+      return { senderMid: video[0].mid, receiverMid: video[1].mid };
+    })());
+    await gatherCandidates(peer);
+    const response = await fetch(`${apiUrl}/api/v1/rooms/${room}/participants?manual_sub=true`, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: peer.localDescription.sdp,
+    });
+    if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
+    await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
+  }
+
+  async function stats() {
+    const report = await peer.getStats();
+    const inbound = [];
+    const outbound = [];
+    for (const value of report.values()) {
+      if (value.type === "outbound-rtp" && value.kind === "video") {
+        outbound.push({ bytesSent: value.bytesSent ?? 0, packetsSent: value.packetsSent ?? 0 });
+      }
+      if (value.type === "inbound-rtp" && value.kind === "video") {
+        inbound.push({
+          framesDecoded: value.framesDecoded ?? 0,
+          jitterBufferDelay: value.jitterBufferDelay ?? 0,
+          jitterBufferEmittedCount: value.jitterBufferEmittedCount ?? 0,
+        });
+      }
+    }
+    return {
+      connectionState: peer.connectionState,
+      inbound,
+      outbound,
+      rendered: videos.map((video) => ({ width: video.videoWidth, height: video.videoHeight })),
+    };
+  }
+
+  function sdp() {
+    return { local: peer?.localDescription?.sdp ?? null, remote: peer?.remoteDescription?.sdp ?? null };
+  }
+
+  window.pulsebeamManual = { connect, sdp, stats };
+</script>

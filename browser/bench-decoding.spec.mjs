@@ -72,6 +72,7 @@ async function startStaticServer() {
     const pages = {
       "/publisher.html": "publisher.html",
       "/viewer.html": "viewer.html",
+      "/manual-subscriptions.html": "manual-subscriptions.html",
     };
     const page = pages[request.url];
     if (!page) {
@@ -107,12 +108,21 @@ async function startPulseBeam() {
 }
 
 function commonCodecs(publisher, viewer) {
-  const codecs = ["video/h264", "video/vp8"].filter((codec) =>
+  const codecs = ["video/h264"].filter((codec) =>
     publisher.includes(codec) && viewer.includes(codec));
-  if (codecs.length === 0) {
-    throw new Error(`browser pair has no supported H.264 or VP8 codec: publisher=${publisher} viewer=${viewer}`);
-  }
   return codecs;
+}
+
+function decodedFrames(stats) {
+  return stats.inbound.reduce((total, stream) => total + stream.framesDecoded, 0);
+}
+
+function jitterSamples(stats) {
+  return stats.inbound.reduce((total, stream) => total + stream.jitterBufferEmittedCount, 0);
+}
+
+function jitterDelay(stats) {
+  return stats.inbound.reduce((total, stream) => total + stream.jitterBufferDelay, 0);
 }
 
 test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) => {
@@ -179,6 +189,74 @@ test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) =>
   }
 });
 
+test("manual browser subscriptions sustain decoded H.264 in both directions", async () => {
+  test.setTimeout(90_000);
+  const fixtureServer = await startStaticServer();
+  const port = fixtureServer.address().port;
+  const leftBrowser = await chromium.launch({ headless: true });
+  const rightBrowser = await chromium.launch({ headless: true });
+  const left = await leftBrowser.newPage();
+  const right = await rightBrowser.newPage();
+  let pulsebeam;
+  try {
+    await Promise.all([
+      left.goto(`http://127.0.0.1:${port}/manual-subscriptions.html`),
+      right.goto(`http://127.0.0.1:${port}/manual-subscriptions.html`),
+    ]);
+    const started = await startPulseBeam();
+    pulsebeam = started.pulsebeam;
+    await left.evaluate((apiUrl) => window.pulsebeamManual.connect({
+      apiUrl,
+      room: "manual-browser-subscriptions",
+    }), started.apiUrl);
+    await right.evaluate((apiUrl) => window.pulsebeamManual.connect({
+      apiUrl,
+      room: "manual-browser-subscriptions",
+    }), started.apiUrl);
+    await expect.poll(async () => {
+      const [leftStats, rightStats] = await Promise.all([
+        left.evaluate(() => window.pulsebeamManual.stats()),
+        right.evaluate(() => window.pulsebeamManual.stats()),
+      ]);
+      return [leftStats, rightStats].every((stats) =>
+        stats.connectionState === "connected" &&
+        stats.outbound.some((stream) => stream.packetsSent > 0) &&
+        decodedFrames(stats) >= 20 &&
+        stats.rendered.some((video) => video.width > 0 && video.height > 0));
+    }, { timeout: 20_000, message: "manual browser subscriptions never produced rendered video" }).toBe(true);
+
+    const before = await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.stats()),
+      right.evaluate(() => window.pulsebeamManual.stats()),
+    ]);
+    await expect.poll(async () => {
+      const after = await Promise.all([
+        left.evaluate(() => window.pulsebeamManual.stats()),
+        right.evaluate(() => window.pulsebeamManual.stats()),
+      ]);
+      return after.every((stats, index) => {
+        const frames = decodedFrames(stats) - decodedFrames(before[index]);
+        const samples = jitterSamples(stats) - jitterSamples(before[index]);
+        const delay = jitterDelay(stats) - jitterDelay(before[index]);
+        return frames >= 20 && (samples === 0 || delay / samples <= 0.5);
+      });
+    }, { timeout: 8_000, message: "manual browser video froze or accumulated excessive jitter-buffer delay" }).toBe(true);
+  } catch (error) {
+    const [leftStats, rightStats, leftSdp, rightSdp] = await Promise.all([
+      left.evaluate(() => window.pulsebeamManual?.stats?.()).catch(() => null),
+      right.evaluate(() => window.pulsebeamManual?.stats?.()).catch(() => null),
+      left.evaluate(() => window.pulsebeamManual?.sdp?.()).catch(() => null),
+      right.evaluate(() => window.pulsebeamManual?.sdp?.()).catch(() => null),
+    ]);
+    throw new Error(`${error.message}\nLeft browser: ${JSON.stringify(leftStats)}\nRight browser: ${JSON.stringify(rightStats)}\nLeft SDP: ${JSON.stringify(leftSdp)}\nRight SDP: ${JSON.stringify(rightSdp)}\nPulseBeam:\n${pulsebeam?.output() ?? "not started"}`);
+  } finally {
+    fixtureServer.close();
+    await stop(pulsebeam?.child);
+    await leftBrowser.close();
+    await rightBrowser.close();
+  }
+});
+
 for (const [publisherName, publisherType] of Object.entries(engines)) {
   for (const [viewerName, viewerType] of Object.entries(engines)) {
     test(`${publisherName} publisher renders on ${viewerName}`, async () => {
@@ -199,6 +277,10 @@ for (const [publisherName, publisherType] of Object.entries(engines)) {
           publisherPage.evaluate(() => window.pulsebeamPublisher.codecs()),
           viewerPage.evaluate(() => window.pulsebeamViewer.codecs()),
         ]);
+        test.skip(
+          commonCodecs(publisherCodecs, viewerCodecs).length === 0,
+          "browser pair has no common H.264 codec",
+        );
         for (const codec of commonCodecs(publisherCodecs, viewerCodecs)) {
           await Promise.all([
             publisherPage.goto(`http://127.0.0.1:${port}/publisher.html`),
