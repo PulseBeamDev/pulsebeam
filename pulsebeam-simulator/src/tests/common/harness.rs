@@ -298,7 +298,7 @@ impl Room {
 #[derive(Clone, Debug)]
 pub struct VideoQuality {
     pub min_frames: u64,
-    pub max_missing_parameter_sets: u64,
+    pub max_undecodable_keyframes: u64,
     pub max_non_contiguous: u64,
 }
 
@@ -307,15 +307,15 @@ impl VideoQuality {
     pub fn min_frames(n: u64) -> Self {
         Self {
             min_frames: n,
-            max_missing_parameter_sets: 0,
+            max_undecodable_keyframes: 0,
             max_non_contiguous: 0,
         }
     }
 
-    /// Allow up to `n` keyframes without preceding SPS+PPS.
+    /// Allow up to `n` keyframes rejected by the decoder.
     #[allow(dead_code)]
-    pub fn allow_missing_parameter_sets(mut self, n: u64) -> Self {
-        self.max_missing_parameter_sets = n;
+    pub fn allow_undecodable_keyframes(mut self, n: u64) -> Self {
+        self.max_undecodable_keyframes = n;
         self
     }
 
@@ -2036,10 +2036,10 @@ async fn execute_plan(
                     stats.keyframes,
                 );
                 assert!(
-                    stats.missing_parameter_sets <= quality.max_missing_parameter_sets,
-                    "step {n}/{total} {kind}: {description} ({participant}) observed {} keyframes without parameter sets in the interval, maximum {}",
-                    stats.missing_parameter_sets,
-                    quality.max_missing_parameter_sets
+                    stats.undecodable_keyframes <= quality.max_undecodable_keyframes,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} undecodable keyframes in the interval, maximum {}",
+                    stats.undecodable_keyframes,
+                    quality.max_undecodable_keyframes
                 );
                 assert!(
                     stats.non_contiguous <= quality.max_non_contiguous,
@@ -2372,6 +2372,18 @@ async fn execute_plan(
                         stream.max_seq_gap <= MAX_CONCEALABLE_GAP,
                         "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  stream:       {ssrc}\n  expected:     at most {MAX_CONCEALABLE_GAP} packets missing\n  actual:       a gap of {} packets\n  note:         this plan configures no loss, so a hole in a slot's stream is the\n                SFU splicing two speakers onto it badly",
                         stream.max_seq_gap
+                    );
+                    assert_eq!(
+                        stream.decoder_errors, 0,
+                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  stream:       {ssrc}\n  expected:     every received Opus packet decodes\n  actual:       decoder_errors={}",
+                        stream.decoder_errors,
+                    );
+                    assert!(
+                        stream.decoded_samples >= 960 && stream.pcm_energy > 0,
+                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  stream:       {ssrc}\n  expected:     decoded audible Opus PCM\n  actual:       decoded_samples={}, pcm_energy={}, concealed_samples={}",
+                        stream.decoded_samples,
+                        stream.pcm_energy,
+                        stream.concealed_samples,
                     );
                 }
             }
@@ -2899,31 +2911,31 @@ fn assert_video_quality(
     let kind = "CheckVideoQuality";
     assert!(
         log.frames >= quality.min_frames,
-        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} frames\n  actual:       frames={}, keyframes={}, missing_parameter_sets={}, ts_regression_count={}, non_contiguous={}",
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} frames\n  actual:       frames={}, keyframes={}, undecodable_keyframes={}, ts_regression_count={}, non_contiguous={}",
         quality.min_frames,
         log.frames,
         log.keyframes,
-        log.missing_parameter_sets,
+        log.undecodable_keyframes,
         log.ts_regression_count,
         log.non_contiguous,
     );
     assert!(
-        log.missing_parameter_sets <= quality.max_missing_parameter_sets,
-        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} keyframes missing parameter sets (decodable)\n  actual:       frames={}, keyframes={}, missing_parameter_sets={}, ts_regression_count={}, non_contiguous={}",
-        quality.max_missing_parameter_sets,
+        log.undecodable_keyframes <= quality.max_undecodable_keyframes,
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} undecodable keyframes\n  actual:       frames={}, keyframes={}, undecodable_keyframes={}, ts_regression_count={}, non_contiguous={}",
+        quality.max_undecodable_keyframes,
         log.frames,
         log.keyframes,
-        log.missing_parameter_sets,
+        log.undecodable_keyframes,
         log.ts_regression_count,
         log.non_contiguous,
     );
     assert!(
         log.non_contiguous <= quality.max_non_contiguous,
-        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} non-contiguous frames (gap budget)\n  actual:       frames={}, keyframes={}, missing_parameter_sets={}, ts_regression_count={}, non_contiguous={}",
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} non-contiguous frames (gap budget)\n  actual:       frames={}, keyframes={}, undecodable_keyframes={}, ts_regression_count={}, non_contiguous={}",
         quality.max_non_contiguous,
         log.frames,
         log.keyframes,
-        log.missing_parameter_sets,
+        log.undecodable_keyframes,
         log.ts_regression_count,
         log.non_contiguous,
     );
@@ -3106,7 +3118,7 @@ fn pct(part: f64, whole: f64) -> f64 {
 pub struct Qoe {
     pub frames: u64,
     pub keyframes: u64,
-    /// Keyframes without SPS+PPS. Each is a stretch the decoder could not render.
+    /// Keyframes rejected by the decoder.
     pub undecodable_keyframes: u64,
     /// Frames preceded by a sequence hole: visible corruption rather than a clean picture.
     pub torn_frames: u64,
@@ -3159,7 +3171,7 @@ impl Qoe {
         }
         if self.undecodable_keyframes > 0 {
             return Experience::Broken(format!(
-                "{} keyframes arrived without parameter sets, so they did not render",
+                "{} keyframes were rejected by the decoder",
                 self.undecodable_keyframes
             ));
         }
@@ -3330,7 +3342,7 @@ fn qoe_of(handle: &ParticipantHandle, _window: Duration) -> Qoe {
     Qoe {
         frames: video.frames,
         keyframes: video.keyframes,
-        undecodable_keyframes: video.missing_parameter_sets,
+        undecodable_keyframes: video.undecodable_keyframes,
         torn_frames: video.non_contiguous,
         // Only where the plan issued an explicit subscription. Falling back to the moment the
         // participant was created measured the plan's own scaffolding instead: nearly every plan
@@ -3546,10 +3558,10 @@ fn check_property(
             if total.keyframes == 0 {
                 return Err("no video keyframe was decoded".to_string());
             }
-            if total.missing_parameter_sets != 0 {
+            if total.undecodable_keyframes != 0 {
                 return Err(format!(
-                    "{} decoded keyframes were missing parameter sets",
-                    total.missing_parameter_sets
+                    "{} keyframes were rejected by the decoder",
+                    total.undecodable_keyframes
                 ));
             }
         }

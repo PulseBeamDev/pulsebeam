@@ -292,7 +292,7 @@ impl JitterBuffer {
     }
 
     /// Note that a frame has reached the application, so gaps are now worth waiting out.
-    fn note_frame_delivered(&mut self) {
+    pub fn note_frame_delivered(&mut self) {
         self.delivered_frame = true;
     }
 

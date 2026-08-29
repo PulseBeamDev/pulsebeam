@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use openh264::decoder::Decoder as H264Decoder;
+use openh264::formats::YUVSource;
 use pulsebeam_agent::actor::AgentBuilder;
 use pulsebeam_agent::agent::{
     DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
@@ -259,14 +261,9 @@ impl SimClientBuilder {
                     let publisher = track.publisher_id().to_owned();
                     let log = log.clone();
                     tokio::spawn(async move {
+                        let mut receiver = BrowserAudioReceiver::new();
                         while let Ok(rtp) = track.recv().await {
-                            log.lock().unwrap().record(
-                                &publisher,
-                                rtp.ssrc.map_or(0, |s| *s),
-                                *rtp.seq,
-                                rtp.payload.len(),
-                                Instant::now(),
-                            );
+                            receiver.push(rtp, &publisher, &mut log.lock().unwrap());
                         }
                     });
                 }
@@ -348,11 +345,8 @@ pub struct VideoReceiveLog {
     pub ts_regression_count: u64,
     /// Largest backwards jump in RTP time, in 90kHz ticks.
     pub max_ts_regression: u64,
-    /// Keyframes that arrived without SPS+PPS in the same picture. The decoder
-    /// cannot render these: the SFU keeps one egress SSRC across switches while
-    /// every simulcast layer has its own SPS.
-    pub missing_parameter_sets: u64,
-    pub bytes: u64,
+    pub undecodable_keyframes: u64,
+    pub decoder_errors: u64,
     pub unexpected_vp8_packets: u64,
     pub missing_mid_packets: u64,
     pub missing_ssrc_packets: u64,
@@ -382,21 +376,39 @@ pub struct VideoReceiveLog {
 }
 
 struct BrowserVideoReceiver {
-    receiver: pulsebeam_agent::FrameReceiver,
+    decoder: H264Decoder,
+    jitter: pulsebeam_agent::JitterBuffer,
     expected_ssrc: Option<u32>,
     expected_payload_type: Option<u8>,
     open_frame_timestamp: Option<u64>,
     rejects_vp8_payload_type: bool,
+    expected_seq: Option<u64>,
+    access_unit: Vec<u8>,
+    fu_header: Option<u8>,
+    frame_is_keyframe: bool,
+    frame_damaged: bool,
+    pending_gap: bool,
+    has_rendered: bool,
 }
 
 impl BrowserVideoReceiver {
     fn new(rejects_vp8_payload_type: bool) -> Self {
         Self {
-            receiver: pulsebeam_agent::FrameReceiver::new(),
+            decoder: H264Decoder::new().expect("bundled OpenH264 decoder initializes"),
+            jitter: pulsebeam_agent::JitterBuffer::new(
+                pulsebeam_agent::pipeline::DEFAULT_JITTER_MAX_WAIT,
+            ),
             expected_ssrc: None,
             expected_payload_type: None,
             open_frame_timestamp: None,
             rejects_vp8_payload_type,
+            expected_seq: None,
+            access_unit: Vec::with_capacity(16 * 1024),
+            fu_header: None,
+            frame_is_keyframe: false,
+            frame_damaged: false,
+            pending_gap: false,
+            has_rendered: false,
         }
     }
 
@@ -404,7 +416,8 @@ impl BrowserVideoReceiver {
         &mut self,
         rtp: pulsebeam_agent::RtpPacket,
         log: &mut VideoReceiveLog,
-    ) -> Vec<pulsebeam_agent::MediaFrame> {
+        publisher: &str,
+    ) {
         if rtp.mid.to_string().is_empty() {
             log.missing_mid_packets = log.missing_mid_packets.saturating_add(1);
         }
@@ -434,6 +447,28 @@ impl BrowserVideoReceiver {
         if self.rejects_vp8_payload_type && rtp.payload_type == Some(96) {
             log.unexpected_vp8_packets = log.unexpected_vp8_packets.saturating_add(1);
         }
+        self.jitter.push(rtp);
+        while let Some(rtp) = self.jitter.pop() {
+            self.process(rtp, log, publisher);
+        }
+    }
+
+    fn process(
+        &mut self,
+        rtp: pulsebeam_agent::RtpPacket,
+        log: &mut VideoReceiveLog,
+        publisher: &str,
+    ) {
+        let sequence = *rtp.seq;
+        if self
+            .expected_seq
+            .is_some_and(|expected| expected != sequence)
+            && !self.access_unit.is_empty()
+        {
+            self.frame_damaged = true;
+        }
+        self.expected_seq = Some(sequence.wrapping_add(1));
+
         let timestamp = rtp.ts.numer();
         if self
             .open_frame_timestamp
@@ -441,15 +476,206 @@ impl BrowserVideoReceiver {
         {
             log.crossed_frame_boundaries = log.crossed_frame_boundaries.saturating_add(1);
         }
-        self.open_frame_timestamp = (!rtp.marker).then_some(timestamp);
-        self.receiver.push(rtp)
+        if self
+            .open_frame_timestamp
+            .is_some_and(|open| open != timestamp)
+        {
+            self.finish(log, publisher, timestamp);
+        }
+        self.open_frame_timestamp = Some(timestamp);
+
+        if !self.append_rtp_payload(&rtp.payload) {
+            self.frame_damaged = true;
+            log.decoder_errors = log.decoder_errors.saturating_add(1);
+        }
+        if rtp.marker {
+            self.finish(log, publisher, timestamp);
+        }
     }
 
-    fn flush(&mut self, log: &mut VideoReceiveLog) -> Vec<pulsebeam_agent::MediaFrame> {
-        if self.open_frame_timestamp.take().is_some() {
-            log.unterminated_frames = log.unterminated_frames.saturating_add(1);
+    fn flush(&mut self, log: &mut VideoReceiveLog, publisher: &str) {
+        let remaining: Vec<_> = self.jitter.drain().collect();
+        for rtp in remaining {
+            self.process(rtp, log, publisher);
         }
-        self.receiver.flush()
+        if let Some(timestamp) = self.open_frame_timestamp.take() {
+            log.unterminated_frames = log.unterminated_frames.saturating_add(1);
+            self.finish(log, publisher, timestamp);
+        }
+    }
+
+    fn append_rtp_payload(&mut self, payload: &[u8]) -> bool {
+        let Some(&header) = payload.first() else {
+            return false;
+        };
+        match header & 0x1f {
+            1..=23 => self.append_nalu(payload),
+            24 => {
+                let mut offset = 1usize;
+                while offset < payload.len() {
+                    let Some(length) = payload
+                        .get(offset..offset.saturating_add(2))
+                        .and_then(|bytes| <&[u8; 2]>::try_from(bytes).ok())
+                        .map(|bytes| usize::from(u16::from_be_bytes(*bytes)))
+                    else {
+                        return false;
+                    };
+                    offset = offset.saturating_add(2);
+                    let Some(nalu) = payload.get(offset..offset.saturating_add(length)) else {
+                        return false;
+                    };
+                    if nalu.is_empty() {
+                        return false;
+                    }
+                    self.append_nalu(nalu);
+                    offset = offset.saturating_add(length);
+                }
+                true
+            }
+            28 => {
+                let Some((&indicator, rest)) = payload.split_first() else {
+                    return false;
+                };
+                let Some((&fu_header, fragment)) = rest.split_first() else {
+                    return false;
+                };
+                if fragment.is_empty() {
+                    return false;
+                }
+                let nal_header = (indicator & 0xe0) | (fu_header & 0x1f);
+                let start = fu_header & 0x80 != 0;
+                let end = fu_header & 0x40 != 0;
+                if start {
+                    if self.fu_header.replace(nal_header).is_some() {
+                        return false;
+                    }
+                    self.append_nalu_header(nal_header);
+                } else if self.fu_header != Some(nal_header) {
+                    return false;
+                }
+                self.access_unit.extend_from_slice(fragment);
+                if end {
+                    self.fu_header = None;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn append_nalu(&mut self, nalu: &[u8]) -> bool {
+        let Some(&header) = nalu.first() else {
+            return false;
+        };
+        self.append_nalu_header(header);
+        self.access_unit
+            .extend_from_slice(nalu.get(1..).unwrap_or_default());
+        true
+    }
+
+    fn append_nalu_header(&mut self, header: u8) {
+        self.access_unit.extend_from_slice(&[0, 0, 0, 1, header]);
+        self.frame_is_keyframe |= header & 0x1f == 5;
+    }
+
+    fn finish(&mut self, log: &mut VideoReceiveLog, publisher: &str, timestamp: u64) {
+        self.open_frame_timestamp = None;
+        let complete =
+            self.fu_header.is_none() && !self.frame_damaged && !self.access_unit.is_empty();
+        if !complete {
+            self.pending_gap = true;
+            self.record_undecodable_keyframe(log);
+        } else {
+            match self.decoder.decode(&self.access_unit) {
+                Ok(Some(image)) => {
+                    let (width, height) = image.dimensions();
+                    if width == 0 || height == 0 {
+                        log.decoder_errors = log.decoder_errors.saturating_add(1);
+                        self.pending_gap = true;
+                        self.record_undecodable_keyframe(log);
+                    } else {
+                        self.jitter.note_frame_delivered();
+                        if self.has_rendered && self.pending_gap {
+                            log.non_contiguous = log.non_contiguous.saturating_add(1);
+                        }
+                        self.pending_gap = false;
+                        self.has_rendered = true;
+                        log.record_decoded(publisher, timestamp, self.frame_is_keyframe);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    log.decoder_errors = log.decoder_errors.saturating_add(1);
+                    self.pending_gap = true;
+                    self.record_undecodable_keyframe(log);
+                }
+            }
+        }
+        self.access_unit.clear();
+        self.fu_header = None;
+        self.frame_is_keyframe = false;
+        self.frame_damaged = false;
+    }
+
+    fn record_undecodable_keyframe(&self, log: &mut VideoReceiveLog) {
+        if self.frame_is_keyframe {
+            log.undecodable_keyframes = log.undecodable_keyframes.saturating_add(1);
+        }
+    }
+}
+
+struct BrowserAudioReceiver {
+    decoder: opus::Decoder,
+    pcm: Box<[i16]>,
+    expected_seq: Option<u64>,
+}
+
+impl BrowserAudioReceiver {
+    fn new() -> Self {
+        Self {
+            decoder: opus::Decoder::new(48_000, opus::Channels::Mono)
+                .expect("bundled Opus decoder initializes"),
+            pcm: vec![0; 5_760].into_boxed_slice(),
+            expected_seq: None,
+        }
+    }
+
+    fn push(
+        &mut self,
+        rtp: pulsebeam_agent::RtpPacket,
+        publisher: &str,
+        log: &mut AudioReceiveLog,
+    ) {
+        let ssrc = rtp.ssrc.map_or(0, |value| *value);
+        let sequence = *rtp.seq;
+        log.record(publisher, ssrc, sequence, rtp.payload.len(), Instant::now());
+        if let Some(expected) = self.expected_seq {
+            let missing = sequence.saturating_sub(expected);
+            for _ in 0..missing.min(64) {
+                self.decode(ssrc, &[], true, log);
+            }
+            if missing > 64 {
+                log.record_decoder_error(ssrc);
+            }
+        }
+        self.expected_seq = Some(sequence.wrapping_add(1));
+        self.decode(ssrc, &rtp.payload, false, log);
+    }
+
+    fn decode(&mut self, ssrc: u32, packet: &[u8], concealed: bool, log: &mut AudioReceiveLog) {
+        match self.decoder.decode(packet, &mut self.pcm, false) {
+            Ok(samples) => {
+                let Some(pcm) = self.pcm.get(..samples) else {
+                    log.record_decoder_error(ssrc);
+                    return;
+                };
+                let energy = pcm.iter().fold(0u64, |total, sample| {
+                    total.saturating_add(u64::from(sample.unsigned_abs()))
+                });
+                log.record_pcm(ssrc, samples, energy, concealed);
+            }
+            Err(_) => log.record_decoder_error(ssrc),
+        }
     }
 }
 
@@ -520,10 +746,24 @@ pub struct AudioReceiveLog {
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct AudioStreamContinuity {
     pub packets: u64,
+    pub decoded_samples: u64,
+    pub concealed_samples: u64,
+    pub decoder_errors: u64,
+    pub pcm_energy: u64,
     /// Largest forward jump in sequence number. Any hole is loss to the receiver, whether the
     /// network caused it or the SFU spliced two speakers together badly.
     pub max_seq_gap: u64,
     last_seq: Option<u64>,
+}
+
+impl AudioStreamContinuity {
+    fn record_pcm(&mut self, samples: usize, energy: u64, concealed: bool) {
+        self.decoded_samples = self.decoded_samples.saturating_add(samples as u64);
+        self.pcm_energy = self.pcm_energy.saturating_add(energy);
+        if concealed {
+            self.concealed_samples = self.concealed_samples.saturating_add(samples as u64);
+        }
+    }
 }
 
 impl AudioReceiveLog {
@@ -542,6 +782,18 @@ impl AudioReceiveLog {
         if stream.last_seq.is_none_or(|previous| seq > previous) {
             stream.last_seq = Some(seq);
         }
+    }
+
+    fn record_pcm(&mut self, ssrc: u32, samples: usize, energy: u64, concealed: bool) {
+        self.by_stream
+            .entry(ssrc)
+            .or_default()
+            .record_pcm(samples, energy, concealed);
+    }
+
+    fn record_decoder_error(&mut self, ssrc: u32) {
+        let stream = self.by_stream.entry(ssrc).or_default();
+        stream.decoder_errors = stream.decoder_errors.saturating_add(1);
     }
 
     fn record_rank(&mut self, publisher: &str, rank: u32) {
@@ -616,7 +868,7 @@ pub const FREEZE_THRESHOLD: Duration = Duration::from_millis(500);
 pub struct VideoReceiveStats {
     pub frames: u64,
     pub keyframes: u64,
-    pub missing_parameter_sets: u64,
+    pub undecodable_keyframes: u64,
     pub non_contiguous: u64,
     pub duplicate_ts_frames: u64,
     pub ts_regression_count: u64,
@@ -626,6 +878,7 @@ pub struct VideoReceiveStats {
     pub last_frame_at: Option<Instant>,
     pub frozen_time: Duration,
     pub browser_packet_errors: u64,
+    pub decoder_errors: u64,
 }
 
 impl VideoReceiveStats {
@@ -633,9 +886,9 @@ impl VideoReceiveStats {
         Self {
             frames: self.frames.saturating_sub(baseline.frames),
             keyframes: self.keyframes.saturating_sub(baseline.keyframes),
-            missing_parameter_sets: self
-                .missing_parameter_sets
-                .saturating_sub(baseline.missing_parameter_sets),
+            undecodable_keyframes: self
+                .undecodable_keyframes
+                .saturating_sub(baseline.undecodable_keyframes),
             non_contiguous: self.non_contiguous.saturating_sub(baseline.non_contiguous),
             duplicate_ts_frames: self
                 .duplicate_ts_frames
@@ -651,35 +904,13 @@ impl VideoReceiveStats {
             browser_packet_errors: self
                 .browser_packet_errors
                 .saturating_sub(baseline.browser_packet_errors),
+            decoder_errors: self.decoder_errors.saturating_sub(baseline.decoder_errors),
         }
     }
 }
 
 /// Scans an Annex-B frame for the H.264 NAL unit types it contains, using the
 /// same `pulsebeam_core::h264::classify()` classifier as the production SFU forwarder.
-fn annexb_nalu_types(data: &[u8]) -> Vec<pulsebeam_core::h264::NalFlags> {
-    let mut flags = Vec::new();
-    let mut i = 0usize;
-    while i + 3 < data.len() {
-        let short = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
-        let long = i + 3 < data.len()
-            && data[i] == 0
-            && data[i + 1] == 0
-            && data[i + 2] == 0
-            && data[i + 3] == 1;
-        if short || long {
-            let start = i + if short { 3 } else { 4 };
-            if start < data.len() {
-                flags.push(pulsebeam_core::h264::classify(&data[start..]));
-            }
-            i = start + 1;
-        } else {
-            i += 1;
-        }
-    }
-    flags
-}
-
 impl VideoReceiveLog {
     pub fn frames_from(&self, publisher: &str) -> u64 {
         self.by_publisher.get(publisher).copied().unwrap_or(0)
@@ -689,7 +920,7 @@ impl VideoReceiveLog {
         VideoReceiveStats {
             frames: self.frames,
             keyframes: self.keyframes,
-            missing_parameter_sets: self.missing_parameter_sets,
+            undecodable_keyframes: self.undecodable_keyframes,
             non_contiguous: self.non_contiguous,
             duplicate_ts_frames: self.duplicate_ts_frames,
             ts_regression_count: self.ts_regression_count,
@@ -699,10 +930,11 @@ impl VideoReceiveLog {
             last_frame_at: self.last_frame_at,
             frozen_time: self.frozen_time,
             browser_packet_errors: self.browser_packet_errors(),
+            decoder_errors: self.decoder_errors,
         }
     }
 
-    fn record(&mut self, publisher: &str, frame: &pulsebeam_agent::MediaFrame) {
+    fn record_decoded(&mut self, publisher: &str, ts: u64, is_keyframe: bool) {
         let now = Instant::now();
         if let Some(previous) = self.last_frame_at {
             let gap = now.saturating_duration_since(previous);
@@ -715,20 +947,9 @@ impl VideoReceiveLog {
         self.last_frame_at = Some(now);
         *self.by_publisher.entry(publisher.to_owned()).or_default() += 1;
         self.frames += 1;
-        self.bytes += frame.data.len() as u64;
-        if frame.is_keyframe {
+        if is_keyframe {
             self.keyframes += 1;
-            let nalus = annexb_nalu_types(&frame.data);
-            let has_sps = nalus.iter().any(|f| f.sps());
-            let has_pps = nalus.iter().any(|f| f.pps());
-            if !nalus.is_empty() && (!has_sps || !has_pps) {
-                self.missing_parameter_sets += 1;
-            }
         }
-        if !frame.contiguous {
-            self.non_contiguous += 1;
-        }
-        let ts = frame.ts.numer();
         if !self.seen_ts.insert(ts) {
             self.duplicate_ts_frames += 1;
         }
@@ -937,14 +1158,10 @@ impl SimClient {
                             let mut receiver = BrowserVideoReceiver::new(reject_vp8);
                             while let Ok(rtp) = track.recv().await {
                                 let mut log = log.lock().unwrap();
-                                for frame in receiver.push(rtp, &mut log) {
-                                    log.record(&publisher_id, &frame);
-                                }
+                                receiver.push(rtp, &mut log, &publisher_id);
                             }
                             let mut log = log.lock().unwrap();
-                            for frame in receiver.flush(&mut log) {
-                                log.record(&publisher_id, &frame);
-                            }
+                            receiver.flush(&mut log, &publisher_id);
                         });
 
                         // Re-check the predicate after processing an event, since a new
@@ -988,6 +1205,31 @@ pub fn create_vbr_looper_for_rid(rid: Option<&str>, profile: VbrProfile) -> VbrL
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
         profile,
     )
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_openh264_decodes_the_h264_fixture() {
+        let mut decoder = H264Decoder::new().unwrap();
+        let image = decoder
+            .decode(pulsebeam_testdata::RAW_H264_QUARTER_CBR)
+            .unwrap();
+        assert!(image.is_some());
+    }
+
+    #[test]
+    fn bundled_opus_decodes_the_audio_fixture() {
+        let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+        let mut pcm = Box::<[i16]>::from([0; 5_760]);
+        let samples = decoder
+            .decode(pulsebeam_testdata::RAW_OPUS_20MS_MONO, &mut pcm, false)
+            .unwrap();
+        assert_eq!(samples, 960);
+        assert!(pcm[..samples].iter().any(|sample| *sample != 0));
+    }
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

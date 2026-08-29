@@ -4,6 +4,7 @@ use str0m::media::MediaTime;
 use tokio::sync::watch;
 
 use crate::{MediaFrame, agent::LocalEncoding};
+use pulsebeam_testdata::RAW_OPUS_20MS_MONO;
 
 #[derive(Clone)]
 pub struct KeyframeNotifier(watch::Sender<u64>);
@@ -744,15 +745,6 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
     }
 }
 
-/// A synthetic audio source: fixed-size packets at a steady cadence, with a declared loudness.
-///
-/// Enough to exercise forwarding and speaker selection, which is what the SFU does with audio. It
-/// is not an encoder — the payload is filler — because nothing downstream of the selector inspects
-/// it, and a real codec would add a dependency for no extra coverage.
-///
-/// The level is the point. The SFU ranks speakers by RFC 6464 loudness and drops any audio packet
-/// that arrives without one, so a source that does not declare a level is a source whose audio
-/// never reaches anybody.
 pub struct AudioLooper {
     /// Loudness while talking, in negative dBov: 0 is full scale, around -30 is ordinary speech.
     level_dbov: i8,
@@ -812,13 +804,9 @@ impl AudioLooper {
 
     /// Where this source is in its speech cycle, and what that sounds like on the wire.
     ///
-    /// Returns the declared level, whether this packet is speech, and how many bytes it carries.
-    /// Silence is quiet *and* small: Opus drops to a few bytes per packet when nobody is talking,
-    /// so a source that keeps sending full-size frames through its pauses misrepresents both the
-    /// loudness the SFU ranks on and the bandwidth it costs.
-    fn at(&self, packet: u64) -> (i8, bool, usize) {
+    fn at(&self, packet: u64) -> (i8, bool) {
         if !self.talks {
-            return (self.level_dbov, false, 8);
+            return (self.level_dbov, false);
         }
         let cycle = self.spurt_packets.saturating_add(self.pause_packets).max(1);
         let phase = packet
@@ -826,14 +814,13 @@ impl AudioLooper {
             .checked_rem(cycle)
             .unwrap_or(0);
         if phase >= self.spurt_packets {
-            // Between spurts: comfort noise, far below anything the selector will rank.
-            return (-70, false, 8);
+            return (-70, false);
         }
         // Speech is not flat. A slow swing of a few dB keeps the ranking from being a constant.
         let swing = i8::try_from((phase % 12) / 4)
             .unwrap_or(0)
             .saturating_mul(3);
-        (self.level_dbov.saturating_add(swing), true, 160)
+        (self.level_dbov.saturating_add(swing), true)
     }
 
     pub async fn run(self, sender: LocalEncoding) {
@@ -854,12 +841,12 @@ impl AudioLooper {
                 .unwrap_or(0);
             packets = packets.saturating_add(1);
 
-            let (level_dbov, speech, payload_bytes) = self.at(packets);
+            let (level_dbov, speech) = self.at(packets);
             let frame = MediaFrame {
                 audio_level: Some(level_dbov),
                 voice_activity: Some(speech),
                 ts: MediaTime::new(ts, str0m::media::Frequency::FORTY_EIGHT_KHZ),
-                data: Arc::from(vec![0u8; payload_bytes].as_slice()),
+                data: Arc::from(RAW_OPUS_20MS_MONO),
                 capture_time: tick_time,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,

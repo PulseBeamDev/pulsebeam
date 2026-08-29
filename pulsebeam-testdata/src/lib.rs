@@ -25,6 +25,10 @@ pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");
 pub const RAW_H264_QUARTER_CBR: &[u8] = include_bytes!("quarter_q_cbr.h264");
 pub const RAW_H264_SCREEN_FULL_VBR: &[u8] = include_bytes!("screen_f_vbr.h264");
 pub const RAW_H264_SCREEN_FULL_TIMING: &str = include_str!("screen_f_vbr.timing");
+pub const RAW_OPUS_20MS_MONO: &[u8] = &[
+    0x08, 0x83, 0x6d, 0x82, 0xd0, 0x1c, 0xfd, 0xed, 0xc4, 0xec, 0xe7, 0xf3, 0x8f, 0xa4, 0x92, 0x47,
+    0x98,
+];
 
 // 16 video and 5 audio downstream slots
 pub const RAW_CHROME_SDP: &str = include_str!("chrome.sdp");

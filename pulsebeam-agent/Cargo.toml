@@ -27,6 +27,7 @@ tokio = { workspace = true }
 http = "1.4.1"
 if-addrs = "0.15.0"
 pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m"] }
+pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
 flume = "0.12.0"
 

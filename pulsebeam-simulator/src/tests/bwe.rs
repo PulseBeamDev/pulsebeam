@@ -879,8 +879,8 @@ fn screenshare_and_camera_over_cellular_test() {
 
 /// Shared plan for the conference tests so the link profile is the only variable.
 ///
-/// `allowed_missing_parameter_sets` is non-zero for the lossy profiles. Losing the SPS/PPS that
-/// precedes a keyframe is a genuine event when the link drops packets, and the property that
+/// `allowed_undecodable_keyframes` is non-zero for the lossy profiles. Losing a keyframe packet
+/// is a genuine event when the link drops packets, and the property that
 /// actually matters is that the stream *recovers* - which the `min_frames` and `allow_gaps`
 /// bounds assert. Demanding zero here would be asserting the link is lossless, not that the
 /// implementation handles loss.
@@ -891,7 +891,7 @@ fn conference_plan(
     camera_min_frames: u64,
     screen_min_frames: u64,
     allowed_gaps: u64,
-    allowed_missing_parameter_sets: u64,
+    allowed_undecodable_keyframes: u64,
 ) {
     LocalNodeSim::new()
         .with_link(link)
@@ -942,14 +942,14 @@ fn conference_plan(
                 participant: "screen",
                 quality: VideoQuality::min_frames(camera_min_frames)
                     .allow_gaps(allowed_gaps)
-                    .allow_missing_parameter_sets(allowed_missing_parameter_sets),
+                    .allow_undecodable_keyframes(allowed_undecodable_keyframes),
             },
             Step::CheckVideoQuality {
                 description: "Camera participant renders the screen share without freezes",
                 participant: "camera",
                 quality: VideoQuality::min_frames(screen_min_frames)
                     .allow_gaps(allowed_gaps)
-                    .allow_missing_parameter_sets(allowed_missing_parameter_sets),
+                    .allow_undecodable_keyframes(allowed_undecodable_keyframes),
             },
         ]);
 }
