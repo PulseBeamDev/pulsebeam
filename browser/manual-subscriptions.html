@@ -9,7 +9,8 @@
   const textDecoder = new TextDecoder();
   let peer;
   let signal;
-  let senderMid;
+  let mainVideoMid;
+  let auxVideoMid;
   let receiverMid;
   let remoteTrackId;
 
@@ -109,8 +110,12 @@
   }
 
   function sendIntent() {
-    if (signal?.readyState !== "open" || !senderMid || !receiverMid) return;
-    const publish = field(3, concat([stringField(1, senderMid), boolField(2, true)]));
+    if (signal?.readyState !== "open" || !mainVideoMid || !auxVideoMid || !receiverMid) return;
+    const publish = [
+      [mainVideoMid, true],
+      [auxVideoMid, false],
+    ].sort(([left], [right]) => left.localeCompare(right)).map(([mid, active]) =>
+      field(3, concat([stringField(1, mid), boolField(2, active)])));
     const video = remoteTrackId === null ? [] : [field(1, concat([
       stringField(1, receiverMid),
       stringField(2, remoteTrackId),
@@ -118,7 +123,7 @@
       numberField(4, 360),
       numberField(6, 200),
     ]))];
-    signal.send(field(1, concat([...video, publish])));
+    signal.send(field(1, concat([...video, ...publish])));
   }
 
   function canvasTrack() {
@@ -139,12 +144,19 @@
     return canvas.captureStream(30).getVideoTracks()[0];
   }
 
-  function setH264(transceiver, capability) {
-    if (!transceiver.setCodecPreferences) return;
-    const codecs = capability("video")?.codecs ?? [];
-    const h264 = codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/h264");
-    if (h264.length === 0) throw new Error("browser does not support H.264");
-    transceiver.setCodecPreferences(h264);
+  async function activateMotionSender(sender, track) {
+    await sender.replaceTrack(track);
+    const parameters = sender.getParameters();
+    const configuration = new Map([
+      ["q", { active: true, scaleResolutionDownBy: 4, maxBitrate: 187500, maxFramerate: 30 }],
+      ["h", { active: true, scaleResolutionDownBy: 2, maxBitrate: 437500, maxFramerate: 30 }],
+      ["f", { active: true, scaleResolutionDownBy: 1, maxBitrate: 1250000, maxFramerate: 30 }],
+    ]);
+    parameters.encodings.forEach((encoding, index) => {
+      const desired = configuration.get(encoding.rid) ?? [...configuration.values()][index];
+      if (desired) Object.assign(encoding, desired);
+    });
+    await sender.setParameters(parameters);
   }
 
   function mids(sdp) {
@@ -171,7 +183,12 @@
 
   async function connect({ apiUrl, room }) {
     remoteTrackId = null;
-    peer = new RTCPeerConnection();
+    peer = new RTCPeerConnection({
+      iceServers: [],
+      bundlePolicy: "max-bundle",
+      rtcpMuxPolicy: "require",
+      iceCandidatePoolSize: 0,
+    });
     signal = peer.createDataChannel("v1/sys/signaling", { ordered: true });
     signal.binaryType = "arraybuffer";
     signal.onopen = sendIntent;
@@ -179,10 +196,31 @@
       consumeState(new Uint8Array(data));
       sendIntent();
     };
-    const sender = peer.addTransceiver(canvasTrack(), { direction: "sendonly" });
-    const receiver = peer.addTransceiver("video", { direction: "recvonly" });
-    setH264(sender, RTCRtpSender.getCapabilities);
-    setH264(receiver, RTCRtpReceiver.getCapabilities);
+    peer.addTransceiver("audio", { direction: "sendonly" });
+    const mainVideo = peer.addTransceiver("video", {
+      direction: "sendonly",
+      sendEncodings: [
+        { rid: "q", active: false, scalabilityMode: "L1T3" },
+        { rid: "h", active: false, scalabilityMode: "L1T3" },
+        { rid: "f", active: false, scalabilityMode: "L1T3" },
+      ],
+    });
+    peer.addTransceiver("audio", { direction: "sendonly" });
+    const auxVideo = peer.addTransceiver("video", {
+      direction: "sendonly",
+      sendEncodings: [
+        { rid: "q", active: false, scalabilityMode: "L1T3" },
+        { rid: "h", active: false, scalabilityMode: "L1T3" },
+        { rid: "f", active: false, scalabilityMode: "L1T3" },
+      ],
+    });
+    for (let index = 0; index < 3; index += 1) {
+      peer.addTransceiver("audio", { direction: "recvonly" });
+    }
+    const videoSlots = [];
+    for (let index = 0; index < 7; index += 1) {
+      videoSlots.push(peer.addTransceiver("video", { direction: "recvonly" }));
+    }
     peer.ontrack = ({ track }) => {
       if (track.kind !== "video") return;
       const video = document.createElement("video");
@@ -194,10 +232,17 @@
       videos.push(video);
     };
     await peer.setLocalDescription(await peer.createOffer());
-    ({ senderMid, receiverMid } = (() => {
-      const video = mids(peer.localDescription.sdp).filter((section) => section.kind === "video");
-      if (video.length !== 2 || !video[0].mid || !video[1].mid) throw new Error("expected send and receive video mids");
-      return { senderMid: video[0].mid, receiverMid: video[1].mid };
+    ({ mainVideoMid, auxVideoMid, receiverMid } = (() => {
+      const sections = mids(peer.localDescription.sdp);
+      const video = sections.filter((section) => section.kind === "video");
+      if (video.length !== 9 || !mainVideo.mid || !auxVideo.mid || !videoSlots[0].mid) {
+        throw new Error("expected PulseBeam SDK send and receive video mids");
+      }
+      return {
+        mainVideoMid: mainVideo.mid,
+        auxVideoMid: auxVideo.mid,
+        receiverMid: videoSlots[0].mid,
+      };
     })());
     await gatherCandidates(peer);
     const response = await fetch(`${apiUrl}/api/v1/rooms/${room}/participants?manual_sub=true`, {
@@ -207,21 +252,37 @@
     });
     if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
     await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
+    await activateMotionSender(mainVideo.sender, canvasTrack());
+    sendIntent();
   }
 
   async function stats() {
     const report = await peer.getStats();
+    const codecs = new Map();
+    for (const value of report.values()) {
+      if (value.type === "codec") codecs.set(value.id, value.mimeType ?? null);
+    }
     const inbound = [];
     const outbound = [];
     for (const value of report.values()) {
       if (value.type === "outbound-rtp" && value.kind === "video") {
-        outbound.push({ bytesSent: value.bytesSent ?? 0, packetsSent: value.packetsSent ?? 0 });
+        outbound.push({
+          bytesSent: value.bytesSent ?? 0,
+          packetsSent: value.packetsSent ?? 0,
+          codec: codecs.get(value.codecId) ?? null,
+          mid: value.mid ?? null,
+          rid: value.rid ?? null,
+          payloadType: value.payloadType ?? null,
+        });
       }
       if (value.type === "inbound-rtp" && value.kind === "video") {
         inbound.push({
           framesDecoded: value.framesDecoded ?? 0,
           jitterBufferDelay: value.jitterBufferDelay ?? 0,
           jitterBufferEmittedCount: value.jitterBufferEmittedCount ?? 0,
+          codec: codecs.get(value.codecId) ?? null,
+          mid: value.mid ?? null,
+          payloadType: value.payloadType ?? null,
         });
       }
     }

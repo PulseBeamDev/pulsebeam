@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const serverBin = path.join(root, "target", "release", "pulsebeam");
+const serverBin = process.env.PULSEBEAM_BROWSER_SERVER ?? path.join(root, "target", "release", "pulsebeam");
 const cliBin = path.join(root, "target", "release", "pulsebeam-cli");
 const engines = { chromium, firefox, webkit };
 
