@@ -1,7 +1,9 @@
 pub use crate::peer::{
+    BweCapacity, DataBackpressure, DataChannel, DataChannelMode, DataPayload, DepartureReceipt,
     DependencyRewrite, ExtendedMediaSequence, ExtendedRtpTimestamp, ForwardingLatency,
     H264NalMetadata, MediaExtensions, MediaPacket, MediaPacketError, MediaRewrite, MediaSemantics,
-    TransitMediaPacket, VideoLayersAllocation, VideoSpatialLayerAllocation, VideoStreamAllocation,
+    RtcConnectionState, RtcEvent, RtcPeer, RtcPeerError, TransitMediaPacket, Transmit,
+    VideoLayersAllocation, VideoSpatialLayerAllocation, VideoStreamAllocation,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,9 +53,9 @@ pub enum MediaDirection {
     Inactive,
     Bidirectional,
 }
-use std::{net::SocketAddr, time::Instant};
+use std::net::SocketAddr;
 
-use crate::{ChannelId, Codec, TransportProtocol};
+use crate::{Codec, TransportProtocol};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatagramProtocol {

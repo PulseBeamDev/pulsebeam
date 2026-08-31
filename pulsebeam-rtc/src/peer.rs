@@ -15,8 +15,8 @@ use crate::{
     EgressSlot, IceCandidate, IceCredentials, IngressDatagram, IngressPacket, IngressStream,
     LiveConnection, LiveConnectionError, LocalTransport, MediaDirection, MediaKind, MediaSectionId,
     NegotiatedCodec, NegotiatedMedia, NegotiatedMediaSection, NegotiatedSession, PacketError,
-    PacketId, PacketProvenance, PacketView, RtcNegotiation, SendId, ServerTransport, TransportEvent,
-    TransportMetadata, negotiate,
+    PacketId, PacketProvenance, PacketView, RtcNegotiation, SendId, ServerTransport,
+    TransportEvent, TransportMetadata, negotiate,
 };
 
 use crate::egress::{
@@ -2554,6 +2554,7 @@ mod tests {
     use std::{net::SocketAddr, time::Duration};
 
     use super::*;
+    use crate::{Codec, TransportProtocol};
 
     fn offer(direction: &str) -> String {
         format!(
@@ -2759,6 +2760,21 @@ mod tests {
         };
         let payload = packet.payload_range();
         let extension_entries = packet.extension_entries().expect("extensions");
+        let negotiated_codec = Codec::new(
+            96,
+            codec.to_owned(),
+            if codec.eq_ignore_ascii_case("opus") {
+                48_000
+            } else {
+                90_000
+            },
+            codec.eq_ignore_ascii_case("opus").then_some(2),
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
         MediaPacket {
             bytes,
             stream: IngressStream::new(1),
@@ -2769,15 +2785,7 @@ mod tests {
             } else {
                 MediaKind::Video
             },
-            codec: NegotiatedCodec {
-                name: codec.to_owned(),
-                clock_rate: if codec.eq_ignore_ascii_case("opus") {
-                    48_000
-                } else {
-                    90_000
-                },
-                channels: codec.eq_ignore_ascii_case("opus").then_some(2),
-            },
+            codec: NegotiatedCodec::from(&negotiated_codec),
             sequence: ExtendedMediaSequence::new(65_534),
             timestamp: ExtendedRtpTimestamp::new(u64::from(u32::MAX).saturating_sub(1)),
             marker: false,

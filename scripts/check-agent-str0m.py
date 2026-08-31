@@ -132,6 +132,9 @@ if not is_registry_str0m(upstream):
         f"0.23.1, got {upstream['version']} from {source(upstream)}"
     )
 
+if agent_str0m["id"] == rtc_str0m["id"] or upstream["id"] == rtc_str0m["id"]:
+    fail("Cargo did not resolve distinct registry and PulseBeamDev str0m packages")
+
 for _, dependency, _ in reachable(agent["id"]):
     package = packages[dependency["pkg"]]
     if package["name"] == "str0m" and not is_registry_str0m(package):

@@ -49,7 +49,6 @@ zstd = "0.13"
 
 [patch.crates-io]
 # dimpl = { git = "https://github.com/PulseBeamDev/dimpl.git", branch = "patch/0.2.1" }
-# str0m = { path = "../str0m" }
 
 [profile.dev]
 panic = "abort"

@@ -8,6 +8,8 @@ dist
 *.data.old
 venv
 workspace.lock.json
+__pycache__/
+*.py[cod]
 
 # Scratch logs and dumps. A 421 MB capture reached a commit once, so the rule
 # is blanket; the committed artifacts below are exempted.
