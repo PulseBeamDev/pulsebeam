@@ -32,7 +32,8 @@ use tokio::time::Instant;
 
 use crate::entity::ParticipantId;
 
-const MAX_FORWARDING_LATENCY_SAMPLES: usize = 65_536;
+const MAX_FORWARDING_LATENCY_SAMPLES: usize = 1_048_576;
+const MAX_EXPECTED_MEDIA: usize = 262_144;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ForwardingLatencySample {
@@ -42,9 +43,28 @@ pub struct ForwardingLatencySample {
     pub total: Duration,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExpectedVideoFrame {
+    pub origin: ParticipantId,
+    pub source_timestamp: u64,
+    pub height: u32,
+    pub packet_count: u32,
+    pub complete: bool,
+    window: u64,
+    decoded: bool,
+    completed_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExpectedAudioPacket {
+    pub origin: ParticipantId,
+    pub source_timestamp: u64,
+}
+
 /// Downstream bandwidth estimate observations, since the last [`reset`].
 #[derive(Debug, Default, Clone)]
 struct Samples {
+    window: u64,
     min_bwe_bps: Option<u64>,
     max_bwe_bps: Option<u64>,
     last_bwe_bps: Option<u64>,
@@ -117,6 +137,9 @@ struct Samples {
     /// Reference point for series timestamps, set on the first sample after a reset.
     series_origin: Option<Instant>,
     forwarding_latency: Vec<ForwardingLatencySample>,
+    expected_video: HashMap<(ParticipantId, ParticipantId, u64), ExpectedVideoFrame>,
+    expected_audio: HashMap<(ParticipantId, u32, u64), ExpectedAudioPacket>,
+    quality_sources: HashMap<ParticipantId, u8>,
 }
 
 thread_local! {
@@ -127,6 +150,163 @@ thread_local! {
 
 pub fn fail_next_materialization() {
     FAIL_NEXT_MATERIALIZATION.with(|fail| fail.set(true));
+}
+
+pub fn register_quality_source(origin: ParticipantId, source: u8) {
+    debug_assert!(source < 2, "quality corpus source is declared");
+    SAMPLES.with_borrow_mut(|samples| {
+        samples.quality_sources.insert(origin, source);
+    });
+}
+
+pub fn quality_source(origin: ParticipantId) -> Option<u8> {
+    SAMPLES.with_borrow(|samples| samples.quality_sources.get(&origin).copied())
+}
+
+pub fn record_expected_video(
+    subscriber: ParticipantId,
+    origin: ParticipantId,
+    output_timestamp: u64,
+    source_timestamp: u64,
+    height: u32,
+    marker: bool,
+) {
+    SAMPLES.with_borrow_mut(|samples| {
+        let window = samples.window;
+        if samples.expected_video.len() >= MAX_EXPECTED_MEDIA
+            && !samples
+                .expected_video
+                .contains_key(&(subscriber, origin, output_timestamp))
+        {
+            debug_assert!(false, "expected video timeline exceeded its bound");
+            return;
+        }
+        let frame = samples
+            .expected_video
+            .entry((subscriber, origin, output_timestamp))
+            .or_insert(ExpectedVideoFrame {
+                origin,
+                source_timestamp,
+                height,
+                packet_count: 0,
+                complete: false,
+                window,
+                decoded: false,
+                completed_at: None,
+            });
+        debug_assert_eq!(frame.origin, origin);
+        debug_assert_eq!(frame.source_timestamp, source_timestamp);
+        debug_assert_eq!(frame.height, height);
+        frame.packet_count = frame.packet_count.saturating_add(1);
+        frame.complete |= marker;
+        if marker {
+            frame.completed_at = Some(std::time::Instant::now());
+        }
+    });
+}
+
+pub fn record_decoded_video(
+    subscriber: ParticipantId,
+    origin: ParticipantId,
+    output_timestamp: u64,
+) {
+    SAMPLES.with_borrow_mut(|samples| {
+        let Some(frame) = samples
+            .expected_video
+            .get_mut(&(subscriber, origin, output_timestamp))
+        else {
+            return;
+        };
+        debug_assert!(frame.complete, "only complete expected frames can decode");
+        frame.decoded = true;
+    });
+}
+
+pub fn expected_video_progress(subscriber: ParticipantId, settlement: Duration) -> (u64, u64) {
+    SAMPLES.with_borrow(|samples| {
+        let now = std::time::Instant::now();
+        samples
+            .expected_video
+            .iter()
+            .filter(|((expected_subscriber, _, _), frame)| {
+                *expected_subscriber == subscriber
+                    && frame.window == samples.window
+                    && frame.complete
+                    && frame.completed_at.is_some_and(|completed| {
+                        now.saturating_duration_since(completed) >= settlement
+                    })
+            })
+            .fold((0u64, 0u64), |(expected, decoded), (_, frame)| {
+                (
+                    expected.saturating_add(1),
+                    decoded.saturating_add(u64::from(frame.decoded)),
+                )
+            })
+    })
+}
+
+pub fn expected_video(
+    subscriber: ParticipantId,
+    origin: ParticipantId,
+    output_timestamp: u64,
+) -> Option<ExpectedVideoFrame> {
+    SAMPLES.with_borrow(|samples| {
+        samples
+            .expected_video
+            .get(&(subscriber, origin, output_timestamp))
+            .copied()
+    })
+}
+
+pub fn record_expected_audio(
+    subscriber: ParticipantId,
+    ssrc: u32,
+    origin: ParticipantId,
+    output_timestamp: u64,
+    source_timestamp: u64,
+) {
+    SAMPLES.with_borrow_mut(|samples| {
+        if samples.expected_audio.len() >= MAX_EXPECTED_MEDIA {
+            debug_assert!(
+                samples
+                    .expected_audio
+                    .contains_key(&(subscriber, ssrc, output_timestamp)),
+                "expected audio timeline exceeded its bound"
+            );
+        }
+        if samples.expected_audio.len() < MAX_EXPECTED_MEDIA
+            || samples
+                .expected_audio
+                .contains_key(&(subscriber, ssrc, output_timestamp))
+        {
+            let previous = samples.expected_audio.insert(
+                (subscriber, ssrc, output_timestamp),
+                ExpectedAudioPacket {
+                    origin,
+                    source_timestamp,
+                },
+            );
+            debug_assert!(
+                previous.is_none_or(|previous| {
+                    previous.origin == origin && previous.source_timestamp == source_timestamp
+                }),
+                "audio output timestamp collision: subscriber={subscriber:?} ssrc={ssrc} origin={origin:?} output={output_timestamp} previous={previous:?} source={source_timestamp}"
+            );
+        }
+    });
+}
+
+pub fn expected_audio(
+    subscriber: ParticipantId,
+    ssrc: u32,
+    output_timestamp: u64,
+) -> Option<ExpectedAudioPacket> {
+    SAMPLES.with_borrow(|samples| {
+        samples
+            .expected_audio
+            .get(&(subscriber, ssrc, output_timestamp))
+            .copied()
+    })
 }
 
 pub fn take_materialization_failure() -> bool {
@@ -223,7 +403,19 @@ pub fn routing_drop(lane: &'static str, stage: &'static str, origin: &'static st
 /// Clear observations. The harness calls this at the start of each timed step so assertions
 /// describe the window just run, matching the byte-counter semantics.
 pub fn reset() {
-    SAMPLES.with_borrow_mut(|s| *s = Samples::default());
+    SAMPLES.with_borrow_mut(|samples| {
+        let expected_video = std::mem::take(&mut samples.expected_video);
+        let expected_audio = std::mem::take(&mut samples.expected_audio);
+        let quality_sources = std::mem::take(&mut samples.quality_sources);
+        let window = samples.window.wrapping_add(1);
+        *samples = Samples {
+            window,
+            expected_video,
+            expected_audio,
+            quality_sources,
+            ..Samples::default()
+        };
+    });
 }
 
 pub fn record_forwarding_latency(

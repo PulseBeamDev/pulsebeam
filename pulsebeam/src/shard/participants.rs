@@ -67,9 +67,8 @@ impl ParticipantRegistry {
         debug_assert_eq!(ingress.shard(), self.shard_id);
         let participant_id = cfg.participant_id;
         let core = ParticipantCore::new(
-            cfg.connection_id,
-            cfg.session,
-            cfg.local,
+            cfg.peer,
+            cfg.media,
             cfg.participant_id,
             cfg.room_id,
             self.shard_id,

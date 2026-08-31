@@ -5,8 +5,46 @@
 //! none of it had ever run against a real participant, and no simulated participant had ever
 //! published audio at all.
 
-use super::common::{LocalNodeSim, Participant, Room, Step};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step};
+use pulsebeam_testdata::QualityAudioSource;
 use std::time::Duration;
+
+#[test]
+fn engineered_opus_sources_are_proven_independently_at_each_listener_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("decoded-opus-corpus")
+                .with_participant(Participant::quality_speaker(
+                    "speaker-a",
+                    QualityAudioSource::Zero,
+                ))
+                .with_participant(Participant::quality_speaker(
+                    "speaker-b",
+                    QualityAudioSource::One,
+                ))
+                .with_participant(Participant::subscriber("listener-a").hearing(2))
+                .with_participant(Participant::subscriber("listener-b").hearing(2)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Both engineered Opus sources traverse independent receiver decoders",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckAudioStreams {
+                description: "First listener decodes both exact source timelines",
+                participant: "listener-a",
+                min_speakers: 2,
+                max_streams: 2,
+            },
+            Step::CheckAudioStreams {
+                description: "Second listener independently decodes both exact source timelines",
+                participant: "listener-b",
+                min_speakers: 2,
+                max_streams: 2,
+            },
+        ]);
+}
 
 /// Audio published by a participant reaches the people in the room.
 ///

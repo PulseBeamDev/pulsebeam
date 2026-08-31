@@ -14,9 +14,10 @@ determines one entire run**, so anything found can be replayed exactly.
 
 | Command | What it is |
 |---|---|
-| `make test` | what CI runs: unit tests + 107 active simulation tests (110 registered, 3 ignored) |
+| `make test` | what CI runs: unit contracts plus every mandatory simulation |
 | `make test-sim-seed SEED=<n>` | replay one seed exactly |
 | `make sim-sweep` | search for seeds nobody has tried |
+| `make test-sim-soak` | run the explicit two-minute decoded-media soak |
 
 ## Two rules
 
@@ -178,35 +179,40 @@ cross-shard data-topic defect survived precisely that: two subscribers, one asse
 participant is a deliberate bystander, assert it received *nothing* — that is a real claim about
 not over-delivering, and it was untested.
 
+## Decoded-media quality gates
+
+The simulator uses checked-in H.264, Opus, YUV, and PCM fixtures engineered for
+exact assertions. Every selected viewer and listener runs the real OpenH264 or
+Opus decoder. A passing packet count is not enough: the gates check source,
+layer, decoded geometry, pixels or samples, RTP continuity, frame damage,
+decoder errors, capture timing, first render, and continued progress. Required
+fixtures and codecs are unconditional dependencies; absence is a build or test
+failure, never a skip.
+
+The strict network matrix adds capacity changes, bounded queues, loss,
+reordering, duplication, feedback impairment, cross traffic, same- and
+cross-shard routing, source switches, and layer switches. The two-minute soak
+requires more than 3,400 correctly decoded frames, no mid-call PLI growth, and
+no blank or frozen interval.
+
+Fixture hashes and structural manifests are checked during unit tests. The
+fixtures are generated manually and committed; see
+[`pulsebeam-testdata/src/Makefile`](../pulsebeam-testdata/src/Makefile) for the
+exact FFmpeg/GStreamer recipes.
+
 ## What the suite still cannot see
 
 Worth writing down, because an absent capability looks exactly like a passing test.
 
-**Anything a browser does.** Both ends of the simulation are str0m, so nothing here exercises
-libwebrtc's receive path, and the two differ in ways that decide designs - see "Why the egress SSRC
-belongs to the slot" below. A plan can be green while Chrome renders nothing. Changes to stream
-identity, SSRCs or SDP need a manual browser check; the suite cannot stand in for one.
-
-The bench fixtures have a static compatibility gate: their SPS values must stay constrained
-baseline at or below level 3.1, and the recorded Chrome SDP must still offer the corresponding
-packetization mode. That rejects an incompatible fixture before it reaches a browser, but it does
-not replace the documented manual browser check after changes to media or signaling.
-
-**Audio quality.** Who is heard, who they are, and how many streams they arrive on are asserted
-now. How *well* they are heard is not: there is no audio continuity, gap or concealment figure
-scoped to a listener's experience, and a 200ms gap is a lost syllable where the same gap in video
-is a stutter nobody remarks on. `AudioStream` has the raw material (`packets`, `longest_gap`); what
-is missing is an `AudioQoe` with its own bar, mirroring `Qoe` rather than reusing it.
+**Browser implementations.** Simulation validates media semantics with real
+decoders but does not execute browser SDP, jitter-buffer, autoplay, or stats
+implementations. The compact production-path Playwright contract runs in
+Chromium, Firefox, and Linux WebKit. It covers interoperability; exhaustive
+impairments remain in deterministic simulation.
 
 **Temporal layers.** One generated scenario publishes with `with_temporal_dd` and exercises
 framerate shedding. The generated suite still lacks temporal-layer coverage across the full
 cross-shard, opaque-payload, marker-only and recovery matrix; that remains a planned gap.
-
-**Torn frames.** 1,370 across a suite run, measured and reported, asserted on by nothing. A frame
-preceded by a sequence hole is visible corruption.
-
-**Time-to-first-frame and freezes** are measured and on the scoreboard, but not gated, because the
-product currently fails both. See the note in `properties.rs`.
 
 ## Why the egress SSRC belongs to the slot
 

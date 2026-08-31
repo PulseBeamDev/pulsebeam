@@ -573,8 +573,7 @@ impl AgentDriver {
     pub(crate) fn new(init: DriverInit) -> Self {
         let (outgoing_tx, outgoing_rx) = mailbox::bounded(256);
         let now = Instant::now();
-        let mut rtc = init.rtc;
-        rtc.bwe().set_current_bitrate(Bitrate::ZERO);
+        let rtc = init.rtc;
 
         let mut driver = Self {
             rtc,
@@ -1095,6 +1094,18 @@ impl AgentDriver {
                 self.media.audio_sink = Some(tx);
                 let _ = response.send(rx);
             }
+            OutgoingCommand::RequestKeyframe { track_id, rid } => {
+                let Some((mid, _)) = self.slot_manager.assigned(&track_id) else {
+                    return;
+                };
+                let mut api = self.rtc.direct_api();
+                let Some(stream) = api.stream_rx_by_mid(mid, rid) else {
+                    return;
+                };
+                stream.request_keyframe(KeyframeRequestKind::Pli);
+                drop(api);
+                let _ = self.rtc.handle_input(Input::Timeout(self.now.into()));
+            }
             OutgoingCommand::SubscribeMedia {
                 subscription,
                 response,
@@ -1108,7 +1119,8 @@ impl AgentDriver {
                             .media_targets_by_track
                             .insert(track_id.clone(), tx);
                     }
-                    let _ = response.send(Ok(RemoteTrack::new(track, rx)));
+                    let _ =
+                        response.send(Ok(RemoteTrack::new(track, rx, self.outgoing_tx.clone())));
                     self.deliver_unrouted();
                     self.subscriptions.parked_subscriptions.remove(&track_id);
                     self.subscriptions
@@ -1149,7 +1161,8 @@ impl AgentDriver {
                     self.media
                         .pending_media_targets
                         .insert(track_id.clone(), tx);
-                    let _ = response.send(Ok(RemoteTrack::new(track, rx)));
+                    let _ =
+                        response.send(Ok(RemoteTrack::new(track, rx, self.outgoing_tx.clone())));
                 } else {
                     self.media
                         .pending_media_subscriptions
@@ -1335,7 +1348,9 @@ impl AgentDriver {
                     _ => {}
                 },
                 Ok(Output::Timeout(t)) => {
-                    return Some(t.into());
+                    let now = Instant::now();
+                    let minimum = now.checked_add(MIN_QUANTA).unwrap_or(now);
+                    return Some(Instant::from_std(t).max(minimum));
                 }
                 Err(e) => {
                     self.session.disconnected_reason = Some(format!("RTC Error: {e:?}"));
@@ -1475,12 +1490,14 @@ impl AgentDriver {
                     self.emit(AgentEvent::SpeakersChanged(self.slot_manager.speakers()));
                 }
                 for (mid, track) in sync.audio_arrivals {
-                    // Nobody subscribed to this: the SFU chose to forward it, and it is described
-                    // entirely by the assignment - a speaker never appears in `tracks_upsert`.
+                    if self.media.media_targets.contains_key(&mid) {
+                        continue;
+                    }
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
                     if let Some(sink) = &self.media.audio_sink {
-                        let _ = sink.try_send(RemoteTrack::new(track, rx));
+                        let _ =
+                            sink.try_send(RemoteTrack::new(track, rx, self.outgoing_tx.clone()));
                     }
                 }
                 for (mid, track) in assignments {
@@ -1506,7 +1523,7 @@ impl AgentDriver {
                         .media_targets_by_track
                         .insert(track_id.clone(), tx.clone());
                     self.media.media_targets.insert(mid, tx);
-                    let remote_track = RemoteTrack::new(track, rx);
+                    let remote_track = RemoteTrack::new(track, rx, self.outgoing_tx.clone());
                     if let Some(response) = self.media.pending_media_subscriptions.remove(&track_id)
                     {
                         let _ = response.send(Ok(remote_track));
@@ -1643,6 +1660,7 @@ impl AgentDriver {
             return;
         }
         let mut api = self.rtc.direct_api();
+        let mut requested = false;
         self.media.lost_before_routing.retain(|mid, rid| {
             if !self.media.media_targets.contains_key(mid) {
                 // Still unassigned. Hold the request until it can be answered
@@ -1653,9 +1671,14 @@ impl AgentDriver {
                 return false;
             };
             stream.request_keyframe(KeyframeRequestKind::Pli);
+            requested = true;
             tracing::debug!(?mid, ?rid, "requesting a keyframe after losing held media");
             false
         });
+        drop(api);
+        if requested {
+            let _ = self.rtc.handle_input(Input::Timeout(self.now.into()));
+        }
     }
 
     fn emit(&mut self, event: AgentEvent) {
@@ -1783,7 +1806,6 @@ impl AgentDriver {
         self.rebind_channels(signaling_cid, &channel_templates, &channel_ids);
         self.rebind_media(medias)?;
         self.rtc = rtc;
-        self.rtc.bwe().set_current_bitrate(Bitrate::ZERO);
         self.network.tcp = self.reconnect_tcp().await?;
         self.media.incoming_rtp_routes.clear();
         self.subscriptions.sub_manager.reset_active_assignments();

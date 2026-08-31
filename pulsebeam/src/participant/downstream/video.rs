@@ -24,7 +24,7 @@ use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::keys::{DownstreamSlotKey, TrackKey};
-use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
+use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_warn};
 use crate::participant::intent::VideoIntent as Intent;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
@@ -84,26 +84,7 @@ pub const START_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
-/// The starting estimate applied by the SFU allocator.
-///
-/// Deliberately above [`START_BANDWIDTH`]: the estimate this SFU starts its own
-/// allocator from is not the same number as the one it tells the transport to
-/// probe from.
-///
-/// **Lowering this to libwebrtc's 300 kbps trades one defect for another, and
-/// both were measured.** It fixes `a_rejoining_publisher_is_shown_to_an_existing_viewer`
-/// at every seed it currently fails: 2 Mbps overshoots a cellular link, and the
-/// burst at a slot switch overruns the client's 128-packet routing buffer, so
-/// media arrives and is discarded. It also costs `a_reordering_path_does_not_churn_keyframes`
-/// an extra layer reversal at the default seed, and
-/// `marker_only_publisher_streams_to_a_dd_subscriber` about 3% of its frames.
-///
-/// The reason it cannot simply be lowered is that libwebrtc pairs a 300 kbps
-/// start with probe clusters that reach a usable rate in a second or two. This
-/// SFU has no probing, so 300 kbps is a genuinely slower climb, and climbing
-/// through layers is what produces the extra reversal. Probing first, then this
-/// number.
-pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
+pub const INITIAL_BANDWIDTH: Bitrate = START_BANDWIDTH;
 
 pub struct VideoAllocator {
     routes: SecondaryMap<TrackKey, DownstreamSlotKey>,
@@ -319,7 +300,7 @@ impl VideoAllocator {
             slot.min_height = intent.min_height;
             slot.min_fps = intent.min_fps;
             slot.priority = intent.priority;
-            slot.switch_to(&layer, false);
+            slot.switch_to(&layer, true);
         } else {
             slot.max_height = 0;
             slot.min_height = 0;
@@ -483,10 +464,15 @@ impl VideoAllocator {
         let decisions = engine.run_compute(available_bandwidth, &views);
         let desired_raw = engine.run_desired(&views);
         self.current_allocation = AllocationEngine::used_bitrate(&decisions);
-        let desired = self
+        let controlled_desired = self
             .desired_ctrl
             .update(desired_raw)
             .max(self.current_allocation);
+        let desired = if views.is_empty() {
+            Bitrate::ZERO
+        } else {
+            controlled_desired
+        };
         debug_assert!(self.current_allocation <= desired);
 
         // Observation for the simulator: the estimate and demand driving this pass, and the layer
@@ -550,10 +536,12 @@ impl VideoAllocator {
         self.current_allocation
     }
 
-    pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
+    pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<(TrackKey, Option<Rid>)> {
         for slot in self.slots.values() {
             if slot.mid == req.mid && slot.rid == req.rid {
-                return slot.target();
+                let target = slot.target()?;
+                let fanout = self.active_track_keys.get(&target.meta.id).copied()?;
+                return Some((fanout, target.rid));
             }
         }
         None
@@ -887,12 +875,8 @@ impl Slot {
         events: &mut impl ParticipantSink,
         fanout_for: impl Fn(TrackId) -> Option<TrackKey>,
     ) {
-        if self.paused {
-            return;
-        }
-        // The switcher is the authority on whether a switch is still pending; the
-        // layer it is waiting on is the one this slot is assigned to (`desired`).
-        if !self.switcher.awaiting_switch() {
+        let waiting = self.switcher.awaiting_switch();
+        if !waiting {
             return;
         }
         let Some(staging) = self.desired.as_ref() else {
@@ -1030,10 +1014,15 @@ impl Slot {
         }
 
         // Stop forwarding but stay staged on the layer, so the route stays
-        // subscribed for a quick resume. `paused` gates `feed`, and `pli_retry`
-        // already skips paused slots, so no keyframes are requested meanwhile.
+        // subscribed for a quick resume.
         if self.switcher.active_stream().is_some()
-            || self.switcher.staging_stream() != Some(layer.stream_id())
+            && self.switcher.active_stream() != Some(layer.stream_id())
+        {
+            self.switcher.stop();
+            changed = true;
+        }
+        if self.switcher.active_stream().is_none()
+            && self.switcher.staging_stream() != Some(layer.stream_id())
         {
             self.switcher.stop();
             self.switcher.switch_to(layer.stream_id());
@@ -1057,29 +1046,31 @@ impl Slot {
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        if self.paused {
-            plog_trace!(self.ctx, mid=%self.mid, track=?track_id, "slot paused, dropping incoming packet");
-            return false;
-        }
         let Some(cache) = cache else {
             return false;
         };
+        if self.paused && self.switcher.active_stream().is_some() {
+            return false;
+        }
 
         // The switcher owns the entire switching state machine; hand it the
         // whole track cache and let it emit whatever the subscriber should see. A
         // change in the active stream means a switch was promoted this tick.
         let (mid, rid, ssrc, payload_types) = (self.mid, self.rid, self.ssrc, self.payload_types);
+        let paused = self.paused;
         let before = self.switcher.active_stream();
-        self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
-            let Some(pt) = payload_types.get(out.codec) else {
-                debug_assert!(
-                    false,
-                    "forwarded video codec must be negotiated by the egress slot"
-                );
-                return;
-            };
-            writer.write_video_owned(out, mid, rid, ssrc, pt);
-        });
+        self.switcher
+            .feed(track_id, cache, arrival_ts, &mut |out, switch_replay| {
+                debug_assert!(!paused || switch_replay);
+                let Some(pt) = payload_types.get(out.codec) else {
+                    debug_assert!(
+                        false,
+                        "forwarded video codec must be negotiated by the egress slot"
+                    );
+                    return;
+                };
+                writer.write_video_owned(out, mid, rid, ssrc, pt);
+            });
         self.switcher.active_stream() != before
     }
 
@@ -1658,27 +1649,35 @@ impl AllocationEngine {
         // lower-priority stream, so a lower-priority floor never preempts a
         // higher-priority target.
         //
-        // Stability comes from the inputs, not from damping the output or holding a
-        // timer: budget math uses the *stable* declared layer bitrate
-        // (`stable_cost`), so a variable-bitrate neighbour cannot bounce the
-        // arithmetic, and each layer transition uses an asymmetric threshold — a
-        // Schmitt dead-band — so a budget merely wobbling at a layer boundary does
-        // not flip it. Real congestion still lands immediately: it shows up as a
-        // lower `bwe`, and the very next allocation sheds.
         for slot in slots {
-            let mut cur: Option<&TrackLayer> = None;
+            let floor = self.floor_layer(slot);
+            let retained = slot
+                .forwarding
+                .then(|| {
+                    slot.track.layers().iter().find(|layer| {
+                        layer.quality == slot.current_quality
+                            && self.eligible(slot, layer)
+                            && floor.is_none_or(|floor| layer.quality >= floor.quality)
+                    })
+                })
+                .flatten()
+                .filter(|layer| self.cost(layer) * Self::DOWNGRADE_FACTOR <= budget);
+            let mut cur: Option<&TrackLayer> = retained;
+            if let Some(layer) = retained {
+                budget -= self.cost(layer);
+            }
             let mut degraded: Option<(DecodeTargetSelection, f64)> = None;
 
             // Floor: guarantee min_height if affordable (retained through the
             // dead-band once held); else shed temporal layers down to the min_fps
             // floor; else leave paused.
-            if let Some(floor) = self.floor_layer(slot) {
-                let cost = self.stable_cost(floor);
+            if cur.is_none()
+                && let Some(floor) = floor
+            {
+                let cost = self.cost(floor);
                 let resuming = !slot.forwarding;
-                let threshold = if resuming {
+                let threshold = if resuming || slot.current_quality >= floor.quality {
                     cost + reserve
-                } else if slot.current_quality >= floor.quality {
-                    cost * Self::DOWNGRADE_FACTOR
                 } else {
                     cost
                 };
@@ -1694,23 +1693,12 @@ impl AllocationEngine {
                 }
             }
 
-            // Climb toward target. Recovery up to the current layer is a cheap
-            // dead-band; climbing above it is a genuine upgrade that must leave the
-            // reserve intact. A temporally-degraded slot stays put — it is under
-            // congestion and recovers once its floor fits again.
+            // Climb toward target. Retention was decided against the complete
+            // current layer above; every climb here is a genuine upgrade.
             if degraded.is_none() {
                 while let Some(next) = self.next_layer(slot, cur) {
-                    let step = self.stable_cost(next) - cur.map_or(0.0, |l| self.stable_cost(l));
-                    // Resuming a paused slot is a genuine upgrade, not retention: it parks on a
-                    // layer it is not sending, so charging it the cheap retention dead-band admits
-                    // a stream the budget cannot actually carry, which overshoots the link and
-                    // squeezes the higher-priority streams already served from this budget.
-                    let resuming = !slot.forwarding;
-                    let admitted = if resuming || next.quality > slot.current_quality {
-                        step + reserve <= budget
-                    } else {
-                        step * Self::DOWNGRADE_FACTOR <= budget
-                    };
+                    let step = self.cost(next) - cur.map_or(0.0, |l| self.cost(l));
+                    let admitted = step + reserve <= budget;
                     if !admitted {
                         break;
                     }
@@ -1723,7 +1711,7 @@ impl AllocationEngine {
                 && self.nothing_spatially_healthy(slot)
                 && let Some(lowest) = self.lowest_ladder(slot)
             {
-                let cost = self.stable_cost(lowest);
+                let cost = self.cost(lowest);
                 if cost <= budget {
                     budget -= cost;
                     cur = Some(lowest);
@@ -1986,6 +1974,47 @@ mod assignment_tests {
     }
 
     #[test]
+    fn retained_simulcast_layer_applies_the_dead_band_to_its_total_cost() {
+        let pid = ParticipantId::new();
+        let (tx, built, states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let key = keys.insert(());
+        let view = SlotView {
+            key,
+            mid: Mid::from("s0"),
+            max_height: 720,
+            min_height: 0,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::High,
+            forwarding: true,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+
+        let retained = engine.run_compute(Bitrate::from(909_000), std::slice::from_ref(&view));
+        assert!(matches!(
+            retained.get(key),
+            Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
+        ));
+
+        let downgraded = engine.run_compute(Bitrate::from(800_000), std::slice::from_ref(&view));
+        assert!(!matches!(
+            downgraded.get(key),
+            Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
+        ));
+    }
+
+    #[test]
     fn unmeasured_requested_layer_starts_forwarding_for_keyframe_recovery() {
         let pid = ParticipantId::new();
         let (tx, built, mut states) = video_track_with_states(
@@ -2187,6 +2216,31 @@ mod assignment_tests {
             0,
             "a keyframe request must not be issued before its fanout binding exists"
         );
+    }
+
+    #[test]
+    fn receiver_keyframe_request_uses_the_subscribed_tracks_reverse_binding() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+
+        let slot = allocator.slots.values().next().expect("video slot");
+        let request = KeyframeRequest {
+            mid: slot.mid,
+            rid: slot.rid,
+            kind: KeyframeRequestKind::Pli,
+        };
+        let expected = allocator
+            .active_track_keys
+            .get(&tracks.ids[0])
+            .copied()
+            .expect("active reverse binding");
+
+        let (fanout, rid) = allocator
+            .handle_keyframe_request(request)
+            .expect("subscribed slot resolves a reverse target");
+        assert_eq!(fanout, expected);
+        assert_eq!(rid, slot.target().expect("active slot target").rid);
     }
 
     #[test]
@@ -2440,6 +2494,53 @@ mod assignment_tests {
             !slot.switch_to(&layer, false),
             "re-applying the same active layer should not mark a change"
         );
+    }
+
+    #[test]
+    fn a_paused_new_subscription_emits_one_decodable_start_frame() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+        let track_id = tracks.ids[0];
+        let layer = allocator
+            .track(&track_id)
+            .unwrap()
+            .lowest_quality()
+            .expect("video track has a layer")
+            .clone();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.set_roles_for_test(None, Some(&layer));
+        slot.paused = true;
+
+        let mut cache = TrackStreamCache::new();
+        let mut writer = StreamWriter::new();
+        let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(
+            1,
+            1000,
+            90_000,
+            tokio::time::Instant::now(),
+        );
+        let keyframe = builder.keyframe(4);
+        for packet in &keyframe {
+            cache.push(packet.clone());
+        }
+        let arrival = keyframe.last().expect("keyframe packet").arrival_ts;
+        assert!(slot.on_rtp(track_id, arrival, Some(&cache), &mut writer));
+
+        let mut emitted = 0usize;
+        while let Some(write) = writer.pop() {
+            if matches!(write, crate::track::StreamWrite::Video { .. }) {
+                emitted = emitted.saturating_add(1);
+            }
+        }
+        assert_eq!(emitted, keyframe.len());
+
+        for packet in builder.delta_frame(2) {
+            let arrival = packet.arrival_ts;
+            cache.push(packet);
+            assert!(!slot.on_rtp(track_id, arrival, Some(&cache), &mut writer));
+        }
+        assert!(writer.pop().is_none());
     }
 
     #[test]

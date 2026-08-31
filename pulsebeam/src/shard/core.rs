@@ -32,6 +32,12 @@ use super::worker::{MediaPayload, ShardCommand, ShardEvent, ShardFrame};
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
 const MAX_DEPARTURES_PER_FLUSH: usize = net::BATCH_SIZE * 64;
 
+struct PendingCachedReplay {
+    key: crate::keys::TrackKey,
+    local: Vec<ParticipantKey>,
+    remote: Vec<crate::route::RouteHandle>,
+}
+
 fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) {
     metrics::counter!(
         "routing_drop",
@@ -78,26 +84,32 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
 
     fn flush(&mut self) -> bool {
         let departures = &mut *self.departures;
-        let udp_progress = self.udp.flush(self.udp_socket, |receipt| {
-            if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
-                debug_assert!(
-                    false,
-                    "one shard flush exceeded its departure receipt bound"
-                );
-            } else {
-                departures.push(receipt);
-            }
-        });
-        let tcp_progress = self.tcp.flush(self.tcp_socket, |receipt| {
-            if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
-                debug_assert!(
-                    false,
-                    "one shard flush exceeded its departure receipt bound"
-                );
-            } else {
-                departures.push(receipt);
-            }
-        });
+        let udp_progress = self
+            .udp
+            .flush_results(self.udp_socket, |mut receipt, sent| {
+                receipt.sent = sent;
+                if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
+                    debug_assert!(
+                        false,
+                        "one shard flush exceeded its departure receipt bound"
+                    );
+                } else {
+                    departures.push(receipt);
+                }
+            });
+        let tcp_progress = self
+            .tcp
+            .flush_results(self.tcp_socket, |mut receipt, sent| {
+                receipt.sent = sent;
+                if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
+                    debug_assert!(
+                        false,
+                        "one shard flush exceeded its departure receipt bound"
+                    );
+                } else {
+                    departures.push(receipt);
+                }
+            });
         udp_progress || tcp_progress
     }
 }
@@ -113,6 +125,7 @@ pub(crate) struct ShardExecution {
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
     plans: SecondaryMap<crate::keys::TrackKey, crate::shard_update::TrackPlan>,
+    pending_cached_replays: Vec<PendingCachedReplay>,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -175,10 +188,19 @@ impl ShardCore {
 
     pub(crate) fn flush_stream_buffers(
         &mut self,
+        now: Instant,
         router: &impl ShardTransport,
         budget: usize,
     ) -> usize {
-        self.execution.flush_stream_buffers(router, budget)
+        self.execution.flush_stream_buffers(now, router, budget)
+    }
+
+    pub(crate) fn flush_cached_replays(
+        &mut self,
+        now: Instant,
+        router: &impl ShardTransport,
+    ) -> usize {
+        self.execution.flush_cached_replays(now, router)
     }
 
     pub(crate) fn flush_participant_events(
@@ -254,6 +276,7 @@ impl ShardExecution {
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             runtime,
             plans: SecondaryMap::new(),
+            pending_cached_replays: Vec::with_capacity(PARTICIPANT_CAPACITY_HINT),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -347,7 +370,32 @@ impl ShardExecution {
         match &operation.plan {
             Some(plan) => {
                 debug_assert!(plan.is_valid());
+                let previous = self.plans.get(operation.key);
+                let local = plan
+                    .local
+                    .iter()
+                    .copied()
+                    .filter(|subscriber| {
+                        previous.is_none_or(|plan| !plan.local.contains(subscriber))
+                    })
+                    .collect();
+                let remote = plan
+                    .remote
+                    .iter()
+                    .copied()
+                    .filter(|destination| {
+                        previous.is_none_or(|plan| !plan.remote.contains(destination))
+                    })
+                    .collect();
                 self.plans.insert(operation.key, plan.clone());
+                let replay = PendingCachedReplay {
+                    key: operation.key,
+                    local,
+                    remote,
+                };
+                if !replay.local.is_empty() || !replay.remote.is_empty() {
+                    self.pending_cached_replays.push(replay);
+                }
                 plan.local
                     .len()
                     .saturating_add(plan.remote.len())
@@ -355,9 +403,55 @@ impl ShardExecution {
             }
             None => {
                 debug_assert!(self.plans.contains_key(operation.key));
+                self.pending_cached_replays
+                    .retain(|replay| replay.key != operation.key);
                 usize::from(self.plans.remove(operation.key).is_some())
             }
         }
+    }
+
+    pub(crate) fn flush_cached_replays(
+        &mut self,
+        now: Instant,
+        router: &impl ShardTransport,
+    ) -> usize {
+        let pending = std::mem::take(&mut self.pending_cached_replays);
+        let mut flushed = 0usize;
+        for mut replay in pending {
+            let Some(plan) = self.plans.get(replay.key) else {
+                continue;
+            };
+            replay
+                .local
+                .retain(|subscriber| plan.local.contains(subscriber));
+            replay
+                .remote
+                .retain(|destination| plan.remote.contains(destination));
+            if replay.local.is_empty() && replay.remote.is_empty() {
+                continue;
+            }
+            let before = replay.local.len().saturating_add(replay.remote.len());
+            let mut ctx = crate::shard::router::ForwardingContext {
+                now,
+                registry: &mut self.registry,
+                dirty: &mut self.dirty,
+                wall: &self.wall,
+                router,
+            };
+            let replay_ready = self.runtime.replay_cached_track(
+                replay.key,
+                &mut replay.local,
+                &mut replay.remote,
+                &mut ctx,
+            );
+            flushed = flushed.saturating_add(
+                before.saturating_sub(replay.local.len().saturating_add(replay.remote.len())),
+            );
+            if replay_ready && (!replay.local.is_empty() || !replay.remote.is_empty()) {
+                self.pending_cached_replays.push(replay);
+            }
+        }
+        flushed
     }
 
     fn on_media_frame(
@@ -396,6 +490,7 @@ impl ShardExecution {
         payload.key = key;
         payload.set_remote_timing(self.wall.to_instant(playout), now);
         let mut ctx = crate::shard::router::ForwardingContext {
+            now,
             registry: &mut self.registry,
             dirty: &mut self.dirty,
             wall: &self.wall,
@@ -471,6 +566,7 @@ impl ShardExecution {
 
     pub(crate) fn flush_stream_buffers(
         &mut self,
+        now: Instant,
         router: &impl ShardTransport,
         budget: usize,
     ) -> usize {
@@ -488,6 +584,7 @@ impl ShardExecution {
                 continue;
             };
             let mut ctx = crate::shard::router::ForwardingContext {
+                now,
                 registry: &mut self.registry,
                 dirty: &mut self.dirty,
                 wall: &self.wall,
@@ -758,35 +855,39 @@ impl ShardExecution {
         }
         {
             let departures = &mut self.departures;
-            self.udp_send_batch.flush(udp_socket, |receipt| {
-                if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
-                    debug_assert!(
-                        false,
-                        "one shard flush exceeded its departure receipt bound"
-                    );
-                } else {
-                    departures.push(receipt);
-                }
-            });
-            self.tcp_send_batcher.flush(tcp_socket, |receipt| {
-                if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
-                    debug_assert!(
-                        false,
-                        "one shard flush exceeded its departure receipt bound"
-                    );
-                } else {
-                    departures.push(receipt);
-                }
-            });
+            self.udp_send_batch
+                .flush_results(udp_socket, |mut receipt, sent| {
+                    receipt.sent = sent;
+                    if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
+                        debug_assert!(
+                            false,
+                            "one shard flush exceeded its departure receipt bound"
+                        );
+                    } else {
+                        departures.push(receipt);
+                    }
+                });
+            self.tcp_send_batcher
+                .flush_results(tcp_socket, |mut receipt, sent| {
+                    receipt.sent = sent;
+                    if departures.len() >= MAX_DEPARTURES_PER_FLUSH {
+                        debug_assert!(
+                            false,
+                            "one shard flush exceeded its departure receipt bound"
+                        );
+                    } else {
+                        departures.push(receipt);
+                    }
+                });
         }
+        let departure_at = Instant::now();
+        debug_assert!(
+            departure_at >= now,
+            "network departure follows shard polling"
+        );
         while let Some(receipt) = self.departures.pop() {
             if let Some(participant) = self.registry.resolve_mut(receipt.participant) {
-                participant.report_departure(
-                    receipt.send_id,
-                    receipt.congestion_tracked,
-                    receipt.timing,
-                    now,
-                );
+                participant.report_departure(receipt.rtc, receipt.sent, departure_at);
             }
         }
         processed

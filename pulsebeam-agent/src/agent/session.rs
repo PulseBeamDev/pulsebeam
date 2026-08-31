@@ -216,8 +216,8 @@ impl Speakers {
 
 /// Every audio track the SFU decides to forward to this receiver.
 ///
-/// The stream never ends on its own: a slot vacated by one speaker is filled by the next, and
-/// each arrival is a fresh track. Pair it with [`Media::speakers`] to know who is in which slot.
+/// Each item is one negotiated audio slot and remains alive as different speakers occupy it.
+/// Pair it with [`Media::speakers`] to identify the current speakers.
 pub struct AudioTracks {
     rx: mailbox::Receiver<RemoteTrack>,
 }

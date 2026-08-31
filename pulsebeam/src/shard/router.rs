@@ -2,7 +2,9 @@ use crate::clock::WallAnchor;
 use crate::id::ShardId;
 use crate::keys::ParticipantKey;
 use crate::participant::reverse::ReversePacket;
-use crate::participant::{ParticipantInput, RoutedTrackPacket, TrackPacket, TrackPacketRef};
+use crate::participant::{
+    ForwardPacket, ParticipantInput, RoutedTrackPacket, TrackPacket, TrackPacketRef,
+};
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use slotmap::SecondaryMap;
@@ -29,6 +31,7 @@ pub(crate) trait ShardTransport {
 }
 
 pub(crate) struct ForwardingContext<'a, R> {
+    pub now: tokio::time::Instant,
     pub registry: &'a mut super::participants::ParticipantRegistry,
     pub dirty: &'a mut super::dirty::DirtyTracker,
     pub wall: &'a WallAnchor,
@@ -38,6 +41,7 @@ pub(crate) struct ForwardingContext<'a, R> {
 struct TrackRuntime {
     origin_key: ParticipantKey,
     cache: Option<TrackStreamCache>,
+    encodings: Vec<Option<crate::rtp::EncodingId>>,
     publisher: Option<ParticipantKey>,
     link_seq: u32,
 }
@@ -77,6 +81,7 @@ fn forward_track(
         return;
     };
     participant.input(ParticipantInput::Track {
+        now: ctx.now,
         key: fanout,
         packet: pkt,
         cache,
@@ -116,6 +121,9 @@ impl ShardRuntime {
                 let cache = descriptor
                     .is_some_and(|descriptor| !descriptor.encodings.is_empty())
                     .then(TrackStreamCache::new);
+                let encodings = descriptor
+                    .map(|descriptor| descriptor.encodings.clone())
+                    .unwrap_or_default();
                 let publisher = runtime.publisher;
                 let key = *key;
                 if let Some(previous) = self.tracks.get(key) {
@@ -129,6 +137,7 @@ impl ShardRuntime {
                     TrackRuntime {
                         origin_key,
                         cache,
+                        encodings,
                         publisher,
                         link_seq: 0,
                     },
@@ -156,12 +165,82 @@ impl ShardRuntime {
         }
     }
 
+    pub(crate) fn replay_cached_track(
+        &mut self,
+        key: TrackKey,
+        local: &mut Vec<ParticipantKey>,
+        remote: &mut Vec<crate::route::RouteHandle>,
+        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+    ) -> bool {
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_work(
+            "track_cached_replay_target",
+            local.len().saturating_add(remote.len()),
+        );
+        let Some(runtime) = self.tracks.get_mut(key) else {
+            debug_assert!(
+                false,
+                "a cached replay plan must resolve to a track runtime"
+            );
+            return false;
+        };
+        let Some(cache) = runtime.cache.as_ref() else {
+            return false;
+        };
+        if !cache.has_replay(&runtime.encodings) {
+            return false;
+        }
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_routing_work(
+            "track_cached_replay_ready",
+            local.len().saturating_add(remote.len()),
+        );
+
+        local.retain(|&subscriber| {
+            let Some(participant) = ctx.registry.resolve_mut(subscriber) else {
+                return false;
+            };
+            let rendered = participant.replay_cached_track(ctx.now, key, cache);
+            if rendered {
+                ctx.dirty.mark(subscriber, participant);
+            }
+            !rendered
+        });
+
+        for packet in cache.replay(&runtime.encodings) {
+            let Some(media) = cache.forward_for(&packet) else {
+                continue;
+            };
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::record_routing_work("track_cached_replay_packet", remote.len());
+            let playout = ctx.wall.to_ntp(packet.playout_time);
+            for destination in remote.iter().copied() {
+                let env = Envelope::media(destination, runtime.link_seq, playout.middle32());
+                runtime.link_seq = runtime.link_seq.wrapping_add(1);
+                ctx.router.send_media(
+                    destination.shard(),
+                    env,
+                    RoutedTrackPacket {
+                        key,
+                        packet: TrackPacket::Rtp {
+                            packet: packet.to_transit(),
+                            media: ForwardPacket::Transit(media.materialize()),
+                        },
+                    },
+                );
+            }
+        }
+        remote.clear();
+        true
+    }
+
     #[inline]
     pub fn route_rtp_with_plan(
         &mut self,
         key: TrackKey,
         origin: Origin,
         pkt: RtpPacket,
+        media: ForwardPacket,
         plan: &crate::shard_update::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
@@ -172,21 +251,36 @@ impl ShardRuntime {
         let rid = pkt.extensions.rid;
         let seq = pkt.seq_no;
         let too_old;
-        let (packet, cache) = if let Some(track_cache) = runtime.cache.as_mut() {
-            too_old = track_cache.push(pkt);
+        let (packet, media, cache) = if let Some(track_cache) = runtime.cache.as_mut() {
+            too_old = track_cache.push_forward(pkt, media);
             let Some(packet) = too_old
                 .as_ref()
+                .map(|(packet, _)| packet)
                 .or_else(|| track_cache.encoding(rid).and_then(|stream| stream.get(seq)))
             else {
                 debug_assert!(false, "a cached packet must be readable");
                 return;
             };
-            (packet, Some(&*track_cache))
+            let media = too_old
+                .as_ref()
+                .map(|(_, media)| media)
+                .or_else(|| track_cache.forward_for(packet));
+            let Some(media) = media else {
+                debug_assert!(false, "a cached RTP packet retains its facade media");
+                return;
+            };
+            (packet, media, Some(&*track_cache))
         } else {
-            (&pkt, None)
+            (&pkt, &media, None)
         };
         fanout_local(plan, |subscriber| {
-            forward_track(ctx, subscriber, key, TrackPacketRef::Rtp(packet), cache);
+            forward_track(
+                ctx,
+                subscriber,
+                key,
+                TrackPacketRef::Rtp { packet, media },
+                cache,
+            );
         });
         if origin.is_local() {
             let playout = ctx.wall.to_ntp(packet.playout_time);
@@ -196,7 +290,10 @@ impl ShardRuntime {
                 playout.middle32(),
                 || RoutedTrackPacket {
                     key,
-                    packet: TrackPacket::Rtp(packet.to_transit()),
+                    packet: TrackPacket::Rtp {
+                        packet: packet.to_transit(),
+                        media: ForwardPacket::Transit(media.materialize()),
+                    },
                 },
                 ctx.router,
             );
@@ -213,7 +310,9 @@ impl ShardRuntime {
     ) {
         debug_assert_eq!(packet.key, key);
         match packet.packet {
-            TrackPacket::Rtp(packet) => self.route_rtp_with_plan(key, origin, packet, plan, ctx),
+            TrackPacket::Rtp { packet, media } => {
+                self.route_rtp_with_plan(key, origin, packet, media, plan, ctx);
+            }
             TrackPacket::Data { lane, bytes } => {
                 self.route_data_with_plan(key, origin, lane, bytes, plan, ctx);
             }

@@ -252,7 +252,6 @@ mod tests {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::ExternalRoomId;
-    use crate::rtp::RtpPacket;
     use crate::track::DataLane;
 
     fn identity() -> SinkIdentity {
@@ -273,11 +272,17 @@ mod tests {
         let mut sink = pipeline.participant_sink(who);
         sink.publish_track_packet(
             Some(TrackKey::default()),
-            TrackPacket::Rtp(RtpPacket::default()),
+            TrackPacket::Data {
+                lane: DataLane::Realtime,
+                bytes: vec![2],
+            },
         );
         sink.publish_track_packet(
             Some(TrackKey::default()),
-            TrackPacket::Rtp(RtpPacket::default()),
+            TrackPacket::Data {
+                lane: DataLane::Reliable,
+                bytes: vec![3],
+            },
         );
         sink.publish_track_packet(
             Some(TrackKey::default()),
@@ -406,7 +411,10 @@ mod tests {
 
         pipeline.participant_sink(who).publish_track_packet(
             Some(TrackKey::default()),
-            TrackPacket::Rtp(RtpPacket::default()),
+            TrackPacket::Data {
+                lane: DataLane::Realtime,
+                bytes: vec![1],
+            },
         );
         assert!(pipeline.has_pending(), "so is a track packet");
         assert!(pipeline.pop_packet().is_some());

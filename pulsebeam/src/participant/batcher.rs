@@ -6,30 +6,21 @@
 //! and the peer receives datagrams that were never sent.
 
 use arrayvec::ArrayVec;
-use pulsebeam_rtc::SendId;
+use pulsebeam_rtc::DepartureReceipt as RtcDepartureReceipt;
 use pulsebeam_runtime::net;
 use std::{
     collections::VecDeque,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
-use tokio::time::Instant;
 
 const MAX_FREE_STATES: usize = 3;
 const MAX_RECEIPTS_PER_BATCH: usize = 64;
 
 #[derive(Clone, Copy)]
-pub(crate) struct ForwardTiming {
-    pub(crate) ingress_at: Instant,
-    pub(crate) pacer_admitted_at: Instant,
-    pub(crate) paced_eligible_at: Instant,
-}
-
-#[derive(Clone, Copy)]
 pub(crate) struct DepartureReceipt {
     pub(crate) participant: crate::keys::ParticipantKey,
-    pub(crate) send_id: SendId,
-    pub(crate) congestion_tracked: bool,
-    pub(crate) timing: Option<ForwardTiming>,
+    pub(crate) rtc: RtcDepartureReceipt,
+    pub(crate) sent: bool,
 }
 
 pub struct OwnedPacketQueue {
@@ -194,6 +185,18 @@ impl GsoSendBatch {
         socket: &mut net::UnifiedSocket,
         mut departed: impl FnMut(DepartureReceipt),
     ) -> bool {
+        self.flush_results(socket, |receipt, sent| {
+            if sent {
+                departed(receipt);
+            }
+        })
+    }
+
+    pub(crate) fn flush_results(
+        &mut self,
+        socket: &mut net::UnifiedSocket,
+        mut completed: impl FnMut(DepartureReceipt, bool),
+    ) -> bool {
         if self.packets.is_empty() {
             return false;
         }
@@ -223,7 +226,12 @@ impl GsoSendBatch {
                 debug_assert!(sent <= self.packets.len());
                 for packet in self.packets.iter().take(sent) {
                     for receipt in &packet.receipts {
-                        departed(*receipt);
+                        completed(*receipt, true);
+                    }
+                }
+                for packet in self.packets.iter().skip(sent) {
+                    for receipt in &packet.receipts {
+                        completed(*receipt, false);
                     }
                 }
                 self.packets.clear();
@@ -232,6 +240,11 @@ impl GsoSendBatch {
             }
             Err(err) => {
                 tracing::trace!(error = ?err, "error writing UDP egress batch");
+                for packet in &self.packets {
+                    for receipt in &packet.receipts {
+                        completed(*receipt, false);
+                    }
+                }
                 self.packets.clear();
                 self.arena.clear();
                 false
@@ -354,6 +367,18 @@ impl Batcher {
         socket: &mut net::tcp::TcpTransport,
         mut departed: impl FnMut(DepartureReceipt),
     ) -> bool {
+        self.flush_results(socket, |receipt, sent| {
+            if sent {
+                departed(receipt);
+            }
+        })
+    }
+
+    pub(crate) fn flush_results(
+        &mut self,
+        socket: &mut net::tcp::TcpTransport,
+        mut completed: impl FnMut(DepartureReceipt, bool),
+    ) -> bool {
         let mut progressed = false;
         while let Some(state) = self.front() {
             debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
@@ -380,7 +405,7 @@ impl Batcher {
                         break;
                     };
                     for receipt in &state.receipts {
-                        departed(*receipt);
+                        completed(*receipt, true);
                     }
                     self.reclaim(state);
                     progressed = true;
@@ -392,6 +417,9 @@ impl Batcher {
                         debug_assert!(false, "a failed batch must remain queued");
                         break;
                     };
+                    for receipt in &state.receipts {
+                        completed(*receipt, false);
+                    }
                     self.reclaim(state);
                     progressed = true;
                 }

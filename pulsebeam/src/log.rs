@@ -41,8 +41,4 @@ macro_rules! plog_info {
 macro_rules! plog_debug {
     ($ctx:expr, $($rest:tt)*) => { $crate::log::plog!(debug, $ctx, $($rest)*) };
 }
-macro_rules! plog_trace {
-    ($ctx:expr, $($rest:tt)*) => { $crate::log::plog!(trace, $ctx, $($rest)*) };
-}
-
-pub(crate) use {plog, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
+pub(crate) use {plog, plog_debug, plog_error, plog_info, plog_warn};

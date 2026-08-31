@@ -14,8 +14,8 @@ use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::{
-    self, EncodingId as Rid, MediaSectionId as Mid, PacketProvenance, PayloadType as Pt, RtpPacket,
-    SenderReport, SimulcastEncoding, Ssrc, VideoLayersAllocation,
+    self, EncodingId as Rid, MediaSectionId as Mid, PayloadType as Pt, RtpPacket, SenderReport,
+    SimulcastEncoding, Ssrc, VideoLayersAllocation,
     monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
@@ -58,8 +58,6 @@ pub enum StreamWrite {
     },
 }
 
-/// Reusable packet queue shared by all downstream allocators for one
-/// participant. It never touches `Rtc`; callers only enqueue writes.
 pub struct StreamWriter {
     pending: VecDeque<StreamWrite>,
 }
@@ -73,7 +71,7 @@ impl Default for StreamWriter {
 impl StreamWriter {
     pub fn new() -> Self {
         Self {
-            pending: VecDeque::with_capacity(64),
+            pending: VecDeque::with_capacity(16),
         }
     }
 
@@ -103,31 +101,8 @@ impl StreamWriter {
         self.pending.pop_front()
     }
 
-    pub(crate) fn front_pacing_size(&self) -> Option<usize> {
-        self.pending.front().map(StreamWrite::pacing_size)
-    }
-
-    pub(crate) fn front_pacing(&self) -> Option<(usize, PacketProvenance)> {
-        self.pending.front().map(|write| {
-            let packet = write.packet();
-            (write.pacing_size(), packet.provenance)
-        })
-    }
-}
-
-impl StreamWrite {
-    fn packet(&self) -> &RtpPacket {
-        match self {
-            Self::Video { pkt, .. } | Self::Audio { pkt, .. } => pkt,
-        }
-    }
-
-    fn pacing_size(&self) -> usize {
-        match self {
-            Self::Video { pkt, .. } | Self::Audio { pkt, .. } => {
-                pkt.payload.len().saturating_add(64)
-            }
-        }
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 }
 
@@ -974,7 +949,7 @@ mod data_track {
     use std::fmt::Display;
 
     use crate::entity::ParticipantId;
-    use pulsebeam_rtc::DataChannelReliability;
+    use pulsebeam_rtc::DataChannelMode;
 
     const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 96;
 
@@ -1124,13 +1099,10 @@ mod data_track {
         #[error("The target user asset label component is missing or empty")]
         MissingLabel,
 
-        #[error(
-            "Unsupported data channel configuration for label '{label}': expected unordered with MaxRetransmits(0), but got ordered={ordered}, reliability={reliability:?}"
-        )]
+        #[error("Unsupported data channel mode for label '{label}': {mode:?}")]
         UnsupportedDataChannelConfig {
             label: String,
-            ordered: bool,
-            reliability: DataChannelReliability,
+            mode: DataChannelMode,
         },
 
         #[error(
@@ -1151,7 +1123,7 @@ mod data_track {
     impl DataTrackIntent {
         pub fn from_channel(
             label: &str,
-            reliability: DataChannelReliability,
+            mode: DataChannelMode,
         ) -> Result<Self, DataTrackIntentError> {
             let s = label;
             if s.len() > MAX_DATA_TRACK_NAMESPACE_LEN {
@@ -1180,21 +1152,13 @@ mod data_track {
                     };
 
                     let supported_delivery_guarantee = match lane {
-                        DataLane::Realtime => {
-                            matches!(reliability.max_retransmits_value(), Some(0))
-                                && !reliability.ordered()
-                        }
-                        DataLane::Reliable => {
-                            reliability.max_retransmits_value().is_none()
-                                && reliability.max_lifetime_value().is_none()
-                                && reliability.ordered()
-                        }
+                        DataLane::Realtime => mode == DataChannelMode::UnreliableUnordered,
+                        DataLane::Reliable => mode == DataChannelMode::ReliableOrdered,
                     };
                     if !supported_delivery_guarantee {
                         return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
                             label: s.to_owned(),
-                            ordered: reliability.ordered(),
-                            reliability,
+                            mode,
                         });
                     }
 
@@ -1266,14 +1230,14 @@ mod data_track {
 
         struct ChannelConfig {
             label: String,
-            reliability: DataChannelReliability,
+            mode: DataChannelMode,
         }
 
         impl TryFrom<&ChannelConfig> for DataTrackIntent {
             type Error = DataTrackIntentError;
 
             fn try_from(value: &ChannelConfig) -> Result<Self, Self::Error> {
-                Self::from_channel(&value.label, value.reliability)
+                Self::from_channel(&value.label, value.mode)
             }
         }
 
@@ -1286,14 +1250,14 @@ mod data_track {
         fn cfg(label: &str) -> ChannelConfig {
             ChannelConfig {
                 label: label.to_string(),
-                reliability: DataChannelReliability::max_retransmits(false, 0),
+                mode: DataChannelMode::UnreliableUnordered,
             }
         }
 
         fn rel_cfg(label: &str) -> ChannelConfig {
             ChannelConfig {
                 label: label.to_string(),
-                reliability: DataChannelReliability::reliable_ordered(),
+                mode: DataChannelMode::ReliableOrdered,
             }
         }
 

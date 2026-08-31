@@ -748,14 +748,15 @@ impl ControllerActor {
             .ok_or(ControllerError::ServiceUnavailable)?;
         let creds = IceUfrag::new(self.cluster_id, self.node_id, handle.route, handle.epoch)
             .into_ice_creds();
-        let direct_id = pulsebeam_rtc::ConnectionId::new(
-            (u64::from(handle.route.get()) << 16) | u64::from(handle.epoch),
-        );
+        let direct_id = (u64::from(handle.route.get()) << 16) | u64::from(handle.epoch);
         let DirectNegotiation {
             answer,
-            session,
-            local,
-        } = match self.negotiator.create_answer(&offer, direct_id, creds) {
+            peer,
+            media,
+        } = match self
+            .negotiator
+            .create_answer(&offer, direct_id, creds.0, creds.1)
+        {
             Ok(value) => value,
             Err(error) => {
                 self.core.remove_participant_key(shard, key);
@@ -770,7 +771,7 @@ impl ControllerActor {
         }
         let config = self
             .core
-            .create_participant(direct_id, session, local, state, shard, handle, key);
+            .create_participant(peer, media, state, shard, handle, key);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {

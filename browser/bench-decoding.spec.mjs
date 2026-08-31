@@ -1,4 +1,4 @@
-import { test, expect, chromium, firefox, webkit } from "@playwright/test";
+import { test, expect } from "@playwright/test";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
@@ -10,8 +10,6 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const serverBin = process.env.PULSEBEAM_BROWSER_SERVER ?? path.join(root, "target", "release", "pulsebeam");
-const cliBin = path.join(root, "target", "release", "pulsebeam-cli");
-const engines = { chromium, firefox, webkit };
 
 function run(command, args) {
   const child = spawn(command, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
@@ -43,18 +41,15 @@ async function freeUdpPort() {
 }
 
 async function waitForPort(port) {
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
+  await expect.poll(async () => {
     const socket = net.connect({ host: "127.0.0.1", port });
     const connected = await new Promise((resolve) => {
       socket.once("connect", () => resolve(true));
       socket.once("error", () => resolve(false));
     });
     socket.destroy();
-    if (connected) return;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`pulsebeam did not bind TCP/${port}`);
+    return connected;
+  }, { timeout: 10_000, message: `PulseBeam did not bind TCP/${port}` }).toBe(true);
 }
 
 async function stop(process) {
@@ -69,18 +64,12 @@ async function stop(process) {
 
 async function startStaticServer() {
   const server = createServer((request, response) => {
-    const pages = {
-      "/publisher.html": "publisher.html",
-      "/viewer.html": "viewer.html",
-      "/manual-subscriptions.html": "manual-subscriptions.html",
-    };
-    const page = pages[request.url];
-    if (!page) {
+    if (request.url !== "/manual-subscriptions.html") {
       response.writeHead(404).end();
       return;
     }
     response.writeHead(200, { "content-type": "text/html" });
-    response.end(readFileSync(path.join(root, "browser", page)));
+    response.end(readFileSync(path.join(root, "browser", "manual-subscriptions.html")));
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -93,7 +82,6 @@ async function startPulseBeam() {
     freePort(),
     freeUdpPort(),
   ]);
-  const apiUrl = `http://127.0.0.1:${apiPort}`;
   const pulsebeam = run(serverBin, [
     "--dev",
     "--api-port", String(apiPort),
@@ -102,129 +90,90 @@ async function startPulseBeam() {
   ]);
   await waitForPort(apiPort);
   if (pulsebeam.child.exitCode !== null) {
-    throw new Error(`pulsebeam exited before browser join: ${pulsebeam.child.exitCode}`);
+    throw new Error(`PulseBeam exited before browser join: ${pulsebeam.child.exitCode}`);
   }
-  return { apiUrl, pulsebeam };
-}
-
-function commonCodecs(publisher, viewer) {
-  const codecs = ["video/h264"].filter((codec) =>
-    publisher.includes(codec) && viewer.includes(codec));
-  return codecs;
+  return { apiUrl: `http://127.0.0.1:${apiPort}`, pulsebeam };
 }
 
 function decodedFrames(stats) {
   return stats.inbound.reduce((total, stream) => total + stream.framesDecoded, 0);
 }
 
-function jitterSamples(stats) {
-  return stats.inbound.reduce((total, stream) => total + stream.jitterBufferEmittedCount, 0);
+function renderedAt(stats, width, height) {
+  return stats.rendered.some((video) => video.width === width && video.height === height);
 }
 
-function jitterDelay(stats) {
-  return stats.inbound.reduce((total, stream) => total + stream.jitterBufferDelay, 0);
+function presentsAt(stats, browserName, width, height) {
+  if (browserName !== "webkit") return renderedAt(stats, width, height);
+  return stats.inbound.some((stream) =>
+    stream.framesDecoded > 0 && stream.frameWidth === width && stream.frameHeight === height);
 }
 
-test("a late meet-shaped browser decodes bench H.264 video", async ({ page }) => {
-  const browserConsole = [];
-  page.on("console", (message) => {
-    browserConsole.push(`${message.type()}: ${message.text()}`);
-    if (browserConsole.length > 100) browserConsole.shift();
-  });
-  const staticServer = await startStaticServer();
-  const viewerPort = staticServer.address().port;
-
-  const [apiPort, metricsPort, rtcPort] = await Promise.all([
-    freePort(),
-    freePort(),
-    freeUdpPort(),
-  ]);
-  const apiUrl = `http://127.0.0.1:${apiPort}`;
-  const pulsebeam = run(serverBin, [
-    "--dev",
-    "--api-port", String(apiPort),
-    "--metrics-port", String(metricsPort),
-    "--rtc-port", String(rtcPort),
-  ]);
-  let bench;
-  try {
-    await waitForPort(apiPort);
-    if (pulsebeam.child.exitCode !== null) {
-      throw new Error(`pulsebeam exited before the browser joined: ${pulsebeam.child.exitCode}`);
-    }
-    bench = run(cliBin, [
-      "--api-url", apiUrl,
-      "bench",
-      "--rooms", "1",
-      "--users-per-room", "4",
-      "--arrival-rate", "1",
-      "--join-spread-secs", "1",
-      "--max-rooms", "1",
-      "--session-duration", "60",
-      "--latency-file", "/tmp/pulsebeam-browser-latency.csv",
-      "--snapshots-file", "/tmp/pulsebeam-browser-snapshots.csv",
-    ]);
-    await new Promise((resolve) => setTimeout(resolve, 3_000));
-
-    await page.goto(`http://127.0.0.1:${viewerPort}/viewer.html`);
-    await page.evaluate((apiUrl) => window.pulsebeamViewer.connect({
-      apiUrl,
-      room: "bench-room-0",
-      meetShape: true,
-    }), apiUrl);
-
-    await expect.poll(async () => {
-      const stats = await page.evaluate(() => window.pulsebeamViewer.stats());
-      return stats.inbound.some((stream) => stream.framesDecoded > 0) &&
-        stats.rendered.some((video) => video.width > 0 && video.height > 0);
-    }, { timeout: 20_000, message: "browser never decoded bench video" }).toBe(true);
-  } catch (error) {
-    const browserStats = await page.evaluate(() => window.pulsebeamViewer?.stats?.()).catch(() => null);
-    const sdp = await page.evaluate(() => window.pulsebeamViewer?.sdp?.()).catch(() => null);
-    throw new Error(`${error.message}\nBrowser stats: ${JSON.stringify(browserStats)}\nSDP: ${JSON.stringify(sdp)}\nBrowser console:\n${browserConsole.join("\n")}\nServer log:\n${pulsebeam.output()}\nBench log:\n${bench?.output() ?? "not started"}`);
-  } finally {
-    staticServer.close();
-    await stop(bench?.child);
-    await stop(pulsebeam.child);
+function publishesRequiredLayers(stats, browserName) {
+  if (browserName === "webkit") {
+    return stats.outbound.some((stream) => stream.packetsSent > 0);
   }
-});
+  return ["q", "h", "f"].every((rid) =>
+    stats.outbound.some((stream) => stream.rid === rid && stream.packetsSent > 0));
+}
 
-test("manual browser subscriptions sustain decoded H.264 in both directions", async () => {
+function feedbackIsHealthy(stats, browserName) {
+  const videoReports = stats.remoteInbound.filter((report) => report.kind === "video");
+  return videoReports.length > 0 &&
+    videoReports.every((report) => report.packetsLost === 0) &&
+    videoReports.some((report) => report.roundTripTimeMeasurements > 0) &&
+    (browserName === "firefox" || stats.availableOutgoingBitrate >= 1_400_000);
+}
+
+test("production SFU browser contract", async ({ browser, browserName }) => {
   test.setTimeout(90_000);
-  const fixtureServer = await startStaticServer();
-  const port = fixtureServer.address().port;
-  const leftBrowser = await chromium.launch({ headless: true });
-  const rightBrowser = await chromium.launch({ headless: true });
-  const left = await leftBrowser.newPage();
-  const right = await rightBrowser.newPage();
+  const staticServer = await startStaticServer();
+  const pageUrl = `http://127.0.0.1:${staticServer.address().port}/manual-subscriptions.html`;
+  const leftContext = await browser.newContext();
+  const rightContext = await browser.newContext();
+  const left = await leftContext.newPage();
+  const right = await rightContext.newPage();
   let pulsebeam;
+
   try {
+    await Promise.all([left.goto(pageUrl), right.goto(pageUrl)]);
     await Promise.all([
-      left.goto(`http://127.0.0.1:${port}/manual-subscriptions.html`),
-      right.goto(`http://127.0.0.1:${port}/manual-subscriptions.html`),
+      left.locator("#enable-media").click(),
+      right.locator("#enable-media").click(),
     ]);
+    await expect.poll(async () => Promise.all([
+      left.evaluate(() => window.pulsebeamManual.supportsH264()),
+      right.evaluate(() => window.pulsebeamManual.supportsH264()),
+    ]), { timeout: 30_000, message: `${browserName} must provide H.264 send and receive` })
+      .toEqual([true, true]);
+
     const started = await startPulseBeam();
     pulsebeam = started.pulsebeam;
-    await left.evaluate((apiUrl) => window.pulsebeamManual.connect({
-      apiUrl,
-      room: "manual-browser-subscriptions",
-    }), started.apiUrl);
-    await right.evaluate((apiUrl) => window.pulsebeamManual.connect({
-      apiUrl,
-      room: "manual-browser-subscriptions",
-    }), started.apiUrl);
+    await Promise.all([
+      left.evaluate((apiUrl) => window.pulsebeamManual.connect({ apiUrl, room: "browser-contract" }), started.apiUrl),
+      right.evaluate((apiUrl) => window.pulsebeamManual.connect({ apiUrl, room: "browser-contract" }), started.apiUrl),
+    ]);
+
     await expect.poll(async () => {
-      const [leftStats, rightStats] = await Promise.all([
+      const stats = await Promise.all([
         left.evaluate(() => window.pulsebeamManual.stats()),
         right.evaluate(() => window.pulsebeamManual.stats()),
       ]);
-      return [leftStats, rightStats].every((stats) =>
-        stats.connectionState === "connected" &&
-        ["q", "h", "f"].every((rid) =>
-          stats.outbound.some((stream) => stream.rid === rid && stream.packetsSent > 0)) &&
-        decodedFrames(stats) >= 20 &&
-        stats.rendered.some((video) => video.width > 0 && video.height > 0));
-    }, { timeout: 20_000, message: "manual browser subscriptions never produced rendered video" }).toBe(true);
+      return stats.every((value) =>
+        value.connectionState === "connected" &&
+        publishesRequiredLayers(value, browserName) &&
+        feedbackIsHealthy(value, browserName) &&
+        decodedFrames(value) >= 20 &&
+        value.inbound.some((stream) => stream.keyFramesDecoded >= 1) &&
+        presentsAt(value, browserName, 1280, 720) &&
+        value.outboundAudio.some((stream) =>
+          stream.packetsSent > 20 && stream.codec?.toLowerCase() === "audio/opus") &&
+        value.inboundAudio.some((stream) =>
+          stream.packetsReceived > 20 && stream.codec?.toLowerCase() === "audio/opus") &&
+        value.dataChannel.readyState === "open" &&
+        value.dataChannel.intentsSent > 0 &&
+        value.dataChannel.messagesReceived > 0);
+    }, { timeout: 25_000, message: `${browserName} did not establish production media and signaling` }).toBe(true);
 
     const before = await Promise.all([
       left.evaluate(() => window.pulsebeamManual.stats()),
@@ -235,100 +184,113 @@ test("manual browser subscriptions sustain decoded H.264 in both directions", as
         left.evaluate(() => window.pulsebeamManual.stats()),
         right.evaluate(() => window.pulsebeamManual.stats()),
       ]);
-      return after.every((stats, index) => {
-        const frames = decodedFrames(stats) - decodedFrames(before[index]);
-        const samples = jitterSamples(stats) - jitterSamples(before[index]);
-        const delay = jitterDelay(stats) - jitterDelay(before[index]);
-        return frames >= 20 && (samples === 0 || delay / samples <= 0.5);
-      });
-    }, { timeout: 8_000, message: "manual browser video froze or accumulated excessive jitter-buffer delay" }).toBe(true);
-  } catch (error) {
-    const [leftStats, rightStats, leftSdp, rightSdp] = await Promise.all([
-      left.evaluate(() => window.pulsebeamManual?.stats?.()).catch(() => null),
-      right.evaluate(() => window.pulsebeamManual?.stats?.()).catch(() => null),
-      left.evaluate(() => window.pulsebeamManual?.sdp?.()).catch(() => null),
-      right.evaluate(() => window.pulsebeamManual?.sdp?.()).catch(() => null),
+      return after.every((value, index) =>
+        decodedFrames(value) - decodedFrames(before[index]) >= 20 &&
+        value.inboundAudio.reduce((sum, stream) => sum + stream.packetsReceived, 0) -
+          before[index].inboundAudio.reduce((sum, stream) => sum + stream.packetsReceived, 0) >= 20);
+    }, { timeout: 8_000, message: `${browserName} video froze after first render` }).toBe(true);
+
+    const beforeLow = await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.stats()),
+      right.evaluate(() => window.pulsebeamManual.stats()),
     ]);
-    throw new Error(`${error.message}\nLeft browser: ${JSON.stringify(leftStats)}\nRight browser: ${JSON.stringify(rightStats)}\nLeft SDP: ${JSON.stringify(leftSdp)}\nRight SDP: ${JSON.stringify(rightSdp)}\nPulseBeam:\n${pulsebeam?.output() ?? "not started"}`);
+    await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(180)),
+      right.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(180)),
+    ]);
+    await expect.poll(async () => {
+      const stats = await Promise.all([
+        left.evaluate(() => window.pulsebeamManual.stats()),
+        right.evaluate(() => window.pulsebeamManual.stats()),
+      ]);
+      return stats.every((value, index) => browserName === "webkit"
+        ? decodedFrames(value) - decodedFrames(beforeLow[index]) >= 5 &&
+          presentsAt(value, browserName, 1280, 720)
+        : renderedAt(value, 320, 180));
+    }, { timeout: 15_000, message: `${browserName} did not render the selected low layer` }).toBe(true);
+
+    await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(720)),
+      right.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(720)),
+    ]);
+    await expect.poll(async () => {
+      const stats = await Promise.all([
+        left.evaluate(() => window.pulsebeamManual.stats()),
+        right.evaluate(() => window.pulsebeamManual.stats()),
+      ]);
+      return stats.every((value) => presentsAt(value, browserName, 1280, 720));
+    }, { timeout: 15_000, message: `${browserName} did not recover the selected high layer` }).toBe(true);
+
+    await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.setPublishing(false)),
+      right.evaluate(() => window.pulsebeamManual.setPublishing(false)),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 6_000));
+    const paused = await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.stats()),
+      right.evaluate(() => window.pulsebeamManual.stats()),
+    ]);
+    await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.setPublishing(true)),
+      right.evaluate(() => window.pulsebeamManual.setPublishing(true)),
+    ]);
+    await expect.poll(async () => {
+      const resumed = await Promise.all([
+        left.evaluate(() => window.pulsebeamManual.stats()),
+        right.evaluate(() => window.pulsebeamManual.stats()),
+      ]);
+      return resumed.every((value, index) =>
+        decodedFrames(value) - decodedFrames(paused[index]) >= 10 &&
+        value.inbound.some((stream, streamIndex) =>
+          stream.keyFramesDecoded > (paused[index].inbound[streamIndex]?.keyFramesDecoded ?? 0)) &&
+        presentsAt(value, browserName, 1280, 720));
+    }, { timeout: 15_000, message: `${browserName} did not recover renderable video after a paused source resumed` }).toBe(true);
+
+    const backpressure = await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.exerciseDataBackpressure()),
+      right.evaluate(() => window.pulsebeamManual.exerciseDataBackpressure()),
+    ]);
+    expect(backpressure.every((result) =>
+      result.peakBufferedAmount > 0 && result.finalBufferedAmount === 0),
+    `${browserName} data channel did not expose and drain backpressure`).toBe(true);
+    const beforeDataControl = await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.stats()),
+      right.evaluate(() => window.pulsebeamManual.stats()),
+    ]);
+    await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(360)),
+      right.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(360)),
+    ]);
+    await expect.poll(async () => {
+      const stats = await Promise.all([
+        left.evaluate(() => window.pulsebeamManual.stats()),
+        right.evaluate(() => window.pulsebeamManual.stats()),
+      ]);
+      return stats.every((value, index) => browserName === "webkit"
+        ? decodedFrames(value) - decodedFrames(beforeDataControl[index]) >= 5 &&
+          presentsAt(value, browserName, 1280, 720)
+        : renderedAt(value, 640, 360));
+    }, { timeout: 10_000, message: `${browserName} data-channel round trip stopped under backpressure` }).toBe(true);
+    await Promise.all([
+      left.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(720)),
+      right.evaluate(() => window.pulsebeamManual.setSubscriptionHeight(720)),
+    ]);
+    await expect.poll(async () => {
+      const stats = await Promise.all([
+        left.evaluate(() => window.pulsebeamManual.stats()),
+        right.evaluate(() => window.pulsebeamManual.stats()),
+      ]);
+      return stats.every((value) => presentsAt(value, browserName, 1280, 720));
+    }, { timeout: 10_000, message: `${browserName} did not recover high video after data-channel backpressure` }).toBe(true);
+  } catch (error) {
+    const diagnostics = await Promise.all([
+      left.evaluate(async () => ({ stats: await window.pulsebeamManual?.stats?.(), sdp: window.pulsebeamManual?.sdp?.() })).catch(() => null),
+      right.evaluate(async () => ({ stats: await window.pulsebeamManual?.stats?.(), sdp: window.pulsebeamManual?.sdp?.() })).catch(() => null),
+    ]);
+    throw new Error(`${error.message}\nBrowser diagnostics: ${JSON.stringify(diagnostics)}\nPulseBeam:\n${pulsebeam?.output() ?? "not started"}`);
   } finally {
-    fixtureServer.close();
+    staticServer.close();
     await stop(pulsebeam?.child);
-    await leftBrowser.close();
-    await rightBrowser.close();
+    await Promise.all([leftContext.close(), rightContext.close()]);
   }
 });
-
-for (const [publisherName, publisherType] of Object.entries(engines)) {
-  for (const [viewerName, viewerType] of Object.entries(engines)) {
-    test(`${publisherName} publisher renders on ${viewerName}`, async () => {
-      test.setTimeout(120_000);
-      const fixtureServer = await startStaticServer();
-      const port = fixtureServer.address().port;
-      const publisherBrowser = await publisherType.launch({ headless: true });
-      const viewerBrowser = await viewerType.launch({ headless: true });
-      const publisherPage = await publisherBrowser.newPage();
-      const viewerPage = await viewerBrowser.newPage();
-      let pulsebeam;
-      try {
-        await Promise.all([
-          publisherPage.goto(`http://127.0.0.1:${port}/publisher.html`),
-          viewerPage.goto(`http://127.0.0.1:${port}/viewer.html`),
-        ]);
-        const [publisherCodecs, viewerCodecs] = await Promise.all([
-          publisherPage.evaluate(() => window.pulsebeamPublisher.codecs()),
-          viewerPage.evaluate(() => window.pulsebeamViewer.codecs()),
-        ]);
-        test.skip(
-          commonCodecs(publisherCodecs, viewerCodecs).length === 0,
-          "browser pair has no common H.264 codec",
-        );
-        for (const codec of commonCodecs(publisherCodecs, viewerCodecs)) {
-          await Promise.all([
-            publisherPage.goto(`http://127.0.0.1:${port}/publisher.html`),
-            viewerPage.goto(`http://127.0.0.1:${port}/viewer.html`),
-          ]);
-          const started = await startPulseBeam();
-          pulsebeam = started.pulsebeam;
-          await publisherPage.evaluate(({ apiUrl, codec }) => window.pulsebeamPublisher.connect({
-            apiUrl,
-            room: "browser-matrix",
-            codec,
-          }), { apiUrl: started.apiUrl, codec });
-          await expect.poll(async () => {
-            const stats = await publisherPage.evaluate(() => window.pulsebeamPublisher.stats());
-            return stats.connectionState === "connected" &&
-              stats.outbound.some((stream) => stream.bytesSent > 0 && stream.packetsSent > 0);
-          }, { timeout: 20_000, message: `browser publisher never sent ${codec} RTP` }).toBe(true);
-          await viewerPage.evaluate(({ apiUrl, codec }) => window.pulsebeamViewer.connect({
-            apiUrl,
-            room: "browser-matrix",
-            codec,
-          }), { apiUrl: started.apiUrl, codec });
-          await expect.poll(async () => {
-            const stats = await viewerPage.evaluate(() => window.pulsebeamViewer.stats());
-            return stats.connectionState === "connected" &&
-              stats.inbound.some((stream) => stream.codec?.toLowerCase() === codec && stream.framesDecoded > 0) &&
-              stats.rendered.some((video) => video.width > 0 && video.height > 0);
-          }, { timeout: 20_000, message: `browser viewer never decoded ${codec}` }).toBe(true);
-          await stop(pulsebeam.child);
-          pulsebeam = undefined;
-        }
-      } catch (error) {
-        const [publisherStats, viewerStats] = await Promise.all([
-          publisherPage.evaluate(() => window.pulsebeamPublisher?.stats?.()).catch(() => null),
-          viewerPage.evaluate(() => window.pulsebeamViewer?.stats?.()).catch(() => null),
-        ]);
-        const [publisherSdp, viewerSdp] = await Promise.all([
-          publisherPage.evaluate(() => window.pulsebeamPublisher?.sdp?.()).catch(() => null),
-          viewerPage.evaluate(() => window.pulsebeamViewer?.sdp?.()).catch(() => null),
-        ]);
-        throw new Error(`${error.message}\nPublisher: ${JSON.stringify(publisherStats)}\nViewer: ${JSON.stringify(viewerStats)}\nPublisher SDP: ${JSON.stringify(publisherSdp)}\nViewer SDP: ${JSON.stringify(viewerSdp)}\nPulseBeam:\n${pulsebeam?.output() ?? "not started"}`);
-      } finally {
-        fixtureServer.close();
-        await stop(pulsebeam?.child);
-        await publisherBrowser.close();
-        await viewerBrowser.close();
-      }
-    });
-  }
-}

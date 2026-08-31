@@ -185,7 +185,8 @@ impl SlotManager {
                     slot.track_id = None;
                     continue;
                 };
-                if slot.track_id.as_deref() == Some(&binding.track_id) {
+                let rebound = slot.track_id.as_deref() != Some(&binding.track_id);
+                if !rebound {
                     if slot.paused != binding.paused {
                         slot.paused = binding.paused;
                         pause_changes.push((binding.track_id.clone(), binding.paused));
@@ -197,10 +198,13 @@ impl SlotManager {
                         pause_changes.push((binding.track_id.clone(), true));
                     }
                 }
-                bound.push((slot.mid, binding.track_id.clone()));
+                bound.push((slot.mid, binding.track_id.clone(), rebound));
             }
-            for (mid, track_id) in bound {
-                if self.active_tracks.contains_key(&track_id) {
+            for (mid, track_id, rebound) in bound {
+                if let Some(publication) = self.active_tracks.get(&track_id).cloned() {
+                    if rebound {
+                        new_assignments.push((mid, publication));
+                    }
                     continue;
                 }
                 if let Some(publication) = self.pending_tracks.remove(&track_id) {
@@ -431,6 +435,23 @@ mod tests {
         assert_eq!(outcome.removed_tracks, vec!["t1"]);
         assert!(slots.known("t1").is_none());
         assert!(slots.assigned("t1").is_none());
+    }
+
+    #[test]
+    fn returning_to_an_active_track_rebinds_the_receiver_slot() {
+        let mut slots = SlotManager::new();
+        slots.register(Mid::from("v0"));
+        slots.sync(update(
+            vec![assignment("v0", "a", false)],
+            vec![track("a"), track("b")],
+        ));
+        slots.sync(update(vec![assignment("v0", "b", false)], Vec::new()));
+
+        let returned = slots.sync(update(vec![assignment("v0", "a", false)], Vec::new()));
+
+        assert_eq!(returned.new_assignments.len(), 1);
+        assert_eq!(returned.new_assignments[0].0, Mid::from("v0"));
+        assert_eq!(returned.new_assignments[0].1.track_id, "a");
     }
 
     /// An audio slot binds its track the same way a video slot does, so the media has somewhere

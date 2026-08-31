@@ -1,5 +1,4 @@
 use crate::route::{TransportHandle, TransportRoute};
-use pulsebeam_rtc::IceCredentials;
 
 /// Wire layout — 10 bytes → 16 Crockford base32 chars (80 bits / 5 = 16, exact):
 ///
@@ -118,11 +117,7 @@ impl IceUfrag {
         Some(Self::from_shared(shared))
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "the encoder creates a non-empty ICE ufrag and password"
-    )]
-    pub fn into_ice_creds(self) -> IceCredentials {
+    pub fn into_ice_creds(self) -> (String, String) {
         // The ICE password is the only thing authenticating a peer against this
         // route, so it comes from OS entropy directly. Under simulation the
         // `getrandom(2)` override makes that reproducible without any seed
@@ -131,8 +126,7 @@ impl IceUfrag {
         use pulsebeam_runtime::rand::RngCore;
         pulsebeam_runtime::rand::os_rng().fill_bytes(&mut pass_raw);
         let pass = base32::encode(base32::Alphabet::Crockford, &pass_raw);
-        IceCredentials::new(self.encode(), pass)
-            .expect("encoded ICE ufrag and random password are non-empty")
+        (self.encode(), pass)
     }
 }
 
@@ -184,9 +178,9 @@ mod tests {
     fn ice_creds_ufrag_and_pass_lengths() {
         let u = IceUfrag::new(1, 2, route(3, 9), 5);
         let creds = u.into_ice_creds();
-        assert_eq!(creds.ufrag().len(), 16);
-        assert_eq!(creds.password().len(), 24);
-        assert!(creds.password().len() >= 22);
+        assert_eq!(creds.0.len(), 16);
+        assert_eq!(creds.1.len(), 24);
+        assert!(creds.1.len() >= 22);
     }
 
     #[test]

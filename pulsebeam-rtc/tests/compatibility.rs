@@ -1,14 +1,10 @@
-use pulsebeam_rtc::{
-    DtlsFingerprint, IceCandidate, IceCredentials, MediaDirection, MediaKind, ServerTransport,
-    negotiate,
-};
+use pulsebeam_rtc::{MediaDirection, MediaKind, RtcNegotiation, RtcPeer};
 use str0m::sdp::{MediaAttribute, Sdp, SessionAttribute};
 
 struct Fixture {
     name: &'static str,
     offer: &'static str,
     media: &'static [(MediaKind, MediaDirection)],
-    remote_candidates: usize,
 }
 
 const FIXTURES: &[Fixture] = &[
@@ -20,7 +16,6 @@ const FIXTURES: &[Fixture] = &[
             (MediaKind::Video, MediaDirection::Inactive),
             (MediaKind::Application, MediaDirection::Bidirectional),
         ],
-        remote_candidates: 1,
     },
     Fixture {
         name: "firefox-128-publisher",
@@ -29,7 +24,6 @@ const FIXTURES: &[Fixture] = &[
             (MediaKind::Audio, MediaDirection::ReceiveOnly),
             (MediaKind::Video, MediaDirection::Inactive),
         ],
-        remote_candidates: 1,
     },
     Fixture {
         name: "webkit-18-subscriber",
@@ -38,43 +32,35 @@ const FIXTURES: &[Fixture] = &[
             (MediaKind::Audio, MediaDirection::SendOnly),
             (MediaKind::Video, MediaDirection::SendOnly),
         ],
-        remote_candidates: 1,
     },
 ];
 
-fn server() -> Result<ServerTransport, &'static str> {
-    let ice = IceCredentials::new("localufrag".to_owned(), "localpassword".to_owned())
-        .ok_or("valid local ICE credentials")?;
-    let fingerprint = DtlsFingerprint::new("sha-256".to_owned(), Box::new([9; 32]))
-        .ok_or("valid local fingerprint")?;
-    let candidate =
-        IceCandidate::new("candidate:1 1 UDP 2130706431 127.0.0.1 9000 typ host".to_owned())
-            .ok_or("valid candidate")?;
-    Ok(ServerTransport::new(
+fn negotiate(offer: &str) -> Result<RtcNegotiation, String> {
+    RtcPeer::accept(
+        std::time::Instant::now(),
         7,
-        ice,
-        fingerprint,
-        Box::new([candidate]),
-    ))
+        offer,
+        "localufrag".to_owned(),
+        "localpassword".to_owned(),
+        vec!["candidate:1 1 UDP 2130706431 127.0.0.1 9000 typ host".to_owned()].into_boxed_slice(),
+    )
+    .map(|(_, negotiation)| negotiation)
+    .map_err(|error| error.to_string())
 }
 
 #[test]
 fn client_offer_corpus_produces_web_rtc_1_compatible_answers() -> Result<(), String> {
     for fixture in FIXTURES {
-        let result = negotiate(fixture.offer, &server().map_err(str::to_owned)?)
-            .map_err(|error| format!("{}: {error}", fixture.name))?;
-        let answer = Sdp::parse(result.answer().as_str())
+        let result =
+            negotiate(fixture.offer).map_err(|error| format!("{}: {error}", fixture.name))?;
+        let answer = Sdp::parse(result.answer())
             .map_err(|error| format!("{}: invalid answer: {error}", fixture.name))?;
         answer
             .assert_consistency()
             .map_err(|error| format!("{}: inconsistent answer: {error}", fixture.name))?;
 
-        assert_eq!(
-            result.session().remote_candidates().len(),
-            fixture.remote_candidates
-        );
-        assert_eq!(result.session().media_sections().len(), fixture.media.len());
-        for (section, expected) in result.session().media_sections().iter().zip(fixture.media) {
+        assert_eq!(result.media().len(), fixture.media.len());
+        for (section, expected) in result.media().iter().zip(fixture.media) {
             assert_eq!(
                 (section.kind(), section.direction()),
                 *expected,
@@ -82,12 +68,7 @@ fn client_offer_corpus_produces_web_rtc_1_compatible_answers() -> Result<(), Str
                 fixture.name
             );
         }
-        for (section, media) in result
-            .session()
-            .media_sections()
-            .iter()
-            .zip(answer.media_lines.iter())
-        {
+        for (section, media) in result.media().iter().zip(answer.media_lines.iter()) {
             assert_eq!(
                 media.disabled,
                 section.kind() != MediaKind::Application && section.codecs().is_empty(),
@@ -143,17 +124,12 @@ fn client_offer_corpus_produces_web_rtc_1_compatible_answers() -> Result<(), Str
 #[test]
 fn browser_offer_corpus_negotiates_only_pulsebeam_codecs() -> Result<(), String> {
     for fixture in FIXTURES {
-        let result = negotiate(fixture.offer, &server().map_err(str::to_owned)?)
-            .map_err(|error| format!("{}: {error}", fixture.name))?;
-        let answer = Sdp::parse(result.answer().as_str())
+        let result =
+            negotiate(fixture.offer).map_err(|error| format!("{}: {error}", fixture.name))?;
+        let answer = Sdp::parse(result.answer())
             .map_err(|error| format!("{}: invalid answer: {error}", fixture.name))?;
 
-        for (section, answer_section) in result
-            .session()
-            .media_sections()
-            .iter()
-            .zip(answer.media_lines.iter())
-        {
+        for (section, answer_section) in result.media().iter().zip(answer.media_lines.iter()) {
             let supported = match section.kind() {
                 MediaKind::Audio => "opus",
                 MediaKind::Video => "h264",
@@ -208,13 +184,10 @@ fn supported_offer_shapes_always_produce_consistent_answers() -> Result<(), Stri
              a=extmap:{extension_id} urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
              {candidate}"
                 );
-                let result =
-                    negotiate(&offer, &server().map_err(str::to_owned)?).map_err(|error| {
-                        format!(
-                            "{direction} extension {extension_id} candidate {candidate:?}: {error}"
-                        )
-                    })?;
-                let answer = Sdp::parse(result.answer().as_str()).map_err(|error| {
+                let result = negotiate(&offer).map_err(|error| {
+                    format!("{direction} extension {extension_id} candidate {candidate:?}: {error}")
+                })?;
+                let answer = Sdp::parse(result.answer()).map_err(|error| {
                     format!("{direction} extension {extension_id} candidate {candidate:?}: {error}")
                 })?;
 

@@ -21,6 +21,7 @@ pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
 
 #[derive(Clone, Copy)]
 pub(crate) struct IncomingRtpRoute {
+    pub(crate) ingress: pulsebeam_rtc::IngressStream,
     pub(crate) ssrc: Ssrc,
     pub(crate) mid: Mid,
     pub(crate) rid: Option<Rid>,
@@ -302,6 +303,14 @@ impl Upstream {
         self.routes.routes.iter().copied().find(|route| {
             route.track_id == track_id && (rid.is_none() || route.rid.as_ref() == rid)
         })
+    }
+    pub(crate) fn routes_for_track(&self, track_id: TrackId) -> Vec<IncomingRtpRoute> {
+        self.routes
+            .routes
+            .iter()
+            .copied()
+            .filter(|route| route.track_id == track_id)
+            .collect()
     }
     pub(crate) fn cache_route(&mut self, route: IncomingRtpRoute) {
         self.routes.insert(route);

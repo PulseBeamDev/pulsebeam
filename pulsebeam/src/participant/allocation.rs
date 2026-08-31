@@ -50,13 +50,10 @@ impl fmt::Display for Bitrate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllocationInput {
     pub estimate: Bitrate,
-    pub application_limited: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocationOutput {
     pub desired: Bitrate,
     pub allocated: Bitrate,
-    pub recovery: Option<Bitrate>,
-    pub probe: Option<Bitrate>,
 }

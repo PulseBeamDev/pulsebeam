@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-
-use crate::MediaSectionId;
+use crate::{IceCandidate, MediaDirection, MediaKind, MediaSectionId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IceCredentials {
@@ -48,54 +46,6 @@ impl DtlsFingerprint {
     pub fn value(&self) -> &[u8] {
         &self.value
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IceCandidate(String);
-
-impl IceCandidate {
-    pub fn new(value: String) -> Option<Self> {
-        if value.is_empty() {
-            return None;
-        }
-
-        Some(Self(value))
-    }
-
-    pub fn as_sdp(&self) -> &str {
-        &self.0
-    }
-
-    pub(crate) fn is_mdns(&self) -> bool {
-        let Some((_, value)) = self.0.split_once(':') else {
-            return false;
-        };
-        let mut fields = value.split_ascii_whitespace();
-        let _foundation = fields.next();
-        let _component = fields.next();
-        let _protocol = fields.next();
-        let _priority = fields.next();
-        let address = fields.next();
-        let _port = fields.next();
-        let typ = fields.next();
-        let _kind = fields.next();
-        matches!(typ, Some("typ")) && address.is_some_and(|address| address.ends_with(".local"))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MediaKind {
-    Audio,
-    Video,
-    Application,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MediaDirection {
-    SendOnly,
-    ReceiveOnly,
-    Inactive,
-    Bidirectional,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,7 +251,6 @@ pub struct NegotiatedSession {
     remote_fingerprint: DtlsFingerprint,
     remote_candidates: Box<[IceCandidate]>,
     media_sections: Box<[NegotiatedMediaSection]>,
-    media_by_mid: HashMap<String, MediaSectionId>,
 }
 
 impl NegotiatedSession {
@@ -343,10 +292,6 @@ impl NegotiatedSession {
         Some(section)
     }
 
-    pub fn media_section_by_mid(&self, mid: &str) -> Option<&NegotiatedMediaSection> {
-        self.media_section(*self.media_by_mid.get(mid)?)
-    }
-
     pub(crate) fn new(
         local_ice: IceCredentials,
         local_fingerprint: DtlsFingerprint,
@@ -356,14 +301,15 @@ impl NegotiatedSession {
         remote_candidates: Box<[IceCandidate]>,
         media_sections: Box<[NegotiatedMediaSection]>,
     ) -> Self {
-        let mut media_by_mid = HashMap::with_capacity(media_sections.len());
-        for section in &media_sections {
-            let previous = media_by_mid.insert(section.mid.clone(), section.id());
-            debug_assert!(
-                previous.is_none(),
-                "negotiation rejects duplicate media section MIDs"
-            );
-        }
+        debug_assert_eq!(
+            media_sections
+                .iter()
+                .map(NegotiatedMediaSection::mid)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            media_sections.len(),
+            "negotiation rejects duplicate media section MIDs"
+        );
         Self {
             local_ice,
             local_fingerprint,
@@ -372,7 +318,6 @@ impl NegotiatedSession {
             remote_fingerprint,
             remote_candidates,
             media_sections,
-            media_by_mid,
         }
     }
 }

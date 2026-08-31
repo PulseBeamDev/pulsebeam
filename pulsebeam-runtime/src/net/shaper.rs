@@ -563,7 +563,6 @@ pub fn clear() {
         .lock()
         .expect("shaper GRO windows poisoned")
         .clear();
-    reorders().lock().expect("shaper reorders poisoned").clear();
     stats_map().lock().expect("shaper stats poisoned").clear();
 }
 
@@ -614,6 +613,14 @@ struct Queued {
     buf: Vec<u8>,
 }
 
+fn udp_wire_bytes(dst: IpAddr, payload_bytes: usize) -> usize {
+    let headers = match dst {
+        IpAddr::V4(_) => 20usize.saturating_add(8),
+        IpAddr::V6(_) => 40usize.saturating_add(8),
+    };
+    payload_bytes.saturating_add(headers)
+}
+
 /// Egress bottleneck state for one socket.
 ///
 /// Shared behind a handle rather than copied: `UdpTransportWriter` is `Clone`, and a bottleneck
@@ -646,6 +653,14 @@ struct ShaperState {
     loss_counter: u64,
     /// Gilbert-Elliott position per destination: true while in the bad state.
     in_bad_state: HashMap<IpAddr, bool>,
+}
+
+#[derive(Clone, Copy)]
+struct ShapingRule {
+    bottleneck: Bottleneck,
+    bits_per_sec: u64,
+    max_backlog: Duration,
+    reorder: Reorder,
 }
 
 impl Default for ShaperState {
@@ -730,10 +745,12 @@ impl Shaper {
                 now,
                 dst,
                 buf,
-                bottleneck,
-                bits_per_sec,
-                max_backlog,
-                reorder,
+                ShapingRule {
+                    bottleneck,
+                    bits_per_sec,
+                    max_backlog,
+                    reorder,
+                },
             )
         })
     }
@@ -823,33 +840,28 @@ impl ShaperState {
         }
     }
 
-    fn offer(
-        &mut self,
-        now: Instant,
-        dst: SocketAddr,
-        buf: &[u8],
-        bottleneck: Bottleneck,
-        bits_per_sec: u64,
-        max_backlog: Duration,
-        reorder: Reorder,
-    ) -> Shaped {
-        // Serialisation delay: how long this packet occupies the link.
+    fn offer(&mut self, now: Instant, dst: SocketAddr, buf: &[u8], rule: ShapingRule) -> Shaped {
+        debug_assert!(rule.bits_per_sec > 0, "a shaped link must advance");
+        let wire_bytes = udp_wire_bytes(dst.ip(), buf.len());
+        debug_assert!(wire_bytes > buf.len(), "UDP/IP headers occupy the wire");
         let on_wire =
-            Duration::from_secs_f64((buf.len() as f64 * 8.0) / bits_per_sec.max(1) as f64);
+            Duration::from_secs_f64((wire_bytes as f64 * 8.0) / rule.bits_per_sec.max(1) as f64);
+        debug_assert!(!on_wire.is_zero(), "a datagram must occupy link time");
 
-        let idle_at = self.next_free.entry(bottleneck).or_insert(now);
+        let idle_at = self.next_free.entry(rule.bottleneck).or_insert(now);
         // A link idle in the past is idle now; it does not accrue credit.
         let release_at = (*idle_at).max(now);
+        debug_assert!(release_at >= now, "serialization cannot start in the past");
         let backlog = release_at.saturating_duration_since(now);
 
-        if backlog > max_backlog {
+        if backlog > rule.max_backlog {
             // Buffer full. Tail drop, exactly as a bottleneck queue does.
-            record_for(bottleneck, |s| s.dropped_overflow += 1);
+            record_for(rule.bottleneck, |s| s.dropped_overflow += 1);
             return Shaped::Absorbed;
         }
 
         *idle_at = release_at + on_wire;
-        record_for(bottleneck, |s| {
+        record_for(rule.bottleneck, |s| {
             s.delivered += 1;
             s.max_backlog = s.max_backlog.max(backlog);
             s.backlog_sum = s.backlog_sum.saturating_add(backlog);
@@ -860,8 +872,10 @@ impl ShaperState {
         // genuinely leaves after ones offered behind it. Delaying it in place would only add
         // jitter; the queue is re-sorted below so departure order actually changes.
         let mut release_at = release_at;
-        if reorder.probability > 0.0 && next_uniform(&mut self.loss_counter) < reorder.probability {
-            release_at += reorder.delay;
+        if rule.reorder.probability > 0.0
+            && next_uniform(&mut self.loss_counter) < rule.reorder.probability
+        {
+            release_at += rule.reorder.delay;
             record(dst.ip(), |s| s.reordered += 1);
         }
 
@@ -876,6 +890,13 @@ impl ShaperState {
         self.queue
             .make_contiguous()
             .sort_by_key(|q: &Queued| q.release_at);
+        debug_assert!(
+            self.queue
+                .iter()
+                .zip(self.queue.iter().skip(1))
+                .all(|(left, right)| left.release_at <= right.release_at),
+            "release queue must remain chronological"
+        );
         Shaped::Absorbed
     }
 
@@ -908,7 +929,7 @@ impl ShaperState {
             if backlog > max_backlog {
                 record_for(shared, |stats| {
                     stats.background_dropped_overflow =
-                        stats.background_dropped_overflow.saturating_add(1)
+                        stats.background_dropped_overflow.saturating_add(1);
                 });
             } else {
                 *idle_at = release_at + on_wire;
@@ -932,6 +953,12 @@ impl ShaperState {
             let q = self.queue.pop_front().expect("front just checked");
             out.push((q.dst, q.buf));
         }
+        debug_assert!(
+            self.queue
+                .front()
+                .is_none_or(|packet| packet.release_at > now),
+            "all due packets must be drained"
+        );
         out
     }
 }
@@ -1007,11 +1034,11 @@ mod tests {
 
         let mut shaper = Shaper::default();
         let start = Instant::now();
-        // 13 x 1054 B = 13702 B, which at 3 Mbps is 36.5ms of serialisation.
+        // Each IPv4 UDP datagram occupies its payload plus 28 header bytes.
         for _ in 0..13 {
             shaper.offer(start, dst, &[0u8; 1054]);
         }
-        let expected = Duration::from_secs_f64(13.0 * 1054.0 * 8.0 / 3_000_000.0);
+        let expected = Duration::from_secs_f64(13.0 * 1082.0 * 8.0 / 3_000_000.0);
 
         let half = shaper.drain_due(start + expected / 2).len();
         assert!(
@@ -1024,6 +1051,85 @@ mod tests {
             shaper.is_empty(),
             "the burst should be fully released once its serialisation time has elapsed"
         );
+    }
+
+    #[test]
+    fn serialization_uses_udp_and_ip_wire_size() {
+        let ipv4: IpAddr = "9.9.9.11".parse().unwrap();
+        let ipv6: IpAddr = "2001:db8::11".parse().unwrap();
+        let rate = 8_000_000;
+        set_downlink_with_backlog(ipv4, rate, Duration::from_secs(1));
+        set_downlink_with_backlog(ipv6, rate, Duration::from_secs(1));
+
+        let start = Instant::now();
+        let payload = [0u8; 972];
+        let mut shaper = Shaper::default();
+        for ip in [ipv4, ipv6] {
+            let dst = SocketAddr::new(ip, 9000);
+            shaper.offer(start, dst, &payload);
+            shaper.offer(start, dst, &payload);
+        }
+
+        let ipv4_time = Duration::from_millis(1);
+        let ipv6_time = Duration::from_micros(1_020);
+        let initial = shaper.drain_due(start);
+        assert_eq!(initial.len(), 2);
+        assert_eq!(
+            shaper
+                .drain_due(start + ipv4_time - Duration::from_nanos(1))
+                .len(),
+            0
+        );
+        let ipv4_due = shaper.drain_due(start + ipv4_time);
+        assert_eq!(ipv4_due.len(), 1);
+        assert_eq!(ipv4_due[0].0.ip(), ipv4);
+        assert_eq!(shaper.drain_due(start + ipv6_time).len(), 1);
+    }
+
+    #[test]
+    fn equal_release_times_preserve_offer_order() {
+        let ip: IpAddr = "9.9.9.12".parse().unwrap();
+        let dst = SocketAddr::new(ip, 9000);
+        set_reorder(
+            ip,
+            Reorder {
+                probability: 1.0,
+                delay: Duration::from_millis(10),
+            },
+        );
+        let mut shaper = Shaper::default();
+        let start = Instant::now();
+        for value in 0u8..8 {
+            assert!(matches!(
+                shaper.offer(start, dst, &[value]),
+                Shaped::Absorbed
+            ));
+        }
+        let due = shaper.drain_due(start + Duration::from_millis(10));
+        assert_eq!(
+            due.into_iter()
+                .map(|(_, payload)| payload[0])
+                .collect::<Vec<_>>(),
+            (0u8..8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn forward_and_feedback_impairments_are_independent() {
+        let forward: IpAddr = "9.9.9.13".parse().unwrap();
+        let feedback: IpAddr = "9.9.9.14".parse().unwrap();
+        set_loss(forward, Loss::Independent(1.0));
+        set_duplicate(forward, 0.0);
+        set_loss(feedback, Loss::Independent(0.0));
+        set_duplicate(feedback, 1.0);
+
+        let mut shaper = Shaper::default();
+        assert!(shaper.should_drop_packet(forward));
+        assert!(!shaper.should_duplicate_packet(forward));
+        assert!(!shaper.should_drop_packet(feedback));
+        assert!(shaper.should_duplicate_packet(feedback));
+        assert_eq!(stats(forward).dropped_loss, 1);
+        assert_eq!(stats(feedback).duplicated, 1);
     }
 
     /// A reordered packet must be *overtaken*, not merely delayed, and must not hold up the

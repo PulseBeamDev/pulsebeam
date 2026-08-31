@@ -434,8 +434,10 @@ mod tests {
     }
 
     fn speaking(level_dbov: i8) -> RtpPacket {
-        let mut pkt = RtpPacket::default();
-        pkt.codec = crate::rtp::Codec::Opus;
+        let mut pkt = RtpPacket {
+            codec: crate::rtp::Codec::Opus,
+            ..RtpPacket::default()
+        };
         pkt.extensions.audio_level = Some(level_dbov);
         pkt
     }

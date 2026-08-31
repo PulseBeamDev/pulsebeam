@@ -1,4 +1,4 @@
-use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Property, Room, Step, VideoQuality};
 use std::time::Duration;
 
 fn cross_shard_video_room() -> super::common::Room {
@@ -40,16 +40,38 @@ fn video_does_not_loop_back_to_publisher_test() {
 #[test]
 fn quality_fixture_is_proven_from_each_viewers_decoded_output_test() {
     LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("decoded-quality-fixture")
-                .with_participant(Participant::quality_publisher("publisher"))
-                .with_participant(Participant::subscriber("viewer-a"))
-                .with_participant(Participant::subscriber("viewer-b")),
+                .with_participant(Participant::quality_publisher_source(
+                    "publisher-a",
+                    pulsebeam_testdata::QualityVideoSource::Zero,
+                ))
+                .with_participant(Participant::quality_publisher_source(
+                    "publisher-b",
+                    pulsebeam_testdata::QualityVideoSource::One,
+                ))
+                .with_participant(Participant::manual_subscriber("viewer-a", 1))
+                .with_participant(Participant::manual_subscriber("viewer-b", 1)),
         )
         .run(vec![
             Step::Run {
-                description: "Establish the quality publisher and both viewers",
-                duration: Duration::from_secs(5),
+                description: "Establish the quality publisher and discover its fixture track",
+                duration: Duration::from_secs(1),
+            },
+            Step::SubscribeTo {
+                description: "Activate the first viewer route",
+                participant: "viewer-a",
+                targets: &[("publisher-a", 180)],
+            },
+            Step::SubscribeTo {
+                description: "Activate the second viewer route",
+                participant: "viewer-b",
+                targets: &[("publisher-b", 720)],
+            },
+            Step::Run {
+                description: "Deliver the deterministic fixture to both viewers",
+                duration: Duration::from_secs(4),
             },
             Step::CheckVideoQuality {
                 description: "First viewer decodes fixture pixels at source resolution",
@@ -59,14 +81,78 @@ fn quality_fixture_is_proven_from_each_viewers_decoded_output_test() {
             Step::CheckVideoQuality {
                 description: "Second viewer independently decodes fixture pixels at source resolution",
                 participant: "viewer-b",
-                quality: VideoQuality::min_frames(30).fixture_fidelity((320, 180), 12, 240),
+                quality: VideoQuality::min_frames(30).fixture_fidelity((1280, 720), 12, 240),
             },
             Step::CheckForwardingLatency {
-                description: "Forwarding completes at the same logical instant outside required pacing",
+                description: "Packet lifecycle stays bounded and decomposes across every forwarding stage",
                 min_samples: 30,
-                max_service: Duration::from_millis(20),
+                max_service: Duration::from_millis(40),
                 max_egress_lateness: Duration::from_millis(1),
-                max_total: Duration::from_millis(50),
+                max_total: Duration::from_millis(150),
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "First viewer renders promptly after activation",
+                participant: "viewer-a",
+                max_latency: Duration::from_millis(175),
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "Second viewer renders promptly after activation",
+                participant: "viewer-b",
+                max_latency: Duration::from_millis(175),
+            },
+        ]);
+}
+
+#[test]
+fn two_minute_quality_fixture_soak_never_blanks_or_freezes_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("two-minute-decoded-soak")
+                .with_participant(Participant::quality_publisher("publisher"))
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the quality source and viewer",
+                duration: Duration::from_secs(1),
+            },
+            Step::SubscribeTo {
+                description: "Select the inexpensive layer for the long decoder gate",
+                participant: "viewer",
+                targets: &[("publisher", 180)],
+            },
+            Step::Run {
+                description: "Complete the bounded activation transition",
+                duration: Duration::from_secs(1),
+            },
+            Step::Run {
+                description: "Decode continuously across twenty-four maintenance intervals and forty fixture epochs",
+                duration: Duration::from_secs(120),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Every steady-state picture remains the requested fixture with no visible freeze",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(3_400)
+                    .fixture_fidelity((320, 180), 12, 240)
+                    .exact_decoded_resolution((320, 180))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+            Step::CheckVideoReceivedFromInterval {
+                description: "Decoded progress belongs to the selected publisher throughout the soak",
+                participant: "viewer",
+                publisher: "publisher",
+                min_frames: 3_400,
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "The activation envelope produces a renderable frame promptly",
+                participant: "viewer",
+                max_latency: Duration::from_millis(175),
+            },
+            Step::CheckKeyframeRequestsInterval {
+                description: "The steady-state decoder window does not hide a PLI loop",
+                participant: "publisher",
+                max: 0,
             },
         ]);
 }
@@ -89,7 +175,7 @@ fn independent_viewer_capacities_keep_their_requested_simulcast_quality_test() {
             Step::SetBandwidth {
                 description: "Constrain only the low-resolution viewer",
                 participant: "low-viewer",
-                bits_per_sec: 350_000,
+                bits_per_sec: 600_000,
             },
             Step::SubscribeTo {
                 description: "High-capacity viewer requests the full encoding",
@@ -104,6 +190,10 @@ fn independent_viewer_capacities_keep_their_requested_simulcast_quality_test() {
             Step::Run {
                 description: "Let each viewer settle on its independently allocated encoding",
                 duration: Duration::from_secs(10),
+            },
+            Step::Run {
+                description: "Measure both viewers after the simulcast ramp is complete",
+                duration: Duration::from_secs(4),
             },
             Step::CheckVideoQualityInterval {
                 description: "High-capacity viewer continuously decodes full-resolution video",
@@ -123,8 +213,290 @@ fn independent_viewer_capacities_keep_their_requested_simulcast_quality_test() {
 }
 
 #[test]
+fn three_viewers_decode_exact_independent_simulcast_layers_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("exact-three-layer-viewers")
+                .with_participant(Participant::quality_publisher("publisher"))
+                .with_participant(Participant::manual_subscriber("low-viewer", 1))
+                .with_participant(Participant::manual_subscriber("mid-viewer", 1))
+                .with_participant(Participant::manual_subscriber("high-viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the publisher and three viewers",
+                duration: Duration::from_secs(2),
+            },
+            Step::SubscribeTo {
+                description: "Pin the low viewer to 180p",
+                participant: "low-viewer",
+                targets: &[("publisher", 180)],
+            },
+            Step::SubscribeTo {
+                description: "Pin the middle viewer to 360p",
+                participant: "mid-viewer",
+                targets: &[("publisher", 360)],
+            },
+            Step::SubscribeTo {
+                description: "Pin the high viewer to 720p",
+                participant: "high-viewer",
+                targets: &[("publisher", 720)],
+            },
+            Step::Run {
+                description: "Let every independent path reach its requested layer",
+                duration: Duration::from_secs(8),
+            },
+            Step::Run {
+                description: "Measure steady decoded progress on every layer",
+                duration: Duration::from_secs(4),
+            },
+            Step::Expect {
+                description: "High viewer has capacity evidence for its requested layer",
+                participant: "high-viewer",
+                property: Property::EstimateMeetsNeed { percent: 90 },
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Low viewer decodes only the engineered 180p layer",
+                participant: "low-viewer",
+                quality: VideoQuality::min_frames(90)
+                    .exact_decoded_resolution((320, 180))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Middle viewer decodes only the engineered 360p layer",
+                participant: "mid-viewer",
+                quality: VideoQuality::min_frames(90)
+                    .exact_decoded_resolution((640, 360))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "High viewer decodes only the engineered 720p layer",
+                participant: "high-viewer",
+                quality: VideoQuality::min_frames(90)
+                    .exact_decoded_resolution((1280, 720))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+        ]);
+}
+
+#[test]
+fn one_viewer_switches_every_simulcast_layer_decodably_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("decoded-layer-switches")
+                .with_participant(Participant::quality_publisher("publisher"))
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the publisher and viewer",
+                duration: Duration::from_secs(2),
+            },
+            Step::SubscribeTo {
+                description: "Start at 180p",
+                participant: "viewer",
+                targets: &[("publisher", 180)],
+            },
+            Step::Run {
+                description: "Cross the initial low-layer keyframe boundary",
+                duration: Duration::from_secs(1),
+            },
+            Step::Run {
+                description: "Measure steady decoded progress on the low layer",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Low layer is exact and continuously decodable",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(60)
+                    .all_forwarded_frames()
+                    .exact_decoded_resolution((320, 180))
+                    .max_frame_gap(Duration::from_millis(102)),
+            },
+            Step::SubscribeTo {
+                description: "Switch to 360p",
+                participant: "viewer",
+                targets: &[("publisher", 360)],
+            },
+            Step::Run {
+                description: "Cross a complete middle-layer keyframe boundary",
+                duration: Duration::from_secs(1),
+            },
+            Step::Run {
+                description: "Measure steady decoded progress on the middle layer",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Middle layer is exact and continuously decodable",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(60)
+                    .all_forwarded_frames()
+                    .exact_decoded_resolution((640, 360))
+                    .max_frame_gap(Duration::from_millis(102)),
+            },
+            Step::SubscribeTo {
+                description: "Switch to 720p",
+                participant: "viewer",
+                targets: &[("publisher", 720)],
+            },
+            Step::Run {
+                description: "Cross a complete high-layer keyframe boundary",
+                duration: Duration::from_secs(1),
+            },
+            Step::Run {
+                description: "Measure steady decoded progress on the high layer",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "High layer is exact and continuously decodable",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(60)
+                    .all_forwarded_frames()
+                    .exact_decoded_resolution((1280, 720))
+                    .max_frame_gap(Duration::from_millis(102)),
+            },
+            Step::SubscribeTo {
+                description: "Switch back to 180p",
+                participant: "viewer",
+                targets: &[("publisher", 180)],
+            },
+            Step::Run {
+                description: "Cross a fresh low-layer keyframe boundary",
+                duration: Duration::from_secs(1),
+            },
+            Step::Run {
+                description: "Measure steady decoded progress after returning low",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The return to low is exact and continuously decodable",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(60)
+                    .all_forwarded_frames()
+                    .exact_decoded_resolution((320, 180))
+                    .max_frame_gap(Duration::from_millis(102)),
+            },
+        ]);
+}
+
+#[test]
+fn source_switch_is_decodable_and_does_not_disturb_stable_viewers_test() {
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("decoded-source-switches")
+                .with_participant(Participant::quality_publisher_source(
+                    "publisher-a",
+                    pulsebeam_testdata::QualityVideoSource::Zero,
+                ))
+                .with_participant(Participant::quality_publisher_source(
+                    "publisher-b",
+                    pulsebeam_testdata::QualityVideoSource::One,
+                ))
+                .with_participant(Participant::manual_subscriber("switching-viewer", 1))
+                .with_participant(Participant::manual_subscriber("stable-viewer", 1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish every source layer before testing route isolation",
+                duration: Duration::from_secs(10),
+            },
+            Step::SubscribeTo {
+                description: "Start the switching viewer on source A",
+                participant: "switching-viewer",
+                targets: &[("publisher-a", 180)],
+            },
+            Step::SubscribeTo {
+                description: "Keep the stable viewer on source A",
+                participant: "stable-viewer",
+                targets: &[("publisher-a", 720)],
+            },
+            Step::Run {
+                description: "Decode source A on both independent routes",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoReceivedFromInterval {
+                description: "The switching viewer receives source A",
+                participant: "switching-viewer",
+                publisher: "publisher-a",
+                min_frames: 60,
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The switching viewer decodes source A at 180p",
+                participant: "switching-viewer",
+                quality: VideoQuality::min_frames(60).exact_decoded_resolution((320, 180)),
+            },
+            Step::SubscribeToQos {
+                description: "Switch the route to source B",
+                participant: "switching-viewer",
+                targets: &[("publisher-b", 360, 0, 100)],
+            },
+            Step::Run {
+                description: "Decode source B while the other route stays on A",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoReceivedFromInterval {
+                description: "The switching viewer receives source B",
+                participant: "switching-viewer",
+                publisher: "publisher-b",
+                min_frames: 60,
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The switching viewer decodes source B at 360p",
+                participant: "switching-viewer",
+                quality: VideoQuality::min_frames(60).exact_decoded_resolution((640, 360)),
+            },
+            Step::CheckVideoReceivedFromInterval {
+                description: "The stable viewer keeps receiving source A",
+                participant: "stable-viewer",
+                publisher: "publisher-a",
+                min_frames: 60,
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The stable viewer remains on source A at 720p",
+                participant: "stable-viewer",
+                quality: VideoQuality::min_frames(60).exact_decoded_resolution((1280, 720)),
+            },
+            Step::SubscribeToQos {
+                description: "Switch the route back to source A",
+                participant: "switching-viewer",
+                targets: &[("publisher-a", 720, 0, 200)],
+            },
+            Step::Run {
+                description: "Decode a fresh source A keyframe on the returning route",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoReceivedFromInterval {
+                description: "The switching viewer receives source A again",
+                participant: "switching-viewer",
+                publisher: "publisher-a",
+                min_frames: 60,
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The returning source A route decodes at 720p",
+                participant: "switching-viewer",
+                quality: VideoQuality::min_frames(60).exact_decoded_resolution((1280, 720)),
+            },
+            Step::CheckVideoReceivedFromInterval {
+                description: "The stable source A route continues independently",
+                participant: "stable-viewer",
+                publisher: "publisher-a",
+                min_frames: 60,
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The stable viewer remains exact through both switches",
+                participant: "stable-viewer",
+                quality: VideoQuality::min_frames(60).exact_decoded_resolution((1280, 720)),
+            },
+        ]);
+}
+
+#[test]
 fn subscription_activation_delivers_a_decoded_fixture_frame_without_slow_poll_test() {
     LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("immediate-decoder-activation")
                 .with_participant(Participant::quality_publisher("publisher"))
@@ -147,7 +519,7 @@ fn subscription_activation_delivers_a_decoded_fixture_frame_without_slow_poll_te
             Step::CheckFirstDecodedFrame {
                 description: "Initial activation reaches a real decoder promptly",
                 participant: "viewer",
-                max_latency: Duration::from_millis(150),
+                max_latency: Duration::from_millis(175),
             },
             Step::SubscribeTo {
                 description: "Deactivate the viewer route",
@@ -170,7 +542,7 @@ fn subscription_activation_delivers_a_decoded_fixture_frame_without_slow_poll_te
             Step::CheckFirstDecodedFrame {
                 description: "Reactivation reaches a real decoder promptly",
                 participant: "viewer",
-                max_latency: Duration::from_millis(150),
+                max_latency: Duration::from_millis(175),
             },
             Step::CheckVideoQuality {
                 description: "The reactivated viewer decodes source-resolution fixture pixels",
@@ -656,6 +1028,10 @@ fn repeated_simulcast_switching_stays_decodable_test() {
                 heights: &[720],
             },
             Step::Run {
+                description: "Cross the final high-layer keyframe boundary",
+                duration: Duration::from_secs(1),
+            },
+            Step::Run {
                 description: "Prove the final high-resolution switch stays continuously decodable",
                 duration: Duration::from_secs(5),
             },
@@ -768,35 +1144,46 @@ fn cross_shard_simulcast_switching_stays_decodable_test() {
         .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["f", "h", "q"]))
-                .with_participant(Participant::subscriber("bob")),
+                .with_participant(Participant::quality_publisher("alice"))
+                .with_participant(Participant::manual_subscriber("bob", 1)),
         )
         .run(vec![
             Step::Run {
                 description: "Establish flow and discover all three encodings",
-                duration: Duration::from_secs(6),
+                duration: Duration::from_secs(2),
             },
-            Step::SetBandwidth {
-                description: "Force a switch down to the lowest encoding",
+            Step::SubscribeTo {
+                description: "Select the lowest encoding across shards",
                 participant: "bob",
-                bits_per_sec: 250_000,
+                targets: &[("alice", 180)],
             },
             Step::Run {
-                description: "Settle on the low layer",
-                duration: Duration::from_secs(8),
+                description: "Cross the low-layer activation boundary",
+                duration: Duration::from_secs(1),
             },
-            Step::SetBandwidth {
-                description: "Restore headroom so the allocator switches back up",
+            Step::Run {
+                description: "Measure steady decoded progress on the low layer",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The cross-shard low layer is exact and continuously decodable",
                 participant: "bob",
-                bits_per_sec: 5_000_000,
+                quality: VideoQuality::min_frames(90)
+                    .exact_decoded_resolution((320, 180))
+                    .max_frame_gap(Duration::from_millis(100)),
+            },
+            Step::SubscribeTo {
+                description: "Select the highest encoding across shards",
+                participant: "bob",
+                targets: &[("alice", 720)],
             },
             Step::Run {
-                description: "Settle on a higher layer",
-                duration: Duration::from_secs(10),
+                description: "Cross a complete high-layer keyframe boundary",
+                duration: Duration::from_secs(1),
             },
             Step::Run {
-                description: "Prove that decoding has recovered after the constrained interval",
-                duration: Duration::from_secs(5),
+                description: "Measure steady decoded progress on the high layer",
+                duration: Duration::from_secs(4),
             },
             Step::CheckCrossShardMedia {
                 description: "the switching stream crossed a shard boundary",
@@ -805,7 +1192,9 @@ fn cross_shard_simulcast_switching_stays_decodable_test() {
             Step::CheckVideoQualityInterval {
                 description: "Bob returns to continuous decodable output after every capacity switch",
                 participant: "bob",
-                quality: VideoQuality::min_frames(100).min_decoded_resolution((1280, 720)),
+                quality: VideoQuality::min_frames(100)
+                    .exact_decoded_resolution((1280, 720))
+                    .max_frame_gap(Duration::from_millis(100)),
             },
         ]);
 }

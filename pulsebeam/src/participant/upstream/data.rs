@@ -1,5 +1,5 @@
+use crate::participant::data::ChannelId;
 use ahash::{HashMap, HashMapExt};
-use pulsebeam_rtc::ChannelId;
 use slotmap::SecondaryMap;
 
 use crate::{entity::TrackId, keys::TrackKey, track::Track};

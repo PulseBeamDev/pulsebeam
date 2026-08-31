@@ -1,4 +1,4 @@
-use pulsebeam_rtc::ChannelId;
+use crate::participant::data::ChannelId;
 use slotmap::SecondaryMap;
 use std::collections::VecDeque;
 

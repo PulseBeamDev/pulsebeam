@@ -1,35 +1,36 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Duration,
+};
 
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_rtc::{
-    ChannelId, ConnectionId, DataChannelEvent, DataChannelOpen, MediaDirection, MediaEvent,
-    MediaKind as RtcMediaKind, ReceiveStream, SendId, SendStream, StreamId, TransportEvent,
+    DataChannel, DataPayload, DependencyRewrite, EgressSlot, ExtendedMediaSequence,
+    ExtendedRtpTimestamp, IngressStream, MediaKind as RtcMediaKind, MediaRewrite, NegotiatedMedia,
+    RtcConnectionState, RtcEvent, RtcPeer,
 };
 use pulsebeam_runtime::net::RecvPacketBatch;
 use tokio::time::Instant;
 
-#[cfg(debug_assertions)]
-use crate::rtp::egress_guard::EgressGuard;
 use crate::{
     entity::{ParticipantId, RoomId, TrackKind},
     id::ShardId,
     keys::TrackKey,
     participant::{
-        TrackPacket,
-        batcher::{Batcher, ForwardTiming, NetworkEgress, OwnedPacketQueue},
-        data::{DataOpenError, DataState},
-        direct_transport::{DirectTransport, DirectTransportConfig, DirectTransportOutput},
+        ForwardPacket, TrackPacket,
+        batcher::{Batcher, NetworkEgress, OwnedPacketQueue},
+        data::{ChannelId, DataOpenError, DataState},
+        direct_transport::DirectTransport,
         downstream::{DownstreamAllocator, SlotConfig},
         event::ParticipantSink,
-        pacer::{PacerDecision, PacketPacer},
         reverse::ReversePacket,
         signaling::Signaling,
         upstream::{IncomingRtpRoute, UpstreamAllocator},
     },
     rtp::cache::TrackStreamCache,
     rtp::{
-        ABS_CAPTURE_TIME_EXTENSION_URI, Codec, CodecPayloadTypes, KeyframeRequest,
-        KeyframeRequestKind, MediaKind, MediaSectionId, PayloadType, Ssrc,
+        Codec, CodecPayloadTypes, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId,
+        PayloadType, Ssrc,
     },
     track::{
         self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent,
@@ -40,318 +41,11 @@ use crate::{
 use super::{ParticipantEffect, ParticipantInput, TrackPacketRef};
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MID_EXTENSION_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
-const TWCC_EXTENSION_URI: &str = "transport-wide-cc";
-const RTP_HISTORY_CAPACITY: usize = 512;
-const MAX_RETRANSMISSIONS_PER_PACKET: u8 = 2;
-const RETRANSMISSION_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_RETRANSMISSIONS_PER_TICK: usize = 64;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ForwardingLatency {
-    service: Duration,
-    pacing: Duration,
-    egress_lateness: Duration,
-    total: Duration,
-}
-
-impl ForwardTiming {
-    fn departed(self, now: Instant) -> ForwardingLatency {
-        debug_assert!(self.ingress_at <= self.pacer_admitted_at);
-        debug_assert!(self.pacer_admitted_at <= self.paced_eligible_at);
-        debug_assert!(self.paced_eligible_at <= now);
-        let service = self
-            .pacer_admitted_at
-            .saturating_duration_since(self.ingress_at);
-        let pacing = self
-            .paced_eligible_at
-            .saturating_duration_since(self.pacer_admitted_at);
-        let egress_lateness = now.saturating_duration_since(self.paced_eligible_at);
-        let total = now.saturating_duration_since(self.ingress_at);
-        debug_assert_eq!(
-            total,
-            service
-                .saturating_add(pacing)
-                .saturating_add(egress_lateness),
-            "forwarding latency components must exactly decompose total latency"
-        );
-        ForwardingLatency {
-            service,
-            pacing,
-            egress_lateness,
-            total,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PacerWait {
-    provenance: crate::rtp::PacketProvenance,
-    admitted_at: Instant,
-    eligible_at: Instant,
-}
-
-#[derive(Clone)]
-struct OutgoingExtensions {
-    absolute_capture_time: Option<u8>,
-    mid: Option<(u8, Box<[u8]>)>,
-    twcc: Option<u8>,
-    dependency_descriptor: Option<u8>,
-    nackable: bool,
-}
-
-impl OutgoingExtensions {
-    fn from_section(section: &pulsebeam_rtc::NegotiatedMediaSection) -> Self {
-        let absolute_capture_time = section
-            .header_extensions()
-            .iter()
-            .find(|extension| extension.uri() == ABS_CAPTURE_TIME_EXTENSION_URI)
-            .map(pulsebeam_rtc::HeaderExtension::id)
-            .filter(|&id| id > 0);
-        let mid = section
-            .header_extensions()
-            .iter()
-            .find(|extension| extension.uri() == MID_EXTENSION_URI)
-            .and_then(|extension| {
-                let id = extension.id();
-                (id > 0 && section.mid().len() <= usize::from(u8::MAX))
-                    .then(|| (id, section.mid().as_bytes().into()))
-            });
-        let twcc = section
-            .header_extensions()
-            .iter()
-            .find(|extension| extension.uri().contains(TWCC_EXTENSION_URI))
-            .map(pulsebeam_rtc::HeaderExtension::id)
-            .filter(|&id| id > 0);
-        let dependency_descriptor = section
-            .header_extensions()
-            .iter()
-            .find(|extension| extension.uri() == pulsebeam_core::dd::URI)
-            .map(pulsebeam_rtc::HeaderExtension::id)
-            .filter(|&id| id > 0);
-        let nackable = section.kind() == RtcMediaKind::Video
-            && section.codecs().iter().any(pulsebeam_rtc::Codec::nack);
-        Self {
-            absolute_capture_time,
-            mid,
-            twcc,
-            dependency_descriptor,
-            nackable,
-        }
-    }
-}
-
-struct SentRtp {
-    sequence: u16,
-    bytes: Vec<u8>,
-    extended_sequence: u64,
-    twcc_offset: Option<usize>,
-    retransmissions: u8,
-    last_retransmission: Option<Instant>,
-}
-
-struct RtpHistory {
-    entries: Box<[Option<SentRtp>]>,
-}
-
-impl RtpHistory {
-    fn new() -> Self {
-        debug_assert!(RTP_HISTORY_CAPACITY.is_power_of_two());
-        let entries = std::iter::repeat_with(|| None)
-            .take(RTP_HISTORY_CAPACITY)
-            .collect();
-        Self { entries }
-    }
-
-    fn store(
-        &mut self,
-        sequence: u16,
-        bytes: Vec<u8>,
-        extended_sequence: u64,
-        twcc_offset: Option<usize>,
-    ) {
-        let index = usize::from(sequence) & (RTP_HISTORY_CAPACITY - 1);
-        let Some(entry) = self.entries.get_mut(index) else {
-            debug_assert!(false, "RTP history index escapes its fixed ring");
-            return;
-        };
-        *entry = Some(SentRtp {
-            sequence,
-            bytes,
-            extended_sequence,
-            twcc_offset,
-            retransmissions: 0,
-            last_retransmission: None,
-        });
-    }
-
-    fn prepare_retransmission(
-        &mut self,
-        sequence: u16,
-        now: Instant,
-    ) -> Option<(Vec<u8>, u64, Option<usize>)> {
-        let index = usize::from(sequence) & (RTP_HISTORY_CAPACITY - 1);
-        let entry = self.entries.get_mut(index)?.as_mut()?;
-        if entry.sequence != sequence
-            || entry.retransmissions >= MAX_RETRANSMISSIONS_PER_PACKET
-            || entry
-                .last_retransmission
-                .is_some_and(|last| now.saturating_duration_since(last) < RETRANSMISSION_INTERVAL)
-        {
-            return None;
-        }
-        entry.retransmissions = entry.retransmissions.saturating_add(1);
-        entry.last_retransmission = Some(now);
-        Some((
-            entry.bytes.clone(),
-            entry.extended_sequence,
-            entry.twcc_offset,
-        ))
-    }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::expect_used,
-    clippy::arithmetic_side_effects,
-    reason = "negotiated RTP fields and extension lengths are validated before encoding"
-)]
-fn encode_rtp(
-    packet: &crate::rtp::RtpPacket,
-    payload_type: PayloadType,
-    ssrc: Ssrc,
-    extensions: Option<&OutgoingExtensions>,
-) -> (Vec<u8>, Option<usize>) {
-    let absolute_capture_time = extensions
-        .and_then(|extensions| extensions.absolute_capture_time)
-        .zip(packet.extensions.absolute_capture_time.as_deref())
-        .filter(|(_, value)| matches!(value.len(), 8 | 16));
-    let mid = extensions.and_then(|extensions| extensions.mid.as_ref());
-    let twcc = extensions.and_then(|extensions| extensions.twcc);
-    let dependency_descriptor = extensions
-        .and_then(|extensions| extensions.dependency_descriptor)
-        .zip(packet.extensions.raw_dependency_descriptor.as_ref())
-        .map(|(id, descriptor)| (id, descriptor.0.as_slice()))
-        .filter(|(_, descriptor)| !descriptor.is_empty());
-    let two_byte_extensions = absolute_capture_time
-        .is_some_and(|(id, value)| id > 14 || value.len() > 16)
-        || mid.is_some_and(|(id, _)| *id > 14)
-        || twcc.is_some_and(|id| id > 14)
-        || dependency_descriptor.is_some_and(|(id, descriptor)| id > 14 || descriptor.len() > 16);
-    let extension_header_len = if two_byte_extensions { 2usize } else { 1usize };
-    let extension_data_len = absolute_capture_time
-        .map_or(0, |(_, value)| {
-            extension_header_len.saturating_add(value.len())
-        })
-        .saturating_add(mid.map_or(0, |(_, value)| {
-            extension_header_len.saturating_add(value.len())
-        }))
-        .saturating_add(twcc.map_or(0, |_| extension_header_len.saturating_add(2)))
-        .saturating_add(dependency_descriptor.map_or(0, |(_, descriptor)| {
-            extension_header_len.saturating_add(descriptor.len())
-        }));
-    let extension_bytes = if extension_data_len == 0 {
-        0
-    } else {
-        4usize.saturating_add(extension_data_len.saturating_add(3) & !3)
-    };
-    let length = 12usize
-        .saturating_add(extension_bytes)
-        .saturating_add(packet.payload.len());
-    let mut bytes = Vec::with_capacity(length);
-    bytes.push(if extension_bytes == 0 { 0x80 } else { 0x90 });
-    bytes.push((u8::from(packet.marker) << 7) | payload_type.get());
-    bytes.extend_from_slice(&packet.seq_no.as_u16().to_be_bytes());
-    bytes.extend_from_slice(&(packet.rtp_ts.numer() as u32).to_be_bytes());
-    bytes.extend_from_slice(&ssrc.get().to_be_bytes());
-    let mut twcc_offset = None;
-    if extension_bytes != 0 {
-        bytes.extend_from_slice(
-            &(if two_byte_extensions {
-                0x1000u16
-            } else {
-                0xbedeu16
-            })
-            .to_be_bytes(),
-        );
-        bytes.extend_from_slice(
-            &u16::try_from(extension_bytes.saturating_sub(4).saturating_div(4))
-                .expect("RTP header extension must fit its 16-bit word length")
-                .to_be_bytes(),
-        );
-        if let Some((id, value)) = absolute_capture_time {
-            debug_assert!(id > 0 && matches!(value.len(), 8 | 16));
-            if two_byte_extensions {
-                bytes.extend_from_slice(&[id, u8::try_from(value.len()).unwrap_or_default()]);
-            } else {
-                debug_assert!(id < 15 && value.len() <= 16);
-                bytes.push((id << 4) | u8::try_from(value.len() - 1).unwrap_or_default());
-            }
-            bytes.extend_from_slice(value);
-        }
-        if let Some((id, mid)) = mid {
-            debug_assert!(*id > 0);
-            debug_assert!(!mid.is_empty() && mid.len() <= usize::from(u8::MAX));
-            if two_byte_extensions {
-                bytes.extend_from_slice(&[*id, u8::try_from(mid.len()).unwrap_or_default()]);
-            } else {
-                debug_assert!(*id < 15 && mid.len() <= 16);
-                bytes.push((*id << 4) | u8::try_from(mid.len() - 1).unwrap_or_default());
-            }
-            bytes.extend_from_slice(mid);
-        }
-        if let Some(id) = twcc {
-            debug_assert!(id > 0);
-            if two_byte_extensions {
-                bytes.extend_from_slice(&[id, 2]);
-            } else {
-                debug_assert!(id < 15);
-                bytes.push((id << 4) | 1);
-            }
-            twcc_offset = Some(bytes.len());
-            bytes.extend_from_slice(&[0, 0]);
-        }
-        if let Some((id, descriptor)) = dependency_descriptor {
-            debug_assert!(id > 0 && descriptor.len() <= usize::from(u8::MAX));
-            if two_byte_extensions {
-                bytes.extend_from_slice(&[id, u8::try_from(descriptor.len()).unwrap_or_default()]);
-            } else {
-                debug_assert!(id < 15 && descriptor.len() <= 16);
-                bytes.push((id << 4) | u8::try_from(descriptor.len() - 1).unwrap_or_default());
-            }
-            bytes.extend_from_slice(descriptor);
-        }
-        bytes.resize(12usize.saturating_add(extension_bytes), 0);
-    }
-    bytes.extend_from_slice(&packet.payload);
-    debug_assert_eq!(bytes.len(), length);
-    (bytes, twcc_offset)
-}
-
-fn picture_loss_indication(media_ssrc: u32) -> [u8; 12] {
-    let mut bytes = [0u8; 12];
-    bytes[0] = 0x81;
-    bytes[1] = 206;
-    bytes[2..4].copy_from_slice(&2u16.to_be_bytes());
-    bytes[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
-    bytes
-}
-
-fn full_intra_request(media_ssrc: u32, sequence: u8) -> [u8; 20] {
-    let mut bytes = [0u8; 20];
-    bytes[0] = 0x84;
-    bytes[1] = 206;
-    bytes[2..4].copy_from_slice(&4u16.to_be_bytes());
-    bytes[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
-    bytes[12..16].copy_from_slice(&media_ssrc.to_be_bytes());
-    bytes[16] = sequence;
-    bytes
-}
 
 #[derive(thiserror::Error, Debug)]
 pub enum DisconnectReason {
     #[error("RTC engine error: {0}")]
-    Rtc(#[from] pulsebeam_rtc::LiveConnectionError),
+    Rtc(#[from] pulsebeam_rtc::RtcPeerError),
     #[error("Signaling error: {0}")]
     Signaling(#[from] crate::participant::signaling::SignalingError),
     #[error("ICE connection disconnected")]
@@ -364,32 +58,37 @@ pub enum DisconnectReason {
     TooManyDataTopicChannels,
 }
 
+#[derive(Clone, Copy)]
+struct IngressRouteFacts {
+    ingress: IngressStream,
+    mid: MediaSectionId,
+    rid: Option<crate::rtp::EncodingId>,
+    ssrc: Ssrc,
+}
+
 pub struct DirectParticipantCore {
     transport: Box<DirectTransport>,
-    sections: HashMap<pulsebeam_rtc::MediaSectionId, MediaSectionId>,
-    receive_sections: HashMap<u8, pulsebeam_rtc::MediaSectionId>,
-    send_sections: HashMap<u32, MediaSectionId>,
-    send_extensions: HashMap<u32, OutgoingExtensions>,
-    rtp_history: HashMap<u32, RtpHistory>,
+    ingress: HashMap<IngressStream, IngressRouteFacts>,
+    egress: HashMap<MediaSectionId, EgressSlot>,
+    egress_mids: HashMap<EgressSlot, MediaSectionId>,
+    pending_media: BTreeMap<u64, ForwardPacket>,
+    initial_keyframes_requested: HashSet<IngressStream>,
+    pending_keyframe_requests: HashSet<IngressStream>,
     upstream: UpstreamAllocator,
     downstream: DownstreamAllocator,
     stream_writer: StreamWriter,
-    pacer: PacketPacer,
     pub(crate) participant_id: ParticipantId,
     pub(crate) room_id: RoomId,
     pub(crate) shard_id: ShardId,
     participant_key: crate::keys::ParticipantKey,
-    next_send_id: u64,
-    forwarded_timing: HashMap<SendId, ForwardTiming>,
-    pacer_wait: Option<PacerWait>,
     activation_pending: bool,
-    next_fir_sequence: u8,
-    #[cfg(debug_assertions)]
-    egress_guard: EgressGuard,
     ingress_shard: Option<ShardId>,
     udp_packets: OwnedPacketQueue,
     tcp_batcher: Batcher,
     pending_data: VecDeque<(ChannelId, Vec<u8>)>,
+    data_channels: HashMap<DataChannel, ChannelId>,
+    rtc_channels: HashMap<ChannelId, DataChannel>,
+    next_data_channel: u16,
     data: DataState,
     signaling: Signaling,
     last_slow_poll: Instant,
@@ -402,9 +101,8 @@ impl DirectParticipantCore {
         reason = "participant materialization takes its complete owned shard configuration"
     )]
     pub fn new(
-        connection_id: ConnectionId,
-        session: pulsebeam_rtc::NegotiatedSession,
-        local: pulsebeam_rtc::LocalTransport,
+        peer: RtcPeer,
+        media: Box<[NegotiatedMedia]>,
         participant_id: ParticipantId,
         room_id: RoomId,
         shard_id: ShardId,
@@ -413,13 +111,14 @@ impl DirectParticipantCore {
         udp_gso_size: usize,
         tcp_gso_size: usize,
         now: Instant,
-    ) -> Result<Self, pulsebeam_rtc::LiveConnectionError> {
+    ) -> Result<Self, pulsebeam_rtc::RtcPeerError> {
         debug_assert!(
             std::mem::size_of::<Self>() < 4096,
             "participant core must keep live protocol components on the heap"
         );
-        let mut sections = HashMap::with_capacity(session.media_sections().len());
-        let mut receive_sections = HashMap::with_capacity(session.media_sections().len());
+        let mut ingress = HashMap::with_capacity(media.len());
+        let mut egress = HashMap::with_capacity(media.len());
+        let mut egress_mids = HashMap::with_capacity(media.len());
         let mut upstream = UpstreamAllocator::new(crate::log::LogCtx {
             room_id,
             participant_id,
@@ -435,22 +134,28 @@ impl DirectParticipantCore {
             now,
             crate::participant::allocation::AllocationInput {
                 estimate: crate::participant::downstream::INITIAL_BANDWIDTH,
-                application_limited: true,
             },
         );
-        let mut send_streams = Vec::new();
-        let mut send_sections = HashMap::with_capacity(session.media_sections().len());
-        let mut send_extensions = HashMap::with_capacity(session.media_sections().len());
-        for section in session.media_sections() {
+        let mut published = HashSet::with_capacity(media.len());
+        let mut next_ssrc = 1u32;
+        for section in &media {
             let mid = MediaSectionId::from(section.mid());
-            sections.insert(section.id(), mid);
-            if section.direction() == MediaDirection::ReceiveOnly {
-                for codec in section.codecs() {
-                    if Codec::from_name(codec.name()).is_some() {
-                        receive_sections
-                            .entry(codec.payload_type())
-                            .or_insert_with(|| section.id());
-                    }
+            if let Some(stream) = section.ingress() {
+                let rid = section.rid().map(crate::rtp::EncodingId::from);
+                let ssrc = Ssrc::from(next_ssrc);
+                next_ssrc = next_ssrc.wrapping_add(1).max(1);
+                let previous = ingress.insert(
+                    stream,
+                    IngressRouteFacts {
+                        ingress: stream,
+                        mid,
+                        rid,
+                        ssrc,
+                    },
+                );
+                debug_assert!(previous.is_none(), "negotiated ingress handles are unique");
+                if !published.insert(mid) {
+                    continue;
                 }
                 let kind = match section.kind() {
                     RtcMediaKind::Audio => TrackKind::Audio,
@@ -468,26 +173,24 @@ impl DirectParticipantCore {
                     TrackKind::Video => track::new_video(
                         mid,
                         meta,
-                        section
-                            .receive_rids()
+                        media
                             .iter()
-                            .map(|rid| crate::rtp::SimulcastEncoding::new(rid.as_str()))
+                            .filter(|candidate| candidate.mid() == section.mid())
+                            .filter_map(NegotiatedMedia::rid)
+                            .map(crate::rtp::SimulcastEncoding::new)
                             .collect(),
                     ),
                     TrackKind::Data => continue,
                 };
                 let _ = upstream.add_published_track(mid, sender, track);
             }
-            if section.direction() == MediaDirection::SendOnly {
+            if let Some(slot) = section.egress() {
                 let mut payload_types = CodecPayloadTypes::default();
                 for codec in section.codecs() {
                     let Some(codec_kind) = Codec::from_name(codec.name()) else {
                         continue;
                     };
-                    let Some(payload_type) = PayloadType::new(codec.payload_type()) else {
-                        debug_assert!(false, "negotiated RTP payload type must be valid");
-                        continue;
-                    };
+                    let payload_type = PayloadType::DEFAULT;
                     payload_types.insert(codec_kind, payload_type);
                 }
                 if payload_types.is_empty() {
@@ -498,13 +201,8 @@ impl DirectParticipantCore {
                     RtcMediaKind::Video => MediaKind::Video,
                     RtcMediaKind::Application => continue,
                 };
-                let ssrc = Ssrc::from(
-                    u32::try_from(connection_id.get())
-                        .unwrap_or(u32::MAX)
-                        .wrapping_mul(0x9e37_79b9)
-                        .wrapping_add(section.id().get() as u32)
-                        .max(1),
-                );
+                let ssrc = Ssrc::from(next_ssrc);
+                next_ssrc = next_ssrc.wrapping_add(1).max(1);
                 downstream.add_slot(SlotConfig {
                     mid,
                     rid: None,
@@ -512,48 +210,35 @@ impl DirectParticipantCore {
                     payload_types,
                     kind,
                 });
-                send_streams.push((section.id(), ssrc));
-                send_sections.insert(ssrc.get(), mid);
-                send_extensions.insert(ssrc.get(), OutgoingExtensions::from_section(section));
-            }
-        }
-        let config = DirectTransportConfig::new(connection_id, session, local);
-        let mut transport = Box::new(DirectTransport::new(config, now)?);
-        for (section, ssrc) in send_streams {
-            let id = StreamId::new(ssrc.get());
-            if transport
-                .register_send(SendStream::new(id, section, ssrc.get(), 0, 0))
-                .is_err()
-            {
-                debug_assert!(false, "one direct send stream per negotiated media section");
+                let previous = egress.insert(mid, slot);
+                debug_assert!(previous.is_none());
+                let previous = egress_mids.insert(slot, mid);
+                debug_assert!(previous.is_none());
             }
         }
         let mut core = Self {
-            transport,
-            sections,
-            receive_sections,
-            send_sections,
-            send_extensions,
-            rtp_history: HashMap::with_capacity(8),
+            transport: Box::new(DirectTransport::new(peer)),
+            ingress,
+            egress,
+            egress_mids,
+            pending_media: BTreeMap::new(),
+            initial_keyframes_requested: HashSet::with_capacity(8),
+            pending_keyframe_requests: HashSet::with_capacity(8),
             upstream,
             downstream,
             stream_writer: StreamWriter::new(),
-            pacer: PacketPacer::new(now, crate::participant::downstream::INITIAL_BANDWIDTH.get()),
             participant_id,
             room_id,
             shard_id,
             participant_key,
-            next_send_id: 0,
-            forwarded_timing: HashMap::new(),
-            pacer_wait: None,
             activation_pending: false,
-            next_fir_sequence: 0,
-            #[cfg(debug_assertions)]
-            egress_guard: EgressGuard::new(),
             ingress_shard: None,
             udp_packets: OwnedPacketQueue::with_capacity(udp_gso_size),
             tcp_batcher: Batcher::with_capacity(tcp_gso_size),
             pending_data: VecDeque::with_capacity(64),
+            data_channels: HashMap::with_capacity(16),
+            rtc_channels: HashMap::with_capacity(16),
+            next_data_channel: 0,
             data: DataState::new(),
             signaling: Signaling::new(crate::log::LogCtx {
                 room_id,
@@ -599,30 +284,26 @@ impl DirectParticipantCore {
 
     pub(crate) fn report_departure(
         &mut self,
-        send_id: pulsebeam_rtc::SendId,
-        congestion_tracked: bool,
-        timing: Option<ForwardTiming>,
+        receipt: pulsebeam_rtc::DepartureReceipt,
+        sent: bool,
         now: Instant,
     ) {
-        if congestion_tracked && self.transport.report_departure(send_id, now).is_err() {
-            debug_assert!(false, "every accepted media packet has one GCC send record");
-        }
-        let Some(timing) = timing else {
-            return;
+        let result = if sent {
+            let result = self.transport.confirm_departure(receipt, now);
+            #[cfg(feature = "sim")]
+            if let Ok(Some(latency)) = result {
+                crate::sim_metrics::record_forwarding_latency(
+                    latency.service(),
+                    latency.pacing(),
+                    latency.egress(),
+                    latency.total(),
+                );
+            }
+            result.map(|_| ())
+        } else {
+            self.transport.abandon_departure(receipt)
         };
-        let latency = timing.departed(now);
-        metrics::histogram!("forwarding_service_us").record(latency.service.as_micros() as f64);
-        metrics::histogram!("forwarding_pacing_us").record(latency.pacing.as_micros() as f64);
-        metrics::histogram!("forwarding_egress_lateness_us")
-            .record(latency.egress_lateness.as_micros() as f64);
-        metrics::histogram!("forwarding_total_us").record(latency.total.as_micros() as f64);
-        #[cfg(feature = "sim")]
-        crate::sim_metrics::record_forwarding_latency(
-            latency.service,
-            latency.pacing,
-            latency.egress_lateness,
-            latency.total,
-        );
+        debug_assert!(result.is_ok(), "every RTC departure receipt completes once");
     }
 
     pub(crate) fn apply(&mut self, effect: ParticipantEffect) {
@@ -662,9 +343,18 @@ impl DirectParticipantCore {
                 self.upstream.bind_track_key(track_id, key);
                 if track_id.kind() == TrackKind::Data {
                     self.upstream.data.bind_source(track_id, key);
+                } else if track_id.kind() == TrackKind::Video {
+                    let routes = self.upstream.routes_for_track(track_id);
+                    for route in routes {
+                        self.request_initial_keyframe(key, route);
+                    }
                 }
             }
             ParticipantEffect::TrackUnpublished { key, track_id } => {
+                for route in self.upstream.routes_for_track(track_id) {
+                    self.initial_keyframes_requested.remove(&route.ingress);
+                    self.pending_keyframe_requests.remove(&route.ingress);
+                }
                 self.upstream.unbind_track_key(track_id, key);
                 if track_id.kind() == TrackKind::Data {
                     self.upstream.data.unpublish(track_id);
@@ -679,20 +369,66 @@ impl DirectParticipantCore {
                 batch,
                 source_shard,
             } => self.enqueue_ingress(batch, source_shard),
-            ParticipantInput::Timeout(now) => self.transport.handle_timeout(now),
-            ParticipantInput::Track { key, packet, cache } => self.handle_track(key, packet, cache),
+            ParticipantInput::Timeout(now) => {
+                if let Err(error) = self.transport.handle_timeout(now) {
+                    self.disconnect_reason = Some(error.into());
+                }
+            }
+            ParticipantInput::Track {
+                now,
+                key,
+                packet,
+                cache,
+            } => self.handle_track(now, key, packet, cache),
             ParticipantInput::Reverse { stream, packet } => self.handle_reverse(stream, packet),
         }
     }
 
+    pub(crate) fn replay_cached_track(
+        &mut self,
+        now: Instant,
+        key: TrackKey,
+        cache: &TrackStreamCache,
+    ) -> bool {
+        let Some(entry) = self.downstream.track_candidate(key) else {
+            return false;
+        };
+        if entry.participant_id == self.participant_id {
+            debug_assert!(
+                false,
+                "a participant must never receive its own cached track"
+            );
+            return false;
+        }
+        if entry.track_id.kind() != TrackKind::Video {
+            debug_assert!(false, "only video tracks replay cached access units");
+            return false;
+        }
+        let origin = entry.participant_id;
+        debug_assert!(
+            self.stream_writer.is_empty(),
+            "cached replay starts with an empty media writer"
+        );
+        let changed =
+            self.downstream
+                .on_forward_rtp(key, now, Some(cache), &mut self.stream_writer);
+        let rendered = !self.stream_writer.is_empty();
+        self.drain_media_writer(now, origin, None, Some(cache));
+        if changed {
+            self.signaling.mark_assignments_dirty();
+        }
+        rendered
+    }
+
     fn handle_track(
         &mut self,
+        now: Instant,
         key: TrackKey,
         packet: TrackPacketRef<'_>,
         cache: Option<&TrackStreamCache>,
     ) {
         match packet {
-            TrackPacketRef::Rtp(packet) => {
+            TrackPacketRef::Rtp { packet, media } => {
                 let Some(entry) = self.downstream.track_candidate(key) else {
                     debug_assert!(false, "a TrackPacket must target an installed track");
                     return;
@@ -701,14 +437,13 @@ impl DirectParticipantCore {
                     debug_assert!(false, "a participant must never receive its own track");
                     return;
                 }
+                let origin = entry.participant_id;
                 match entry.track_id.kind() {
                     TrackKind::Video => {
-                        if self.downstream.on_forward_rtp(
-                            key,
-                            packet.arrival_ts,
-                            cache,
-                            &mut self.stream_writer,
-                        ) {
+                        if self
+                            .downstream
+                            .on_forward_rtp(key, now, cache, &mut self.stream_writer)
+                        {
                             self.signaling.mark_assignments_dirty();
                         }
                     }
@@ -728,6 +463,7 @@ impl DirectParticipantCore {
                     }
                     TrackKind::Data => debug_assert!(false, "data tracks do not carry RTP"),
                 }
+                self.drain_media_writer(now, origin, Some(media), cache);
             }
             TrackPacketRef::Data { lane: _, bytes } => {
                 let Some(channel) = self.downstream.data.forwarding(key) else {
@@ -762,7 +498,7 @@ impl DirectParticipantCore {
         &mut self,
         stream: TrackKey,
         rid: Option<&crate::rtp::EncodingId>,
-        kind: KeyframeRequestKind,
+        _kind: KeyframeRequestKind,
     ) {
         let Some(track_id) = self.upstream.track_for_fanout(stream) else {
             return;
@@ -770,29 +506,14 @@ impl DirectParticipantCore {
         let Some(route) = self.upstream.route_for_track(track_id, rid) else {
             return;
         };
-        let mut bytes = [0u8; 20];
-        let length = match kind {
-            KeyframeRequestKind::Pli => {
-                bytes[..12].copy_from_slice(&picture_loss_indication(route.ssrc.get()));
-                12
-            }
-            KeyframeRequestKind::Fir => {
-                let sequence = self.next_fir_sequence;
-                self.next_fir_sequence = self.next_fir_sequence.wrapping_add(1);
-                bytes.copy_from_slice(&full_intra_request(route.ssrc.get(), sequence));
-                20
-            }
-        };
-        let Some(rtcp) = bytes.get(..length) else {
-            debug_assert!(
-                false,
-                "a fixed RTCP feedback buffer bounds its encoded length"
-            );
+        self.pending_keyframe_requests.insert(route.ingress);
+    }
+
+    fn request_initial_keyframe(&mut self, stream: TrackKey, route: IncomingRtpRoute) {
+        if !self.initial_keyframes_requested.insert(route.ingress) {
             return;
-        };
-        if self.transport.send_rtcp(rtcp).is_err() {
-            debug_assert!(false, "an active publisher must have an SRTCP egress path");
         }
+        self.request_remote_keyframe(stream, route.rid.as_ref(), KeyframeRequestKind::Pli);
     }
 
     pub fn enqueue_ingress(&mut self, batch: RecvPacketBatch, source_shard: ShardId) {
@@ -800,52 +521,120 @@ impl DirectParticipantCore {
         self.transport.enqueue(batch);
     }
 
+    fn drain_media_writer(
+        &mut self,
+        now: Instant,
+        origin: ParticipantId,
+        current: Option<&ForwardPacket>,
+        cache: Option<&TrackStreamCache>,
+    ) {
+        #[cfg(not(feature = "sim"))]
+        let _ = origin;
+        while let Some(write) = self.stream_writer.pop() {
+            let (packet, mid, ssrc) = match write {
+                StreamWrite::Video { pkt, mid, ssrc, .. }
+                | StreamWrite::Audio { pkt, mid, ssrc, .. } => (pkt, mid, ssrc),
+            };
+            #[cfg(not(feature = "sim"))]
+            let _ = ssrc;
+            let Some(slot) = self.egress.get(&mid).copied() else {
+                debug_assert!(false, "a downstream write has a negotiated RTC slot");
+                continue;
+            };
+            let source = current
+                .filter(|media| media.packet().packet_id() == packet.provenance.packet_id)
+                .or_else(|| cache.and_then(|cache| cache.forward_for(&packet)));
+            let Some(source) = source else {
+                debug_assert!(
+                    false,
+                    "every routed packet retains authenticated media storage: packet={:?} current={:?} cache={}",
+                    packet.provenance,
+                    current.map(|media| media.packet().packet_id()),
+                    cache.is_some()
+                );
+                continue;
+            };
+            let dependency = packet
+                .extensions
+                .raw_dependency_descriptor
+                .as_ref()
+                .filter(|descriptor| !descriptor.0.is_empty())
+                .map(|descriptor| DependencyRewrite::new(descriptor.0.as_slice().into()));
+            let rewrite = MediaRewrite {
+                sequence: ExtendedMediaSequence::new(u64::from(packet.seq_no)),
+                timestamp: ExtendedRtpTimestamp::new(packet.rtp_ts.numer()),
+                marker: packet.marker,
+                dependency,
+            };
+            #[cfg(feature = "sim")]
+            let expected = (
+                rewrite.timestamp.get(),
+                source.packet().timestamp().get(),
+                rewrite.marker,
+            );
+            let result = match source {
+                ForwardPacket::Local(media) => self.transport.forward(now, slot, media, rewrite),
+                ForwardPacket::Transit(media) => {
+                    self.transport.forward_transit(now, slot, media, rewrite)
+                }
+            };
+            match result {
+                Ok(()) => {
+                    #[cfg(feature = "sim")]
+                    {
+                        crate::sim_metrics::record_forwarded_media_for(
+                            self.participant_id,
+                            u64::try_from(source.packet().payload().len()).unwrap_or(u64::MAX),
+                        );
+                        match source.packet().kind() {
+                            RtcMediaKind::Video => {
+                                let height = match source.packet().rid() {
+                                    Some("h") => 360,
+                                    Some("f") => 720,
+                                    _ => 180,
+                                };
+                                crate::sim_metrics::record_expected_video(
+                                    self.participant_id,
+                                    origin,
+                                    expected.0,
+                                    expected.1,
+                                    height,
+                                    expected.2,
+                                );
+                            }
+                            RtcMediaKind::Audio => crate::sim_metrics::record_expected_audio(
+                                self.participant_id,
+                                *ssrc,
+                                origin,
+                                expected.0,
+                                expected.1,
+                            ),
+                            RtcMediaKind::Application => {}
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(?error, %mid, "RTC rejected a forwarding decision");
+                }
+            }
+        }
+    }
+
     pub(crate) fn process(
         &mut self,
         now: Instant,
         events: &mut impl ParticipantSink,
-    ) -> Result<usize, pulsebeam_rtc::LiveConnectionError> {
+    ) -> Result<usize, pulsebeam_rtc::RtcPeerError> {
         let processed = self.transport.process_ingress(now)?;
-        while let Some(output) = self.transport.poll_output() {
-            match output {
-                DirectTransportOutput::Rtp { stream, packet } => {
-                    self.handle_rtp(stream, packet, events);
-                }
-                DirectTransportOutput::Transport(event) => {
-                    self.handle_transport_event(event, events);
-                }
-                DirectTransportOutput::Data(event) => self.handle_data_event(event, events),
-                DirectTransportOutput::Rtcp { nacks } => self.retransmit(&nacks, now),
-            }
+        if self
+            .transport
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.transport.handle_timeout(now)?;
         }
-        while let Some(event) = self.transport.poll_media_event() {
-            match event {
-                MediaEvent::StreamDiscovered { ssrc, payload_type } => {
-                    let _ = self.discover_receive_stream(ssrc, payload_type);
-                }
-                MediaEvent::KeyframeRequest { ssrc } => {
-                    self.handle_downstream_keyframe_request(Ssrc::from(ssrc), events);
-                }
-                MediaEvent::SenderReport { .. } | MediaEvent::Feedback { .. } => {}
-            }
-        }
-        let mut congestion = None;
-        while let Some(outcome) = self.transport.poll_congestion() {
-            let estimate = outcome.estimate();
-            congestion = Some((estimate.bitrate_bps(), estimate.application_limited()));
-            if let Some(probe) = outcome.probe() {
-                let target = probe.target_bitrate_bps().max(estimate.bitrate_bps());
-                congestion = Some((target, estimate.application_limited()));
-            }
-        }
-        if let Some((estimate, application_limited)) = congestion {
-            self.downstream.update_allocation_input(
-                now,
-                crate::participant::allocation::AllocationInput {
-                    estimate: crate::participant::allocation::Bitrate::bps(estimate),
-                    application_limited,
-                },
-            );
+        while let Some(event) = self.transport.poll_event() {
+            self.handle_rtc_event(now, event, events);
         }
         Ok(processed)
     }
@@ -863,8 +652,13 @@ impl DirectParticipantCore {
             events.exit();
             return None;
         }
+        for stream in self.pending_keyframe_requests.drain() {
+            let result = self.transport.request_keyframe(now, stream);
+            debug_assert!(result.is_ok(), "cached ingress handles remain valid");
+        }
         if self.activation_pending {
-            let (assignments_changed, _) = self.downstream.poll_slow(now, events);
+            let (assignments_changed, allocation) = self.downstream.poll_slow(now, events);
+            self.apply_allocation(now, allocation);
             if assignments_changed {
                 self.signaling.mark_assignments_dirty();
             }
@@ -872,7 +666,8 @@ impl DirectParticipantCore {
         }
         if now.saturating_duration_since(self.last_slow_poll) >= SLOW_POLL_INTERVAL {
             self.upstream.poll_slow(now);
-            let (assignments_changed, _) = self.downstream.poll_slow(now, events);
+            let (assignments_changed, allocation) = self.downstream.poll_slow(now, events);
+            self.apply_allocation(now, allocation);
             if assignments_changed {
                 self.signaling.mark_assignments_dirty();
             }
@@ -882,11 +677,7 @@ impl DirectParticipantCore {
             let mut snapshot = self.downstream.signaling_snapshot();
             snapshot.participants = self.signaling.participants_snapshot();
             if let Some(output) = self.signaling.poll(&snapshot) {
-                if self
-                    .transport
-                    .send_data(output.cid, true, output.bytes, now)
-                    .is_ok()
-                {
+                if self.send_data(now, output.cid, output.bytes).is_ok() {
                     self.signaling.commit_sent();
                 } else {
                     self.signaling.retry_pending();
@@ -894,221 +685,268 @@ impl DirectParticipantCore {
             }
         }
         self.write_pending(now);
-        self.drain_transport_egress();
+        if self.settle_transport(now, events).is_err() {
+            self.disconnect_reason = Some(DisconnectReason::IceDisconnected);
+            events.exit();
+            return None;
+        }
         let slow = self
             .last_slow_poll
             .checked_add(SLOW_POLL_INTERVAL)
             .unwrap_or(self.last_slow_poll);
-        let pacer = self
-            .stream_writer
-            .front_pacing_size()
-            .map(|bytes| self.pacer.next_ready(now, bytes));
-        self.transport
-            .next_deadline(now)
-            .map_or(Some(slow), |deadline| Some(deadline.min(slow)))
-            .map(|deadline| pacer.map_or(deadline, |pacer| deadline.min(pacer)))
+        let deadline = self
+            .transport
+            .next_deadline()
+            .map_or(slow, |deadline| deadline.min(slow));
+        debug_assert!(
+            deadline > now,
+            "participant deadline must advance: deadline={deadline:?}, now={now:?}"
+        );
+        Some(deadline)
+    }
+
+    fn settle_transport(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) -> Result<(), pulsebeam_rtc::RtcPeerError> {
+        const MAX_IMMEDIATE_PASSES: usize = 64;
+        for _ in 0..MAX_IMMEDIATE_PASSES {
+            self.drain_transport_egress(now);
+            if self
+                .transport
+                .next_deadline()
+                .is_none_or(|deadline| deadline > now)
+            {
+                return Ok(());
+            }
+            self.transport.handle_timeout(now)?;
+            while let Some(event) = self.transport.poll_event() {
+                self.handle_rtc_event(now, event, events);
+            }
+        }
+        debug_assert!(false, "RTC work must quiesce within one participant poll");
+        Ok(())
+    }
+
+    fn handle_rtc_event(
+        &mut self,
+        now: Instant,
+        event: RtcEvent,
+        events: &mut impl ParticipantSink,
+    ) {
+        match event {
+            RtcEvent::Media(media) => self.handle_media(media, events),
+            RtcEvent::ConnectionStateChanged(state) => {
+                self.handle_connection_state(state, events);
+            }
+            RtcEvent::KeyframeRequested(slot) => {
+                self.handle_downstream_keyframe_request(slot, events);
+            }
+            RtcEvent::BweCapacity(capacity) => self.downstream.update_allocation_input(
+                now,
+                crate::participant::allocation::AllocationInput {
+                    estimate: crate::participant::allocation::Bitrate::bps(capacity.bitrate_bps()),
+                },
+            ),
+            RtcEvent::DataChannelOpened {
+                channel,
+                label,
+                protocol,
+                mode,
+            } => self.open_data_channel(channel, label, protocol, mode, events),
+            RtcEvent::DataMessage { channel, payload } => {
+                let Some(id) = self.data_channels.get(&channel).copied() else {
+                    return;
+                };
+                match payload {
+                    DataPayload::Text(text) => {
+                        self.handle_data_message(id, false, text.into_bytes(), events);
+                    }
+                    DataPayload::Binary(bytes) => {
+                        self.handle_data_message(id, true, bytes, events);
+                    }
+                }
+            }
+            RtcEvent::DataChannelClosed(channel) => self.close_data_channel(channel, events),
+            RtcEvent::DataChannelUnavailable => {
+                self.disconnect_reason = Some(DisconnectReason::IceDisconnected);
+                events.exit();
+            }
+            RtcEvent::DataChannelReady | RtcEvent::DataBackpressure(_) => {}
+        }
+    }
+
+    fn handle_media(
+        &mut self,
+        media: pulsebeam_rtc::MediaPacket,
+        events: &mut impl ParticipantSink,
+    ) {
+        let Some(facts) = self.ingress.get(&media.stream()).copied() else {
+            debug_assert!(false, "RTC media carries a negotiated ingress handle");
+            return;
+        };
+        let Ok(packet) = crate::rtp::RtpPacket::from_media_packet(&media, facts.ssrc) else {
+            return;
+        };
+        let packet_id = media.packet_id();
+        let previous = self
+            .pending_media
+            .insert(packet_id, ForwardPacket::Local(media));
+        debug_assert!(
+            previous.is_none(),
+            "an authenticated packet enters normalization once"
+        );
+        while self.pending_media.len() > crate::rtp::cache::PACKET_WINDOW_CAPACITY.saturating_mul(4)
+        {
+            let Some((&oldest, _)) = self.pending_media.first_key_value() else {
+                break;
+            };
+            let _ = self.pending_media.remove(&oldest);
+        }
+        let Some((slot, track_id)) = self.upstream.slot_for_mid(facts.mid) else {
+            return;
+        };
+        let route = IncomingRtpRoute {
+            ingress: facts.ingress,
+            ssrc: facts.ssrc,
+            mid: facts.mid,
+            rid: facts.rid,
+            upstream_slot: slot,
+            track_id,
+            fanout: self.upstream.track_fanout(track_id),
+        };
+        self.upstream.cache_route(route);
+        let processed = self.upstream.handle_incoming_rtp(
+            route.upstream_slot,
+            route.mid,
+            route.rid.as_ref(),
+            packet,
+            None,
+        );
+        if !processed.valid_route {
+            self.upstream.remove_route(route.ssrc);
+            return;
+        }
+        if let Some(fanout) = route.fanout {
+            self.request_initial_keyframe(fanout, route);
+        }
+        if route.fanout.is_none()
+            && let Some((track, in_topology)) = self.upstream.announce_state_mut(route.mid)
+            && !*in_topology
+        {
+            *in_topology = true;
+            events.publish_track(track.clone());
+        }
+        if processed.request_keyframe {
+            self.request_upstream_keyframe(route, events);
+        }
+        for packet in processed.first.into_iter().chain(processed.remaining) {
+            let id = packet.provenance.packet_id;
+            let Some(media) = self.pending_media.remove(&id) else {
+                debug_assert!(
+                    false,
+                    "normalized packets retain their authenticated storage"
+                );
+                continue;
+            };
+            events.publish_track_packet(route.fanout, TrackPacket::Rtp { packet, media });
+        }
+    }
+
+    fn handle_connection_state(
+        &mut self,
+        state: RtcConnectionState,
+        events: &mut impl ParticipantSink,
+    ) {
+        match state {
+            RtcConnectionState::Connected => {
+                let Some(source_shard) = self.ingress_shard else {
+                    return;
+                };
+                let Some((source, destination)) = self.transport.ingress_context() else {
+                    return;
+                };
+                events.connected(source, destination, source_shard);
+            }
+            RtcConnectionState::Closed | RtcConnectionState::Failed => events.exit(),
+            RtcConnectionState::Negotiated
+            | RtcConnectionState::Connecting
+            | RtcConnectionState::Draining => {}
+        }
+    }
+
+    fn apply_allocation(
+        &mut self,
+        now: Instant,
+        allocation: crate::participant::allocation::AllocationOutput,
+    ) {
+        let desired = self
+            .transport
+            .set_desired_bitrate(now, allocation.desired.get());
+        let current = self
+            .transport
+            .set_current_bitrate(now, allocation.allocated.get());
+        debug_assert!(
+            matches!(desired, Ok(()) | Err(pulsebeam_rtc::RtcPeerError::Closed))
+                && matches!(current, Ok(()) | Err(pulsebeam_rtc::RtcPeerError::Closed)),
+            "allocation demand only fails after the peer closes"
+        );
     }
 
     fn write_pending(&mut self, now: Instant) {
         while let Some((channel, bytes)) = self.pending_data.pop_front() {
-            if self.transport.send_data(channel, true, bytes, now).is_err() {
-                break;
-            }
-        }
-        self.pacer
-            .set_rate(now, self.transport.congestion_bitrate_bps(now));
-        while let Some((estimated_size, provenance)) = self.stream_writer.front_pacing() {
-            let (pacer_admitted_at, paced_eligible_at) = match self.pacer.admit(now, estimated_size)
-            {
-                PacerDecision::Admitted { eligible_at } => match self.pacer_wait.take() {
-                    Some(wait) if wait.provenance == provenance => {
-                        debug_assert_eq!(wait.provenance, provenance);
-                        debug_assert!(wait.admitted_at <= wait.eligible_at);
-                        (wait.admitted_at, wait.eligible_at)
-                    }
-                    Some(wait) => {
-                        debug_assert_eq!(wait.provenance, provenance);
-                        (now, eligible_at)
-                    }
-                    None => (now, eligible_at),
-                },
-                PacerDecision::Deferred { eligible_at } => {
-                    match self.pacer_wait.as_mut() {
-                        Some(wait) if wait.provenance == provenance => {
-                            debug_assert_eq!(wait.provenance, provenance);
-                            wait.eligible_at = eligible_at;
-                        }
-                        Some(wait) => {
-                            debug_assert_eq!(wait.provenance, provenance);
-                            *wait = PacerWait {
-                                provenance,
-                                admitted_at: now,
-                                eligible_at,
-                            };
-                        }
-                        None => {
-                            self.pacer_wait = Some(PacerWait {
-                                provenance,
-                                admitted_at: now,
-                                eligible_at,
-                            });
-                        }
-                    }
+            match self.send_data(now, channel, bytes) {
+                Ok(()) => {}
+                Err((channel, bytes)) => {
+                    self.pending_data.push_front((channel, bytes));
                     break;
                 }
-            };
-            let Some(write) = self.stream_writer.pop() else {
-                debug_assert!(false, "a paced stream write must remain queued");
-                break;
-            };
-            let (packet, _mid, _rid, payload_type, ssrc, _kind) = match write {
-                StreamWrite::Video {
-                    pkt,
-                    mid,
-                    rid,
-                    pt,
-                    ssrc,
-                } => (pkt, mid, rid, pt, ssrc, MediaKind::Video),
-                StreamWrite::Audio { pkt, mid, pt, ssrc } => {
-                    (pkt, mid, None, pt, ssrc, MediaKind::Audio)
-                }
-            };
-            #[cfg(debug_assertions)]
-            if let Some(violation) = self.egress_guard.check(
-                _mid,
-                _rid,
-                u64::from(packet.seq_no),
-                packet.rtp_ts.numer(),
-                packet.marker,
-                _kind,
-            ) {
-                tracing::error!(%_mid, ?_rid, %violation, "egress stream invariant violated");
-                #[cfg(feature = "sim")]
-                pulsebeam_runtime::fatal!("egress stream invariant violated: {violation}");
-            }
-            let extensions = self.send_extensions.get(&ssrc.get());
-            let nackable = extensions.is_some_and(|extensions| extensions.nackable);
-            let (mut bytes, twcc_offset) = encode_rtp(&packet, payload_type, ssrc, extensions);
-            let send_id = self.next_send_id();
-            let result = if let Some(twcc_offset) = twcc_offset {
-                match self.transport.assign_congestion(send_id, bytes.len()) {
-                    Ok(congestion) => {
-                        let sequence = congestion.transport_sequence().to_be_bytes();
-                        let Some(slot) = bytes.get_mut(twcc_offset..twcc_offset.saturating_add(2))
-                        else {
-                            debug_assert!(false, "TWCC extension must fit the encoded RTP packet");
-                            break;
-                        };
-                        slot.copy_from_slice(&sequence);
-                        self.transport.send_rtp_with_assigned_congestion(
-                            &bytes,
-                            u64::from(packet.seq_no),
-                            send_id,
-                        )
-                    }
-                    Err(error) => Err(error),
-                }
-            } else {
-                self.transport
-                    .send_rtp_untracked(&bytes, u64::from(packet.seq_no), send_id)
-            };
-            if result.is_err() {
-                break;
-            }
-            let timing = ForwardTiming {
-                ingress_at: packet.provenance.received_at,
-                pacer_admitted_at,
-                paced_eligible_at,
-            };
-            debug_assert!(timing.ingress_at <= timing.pacer_admitted_at);
-            debug_assert!(
-                self.forwarded_timing.insert(send_id, timing).is_none(),
-                "each forwarded packet must retain one timing record until egress batching"
-            );
-            if nackable {
-                self.rtp_history
-                    .entry(ssrc.get())
-                    .or_insert_with(RtpHistory::new)
-                    .store(
-                        packet.seq_no.as_u16(),
-                        bytes,
-                        u64::from(packet.seq_no),
-                        twcc_offset,
-                    );
-            }
-            #[cfg(feature = "sim")]
-            crate::sim_metrics::record_forwarded_media_for(
-                self.participant_id,
-                u64::try_from(packet.payload.len()).unwrap_or(u64::MAX),
-            );
-        }
-    }
-
-    fn retransmit(&mut self, nacks: &[pulsebeam_rtc::RtcpNack], now: Instant) {
-        let mut remaining = MAX_RETRANSMISSIONS_PER_TICK;
-        for nack in nacks {
-            for &sequence in nack.sequences() {
-                if remaining == 0 {
-                    return;
-                }
-                let Some((mut bytes, extended_sequence, twcc_offset)) = self
-                    .rtp_history
-                    .get_mut(&nack.media_ssrc())
-                    .and_then(|history| history.prepare_retransmission(sequence, now))
-                else {
-                    continue;
-                };
-                let send_id = self.next_send_id();
-                let result = if let Some(twcc_offset) = twcc_offset {
-                    let Ok(congestion) = self.transport.assign_congestion(send_id, bytes.len())
-                    else {
-                        continue;
-                    };
-                    let Some(slot) = bytes.get_mut(twcc_offset..twcc_offset.saturating_add(2))
-                    else {
-                        debug_assert!(false, "TWCC extension must fit retransmitted RTP");
-                        continue;
-                    };
-                    slot.copy_from_slice(&congestion.transport_sequence().to_be_bytes());
-                    self.transport.send_rtp_with_assigned_congestion(
-                        &bytes,
-                        extended_sequence,
-                        send_id,
-                    )
-                } else {
-                    self.transport
-                        .send_rtp_untracked(&bytes, extended_sequence, send_id)
-                };
-                if result.is_err() {
-                    return;
-                }
-                remaining = remaining.saturating_sub(1);
             }
         }
     }
 
-    fn drain_transport_egress(&mut self) {
-        while let Some(datagram) = self.transport.poll_egress() {
-            let (bytes, transport, send_id, congestion_tracked) = datagram.into_parts();
-            let destination = transport.destination();
-            let timing = send_id.and_then(|send_id| self.forwarded_timing.remove(&send_id));
-            let receipt = send_id.map(|send_id| crate::participant::batcher::DepartureReceipt {
+    fn send_data(
+        &mut self,
+        now: Instant,
+        channel: ChannelId,
+        bytes: Vec<u8>,
+    ) -> Result<(), (ChannelId, Vec<u8>)> {
+        let Some(rtc) = self.rtc_channels.get(&channel).copied() else {
+            return Err((channel, bytes));
+        };
+        self.transport
+            .send_data(rtc, DataPayload::Binary(bytes.clone()), now)
+            .map_err(|_| (channel, bytes))
+    }
+
+    fn drain_transport_egress(&mut self, now: Instant) {
+        const MAX_TRANSMITS_PER_POLL: usize = 4_096;
+        for _ in 0..MAX_TRANSMITS_PER_POLL {
+            let Some(transmit) = self.transport.poll_transmit(now) else {
+                return;
+            };
+            let (protocol, _source, destination, bytes, rtc) = transmit.into_parts();
+            let receipt = Some(crate::participant::batcher::DepartureReceipt {
                 participant: self.participant_key,
-                send_id,
-                congestion_tracked,
-                timing,
+                rtc,
+                sent: false,
             });
-            match transport.protocol() {
-                pulsebeam_rtc::TransportProtocol::Udp => {
+            match protocol {
+                pulsebeam_rtc::DatagramProtocol::Udp => {
                     self.udp_packets
                         .push_back_with_receipt(destination, bytes, receipt);
                 }
-                pulsebeam_rtc::TransportProtocol::Tcp => {
+                pulsebeam_rtc::DatagramProtocol::Tcp => {
                     self.tcp_batcher
                         .push_back_with_receipt(destination, &bytes, receipt);
                 }
             }
         }
+        debug_assert!(
+            false,
+            "one participant poll exceeded its transmit work budget"
+        );
     }
 
     pub(crate) fn drain_network(&mut self, egress: &mut impl NetworkEgress) {
@@ -1128,32 +966,23 @@ impl DirectParticipantCore {
         }
     }
 
-    fn handle_data_event(&mut self, event: DataChannelEvent, events: &mut impl ParticipantSink) {
-        match event {
-            DataChannelEvent::Open(open) => self.open_data_channel(open, events),
-            DataChannelEvent::Close(channel) => {
-                let Some(topic) = self.data.close(channel) else {
-                    return;
-                };
-                self.downstream.data.close(channel);
-                self.upstream.data.close(channel);
-                self.release_data_channel(topic, events);
-            }
-            DataChannelEvent::Message {
-                id,
-                binary,
-                payload,
-            } => self.handle_data_message(id, binary, payload, events),
-            DataChannelEvent::AssociationClosed | DataChannelEvent::Error => {
-                self.disconnect_reason = Some(DisconnectReason::IceDisconnected);
-                events.exit();
-            }
-            DataChannelEvent::AssociationConnected => {}
+    fn open_data_channel(
+        &mut self,
+        rtc: DataChannel,
+        label: String,
+        _protocol: String,
+        mode: pulsebeam_rtc::DataChannelMode,
+        events: &mut impl ParticipantSink,
+    ) {
+        let channel = ChannelId::new(self.next_data_channel);
+        self.next_data_channel = self.next_data_channel.wrapping_add(1);
+        if let Some(previous) = self.data_channels.insert(rtc, channel) {
+            let _ = self.rtc_channels.remove(&previous);
+            debug_assert!(false, "an open RTC channel handle is unique");
         }
-    }
-
-    fn open_data_channel(&mut self, open: DataChannelOpen, events: &mut impl ParticipantSink) {
-        let intent = match DataTrackIntent::from_channel(open.label(), open.reliability()) {
+        let previous = self.rtc_channels.insert(channel, rtc);
+        debug_assert!(previous.is_none());
+        let intent = match DataTrackIntent::from_channel(&label, mode) {
             Ok(intent) => intent,
             Err(error) => {
                 self.disconnect_reason = Some(error.into());
@@ -1162,12 +991,14 @@ impl DirectParticipantCore {
             }
         };
         match intent {
-            DataTrackIntent::InternalSignaling => self.signaling.set_cid(open.id()),
+            DataTrackIntent::InternalSignaling => {
+                self.signaling.set_cid(channel);
+            }
             DataTrackIntent::UserTopic(topic) => {
-                if let Some(previous) = self.data.close(open.id()) {
+                if let Some(previous) = self.data.close(channel) {
                     self.release_data_channel(previous, events);
                 }
-                if let Err(error) = self.data.open(open.id(), topic.clone()) {
+                if let Err(error) = self.data.open(channel, topic.clone()) {
                     self.disconnect_reason = Some(match error {
                         DataOpenError::DuplicateDataChannelLabel(value) => {
                             DisconnectReason::DuplicateDataChannelLabel(value)
@@ -1193,7 +1024,7 @@ impl DirectParticipantCore {
                             topic.lane,
                             None,
                         );
-                        self.upstream.data.publish(open.id(), &track);
+                        self.upstream.data.publish(channel, &track);
                         events.publish_track(track);
                     }
                     DataTrackDirection::Subscribe => events.subscribe_tracks(
@@ -1203,6 +1034,19 @@ impl DirectParticipantCore {
                 }
             }
         }
+    }
+
+    fn close_data_channel(&mut self, rtc: DataChannel, events: &mut impl ParticipantSink) {
+        let Some(channel) = self.data_channels.remove(&rtc) else {
+            return;
+        };
+        let _ = self.rtc_channels.remove(&channel);
+        let Some(topic) = self.data.close(channel) else {
+            return;
+        };
+        self.downstream.data.close(channel);
+        self.upstream.data.close(channel);
+        self.release_data_channel(topic, events);
     }
 
     fn handle_data_message(
@@ -1274,66 +1118,12 @@ impl DirectParticipantCore {
         }
     }
 
-    fn handle_rtp(
-        &mut self,
-        stream: ReceiveStream,
-        packet: crate::rtp::RtpPacket,
-        events: &mut impl ParticipantSink,
-    ) {
-        let Some(mid) = self.sections.get(&stream.media_section()).copied() else {
-            debug_assert!(
-                false,
-                "a registered receive stream must have a media section"
-            );
-            return;
-        };
-        let Some((slot, track_id)) = self.upstream.slot_for_mid(mid) else {
-            return;
-        };
-        let route = IncomingRtpRoute {
-            ssrc: Ssrc::from(stream.ssrc()),
-            mid,
-            rid: packet.extensions.rid,
-            upstream_slot: slot,
-            track_id,
-            fanout: self.upstream.track_fanout(track_id),
-        };
-        self.upstream.cache_route(route);
-        let processed = self.upstream.handle_incoming_rtp(
-            route.upstream_slot,
-            route.mid,
-            route.rid.as_ref(),
-            packet,
-            None,
-        );
-        if !processed.valid_route {
-            self.upstream.remove_route(route.ssrc);
-            return;
-        }
-        if route.fanout.is_none()
-            && let Some((track, in_topology)) = self.upstream.announce_state_mut(route.mid)
-            && !*in_topology
-        {
-            *in_topology = true;
-            events.publish_track(track.clone());
-        }
-        if processed.request_keyframe {
-            self.request_upstream_keyframe(route, events);
-        }
-        if let Some(packet) = processed.first {
-            events.publish_track_packet(route.fanout, TrackPacket::Rtp(packet));
-        }
-        for packet in processed.remaining {
-            events.publish_track_packet(route.fanout, TrackPacket::Rtp(packet));
-        }
-    }
-
     fn handle_downstream_keyframe_request(
         &mut self,
-        ssrc: Ssrc,
+        slot: EgressSlot,
         events: &mut impl ParticipantSink,
     ) {
-        let Some(mid) = self.send_sections.get(&ssrc.get()).copied() else {
+        let Some(mid) = self.egress_mids.get(&slot).copied() else {
             return;
         };
         let request = KeyframeRequest {
@@ -1341,16 +1131,13 @@ impl DirectParticipantCore {
             rid: None,
             kind: KeyframeRequestKind::Pli,
         };
-        let Some(layer) = self.downstream.handle_keyframe_request(request) else {
+        let Some((fanout, rid)) = self.downstream.handle_keyframe_request(request) else {
             return;
         };
-        let stream = layer.stream_id();
-        if let Some(fanout) = self.upstream.track_fanout(stream.0) {
-            events.request_reverse(
-                fanout,
-                ReversePacket::keyframe(stream.1, KeyframeRequestKind::Pli),
-            );
-        }
+        events.request_reverse(
+            fanout,
+            ReversePacket::keyframe(rid, KeyframeRequestKind::Pli),
+        );
     }
 
     fn request_upstream_keyframe(
@@ -1364,207 +1151,5 @@ impl DirectParticipantCore {
                 ReversePacket::keyframe(route.rid, KeyframeRequestKind::Pli),
             );
         }
-    }
-
-    fn handle_transport_event(&mut self, event: TransportEvent, events: &mut impl ParticipantSink) {
-        match event {
-            TransportEvent::IceConnected => {
-                let Some(source_shard) = self.ingress_shard else {
-                    return;
-                };
-                let Some((source, destination)) = self.transport.ingress_context() else {
-                    return;
-                };
-                events.connected(source, destination, source_shard);
-            }
-            TransportEvent::IceDisconnected
-            | TransportEvent::IceFailed
-            | TransportEvent::DtlsClosed => {
-                events.exit();
-            }
-            TransportEvent::IceChecking | TransportEvent::DtlsConnected => {}
-        }
-    }
-
-    pub fn discover_receive_stream(&mut self, ssrc: u32, payload_type: u8) -> bool {
-        let Some(section) = self.receive_sections.get(&payload_type).copied() else {
-            return false;
-        };
-        let id = StreamId::new(ssrc);
-        self.transport
-            .register_receive(ReceiveStream::new(id, section, ssrc))
-            .is_ok()
-    }
-
-    pub fn register_send_stream(
-        &mut self,
-        section: pulsebeam_rtc::MediaSectionId,
-        ssrc: Ssrc,
-    ) -> bool {
-        let id = StreamId::new(ssrc.get());
-        self.transport
-            .register_send(SendStream::new(id, section, ssrc.get(), 0, 0))
-            .is_ok()
-    }
-
-    pub fn next_send_id(&mut self) -> SendId {
-        let id = SendId::new(self.next_send_id);
-        self.next_send_id = self.next_send_id.wrapping_add(1);
-        id
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn forwarding_latency_components_exactly_decompose_departure() {
-        let ingress_at = Instant::now();
-        let timing = ForwardTiming {
-            ingress_at,
-            pacer_admitted_at: ingress_at + Duration::from_millis(2),
-            paced_eligible_at: ingress_at + Duration::from_millis(7),
-        };
-
-        assert_eq!(
-            timing.departed(ingress_at + Duration::from_millis(11)),
-            ForwardingLatency {
-                service: Duration::from_millis(2),
-                pacing: Duration::from_millis(5),
-                egress_lateness: Duration::from_millis(4),
-                total: Duration::from_millis(11),
-            }
-        );
-    }
-
-    #[test]
-    fn outgoing_rtp_carries_negotiated_mid_and_twcc_fields() {
-        let extensions = OutgoingExtensions {
-            absolute_capture_time: None,
-            mid: Some((3, Box::from(*b"video"))),
-            twcc: Some(5),
-            dependency_descriptor: None,
-            nackable: true,
-        };
-        let packet = crate::rtp::RtpPacket {
-            payload: vec![1, 2, 3],
-            ..Default::default()
-        };
-        let (bytes, twcc_offset) = encode_rtp(
-            &packet,
-            PayloadType::new(96).expect("valid RTP payload type"),
-            Ssrc::from(17),
-            Some(&extensions),
-        );
-
-        assert_eq!(bytes[0], 0x90);
-        assert_eq!(&bytes[12..16], &[0xbe, 0xde, 0, 3]);
-        assert_eq!(bytes[16], 0x34);
-        assert_eq!(&bytes[17..22], b"video");
-        let offset = twcc_offset.expect("TWCC is negotiated");
-        assert_eq!(bytes[offset - 1], 0x51);
-        assert_eq!(&bytes[offset..offset + 2], &[0, 0]);
-        assert_eq!(&bytes[bytes.len() - 3..], &[1, 2, 3]);
-    }
-
-    #[test]
-    fn outgoing_rtp_never_forwards_the_source_rid() {
-        let extensions = OutgoingExtensions {
-            absolute_capture_time: None,
-            mid: None,
-            twcc: None,
-            dependency_descriptor: None,
-            nackable: true,
-        };
-        let packet = crate::rtp::RtpPacket {
-            extensions: crate::rtp::PacketExtensions {
-                rid: Some(crate::rtp::EncodingId::from("f")),
-                ..Default::default()
-            },
-            payload: vec![1, 2, 3],
-            ..Default::default()
-        };
-        let (bytes, twcc_offset) = encode_rtp(
-            &packet,
-            PayloadType::new(96).expect("valid RTP payload type"),
-            Ssrc::from(17),
-            Some(&extensions),
-        );
-
-        assert_eq!(bytes[0], 0x80);
-        assert_eq!(&bytes[12..], &[1, 2, 3]);
-        assert!(twcc_offset.is_none());
-    }
-
-    #[test]
-    fn outgoing_rtp_preserves_long_dependency_descriptor() {
-        let extensions = OutgoingExtensions {
-            absolute_capture_time: None,
-            mid: None,
-            twcc: None,
-            dependency_descriptor: Some(4),
-            nackable: true,
-        };
-        let descriptor = (0u8..17).collect();
-        let packet = crate::rtp::RtpPacket {
-            extensions: crate::rtp::PacketExtensions {
-                raw_dependency_descriptor: Some(pulsebeam_core::dd::RawDependencyDescriptor(
-                    descriptor,
-                )),
-                ..Default::default()
-            },
-            payload: vec![1, 2, 3],
-            ..Default::default()
-        };
-        let (bytes, twcc_offset) = encode_rtp(
-            &packet,
-            PayloadType::new(96).expect("valid RTP payload type"),
-            Ssrc::from(17),
-            Some(&extensions),
-        );
-
-        assert_eq!(&bytes[12..16], &[0x10, 0, 0, 5]);
-        assert_eq!(&bytes[16..18], &[4, 17]);
-        assert_eq!(&bytes[18..35], &(0u8..17).collect::<Vec<_>>());
-        assert!(twcc_offset.is_none());
-        assert_eq!(&bytes[bytes.len() - 3..], &[1, 2, 3]);
-    }
-
-    #[test]
-    fn outgoing_rtp_preserves_absolute_capture_time() {
-        let extensions = OutgoingExtensions {
-            absolute_capture_time: Some(3),
-            mid: None,
-            twcc: None,
-            dependency_descriptor: None,
-            nackable: false,
-        };
-        let packet = crate::rtp::RtpPacket {
-            extensions: crate::rtp::PacketExtensions {
-                absolute_capture_time: Some(Box::new([1, 2, 3, 4, 5, 6, 7, 8])),
-                ..Default::default()
-            },
-            payload: vec![1, 2, 3],
-            ..Default::default()
-        };
-        let (bytes, twcc_offset) = encode_rtp(
-            &packet,
-            PayloadType::new(96).expect("valid RTP payload type"),
-            Ssrc::from(17),
-            Some(&extensions),
-        );
-
-        assert_eq!(&bytes[12..16], &[0xbe, 0xde, 0, 3]);
-        assert_eq!(&bytes[16..25], &[0x37, 1, 2, 3, 4, 5, 6, 7, 8]);
-        assert!(twcc_offset.is_none());
-    }
-
-    #[test]
-    fn direct_participant_core_keeps_live_protocol_state_off_the_stack() {
-        assert!(
-            std::mem::size_of::<DirectParticipantCore>() < 4096,
-            "participant core must keep live protocol components on the heap"
-        );
     }
 }

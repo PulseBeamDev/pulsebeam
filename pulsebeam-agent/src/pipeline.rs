@@ -242,6 +242,9 @@ impl JitterBuffer {
     }
 
     pub fn push(&mut self, rtp: RtpPacket) {
+        if self.next.is_some_and(|next| *rtp.seq < next) {
+            return;
+        }
         let arrival = rtp.arrival;
         self.latest_arrival = Some(self.latest_arrival.map_or(arrival, |l| l.max(arrival)));
         self.buf.insert(*rtp.seq, rtp);
@@ -696,6 +699,42 @@ mod tests {
         }
         // 1 was never delivered; after the wait it is skipped and 2,3 follow in order.
         assert_eq!(seqs, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn jitter_buffer_drops_a_retransmission_after_its_gap_was_committed() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let pkt = |seq: u64, at_ms: u64| RtpPacket {
+            ssrc: None,
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload_type: None,
+            payload: Arc::from([u8::try_from(seq % 256).expect("masked to a byte")].as_slice()),
+            ext_vals: ExtensionValues::default(),
+            arrival: base + Duration::from_millis(at_ms),
+        };
+
+        let mut jb = JitterBuffer::new(Duration::from_millis(50));
+        jb.push(pkt(0, 0));
+        jb.push(pkt(1, 50));
+        assert_eq!(jb.pop().map(|packet| *packet.seq), Some(0));
+        assert_eq!(jb.pop().map(|packet| *packet.seq), Some(1));
+        jb.note_frame_delivered();
+
+        jb.push(pkt(3, 60));
+        jb.push(pkt(4, 120));
+        assert_eq!(jb.pop().map(|packet| *packet.seq), Some(3));
+        assert_eq!(jb.pop().map(|packet| *packet.seq), Some(4));
+
+        jb.push(pkt(2, 130));
+        jb.push(pkt(5, 180));
+        assert_eq!(jb.pop().map(|packet| *packet.seq), Some(5));
+        assert!(jb.pop().is_none());
     }
 
     /// Opening a stream costs the reordering window, not the loss-recovery budget.

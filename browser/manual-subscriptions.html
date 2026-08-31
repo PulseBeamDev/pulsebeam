@@ -1,9 +1,11 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>PulseBeam Manual Subscriber</title>
+<button id="enable-media" type="button">Enable media</button>
 <div id="videos"></div>
 <script type="module">
   const videoRoot = document.querySelector("#videos");
+  const enableMediaButton = document.querySelector("#enable-media");
   const videos = [];
   const text = new TextEncoder();
   const textDecoder = new TextDecoder();
@@ -13,6 +15,13 @@
   let auxVideoMid;
   let receiverMid;
   let remoteTrackId;
+  let desiredHeight = 720;
+  let mainSender;
+  let mainTrack;
+  let mainAudioTrack;
+  let audioContext;
+  let signalMessages = 0;
+  let intentsSent = 0;
 
   function concat(parts) {
     const length = parts.reduce((sum, part) => sum + part.length, 0);
@@ -119,17 +128,19 @@
     const video = remoteTrackId === null ? [] : [field(1, concat([
       stringField(1, receiverMid),
       stringField(2, remoteTrackId),
-      numberField(3, 1080),
-      numberField(4, 360),
+      numberField(3, desiredHeight),
+      numberField(4, Math.min(desiredHeight, 180)),
       numberField(6, 200),
     ]))];
-    signal.send(field(1, concat([...video, ...publish])));
+    const audio = signalMessages === 0 ? [] : [field(2, boolField(2, true))];
+    signal.send(field(1, concat([...video, ...audio, ...publish])));
+    intentsSent += 1;
   }
 
   function canvasTrack() {
     const canvas = document.createElement("canvas");
-    canvas.width = 320;
-    canvas.height = 180;
+    canvas.width = 1280;
+    canvas.height = 720;
     const context = canvas.getContext("2d");
     let frame = 0;
     const draw = () => {
@@ -143,6 +154,22 @@
     draw();
     return canvas.captureStream(30).getVideoTracks()[0];
   }
+
+  async function enableMedia() {
+    if (mainAudioTrack) return;
+    audioContext = new AudioContext();
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    const destination = audioContext.createMediaStreamDestination();
+    oscillator.frequency.value = 440;
+    gain.gain.value = 0.1;
+    oscillator.connect(gain).connect(destination);
+    oscillator.start();
+    await audioContext.resume();
+    mainAudioTrack = destination.stream.getAudioTracks()[0];
+  }
+
+  enableMediaButton.addEventListener("click", enableMedia);
 
   async function activateMotionSender(sender, track) {
     await sender.replaceTrack(track);
@@ -182,6 +209,7 @@
   }
 
   async function connect({ apiUrl, room }) {
+    if (!mainAudioTrack) throw new Error("media must be enabled before connecting");
     remoteTrackId = null;
     peer = new RTCPeerConnection({
       iceServers: [],
@@ -193,16 +221,18 @@
     signal.binaryType = "arraybuffer";
     signal.onopen = sendIntent;
     signal.onmessage = ({ data }) => {
+      signalMessages += 1;
       consumeState(new Uint8Array(data));
       sendIntent();
     };
-    peer.addTransceiver("audio", { direction: "sendonly" });
-    const mainVideo = peer.addTransceiver("video", {
+    peer.addTransceiver(mainAudioTrack, { direction: "sendonly" });
+    mainTrack = canvasTrack();
+    const mainVideo = peer.addTransceiver(mainTrack, {
       direction: "sendonly",
       sendEncodings: [
-        { rid: "q", active: false, scalabilityMode: "L1T3" },
-        { rid: "h", active: false, scalabilityMode: "L1T3" },
-        { rid: "f", active: false, scalabilityMode: "L1T3" },
+        { rid: "q", active: true, scaleResolutionDownBy: 4, maxBitrate: 187500, maxFramerate: 30, scalabilityMode: "L1T3" },
+        { rid: "h", active: true, scaleResolutionDownBy: 2, maxBitrate: 437500, maxFramerate: 30, scalabilityMode: "L1T3" },
+        { rid: "f", active: true, scaleResolutionDownBy: 1, maxBitrate: 1250000, maxFramerate: 30, scalabilityMode: "L1T3" },
       ],
     });
     peer.addTransceiver("audio", { direction: "sendonly" });
@@ -230,6 +260,9 @@
       video.srcObject = new MediaStream([track]);
       videoRoot.append(video);
       videos.push(video);
+      const play = () => video.play().catch(() => {});
+      video.addEventListener("loadedmetadata", play, { once: true });
+      play();
     };
     await peer.setLocalDescription(await peer.createOffer());
     ({ mainVideoMid, auxVideoMid, receiverMid } = (() => {
@@ -252,8 +285,41 @@
     });
     if (!response.ok) throw new Error(`signaling failed: ${response.status}`);
     await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
-    await activateMotionSender(mainVideo.sender, canvasTrack());
+    mainSender = mainVideo.sender;
+    await activateMotionSender(mainSender, mainTrack);
     sendIntent();
+  }
+
+  function supportsH264() {
+    return RTCRtpSender.getCapabilities("video")?.codecs
+      ?.some((codec) => codec.mimeType.toLowerCase() === "video/h264") === true &&
+      RTCRtpReceiver.getCapabilities("video")?.codecs
+        ?.some((codec) => codec.mimeType.toLowerCase() === "video/h264") === true;
+  }
+
+  function setSubscriptionHeight(height) {
+    desiredHeight = height;
+    sendIntent();
+  }
+
+  async function setPublishing(active) {
+    await mainSender.replaceTrack(active ? mainTrack : null);
+  }
+
+  async function exerciseDataBackpressure() {
+    if (signal?.readyState !== "open") throw new Error("data channel is not open");
+    signal.bufferedAmountLowThreshold = 0;
+    const drained = new Promise((resolve) => {
+      signal.addEventListener("bufferedamountlow", resolve, { once: true });
+      setTimeout(resolve, 5_000);
+    });
+    for (let index = 0; index < 512; index += 1) sendIntent();
+    const peakBufferedAmount = signal.bufferedAmount;
+    if (peakBufferedAmount > 0) await drained;
+    return {
+      peakBufferedAmount,
+      finalBufferedAmount: signal.bufferedAmount,
+    };
   }
 
   async function stats() {
@@ -264,6 +330,9 @@
     }
     const inbound = [];
     const outbound = [];
+    const inboundAudio = [];
+    const outboundAudio = [];
+    const remoteInbound = [];
     for (const value of report.values()) {
       if (value.type === "outbound-rtp" && value.kind === "video") {
         outbound.push({
@@ -283,12 +352,44 @@
       }
       if (value.type === "inbound-rtp" && value.kind === "video") {
         inbound.push({
+          packetsReceived: value.packetsReceived ?? 0,
           framesDecoded: value.framesDecoded ?? 0,
+          keyFramesDecoded: value.keyFramesDecoded ?? 0,
+          nackCount: value.nackCount ?? 0,
+          pliCount: value.pliCount ?? 0,
           jitterBufferDelay: value.jitterBufferDelay ?? 0,
           jitterBufferEmittedCount: value.jitterBufferEmittedCount ?? 0,
+          frameWidth: value.frameWidth ?? null,
+          frameHeight: value.frameHeight ?? null,
           codec: codecs.get(value.codecId) ?? null,
           mid: value.mid ?? null,
           payloadType: value.payloadType ?? null,
+        });
+      }
+      if (value.type === "outbound-rtp" && value.kind === "audio") {
+        outboundAudio.push({
+          packetsSent: value.packetsSent ?? 0,
+          bytesSent: value.bytesSent ?? 0,
+          codec: codecs.get(value.codecId) ?? null,
+        });
+      }
+      if (value.type === "inbound-rtp" && value.kind === "audio") {
+        inboundAudio.push({
+          packetsReceived: value.packetsReceived ?? 0,
+          bytesReceived: value.bytesReceived ?? 0,
+          packetsLost: value.packetsLost ?? 0,
+          codec: codecs.get(value.codecId) ?? null,
+        });
+      }
+      if (value.type === "remote-inbound-rtp") {
+        remoteInbound.push({
+          kind: value.kind ?? null,
+          localId: value.localId ?? null,
+          packetsLost: value.packetsLost ?? null,
+          fractionLost: value.fractionLost ?? null,
+          roundTripTime: value.roundTripTime ?? null,
+          totalRoundTripTime: value.totalRoundTripTime ?? null,
+          roundTripTimeMeasurements: value.roundTripTimeMeasurements ?? null,
         });
       }
     }
@@ -308,10 +409,19 @@
       value.type === "candidate-pair" && value.nominated && value.state === "succeeded");
     return {
       connectionState: peer.connectionState,
+      remoteTrackId,
       inbound,
       outbound,
+      inboundAudio,
+      outboundAudio,
+      remoteInbound,
       sendEncodings,
       availableOutgoingBitrate: selectedCandidatePair?.availableOutgoingBitrate ?? null,
+      dataChannel: {
+        intentsSent,
+        messagesReceived: signalMessages,
+        readyState: signal?.readyState ?? "closed",
+      },
       rendered: videos.map((video) => ({ width: video.videoWidth, height: video.videoHeight })),
     };
   }
@@ -325,5 +435,13 @@
     };
   }
 
-  window.pulsebeamManual = { connect, sdp, stats };
+  window.pulsebeamManual = {
+    connect,
+    exerciseDataBackpressure,
+    sdp,
+    setPublishing,
+    setSubscriptionHeight,
+    stats,
+    supportsH264,
+  };
 </script>

@@ -26,6 +26,7 @@ pub struct AgentBuilder {
     tcp_server_addr: Option<SocketAddr>,
     manual_sub: bool,
     negotiate_dependency_descriptor: bool,
+    initial_send_bitrate: Bitrate,
 }
 
 impl AgentBuilder {
@@ -38,6 +39,7 @@ impl AgentBuilder {
             tcp_server_addr: None,
             manual_sub: false,
             negotiate_dependency_descriptor: true,
+            initial_send_bitrate: Bitrate::kbps(2000),
         }
     }
 
@@ -108,6 +110,12 @@ impl AgentBuilder {
         self
     }
 
+    pub fn with_initial_send_bitrate_bps(mut self, bitrate_bps: u64) -> Self {
+        debug_assert!(bitrate_bps > 0);
+        self.initial_send_bitrate = Bitrate::bps(bitrate_bps);
+        self
+    }
+
     pub async fn connect(self, room_id: &str) -> Result<Agent, AgentError> {
         let (agent, runner) = self.connect_unmanaged(room_id).await?;
         tokio::spawn(async move {
@@ -135,7 +143,7 @@ impl AgentBuilder {
 
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
-            .enable_bwe(Some(Bitrate::kbps(2000)))
+            .enable_bwe(Some(self.initial_send_bitrate))
             .set_extension(
                 rtp_extensions::ABS_CAPTURE_TIME,
                 str0m::rtp::Extension::AbsoluteCaptureTime,

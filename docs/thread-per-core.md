@@ -2,9 +2,11 @@
 
 This SFU is thread-per-core. A shard owns its mutable participants, compiled
 track plans, routes, packet buffers and packet runtime outright, runs on one
-core, and reaches other shards only by message. `ShardWorker` is `!Send` on
-purpose. The controller sends owned plan updates; every shard materializes and
-mutates only its own copy.
+runtime task at a time, and reaches other shards only by message. `ShardWorker`
+and its `RtcPeer` values are `Send`, so the work-stealing runtime may move an
+idle shard task between worker threads. They are never polled concurrently.
+The controller sends owned plan updates; every shard materializes and mutates
+only its own copy.
 
 That is unusual enough that the obvious "improvement" is usually a regression.
 This file says what the rules are and why, so the reasoning survives the person

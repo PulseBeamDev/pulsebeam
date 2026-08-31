@@ -137,9 +137,8 @@ impl ControllerCore {
     )]
     pub fn create_participant(
         &mut self,
-        connection_id: pulsebeam_rtc::ConnectionId,
-        session: pulsebeam_rtc::NegotiatedSession,
-        local: pulsebeam_rtc::LocalTransport,
+        peer: pulsebeam_rtc::RtcPeer,
+        media: Box<[pulsebeam_rtc::NegotiatedMedia]>,
         state: ParticipantState,
         shard: ShardId,
         transport: TransportHandle,
@@ -154,9 +153,8 @@ impl ControllerCore {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
             participant_id: state.participant_id,
-            connection_id,
-            session,
-            local,
+            peer,
+            media,
         }
     }
 

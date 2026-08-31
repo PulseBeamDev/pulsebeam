@@ -4,7 +4,9 @@ use str0m::media::MediaTime;
 use tokio::sync::watch;
 
 use crate::{MediaFrame, agent::LocalEncoding};
-use pulsebeam_testdata::quality_audio_fixture;
+use pulsebeam_testdata::{
+    QualityAudioRegion, QualityAudioSource, quality_audio_fixture, quality_corpus_audio,
+};
 
 #[derive(Clone)]
 pub struct KeyframeNotifier(watch::Sender<u64>);
@@ -36,27 +38,38 @@ impl KeyframeReceiver {
             false
         }
     }
+
+    async fn wait_requested(&mut self) -> bool {
+        if self.0.changed().await.is_err() {
+            return false;
+        }
+        let _ = self.0.borrow_and_update();
+        true
+    }
 }
 
 pub struct SharedH264Asset {
     pub(crate) frames: Vec<Arc<[u8]>>,
     pub(crate) first_idr: usize,
+    idrs: Vec<usize>,
 }
 
 impl SharedH264Asset {
     pub fn new(data: &[u8]) -> Self {
         let slicer = H264FrameSlicer::new(data);
         let frames: Vec<Arc<[u8]>> = slicer.map(Arc::from).collect();
-        let first_idr = Self::find_first_idr(&frames);
-
-        Self { frames, first_idr }
-    }
-
-    fn find_first_idr(frames: &[Arc<[u8]>]) -> usize {
-        frames
+        let idrs: Vec<_> = frames
             .iter()
-            .position(|f| Self::frame_has_idr(f))
-            .unwrap_or(0)
+            .enumerate()
+            .filter_map(|(index, frame)| Self::frame_has_idr(frame).then_some(index))
+            .collect();
+        let first_idr = idrs.first().copied().unwrap_or(0);
+
+        Self {
+            frames,
+            first_idr,
+            idrs,
+        }
     }
 
     fn frame_has_idr(frame: &[u8]) -> bool {
@@ -88,6 +101,25 @@ impl SharedH264Asset {
         }
         false
     }
+
+    fn next_idr(&self, index: usize) -> (usize, usize) {
+        debug_assert!(index < self.frames.len());
+        let target = self
+            .idrs
+            .iter()
+            .copied()
+            .find(|candidate| *candidate >= index)
+            .unwrap_or(self.first_idr);
+        let skipped = if target >= index {
+            target.saturating_sub(index)
+        } else {
+            self.frames
+                .len()
+                .saturating_sub(index)
+                .saturating_add(target)
+        };
+        (target, skipped)
+    }
 }
 
 /// Convert a computed rate or timestamp to an integer without letting a NaN or
@@ -108,31 +140,34 @@ pub(crate) fn saturating_u64_from_f64(v: f64) -> u64 {
     }
 }
 
-/// Rewrite every Annex-B NAL unit type to a non-IDR coded slice (type 1),
-/// preserving the framing so str0m still packetizes and depacketizes the stream
-/// but the SFU's h264::classify finds no IDR, SPS, or PPS. This simulates
-/// SFrame/E2EE, where the media bitstream is opaque to the SFU and the Dependency
-/// Descriptor is the only keyframe signal.
 fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
     const NON_IDR_SLICE: u8 = 1;
-    let mut out = frame.to_vec();
-    let mut i = 0usize;
-    while i.saturating_add(3) < out.len() {
-        let start_code = out.get(i) == Some(&0)
-            && out.get(i.saturating_add(1)) == Some(&0)
-            && out.get(i.saturating_add(2)) == Some(&1);
-        if start_code {
-            let header = i.saturating_add(3);
-            // Keep forbidden_zero_bit + nal_ref_idc, replace only the 5-bit type.
-            if let Some(byte) = out.get_mut(header) {
-                *byte = (*byte & 0xE0) | NON_IDR_SLICE;
-            }
-            i = header.saturating_add(1);
-        } else {
-            i = i.saturating_add(1);
-        }
+    let mut out: Vec<u8> = frame.iter().map(|byte| byte ^ 0xa5).collect();
+    for first in (0..out.len()).step_by(pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD) {
+        let Some(byte) = out.get_mut(first) else {
+            debug_assert!(false, "opaque packet boundary must remain inside the frame");
+            continue;
+        };
+        *byte = (*byte & 0xe0) | NON_IDR_SLICE;
     }
     out.into()
+}
+
+#[cfg(test)]
+mod opaque_frame_tests {
+    use super::opaque_frame;
+
+    #[test]
+    fn opaque_payload_has_no_h264_switch_signal_at_any_packet_boundary() {
+        let frame = vec![0xff; pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD * 4 + 317];
+        let opaque = opaque_frame(&frame);
+        for payload in opaque.chunks(pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD) {
+            let nal = pulsebeam_core::h264::classify(payload);
+            assert!(!nal.idr());
+            assert!(!nal.sps());
+            assert!(!nal.pps());
+        }
+    }
 }
 
 pub struct H264Looper {
@@ -236,16 +271,21 @@ impl H264Looper {
             let tick_time = interval.tick().await;
 
             if sender.keyframe_rx.is_requested() {
-                tracing::debug!(
-                    ?mid,
-                    ?rid,
-                    first_idr = self.asset.first_idr,
-                    "keyframe reset"
-                );
-                self.index = self.asset.first_idr;
+                let (target, skipped) = self.asset.next_idr(self.index);
+                tracing::debug!(?mid, ?rid, decoder_reset = target, "keyframe reset");
+                self.index = target;
+                frame_count =
+                    frame_count.saturating_add(u64::try_from(skipped).unwrap_or(u64::MAX));
             }
 
-            let is_keyframe = self.index == self.asset.first_idr;
+            debug_assert_eq!(
+                self.index,
+                usize::try_from(frame_count)
+                    .unwrap_or_default()
+                    .checked_rem(self.asset.frames.len())
+                    .unwrap_or_default()
+            );
+            let is_keyframe = self.asset.idrs.contains(&self.index);
             let frame_data = self.next();
             let next_ts = frame_count
                 .saturating_mul(clock_rate)
@@ -548,9 +588,12 @@ impl VbrLooper {
                     .get(index)
                     .and_then(|offset| loop_start.checked_add(*offset))
                     .unwrap_or(loop_start);
-                tokio::time::sleep_until(due).await;
+                let requested = tokio::select! {
+                    _ = tokio::time::sleep_until(due) => false,
+                    requested = sender.keyframe_rx.wait_requested() => requested,
+                };
                 let now = tokio::time::Instant::now();
-                if sender.keyframe_rx.is_requested() {
+                if requested || sender.keyframe_rx.is_requested() {
                     index = self.asset.first_idr;
                     debug_assert_eq!(index, 0, "scheduled fixture must begin with its first IDR");
                     loop_start = now;
@@ -589,7 +632,10 @@ impl VbrLooper {
         let mut next_frame_at = start;
 
         loop {
-            tokio::time::sleep_until(next_frame_at).await;
+            let requested = tokio::select! {
+                _ = tokio::time::sleep_until(next_frame_at) => false,
+                requested = sender.keyframe_rx.wait_requested() => requested,
+            };
             let now = tokio::time::Instant::now();
             let elapsed = now.duration_since(start);
 
@@ -604,7 +650,7 @@ impl VbrLooper {
                 .checked_add(Duration::from_secs_f64(1.0 / fps as f64))
                 .unwrap_or(now);
 
-            if sender.keyframe_rx.is_requested() {
+            if requested || sender.keyframe_rx.is_requested() {
                 tracing::debug!(
                     ?mid,
                     ?rid,
@@ -765,6 +811,7 @@ pub struct AudioLooper {
     /// selector ranks them and never switches. Offsetting one makes them take turns, which is the
     /// only way a plan reaches the slot-stealing path.
     phase_offset: u64,
+    corpus_source: Option<QualityAudioSource>,
 }
 
 impl AudioLooper {
@@ -777,6 +824,7 @@ impl AudioLooper {
             spurt_packets: 90,
             pause_packets: 60,
             phase_offset: 0,
+            corpus_source: None,
         }
     }
 
@@ -800,6 +848,13 @@ impl AudioLooper {
         self.level_dbov = level_dbov;
         self.talks = level_dbov > -60;
         self
+    }
+
+    pub fn corpus(source: QualityAudioSource) -> Self {
+        Self {
+            corpus_source: Some(source),
+            ..Self::speaking()
+        }
     }
 
     /// Where this source is in its speech cycle, and what that sounds like on the wire.
@@ -832,10 +887,19 @@ impl AudioLooper {
         let mut interval = tokio::time::interval(Duration::from_millis(self.packet_ms));
         let mut packets: u64 = 0;
         let fixture = quality_audio_fixture();
-        if fixture.is_empty() {
+        let corpus = self.corpus_source.map(quality_corpus_audio);
+        if fixture.is_empty()
+            || corpus
+                .as_ref()
+                .is_some_and(pulsebeam_testdata::QualityCorpusAudio::is_empty)
+        {
             return;
         }
-        let fixture_len = u64::try_from(fixture.len()).unwrap_or(u64::MAX);
+        let fixture_len = u64::try_from(corpus.as_ref().map_or_else(
+            || fixture.len(),
+            pulsebeam_testdata::QualityCorpusAudio::len,
+        ))
+        .unwrap_or(u64::MAX);
 
         loop {
             let tick_time = interval.tick().await;
@@ -846,7 +910,6 @@ impl AudioLooper {
                 .unwrap_or(0);
             packets = packets.saturating_add(1);
 
-            let (level_dbov, speech) = self.at(packets);
             let fixture_index = usize::try_from(
                 packets
                     .saturating_sub(1)
@@ -854,14 +917,28 @@ impl AudioLooper {
                     .unwrap_or(0),
             )
             .unwrap_or(0);
-            let Some(fixture_frame) = fixture.frame(fixture_index) else {
-                return;
+            let (packet, level_dbov, speech) = if let Some(corpus) = &corpus {
+                let Some(frame) = corpus.frame(fixture_index) else {
+                    return;
+                };
+                let active = frame.region == QualityAudioRegion::Active;
+                (
+                    frame.opus_packet,
+                    if active { self.level_dbov } else { -70 },
+                    active,
+                )
+            } else {
+                let Some(frame) = fixture.frame(fixture_index) else {
+                    return;
+                };
+                let (level_dbov, speech) = self.at(packets);
+                (frame.opus_packet, level_dbov, speech)
             };
             let frame = MediaFrame {
                 audio_level: Some(level_dbov),
                 voice_activity: Some(speech),
                 ts: MediaTime::new(ts, str0m::media::Frequency::FORTY_EIGHT_KHZ),
-                data: Arc::from(fixture_frame.opus_packet),
+                data: Arc::from(packet),
                 capture_time: tick_time,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,

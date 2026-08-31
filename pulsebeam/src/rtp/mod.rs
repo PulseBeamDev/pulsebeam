@@ -118,6 +118,7 @@ pub struct RtpPacket {
     /// for audio.
     pub nal: h264::NalFlags,
     pub payload: Vec<u8>,
+    pub payload_len: usize,
 }
 
 impl Default for RtpPacket {
@@ -141,6 +142,7 @@ impl Default for RtpPacket {
             is_frame_start: true,
             nal: h264::NalFlags::empty(),
             payload: vec![0u8; 1200],
+            payload_len: 1200,
         }
     }
 }
@@ -170,6 +172,7 @@ impl RtpPacket {
             }
             Codec::Opus => true,
         };
+        let payload_len = payload.len();
         Self {
             codec,
             ssrc,
@@ -185,6 +188,7 @@ impl RtpPacket {
             is_frame_start: true,
             nal,
             payload,
+            payload_len,
         }
     }
 
@@ -207,6 +211,7 @@ impl RtpPacket {
             is_frame_start: self.is_frame_start,
             nal: self.nal,
             payload: self.payload.clone(),
+            payload_len: self.payload_len,
         }
     }
 
@@ -217,48 +222,110 @@ impl RtpPacket {
         );
     }
 
+    pub const fn payload_size(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn from_media_packet(
+        packet: &pulsebeam_rtc::MediaPacket,
+        ssrc: Ssrc,
+    ) -> Result<Self, pulsebeam_rtc::MediaPacketError> {
+        let codec = Codec::from_name(packet.codec().name()).unwrap_or(Codec::H264);
+        let semantics = packet.semantics()?;
+        let media_extensions = packet.extensions()?;
+        let mut extensions = PacketExtensions {
+            absolute_capture_time: media_extensions.absolute_capture_time().map(Into::into),
+            audio_level: media_extensions.audio_level(),
+            mid: Some(packet.mid().into()),
+            rid: packet.rid().map(Into::into),
+            ..PacketExtensions::default()
+        };
+        extensions.raw_dependency_descriptor = media_extensions
+            .dependency_descriptor()
+            .filter(|value| value.len() <= pulsebeam_core::dd::model::MAX_DD_LEN)
+            .map(|value| {
+                pulsebeam_core::dd::RawDependencyDescriptor(value.iter().copied().collect())
+            });
+        extensions.video_layers_allocation =
+            media_extensions
+                .video_layers_allocation()
+                .map(|vla| types::VideoLayersAllocation {
+                    current_simulcast_stream_index: vla.current_stream(),
+                    simulcast_streams: vla
+                        .streams()
+                        .iter()
+                        .map(|stream| types::SimulcastStreamAllocation {
+                            spatial_layers: stream
+                                .spatial_layers()
+                                .iter()
+                                .map(|spatial| types::SpatialLayerAllocation {
+                                    temporal_layers: spatial
+                                        .cumulative_temporal_kbps()
+                                        .iter()
+                                        .copied()
+                                        .map(|cumulative_kbps| types::TemporalLayerAllocation {
+                                            cumulative_kbps,
+                                        })
+                                        .collect(),
+                                    resolution_and_framerate: spatial.resolution().map(
+                                        |(width, height, framerate)| {
+                                            types::ResolutionAndFramerate {
+                                                width,
+                                                height,
+                                                framerate,
+                                            }
+                                        },
+                                    ),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                });
+        let nal = semantics
+            .h264()
+            .map_or_else(h264::NalFlags::empty, |metadata| {
+                h264::NalFlags::from_parts(metadata.sps(), metadata.pps(), metadata.idr())
+            });
+        let received_at = Instant::from_std(packet.received_at());
+        Ok(Self {
+            codec,
+            ssrc,
+            marker: packet.marker(),
+            extensions,
+            header_len: 12,
+            seq_no: packet.sequence().get().into(),
+            rtp_ts: MediaTime::new(
+                packet.timestamp().get(),
+                if codec == Codec::Opus {
+                    AUDIO_FREQUENCY
+                } else {
+                    VIDEO_FREQUENCY
+                },
+            ),
+            arrival_ts: received_at,
+            provenance: PacketProvenance {
+                received_at,
+                packet_id: packet.packet_id(),
+                stream_id: None,
+            },
+            playout_time: received_at,
+            is_keyframe: semantics.keyframe(),
+            is_frame_start: semantics.frame_start(),
+            nal,
+            payload: Vec::new(),
+            payload_len: packet.payload().len(),
+        })
+    }
+
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {
         self.playout_time = playout_time;
         self
-    }
-
-    pub fn from_packet_view(
-        packet: &pulsebeam_rtc::RtpPacketView<'_>,
-        codec: Codec,
-        extensions: PacketExtensions,
-        mut payload: Vec<u8>,
-    ) -> Self {
-        payload.clear();
-        payload.extend_from_slice(packet.payload());
-        let source = packet.provenance();
-        let received_at = Instant::from_std(source.received_at());
-        Self::from_ingress_parts(
-            packet.ssrc().into(),
-            packet.marker(),
-            packet.header().len(),
-            u64::from(packet.sequence_number()).into(),
-            MediaTime::new(u64::from(packet.timestamp()), VIDEO_FREQUENCY),
-            received_at,
-            PacketProvenance {
-                received_at,
-                packet_id: source.packet_id().get(),
-                stream_id: source.stream_id().map(pulsebeam_rtc::StreamId::get),
-            },
-            extensions,
-            codec,
-            payload,
-        )
     }
 }
 
 #[cfg(test)]
 mod structural_tests {
     use super::*;
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::Instant as StdInstant,
-    };
-
     #[test]
     fn codec_lookup_accepts_only_h264_and_opus() {
         assert_eq!(Codec::from_name("h264"), Some(Codec::H264));
@@ -266,40 +333,6 @@ mod structural_tests {
         assert_eq!(Codec::from_name("vp8"), None);
         assert_eq!(Codec::from_name("vp9"), None);
         assert_eq!(Codec::from_name("av1"), None);
-    }
-
-    #[test]
-    fn packet_view_preserves_provenance_and_reuses_the_destination_buffer() {
-        let bytes = [
-            0x80, 0xe0, 0x00, 0x09, 0x00, 0x00, 0x0b, 0xb8, 0x00, 0x00, 0x00, 0x07, 0x65, 0x01,
-            0x02,
-        ];
-        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_001);
-        let provenance = pulsebeam_rtc::PacketProvenance::new(
-            StdInstant::now(),
-            pulsebeam_rtc::TransportMetadata::new(
-                pulsebeam_rtc::TransportProtocol::Udp,
-                address,
-                address,
-            ),
-            pulsebeam_rtc::PacketId::new(41),
-        );
-        let pulsebeam_rtc::PacketView::Rtp(view) =
-            pulsebeam_rtc::IngressPacket::new(&bytes, provenance)
-                .parse()
-                .expect("valid RTP")
-        else {
-            panic!("fixture is RTP");
-        };
-        let storage = Vec::with_capacity(1_500);
-        let capacity = storage.capacity();
-        let packet =
-            RtpPacket::from_packet_view(&view, Codec::H264, PacketExtensions::default(), storage);
-
-        assert_eq!(packet.payload, [0x65, 0x01, 0x02]);
-        assert_eq!(packet.provenance.packet_id, 41);
-        assert_eq!(packet.provenance.received_at, packet.arrival_ts);
-        assert_eq!(packet.payload.capacity(), capacity);
     }
 }
 

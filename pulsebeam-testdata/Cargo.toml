@@ -13,3 +13,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+zstd.workspace = true
+
+[dev-dependencies]
+openh264.workspace = true
+opus.workspace = true
+sha2.workspace = true

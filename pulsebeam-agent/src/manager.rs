@@ -79,6 +79,13 @@ impl SubscriptionManager {
         let mut used_mids = HashSet::new();
 
         let mut still_desired = self.desired.clone();
+        still_desired.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.track_id.cmp(&right.track_id))
+        });
+        still_desired.truncate(self.slots.len());
 
         // Pass 1: Sticky Assignments (preserve existing mappings if track is still desired)
         for &mid in &self.slots {
@@ -197,6 +204,23 @@ mod tests {
         let _ = manager.reconcile();
 
         manager.remove_track("camera");
+        let (changed, requests) = manager.reconcile();
+
+        assert!(changed);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].track_id, "screen");
+    }
+
+    #[test]
+    fn higher_priority_track_replaces_a_sticky_assignment() {
+        let mut manager = SubscriptionManager::new(vec![Mid::from("0")]);
+        manager.set_desired(vec![VideoSubscription::new("camera")]);
+        let _ = manager.reconcile();
+
+        manager.set_desired(vec![
+            VideoSubscription::new("camera"),
+            VideoSubscription::new("screen").priority(100),
+        ]);
         let (changed, requests) = manager.reconcile();
 
         assert!(changed);

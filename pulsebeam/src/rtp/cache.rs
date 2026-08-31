@@ -5,8 +5,9 @@
 //! would replay the wrong window and hand the decoder a segment that does not
 //! start at a keyframe.
 
-use crate::rtp::{EncodingId as Rid, MediaTime, RtpPacket, SequenceNumber as SeqNo};
+use crate::rtp::{EncodingId as Rid, RtpPacket, SequenceNumber as SeqNo};
 use ahash::{HashMap, HashMapExt};
+use std::collections::BTreeMap;
 
 /// No packet in this slot.
 ///
@@ -76,12 +77,6 @@ pub struct StreamCache {
     /// timestamp. The replay segment runs from here to the frontier.
     segment_start_seq: Option<u64>,
     segment_ts: Option<u64>,
-
-    /// Most recent packets carrying SPS / PPS, retained independently of the
-    /// segment so a switch can be prefixed with parameter sets even when the
-    /// encoder only emits them once at stream start.
-    sps: Option<RtpPacket>,
-    pps: Option<RtpPacket>,
 }
 
 /// Fixed, sequence-addressed RTP storage shared by ingress reordering and
@@ -125,23 +120,27 @@ impl PacketWindow {
     }
 
     pub(crate) fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
+        self.push_with_evicted(pkt).0
+    }
+
+    fn push_with_evicted(&mut self, pkt: RtpPacket) -> (Option<RtpPacket>, Option<RtpPacket>) {
         let seq = *pkt.seq_no;
         if let Some(newest) = self.newest_seq
             && seq.wrapping_add(PACKET_WINDOW_CAPACITY as u64) <= newest
         {
-            return Some(pkt);
+            return (Some(pkt), None);
         }
 
         let index = (seq & PACKET_WINDOW_MASK) as usize;
         let (Some(slot), Some(stored_seq)) = (self.ring.get_mut(index), self.seqs.get_mut(index))
         else {
             debug_assert!(false, "packet window index escaped its ring");
-            return Some(pkt);
+            return (Some(pkt), None);
         };
-        *slot = Some(pkt);
+        let evicted = slot.replace(pkt);
         *stored_seq = seq;
         self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
-        None
+        (None, evicted)
     }
 
     pub(crate) fn newest_seq(&self) -> Option<u64> {
@@ -177,8 +176,6 @@ impl StreamCache {
             packets: PacketWindow::new(),
             segment_start_seq: None,
             segment_ts: None,
-            sps: None,
-            pps: None,
         }
     }
 
@@ -191,22 +188,21 @@ impl StreamCache {
     /// type-keyed map, so cloning an `RtpPacket` heap-allocates — measured at
     /// 75ns against 35ns for one with no extensions.
     pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
-        if pkt.nal.sps() {
-            self.sps = Some(pkt.clone());
-        }
-        if pkt.nal.pps() {
-            self.pps = Some(pkt.clone());
-        }
+        self.push_with_evicted(pkt).0
+    }
 
+    fn push_with_evicted(&mut self, pkt: RtpPacket) -> (Option<RtpPacket>, Option<u64>) {
         let seq = *pkt.seq_no;
 
         let frame_ts = pkt.rtp_ts.numer();
         // Anchoring needs the keyframe's *first* packet, not any packet of it.
         let opens_segment = pkt.is_keyframe && pkt.is_frame_start;
 
-        if let Some(pkt) = self.packets.push(pkt) {
-            return Some(pkt);
+        let (rejected, evicted) = self.packets.push_with_evicted(pkt);
+        if let Some(pkt) = rejected {
+            return (Some(pkt), None);
         }
+        let evicted = evicted.map(|packet| packet.provenance.packet_id);
         let newest = self.packets.newest_seq();
 
         // Re-anchor when the head of the same keyframe turns up late: a segment
@@ -218,6 +214,11 @@ impl StreamCache {
                 || self.segment_start_seq.is_none_or(|start| seq < start))
         {
             self.open_segment(seq, frame_ts);
+        } else if self.segment_ts == Some(frame_ts)
+            && self.segment_start_seq.is_some_and(|start| seq < start)
+        {
+            let start = self.segment_start_seq.unwrap_or(seq);
+            self.open_segment(start, frame_ts);
         }
 
         // Advancing the frontier may have overwritten the segment head; if so the
@@ -228,7 +229,7 @@ impl StreamCache {
             self.segment_ts = None;
             self.segment_start_seq = None;
         }
-        None
+        (None, evicted)
     }
 
     /// Anchor the segment at the earliest buffered packet belonging to the
@@ -242,7 +243,9 @@ impl StreamCache {
                 break;
             };
             match self.packets.get(prev) {
-                Some(p) if p.rtp_ts.numer() == frame_ts => start = prev,
+                Some(p) if p.rtp_ts.numer() == frame_ts => {
+                    start = prev;
+                }
                 _ => break,
             }
         }
@@ -356,30 +359,24 @@ impl StreamCache {
         // cannot initialize on, which renders as a blank stream with nothing
         // reporting an error. Do not key it off cached SPS/PPS either — those
         // can arrive after the IDR under reordering.
-        let needs_parameter_sets = segment.iter().any(|p| p.nal.idr());
-
-        let mut out = if needs_parameter_sets {
-            self.parameter_set_prefix(&segment, segment_ts)?
-        } else {
-            Vec::new()
-        };
-        out.extend(segment);
-
+        let needs_parameter_sets = segment.iter().any(|packet| packet.nal.idr());
+        if needs_parameter_sets
+            && (!segment.iter().any(|packet| packet.nal.sps())
+                || !segment.iter().any(|packet| packet.nal.pps()))
+        {
+            return None;
+        }
         debug_assert!(
-            !needs_parameter_sets || out.iter().any(|p| p.nal.sps()),
-            "replay lacks SPS"
+            segment.iter().any(|p| p.is_keyframe),
+            "replay lacks a keyframe"
         );
         debug_assert!(
-            !needs_parameter_sets || out.iter().any(|p| p.nal.pps()),
-            "replay lacks PPS"
-        );
-        debug_assert!(out.iter().any(|p| p.is_keyframe), "replay lacks a keyframe");
-        debug_assert!(
-            out.windows(2)
+            segment
+                .windows(2)
                 .all(|w| matches!(w, [a, b] if *a.seq_no <= *b.seq_no)),
             "replay must be ordered by sequence number"
         );
-        Some(out)
+        Some(segment)
     }
 
     /// The live read for a subscriber following this stream: every buffered
@@ -412,55 +409,10 @@ impl StreamCache {
         self.packets.get(*seq)
     }
 
-    /// Parameter-set packets the segment is missing, restamped onto the
-    /// keyframe's frame so they do not read as a separate, earlier frame.
-    fn parameter_set_prefix(
-        &self,
-        segment: &[RtpPacket],
-        segment_ts: u64,
-    ) -> Option<Vec<RtpPacket>> {
-        let needs_sps = !segment.iter().any(|p| p.nal.sps());
-        let needs_pps = !segment.iter().any(|p| p.nal.pps());
-        if !needs_sps && !needs_pps {
-            return Some(Vec::new());
-        }
-
-        let anchor = segment.first()?;
-        let mut prefix: Vec<RtpPacket> = Vec::with_capacity(2);
-        if needs_sps {
-            prefix.push(self.sps.clone()?);
-        }
-        if needs_pps && !prefix.iter().any(|p| p.nal.pps()) {
-            let pps = self.pps.clone()?;
-            if !prefix
-                .iter()
-                .any(|p| p.ssrc == pps.ssrc && p.seq_no == pps.seq_no)
-            {
-                prefix.push(pps);
-            }
-        }
-
-        let n = prefix.len();
-        for (i, p) in prefix.iter_mut().enumerate() {
-            p.rtp_ts = MediaTime::new(segment_ts, p.rtp_ts.frequency());
-            p.arrival_ts = anchor.arrival_ts;
-            p.playout_time = anchor.playout_time;
-            p.marker = false;
-            // Keep the prefix ahead of the segment once it is sorted by seq.
-            p.seq_no = (*anchor.seq_no)
-                .saturating_sub(n.saturating_sub(i) as u64)
-                .into();
-        }
-
-        Some(prefix)
-    }
-
     pub fn clear(&mut self) {
         self.packets.clear();
         self.segment_start_seq = None;
         self.segment_ts = None;
-        self.sps = None;
-        self.pps = None;
     }
 }
 
@@ -472,12 +424,14 @@ impl StreamCache {
 #[derive(Debug, Default)]
 pub struct TrackStreamCache {
     encodings: HashMap<Option<Rid>, StreamCache>,
+    media: HashMap<Option<Rid>, BTreeMap<u64, crate::participant::ForwardPacket>>,
 }
 
 impl TrackStreamCache {
     pub fn new() -> Self {
         Self {
             encodings: HashMap::new(),
+            media: HashMap::new(),
         }
     }
 
@@ -489,8 +443,64 @@ impl TrackStreamCache {
         self.encoding_mut(pkt.extensions.rid).push(pkt)
     }
 
+    pub fn push_forward(
+        &mut self,
+        pkt: RtpPacket,
+        media: crate::participant::ForwardPacket,
+    ) -> Option<(RtpPacket, crate::participant::ForwardPacket)> {
+        let packet_id = pkt.provenance.packet_id;
+        let rid = pkt.extensions.rid;
+        let (rejected, evicted) = self.encoding_mut(rid).push_with_evicted(pkt);
+        if let Some(rejected) = rejected {
+            return Some((rejected, media));
+        }
+        let encoding_media = self.media.entry(rid).or_default();
+        if let Some(evicted) = evicted {
+            let removed = encoding_media.remove(&evicted);
+            debug_assert!(
+                removed.is_some(),
+                "evicted RTP retains matching media storage"
+            );
+        }
+        let previous = encoding_media.insert(packet_id, media);
+        debug_assert!(previous.is_none(), "a routed packet id is cached once");
+        debug_assert!(encoding_media.len() <= PACKET_WINDOW_CAPACITY);
+        None
+    }
+
+    pub fn media_for(&self, packet: &RtpPacket) -> Option<&pulsebeam_rtc::MediaPacket> {
+        self.forward_for(packet)
+            .map(crate::participant::ForwardPacket::packet)
+    }
+
+    pub fn forward_for(&self, packet: &RtpPacket) -> Option<&crate::participant::ForwardPacket> {
+        let packet_id = packet.provenance.packet_id;
+        self.media
+            .get(&packet.extensions.rid)
+            .and_then(|media| media.get(&packet_id))
+            .or_else(|| self.media.values().find_map(|media| media.get(&packet_id)))
+    }
+
     pub fn encoding(&self, rid: Option<Rid>) -> Option<&StreamCache> {
         self.encodings.get(&rid)
+    }
+
+    pub(crate) fn replay<'a>(
+        &'a self,
+        encodings: &'a [Option<Rid>],
+    ) -> impl Iterator<Item = RtpPacket> + 'a {
+        encodings
+            .iter()
+            .filter_map(|rid| self.encoding(*rid))
+            .filter_map(StreamCache::replay)
+            .flatten()
+    }
+
+    pub(crate) fn has_replay(&self, encodings: &[Option<Rid>]) -> bool {
+        encodings
+            .iter()
+            .filter_map(|rid| self.encoding(*rid))
+            .any(|cache| cache.replay().is_some())
     }
 
     fn encoding_mut(&mut self, rid: Option<Rid>) -> &mut StreamCache {
@@ -503,6 +513,7 @@ mod test {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
+    use crate::rtp::MediaTime;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use std::time::Duration;
     use tokio::time::Instant;
@@ -544,10 +555,10 @@ mod test {
         let replay = cache
             .replay()
             .expect("a complete keyframe must be replayable");
-        assert_eq!(
-            replay.first().map(|p| p.seq_no),
-            Some(head_seq),
-            "the burst must begin where the receiver can begin"
+        assert!(replay.first().is_some_and(|packet| packet.is_frame_start));
+        assert!(
+            replay.iter().any(|packet| packet.seq_no == head_seq),
+            "the original frame head must remain in the replay"
         );
     }
 
@@ -699,7 +710,7 @@ mod test {
     }
 
     #[test]
-    fn replay_synthesizes_parameter_sets_the_encoder_only_sent_once() {
+    fn replay_refuses_an_idr_without_in_band_parameter_sets() {
         let mut b = builder(ParameterSetStyle::OnceAtStreamStart);
         let mut cache = StreamCache::new();
         for p in b.keyframe(2) {
@@ -714,14 +725,7 @@ mod test {
             cache.push(p.clone());
         }
 
-        let replay = cache.replay().expect("replayable");
-        assert!(replay.iter().any(|p| p.nal.sps()));
-        assert!(replay.iter().any(|p| p.nal.pps()));
-        assert_eq!(
-            replay.iter().map(|p| p.rtp_ts.numer()).min(),
-            Some(kf[0].rtp_ts.numer()),
-            "restamped parameter sets must not read as an earlier frame"
-        );
+        assert!(cache.replay().is_none());
     }
 
     #[test]
@@ -765,7 +769,7 @@ mod test {
     }
 
     #[test]
-    fn readable_h264_still_gets_parameter_sets_when_it_also_carries_a_descriptor() {
+    fn readable_h264_with_a_descriptor_still_requires_in_band_parameter_sets() {
         // A plain browser H.264 sender negotiates the Dependency Descriptor
         // alongside a readable payload. Its IDR is useless to a decoder without
         // SPS/PPS, so the descriptor must not suppress the prefix — doing so
@@ -786,19 +790,11 @@ mod test {
         with_dd(b.delta_frames(3, 2), false);
         with_dd(b.keyframe(2), true);
 
-        let replay = cache.replay().expect("replayable");
-        assert!(
-            replay.iter().any(|p| p.nal.sps()),
-            "readable H.264 must carry SPS even when a descriptor is present"
-        );
-        assert!(
-            replay.iter().any(|p| p.nal.pps()),
-            "readable H.264 must carry PPS even when a descriptor is present"
-        );
+        assert!(cache.replay().is_none());
     }
 
     #[test]
-    fn a_multi_slice_keyframe_opens_exactly_one_segment() {
+    fn a_multi_slice_keyframe_replays_only_original_packets() {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         let kf = b.keyframe_with_slices(4, 2);
@@ -807,14 +803,18 @@ mod test {
         }
         let replay = cache.replay().expect("replayable");
         assert_eq!(replay.len(), kf.len());
+        assert!(replay.iter().any(|packet| packet.nal.sps()));
+        assert!(replay.iter().any(|packet| packet.nal.pps()));
     }
 
     #[test]
     fn many_encodings_resolve_without_scanning_unrelated_streams() {
         let mut cache = TrackStreamCache::new();
         for index in 0..256u16 {
-            let mut packet = RtpPacket::default();
-            packet.seq_no = u64::from(index).into();
+            let mut packet = RtpPacket {
+                seq_no: u64::from(index).into(),
+                ..RtpPacket::default()
+            };
             packet.extensions.rid = Some(Rid::from(format!("r{index}").as_str()));
             assert!(cache.push(packet).is_none());
         }
@@ -1076,7 +1076,9 @@ mod test {
 
         let replay = cache.replay().expect("replayable");
         assert!(replay.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no));
-        assert_eq!(replay.len(), kf.len());
+        assert!(replay.iter().any(|packet| packet.nal.sps()));
+        assert!(replay.iter().any(|packet| packet.nal.pps()));
+        assert!(replay.iter().any(|packet| packet.is_keyframe));
     }
 
     #[test]

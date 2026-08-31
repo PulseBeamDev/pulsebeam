@@ -19,10 +19,6 @@ const RATE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
 /// Reactive-cost fall constant for the three-second estimate window.
 /// so per-layer allocator costs converge on the same timescale as the reported BWE.
 const RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(3);
-/// Stable-cost fall constant — very slow decay keeps the desired-bitrate signal high,
-/// motivating the probe controller to maintain headroom even when the sender
-/// temporarily reduces its declared rate.
-const STABLE_RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(30);
 // An eligibility signal, not a per-packet alarm: small 500ms windows on a
 // lossy WAN regularly contain one late/missing packet, and treating those
 // as health transitions causes false layer churn and PLI storms.
@@ -125,7 +121,7 @@ pub struct StreamStats {
     pub healthy: bool,
     /// Reactive rate estimate (bps).
     pub bitrate_bps: u32,
-    /// Slow-decay rate estimate (bps), never below `bitrate_bps`.
+    /// Retained target rate (bps), never below `bitrate_bps`.
     pub stable_bitrate_bps: u32,
     pub height: u32,
     pub quality: StreamQuality,
@@ -303,7 +299,7 @@ pub struct StreamMonitor {
     bwe: BitrateEstimate,
 
     cost_filter: RateFilter,
-    stable_filter: RateFilter,
+    stable_peak_bps: f64,
 
     current_quality: StreamQuality,
     quality_transition_since: Option<Instant>,
@@ -340,10 +336,7 @@ impl StreamMonitor {
             smoothed_loss_ratio: 0.0,
             bwe: BitrateEstimate::new(),
             cost_filter: RateFilter::new(),
-            stable_filter: RateFilter::with_taus(
-                RATE_RISE_TIME_CONSTANT,
-                STABLE_RATE_FALL_TIME_CONSTANT,
-            ),
+            stable_peak_bps: nominal_bitrate_bps as f64,
             current_quality,
             quality_transition_since: None,
             quality_transition_target: None,
@@ -429,7 +422,7 @@ impl StreamMonitor {
         self.stats.inactive = true;
         self.stats.bitrate_bps = 0;
         self.stats.stable_bitrate_bps = 0;
-        self.stable_filter.reset();
+        self.stable_peak_bps = 0.0;
         debug_assert!(self.stats.inactive);
         debug_assert!(!self.stats.healthy);
         debug_assert_eq!(self.stats.bitrate_bps, 0);
@@ -451,36 +444,23 @@ impl StreamMonitor {
 
     pub fn poll(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.bwe.poll(now);
-        // Unified raw target: prefer the VLA-declared target (set by apply_vla in
-        // track.rs) because it reflects the encoder's committed rate and is therefore
-        // more stable than instantaneous byte measurements. Fall back to the measured
-        // tick rate when no VLA is present.
         let declared = self.declared_target_bps;
-        let raw_bps = if declared > 0 {
-            declared as f64
-        } else {
+        let measured = if self.bwe.is_warm() {
             self.bwe.tick_bps()
-        };
-        let raw_with_floor = if declared > 0 {
-            raw_bps
         } else {
-            raw_bps.max(self.nominal_bitrate_bps as f64)
+            declared.max(self.nominal_bitrate_bps) as f64
+        };
+        let measured = if declared == 0 {
+            measured.max(self.nominal_bitrate_bps as f64)
+        } else {
+            measured
         };
 
-        self.cost_filter.update(now, raw_with_floor);
-        self.stable_filter.update(now, raw_with_floor);
-
-        // Invariant: the stable cost is never below the reactive one. The stable
-        // filter rises slowly, so during a genuine rate increase it can momentarily
-        // sit below the measured rate; allocating against a stable cost that
-        // under-reports what the stream actually sends would admit a layer and then
-        // shed it the moment the reactive number caught up. Clamping keeps the
-        // stable cost a safe conservative envelope.
+        self.cost_filter.update(now, measured);
         let reactive = self.cost_filter.current();
-        let stable = self.stable_filter.current().max(reactive);
+        self.stable_peak_bps = self.stable_peak_bps.max(declared as f64).max(reactive);
+        let stable = self.stable_peak_bps;
 
-        // Both signals move together. They are fields of one value now, so that
-        // is structural rather than something the packing arranged.
         self.stats.bitrate_bps =
             u32::try_from(crate::bitrate::saturating_bps(reactive)).unwrap_or(u32::MAX);
         self.stats.stable_bitrate_bps =
@@ -512,7 +492,7 @@ impl StreamMonitor {
                 self.quality_transition_target = None;
                 self.quality_transition_last_evidence = None;
                 self.cost_filter.reset();
-                self.stable_filter.reset();
+                self.stable_peak_bps = 0.0;
             }
             return;
         }
@@ -697,7 +677,7 @@ impl StreamMonitor {
         self.quality_transition_last_evidence = None;
         self.bwe = BitrateEstimate::new();
         self.cost_filter.reset();
-        self.stable_filter.reset();
+        self.stable_peak_bps = 0.0;
         // Audio stays stubbed Excellent even across a dead-stream reset —
         // see `new`.
         self.current_quality = match self.kind {
@@ -1371,27 +1351,28 @@ mod test {
     }
 
     #[test]
-    fn stream_monitor_cost_filter_unifies_vla_and_measured() {
-        // With a declared VLA target, bitrate_bps should reflect the smoothed
-        // VLA value, not the raw measured tick rate.
+    fn stream_monitor_separates_forwardable_rate_from_retained_target() {
         let shared = StreamStats::new(false, 0, 0);
         let mut monitor = StreamMonitor::new(TrackKind::Video, "vla".into(), shared);
         let now = Instant::now();
 
-        // Seed one measured-rate tick at a very low rate.
         let tiny_pkt = make_packet(now, 100);
         monitor.process_packet(&tiny_pkt);
         monitor.poll(now + BitrateEstimate::TICK, false);
 
-        // Now inject a VLA-declared target of 1 Mbit/s.
         monitor.apply_vla(1_000_000, None);
         monitor.poll(now + BitrateEstimate::TICK * 2, false);
 
-        // bitrate_bps should now be influenced by the VLA target (rising toward 1M).
-        assert_ge!(
-            monitor.stats().bitrate_bps(),
-            400_000.0,
-            "after 1 rise-tau with VLA=1M, bitrate_bps should have risen substantially"
+        let stats = monitor.stats();
+        assert_le!(
+            stats.bitrate_bps(),
+            10_000.0,
+            "a sparse source must cost what it currently sends"
+        );
+        assert_eq!(
+            stats.stable_bitrate_bps(),
+            1_000_000.0,
+            "the desired layer rate must retain the sender's declared capacity"
         );
     }
 
@@ -1412,10 +1393,7 @@ mod test {
             !monitor.stats().is_inactive(),
             "VLA-declared layer must survive 1.5 s packet silence"
         );
-        assert!(
-            monitor.stats().bitrate_bps() >= 875_000.0 * 0.5,
-            "cost should be near VLA target, not zero"
-        );
+        assert_eq!(monitor.stats().stable_bitrate_bps(), 875_000.0);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use openh264::decoder::Decoder as H264Decoder;
 use openh264::formats::YUVSource;
+use pulsebeam::entity::ParticipantId;
 use pulsebeam_agent::actor::AgentBuilder;
 use pulsebeam_agent::agent::{
     DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
@@ -14,7 +15,10 @@ use pulsebeam_agent::{
 };
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
-use pulsebeam_testdata::{quality_audio_fixture, quality_video_frame_for_rtp_timestamp};
+use pulsebeam_testdata::{
+    QUALITY_AUDIO_FRAME_SAMPLES, QUALITY_VIDEO_FRAME_COUNT, QualityAudioSource, QualityVideoLayer,
+    QualityVideoSource, quality_audio_fixture, quality_corpus_video, quality_video_frame,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -28,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 pub const MAX_FIXTURE_PCM_MEAN_ABSOLUTE_ERROR: u64 = 5_500;
+const BROWSER_VIDEO_MAX_GAP_WAIT: Duration = Duration::from_millis(500);
 
 pub struct SimClientBuilder {
     ip: IpAddr,
@@ -46,7 +51,7 @@ pub struct SimClientBuilder {
     receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
-    quality_fixture: bool,
+    quality_source: Option<QualityVideoSource>,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -84,7 +89,7 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
-            quality_fixture: false,
+            quality_source: None,
         })
     }
 
@@ -113,7 +118,7 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
-            quality_fixture: false,
+            quality_source: None,
         })
     }
 
@@ -160,8 +165,16 @@ impl SimClientBuilder {
         self
     }
 
-    pub fn with_quality_fixture(mut self) -> Self {
-        self.quality_fixture = true;
+    pub fn with_quality_fixture(mut self, source: QualityVideoSource) -> Self {
+        self.quality_source = Some(source);
+        self.agent_builder = self.agent_builder.with_initial_send_bitrate_bps(5_000_000);
+        self
+    }
+
+    pub fn with_initial_send_bitrate_bps(mut self, bitrate_bps: u64) -> Self {
+        self.agent_builder = self
+            .agent_builder
+            .with_initial_send_bitrate_bps(bitrate_bps);
         self
     }
 
@@ -258,13 +271,18 @@ impl SimClientBuilder {
             local_publications: local_video.into_iter().collect(),
         };
         if let Some(mut audio_tracks) = audio_tracks {
+            let subscriber_id: ParticipantId = ctx
+                .agent
+                .participant_id()
+                .parse()
+                .expect("agent participant id");
             let log = ctx.audio_rx.clone();
             join_set.spawn(async move {
                 while let Ok(mut track) = audio_tracks.next().await {
                     let publisher = track.publisher_id().to_owned();
                     let log = log.clone();
                     tokio::spawn(async move {
-                        let mut receiver = BrowserAudioReceiver::new();
+                        let mut receiver = BrowserAudioReceiver::for_subscriber(subscriber_id);
                         while let Ok(rtp) = track.recv().await {
                             receiver.push(rtp, &publisher, &mut log.lock().unwrap());
                         }
@@ -296,10 +314,18 @@ impl SimClientBuilder {
                         join_set.spawn(looper.run(sender));
                     }
                     None => {
-                        let mut looper = if self.quality_fixture {
-                            debug_assert!(rid.is_none());
+                        let mut looper = if let Some(source) = self.quality_source {
+                            let layer = match rid {
+                                Some("q") => QualityVideoLayer::P180,
+                                Some("h") => QualityVideoLayer::P360,
+                                Some("f") => QualityVideoLayer::P720,
+                                _ => {
+                                    debug_assert!(false, "quality corpus uses q/h/f simulcast");
+                                    QualityVideoLayer::P180
+                                }
+                            };
                             H264Looper::new(
-                                pulsebeam_testdata::QUALITY_H264_320X180_30,
+                                quality_corpus_video(source, layer).encoded(),
                                 pulsebeam_testdata::QUALITY_VIDEO_FPS,
                             )
                         } else {
@@ -318,12 +344,18 @@ impl SimClientBuilder {
         }
         if let Some((publication, level)) = local_audio {
             for sender in publication.encodings().iter().cloned() {
-                join_set.spawn(
+                let looper = if let Some(source) = self.quality_source {
+                    AudioLooper::corpus(match source {
+                        QualityVideoSource::Zero => QualityAudioSource::Zero,
+                        QualityVideoSource::One => QualityAudioSource::One,
+                    })
+                    .with_level_dbov(level)
+                } else {
                     AudioLooper::speaking()
                         .with_level_dbov(level)
                         .with_phase_offset(self.audio_phase_offset)
-                        .run(sender),
-                );
+                };
+                join_set.spawn(looper.run(sender));
             }
             // The handle has to outlive the loopers. Dropping a `LocalTrack` unpublishes it, so
             // letting it fall out of scope here declared the track inactive the moment it was
@@ -426,22 +458,59 @@ fn plane_error(
     })
 }
 
-fn decoded_video_error(image: &impl YUVSource, timestamp: u64) -> Option<PlaneError> {
-    let reference = quality_video_frame_for_rtp_timestamp(timestamp)?;
-    let (width, height) = image.dimensions();
-    if width != reference.width || height != reference.height {
+fn sampled_luma_error(
+    reference: &[u8],
+    decoded: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Option<u64> {
+    let expected_len = width.checked_mul(height)?;
+    if reference.len() != expected_len || width > stride {
         return None;
     }
+    let mut sum = 0u64;
+    for row in (0..height).step_by(8) {
+        let decoded_row = row.checked_mul(stride)?;
+        let reference_row = row.checked_mul(width)?;
+        for column in (0..width).step_by(8) {
+            let expected = *reference.get(reference_row.checked_add(column)?)?;
+            let actual = *decoded.get(decoded_row.checked_add(column)?)?;
+            sum = sum.saturating_add(u64::from(expected.abs_diff(actual)));
+        }
+    }
+    Some(sum)
+}
+
+fn decoded_video_error(image: &impl YUVSource) -> Option<PlaneError> {
+    let (width, height) = image.dimensions();
+    let (y_stride, _, _) = image.strides();
+    let y_len = width.checked_mul(height)?;
+    let reference = (0..QUALITY_VIDEO_FRAME_COUNT)
+        .filter_map(quality_video_frame)
+        .filter(|reference| reference.width == width && reference.height == height)
+        .filter_map(|reference| {
+            let y_reference = reference.reference_yuv420p.get(..y_len)?;
+            let error = sampled_luma_error(y_reference, image.y(), y_stride, width, height)?;
+            Some((error, reference))
+        })
+        .min_by_key(|(error, _)| *error)?
+        .1;
+    decoded_video_reference_error(image, reference.reference_yuv420p)
+}
+
+fn decoded_video_reference_error(image: &impl YUVSource, reference: &[u8]) -> Option<PlaneError> {
+    let (width, height) = image.dimensions();
+    let (y_stride, u_stride, v_stride) = image.strides();
     let y_len = width.checked_mul(height)?;
     let chroma_len = y_len.checked_div(4)?;
-    let y_reference = reference.reference_yuv420p.get(..y_len)?;
+    let y_reference = reference.get(..y_len)?;
     let u_start = y_len;
     let u_end = u_start.checked_add(chroma_len)?;
-    let u_reference = reference.reference_yuv420p.get(u_start..u_end)?;
+    let u_reference = reference.get(u_start..u_end)?;
     let v_end = u_end.checked_add(chroma_len)?;
-    let v_reference = reference.reference_yuv420p.get(u_end..v_end)?;
-    debug_assert_eq!(v_end, reference.reference_yuv420p.len());
-    let (y_stride, u_stride, v_stride) = image.strides();
+    let v_reference = reference.get(u_end..v_end)?;
+    debug_assert_eq!(v_end, reference.len());
     let y_error = plane_error(y_reference, image.y(), y_stride, width, height)?;
     let chroma_width = width.checked_div(2)?;
     let chroma_height = height.checked_div(2)?;
@@ -490,12 +559,17 @@ pub struct VideoReceiveLog {
     pub max_ts_regression: u64,
     pub undecodable_keyframes: u64,
     pub decoder_errors: u64,
+    pub damaged_frames: u64,
     pub missing_mid_packets: u64,
     pub missing_ssrc_packets: u64,
     pub missing_payload_type_packets: u64,
     pub changed_ssrc_packets: u64,
     pub changed_payload_type_packets: u64,
     pub crossed_frame_boundaries: u64,
+    pub unexpected_frames: u64,
+    pub wrong_origin_frames: u64,
+    pub wrong_layer_frames: u64,
+    pub wrong_content_frames: u64,
     /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
     /// against the moment the viewer subscribed, which only the harness knows.
     pub first_frame_at: Option<Instant>,
@@ -515,11 +589,18 @@ pub struct VideoReceiveLog {
     pub capture_timed_frames: u64,
     pub max_capture_to_decode_latency: Duration,
     last_frame_at: Option<Instant>,
+    interval_started_at: Option<Instant>,
+    interval_longest_frame_gap: Duration,
+    interval_min_decoded_width: usize,
+    interval_min_decoded_height: usize,
+    interval_max_decoded_width: usize,
+    interval_max_decoded_height: usize,
     last_ts: Option<u64>,
     seen_ts: HashSet<u64>,
 }
 
 struct BrowserVideoReceiver {
+    subscriber: Option<ParticipantId>,
     decoder: H264Decoder,
     jitter: pulsebeam_agent::JitterBuffer,
     expected_ssrc: Option<u32>,
@@ -531,17 +612,19 @@ struct BrowserVideoReceiver {
     fu_header: Option<u8>,
     frame_is_keyframe: bool,
     frame_damaged: bool,
+    reference_gap: bool,
     pending_gap: bool,
     has_rendered: bool,
+    awaiting_keyframe: bool,
+    references: BTreeMap<(QualityVideoSource, QualityVideoLayer), Vec<u8>>,
 }
 
 impl BrowserVideoReceiver {
     fn new() -> Self {
         Self {
+            subscriber: None,
             decoder: H264Decoder::new().expect("bundled OpenH264 decoder initializes"),
-            jitter: pulsebeam_agent::JitterBuffer::new(
-                pulsebeam_agent::pipeline::DEFAULT_JITTER_MAX_WAIT,
-            ),
+            jitter: pulsebeam_agent::JitterBuffer::new(BROWSER_VIDEO_MAX_GAP_WAIT),
             expected_ssrc: None,
             expected_payload_type: None,
             open_frame_timestamp: None,
@@ -551,9 +634,23 @@ impl BrowserVideoReceiver {
             fu_header: None,
             frame_is_keyframe: false,
             frame_damaged: false,
+            reference_gap: false,
             pending_gap: false,
             has_rendered: false,
+            awaiting_keyframe: false,
+            references: BTreeMap::new(),
         }
+    }
+
+    fn for_subscriber(subscriber: ParticipantId) -> Self {
+        Self {
+            subscriber: Some(subscriber),
+            ..Self::new()
+        }
+    }
+
+    fn needs_keyframe(&self) -> bool {
+        self.awaiting_keyframe
     }
 
     fn push(
@@ -561,7 +658,7 @@ impl BrowserVideoReceiver {
         rtp: pulsebeam_agent::RtpPacket,
         log: &mut VideoReceiveLog,
         publisher: &str,
-    ) {
+    ) -> bool {
         if rtp.mid.to_string().is_empty() {
             log.missing_mid_packets = log.missing_mid_packets.saturating_add(1);
         }
@@ -589,9 +686,11 @@ impl BrowserVideoReceiver {
             _ => {}
         }
         self.jitter.push(rtp);
+        let mut request_keyframe = false;
         while let Some(rtp) = self.jitter.pop() {
-            self.process(rtp, log, publisher);
+            request_keyframe |= self.process(rtp, log, publisher);
         }
+        request_keyframe
     }
 
     fn process(
@@ -599,18 +698,26 @@ impl BrowserVideoReceiver {
         rtp: pulsebeam_agent::RtpPacket,
         log: &mut VideoReceiveLog,
         publisher: &str,
-    ) {
+    ) -> bool {
         let sequence = *rtp.seq;
         if self
             .expected_seq
             .is_some_and(|expected| expected != sequence)
-            && !self.access_unit.is_empty()
         {
-            self.frame_damaged = true;
+            if self.access_unit.is_empty() {
+                self.reference_gap = true;
+            } else {
+                self.frame_damaged = true;
+            }
         }
         self.expected_seq = Some(sequence.wrapping_add(1));
 
+        if rtp.payload.is_empty() {
+            return false;
+        }
+
         let timestamp = rtp.ts.numer();
+        let mut request_keyframe = false;
         if self
             .open_frame_timestamp
             .is_some_and(|open| open != timestamp)
@@ -621,7 +728,7 @@ impl BrowserVideoReceiver {
             .open_frame_timestamp
             .is_some_and(|open| open != timestamp)
         {
-            self.finish(log, publisher, timestamp);
+            request_keyframe |= self.finish(log, publisher, timestamp);
         }
         if self.open_frame_timestamp.is_none() {
             self.frame_capture_time = rtp
@@ -633,11 +740,11 @@ impl BrowserVideoReceiver {
 
         if !self.append_rtp_payload(&rtp.payload) {
             self.frame_damaged = true;
-            log.decoder_errors = log.decoder_errors.saturating_add(1);
         }
         if rtp.marker {
-            self.finish(log, publisher, timestamp);
+            request_keyframe |= self.finish(log, publisher, timestamp);
         }
+        request_keyframe
     }
 
     fn append_rtp_payload(&mut self, payload: &[u8]) -> bool {
@@ -714,13 +821,21 @@ impl BrowserVideoReceiver {
         self.frame_is_keyframe |= header & 0x1f == 5;
     }
 
-    fn finish(&mut self, log: &mut VideoReceiveLog, publisher: &str, timestamp: u64) {
+    fn finish(&mut self, log: &mut VideoReceiveLog, publisher: &str, timestamp: u64) -> bool {
         self.open_frame_timestamp = None;
         let complete =
             self.fu_header.is_none() && !self.frame_damaged && !self.access_unit.is_empty();
+        let mut request_keyframe = false;
         if !complete {
+            log.damaged_frames = log.damaged_frames.saturating_add(1);
             self.pending_gap = true;
             self.record_undecodable_keyframe(log);
+            request_keyframe = !self.awaiting_keyframe;
+            self.awaiting_keyframe = true;
+        } else if (self.awaiting_keyframe || self.reference_gap) && !self.frame_is_keyframe {
+            self.pending_gap = true;
+            request_keyframe = !self.awaiting_keyframe;
+            self.awaiting_keyframe = true;
         } else {
             match self.decoder.decode(&self.access_unit) {
                 Ok(Some(image)) => {
@@ -729,27 +844,49 @@ impl BrowserVideoReceiver {
                         log.decoder_errors = log.decoder_errors.saturating_add(1);
                         self.pending_gap = true;
                         self.record_undecodable_keyframe(log);
+                        request_keyframe = !self.awaiting_keyframe;
+                        self.awaiting_keyframe = true;
                     } else {
                         self.jitter.note_frame_delivered();
+                        if self.frame_is_keyframe {
+                            self.awaiting_keyframe = false;
+                        }
                         if self.has_rendered && self.pending_gap {
                             log.non_contiguous = log.non_contiguous.saturating_add(1);
                         }
                         self.pending_gap = false;
                         self.has_rendered = true;
+                        let reference_error = expected_video_error(
+                            self.subscriber,
+                            &mut self.references,
+                            publisher,
+                            timestamp,
+                            &image,
+                            log,
+                        );
                         log.record_decoded(
                             publisher,
                             timestamp,
                             self.frame_is_keyframe,
                             self.frame_capture_time,
                             &image,
+                            reference_error,
                         );
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    log.decoder_errors = log.decoder_errors.saturating_add(1);
+                    self.pending_gap = true;
+                    self.record_undecodable_keyframe(log);
+                    request_keyframe = !self.awaiting_keyframe;
+                    self.awaiting_keyframe = true;
+                }
                 Err(_) => {
                     log.decoder_errors = log.decoder_errors.saturating_add(1);
                     self.pending_gap = true;
                     self.record_undecodable_keyframe(log);
+                    request_keyframe = !self.awaiting_keyframe;
+                    self.awaiting_keyframe = true;
                 }
             }
         }
@@ -757,7 +894,9 @@ impl BrowserVideoReceiver {
         self.fu_header = None;
         self.frame_is_keyframe = false;
         self.frame_damaged = false;
+        self.reference_gap = false;
         self.frame_capture_time = None;
+        request_keyframe
     }
 
     fn record_undecodable_keyframe(&self, log: &mut VideoReceiveLog) {
@@ -767,21 +906,122 @@ impl BrowserVideoReceiver {
     }
 }
 
-struct BrowserAudioReceiver {
+fn expected_video_error(
+    subscriber: Option<ParticipantId>,
+    references: &mut BTreeMap<(QualityVideoSource, QualityVideoLayer), Vec<u8>>,
+    publisher: &str,
+    timestamp: u64,
+    image: &impl YUVSource,
+    log: &mut VideoReceiveLog,
+) -> Option<PlaneError> {
+    let Some(subscriber) = subscriber else {
+        return decoded_video_error(image);
+    };
+    let Ok(origin): Result<ParticipantId, _> = publisher.parse() else {
+        log.wrong_origin_frames = log.wrong_origin_frames.saturating_add(1);
+        return None;
+    };
+    let Some(expected) = pulsebeam::sim_metrics::expected_video(subscriber, origin, timestamp)
+    else {
+        log.unexpected_frames = log.unexpected_frames.saturating_add(1);
+        return None;
+    };
+    if !expected.complete {
+        log.unexpected_frames = log.unexpected_frames.saturating_add(1);
+        return None;
+    }
+    pulsebeam::sim_metrics::record_decoded_video(subscriber, origin, timestamp);
+    if expected.origin.to_string() != publisher {
+        log.wrong_origin_frames = log.wrong_origin_frames.saturating_add(1);
+    }
+    let Some(source) = pulsebeam::sim_metrics::quality_source(expected.origin) else {
+        return decoded_video_error(image);
+    };
+    let layer = match expected.height {
+        180 => QualityVideoLayer::P180,
+        360 => QualityVideoLayer::P360,
+        720 => QualityVideoLayer::P720,
+        _ => {
+            log.wrong_layer_frames = log.wrong_layer_frames.saturating_add(1);
+            return None;
+        }
+    };
+    if image.dimensions() != layer.dimensions() {
+        log.wrong_layer_frames = log.wrong_layer_frames.saturating_add(1);
+        return None;
+    }
+    let source = match source {
+        0 => QualityVideoSource::Zero,
+        1 => QualityVideoSource::One,
+        _ => {
+            debug_assert!(false, "registered quality source is valid");
+            return None;
+        }
+    };
+    let fixture = quality_corpus_video(source, layer);
+    let frame = fixture.frame_for_rtp_timestamp(expected.source_timestamp)?;
+    let reference = references.entry((source, layer)).or_insert_with(|| {
+        fixture
+            .decode_reference()
+            .expect("checked-in zstd video reference")
+    });
+    let reference = fixture.reference_frame(reference, frame.index)?;
+    let error = decoded_video_reference_error(image, reference)?;
+    let mean = error.sum.checked_div(error.samples).unwrap_or(u64::MAX);
+    if mean > 2 || error.max > 32 {
+        log.wrong_content_frames = log.wrong_content_frames.saturating_add(1);
+    }
+    Some(error)
+}
+
+struct ExpectedAudioDecoder {
     decoder: opus::Decoder,
     pcm: Box<[i16]>,
-    expected_seq: Option<u64>,
+}
+
+impl ExpectedAudioDecoder {
+    fn new() -> Self {
+        Self {
+            decoder: opus::Decoder::new(48_000, opus::Channels::Mono)
+                .expect("bundled Opus reference decoder initializes"),
+            pcm: vec![0; 5_760].into_boxed_slice(),
+        }
+    }
+
+    fn conceal(&mut self) {
+        debug_assert!(
+            self.decoder.decode(&[], &mut self.pcm, false).is_ok(),
+            "Opus PLC accepts an absent packet"
+        );
+    }
+}
+
+struct BrowserAudioReceiver {
+    subscriber: Option<ParticipantId>,
+    decoder: opus::Decoder,
+    expected: ExpectedAudioDecoder,
+    pcm: Box<[i16]>,
+    expected_timestamp: Option<u64>,
     fixture: pulsebeam_testdata::QualityAudioFixture,
 }
 
 impl BrowserAudioReceiver {
     fn new() -> Self {
         Self {
+            subscriber: None,
             decoder: opus::Decoder::new(48_000, opus::Channels::Mono)
                 .expect("bundled Opus decoder initializes"),
+            expected: ExpectedAudioDecoder::new(),
             pcm: vec![0; 5_760].into_boxed_slice(),
-            expected_seq: None,
+            expected_timestamp: None,
             fixture: quality_audio_fixture(),
+        }
+    }
+
+    fn for_subscriber(subscriber: ParticipantId) -> Self {
+        Self {
+            subscriber: Some(subscriber),
+            ..Self::new()
         }
     }
 
@@ -794,17 +1034,40 @@ impl BrowserAudioReceiver {
         let ssrc = rtp.ssrc.map_or(0, |value| *value);
         let sequence = *rtp.seq;
         let timestamp = rtp.ts.numer();
-        log.record(publisher, ssrc, sequence, rtp.payload.len(), Instant::now());
-        if let Some(expected) = self.expected_seq {
-            let missing = sequence.saturating_sub(expected);
+        if rtp.payload.is_empty() {
+            log.record_stream_packet(ssrc, sequence);
+            return;
+        }
+        if let Some(expected) = self.expected_timestamp {
+            let missing = timestamp
+                .saturating_sub(expected)
+                .checked_div(QUALITY_AUDIO_FRAME_SAMPLES as u64)
+                .unwrap_or_default();
             for _ in 0..missing.min(64) {
+                self.expected.conceal();
                 self.decode(publisher, ssrc, None, &[], true, log);
             }
             if missing > 64 {
                 log.record_decoder_error(ssrc);
             }
         }
-        self.expected_seq = Some(sequence.wrapping_add(1));
+        self.expected_timestamp =
+            Some(timestamp.saturating_add(QUALITY_AUDIO_FRAME_SAMPLES as u64));
+        let expected_publisher = self
+            .subscriber
+            .and_then(|subscriber| {
+                pulsebeam::sim_metrics::expected_audio(subscriber, ssrc, timestamp)
+            })
+            .map(|expected| expected.origin.to_string());
+        let publisher = expected_publisher.as_deref().unwrap_or(publisher);
+        log.record(
+            publisher,
+            ssrc,
+            sequence,
+            timestamp,
+            rtp.payload.len(),
+            Instant::now(),
+        );
         self.decode(publisher, ssrc, Some(timestamp), &rtp.payload, false, log);
     }
 
@@ -826,14 +1089,75 @@ impl BrowserAudioReceiver {
                 let energy = pcm.iter().fold(0u64, |total, sample| {
                     total.saturating_add(u64::from(sample.unsigned_abs()))
                 });
-                let reference = timestamp
-                    .and_then(|timestamp| self.fixture.frame_for_rtp_timestamp(timestamp))
-                    .map(|frame| frame.reference_pcm_s16le);
-                log.record_pcm(publisher, ssrc, pcm, energy, concealed, reference);
+                let quality_reference = timestamp.and_then(|timestamp| {
+                    expected_audio_reference(
+                        self.subscriber,
+                        &mut self.expected,
+                        ssrc,
+                        timestamp,
+                        packet,
+                        samples,
+                        log,
+                    )
+                });
+                if let Some(reference) = quality_reference {
+                    let error = pcm_error(pcm, &reference);
+                    if error.is_none_or(|error| error.sum > 0 || error.max > 0) {
+                        log.wrong_content_packets = log.wrong_content_packets.saturating_add(1);
+                    }
+                    log.record_pcm(publisher, ssrc, pcm, energy, concealed, Some(&reference));
+                } else {
+                    let reference = timestamp
+                        .and_then(|timestamp| self.fixture.frame_for_rtp_timestamp(timestamp))
+                        .map(|frame| frame.reference_pcm_s16le);
+                    log.record_pcm(publisher, ssrc, pcm, energy, concealed, reference);
+                }
             }
             Err(_) => log.record_decoder_error(ssrc),
         }
     }
+}
+
+fn expected_audio_reference(
+    subscriber: Option<ParticipantId>,
+    expected_decoder: &mut ExpectedAudioDecoder,
+    ssrc: u32,
+    timestamp: u64,
+    packet: &[u8],
+    samples: usize,
+    log: &mut AudioReceiveLog,
+) -> Option<Vec<u8>> {
+    let subscriber = subscriber?;
+    let Some(expected) = pulsebeam::sim_metrics::expected_audio(subscriber, ssrc, timestamp) else {
+        log.unexpected_packets = log.unexpected_packets.saturating_add(1);
+        return None;
+    };
+    let source = match pulsebeam::sim_metrics::quality_source(expected.origin)? {
+        0 => QualityAudioSource::Zero,
+        1 => QualityAudioSource::One,
+        _ => {
+            debug_assert!(false, "registered quality source is valid");
+            return None;
+        }
+    };
+    let fixture = pulsebeam_testdata::quality_corpus_audio(source);
+    let frame = fixture.frame_for_rtp_timestamp(expected.source_timestamp)?;
+    if packet != frame.opus_packet {
+        log.wrong_content_packets = log.wrong_content_packets.saturating_add(1);
+    }
+    let expected_samples = expected_decoder
+        .decoder
+        .decode(frame.opus_packet, &mut expected_decoder.pcm, false)
+        .ok()?;
+    if expected_samples != samples {
+        log.wrong_content_packets = log.wrong_content_packets.saturating_add(1);
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(expected_samples.saturating_mul(2));
+    for sample in expected_decoder.pcm.get(..expected_samples)? {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    Some(bytes)
 }
 
 /// What arrived from one speaker, as the listener heard it.
@@ -898,6 +1222,8 @@ pub struct AudioReceiveLog {
     /// SSRC, and libwebrtc answers an SSRC it did not see in the SDP by building a whole new
     /// receive stream. What has to hold is that the shared stream is unbroken across the changes.
     pub by_stream: std::collections::BTreeMap<u32, AudioStreamContinuity>,
+    pub unexpected_packets: u64,
+    pub wrong_content_packets: u64,
 }
 
 /// One inbound RTP stream, whoever happens to be on it.
@@ -911,7 +1237,9 @@ pub struct AudioStreamContinuity {
     /// Largest forward jump in sequence number. Any hole is loss to the receiver, whether the
     /// network caused it or the SFU spliced two speakers together badly.
     pub max_seq_gap: u64,
+    pub max_timestamp_gap: u64,
     last_seq: Option<u64>,
+    last_timestamp: Option<u64>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -998,12 +1326,7 @@ impl AudioStreamContinuity {
 }
 
 impl AudioReceiveLog {
-    fn record(&mut self, publisher: &str, ssrc: u32, seq: u64, bytes: usize, now: Instant) {
-        self.by_publisher
-            .entry(publisher.to_owned())
-            .or_default()
-            .record(bytes, now);
-
+    fn record_stream_packet(&mut self, ssrc: u32, seq: u64) {
         let stream = self.by_stream.entry(ssrc).or_default();
         stream.packets = stream.packets.saturating_add(1);
         if let Some(previous) = stream.last_seq {
@@ -1012,6 +1335,38 @@ impl AudioReceiveLog {
         }
         if stream.last_seq.is_none_or(|previous| seq > previous) {
             stream.last_seq = Some(seq);
+        }
+    }
+
+    fn record(
+        &mut self,
+        publisher: &str,
+        ssrc: u32,
+        seq: u64,
+        timestamp: u64,
+        bytes: usize,
+        now: Instant,
+    ) {
+        self.by_publisher
+            .entry(publisher.to_owned())
+            .or_default()
+            .record(bytes, now);
+
+        self.record_stream_packet(ssrc, seq);
+        let stream = self.by_stream.entry(ssrc).or_default();
+        if let Some(previous) = stream.last_timestamp {
+            let gap = timestamp
+                .saturating_sub(previous)
+                .checked_div(QUALITY_AUDIO_FRAME_SAMPLES as u64)
+                .unwrap_or_default()
+                .saturating_sub(1);
+            stream.max_timestamp_gap = stream.max_timestamp_gap.max(gap);
+        }
+        if stream
+            .last_timestamp
+            .is_none_or(|previous| timestamp > previous)
+        {
+            stream.last_timestamp = Some(timestamp);
         }
     }
 
@@ -1124,8 +1479,15 @@ pub struct VideoReceiveStats {
     pub frozen_time: Duration,
     pub browser_packet_errors: u64,
     pub decoder_errors: u64,
+    pub damaged_frames: u64,
+    pub unexpected_frames: u64,
+    pub wrong_origin_frames: u64,
+    pub wrong_layer_frames: u64,
+    pub wrong_content_frames: u64,
     pub min_decoded_width: usize,
     pub min_decoded_height: usize,
+    pub max_decoded_width: usize,
+    pub max_decoded_height: usize,
 }
 
 impl VideoReceiveStats {
@@ -1158,8 +1520,23 @@ impl VideoReceiveStats {
                 .browser_packet_errors
                 .saturating_sub(baseline.browser_packet_errors),
             decoder_errors: self.decoder_errors.saturating_sub(baseline.decoder_errors),
+            damaged_frames: self.damaged_frames.saturating_sub(baseline.damaged_frames),
+            unexpected_frames: self
+                .unexpected_frames
+                .saturating_sub(baseline.unexpected_frames),
+            wrong_origin_frames: self
+                .wrong_origin_frames
+                .saturating_sub(baseline.wrong_origin_frames),
+            wrong_layer_frames: self
+                .wrong_layer_frames
+                .saturating_sub(baseline.wrong_layer_frames),
+            wrong_content_frames: self
+                .wrong_content_frames
+                .saturating_sub(baseline.wrong_content_frames),
             min_decoded_width: self.min_decoded_width,
             min_decoded_height: self.min_decoded_height,
+            max_decoded_width: self.max_decoded_width,
+            max_decoded_height: self.max_decoded_height,
         }
     }
 }
@@ -1167,6 +1544,31 @@ impl VideoReceiveStats {
 /// Scans an Annex-B frame for the H.264 NAL unit types it contains, using the
 /// same `pulsebeam_core::h264::classify()` classifier as the production SFU forwarder.
 impl VideoReceiveLog {
+    pub fn begin_interval(&mut self, now: Instant) {
+        self.interval_started_at = Some(now);
+        self.interval_longest_frame_gap = Duration::ZERO;
+        self.interval_min_decoded_width = 0;
+        self.interval_min_decoded_height = 0;
+        self.interval_max_decoded_width = 0;
+        self.interval_max_decoded_height = 0;
+    }
+
+    pub fn interval_stats_since(&self, baseline: VideoReceiveStats) -> VideoReceiveStats {
+        let mut stats = self.stats().since(baseline);
+        stats.longest_frame_gap = self.interval_longest_frame_gap;
+        stats.min_decoded_width = self.interval_min_decoded_width;
+        stats.min_decoded_height = self.interval_min_decoded_height;
+        stats.max_decoded_width = self.interval_max_decoded_width;
+        stats.max_decoded_height = self.interval_max_decoded_height;
+        if let Some(started_at) = self.interval_started_at {
+            stats.last_frame_at = Some(
+                self.last_frame_at
+                    .map_or(started_at, |last| last.max(started_at)),
+            );
+        }
+        stats
+    }
+
     pub fn begin_first_frame_measurement(&mut self) {
         self.first_frame_since_measurement = None;
     }
@@ -1188,6 +1590,18 @@ impl VideoReceiveLog {
             .map(|quality| quality.decoded_height)
             .min()
             .unwrap_or(0);
+        let max_decoded_width = self
+            .quality_by_publisher
+            .values()
+            .map(|quality| quality.decoded_width)
+            .max()
+            .unwrap_or(0);
+        let max_decoded_height = self
+            .quality_by_publisher
+            .values()
+            .map(|quality| quality.decoded_height)
+            .max()
+            .unwrap_or(0);
         VideoReceiveStats {
             frames: self.frames,
             keyframes: self.keyframes,
@@ -1204,8 +1618,15 @@ impl VideoReceiveLog {
             frozen_time: self.frozen_time,
             browser_packet_errors: self.browser_packet_errors(),
             decoder_errors: self.decoder_errors,
+            damaged_frames: self.damaged_frames,
+            unexpected_frames: self.unexpected_frames,
+            wrong_origin_frames: self.wrong_origin_frames,
+            wrong_layer_frames: self.wrong_layer_frames,
+            wrong_content_frames: self.wrong_content_frames,
             min_decoded_width,
             min_decoded_height,
+            max_decoded_width,
+            max_decoded_height,
         }
     }
 
@@ -1216,6 +1637,7 @@ impl VideoReceiveLog {
         is_keyframe: bool,
         capture_time: Option<SystemTime>,
         image: &impl YUVSource,
+        reference_error: Option<PlaneError>,
     ) {
         let now = Instant::now();
         if let Some(capture_time) = capture_time
@@ -1232,12 +1654,32 @@ impl VideoReceiveLog {
                 self.frozen_time = self.frozen_time.saturating_add(gap);
             }
         }
+        if let Some(started_at) = self.interval_started_at {
+            let previous = self
+                .last_frame_at
+                .map_or(started_at, |last| last.max(started_at));
+            let gap = now.saturating_duration_since(previous);
+            self.interval_longest_frame_gap = self.interval_longest_frame_gap.max(gap);
+        }
         self.first_frame_at.get_or_insert(now);
         self.first_frame_since_measurement.get_or_insert(now);
         self.last_frame_at = Some(now);
         *self.by_publisher.entry(publisher.to_owned()).or_default() += 1;
         let (width, height) = image.dimensions();
-        let reference_error = decoded_video_error(image, ts);
+        if self.interval_started_at.is_some() {
+            self.interval_min_decoded_width = if self.interval_min_decoded_width == 0 {
+                width
+            } else {
+                self.interval_min_decoded_width.min(width)
+            };
+            self.interval_min_decoded_height = if self.interval_min_decoded_height == 0 {
+                height
+            } else {
+                self.interval_min_decoded_height.min(height)
+            };
+            self.interval_max_decoded_width = self.interval_max_decoded_width.max(width);
+            self.interval_max_decoded_height = self.interval_max_decoded_height.max(height);
+        }
         self.quality_by_publisher
             .entry(publisher.to_owned())
             .or_default()
@@ -1448,16 +1890,50 @@ impl SimClient {
                             .remote_tracks
                             .insert(publication_id.clone(), publication_id.clone());
                         let publisher_id = track.publisher_id().to_owned();
+                        let subscriber_id: ParticipantId = self
+                            .ctx
+                            .agent
+                            .participant_id()
+                            .parse()
+                            .expect("agent participant id");
                         let log = self.ctx.video_rx.clone();
                         let receivers = self.ctx.video_receivers.clone();
                         self.join_set.spawn(async move {
-                            while let Ok(rtp) = track.recv().await {
-                                let mut receivers = receivers.lock().unwrap();
-                                let receiver = receivers
-                                    .entry(publisher_id.clone())
-                                    .or_insert_with(BrowserVideoReceiver::new);
-                                let mut log = log.lock().unwrap();
-                                receiver.push(rtp, &mut log, &publisher_id);
+                            let mut keyframe_retry =
+                                tokio::time::interval(Duration::from_secs(1));
+                            keyframe_retry.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Skip,
+                            );
+                            loop {
+                                enum Next {
+                                    Packet(Result<pulsebeam_agent::RtpPacket, pulsebeam_agent::agent::RecvError>),
+                                    Retry,
+                                }
+                                let next = tokio::select! {
+                                    packet = track.recv() => Next::Packet(packet),
+                                    _ = keyframe_retry.tick() => Next::Retry,
+                                };
+                                let request_keyframe = match next {
+                                    Next::Packet(Ok(rtp)) => {
+                                        let mut receivers = receivers.lock().unwrap();
+                                        let receiver = receivers
+                                            .entry(publisher_id.clone())
+                                            .or_insert_with(|| {
+                                                BrowserVideoReceiver::for_subscriber(subscriber_id)
+                                            });
+                                        let mut log = log.lock().unwrap();
+                                        receiver.push(rtp, &mut log, &publisher_id)
+                                    }
+                                    Next::Packet(Err(_)) => break,
+                                    Next::Retry => receivers
+                                        .lock()
+                                        .unwrap()
+                                        .get(&publisher_id)
+                                        .is_some_and(BrowserVideoReceiver::needs_keyframe),
+                                };
+                                if request_keyframe {
+                                    track.request_keyframe();
+                                }
                             }
                         });
 
@@ -1537,6 +2013,21 @@ mod decoder_tests {
     }
 
     #[test]
+    fn bundled_openh264_decodes_the_scheduled_screenshare_fixture_continuously() {
+        let mut decoder = H264Decoder::new().unwrap();
+        for (index, frame) in pulsebeam_agent::media::H264FrameSlicer::new(
+            pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
+        )
+        .enumerate()
+        {
+            assert!(
+                decoder.decode(frame).is_ok_and(|image| image.is_some()),
+                "OpenH264 did not render screen-share source frame {index}"
+            );
+        }
+    }
+
+    #[test]
     fn bundled_openh264_decodes_a_full_half_full_idr_sequence() {
         let mut decoder = H264Decoder::new().unwrap();
         for (label, fixture) in [
@@ -1611,6 +2102,65 @@ mod decoder_tests {
     }
 
     #[test]
+    fn a_whole_lost_delta_frame_waits_for_an_idr_without_poisoning_the_decoder() {
+        let frames: Vec<_> =
+            pulsebeam_agent::media::H264FrameSlicer::new(pulsebeam_testdata::RAW_H264_FULL_CBR)
+                .take(3)
+                .collect();
+        assert_eq!(frames.len(), 3);
+        let packetizer =
+            pulsebeam_core::h264::Packetizer::new(pulsebeam_core::framing::DEFAULT_MTU_PAYLOAD);
+        let mut next_seq = 0u64;
+        let mut packets = |frame: &[u8], timestamp: u64| {
+            packetizer
+                .packetize(frame)
+                .into_iter()
+                .map(|packet| {
+                    let sequence = next_seq;
+                    next_seq = next_seq.wrapping_add(1);
+                    pulsebeam_agent::RtpPacket {
+                        mid: pulsebeam_agent::Mid::from("v0"),
+                        rid: None,
+                        seq: pulsebeam_agent::SeqNo::from(sequence),
+                        ts: pulsebeam_agent::MediaTime::from_90khz(timestamp),
+                        marker: packet.end_of_frame,
+                        payload_type: Some(96),
+                        ssrc: Some(pulsebeam_agent::Ssrc::from(1)),
+                        payload: Arc::from(packet.payload),
+                        ext_vals: pulsebeam_agent::ExtensionValues::default(),
+                        arrival: tokio::time::Instant::now(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let first = packets(frames[0], 0);
+        let _lost = packets(frames[1], 3_000);
+        let after_loss = packets(frames[2], 6_000);
+        let recovery = packets(frames[0], 9_000);
+        let mut receiver = BrowserVideoReceiver::new();
+        let mut log = VideoReceiveLog::default();
+
+        for packet in first {
+            assert!(!receiver.process(packet, &mut log, "publisher"));
+        }
+        assert_eq!(log.frames, 1);
+        let mut requested = false;
+        for packet in after_loss {
+            requested |= receiver.process(packet, &mut log, "publisher");
+        }
+        assert!(requested);
+        assert_eq!(log.frames, 1);
+        assert_eq!(log.decoder_errors, 0);
+        for packet in recovery {
+            let _ = receiver.process(packet, &mut log, "publisher");
+        }
+        assert_eq!(log.frames, 2);
+        assert_eq!(log.decoder_errors, 0);
+        assert_eq!(log.undecodable_keyframes, 0);
+    }
+
+    #[test]
     fn bundled_opus_decodes_the_audio_fixture() {
         let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
         let mut pcm = Box::<[i16]>::from([0; 5_760]);
@@ -1637,7 +2187,14 @@ mod decoder_tests {
             .unwrap()
             .expect("decoded frame");
         let mut log = VideoReceiveLog::default();
-        log.record_decoded("publisher", frame.rtp_timestamp, true, None, &image);
+        log.record_decoded(
+            "publisher",
+            frame.rtp_timestamp,
+            true,
+            None,
+            &image,
+            decoded_video_error(&image),
+        );
         let quality = log
             .quality_by_publisher
             .get("publisher")
@@ -1663,6 +2220,210 @@ mod decoder_tests {
         audio.record_pcm(&[1], false, Some(&[0, 0]));
         assert_eq!(audio.reference_packets, 1);
         assert!(audio.mean_absolute_error().is_some());
+    }
+
+    #[test]
+    fn exact_video_oracle_classifies_missing_layer_source_and_stale_output() {
+        let subscriber = ParticipantId::from_bytes([31; 16]);
+        let origin = ParticipantId::from_bytes([32; 16]);
+        pulsebeam::sim_metrics::register_quality_source(origin, 0);
+        let publisher = origin.to_string();
+        let fixture = quality_corpus_video(QualityVideoSource::Zero, QualityVideoLayer::P180);
+        let mut references = BTreeMap::new();
+        let mut log = VideoReceiveLog::default();
+        let mut decoder = H264Decoder::new().expect("OpenH264");
+
+        let first = fixture.frame(0).expect("first frame");
+        pulsebeam::sim_metrics::record_expected_video(
+            subscriber,
+            origin,
+            10,
+            first.rtp_timestamp,
+            180,
+            true,
+        );
+        let image = decoder
+            .decode(first.encoded)
+            .expect("decode")
+            .expect("image");
+        let error = expected_video_error(
+            Some(subscriber),
+            &mut references,
+            &publisher,
+            10,
+            &image,
+            &mut log,
+        )
+        .expect("reference error");
+        assert_eq!(error.sum, 0);
+        assert_eq!(log.wrong_content_frames, 0);
+
+        pulsebeam::sim_metrics::record_expected_video(
+            subscriber,
+            origin,
+            11,
+            first.rtp_timestamp,
+            720,
+            true,
+        );
+        let _ = expected_video_error(
+            Some(subscriber),
+            &mut references,
+            &publisher,
+            11,
+            &image,
+            &mut log,
+        );
+        assert_eq!(log.wrong_layer_frames, 1);
+
+        let mut wrong_source_decoder = H264Decoder::new().expect("OpenH264");
+        let wrong_source = quality_corpus_video(QualityVideoSource::One, QualityVideoLayer::P180)
+            .frame(0)
+            .expect("wrong source frame");
+        let wrong_source_image = wrong_source_decoder
+            .decode(wrong_source.encoded)
+            .expect("decode")
+            .expect("image");
+        pulsebeam::sim_metrics::record_expected_video(
+            subscriber,
+            origin,
+            12,
+            first.rtp_timestamp,
+            180,
+            true,
+        );
+        let _ = expected_video_error(
+            Some(subscriber),
+            &mut references,
+            &publisher,
+            12,
+            &wrong_source_image,
+            &mut log,
+        );
+        assert_eq!(log.wrong_content_frames, 1);
+
+        let second = fixture.frame(1).expect("second frame");
+        let stale_image = decoder
+            .decode(second.encoded)
+            .expect("decode")
+            .expect("image");
+        pulsebeam::sim_metrics::record_expected_video(
+            subscriber,
+            origin,
+            13,
+            first.rtp_timestamp,
+            180,
+            true,
+        );
+        let _ = expected_video_error(
+            Some(subscriber),
+            &mut references,
+            &publisher,
+            13,
+            &stale_image,
+            &mut log,
+        );
+        assert_eq!(log.wrong_content_frames, 2);
+
+        let _ = expected_video_error(
+            Some(subscriber),
+            &mut references,
+            &publisher,
+            14,
+            &stale_image,
+            &mut log,
+        );
+        assert_eq!(log.unexpected_frames, 1);
+    }
+
+    #[test]
+    fn exact_video_progress_is_complete_decoded_and_window_scoped() {
+        pulsebeam::sim_metrics::reset();
+        let subscriber = ParticipantId::from_bytes([51; 16]);
+        let origin = ParticipantId::from_bytes([52; 16]);
+        pulsebeam::sim_metrics::record_expected_video(subscriber, origin, 1, 10, 180, false);
+        pulsebeam::sim_metrics::record_expected_video(subscriber, origin, 2, 20, 180, true);
+        pulsebeam::sim_metrics::record_expected_video(subscriber, origin, 3, 30, 180, true);
+        pulsebeam::sim_metrics::record_decoded_video(subscriber, origin, 2);
+
+        assert_eq!(
+            pulsebeam::sim_metrics::expected_video_progress(subscriber, Duration::ZERO),
+            (2, 1)
+        );
+
+        pulsebeam::sim_metrics::reset();
+        assert_eq!(
+            pulsebeam::sim_metrics::expected_video_progress(subscriber, Duration::ZERO),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn exact_audio_oracle_uses_the_accepted_source_packet_and_decoder_state() {
+        let subscriber = ParticipantId::from_bytes([41; 16]);
+        let origin = ParticipantId::from_bytes([42; 16]);
+        pulsebeam::sim_metrics::register_quality_source(origin, 0);
+        let fixture = pulsebeam_testdata::quality_corpus_audio(QualityAudioSource::Zero);
+        let first = fixture.frame(0).expect("first packet");
+        pulsebeam::sim_metrics::record_expected_audio(
+            subscriber,
+            7,
+            origin,
+            20,
+            first.rtp_timestamp,
+        );
+        let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono).expect("decoder");
+        let mut expected_decoder = ExpectedAudioDecoder::new();
+        let mut pcm = [0i16; QUALITY_AUDIO_FRAME_SAMPLES];
+        let samples = decoder
+            .decode(first.opus_packet, &mut pcm, false)
+            .expect("decode");
+        let mut log = AudioReceiveLog::default();
+        let reference = expected_audio_reference(
+            Some(subscriber),
+            &mut expected_decoder,
+            7,
+            20,
+            first.opus_packet,
+            samples,
+            &mut log,
+        )
+        .expect("expected PCM");
+        let error = pcm_error(&pcm[..samples], &reference).expect("PCM error");
+        assert_eq!((error.sum, error.max), (0, 0));
+
+        let second = fixture.frame(1).expect("second packet");
+        pulsebeam::sim_metrics::record_expected_audio(
+            subscriber,
+            7,
+            origin,
+            21,
+            second.rtp_timestamp,
+        );
+        let wrong = pulsebeam_testdata::quality_corpus_audio(QualityAudioSource::One)
+            .frame(1)
+            .expect("wrong packet");
+        let _ = expected_audio_reference(
+            Some(subscriber),
+            &mut expected_decoder,
+            7,
+            21,
+            wrong.opus_packet,
+            QUALITY_AUDIO_FRAME_SAMPLES,
+            &mut log,
+        );
+        assert_eq!(log.wrong_content_packets, 1);
+
+        let _ = expected_audio_reference(
+            Some(subscriber),
+            &mut expected_decoder,
+            7,
+            22,
+            second.opus_packet,
+            QUALITY_AUDIO_FRAME_SAMPLES,
+            &mut log,
+        );
+        assert_eq!(log.unexpected_packets, 1);
     }
 }
 

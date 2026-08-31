@@ -8,7 +8,7 @@ SIM := sim
 TARGET = pulsebeam
 TEST =
 
-.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing test-browser test-rtc-browser test-rtc-browser-all test-browser-bench
+.PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean build-ebpf test-routing test-browser test-browser-contract test-rtc-browser test-rtc-browser-all test-sim-soak check-agent-str0m
 all: build
 
 dev:
@@ -28,7 +28,7 @@ run-profile: profile
 
 test: test-unit test-sim
 
-test-browser: test-rtc-browser test-browser-bench
+test-browser: test-browser-contract
 
 test-rtc-browser:
 	cargo build --release -p pulsebeam-rtc --features browser-test --example browser_interop
@@ -38,16 +38,17 @@ test-rtc-browser:
 
 test-rtc-browser-all: test-rtc-browser
 
-test-browser-bench:
-	cargo build --release -p pulsebeam -p pulsebeam-cli
+test-browser-contract:
+	cargo build --release -p pulsebeam
 	npm ci --prefix browser
 	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npx --prefix browser playwright install chromium firefox webkit
-	PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npm test --prefix browser
+	FIREFOX_GMP_PATH=$$(python3 scripts/install-firefox-openh264.py $(CURDIR)/browser/.playwright); \
+	MOZ_GMP_PATH=$$FIREFOX_GMP_PATH PLAYWRIGHT_BROWSERS_PATH=$(CURDIR)/browser/.playwright npm test --prefix browser
 
 # `sim` is on because the shaper lives behind it, and the shaper is the authority on what a
 # simulated link can carry. Without the feature its tests are not compiled, so they never ran
 # here and nothing said so.
-test-unit:
+test-unit: check-agent-str0m
 	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --features pulsebeam/sim -- $(TEST)
 
 # One plan per process, across all cores.
@@ -64,6 +65,10 @@ test-unit:
 test-sim:
 	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator --no-fail-fast $(TEST)
 
+test-sim-soak:
+	$(CARGO_CMD) nextest run --cargo-profile $(SIM) -p pulsebeam-simulator \
+		two_minute_quality_fixture_soak_never_blanks_or_freezes_test
+
 # Replay one seed. This is what a sweep failure prints.
 test-sim-seed:
 	PULSEBEAM_SIM_SEED=$(SEED) $(CARGO_CMD) nextest run --cargo-profile $(SIM) \
@@ -78,6 +83,9 @@ build-ebpf:
 
 test-routing:
 	$(CARGO_CMD) test -p pulsebeam-routing -- $(TEST)
+
+check-agent-str0m:
+	python3 scripts/check-agent-str0m.py
 
 # Run the suite over many seeds.
 #
@@ -115,6 +123,7 @@ lint:
 # be linted; naming it here means that stays true if the simulator ever leaves
 # the default members.
 lint-check:
+	@$(MAKE) --no-print-directory check-agent-str0m
 	@! rg -n '\\bstr0m\\b' pulsebeam --glob '!target/**'
 	cargo clippy --all-targets --workspace --features pulsebeam/sim
 

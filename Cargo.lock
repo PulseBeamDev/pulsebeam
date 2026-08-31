@@ -1945,11 +1945,12 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "is"
 version = "0.11.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6#2c55e7a07864649fef84a9ee0c3f6d4f287b37e0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08f9118d003d441f79c1070e84d0a2a89f35721ca8ae0cd5e1f9026dc4a2517"
 dependencies = [
  "crc",
  "serde",
- "str0m-proto 0.7.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
+ "str0m-proto 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "subtle",
  "tracing",
 ]
@@ -3006,7 +3007,7 @@ dependencies = [
  "pulsebeam-core",
  "pulsebeam-proto",
  "pulsebeam-testdata",
- "str0m 0.22.0",
+ "str0m 0.23.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3041,7 +3042,7 @@ dependencies = [
  "proptest",
  "pulsebeam-core",
  "reqwest",
- "str0m 0.22.0",
+ "str0m 0.23.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.19",
  "tokio",
  "turmoil",
@@ -3079,10 +3080,13 @@ version = "0.3.2"
 dependencies = [
  "dcsctp",
  "is 0.11.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1)",
+ "metrics",
  "pulsebeam-core",
  "pulsebeam-testdata",
- "str0m 0.23.1",
+ "str0m 0.23.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "str0m 0.23.1 (git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1)",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -3152,6 +3156,12 @@ dependencies = [
 [[package]]
 name = "pulsebeam-testdata"
 version = "0.3.2"
+dependencies = [
+ "openh264",
+ "opus",
+ "sha2",
+ "zstd",
+]
 
 [[package]]
 name = "quanta"
@@ -3980,19 +3990,20 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "str0m"
-version = "0.22.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6#2c55e7a07864649fef84a9ee0c3f6d4f287b37e0"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8522aa06c731cfdc1488e32de7fcebcfc8d9d86d49a6ecc95a64779fe7b545f2"
 dependencies = [
  "arrayvec",
  "base64ct",
  "combine",
  "dimpl",
  "fastrand",
- "is 0.11.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
+ "is 0.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "sctp-proto",
  "serde",
- "str0m-aws-lc-rs 0.6.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
- "str0m-proto 0.7.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
+ "str0m-aws-lc-rs 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "str0m-proto 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "subtle",
  "time",
  "tracing",
@@ -4021,11 +4032,12 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.6.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6#2c55e7a07864649fef84a9ee0c3f6d4f287b37e0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73269314334fc6bfa8024f09dd652b9f5068360bf623c871e3d8d18e26d8035a"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
- "str0m-proto 0.7.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6)",
+ "str0m-proto 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "time",
 ]
 
@@ -4043,7 +4055,8 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.7.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-6#2c55e7a07864649fef84a9ee0c3f6d4f287b37e0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8f3d99f2cf6c76a502e45feb896ea71e54787ede8744bcdb215acfbfcb905dd"
 dependencies = [
  "base64ct",
  "dimpl",

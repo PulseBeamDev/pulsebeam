@@ -96,8 +96,9 @@ impl TryFrom<Response<Vec<u8>>> for CreateParticipantResponse {
     fn try_from(resp: Response<Vec<u8>>) -> Result<Self, Self::Error> {
         if !resp.status().is_success() {
             return Err(ApiError::Protocol(format!(
-                "Server rejected join: {}",
-                resp.status()
+                "Server rejected join: {}: {}",
+                resp.status(),
+                String::from_utf8_lossy(resp.body())
             )));
         }
         let resource_uri = resp

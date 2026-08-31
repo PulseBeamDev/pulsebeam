@@ -1,5 +1,6 @@
 pub mod client;
 pub mod harness;
+pub mod impairment;
 
 pub use harness::{
     Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Loss,
@@ -173,6 +174,7 @@ mod default_profile_tests {
         assert!(link.loss > 0.0);
         assert!(link.loss_model.is_some());
         assert!(link.feedback.is_some());
+        assert_eq!(link.min_latency, link.max_latency);
         assert!(link.reorder.probability > Reorder::NONE.probability);
         assert!(link.reorder.delay > Reorder::NONE.delay);
         assert!(link.duplicate > 0.0);

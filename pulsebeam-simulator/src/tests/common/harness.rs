@@ -6,10 +6,12 @@ use crate::tests::common::{
     DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
     subnet_ip_v6,
 };
+use pulsebeam::entity::ParticipantId;
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
 use pulsebeam_runtime::net::shaper::SharedBottleneck;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
+use pulsebeam_testdata::{QualityAudioSource, QualityVideoSource};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -62,8 +64,7 @@ pub struct Participant {
     /// Make the published payload opaque (simulating SFrame/E2EE), forcing the SFU
     /// to forward on the Dependency Descriptor alone.
     pub opaque_payload: bool,
-    /// Publish the decoder-quality fixture instead of a legacy benchmark encoding.
-    pub quality_fixture: bool,
+    pub quality_source: Option<QualityVideoSource>,
     /// Model a legacy peer that never negotiates the Dependency Descriptor
     /// extension, exercising the marker/deep-inspection fallback for mixed rooms.
     pub marker_only: bool,
@@ -85,7 +86,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
-            quality_fixture: false,
+            quality_source: None,
             marker_only: false,
         }
     }
@@ -105,15 +106,33 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
-            quality_fixture: false,
+            quality_source: None,
             marker_only: false,
         }
     }
 
     pub fn quality_publisher(name: &'static str) -> Self {
         Self {
-            quality_fixture: true,
-            ..Self::single_publisher(name)
+            quality_source: Some(QualityVideoSource::Zero),
+            ..Self::publisher(name, &["q", "h", "f"])
+        }
+    }
+
+    pub fn quality_publisher_source(name: &'static str, source: QualityVideoSource) -> Self {
+        Self {
+            quality_source: Some(source),
+            ..Self::publisher(name, &["q", "h", "f"])
+        }
+    }
+
+    pub fn quality_speaker(name: &'static str, source: QualityAudioSource) -> Self {
+        Self {
+            quality_source: Some(match source {
+                QualityAudioSource::Zero => QualityVideoSource::Zero,
+                QualityAudioSource::One => QualityVideoSource::One,
+            }),
+            audio_level_dbov: Some(-30),
+            ..Self::data_participant(name)
         }
     }
 
@@ -132,7 +151,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
-            quality_fixture: false,
+            quality_source: None,
             marker_only: false,
         }
     }
@@ -153,7 +172,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
-            quality_fixture: false,
+            quality_source: None,
             marker_only: false,
         }
     }
@@ -190,7 +209,7 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
-            quality_fixture: false,
+            quality_source: None,
             marker_only: false,
         }
     }
@@ -316,11 +335,14 @@ impl Room {
 #[derive(Clone, Debug)]
 pub struct VideoQuality {
     pub min_frames: u64,
+    pub require_all_forwarded_frames: bool,
     pub max_undecodable_keyframes: u64,
     pub max_non_contiguous: u64,
+    pub max_damaged_frames: u64,
     pub max_capture_to_decode_latency: Option<Duration>,
     pub max_frame_gap: Option<Duration>,
     pub min_decoded_resolution: Option<(usize, usize)>,
+    pub exact_decoded_resolution: Option<(usize, usize)>,
     pub max_visual_mean_absolute_error: Option<u64>,
     pub max_visual_error: Option<u8>,
 }
@@ -330,14 +352,22 @@ impl VideoQuality {
     pub fn min_frames(n: u64) -> Self {
         Self {
             min_frames: n,
+            require_all_forwarded_frames: false,
             max_undecodable_keyframes: 0,
             max_non_contiguous: 0,
+            max_damaged_frames: 0,
             max_capture_to_decode_latency: None,
             max_frame_gap: None,
             min_decoded_resolution: None,
+            exact_decoded_resolution: None,
             max_visual_mean_absolute_error: None,
             max_visual_error: None,
         }
+    }
+
+    pub fn all_forwarded_frames(mut self) -> Self {
+        self.require_all_forwarded_frames = true;
+        self
     }
 
     /// Allow up to `n` keyframes rejected by the decoder.
@@ -355,6 +385,11 @@ impl VideoQuality {
         self
     }
 
+    pub fn allow_damaged_frames(mut self, n: u64) -> Self {
+        self.max_damaged_frames = n;
+        self
+    }
+
     pub fn max_capture_to_decode_latency(mut self, latency: Duration) -> Self {
         self.max_capture_to_decode_latency = Some(latency);
         self
@@ -367,6 +402,11 @@ impl VideoQuality {
 
     pub fn min_decoded_resolution(mut self, minimum: (usize, usize)) -> Self {
         self.min_decoded_resolution = Some(minimum);
+        self
+    }
+
+    pub fn exact_decoded_resolution(mut self, resolution: (usize, usize)) -> Self {
+        self.exact_decoded_resolution = Some(resolution);
         self
     }
 
@@ -579,6 +619,12 @@ pub enum Step {
         publisher: &'static str,
         min_frames: u64,
     },
+    CheckVideoReceivedFromInterval {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_frames: u64,
+    },
     CheckFirstDecodedFrame {
         description: &'static str,
         participant: &'static str,
@@ -623,6 +669,11 @@ pub enum Step {
     /// A constantly climbing count means downstream cannot decode the forwarded
     /// stream — the signature of a broken DD/reassembly path (the "PLI storm").
     CheckKeyframeRequests {
+        description: &'static str,
+        participant: &'static str,
+        max: u64,
+    },
+    CheckKeyframeRequestsInterval {
         description: &'static str,
         participant: &'static str,
         max: u64,
@@ -993,6 +1044,8 @@ struct ParticipantHandle {
     /// viewer spent waiting.
     subscribed_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
+    interval_video_by_publisher_baseline: BTreeMap<String, u64>,
+    interval_keyframe_requests_baseline: u64,
     /// Ground truth, from the plan rather than from anything the SFU said.
     ///
     /// The room invariant is checked against these: what this participant actually publishes, and
@@ -1075,7 +1128,17 @@ impl ParticipantHandle {
     }
 
     fn video_stats_since_interval(&self) -> VideoReceiveStats {
-        self.video_rx().stats().since(self.interval_video_baseline)
+        self.video_rx()
+            .interval_stats_since(self.interval_video_baseline)
+    }
+
+    fn video_frames_from_since_interval(&self, publisher: &str) -> u64 {
+        self.video_rx().frames_from(publisher).saturating_sub(
+            self.interval_video_by_publisher_baseline
+                .get(publisher)
+                .copied()
+                .unwrap_or(0),
+        )
     }
 
     /// The SFU-side participant id, once connected. Keys the per-subscriber metrics.
@@ -1093,7 +1156,12 @@ impl ParticipantHandle {
     fn snapshot_interval(&mut self) {
         self.interval_tx_baseline = self.tx_bytes();
         self.interval_rx_baseline = self.rx_bytes();
-        self.interval_video_baseline = self.video_rx().stats();
+        self.interval_keyframe_requests_baseline = self.keyframe_requests();
+        let now = Instant::now();
+        let mut video = self.shared.video_rx.lock().unwrap();
+        self.interval_video_baseline = video.stats();
+        self.interval_video_by_publisher_baseline = video.by_publisher.clone();
+        video.begin_interval(now);
     }
 }
 
@@ -1129,6 +1197,7 @@ async fn run_participant(
 
         match config.role {
             Role::Publisher => {
+                builder = builder.with_initial_send_bitrate_bps(5_000_000);
                 let layers = if config.rids.is_empty() {
                     None
                 } else {
@@ -1144,9 +1213,6 @@ async fn run_participant(
                 if config.opaque_payload {
                     builder = builder.with_opaque_payload();
                 }
-                if config.quality_fixture {
-                    builder = builder.with_quality_fixture();
-                }
                 if config.subscribes {
                     builder = builder.receive_video(config.slots.max(1));
                 }
@@ -1157,6 +1223,10 @@ async fn run_participant(
             Role::DataOnly => {
                 // No tracks; data channels only.
             }
+        }
+
+        if let Some(source) = config.quality_source {
+            builder = builder.with_quality_fixture(source);
         }
 
         // After the role's video slots. Transceivers are reserved in order, so putting audio first
@@ -1197,7 +1267,16 @@ async fn run_participant(
         {
             let id = client.ctx.agent.participant_id().clone();
             *shared.participant_id.lock().unwrap() = Some(id.clone());
-            shared.incarnations.lock().unwrap().push(id);
+            shared.incarnations.lock().unwrap().push(id.clone());
+            if let Some(source) = config.quality_source {
+                pulsebeam::sim_metrics::register_quality_source(
+                    id.parse().expect("agent participant id"),
+                    match source {
+                        QualityVideoSource::Zero => 0,
+                        QualityVideoSource::One => 1,
+                    },
+                );
+            }
         }
         *shared.connected.lock().unwrap() = true;
 
@@ -1541,9 +1620,11 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
         Step::CheckVideoReceivedFrom { .. } => "CheckVideoReceivedFrom",
+        Step::CheckVideoReceivedFromInterval { .. } => "CheckVideoReceivedFromInterval",
         Step::CheckFirstDecodedFrame { .. } => "CheckFirstDecodedFrame",
         Step::CheckForwardingLatency { .. } => "CheckForwardingLatency",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
+        Step::CheckKeyframeRequestsInterval { .. } => "CheckKeyframeRequestsInterval",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
         Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
         Step::CheckRoutingCounterAtLeast { .. } => "CheckRoutingCounterAtLeast",
@@ -2195,17 +2276,43 @@ async fn execute_plan(
                     stats.frames,
                     stats.keyframes,
                 );
+                if quality.require_all_forwarded_frames {
+                    let subscriber = handle
+                        .participant_id()
+                        .and_then(|id| id.parse::<ParticipantId>().ok())
+                        .expect("connected participant has a valid runtime id");
+                    let (expected, decoded) = pulsebeam::sim_metrics::expected_video_progress(
+                        subscriber,
+                        Duration::from_secs(1),
+                    );
+                    assert!(
+                        expected > 0,
+                        "step {n}/{total} {kind}: {description} ({participant}) observed no complete SFU forwarding decisions in the interval"
+                    );
+                    assert_eq!(
+                        decoded, expected,
+                        "step {n}/{total} {kind}: {description} ({participant}) decoded {decoded}/{expected} complete frames admitted by the SFU in the interval"
+                    );
+                }
                 assert!(
                     stats.undecodable_keyframes <= quality.max_undecodable_keyframes,
-                    "step {n}/{total} {kind}: {description} ({participant}) observed {} undecodable keyframes in the interval, maximum {}",
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} undecodable keyframes in the interval, maximum {}; decoder_errors={}, damaged_frames={}",
                     stats.undecodable_keyframes,
-                    quality.max_undecodable_keyframes
+                    quality.max_undecodable_keyframes,
+                    stats.decoder_errors,
+                    stats.damaged_frames,
                 );
                 assert!(
                     stats.non_contiguous <= quality.max_non_contiguous,
                     "step {n}/{total} {kind}: {description} ({participant}) observed {} non-contiguous frames in the interval, maximum {}",
                     stats.non_contiguous,
                     quality.max_non_contiguous
+                );
+                assert!(
+                    stats.damaged_frames <= quality.max_damaged_frames,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} network-damaged frame(s) in the interval, maximum {}",
+                    stats.damaged_frames,
+                    quality.max_damaged_frames,
                 );
                 assert_eq!(
                     stats.duplicate_ts_frames, 0,
@@ -2225,6 +2332,20 @@ async fn execute_plan(
                     "step {n}/{total} {kind}: {description} ({participant}) observed {} decoder error(s) in the interval",
                     stats.decoder_errors,
                 );
+                assert_eq!(
+                    (
+                        stats.unexpected_frames,
+                        stats.wrong_origin_frames,
+                        stats.wrong_layer_frames,
+                        stats.wrong_content_frames,
+                    ),
+                    (0, 0, 0, 0),
+                    "step {n}/{total} {kind}: {description} ({participant}) exact decoded-media oracle failed: unexpected={}, wrong_origin={}, wrong_layer={}, wrong_content={}",
+                    stats.unexpected_frames,
+                    stats.wrong_origin_frames,
+                    stats.wrong_layer_frames,
+                    stats.wrong_content_frames,
+                );
                 if let Some((minimum_width, minimum_height)) = quality.min_decoded_resolution {
                     assert!(
                         stats.min_decoded_width >= minimum_width
@@ -2232,6 +2353,18 @@ async fn execute_plan(
                         "step {n}/{total} {kind}: {description} ({participant}) decoded {}x{}, minimum {minimum_width}x{minimum_height}",
                         stats.min_decoded_width,
                         stats.min_decoded_height,
+                    );
+                }
+                if let Some(expected) = quality.exact_decoded_resolution {
+                    assert_eq!(
+                        (
+                            stats.min_decoded_width,
+                            stats.min_decoded_height,
+                            stats.max_decoded_width,
+                            stats.max_decoded_height,
+                        ),
+                        (expected.0, expected.1, expected.0, expected.1),
+                        "step {n}/{total} {kind}: {description} ({participant}) decoded a resolution outside the exact simulcast assignment"
                     );
                 }
                 if let Some(max_latency) = quality.max_capture_to_decode_latency {
@@ -2264,6 +2397,9 @@ async fn execute_plan(
                     "step {n}/{total} {kind}: {description} captured {} forwarding departures, minimum {min_samples}; no samples means the packet path was not exercised",
                     samples.len(),
                 );
+                let mut observed_service = Duration::ZERO;
+                let mut observed_egress_lateness = Duration::ZERO;
+                let mut observed_total = Duration::ZERO;
                 for sample in samples {
                     assert_eq!(
                         sample.total,
@@ -2273,22 +2409,22 @@ async fn execute_plan(
                             .saturating_add(sample.egress_lateness),
                         "step {n}/{total} {kind}: {description} forwarding latency did not decompose causally",
                     );
-                    assert!(
-                        sample.service <= *max_service,
-                        "step {n}/{total} {kind}: {description} forwarding service latency {:?} exceeded {max_service:?}",
-                        sample.service,
-                    );
-                    assert!(
-                        sample.egress_lateness <= *max_egress_lateness,
-                        "step {n}/{total} {kind}: {description} forwarding egress lateness {:?} exceeded {max_egress_lateness:?}",
-                        sample.egress_lateness,
-                    );
-                    assert!(
-                        sample.total <= *max_total,
-                        "step {n}/{total} {kind}: {description} total SFU forwarding latency {:?} exceeded {max_total:?}",
-                        sample.total,
-                    );
+                    observed_service = observed_service.max(sample.service);
+                    observed_egress_lateness = observed_egress_lateness.max(sample.egress_lateness);
+                    observed_total = observed_total.max(sample.total);
                 }
+                assert!(
+                    observed_service <= *max_service,
+                    "step {n}/{total} {kind}: {description} maximum forwarding service latency {observed_service:?} exceeded {max_service:?}",
+                );
+                assert!(
+                    observed_egress_lateness <= *max_egress_lateness,
+                    "step {n}/{total} {kind}: {description} maximum forwarding egress lateness {observed_egress_lateness:?} exceeded {max_egress_lateness:?}",
+                );
+                assert!(
+                    observed_total <= *max_total,
+                    "step {n}/{total} {kind}: {description} maximum total SFU forwarding latency {observed_total:?} exceeded {max_total:?}",
+                );
             }
 
             Step::CheckVideoNotReceivedFrom {
@@ -2339,6 +2475,32 @@ async fn execute_plan(
                 assert!(
                     actual >= *min_frames,
                     "step {n}/{total} {kind}: {description} ({participant} <- {publisher}): expected at least {min_frames} frames from participant_id {publisher_id}, got {actual}"
+                );
+            }
+
+            Step::CheckVideoReceivedFromInterval {
+                description,
+                participant,
+                publisher,
+                min_frames,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
+                );
+                let publisher_id = handles
+                    .get(publisher)
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
+                    .participant_id()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step \"{description}\": publisher {publisher} has no runtime participant id"
+                        )
+                    })?;
+                let handle = get_handle(handles, participant, description)?;
+                let actual = handle.video_frames_from_since_interval(&publisher_id);
+                assert!(
+                    actual >= *min_frames,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher}): expected at least {min_frames} frames from participant_id {publisher_id} in the last interval, got {actual}"
                 );
             }
 
@@ -2464,6 +2626,24 @@ async fn execute_plan(
                 assert!(
                     actual <= *max,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {max} keyframe (PLI) requests\n  actual:       {actual} (a climbing count means downstream cannot decode — PLI storm)"
+                );
+            }
+
+            Step::CheckKeyframeRequestsInterval {
+                description,
+                participant,
+                max,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, max {max})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let actual = handle
+                    .keyframe_requests()
+                    .saturating_sub(handle.interval_keyframe_requests_baseline);
+                assert!(
+                    actual <= *max,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {max} keyframe (PLI) requests during the last run\n  actual:       {actual}"
                 );
             }
 
@@ -2596,11 +2776,19 @@ async fn execute_plan(
                     audio.by_stream.len(),
                     audio.by_stream.keys().collect::<Vec<_>>()
                 );
+                assert_eq!(
+                    (audio.unexpected_packets, audio.wrong_content_packets,),
+                    (0, 0),
+                    "step {n}/{total} {kind}: {description} ({participant}) exact audio oracle failed: unexpected={}, wrong_content={}, quality={:?}",
+                    audio.unexpected_packets,
+                    audio.wrong_content_packets,
+                    audio.quality_by_publisher,
+                );
                 for (ssrc, stream) in &audio.by_stream {
                     assert!(
-                        stream.max_seq_gap <= MAX_CONCEALABLE_GAP,
+                        stream.max_timestamp_gap <= MAX_CONCEALABLE_GAP,
                         "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  stream:       {ssrc}\n  expected:     at most {MAX_CONCEALABLE_GAP} packets missing\n  actual:       a gap of {} packets\n  note:         this plan configures no loss, so a hole in a slot's stream is the\n                SFU splicing two speakers onto it badly",
-                        stream.max_seq_gap
+                        stream.max_timestamp_gap
                     );
                     assert_eq!(
                         stream.decoder_errors, 0,
@@ -3187,13 +3375,29 @@ fn assert_video_quality(
         log.ts_regression_count,
         log.non_contiguous,
     );
+    assert_eq!(
+        (
+            log.unexpected_frames,
+            log.wrong_origin_frames,
+            log.wrong_layer_frames,
+            log.wrong_content_frames,
+        ),
+        (0, 0, 0, 0),
+        "step {n}/{total} {kind}: {description} ({participant}) exact decoded-media oracle failed: unexpected={}, wrong_origin={}, wrong_layer={}, wrong_content={}",
+        log.unexpected_frames,
+        log.wrong_origin_frames,
+        log.wrong_layer_frames,
+        log.wrong_content_frames,
+    );
     assert!(
         log.undecodable_keyframes <= quality.max_undecodable_keyframes,
-        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} undecodable keyframes\n  actual:       frames={}, keyframes={}, undecodable_keyframes={}, ts_regression_count={}, non_contiguous={}",
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} undecodable keyframes\n  actual:       frames={}, keyframes={}, undecodable_keyframes={}, decoder_errors={}, damaged_frames={}, ts_regression_count={}, non_contiguous={}",
         quality.max_undecodable_keyframes,
         log.frames,
         log.keyframes,
         log.undecodable_keyframes,
+        log.decoder_errors,
+        log.damaged_frames,
         log.ts_regression_count,
         log.non_contiguous,
     );
@@ -3206,6 +3410,12 @@ fn assert_video_quality(
         log.undecodable_keyframes,
         log.ts_regression_count,
         log.non_contiguous,
+    );
+    assert!(
+        log.damaged_frames <= quality.max_damaged_frames,
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} network-damaged frames\n  actual:       {}",
+        quality.max_damaged_frames,
+        log.damaged_frames,
     );
     if let Some(max_latency) = quality.max_capture_to_decode_latency {
         assert_eq!(
@@ -3269,6 +3479,19 @@ fn assert_video_quality(
             }
         }
     }
+    if let Some(expected) = quality.exact_decoded_resolution {
+        assert!(
+            !log.quality_by_publisher.is_empty(),
+            "step {n}/{total} {kind}: {description} ({participant}) decoded no publisher output"
+        );
+        for (publisher, decoded) in &log.quality_by_publisher {
+            assert_eq!(
+                (decoded.decoded_width, decoded.decoded_height),
+                expected,
+                "step {n}/{total} {kind}: {description} ({participant}) decoded {publisher} at the wrong simulcast resolution"
+            );
+        }
+    }
     assert_video_frame_gap(
         n,
         total,
@@ -3300,7 +3523,8 @@ fn assert_video_frame_gap(
     let observed = stats.longest_frame_gap.max(terminal);
     assert!(
         observed <= maximum,
-        "step {n}/{total} {kind}: {description} ({participant}) had a {observed:?} decoded-frame gap, maximum {maximum:?}"
+        "step {n}/{total} {kind}: {description} ({participant}) had a {observed:?} decoded-frame gap, maximum {maximum:?} (between frames {:?}, terminal {terminal:?})",
+        stats.longest_frame_gap,
     );
 }
 
@@ -3841,12 +4065,13 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
     let offered = stats.delivered + stats.dropped_overflow;
     let capture_to_decode_latency = handle.video_rx().max_capture_to_decode_latency;
     out.push_str(&format!(
-        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} capture-to-decode={capture_to_decode_latency:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
+        " | qoe {} fps={:.1} key={} undecodable={} torn={} pli={} ttff={:?} capture-to-decode={capture_to_decode_latency:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
         qoe_now.frames,
         qoe_now.mean_fps,
         qoe_now.keyframes,
         qoe_now.undecodable_keyframes,
         qoe_now.torn_frames,
+        handle.keyframe_requests(),
         qoe_now.time_to_first_frame,
         qoe_now.longest_freeze,
         qoe_now.freeze_ratio * 100.0,
@@ -4182,14 +4407,10 @@ fn check_property(
 /// loss estimate on a link that drops nothing. Any BWE conclusion drawn in that environment is
 /// an artifact of the simulator.
 ///
-/// These profiles instead use a tight latency band, which is what a real path looks like:
-/// propagation delay is near-constant and jitter is small relative to it.
-///
-/// Note the jitter band must stay narrow even for "bad" networks. turmoil draws each message's
-/// latency *independently*, so a +/-15ms band reorders roughly 30 consecutive packets - far more
-/// than a real link, where packets queue in order behind one another. Measured against a 1% loss
-/// configuration that produced 17-51% apparent loss, because the receiver counts not-yet-arrived
-/// packets as lost. Model a worse network by raising latency and loss, not by widening jitter.
+/// These profiles use a fixed propagation delay. Turmoil samples every message independently, so
+/// even a narrow latency band reorders the small SPS/PPS packets at the front of a paced keyframe.
+/// Real path jitter is correlated by serialization and queues. Loss and explicit seeded reordering
+/// model those impairments without silently adding a second, unbounded reordering mechanism.
 ///
 /// Capacity, buffer depth and the loss model live in `pulsebeam_runtime::net::shaper`; turmoil
 /// itself has no notion of any of them.
@@ -4253,6 +4474,7 @@ pub const GRO_WINDOW: Duration = Duration::from_micros(100);
 pub struct FeedbackProfile {
     pub loss: Option<Loss>,
     pub reorder: Reorder,
+    pub duplicate: f64,
 }
 
 impl FeedbackProfile {
@@ -4261,6 +4483,7 @@ impl FeedbackProfile {
         Self {
             loss: Some(Loss::wifi()),
             reorder: Reorder::occasional(),
+            duplicate: 0.0005,
         }
     }
 
@@ -4269,6 +4492,7 @@ impl FeedbackProfile {
         Self {
             loss: Some(Loss::cellular()),
             reorder: Reorder::occasional(),
+            duplicate: 0.001,
         }
     }
 }
@@ -4278,7 +4502,7 @@ impl LinkProfile {
     pub fn fiber() -> Self {
         Self {
             min_latency: Duration::from_millis(5),
-            max_latency: Duration::from_millis(6),
+            max_latency: Duration::from_millis(5),
             loss: 0.0,
             bandwidth_bps: None,
             loss_model: None,
@@ -4292,8 +4516,8 @@ impl LinkProfile {
     /// Home Wi-Fi: a little more latency and jitter than wired, plus occasional loss.
     pub fn wifi() -> Self {
         Self {
-            min_latency: Duration::from_millis(8),
-            max_latency: Duration::from_millis(13),
+            min_latency: Duration::from_millis(10),
+            max_latency: Duration::from_millis(10),
             loss: 0.002,
             bandwidth_bps: None,
             loss_model: Some(Loss::wifi()),
@@ -4308,8 +4532,8 @@ impl LinkProfile {
     /// on why a wide band is not a realistic way to model a worse network).
     pub fn cellular() -> Self {
         Self {
-            min_latency: Duration::from_millis(45),
-            max_latency: Duration::from_millis(52),
+            min_latency: Duration::from_millis(48),
+            max_latency: Duration::from_millis(48),
             loss: 0.01,
             bandwidth_bps: None,
             loss_model: Some(Loss::cellular()),
@@ -4525,6 +4749,7 @@ impl LocalNodeSim {
                 pulsebeam_runtime::net::shaper::set_loss(server_ip, loss);
             }
             pulsebeam_runtime::net::shaper::set_reorder(server_ip, feedback.reorder);
+            pulsebeam_runtime::net::shaper::set_duplicate(server_ip, feedback.duplicate);
         }
 
         let mut ip_counter = 2u8;
@@ -4572,6 +4797,8 @@ impl LocalNodeSim {
                         interval_rx_baseline: 0,
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
+                        interval_video_by_publisher_baseline: BTreeMap::new(),
+                        interval_keyframe_requests_baseline: 0,
                         publishes_video: matches!(participant.role, Role::Publisher)
                             || participant.subscribes && !participant.rids.is_empty(),
                         publishes_audio: participant.audio_level_dbov.is_some(),

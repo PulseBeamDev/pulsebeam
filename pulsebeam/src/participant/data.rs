@@ -1,7 +1,14 @@
-use ahash::{HashMap, HashMapExt};
-use pulsebeam_rtc::ChannelId;
-
 use crate::track::{DataTopicChannel, DataTrackDirection, TrackSelector};
+use ahash::{HashMap, HashMapExt};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ChannelId(u16);
+
+impl ChannelId {
+    pub(crate) const fn new(value: u16) -> Self {
+        Self(value)
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum DataOpenError {

@@ -12,10 +12,9 @@ use str0m::{
 };
 
 use crate::{
-    CongestionEstimate, ConnectionId, DataChannelAssociation, EgressCongestion, ForwardedRtp, Gcc,
-    GccError, GccOutcome, IngressPacket, MediaSectionId, NegotiatedMediaSection, NegotiatedSession,
-    PacketError, PacketProvenance, PacketView, RtpPacketView, SendId, TransportMetadata,
-    TransportProtocol,
+    ConnectionId, DataChannelAssociation, EgressCongestion, Gcc, GccError, GccOutcome,
+    IngressPacket, NegotiatedSession, PacketError, PacketProvenance, PacketView, SendId,
+    TransportMetadata, TransportProtocol,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +26,7 @@ pub struct EgressDatagram {
 }
 
 const EGRESS_CAPACITY: usize = 256;
+const TIMEOUT_SETTLE_BUDGET: usize = 64;
 const DTLS_OUTPUT_BUDGET: usize = 64;
 
 impl EgressDatagram {
@@ -111,6 +111,11 @@ pub struct AuthenticatedPacket {
 }
 
 impl AuthenticatedPacket {
+    #[cfg(test)]
+    pub(crate) const fn for_test(bytes: Vec<u8>, provenance: PacketProvenance) -> Self {
+        Self { bytes, provenance }
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -121,6 +126,10 @@ impl AuthenticatedPacket {
 
     pub fn parse(&self) -> Result<PacketView<'_>, PacketError> {
         IngressPacket::new(&self.bytes, self.provenance).parse()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, PacketProvenance) {
+        (self.bytes, self.provenance)
     }
 }
 
@@ -169,6 +178,8 @@ pub struct LiveConnection {
     next_dtls_deadline: Option<Instant>,
     nominated: Option<TransportMetadata>,
     gcc: Gcc,
+    gcc_started: bool,
+    gcc_feedback_negotiated: bool,
     twcc_rx: Option<crate::gcc::TwccReceiver>,
     congestion: VecDeque<GccOutcome>,
 }
@@ -181,10 +192,25 @@ struct RtpReceiveIndex {
     replay_window: u64,
 }
 
-fn negotiated_twcc(session: &NegotiatedSession) -> bool {
+fn negotiated_twcc_receiver(session: &NegotiatedSession) -> bool {
     session.media_sections().iter().any(|section| {
-        section.direction() == crate::MediaDirection::ReceiveOnly
-            && section.codecs().iter().any(crate::Codec::transport_cc)
+        matches!(
+            section.direction(),
+            crate::MediaDirection::ReceiveOnly | crate::MediaDirection::Bidirectional
+        ) && section.codecs().iter().any(crate::Codec::transport_cc)
+            && section
+                .header_extensions()
+                .iter()
+                .any(|extension| extension.uri().contains("transport-wide-cc"))
+    })
+}
+
+fn negotiated_twcc_sender(session: &NegotiatedSession) -> bool {
+    session.media_sections().iter().any(|section| {
+        matches!(
+            section.direction(),
+            crate::MediaDirection::SendOnly | crate::MediaDirection::Bidirectional
+        ) && section.codecs().iter().any(crate::Codec::transport_cc)
             && section
                 .header_extensions()
                 .iter()
@@ -314,7 +340,11 @@ impl LiveConnection {
             .map(|parameters| {
                 DataChannelAssociation::new("pulsebeam", parameters.sctp_port(), now, 64, 64)
             });
-        let twcc_rx = negotiated_twcc(&session).then(|| crate::gcc::TwccReceiver::new(now));
+        let gcc_feedback_negotiated = negotiated_twcc_sender(&session);
+        let twcc_rx =
+            negotiated_twcc_receiver(&session).then(|| crate::gcc::TwccReceiver::new(now));
+        let gcc = Gcc::with_initial_bitrate(EGRESS_CAPACITY.saturating_mul(4), initial_bitrate_bps);
+        let congestion = VecDeque::with_capacity(64);
         Ok(Self {
             id,
             session,
@@ -331,9 +361,11 @@ impl LiveConnection {
             dtls_buf: vec![0; 2048].into_boxed_slice(),
             next_dtls_deadline: None,
             nominated: None,
-            gcc: Gcc::with_initial_bitrate(EGRESS_CAPACITY.saturating_mul(4), initial_bitrate_bps),
+            gcc,
+            gcc_started: false,
+            gcc_feedback_negotiated,
             twcc_rx,
-            congestion: VecDeque::with_capacity(64),
+            congestion,
         })
     }
 
@@ -345,22 +377,21 @@ impl LiveConnection {
         &self.session
     }
 
-    pub fn media_section(&self, id: MediaSectionId) -> Option<&NegotiatedMediaSection> {
-        self.session.media_section(id)
-    }
-
-    pub fn media_section_by_mid(&self, mid: &str) -> Option<&NegotiatedMediaSection> {
-        self.session.media_section_by_mid(mid)
-    }
-
     pub fn handle_timeout(&mut self, now: Instant) {
         self.ice.handle_timeout(now);
         if self
             .next_dtls_deadline
             .is_some_and(|deadline| now >= deadline)
         {
+            self.next_dtls_deadline = None;
             let _ = self.dtls.handle_timeout(now);
         }
+        if let Some(data) = self.data.as_mut()
+            && data.next_deadline().is_some_and(|deadline| now >= deadline)
+        {
+            data.handle_timeout(now);
+        }
+        self.drain(now);
         if let Some(outcome) = self.gcc.handle_timeout(now)
             && self.congestion.len() < self.congestion.capacity()
         {
@@ -368,6 +399,59 @@ impl LiveConnection {
         }
         self.emit_twcc_feedback(now);
         self.drive_data(now);
+        for _ in 0..TIMEOUT_SETTLE_BUDGET {
+            let dtls_due = self
+                .next_dtls_deadline
+                .is_some_and(|deadline| deadline <= now);
+            let data_due = self
+                .data
+                .as_ref()
+                .and_then(DataChannelAssociation::next_deadline)
+                .is_some_and(|deadline| deadline <= now);
+            if !dtls_due && !data_due {
+                break;
+            }
+            if dtls_due {
+                self.next_dtls_deadline = None;
+                let _ = self.dtls.handle_timeout(now);
+            }
+            if data_due && let Some(data) = self.data.as_mut() {
+                data.handle_timeout(now);
+            }
+            self.drain(now);
+            self.drive_data(now);
+        }
+        debug_assert!(
+            self.ice
+                .poll_timeout()
+                .is_none_or(|deadline| deadline > now),
+            "ICE timeout advances after handling"
+        );
+        debug_assert!(
+            self.next_dtls_deadline
+                .is_none_or(|deadline| deadline > now),
+            "DTLS timeout advances after handling"
+        );
+        debug_assert!(
+            self.data
+                .as_ref()
+                .and_then(DataChannelAssociation::next_deadline)
+                .is_none_or(|deadline| deadline > now),
+            "SCTP timeout advances after handling"
+        );
+        debug_assert!(
+            self.gcc
+                .next_deadline(now)
+                .is_none_or(|deadline| deadline > now),
+            "GCC timeout advances after handling"
+        );
+        debug_assert!(
+            self.twcc_rx
+                .as_ref()
+                .and_then(crate::gcc::TwccReceiver::next_deadline)
+                .is_none_or(|deadline| deadline > now),
+            "TWCC timeout advances after handling"
+        );
     }
 
     pub fn handle_datagram(
@@ -419,7 +503,7 @@ impl LiveConnection {
         Err(LiveConnectionError::UnsupportedDatagram)
     }
 
-    pub fn next_deadline(&mut self) -> Option<Instant> {
+    pub fn next_deadline(&mut self, now: Instant) -> Option<Instant> {
         let mut deadline = self.ice.poll_timeout();
         if let Some(dtls) = self.next_dtls_deadline {
             deadline = Some(deadline.map_or(dtls, |current| current.min(dtls)));
@@ -431,7 +515,7 @@ impl LiveConnection {
         {
             deadline = Some(deadline.map_or(data, |current| current.min(data)));
         }
-        if let Some(gcc) = self.gcc.next_deadline() {
+        if let Some(gcc) = self.gcc.next_deadline(now) {
             deadline = Some(deadline.map_or(gcc, |current| current.min(gcc)));
         }
         if let Some(twcc) = self
@@ -460,8 +544,32 @@ impl LiveConnection {
         self.authenticated.pop_front()
     }
 
-    pub fn congestion_estimate(&self, now: Instant) -> CongestionEstimate {
-        self.gcc.estimate(now)
+    pub fn set_max_total_allocated_bitrate(
+        &mut self,
+        now: Instant,
+        bitrate_bps: u64,
+    ) -> Option<GccOutcome> {
+        self.gcc.set_max_total_allocated_bitrate(bitrate_bps);
+        if bitrate_bps > 0 && self.gcc_feedback_negotiated && !self.gcc_started {
+            self.gcc_started = true;
+            return Some(self.gcc.start(now));
+        }
+        None
+    }
+
+    pub(crate) fn request_maintenance_probe(
+        &mut self,
+        now: Instant,
+        bitrate_bps: u64,
+    ) -> Option<GccOutcome> {
+        if bitrate_bps == 0 || !self.gcc_feedback_negotiated || !self.gcc_started {
+            return None;
+        }
+        self.gcc.maintenance_probe(now, bitrate_bps)
+    }
+
+    pub(crate) fn media_egress_ready(&self) -> bool {
+        self.srtp_tx.is_some() && self.nominated.is_some() && self.egress_ready()
     }
 
     pub fn poll_congestion(&mut self) -> Option<GccOutcome> {
@@ -477,43 +585,24 @@ impl LiveConnection {
         Ok(())
     }
 
-    pub fn observe_rtp(
+    pub(crate) fn observe_transport_sequence(
         &mut self,
-        section_id: MediaSectionId,
-        packet: &RtpPacketView<'_>,
-    ) -> Result<(), PacketError> {
+        sequence: u16,
+        received_at: Instant,
+        ssrc: u32,
+    ) {
         let Some(receiver) = self.twcc_rx.as_mut() else {
-            return Ok(());
+            return;
         };
-        let Some(section) = self.session.media_section(section_id) else {
-            debug_assert!(
-                false,
-                "registered receive streams retain negotiated media sections"
-            );
-            return Ok(());
-        };
-        let transport_cc = section
-            .codecs()
-            .iter()
-            .any(|codec| codec.payload_type() == packet.payload_type() && codec.transport_cc());
-        if !transport_cc {
-            return Ok(());
-        }
-        let Some(extension) = section
-            .header_extensions()
-            .iter()
-            .find(|extension| extension.uri().contains("transport-wide-cc"))
-        else {
-            return Ok(());
-        };
-        let Some(value) = packet.header_extension(section, extension.id())? else {
-            return Ok(());
-        };
-        let Some(sequence) = value.value().try_into().ok().map(u16::from_be_bytes) else {
-            return Ok(());
-        };
-        receiver.observe(sequence, packet.provenance().received_at(), packet.ssrc());
-        Ok(())
+        receiver.observe(sequence, received_at, ssrc);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_feedback_for_test(&mut self, now: Instant) -> Option<Vec<u8>> {
+        self.twcc_rx
+            .as_mut()?
+            .build_feedback(now, 1)
+            .map(ToOwned::to_owned)
     }
 
     pub fn data_association(&mut self) -> Option<&mut DataChannelAssociation> {
@@ -625,23 +714,20 @@ impl LiveConnection {
         self.push_protected_egress(encrypted, None, false)
     }
 
-    pub fn send_rtp_with_congestion(
-        &mut self,
-        bytes: &[u8],
-        extended_sequence: u64,
-        send_id: SendId,
-    ) -> Result<EgressCongestion, LiveConnectionError> {
-        let congestion = self.gcc.assign(send_id, bytes.len())?;
-        self.send_rtp_with_assigned_congestion(bytes, extended_sequence, send_id)?;
-        Ok(congestion)
-    }
-
     pub fn assign_congestion(
         &mut self,
         send_id: SendId,
         bytes: usize,
+        probe_id: Option<u32>,
     ) -> Result<EgressCongestion, LiveConnectionError> {
-        Ok(self.gcc.assign(send_id, bytes)?)
+        match probe_id {
+            Some(probe_id) => Ok(self.gcc.assign_probe(send_id, bytes, probe_id)?),
+            None => Ok(self.gcc.assign(send_id, bytes)?),
+        }
+    }
+
+    pub fn complete_probe(&mut self, probe_id: u32) {
+        self.gcc.complete_probe(probe_id);
     }
 
     pub fn send_rtp_with_assigned_congestion(
@@ -659,26 +745,6 @@ impl LiveConnection {
             .protect_rtp(bytes, &header, extended_sequence);
         self.push_protected_egress(encrypted, Some(send_id), true)?;
         Ok(())
-    }
-
-    pub fn send_rtp_with_departure_id(
-        &mut self,
-        bytes: &[u8],
-        extended_sequence: u64,
-        send_id: SendId,
-    ) -> Result<(), LiveConnectionError> {
-        let header = RtpHeader::parse(bytes, &ExtensionMap::empty())
-            .ok_or(LiveConnectionError::RtpHeader)?;
-        let encrypted = self
-            .srtp_tx
-            .as_mut()
-            .ok_or(LiveConnectionError::CryptoNotReady)?
-            .protect_rtp(bytes, &header, extended_sequence);
-        self.push_protected_egress(encrypted, Some(send_id), false)
-    }
-
-    pub fn send_forwarded_rtp(&mut self, packet: &ForwardedRtp) -> Result<(), LiveConnectionError> {
-        self.send_rtp(packet.bytes(), packet.extended_sequence())
     }
 
     pub fn send_rtcp(&mut self, bytes: &[u8]) -> Result<(), LiveConnectionError> {
@@ -880,6 +946,10 @@ mod tests {
     }
 
     fn connection(now: Instant) -> LiveConnection {
+        connection_from_offer(now, &offer())
+    }
+
+    fn connection_from_offer(now: Instant, offer: &str) -> LiveConnection {
         let local = LocalTransport::generate(
             IceCredentials::new("localufrag".to_owned(), "localpassword".to_owned())
                 .expect("valid local credentials"),
@@ -894,7 +964,7 @@ mod tests {
             local.fingerprint().clone(),
             Box::new([candidate]),
         );
-        let session = negotiate(&offer(), &server)
+        let session = negotiate(offer, &server)
             .expect("negotiated session")
             .session()
             .clone();
@@ -949,14 +1019,61 @@ mod tests {
     }
 
     #[test]
+    fn transport_wide_feedback_observes_rtx_padding_without_a_media_route() {
+        let now = Instant::now();
+        let offer = offer()
+            .replace(
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+                "m=video 9 UDP/TLS/RTP/SAVPF 96 97",
+            )
+            .replace("a=rtpmap:111 opus/48000/2", "a=rtpmap:96 H264/90000")
+            + "a=rtpmap:97 rtx/90000\r\n\
+               a=fmtp:97 apt=96\r\n\
+               a=rtcp-fb:96 transport-cc\r\n\
+               a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n";
+        let mut connection = connection_from_offer(now, &offer);
+        let bytes = [
+            0xb0, 97, 0, 7, 0, 0, 0, 9, 0, 0, 0, 10, 0xbe, 0xde, 0, 1, 0x41, 0x12, 0x34, 0, 4, 0,
+            0, 4,
+        ];
+        let packet = IngressPacket::new(&bytes, provenance(now))
+            .parse()
+            .expect("valid RTP");
+        let PacketView::Rtp(rtp) = packet else {
+            panic!("RTP packet");
+        };
+
+        connection.observe_transport_sequence(0x1234, now, rtp.ssrc());
+        let feedback = connection
+            .twcc_rx
+            .as_mut()
+            .expect("negotiated TWCC receiver")
+            .build_feedback(now + std::time::Duration::from_millis(100), 1)
+            .expect("feedback for an unrouted probe packet")
+            .to_owned();
+        let packet = IngressPacket::new(&feedback, provenance(now))
+            .parse()
+            .expect("valid RTCP");
+        let PacketView::Rtcp(rtcp) = packet else {
+            panic!("RTCP packet");
+        };
+        let reports = crate::gcc::parse_twcc(&rtcp).expect("valid TWCC");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].statuses().len(), 1);
+        assert_eq!(reports[0].statuses()[0].sequence(), 0x1234);
+        assert!(reports[0].statuses()[0].received_at().is_some());
+    }
+
+    #[test]
     fn live_transport_reports_its_only_idle_work_as_a_deadline() {
         let now = Instant::now();
         let mut connection = connection(now);
 
-        assert!(connection.next_deadline().is_none());
+        assert!(connection.next_deadline(now).is_none());
         connection.handle_timeout(now);
         let deadline = connection
-            .next_deadline()
+            .next_deadline(now)
             .expect("ICE deadline after activation");
         debug_assert!(deadline >= now);
         assert_eq!(connection.poll_event(), Some(TransportEvent::IceChecking));

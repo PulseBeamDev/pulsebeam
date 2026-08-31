@@ -550,7 +550,7 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn tick(&mut self, now: Instant) {
+    fn tick(&mut self, mut now: Instant) {
         // phase 1: input
         let mut commands: usize = 0;
         for _ in 0..SHARD_COMMAND_BUDGET {
@@ -575,6 +575,20 @@ impl ShardWorker {
         if self.core.apply_updates(SHARD_UPDATE_OP_BUDGET) >= SHARD_UPDATE_OP_BUDGET {
             self.tick_budget_hit("shard_update");
         }
+        self.core.fire_timers(now);
+        if self.core.poll_and_flush_dirty(
+            now,
+            &mut self.udp_socket,
+            &mut self.tcp_socket,
+            SHARD_PARTICIPANT_BUDGET,
+        ) == SHARD_PARTICIPANT_BUDGET
+        {
+            self.tick_budget_hit("participants");
+        }
+        let after_first_flush = Instant::now();
+        debug_assert!(after_first_flush >= now);
+        now = after_first_flush;
+        let _ = self.core.flush_cached_replays(now, &self.router);
         let mut frames: usize = 0;
         self.frame_batch.clear();
         for _ in 0..SHARD_FRAME_BUDGET {
@@ -589,8 +603,6 @@ impl ShardWorker {
         if frames == SHARD_FRAME_BUDGET {
             self.tick_budget_hit("frames");
         }
-        self.core.fire_timers(now);
-
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
         let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
         let received = self.recv_batch.len();
@@ -604,22 +616,16 @@ impl ShardWorker {
             self.tick_budget_hit("udp");
         }
 
-        if self.core.poll_and_flush_dirty(
-            now,
-            &mut self.udp_socket,
-            &mut self.tcp_socket,
-            SHARD_PARTICIPANT_BUDGET,
-        ) == SHARD_PARTICIPANT_BUDGET
-        {
-            self.tick_budget_hit("participants");
-        }
         if self
             .core
-            .flush_stream_buffers(&self.router, SHARD_PIPELINE_BUDGET)
+            .flush_stream_buffers(now, &self.router, SHARD_PIPELINE_BUDGET)
             == SHARD_PIPELINE_BUDGET
         {
             self.tick_budget_hit("pipeline");
         }
+        let after_io = Instant::now();
+        debug_assert!(after_io >= now);
+        now = after_io;
         if self.core.poll_and_flush_dirty(
             now,
             &mut self.udp_socket,

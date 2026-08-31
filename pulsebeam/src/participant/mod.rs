@@ -7,7 +7,6 @@ pub(crate) mod downstream;
 pub mod effect;
 pub(crate) mod event;
 pub(crate) mod intent;
-mod pacer;
 pub mod packet;
 pub(crate) mod reverse;
 mod signaling;
@@ -19,15 +18,14 @@ use tokio::time::Instant;
 
 pub use direct_core::{DirectParticipantCore as ParticipantCore, DisconnectReason};
 pub use effect::ParticipantEffect;
-pub use packet::{RoutedTrackPacket, TrackPacket, TrackPacketRef};
+pub use packet::{ForwardPacket, RoutedTrackPacket, TrackPacket, TrackPacketRef};
 
 pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: crate::entity::RoomId,
     pub participant_id: crate::entity::ParticipantId,
-    pub connection_id: pulsebeam_rtc::ConnectionId,
-    pub session: pulsebeam_rtc::NegotiatedSession,
-    pub local: pulsebeam_rtc::LocalTransport,
+    pub peer: pulsebeam_rtc::RtcPeer,
+    pub media: Box<[pulsebeam_rtc::NegotiatedMedia]>,
 }
 
 impl std::fmt::Debug for ParticipantConfig {
@@ -37,8 +35,8 @@ impl std::fmt::Debug for ParticipantConfig {
             .field("manual_sub", &self.manual_sub)
             .field("room_id", &self.room_id)
             .field("participant_id", &self.participant_id)
-            .field("connection_id", &self.connection_id)
-            .field("session", &self.session)
+            .field("rtc_state", &self.peer.state())
+            .field("media", &self.media)
             .finish_non_exhaustive()
     }
 }
@@ -50,6 +48,7 @@ pub(crate) enum ParticipantInput<'a> {
     },
     Timeout(Instant),
     Track {
+        now: Instant,
         key: TrackKey,
         packet: TrackPacketRef<'a>,
         cache: Option<&'a TrackStreamCache>,

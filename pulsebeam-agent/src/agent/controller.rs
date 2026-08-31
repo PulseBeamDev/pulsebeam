@@ -10,7 +10,6 @@ const BWE_DEFAULT: Bitrate = Bitrate::kbps(500);
 const DEBT_LINGER_THRESHOLD: f64 = 0.10;
 const DEBT_LINGER_MAX_TICKS: u32 = 5;
 const DEBT_IMMEDIATE_THRESHOLD: f64 = 0.25;
-const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
 fn layer_seed_bps(rid: Option<Rid>) -> f64 {
     match LayerQuality::from_rid(rid.as_ref().map(|r| r.as_ref())) {
@@ -214,7 +213,6 @@ impl BitrateController {
 
 pub struct LayerController {
     available_bps: f64,
-    last_keyframe_request: HashMap<(Mid, Option<Rid>), Instant>,
     order: Vec<(Mid, Option<Rid>)>,
     states: HashMap<(Mid, Option<Rid>), LayerState>,
     notifiers: HashMap<(Mid, Option<Rid>), KeyframeNotifier>,
@@ -233,7 +231,6 @@ impl LayerController {
             // No estimate yet: unlimited. Infinity rather than MAX so the
             // check below is `is_infinite()` and not a float equality.
             available_bps: f64::INFINITY,
-            last_keyframe_request: HashMap::new(),
             order: Vec::new(),
             states: HashMap::new(),
             notifiers: HashMap::new(),
@@ -281,9 +278,6 @@ impl LayerController {
             if let Some(notifier) = self.notifiers.remove(&old_key) {
                 self.notifiers.insert(new_key, notifier);
             }
-            if let Some(last_request) = self.last_keyframe_request.remove(&old_key) {
-                self.last_keyframe_request.insert(new_key, last_request);
-            }
         }
     }
 
@@ -301,6 +295,10 @@ impl LayerController {
 
     fn refresh_bitrate_estimates(&mut self, now: Instant) {
         for s in self.states.values_mut() {
+            if s.paused {
+                debug_assert!(s.bps > 0.0);
+                continue;
+            }
             s.estimate.poll(now);
             s.bps = s.estimate.estimate_bps();
         }
@@ -310,19 +308,7 @@ impl LayerController {
         self.states.get(&(mid, rid)).is_some_and(|s| s.paused)
     }
 
-    pub fn request_keyframe(&mut self, mid: Mid, rid: Option<Rid>, kind: KeyframeRequestKind) {
-        if kind == KeyframeRequestKind::Pli {
-            let key = (mid, rid);
-            let now = Instant::now();
-            if let Some(last) = self.last_keyframe_request.get(&key)
-                && now.duration_since(*last) < KEYFRAME_REQUEST_THROTTLE
-            {
-                tracing::debug!(mid = ?mid, rid = ?rid, "throttling repeated PLI");
-                return;
-            }
-            self.last_keyframe_request.insert(key, now);
-        }
-
+    pub fn request_keyframe(&mut self, mid: Mid, rid: Option<Rid>, _kind: KeyframeRequestKind) {
         if let Some(n) = self.notifiers.get(&(mid, rid)) {
             n.notify();
         }
@@ -370,7 +356,15 @@ impl LayerController {
                 .order
                 .iter()
                 .rev()
-                .find(|k| self.states.get(*k).is_some_and(|s| !s.paused) && k.1.is_some())
+                .find(|k| {
+                    self.states.get(*k).is_some_and(|s| !s.paused)
+                        && k.1.is_some()
+                        && self.order.iter().any(|other| {
+                            other.0 == k.0
+                                && other != *k
+                                && self.states.get(other).is_some_and(|s| !s.paused)
+                        })
+                })
                 .cloned()
             {
                 if let Some(s) = self.states.get_mut(&key) {
@@ -398,7 +392,9 @@ impl LayerController {
             if let Some(key) = candidate {
                 if let Some(s) = self.states.get_mut(&key) {
                     debug_assert!(s.paused);
+                    debug_assert!(s.bps > 0.0);
                     s.paused = false;
+                    s.estimate = BitrateEstimate::new_with_seed(s.bps);
                 }
                 if let Some(n) = self.notifiers.get(&key) {
                     n.notify();
@@ -408,5 +404,59 @@ impl LayerController {
         }
 
         desired
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_layer_retains_a_restart_cost_and_resumes_after_a_long_pause() {
+        let start = Instant::now();
+        let mid = Mid::from("video");
+        let low = Some(Rid::from("q"));
+        let high = Some(Rid::from("f"));
+        let (low_notifier, _) = KeyframeNotifier::pair();
+        let (high_notifier, _) = KeyframeNotifier::pair();
+        let mut controller = LayerController::new();
+        controller.register(mid, low, low_notifier);
+        controller.register(mid, high, high_notifier);
+
+        controller.update_available(Bitrate::mbps(2));
+        controller.tick(start);
+        controller.tick(start + Duration::from_millis(200));
+        assert!(!controller.is_paused(mid, low));
+        assert!(!controller.is_paused(mid, high));
+
+        controller.update_available(Bitrate::kbps(100));
+        controller.tick(start + Duration::from_millis(400));
+        assert!(!controller.is_paused(mid, low));
+        assert!(controller.is_paused(mid, high));
+
+        controller.tick(start + Duration::from_secs(30));
+        controller.update_available(Bitrate::mbps(2));
+        controller.tick(start + Duration::from_secs(31));
+
+        assert!(!controller.is_paused(mid, high));
+    }
+
+    #[test]
+    fn a_single_encoding_mid_is_never_paused() {
+        let start = Instant::now();
+        let mid = Mid::from("screen");
+        let rid = Some(Rid::from("f"));
+        let (notifier, _) = KeyframeNotifier::pair();
+        let mut controller = LayerController::new();
+        controller.register(mid, rid, notifier);
+
+        controller.update_available(Bitrate::mbps(2));
+        controller.tick(start);
+        controller.update_available(Bitrate::kbps(100));
+        for tick in 1..=10 {
+            controller.tick(start + Duration::from_millis(tick * 200));
+        }
+
+        assert!(!controller.is_paused(mid, rid));
     }
 }

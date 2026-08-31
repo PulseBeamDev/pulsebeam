@@ -639,10 +639,19 @@ fn reconnection_recovery_test() {
                 description: "Recovery period",
                 duration: Duration::from_secs(20),
             },
-            Step::CheckVideoQuality {
+            Step::CheckVideoQualityInterval {
                 description: "Bob receives renderable video after Alice reconnects",
                 participant: "bob",
                 quality: VideoQuality::min_frames(100).allow_gaps(1),
+            },
+            Step::Run {
+                description: "Settled recovery window",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Recovered video stays clean",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100),
             },
         ]);
 }

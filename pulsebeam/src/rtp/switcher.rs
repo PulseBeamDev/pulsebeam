@@ -210,7 +210,7 @@ impl Switcher {
         track_id: TrackId,
         cache: &TrackStreamCache,
         now: Instant,
-        emit: &mut impl FnMut(RtpPacket),
+        emit: &mut impl FnMut(RtpPacket, bool),
     ) {
         if let Some(active) = self.active.filter(|s| s.0 == track_id)
             && let Some(encoding) = cache.encoding(crate::track::packet_encoding(active.1))
@@ -265,7 +265,7 @@ impl Switcher {
     /// Hot path: `range_after` yields the single just-arrived packet in the
     /// common case (O(1)), and the O(holes) backfill runs only on the rare
     /// reorder event where the forward pass produced nothing.
-    fn pull_active(&mut self, cache: &StreamCache, emit: &mut impl FnMut(RtpPacket)) {
+    fn pull_active(&mut self, cache: &StreamCache, emit: &mut impl FnMut(RtpPacket, bool)) {
         let mut forwarded_any = false;
 
         if let Some(cursor) = self.active_cursor {
@@ -321,7 +321,7 @@ impl Switcher {
                             let mut out = pkt.clone();
                             self.timeline.rewrite(&mut out);
                             self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
-                            emit(out);
+                            emit(out, false);
                         }
                     }
                 }
@@ -359,7 +359,11 @@ impl Switcher {
     /// Gaps are tracked in the stream's own input space and reset on every
     /// switch, so the cache lookup is unambiguous — it can only return this
     /// stream's packet, never a stale one an earlier stream left on the layer.
-    fn backfill_active_holes(&mut self, cache: &StreamCache, emit: &mut impl FnMut(RtpPacket)) {
+    fn backfill_active_holes(
+        &mut self,
+        cache: &StreamCache,
+        emit: &mut impl FnMut(RtpPacket, bool),
+    ) {
         if self.active_input_holes.is_empty() {
             return;
         }
@@ -372,7 +376,7 @@ impl Switcher {
             self.timeline.rewrite(&mut out);
             self.active_input_holes.remove(&input_seq);
             self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
-            emit(out);
+            emit(out, false);
         }
     }
 
@@ -381,18 +385,22 @@ impl Switcher {
     /// Waits for a clean frame boundary on the active stream, then replays the
     /// staged stream's keyframe segment onto a fresh, contiguous output sequence
     /// and promotes it to active. The old active stream begins draining.
-    fn try_switch(&mut self, cache: &StreamCache, now: Instant, emit: &mut impl FnMut(RtpPacket)) {
-        if !self.may_switch_now(now) {
-            return;
-        }
+    fn try_switch(
+        &mut self,
+        cache: &StreamCache,
+        now: Instant,
+        emit: &mut impl FnMut(RtpPacket, bool),
+    ) {
         let Some(packets) = cache.replay() else {
             // Not decodable from here yet; the slot's PLI retry keeps probing.
             return;
         };
+        if !self.may_switch_now(now) {
+            return;
+        }
         let Some(new_cursor) = packets.last().map(|p| p.seq_no) else {
             return;
         };
-
         // If the previously emitted output frame was left open — whether the old
         // stream is now being drained or the slot was merely paused since — burn
         // one output sequence number so the burst does not continue that frame
@@ -438,7 +446,7 @@ impl Switcher {
             }
             self.timeline.rewrite_sequential(&mut pkt);
             self.note_emitted(pkt.seq_no, pkt.marker, pkt.rtp_ts.numer());
-            emit(pkt);
+            emit(pkt, true);
         }
 
         // Realign so the stream's next live packet (new_cursor + 1) continues
@@ -477,7 +485,12 @@ impl Switcher {
     /// A straggler that fills a hole has a sequence number *below* the point the
     /// slot had reached on that stream, so it is looked up by the hole it fills
     /// rather than pulled from a cursor — a cursor only ever moves forward.
-    fn drain_tail(&mut self, cache: &StreamCache, now: Instant, emit: &mut impl FnMut(RtpPacket)) {
+    fn drain_tail(
+        &mut self,
+        cache: &StreamCache,
+        now: Instant,
+        emit: &mut impl FnMut(RtpPacket, bool),
+    ) {
         let Some(tail) = self.tail.as_ref() else {
             self.draining = None;
             return;
@@ -502,7 +515,7 @@ impl Switcher {
                 pkt.rtp_ts.numer().wrapping_add(ts_base),
                 pkt.rtp_ts.frequency(),
             );
-            emit(out);
+            emit(out, false);
             if let Some(tail) = self.tail.as_mut() {
                 tail.holes.remove(&output_seq);
             }
@@ -657,7 +670,7 @@ mod test {
             p.extensions.rid = crate::track::packet_encoding(stream.1);
             let now = p.arrival_ts;
             cache.push(p);
-            switcher.feed(stream.0, cache, now, &mut |o| out.push(o));
+            switcher.feed(stream.0, cache, now, &mut |o, _| out.push(o));
         }
     }
 
@@ -688,6 +701,35 @@ mod test {
         ingest(&mut switcher, q, &mut cache, &delta, &mut out);
         let live_first = *out[out.len() - delta.len()].seq_no;
         assert_eq!(live_first, burst_last + 1, "live continues from the burst");
+    }
+
+    #[test]
+    fn cached_keyframe_activates_a_quiet_source_immediately() {
+        let (q, _) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
+        let mut cache = TrackStreamCache::new();
+        let mut b = builder(1);
+        let stale = b.keyframe(2);
+        let stale_at = stale
+            .last()
+            .map_or_else(Instant::now, |packet| packet.arrival_ts);
+        for mut packet in stale {
+            packet.extensions.rid = crate::track::packet_encoding(q.1);
+            cache.push(packet);
+        }
+        let mut out = Vec::new();
+        switcher.switch_to(q);
+
+        switcher.feed(
+            q.0,
+            &cache,
+            stale_at + Duration::from_secs(60),
+            &mut |packet, _| out.push(packet),
+        );
+
+        assert!(!out.is_empty());
+        assert_eq!(switcher.active_stream(), Some(q));
+        assert!(!switcher.awaiting_switch());
     }
 
     #[test]

@@ -169,6 +169,22 @@ struct HeaderExtensionLocation {
     data: Range<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RtpExtensionEntry {
+    id: u8,
+    value: Range<usize>,
+}
+
+impl RtpExtensionEntry {
+    pub(crate) const fn id(&self) -> u8 {
+        self.id
+    }
+
+    pub(crate) fn value(&self) -> Range<usize> {
+        self.value.clone()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RtpPacketView<'a> {
     bytes: &'a [u8],
@@ -275,6 +291,25 @@ impl<'a> RtpPacketView<'a> {
     pub fn payload(&self) -> &'a [u8] {
         debug_assert!(self.payload.end <= self.bytes.len());
         &self.bytes[self.payload.clone()]
+    }
+
+    pub(crate) fn payload_range(&self) -> Range<usize> {
+        self.payload.clone()
+    }
+
+    pub(crate) fn extension_entries(&self) -> Result<Box<[RtpExtensionEntry]>, PacketError> {
+        let Some(location) = self.extension.as_ref() else {
+            return Ok(Box::new([]));
+        };
+        let data = self
+            .bytes
+            .get(location.data.clone())
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        match location.profile {
+            0xbede => one_byte_extension_entries(data, location.data.start),
+            0x1000..=0x10ff => two_byte_extension_entries(data, location.data.start),
+            _ => Ok(Box::new([])),
+        }
     }
 
     pub fn marker(&self) -> bool {
@@ -453,6 +488,73 @@ fn two_byte_extension(
         }
     }
     Ok(None)
+}
+
+fn one_byte_extension_entries(
+    data: &[u8],
+    base: usize,
+) -> Result<Box<[RtpExtensionEntry]>, PacketError> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let entry = *data.get(offset).ok_or(PacketError::InvalidRtpExtension)?;
+        offset = offset
+            .checked_add(1)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if entry == 0 {
+            continue;
+        }
+        let id = entry >> 4;
+        if id == 15 {
+            break;
+        }
+        let length = usize::from((entry & 0x0f).saturating_add(1));
+        let end = offset
+            .checked_add(length)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if data.get(offset..end).is_none() {
+            return Err(PacketError::InvalidRtpExtension);
+        }
+        entries.push(RtpExtensionEntry {
+            id,
+            value: base.saturating_add(offset)..base.saturating_add(end),
+        });
+        offset = end;
+    }
+    Ok(entries.into_boxed_slice())
+}
+
+fn two_byte_extension_entries(
+    data: &[u8],
+    base: usize,
+) -> Result<Box<[RtpExtensionEntry]>, PacketError> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let id = *data.get(offset).ok_or(PacketError::InvalidRtpExtension)?;
+        offset = offset
+            .checked_add(1)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if id == 0 {
+            continue;
+        }
+        let length = usize::from(*data.get(offset).ok_or(PacketError::InvalidRtpExtension)?);
+        offset = offset
+            .checked_add(1)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(PacketError::InvalidRtpExtension)?;
+        if data.get(offset..end).is_none() {
+            return Err(PacketError::InvalidRtpExtension);
+        }
+        entries.push(RtpExtensionEntry {
+            id,
+            value: base.saturating_add(offset)..base.saturating_add(end),
+        });
+        offset = end;
+    }
+    Ok(entries.into_boxed_slice())
 }
 
 #[allow(

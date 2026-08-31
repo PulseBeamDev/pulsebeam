@@ -179,9 +179,13 @@ impl DataChannelAssociation {
         event_capacity: usize,
         egress_capacity: usize,
     ) -> Self {
-        let mut options = Options::default();
-        options.local_port = port;
-        options.remote_port = port;
+        debug_assert!(event_capacity > 0, "data event capacity must be nonzero");
+        debug_assert!(egress_capacity > 0, "SCTP egress capacity must be nonzero");
+        let options = Options {
+            local_port: port,
+            remote_port: port,
+            ..Default::default()
+        };
         let socket = ShardSctpSocket(dcsctp::new_socket(name, &options));
         Self {
             socket,
@@ -228,6 +232,9 @@ impl DataChannelAssociation {
         if self.channels.contains_key(&open.id) {
             return Err(DataChannelError::DuplicateChannel(open.id));
         }
+        if !self.events_ready() {
+            return Err(DataChannelError::EgressFull);
+        }
         let payload = encode_open(&open)?;
         self.socket
             .send(
@@ -268,6 +275,9 @@ impl DataChannelAssociation {
     }
 
     pub fn close(&mut self, id: ChannelId) -> Result<(), DataChannelError> {
+        if !self.events_ready() {
+            return Err(DataChannelError::EgressFull);
+        }
         if self.channels.remove(&id).is_none() {
             return Err(DataChannelError::UnknownChannel(id));
         }
@@ -276,15 +286,23 @@ impl DataChannelAssociation {
     }
 
     pub fn poll_event(&mut self) -> Option<DataChannelEvent> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.drain();
+        Some(event)
     }
 
     pub fn poll_egress(&mut self) -> Option<Vec<u8>> {
-        self.egress.pop_front()
+        let packet = self.egress.pop_front()?;
+        self.drain();
+        Some(packet)
     }
 
     pub fn egress_ready(&self) -> bool {
         self.egress.len() < self.egress_capacity
+    }
+
+    fn events_ready(&self) -> bool {
+        self.events.len() < self.event_capacity
     }
 
     #[allow(
@@ -298,14 +316,16 @@ impl DataChannelAssociation {
 
     fn drain(&mut self) {
         for _ in 0..MAX_WORK_PER_TICK {
+            if !self.egress_ready() || !self.events_ready() {
+                break;
+            }
             let Some(event) = self.socket.poll_event() else {
                 break;
             };
             match event {
                 SocketEvent::SendPacket(packet) => {
-                    if self.egress_ready() {
-                        self.egress.push_back(packet);
-                    }
+                    debug_assert!(self.egress_ready(), "SCTP packet requires queue capacity");
+                    self.egress.push_back(packet);
                 }
                 SocketEvent::OnConnected() => {
                     self.push_event(DataChannelEvent::AssociationConnected);
@@ -317,7 +337,8 @@ impl DataChannelAssociation {
                     self.push_event(DataChannelEvent::Error);
                 }
                 SocketEvent::OnIncomingStreamReset(streams) => {
-                    for stream in streams.into_iter().take(MAX_WORK_PER_TICK) {
+                    let available = self.event_capacity.saturating_sub(self.events.len());
+                    for stream in streams.into_iter().take(MAX_WORK_PER_TICK.min(available)) {
                         let id = ChannelId::new(stream.0);
                         if self.channels.remove(&id).is_some() {
                             self.push_event(DataChannelEvent::Close(id));
@@ -328,6 +349,9 @@ impl DataChannelAssociation {
             }
         }
         for _ in 0..MAX_WORK_PER_TICK {
+            if !self.events_ready() {
+                break;
+            }
             let Some(message) = self.socket.get_next_message() else {
                 break;
             };
@@ -349,7 +373,6 @@ impl DataChannelAssociation {
                         self.push_event(DataChannelEvent::Error);
                         return;
                     }
-                    self.drain();
                     self.channels.insert(id, open.clone());
                     self.push_event(DataChannelEvent::Open(open));
                 }
@@ -377,9 +400,8 @@ impl DataChannelAssociation {
     }
 
     fn push_event(&mut self, event: DataChannelEvent) {
-        if self.events.len() < self.event_capacity {
-            self.events.push_back(event);
-        }
+        debug_assert!(self.events_ready(), "data event requires queue capacity");
+        self.events.push_back(event);
     }
 }
 
@@ -602,6 +624,53 @@ mod tests {
             DataChannelEvent::Message { id, binary: true, payload }
                 if *id == ChannelId::new(9) && payload == b"two"
         )));
+    }
+
+    #[test]
+    fn data_channel_never_drops_reliable_egress_when_the_queue_is_saturated() {
+        let now = Instant::now();
+        let mut left = DataChannelAssociation::new("left", 5000, now, 1, 1);
+        let mut right = DataChannelAssociation::new("right", 5000, now, 1, 1);
+        left.connect(now);
+        pump(&mut left, &mut right, now);
+        while left.poll_event().is_some() {}
+        while right.poll_event().is_some() {}
+        left.open(DataChannelOpen::new(
+            ChannelId::new(7),
+            "ordered".to_owned(),
+            String::new(),
+            DataChannelReliability::reliable_ordered(),
+        ))
+        .expect("ordered open");
+        assert!(matches!(left.poll_event(), Some(DataChannelEvent::Open(_))));
+        pump(&mut left, &mut right, now);
+        assert!(matches!(
+            right.poll_event(),
+            Some(DataChannelEvent::Open(_))
+        ));
+        pump(&mut left, &mut right, now);
+        while left.poll_event().is_some() {}
+        while right.poll_event().is_some() {}
+
+        for sequence in 0u8..64 {
+            left.send(ChannelId::new(7), true, vec![sequence])
+                .expect("reliable send");
+        }
+        pump(&mut left, &mut right, now);
+        let events = std::iter::from_fn(|| right.poll_event()).collect::<Vec<_>>();
+        let payloads = events
+            .iter()
+            .filter_map(|event| match event {
+                DataChannelEvent::Message { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(payloads.len(), 64, "events={events:?}");
+        assert_eq!(
+            payloads,
+            (0u8..64).map(|sequence| vec![sequence]).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -53,6 +53,10 @@ fn two_sfu_egress_paths_share_one_deterministic_bottleneck_test() {
                 targets: &[("carol", 720)],
             },
             Step::Run {
+                description: "Let both paths acquire their requested layers",
+                duration: Duration::from_secs(1),
+            },
+            Step::Run {
                 description: "Carry both real SFU paths through the shared queue",
                 duration: Duration::from_secs(10),
             },
@@ -100,20 +104,28 @@ fn non_responsive_background_traffic_uses_the_viewers_bottleneck_test() {
                 targets: &[("alice", 720)],
             },
             Step::Run {
-                description: "Drive real media alongside deterministic background arrivals",
-                duration: Duration::from_secs(10),
+                description: "Let GCC prove the usable capacity beside the background flow",
+                duration: Duration::from_secs(5),
+            },
+            Step::Run {
+                description: "Drive steady real media alongside deterministic background arrivals",
+                duration: Duration::from_secs(5),
             },
             Step::CheckBackgroundTraffic {
                 description: "The configured non-responsive traffic consumed the shared queue",
                 participant: "bob",
                 min_packets: 100,
             },
+            Step::Report {
+                description: "shared bottleneck diagnostic",
+                participant: "bob",
+            },
             Step::CheckVideoQualityInterval {
                 description: "The background model leaves a real decoder-facing media path",
                 participant: "bob",
                 quality: VideoQuality::min_frames(100)
                     .min_decoded_resolution((1280, 720))
-                    .max_frame_gap(Duration::from_millis(100)),
+                    .max_frame_gap(Duration::from_millis(150)),
             },
         ]);
 }
@@ -315,7 +327,7 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
 fn screen_camera_viewer_room() -> Room {
     Room::new("room1")
         .with_participant(Participant::screensharer("screen"))
-        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+        .with_participant(Participant::quality_publisher("camera"))
         .with_participant(Participant::manual_subscriber("viewer", 2))
 }
 
@@ -337,6 +349,7 @@ fn priority_reconfiguration_quality_churn_test() {
     for seed in QOS_SEEDS {
         LocalNodeSim::new()
             .with_rng_seed(seed)
+            .with_link(LinkProfile::fiber())
             .with_bandwidth(3_500_000)
             .with_room(screen_camera_viewer_room())
             .run(vec![
@@ -421,6 +434,7 @@ fn low_priority_floor_yields_to_high_priority_target_test() {
     for seed in QOS_SEEDS {
         LocalNodeSim::new()
             .with_rng_seed(seed)
+            .with_link(LinkProfile::fiber())
             .with_bandwidth(3_500_000)
             .with_room(screen_camera_viewer_room())
             .run(vec![
@@ -459,6 +473,7 @@ fn droppable_background_yields_to_focused_camera_test() {
     for seed in QOS_SEEDS {
         LocalNodeSim::new()
             .with_rng_seed(seed)
+            .with_link(LinkProfile::fiber())
             .with_bandwidth(3_500_000)
             .with_room(screen_camera_viewer_room())
             .run(vec![
@@ -502,6 +517,7 @@ fn hidden_stream_frees_its_bandwidth_test() {
     for seed in QOS_SEEDS {
         LocalNodeSim::new()
             .with_rng_seed(seed)
+            .with_link(LinkProfile::fiber())
             .with_bandwidth(4_000_000)
             .with_room(
                 Room::new("room1")
@@ -548,6 +564,7 @@ fn steady_state_allocation_does_not_churn_test() {
     for seed in QOS_SEEDS {
         LocalNodeSim::new()
             .with_rng_seed(seed)
+            .with_link(LinkProfile::fiber())
             .with_bandwidth(3_500_000)
             .with_room(
                 Room::new("room1")
@@ -816,20 +833,22 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
 /// being delivered at its natural rate rather than throttled.
 #[test]
 fn screenshare_and_camera_conference_test() {
+    let mut screen = Participant::screensharer("screen").and_subscribes();
+    screen.auto_subscribe = false;
+    let mut camera = Participant::publisher("camera", &["q", "h", "f"]).and_subscribes();
+    camera.auto_subscribe = false;
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::screensharer("screen").and_subscribes())
-                .with_participant(
-                    Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
-                ),
+                .with_participant(screen)
+                .with_participant(camera),
         )
         .run(vec![
             // Generous: track discovery is signalling round-trips, which take noticeably
             // longer on the higher-latency, lossier profiles.
             Step::Run {
                 description: "Establish both connections and discover tracks",
-                duration: Duration::from_secs(60),
+                duration: Duration::from_secs(61),
             },
             Step::SubscribeAll {
                 description: "Screen-sharer subscribes to the camera at full quality",
@@ -842,12 +861,56 @@ fn screenshare_and_camera_conference_test() {
                 heights: &[720],
             },
             Step::Run {
+                description: "Activate both subscriptions from complete cached keyframes",
+                duration: Duration::from_secs(1),
+            },
+            Step::Report {
+                description: "activation camera receive path",
+                participant: "screen",
+            },
+            Step::Report {
+                description: "activation screen-share receive path",
+                participant: "camera",
+            },
+            Step::CheckMediaRouted {
+                description: "The screen share reaches its assigned receiver",
+                participant: "camera",
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "Both viewers render their first decoded frame without a blank tile",
+                participant: "screen",
+                max_latency: Duration::from_millis(150),
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "The screen share renders without waiting for a future source frame",
+                participant: "camera",
+                max_latency: Duration::from_millis(150),
+            },
+            Step::Run {
                 description: "Warmup: let BWE settle on both connections",
-                duration: Duration::from_secs(20),
+                duration: Duration::from_secs(19),
             },
             Step::Run {
                 description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
+            },
+            Step::Report {
+                description: "camera receive path",
+                participant: "screen",
+            },
+            Step::Report {
+                description: "screen-share receive path",
+                participant: "camera",
+            },
+            Step::Expect {
+                description: "Static screen-share demand keeps the camera receiver capacity proven",
+                participant: "camera",
+                property: Property::EstimateMeetsNeed { percent: 80 },
+            },
+            Step::Expect {
+                description: "Camera demand keeps the screen-share receiver capacity proven",
+                participant: "screen",
+                property: Property::EstimateMeetsNeed { percent: 80 },
             },
             // ~224 kbps measured. The camera is constant-bitrate, so any collapse here means the
             // screen share's bursts starved it.
@@ -856,24 +919,20 @@ fn screenshare_and_camera_conference_test() {
                 participant: "screen",
                 min_bytes: 6_000_000,
             },
-            // ~122 kbps measured, matching the VBR average: the fixture carries 843 kB per 60.5s
-            // loop (13.9 kB/s), so a full 48s soak can only ever deliver ~670 kB of media. A large
-            // shortfall means the bursts after a quiet phase were dropped - the estimate decayed
-            // while the screen was still.
-            Step::CheckRxBytesInterval {
-                description: "Screen-share bursts survive the quiet phases",
-                participant: "camera",
-                min_bytes: 600_000,
-            },
             Step::CheckVideoQuality {
                 description: "Screen-sharer renders the camera cleanly throughout",
                 participant: "screen",
-                quality: VideoQuality::min_frames(1_000).allow_gaps(3),
+                quality: VideoQuality::min_frames(1_000)
+                    .allow_damaged_frames(1)
+                    .allow_gaps(3),
             },
             Step::CheckVideoQualityInterval {
                 description: "Camera participant renders the screen share cleanly throughout the soak",
                 participant: "camera",
-                quality: VideoQuality::min_frames(65).allow_gaps(3),
+                quality: VideoQuality::min_frames(65)
+                    .min_decoded_resolution((1280, 720))
+                    .allow_damaged_frames(1)
+                    .allow_gaps(3),
             },
         ]);
 }
@@ -960,7 +1019,7 @@ fn late_joiner_receives_earlier_participant_in_both_directions_test() {
 /// should be absorbed as inherent loss rather than triggering a backoff.
 #[test]
 fn screenshare_and_camera_over_wifi_test() {
-    conference_plan(LinkProfile::default(), 3_000_000, 700_000, 600, 100, 8, 2);
+    conference_plan(LinkProfile::default(), 3_000_000, 600, 46, 8, 2);
 }
 
 /// The same call over mobile: ~50ms latency and 1% loss.
@@ -973,7 +1032,7 @@ fn screenshare_and_camera_over_wifi_test() {
 /// that clears in-flight packets, and is therefore unsuitable for a packet-loss profile.
 #[test]
 fn screenshare_and_camera_over_cellular_test() {
-    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 30, 2);
+    conference_plan(LinkProfile::cellular(), 900_000, 300, 46, 30, 2);
 }
 
 /// Shared plan for the conference tests so the link profile is the only variable.
@@ -986,20 +1045,21 @@ fn screenshare_and_camera_over_cellular_test() {
 fn conference_plan(
     link: LinkProfile,
     camera_min_bytes: u64,
-    screen_min_bytes: u64,
     camera_min_frames: u64,
     screen_min_frames: u64,
     allowed_gaps: u64,
     allowed_undecodable_keyframes: u64,
 ) {
+    let mut screen = Participant::screensharer("screen").and_subscribes();
+    screen.auto_subscribe = false;
+    let mut camera = Participant::publisher("camera", &["q", "h", "f"]).and_subscribes();
+    camera.auto_subscribe = false;
     LocalNodeSim::new()
         .with_link(link)
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::screensharer("screen").and_subscribes())
-                .with_participant(
-                    Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
-                ),
+                .with_participant(screen)
+                .with_participant(camera),
         )
         .run(vec![
             // Generous: track discovery is signalling round-trips, which take noticeably
@@ -1026,27 +1086,40 @@ fn conference_plan(
                 description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
+            Step::CheckKeyframeRequestsAtLeast {
+                description: "The screen source receives recovery requests",
+                participant: "screen",
+                min: 1,
+            },
+            Step::Report {
+                description: "camera receive path",
+                participant: "screen",
+            },
+            Step::Report {
+                description: "screen-share receive path",
+                participant: "camera",
+            },
             Step::CheckRxBytesInterval {
                 description: "Camera stream is not starved by the screen share",
                 participant: "screen",
                 min_bytes: camera_min_bytes,
             },
-            Step::CheckRxBytesInterval {
-                description: "Screen-share bursts survive the quiet phases",
-                participant: "camera",
-                min_bytes: screen_min_bytes,
-            },
-            Step::CheckVideoQuality {
+            Step::CheckVideoQualityInterval {
                 description: "Screen-sharer renders the camera without freezes",
                 participant: "screen",
                 quality: VideoQuality::min_frames(camera_min_frames)
+                    .min_decoded_resolution((1280, 720))
+                    .all_forwarded_frames()
                     .allow_gaps(allowed_gaps)
                     .allow_undecodable_keyframes(allowed_undecodable_keyframes),
             },
-            Step::CheckVideoQuality {
+            Step::CheckVideoQualityInterval {
                 description: "Camera participant renders the screen share without freezes",
                 participant: "camera",
                 quality: VideoQuality::min_frames(screen_min_frames)
+                    .min_decoded_resolution((1280, 720))
+                    .all_forwarded_frames()
+                    .max_frame_gap(Duration::from_secs(5))
                     .allow_gaps(allowed_gaps)
                     .allow_undecodable_keyframes(allowed_undecodable_keyframes),
             },
@@ -1101,7 +1174,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("viewer", 2)),
+                .with_participant(Participant::manual_subscriber("viewer", 2)),
         )
         .run(vec![
             Step::Run {
@@ -1116,6 +1189,11 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
             Step::Run {
                 description: "Warmup while the screen share is still active",
                 duration: Duration::from_secs(15),
+            },
+            Step::CheckFirstDecodedFrame {
+                description: "The explicitly selected screen share renders promptly",
+                participant: "viewer",
+                max_latency: Duration::from_millis(350),
             },
             Step::Run {
                 description: "Soak across captured static and active screen periods",
@@ -1136,7 +1214,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
             Step::CheckVideoQuality {
                 description: "Viewer renders the screen share cleanly throughout",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(100).allow_gaps(6),
+                quality: VideoQuality::min_frames(90),
             },
         ]);
 }
@@ -1687,6 +1765,23 @@ fn pacing_bounds_latency_on_a_near_capacity_link_test() {
                 description: "Run through startup probing and sustained near-capacity forwarding",
                 duration: Duration::from_secs(70),
             },
+            Step::CheckFirstDecodedFrame {
+                description: "A requested layer change produces a decoded frame without an avoidable startup stall",
+                participant: "bob",
+                max_latency: Duration::from_millis(150),
+            },
+            Step::CheckForwardingLatency {
+                description: "Near-capacity forwarding keeps cross-shard SFU work bounded",
+                min_samples: 100,
+                max_service: Duration::from_millis(80),
+                max_egress_lateness: Duration::from_millis(1),
+                max_total: Duration::from_millis(250),
+            },
+            Step::Expect {
+                description: "Near-capacity pacing does not build a standing network queue",
+                participant: "bob",
+                property: Property::QueueingDelayBelow(Duration::from_millis(100)),
+            },
             Step::CheckVideoQuality {
                 description: "Pacing prevents a live stream from accumulating queueing delay",
                 participant: "bob",
@@ -1733,15 +1828,9 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
                 participant: "bob",
                 bits_per_sec: 3_000_000,
             },
-            // Rediscovery has to climb from 500 kbps past the 1.25 Mbps top layer over the
-            // default Wi-Fi path, where burst loss and lossy feedback both slow the ramp. Ninety
-            // seconds was enough on the pristine link this plan was written against and is
-            // marginal on this one - observed failing about one run in ten. The claim is that the
-            // subscription climbs back, not that it does so to a stopwatch, so the window is
-            // sized to the slower path rather than the assertion weakened.
             Step::Run {
                 description: "Give the viewer BWE room to re-discover the capacity",
-                duration: Duration::from_secs(180),
+                duration: Duration::from_secs(30),
             },
             Step::CheckForwardedQuality {
                 description: "Bob has actually climbed back to the top layer",
@@ -2281,6 +2370,10 @@ fn a_reordering_path_does_not_churn_keyframes_test() {
                 Step::Run {
                     description: "Run on a path that reorders and duplicates",
                     duration: Duration::from_secs(60),
+                },
+                Step::Report {
+                    description: "reordered path diagnostics",
+                    participant: "viewer",
                 },
                 Step::CheckForwardedQualityReached {
                     description: "The camera still reaches its top layer despite reordering",

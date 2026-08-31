@@ -38,6 +38,10 @@ pub(crate) enum OutgoingCommand {
         subscription: VideoSubscription,
         response: tokio::sync::oneshot::Sender<Result<RemoteTrack, super::AgentError>>,
     },
+    RequestKeyframe {
+        track_id: String,
+        rid: Option<Rid>,
+    },
     /// Ask to be handed every audio track the SFU decides to forward.
     ///
     /// Audio has no per-track subscription: which speakers are forwarded is the SFU's decision,
@@ -326,13 +330,21 @@ impl Publication {
 pub struct RemoteTrack {
     publication: Publication,
     pub(crate) rx: mailbox::Receiver<RtpPacket>,
+    commands: mailbox::Sender<OutgoingCommand>,
+    last_rid: Option<Rid>,
 }
 
 impl RemoteTrack {
-    pub(crate) fn new(track: Track, rx: mailbox::Receiver<RtpPacket>) -> Self {
+    pub(crate) fn new(
+        track: Track,
+        rx: mailbox::Receiver<RtpPacket>,
+        commands: mailbox::Sender<OutgoingCommand>,
+    ) -> Self {
         Self {
             publication: Publication::from_signaling(track),
             rx,
+            commands,
+            last_rid: None,
         }
     }
 
@@ -353,6 +365,44 @@ impl RemoteTrack {
     /// buffering, and decryption are higher-level concerns — see
     /// [`crate::pipeline::FrameReceiver`].
     pub async fn recv(&mut self) -> Result<RtpPacket, mailbox::RecvError> {
-        self.rx.recv().await
+        let packet = self.rx.recv().await?;
+        self.last_rid = packet.rid;
+        Ok(packet)
+    }
+
+    pub fn request_keyframe(&self) -> bool {
+        self.commands
+            .try_send(OutgoingCommand::RequestKeyframe {
+                track_id: self.publication.id().to_owned(),
+                rid: self.last_rid,
+            })
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_track_requests_a_keyframe_for_its_publication() {
+        let (_media_tx, media_rx) = mailbox::bounded(1);
+        let (commands, command_rx) = mailbox::bounded(1);
+        let track = RemoteTrack::new(
+            Track {
+                track_id: "video-track".into(),
+                participant_id: "publisher".into(),
+                kind: 1,
+            },
+            media_rx,
+            commands,
+        );
+
+        assert!(track.request_keyframe());
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(OutgoingCommand::RequestKeyframe { track_id, rid: None })
+                if track_id == "video-track"
+        ));
     }
 }
