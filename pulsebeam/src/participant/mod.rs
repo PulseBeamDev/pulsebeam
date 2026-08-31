@@ -18,6 +18,7 @@ use tokio::time::Instant;
 
 pub use direct_core::{DirectParticipantCore as ParticipantCore, DisconnectReason};
 pub use effect::ParticipantEffect;
+pub(crate) use packet::derive_packet;
 pub use packet::{ForwardPacket, RoutedTrackPacket, TrackPacket, TrackPacketRef};
 
 pub struct ParticipantConfig {

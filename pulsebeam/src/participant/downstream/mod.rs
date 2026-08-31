@@ -14,7 +14,7 @@ use crate::participant::event::ParticipantSink;
 pub use crate::participant::intent::AudioIntent;
 use crate::rtp::{
     Codec, CodecPayloadTypes, EncodingId as Rid, KeyframeRequest, MediaKind, MediaSectionId as Mid,
-    MediaTime, PayloadType as Pt, RtpPacket, SequenceNumber as SeqNo, Ssrc,
+    MediaTime, PacketForwardingState, PayloadType as Pt, SequenceNumber as SeqNo, Ssrc,
 };
 use crate::track::{StreamWriter, Track, TrackMeta};
 use ahash::HashSetExt;
@@ -360,10 +360,13 @@ impl Downstream {
     pub fn on_forward_audio_rtp(
         &mut self,
         origin: AudioOrigin,
-        pkt: &RtpPacket,
+        pkt: &PacketForwardingState,
+        media: &crate::participant::ForwardPacket,
+        audio_level_extension: Option<u8>,
         writer: &mut StreamWriter,
     ) {
-        self.audio.on_rtp(origin, pkt, writer);
+        self.audio
+            .on_rtp_with_media(origin, pkt, media, audio_level_extension, writer);
     }
 
     /// Whether someone new took over an audio slot since this was last asked.

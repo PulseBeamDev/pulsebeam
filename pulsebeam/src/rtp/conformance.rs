@@ -11,7 +11,7 @@
 
 use ahash::{HashSet, HashSetExt};
 
-use crate::rtp::RtpPacket;
+use crate::rtp::PacketForwardingState;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Violation {
@@ -32,7 +32,7 @@ pub struct Violation {
 /// Frame structure is judged in sequence order rather than the order packets
 /// were written, because sequence order is what the subscriber reassembles.
 /// Emitting a packet late is the network's doing and ours to pass on faithfully.
-pub fn check_egress(packets: &[RtpPacket]) -> Vec<Violation> {
+pub fn check_egress(packets: &[PacketForwardingState]) -> Vec<Violation> {
     let mut violations = Vec::new();
     let mut push = |index: usize, reason: String| violations.push(Violation { index, reason });
 
@@ -50,9 +50,9 @@ pub fn check_egress(packets: &[RtpPacket]) -> Vec<Violation> {
         }
     }
 
-    let mut ordered: Vec<&RtpPacket> = packets.iter().collect();
+    let mut ordered: Vec<&PacketForwardingState> = packets.iter().collect();
     ordered.sort_by_key(|p| *p.seq_no);
-    let packets: Vec<RtpPacket> = ordered.into_iter().cloned().collect();
+    let packets: Vec<PacketForwardingState> = ordered.into_iter().cloned().collect();
     let packets = &packets[..];
 
     for (i, w) in packets.windows(2).enumerate() {
@@ -150,7 +150,7 @@ pub fn check_egress(packets: &[RtpPacket]) -> Vec<Violation> {
 
 /// Panics with a readable report if `packets` violates any egress invariant.
 #[track_caller]
-pub fn assert_decodable(packets: &[RtpPacket], what: &str) {
+pub fn assert_decodable(packets: &[PacketForwardingState], what: &str) {
     let violations = check_egress(packets);
     if violations.is_empty() {
         return;

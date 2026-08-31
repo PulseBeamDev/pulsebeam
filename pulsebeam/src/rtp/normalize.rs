@@ -11,7 +11,9 @@
 
 use pulsebeam_core::dd::{DdReadError, DependencyDescriptorReader, read_mandatory};
 
-use crate::rtp::{EncodingId as Rid, MediaSectionId as Mid, RtpPacket, cache::PacketWindow};
+use crate::rtp::{
+    EncodingId as Rid, MediaSectionId as Mid, PacketForwardingState, cache::PacketWindow,
+};
 
 /// What normalizing a packet taught us about its stream.
 ///
@@ -26,8 +28,8 @@ pub struct StreamFacts {
 }
 
 pub struct Normalization {
-    pub first: Option<(RtpPacket, StreamFacts)>,
-    pub remaining: Vec<(RtpPacket, StreamFacts)>,
+    pub first: Option<(PacketForwardingState, StreamFacts)>,
+    pub remaining: Vec<(PacketForwardingState, StreamFacts)>,
     pub request_keyframe: bool,
 }
 
@@ -69,8 +71,8 @@ impl StreamNormalizer {
     }
 
     /// Bring `pkt` into the SFU's internal form and report what it declared.
-    pub fn normalize(&mut self, mut pkt: RtpPacket) -> Normalization {
-        let carries_dd = pkt.extensions.raw_dependency_descriptor.is_some();
+    pub fn normalize(&mut self, mut pkt: PacketForwardingState) -> Normalization {
+        let carries_dd = pkt.derived.raw_dependency_descriptor.is_some();
         let cold = self.dd.structure().is_none();
         let mut parse_error = None;
         let Some(facts) = self.normalize_ready(&mut pkt, &mut parse_error) else {
@@ -124,19 +126,19 @@ impl StreamNormalizer {
         }
     }
 
-    fn learn_vla_index(&mut self, pkt: &RtpPacket) {
-        if let Some(vla) = &pkt.extensions.video_layers_allocation {
+    fn learn_vla_index(&mut self, pkt: &PacketForwardingState) {
+        if let Some(vla) = &pkt.derived.video_layers_allocation {
             self.vla_index = Some(vla.current_simulcast_stream_index);
         }
     }
 
     fn normalize_ready(
         &mut self,
-        pkt: &mut RtpPacket,
+        pkt: &mut PacketForwardingState,
         parse_error: &mut Option<DdReadError>,
     ) -> Option<StreamFacts> {
         self.learn_vla_index(pkt);
-        let Some(raw) = pkt.extensions.raw_dependency_descriptor.as_ref() else {
+        let Some(raw) = pkt.derived.raw_dependency_descriptor.as_ref() else {
             return Some(StreamFacts::default());
         };
         match self.dd.read(&raw.0) {
@@ -148,7 +150,7 @@ impl StreamNormalizer {
                 // keyframe signal whenever present.
                 pkt.is_keyframe |= dd.attached_structure.is_some();
                 pkt.is_frame_start = dd.start_of_frame;
-                pkt.extensions.dependency_descriptor = Some(dd);
+                pkt.derived.dependency_descriptor = Some(dd);
                 Some(StreamFacts {
                     decode_targets: self.dd.structure().map(|s| s.decode_target_count),
                 })
@@ -160,9 +162,13 @@ impl StreamNormalizer {
         }
     }
 
-    fn release_cold_start(&mut self, packet: RtpPacket, facts: StreamFacts) -> Normalization {
+    fn release_cold_start(
+        &mut self,
+        packet: PacketForwardingState,
+        facts: StreamFacts,
+    ) -> Normalization {
         let frame_number = packet
-            .extensions
+            .derived
             .raw_dependency_descriptor
             .as_ref()
             .and_then(|raw| read_mandatory(&raw.0).ok())
@@ -179,7 +185,7 @@ impl StreamNormalizer {
         let mut packets = vec![(packet, facts)];
         for held in self.pending_dd.take_all_sorted() {
             let belongs_to_template = held
-                .extensions
+                .derived
                 .raw_dependency_descriptor
                 .as_ref()
                 .and_then(|raw| read_mandatory(&raw.0).ok())
@@ -234,12 +240,12 @@ mod tests {
     use pulsebeam_core::dd::RawDependencyDescriptor;
     use pulsebeam_core::dd::temporal::TemporalDdSource;
 
-    fn packet(seq: u64, raw: RawDependencyDescriptor) -> RtpPacket {
-        let mut packet = RtpPacket {
+    fn packet(seq: u64, raw: RawDependencyDescriptor) -> PacketForwardingState {
+        let mut packet = PacketForwardingState {
             seq_no: seq.into(),
-            ..RtpPacket::default()
+            ..PacketForwardingState::default()
         };
-        packet.extensions.raw_dependency_descriptor = Some(raw);
+        packet.derived.raw_dependency_descriptor = Some(raw);
         packet
     }
 

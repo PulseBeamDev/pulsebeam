@@ -843,7 +843,7 @@ impl ShardExecution {
                 room_id: participant.room_id,
             };
             let mut sink = self.pipeline.participant_sink(who);
-            if let Some(deadline) = participant.poll(now, &mut sink) {
+            if let Some(deadline) = participant.poll(now, &self.wall, &mut sink) {
                 self.timers.schedule(key, deadline);
             }
             self.drain_participant_network(key, udp_socket, tcp_socket);

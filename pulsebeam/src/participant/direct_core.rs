@@ -20,6 +20,7 @@ use crate::{
         ForwardPacket, TrackPacket,
         batcher::{Batcher, NetworkEgress, OwnedPacketQueue},
         data::{ChannelId, DataOpenError, DataState},
+        derive_packet,
         direct_transport::DirectTransport,
         downstream::{DownstreamAllocator, SlotConfig},
         event::ParticipantSink,
@@ -39,6 +40,7 @@ use crate::{
 };
 
 use super::{ParticipantEffect, ParticipantInput, TrackPacketRef};
+use crate::clock::WallAnchor;
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -58,12 +60,13 @@ pub enum DisconnectReason {
     TooManyDataTopicChannels,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct IngressRouteFacts {
     ingress: IngressStream,
     mid: MediaSectionId,
     rid: Option<crate::rtp::EncodingId>,
     ssrc: Ssrc,
+    descriptor: pulsebeam_rtc::EncodedStreamDescriptor,
 }
 
 pub struct DirectParticipantCore {
@@ -151,6 +154,10 @@ impl DirectParticipantCore {
                         mid,
                         rid,
                         ssrc,
+                        descriptor: section
+                            .packet_descriptor()
+                            .cloned()
+                            .ok_or(pulsebeam_rtc::RtcPeerError::UnknownIngress)?,
                     },
                 );
                 debug_assert!(previous.is_none(), "negotiated ingress handles are unique");
@@ -428,7 +435,12 @@ impl DirectParticipantCore {
         cache: Option<&TrackStreamCache>,
     ) {
         match packet {
-            TrackPacketRef::Rtp { packet, media } => {
+            TrackPacketRef::Rtp {
+                packet,
+                audio_level_extension,
+                media,
+                ..
+            } => {
                 let Some(entry) = self.downstream.track_candidate(key) else {
                     debug_assert!(false, "a TrackPacket must target an installed track");
                     return;
@@ -455,6 +467,8 @@ impl DirectParticipantCore {
                         self.downstream.on_forward_audio_rtp(
                             origin,
                             packet,
+                            media,
+                            audio_level_extension,
                             &mut self.stream_writer,
                         );
                         if self.downstream.take_audio_speakers_changed() {
@@ -542,20 +556,20 @@ impl DirectParticipantCore {
                 continue;
             };
             let source = current
-                .filter(|media| media.packet().packet_id() == packet.provenance.packet_id)
+                .filter(|media| media.packet().packet_id() == packet.packet_id)
                 .or_else(|| cache.and_then(|cache| cache.forward_for(&packet)));
             let Some(source) = source else {
                 debug_assert!(
                     false,
                     "every routed packet retains authenticated media storage: packet={:?} current={:?} cache={}",
-                    packet.provenance,
+                    packet.packet_id,
                     current.map(|media| media.packet().packet_id()),
                     cache.is_some()
                 );
                 continue;
             };
             let dependency = packet
-                .extensions
+                .derived
                 .raw_dependency_descriptor
                 .as_ref()
                 .filter(|descriptor| !descriptor.0.is_empty())
@@ -623,9 +637,10 @@ impl DirectParticipantCore {
     pub(crate) fn process(
         &mut self,
         now: Instant,
+        wall: &WallAnchor,
         events: &mut impl ParticipantSink,
     ) -> Result<usize, pulsebeam_rtc::RtcPeerError> {
-        let processed = self.transport.process_ingress(now)?;
+        let processed = self.transport.process_ingress(now, wall)?;
         if self
             .transport
             .next_deadline()
@@ -634,7 +649,7 @@ impl DirectParticipantCore {
             self.transport.handle_timeout(now)?;
         }
         while let Some(event) = self.transport.poll_event() {
-            self.handle_rtc_event(now, event, events);
+            self.handle_rtc_event(now, wall, event, events);
         }
         Ok(processed)
     }
@@ -642,12 +657,13 @@ impl DirectParticipantCore {
     pub(crate) fn poll(
         &mut self,
         now: Instant,
+        wall: &WallAnchor,
         events: &mut impl ParticipantSink,
     ) -> Option<Instant> {
         if self.disconnect_reason.is_some() {
             return None;
         }
-        if self.process(now, events).is_err() {
+        if self.process(now, wall, events).is_err() {
             self.disconnect_reason = Some(DisconnectReason::IceDisconnected);
             events.exit();
             return None;
@@ -685,7 +701,7 @@ impl DirectParticipantCore {
             }
         }
         self.write_pending(now);
-        if self.settle_transport(now, events).is_err() {
+        if self.settle_transport(now, wall, events).is_err() {
             self.disconnect_reason = Some(DisconnectReason::IceDisconnected);
             events.exit();
             return None;
@@ -708,6 +724,7 @@ impl DirectParticipantCore {
     fn settle_transport(
         &mut self,
         now: Instant,
+        wall: &WallAnchor,
         events: &mut impl ParticipantSink,
     ) -> Result<(), pulsebeam_rtc::RtcPeerError> {
         const MAX_IMMEDIATE_PASSES: usize = 64;
@@ -722,7 +739,7 @@ impl DirectParticipantCore {
             }
             self.transport.handle_timeout(now)?;
             while let Some(event) = self.transport.poll_event() {
-                self.handle_rtc_event(now, event, events);
+                self.handle_rtc_event(now, wall, event, events);
             }
         }
         debug_assert!(false, "RTC work must quiesce within one participant poll");
@@ -732,11 +749,12 @@ impl DirectParticipantCore {
     fn handle_rtc_event(
         &mut self,
         now: Instant,
+        wall: &WallAnchor,
         event: RtcEvent,
         events: &mut impl ParticipantSink,
     ) {
         match event {
-            RtcEvent::Media(media) => self.handle_media(media, events),
+            RtcEvent::Media(media) => self.handle_media(media, wall, events),
             RtcEvent::ConnectionStateChanged(state) => {
                 self.handle_connection_state(state, events);
             }
@@ -780,13 +798,20 @@ impl DirectParticipantCore {
     fn handle_media(
         &mut self,
         media: pulsebeam_rtc::MediaPacket,
+        wall: &WallAnchor,
         events: &mut impl ParticipantSink,
     ) {
-        let Some(facts) = self.ingress.get(&media.stream()).copied() else {
+        let Some(facts) = self.ingress.get(&media.stream()) else {
             debug_assert!(false, "RTC media carries a negotiated ingress handle");
             return;
         };
-        let Ok(packet) = crate::rtp::RtpPacket::from_media_packet(&media, facts.ssrc) else {
+        let ingress = facts.ingress;
+        let mid = facts.mid;
+        let rid = facts.rid;
+        let ssrc = facts.ssrc;
+        let descriptor = &facts.descriptor;
+        let audio_level_extension = descriptor.extension_ids().audio_level();
+        let Ok(packet) = derive_packet(&media, descriptor, wall) else {
             return;
         };
         let packet_id = media.packet_id();
@@ -804,14 +829,14 @@ impl DirectParticipantCore {
             };
             let _ = self.pending_media.remove(&oldest);
         }
-        let Some((slot, track_id)) = self.upstream.slot_for_mid(facts.mid) else {
+        let Some((slot, track_id)) = self.upstream.slot_for_mid(mid) else {
             return;
         };
         let route = IncomingRtpRoute {
-            ingress: facts.ingress,
-            ssrc: facts.ssrc,
-            mid: facts.mid,
-            rid: facts.rid,
+            ingress,
+            ssrc,
+            mid,
+            rid,
             upstream_slot: slot,
             track_id,
             fanout: self.upstream.track_fanout(track_id),
@@ -821,6 +846,7 @@ impl DirectParticipantCore {
             route.upstream_slot,
             route.mid,
             route.rid.as_ref(),
+            route.ssrc,
             packet,
             None,
         );
@@ -842,7 +868,7 @@ impl DirectParticipantCore {
             self.request_upstream_keyframe(route, events);
         }
         for packet in processed.first.into_iter().chain(processed.remaining) {
-            let id = packet.provenance.packet_id;
+            let id = packet.packet_id;
             let Some(media) = self.pending_media.remove(&id) else {
                 debug_assert!(
                     false,
@@ -850,7 +876,15 @@ impl DirectParticipantCore {
                 );
                 continue;
             };
-            events.publish_track_packet(route.fanout, TrackPacket::Rtp { packet, media });
+            events.publish_track_packet(
+                route.fanout,
+                TrackPacket::Rtp {
+                    packet,
+                    encoding: route.rid,
+                    audio_level_extension,
+                    media,
+                },
+            );
         }
     }
 

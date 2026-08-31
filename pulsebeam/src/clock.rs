@@ -260,6 +260,25 @@ impl WallAnchor {
         }
     }
 
+    pub fn to_instant_system(&self, t: SystemTime) -> Result<Instant, AnchorError> {
+        if t >= self.wall {
+            let delta = t
+                .duration_since(self.wall)
+                .map_err(|_| AnchorError::ProjectionOverflow)?;
+            self.mono
+                .checked_add(delta)
+                .ok_or(AnchorError::MonotonicOverflow)
+        } else {
+            let delta = self
+                .wall
+                .duration_since(t)
+                .map_err(|_| AnchorError::ProjectionOverflow)?;
+            self.mono
+                .checked_sub(delta)
+                .ok_or(AnchorError::MonotonicOverflow)
+        }
+    }
+
     pub fn deadline(
         &self,
         playout: SystemTime,

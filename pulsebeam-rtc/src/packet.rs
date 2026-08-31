@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, ops::Range, time::Instant};
+use std::{
+    net::SocketAddr,
+    ops::Range,
+    time::{Instant, SystemTime},
+};
 
 use crate::{NegotiatedMediaSection, PacketId, SenderReport, StreamId};
 
@@ -44,6 +48,7 @@ impl TransportMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketProvenance {
     received_at: Instant,
+    playout_time: SystemTime,
     transport: TransportMetadata,
     packet_id: PacketId,
     stream_id: Option<StreamId>,
@@ -57,6 +62,7 @@ impl PacketProvenance {
     ) -> Self {
         Self {
             received_at,
+            playout_time: SystemTime::UNIX_EPOCH,
             transport,
             packet_id,
             stream_id: None,
@@ -65,6 +71,20 @@ impl PacketProvenance {
 
     pub const fn received_at(self) -> Instant {
         self.received_at
+    }
+
+    pub const fn playout_time(self) -> SystemTime {
+        self.playout_time
+    }
+
+    pub const fn with_playout_time(self, playout_time: SystemTime) -> Self {
+        Self {
+            received_at: self.received_at,
+            playout_time,
+            transport: self.transport,
+            packet_id: self.packet_id,
+            stream_id: self.stream_id,
+        }
     }
 
     pub const fn transport(self) -> TransportMetadata {
@@ -82,6 +102,7 @@ impl PacketProvenance {
     pub const fn with_stream(self, stream_id: StreamId) -> Self {
         Self {
             received_at: self.received_at,
+            playout_time: self.playout_time,
             transport: self.transport,
             packet_id: self.packet_id,
             stream_id: Some(stream_id),
@@ -1035,5 +1056,266 @@ mod tests {
         assert_eq!(nacks.len(), 1);
         assert_eq!(nacks[0].media_ssrc(), 9);
         assert_eq!(nacks[0].sequences(), [10, 11, 13]);
+    }
+
+    fn rtp_bytes(
+        first: u8,
+        csrcs: &[u32],
+        extension: Option<(u16, &[u8])>,
+        payload: &[u8],
+        padding: usize,
+    ) -> Vec<u8> {
+        let mut bytes = vec![first, 111, 0, 7, 0, 0, 0, 9, 0, 0, 0, 10];
+        for csrc in csrcs {
+            bytes.extend_from_slice(&csrc.to_be_bytes());
+        }
+        if let Some((profile, data)) = extension {
+            debug_assert!(data.len().is_multiple_of(4));
+            bytes.extend_from_slice(&profile.to_be_bytes());
+            bytes.extend_from_slice(
+                &u16::try_from(data.len() / 4)
+                    .expect("test extension fits the RTP length field")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(data);
+        }
+        bytes.extend_from_slice(payload);
+        if padding != 0 {
+            bytes.resize(bytes.len() + padding, 0);
+            let last = bytes.len().saturating_sub(1);
+            bytes[last] = u8::try_from(padding).expect("test padding fits one byte");
+        }
+        bytes
+    }
+
+    #[test]
+    fn rtp_structure_is_one_borrowed_set_of_safe_ranges() {
+        let cases = [
+            (
+                "one-byte extensions with CSRCs and padding",
+                0xb2,
+                vec![0x0102_0304, 0xa0b0_c0d0],
+                Some((0xbede, &[0x11, 0xaa, 0xbb, 0][..])),
+                vec![0xde, 0xad],
+                3,
+                28usize,
+            ),
+            (
+                "two-byte extensions without CSRCs",
+                0x90,
+                vec![],
+                Some((0x1001, &[3, 2, 0xaa, 0xbb][..])),
+                vec![0xca, 0xfe],
+                0,
+                20usize,
+            ),
+            (
+                "plain RTP without optional sections",
+                0x80,
+                vec![],
+                None,
+                vec![1, 2, 3],
+                0,
+                12usize,
+            ),
+        ];
+
+        for (name, first, csrcs, extension, payload, padding, header_len) in cases {
+            let bytes = rtp_bytes(first, &csrcs, extension, &payload, padding);
+            let parsed = IngressPacket::new(&bytes, provenance())
+                .parse()
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let PacketView::Rtp(packet) = parsed else {
+                panic!("{name}: expected RTP");
+            };
+
+            assert_eq!(packet.header().len(), header_len, "{name}");
+            assert_eq!(packet.payload(), payload.as_slice(), "{name}");
+            assert_eq!(
+                packet.payload().as_ptr(),
+                bytes[header_len..].as_ptr(),
+                "{name}"
+            );
+            if let Some((_, extension_data)) = extension {
+                let id = if extension_data[0] >> 4 == 0 {
+                    extension_data[0]
+                } else {
+                    extension_data[0] >> 4
+                };
+                let value = packet
+                    .header_extension_by_id(id)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .expect("extension value");
+                let expected = if extension_data[0] >> 4 == 0 {
+                    &extension_data[2..]
+                } else if extension_data[0] == 3 {
+                    &extension_data[2..4]
+                } else {
+                    &extension_data[1..3]
+                };
+                assert_eq!(value.value(), expected, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn structural_rtp_survives_malformed_optional_element() {
+        let bytes = rtp_bytes(
+            0x90,
+            &[],
+            Some((0xbede, &[0x1f, 0xaa, 0xbb, 0xcc][..])),
+            &[0x65, 0x01],
+            0,
+        );
+        let parsed = IngressPacket::new(&bytes, provenance())
+            .parse()
+            .expect("the extension block itself has a valid structural length");
+        let PacketView::Rtp(packet) = parsed else {
+            panic!("expected RTP");
+        };
+
+        assert_eq!(packet.payload(), [0x65, 0x01]);
+        assert_eq!(
+            packet.header_extension_by_id(1),
+            Err(PacketError::InvalidRtpExtension)
+        );
+        assert_eq!(packet.payload(), [0x65, 0x01]);
+    }
+
+    #[test]
+    fn truncated_headers_extensions_csrcs_and_padding_are_rejected_at_boundaries() {
+        let valid = rtp_bytes(
+            0xb1,
+            &[0x0102_0304],
+            Some((0x1001, &[3, 2, 0xaa, 0xbb][..])),
+            &[0xca, 0xfe],
+            2,
+        );
+        for length in 0..valid.len() {
+            let bytes = &valid[..length];
+            assert!(
+                IngressPacket::new(bytes, provenance()).parse().is_err(),
+                "truncated RTP unexpectedly parsed at {length} bytes"
+            );
+        }
+
+        let mut invalid_padding = rtp_bytes(0x80, &[], None, &[1, 2], 0);
+        invalid_padding.push(0);
+        invalid_padding[0] |= 0x20;
+        assert!(matches!(
+            IngressPacket::new(&invalid_padding, provenance()).parse(),
+            Err(PacketError::InvalidRtpPadding)
+        ));
+    }
+
+    #[test]
+    fn arbitrary_rtp_bytes_never_escape_borrowed_ranges() {
+        let mut state = 0x9e37_79b9u32;
+        for csrc_count in 0..=15 {
+            for extension_kind in [None, Some(0xbede), Some(0x1001)] {
+                for has_padding in [false, true] {
+                    let mut next = || {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        state
+                    };
+                    let csrcs = (0..csrc_count).map(|_| next()).collect::<Vec<_>>();
+                    let extension_data = extension_kind.map(|profile| {
+                        let entry_count = usize::try_from(next() % 3 + 1)
+                            .expect("small generated entry count fits");
+                        let mut data = Vec::new();
+                        for entry in 0..entry_count {
+                            let id = u8::try_from(entry + 1).expect("generated id fits");
+                            let length = usize::try_from(next() % 4 + 1)
+                                .expect("small generated extension length fits");
+                            match profile {
+                                0xbede => {
+                                    data.push((id << 4) | u8::try_from(length - 1).unwrap());
+                                }
+                                0x1001 => {
+                                    data.push(id);
+                                    data.push(u8::try_from(length).unwrap());
+                                }
+                                _ => {}
+                            }
+                            for _ in 0..length {
+                                data.push(u8::try_from(next() >> 24).unwrap());
+                            }
+                        }
+                        while !data.len().is_multiple_of(4) {
+                            data.push(0);
+                        }
+                        (profile, data)
+                    });
+                    let payload = vec![0xff; usize::try_from(next() % 6 + 1).unwrap()];
+                    let padding = if has_padding {
+                        usize::try_from(next() % 8 + 1).unwrap()
+                    } else {
+                        0
+                    };
+                    let first = 0x80
+                        | u8::try_from(csrc_count).expect("generated CSRC count fits")
+                        | extension_data.as_ref().map_or(0, |_| 0x10)
+                        | (u8::from(has_padding) * 0x20);
+                    let bytes = rtp_bytes(
+                        first,
+                        &csrcs,
+                        extension_data
+                            .as_ref()
+                            .map(|(profile, data)| (*profile, data.as_slice())),
+                        &payload,
+                        padding,
+                    );
+                    let extension_length = extension_data
+                        .as_ref()
+                        .map_or(0, |(_, data)| 4 + data.len());
+                    let header_length = 12 + csrc_count * 4 + extension_length;
+                    let extension_data_start = 12 + csrc_count * 4 + 4;
+                    let payload_end = bytes.len() - padding;
+                    let parsed = IngressPacket::new(&bytes, provenance())
+                        .parse()
+                        .expect("generated RTP structure parses");
+                    let PacketView::Rtp(packet) = parsed else {
+                        panic!("generated packet is RTP");
+                    };
+                    assert_eq!(packet.bytes(), bytes.as_slice());
+                    assert_eq!(packet.header(), &bytes[..header_length]);
+                    assert_eq!(packet.payload(), &bytes[header_length..payload_end]);
+                    let entries = packet
+                        .extension_entries()
+                        .expect("generated extension structure parses");
+                    for entry in &entries {
+                        let range = entry.value();
+                        assert!(range.start >= extension_data_start);
+                        assert!(range.end <= header_length);
+                        let expected = packet
+                            .bytes()
+                            .get(range.clone())
+                            .expect("entry range stays within original bytes");
+                        let value = packet
+                            .header_extension_by_id(entry.id())
+                            .expect("generated extension lookup cannot panic")
+                            .expect("generated extension entry remains addressable");
+                        assert_eq!(
+                            value,
+                            HeaderExtensionValue {
+                                id: entry.id(),
+                                value: expected
+                            }
+                        );
+                    }
+
+                    for length in 0..bytes.len() {
+                        let result = IngressPacket::new(&bytes[..length], provenance()).parse();
+                        if has_padding {
+                            assert!(result.is_err(), "padded truncation parsed at {length}");
+                        } else if length < header_length {
+                            assert!(result.is_err(), "structural truncation parsed at {length}");
+                        } else {
+                            assert!(result.is_ok(), "payload truncation rejected at {length}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

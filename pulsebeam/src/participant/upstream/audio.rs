@@ -2,7 +2,7 @@ use super::UpstreamMedia;
 use crate::{
     entity::TrackId,
     log::LogCtx,
-    rtp::{EncodingId as Rid, MediaSectionId as Mid, RtpPacket, SenderReport},
+    rtp::{EncodingId as Rid, MediaSectionId as Mid, PacketForwardingState, SenderReport, Ssrc},
     track::UpstreamTrack,
 };
 use tokio::time::Instant;
@@ -32,10 +32,12 @@ impl UpstreamAudio {
         index: usize,
         mid: Mid,
         rid: Option<&Rid>,
-        rtp: RtpPacket,
+        rtp: PacketForwardingState,
+        ssrc: Ssrc,
         sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {
-        self.media.handle_incoming_rtp(index, mid, rid, rtp, sr)
+        self.media
+            .handle_incoming_rtp(index, mid, rid, rtp, ssrc, sr)
     }
     pub(super) fn announce_state_mut(
         &mut self,

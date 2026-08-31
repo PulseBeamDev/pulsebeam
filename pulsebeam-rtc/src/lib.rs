@@ -3,6 +3,7 @@ mod data_channel;
 mod egress;
 mod gcc;
 mod id;
+mod media_packet;
 mod negotiation;
 mod pacer;
 mod packet;
@@ -12,12 +13,13 @@ mod transport;
 
 pub use api::{
     BweCapacity, DataBackpressure, DataChannel, DataChannelMode, DataPayload, DatagramProtocol,
-    DepartureReceipt, DependencyRewrite, EgressSlot, ExtendedMediaSequence, ExtendedRtpTimestamp,
-    ForwardingLatency, H264NalMetadata, IceCandidate, IngressDatagram, IngressStream,
-    MediaDirection, MediaExtensions, MediaKind, MediaPacket, MediaPacketError, MediaRewrite,
-    MediaSemantics, NegotiatedCodec, NegotiatedMedia, RtcConnectionState, RtcEvent, RtcNegotiation,
-    RtcPeer, RtcPeerError, SenderReport, TransitMediaPacket, Transmit, VideoLayersAllocation,
-    VideoSpatialLayerAllocation, VideoStreamAllocation,
+    DepartureReceipt, DependencyRewrite, EgressSlot, EncodedStreamDescriptor,
+    ExtendedMediaSequence, ExtendedRtpTimestamp, ForwardingLatency, H264NalMetadata, IceCandidate,
+    IngressDatagram, IngressStream, MediaDirection, MediaKind, MediaPacket, MediaPacketError,
+    MediaRewrite, MediaSemantics, NegotiatedCodec, NegotiatedExtensionIds, NegotiatedMedia,
+    RtcConnectionState, RtcEvent, RtcNegotiation, RtcPeer, RtcPeerError, SenderReport,
+    TransitMediaPacket, Transmit, VideoLayersAllocation, VideoSpatialLayerAllocation,
+    VideoStreamAllocation,
 };
 pub(crate) use data_channel::{DataChannelAssociation, DataChannelError, DataChannelEvent};
 pub(crate) use gcc::{

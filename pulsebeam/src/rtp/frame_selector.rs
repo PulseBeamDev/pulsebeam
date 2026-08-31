@@ -15,7 +15,7 @@
 
 use pulsebeam_core::dd::DependencyDescriptor;
 
-use crate::rtp::RtpPacket;
+use crate::rtp::PacketForwardingState;
 
 /// Per-packet forwarding decision within one encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub enum FrameDecision {
 
 /// Decides whether each packet of the active encoding is forwarded.
 pub trait FrameSelector: std::fmt::Debug {
-    fn decide(&mut self, pkt: &RtpPacket) -> FrameDecision;
+    fn decide(&mut self, pkt: &PacketForwardingState) -> FrameDecision;
 }
 
 /// Forward every packet. Used when the encoding carries no Dependency Descriptor,
@@ -40,7 +40,7 @@ pub struct MarkerSelector;
 
 impl FrameSelector for MarkerSelector {
     #[inline]
-    fn decide(&mut self, _pkt: &RtpPacket) -> FrameDecision {
+    fn decide(&mut self, _pkt: &PacketForwardingState) -> FrameDecision {
         FrameDecision::Forward
     }
 }
@@ -99,8 +99,8 @@ impl DependencyDescriptorSelector {
 }
 
 impl FrameSelector for DependencyDescriptorSelector {
-    fn decide(&mut self, pkt: &RtpPacket) -> FrameDecision {
-        match pkt.extensions.dependency_descriptor.as_ref() {
+    fn decide(&mut self, pkt: &PacketForwardingState) -> FrameDecision {
+        match pkt.derived.dependency_descriptor.as_ref() {
             Some(dd) if !self.keep(dd) => FrameDecision::Drop,
             // In target, or no descriptor to reason about: forward.
             _ => FrameDecision::Forward,
@@ -118,7 +118,7 @@ mod test {
     };
 
     /// A packet whose frame declares the given per-decode-target indications.
-    fn pkt_with_dtis(dtis: &[DecodeTargetIndication]) -> RtpPacket {
+    fn pkt_with_dtis(dtis: &[DecodeTargetIndication]) -> PacketForwardingState {
         let dd = DependencyDescriptor {
             frame_dependencies: FrameDependencyTemplate {
                 dtis: dtis.iter().copied().collect(),
@@ -126,13 +126,13 @@ mod test {
             },
             ..Default::default()
         };
-        let mut pkt = RtpPacket::default();
-        pkt.extensions.dependency_descriptor = Some(dd);
+        let mut pkt = PacketForwardingState::default();
+        pkt.derived.dependency_descriptor = Some(dd);
         pkt
     }
 
-    fn plain_pkt() -> RtpPacket {
-        RtpPacket::default()
+    fn plain_pkt() -> PacketForwardingState {
+        PacketForwardingState::default()
     }
 
     use DecodeTargetIndication::{Discardable, NotPresent, Required, Switch};

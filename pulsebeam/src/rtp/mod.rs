@@ -17,11 +17,10 @@ use tokio::time::Instant;
 
 pub use types::{
     EncodingId, Frequency, KeyframeRequest, KeyframeRequestKind, MediaKind, MediaSectionId,
-    MediaTime, PacketExtensions, PacketProvenance, PayloadType, SenderReport, SequenceNumber,
-    SimulcastEncoding, Ssrc, VideoLayersAllocation,
+    MediaTime, PacketDerivedFacts, PayloadType, ResolutionAndFramerate, SenderReport,
+    SequenceNumber, SimulcastEncoding, SimulcastStreamAllocation, SpatialLayerAllocation, Ssrc,
+    TemporalLayerAllocation, VideoLayersAllocation,
 };
-
-use crate::entity::{ParticipantId, TrackId};
 
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
 /// TODO: get these clocks from SDP instead.
@@ -74,33 +73,16 @@ impl CodecPayloadTypes {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct AudioRtpPacket {
-    pub participant_id: ParticipantId,
-    pub track_id: TrackId,
-    pub packet: RtpPacket,
-}
-
-/// Unified internal RTP packet representation used across the SFU.
-/// This struct is designed for mutability and composition in middleware.
-/// Only the fields actually consumed by the forwarding pipeline are kept here;
-/// redundant header data (sequence_number, timestamp, csrc list, etc.) is dropped
-/// at ingress so every ring-slot stays as small as possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RtpPacket {
-    pub codec: Codec,
-    pub ssrc: Ssrc,
+pub struct PacketForwardingState {
     pub marker: bool,
-    pub extensions: PacketExtensions,
-    pub header_len: usize,
+    pub derived: PacketDerivedFacts,
+    pub size_bytes: usize,
     pub seq_no: SequenceNumber,
     pub rtp_ts: MediaTime,
     pub arrival_ts: Instant,
-    pub provenance: PacketProvenance,
+    pub packet_id: u64,
 
-    /// Scheduled playout time for the packet, in the server's monotonic clock domain.
-    /// Since all streams in this process share the same monotonic clock, this time can
-    /// be compared directly between unrelated streams for scheduling or synchronization.
     pub playout_time: Instant,
     /// Whether this packet begins a frame that can be decoded without any
     /// preceding frame (an H.264 IDR, or any Opus packet).
@@ -117,204 +99,56 @@ pub struct RtpPacket {
     /// Which switch-relevant H.264 NAL units this payload carries. Always empty
     /// for audio.
     pub nal: h264::NalFlags,
+    #[cfg(test)]
+    pub codec: Codec,
+    #[cfg(test)]
+    pub ssrc: Ssrc,
+    #[cfg(test)]
+    pub rid: Option<EncodingId>,
+    #[cfg(test)]
+    pub test_audio_level: Option<i8>,
+    #[cfg(test)]
     pub payload: Vec<u8>,
-    pub payload_len: usize,
 }
 
-impl Default for RtpPacket {
+#[cfg(test)]
+pub type RtpPacket = PacketForwardingState;
+
+#[cfg(test)]
+impl Default for PacketForwardingState {
     fn default() -> Self {
         Self {
-            codec: Codec::H264,
-            ssrc: 1234.into(),
             marker: false,
-            extensions: PacketExtensions::default(),
-            header_len: 12,
+            derived: PacketDerivedFacts::default(),
+            size_bytes: 1212,
             seq_no: SequenceNumber::from(1u64),
             rtp_ts: MediaTime::new(0, VIDEO_FREQUENCY),
             arrival_ts: Instant::now(),
-            provenance: PacketProvenance {
-                received_at: Instant::now(),
-                packet_id: 0,
-                stream_id: None,
-            },
+            packet_id: 0,
             playout_time: Instant::now(),
             is_keyframe: false,
             is_frame_start: true,
             nal: h264::NalFlags::empty(),
+            #[cfg(test)]
+            codec: Codec::H264,
+            #[cfg(test)]
+            ssrc: 1234.into(),
+            #[cfg(test)]
+            rid: None,
+            #[cfg(test)]
+            test_audio_level: None,
+            #[cfg(test)]
             payload: vec![0u8; 1200],
-            payload_len: 1200,
         }
     }
 }
 
-impl RtpPacket {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "structural parsing passes the already-validated RTP parts without reification"
-    )]
-    pub(crate) fn from_ingress_parts(
-        ssrc: Ssrc,
-        marker: bool,
-        header_len: usize,
-        seq_no: SequenceNumber,
-        rtp_ts: MediaTime,
-        arrival_ts: Instant,
-        provenance: PacketProvenance,
-        extensions: PacketExtensions,
-        codec: Codec,
-        payload: Vec<u8>,
-    ) -> Self {
-        let mut nal = h264::NalFlags::empty();
-        let is_keyframe_start = match codec {
-            Codec::H264 => {
-                nal = h264::classify(&payload);
-                nal.idr()
-            }
-            Codec::Opus => true,
-        };
-        let payload_len = payload.len();
-        Self {
-            codec,
-            ssrc,
-            marker,
-            extensions,
-            header_len,
-            seq_no,
-            rtp_ts,
-            arrival_ts,
-            provenance,
-            playout_time: arrival_ts,
-            is_keyframe: is_keyframe_start,
-            is_frame_start: true,
-            nal,
-            payload,
-            payload_len,
-        }
-    }
-
-    pub fn to_transit(&self) -> Self {
-        let mut extensions = self.extensions.clone();
-        extensions.video_layers_allocation = None;
-
-        Self {
-            codec: self.codec,
-            ssrc: self.ssrc,
-            marker: self.marker,
-            extensions,
-            header_len: self.header_len,
-            seq_no: self.seq_no,
-            rtp_ts: self.rtp_ts,
-            arrival_ts: self.arrival_ts,
-            provenance: self.provenance,
-            playout_time: self.playout_time,
-            is_keyframe: self.is_keyframe,
-            is_frame_start: self.is_frame_start,
-            nal: self.nal,
-            payload: self.payload.clone(),
-            payload_len: self.payload_len,
-        }
-    }
-
-    pub fn rehome_extensions(&mut self) {
+impl PacketForwardingState {
+    pub fn validate_derived(&mut self) {
         debug_assert!(
-            self.extensions.dependency_descriptor.is_none()
-                || self.extensions.raw_dependency_descriptor.is_some()
+            self.derived.dependency_descriptor.is_none()
+                || self.derived.raw_dependency_descriptor.is_some()
         );
-    }
-
-    pub const fn payload_size(&self) -> usize {
-        self.payload_len
-    }
-
-    pub fn from_media_packet(
-        packet: &pulsebeam_rtc::MediaPacket,
-        ssrc: Ssrc,
-    ) -> Result<Self, pulsebeam_rtc::MediaPacketError> {
-        let codec = Codec::from_name(packet.codec().name()).unwrap_or(Codec::H264);
-        let semantics = packet.semantics()?;
-        let media_extensions = packet.extensions()?;
-        let mut extensions = PacketExtensions {
-            absolute_capture_time: media_extensions.absolute_capture_time().map(Into::into),
-            audio_level: media_extensions.audio_level(),
-            mid: Some(packet.mid().into()),
-            rid: packet.rid().map(Into::into),
-            ..PacketExtensions::default()
-        };
-        extensions.raw_dependency_descriptor = media_extensions
-            .dependency_descriptor()
-            .filter(|value| value.len() <= pulsebeam_core::dd::model::MAX_DD_LEN)
-            .map(|value| {
-                pulsebeam_core::dd::RawDependencyDescriptor(value.iter().copied().collect())
-            });
-        extensions.video_layers_allocation =
-            media_extensions
-                .video_layers_allocation()
-                .map(|vla| types::VideoLayersAllocation {
-                    current_simulcast_stream_index: vla.current_stream(),
-                    simulcast_streams: vla
-                        .streams()
-                        .iter()
-                        .map(|stream| types::SimulcastStreamAllocation {
-                            spatial_layers: stream
-                                .spatial_layers()
-                                .iter()
-                                .map(|spatial| types::SpatialLayerAllocation {
-                                    temporal_layers: spatial
-                                        .cumulative_temporal_kbps()
-                                        .iter()
-                                        .copied()
-                                        .map(|cumulative_kbps| types::TemporalLayerAllocation {
-                                            cumulative_kbps,
-                                        })
-                                        .collect(),
-                                    resolution_and_framerate: spatial.resolution().map(
-                                        |(width, height, framerate)| {
-                                            types::ResolutionAndFramerate {
-                                                width,
-                                                height,
-                                                framerate,
-                                            }
-                                        },
-                                    ),
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                });
-        let nal = semantics
-            .h264()
-            .map_or_else(h264::NalFlags::empty, |metadata| {
-                h264::NalFlags::from_parts(metadata.sps(), metadata.pps(), metadata.idr())
-            });
-        let received_at = Instant::from_std(packet.received_at());
-        Ok(Self {
-            codec,
-            ssrc,
-            marker: packet.marker(),
-            extensions,
-            header_len: 12,
-            seq_no: packet.sequence().get().into(),
-            rtp_ts: MediaTime::new(
-                packet.timestamp().get(),
-                if codec == Codec::Opus {
-                    AUDIO_FREQUENCY
-                } else {
-                    VIDEO_FREQUENCY
-                },
-            ),
-            arrival_ts: received_at,
-            provenance: PacketProvenance {
-                received_at,
-                packet_id: packet.packet_id(),
-                stream_id: None,
-            },
-            playout_time: received_at,
-            is_keyframe: semantics.keyframe(),
-            is_frame_start: semantics.frame_start(),
-            nal,
-            payload: Vec::new(),
-            payload_len: packet.payload().len(),
-        })
     }
 
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {
@@ -345,7 +179,7 @@ pub mod test_utils {
 
     use super::*;
 
-    impl RtpPacket {
+    impl PacketForwardingState {
         fn next_seq(&self) -> Self {
             let mut new_packet = self.clone();
             new_packet.seq_no = self.seq_no.wrapping_add(1);
@@ -373,13 +207,13 @@ pub mod test_utils {
         }
     }
 
-    pub type ScenarioStep = Box<dyn Fn(&RtpPacket) -> RtpPacket>;
+    pub type ScenarioStep = Box<dyn Fn(&PacketForwardingState) -> PacketForwardingState>;
 
     pub fn next_seq() -> ScenarioStep {
-        Box::new(RtpPacket::next_seq)
+        Box::new(PacketForwardingState::next_seq)
     }
     pub fn next_frame() -> ScenarioStep {
-        Box::new(RtpPacket::next_frame)
+        Box::new(PacketForwardingState::next_frame)
     }
     pub fn keyframe() -> ScenarioStep {
         Box::new(|prev| {
@@ -407,8 +241,10 @@ pub mod test_utils {
         })
     }
 
-    /// Generates a `Vec<RtpPacket>` from a series of steps.
-    pub fn generate(initial: RtpPacket, steps: Vec<ScenarioStep>) -> Vec<RtpPacket> {
+    pub fn generate(
+        initial: PacketForwardingState,
+        steps: Vec<ScenarioStep>,
+    ) -> Vec<PacketForwardingState> {
         let mut packets = Vec::with_capacity(steps.len());
         let mut current = initial;
         packets.push(current.clone());
@@ -492,11 +328,16 @@ pub mod test_utils {
             self.seq += n;
         }
 
-        fn packet(&mut self, payload: Vec<u8>, marker: bool, offset: usize) -> RtpPacket {
+        fn packet(
+            &mut self,
+            payload: Vec<u8>,
+            marker: bool,
+            offset: usize,
+        ) -> PacketForwardingState {
             let at = self.clock
                 + INTRA_FRAME_ARRIVAL * u32::try_from(offset).expect("offset fits a u32");
             let nal = crate::rtp::h264::classify(&payload);
-            let pkt = RtpPacket {
+            let pkt = PacketForwardingState {
                 ssrc: self.ssrc,
                 marker,
                 seq_no: SequenceNumber::from(self.seq),
@@ -520,7 +361,7 @@ pub mod test_utils {
 
         /// A decodable keyframe: parameter sets followed by `fragments` FU-A
         /// fragments of an IDR, terminated by the marker bit.
-        pub fn keyframe(&mut self, fragments: usize) -> Vec<RtpPacket> {
+        pub fn keyframe(&mut self, fragments: usize) -> Vec<PacketForwardingState> {
             self.keyframe_with_slices(1, fragments)
         }
 
@@ -531,7 +372,7 @@ pub mod test_utils {
             &mut self,
             slices: usize,
             fragments_per_slice: usize,
-        ) -> Vec<RtpPacket> {
+        ) -> Vec<PacketForwardingState> {
             debug_assert!(slices >= 1 && fragments_per_slice >= 1);
             let mut out = Vec::new();
             let send_parameter_sets = self.parameter_sets != ParameterSetStyle::OnceAtStreamStart
@@ -565,7 +406,7 @@ pub mod test_utils {
         }
 
         /// An ordinary inter-coded frame of `packets` non-IDR slice packets.
-        pub fn delta_frame(&mut self, packets: usize) -> Vec<RtpPacket> {
+        pub fn delta_frame(&mut self, packets: usize) -> Vec<PacketForwardingState> {
             debug_assert!(packets >= 1);
             let mut out = Vec::new();
             for i in 0..packets {
@@ -578,7 +419,11 @@ pub mod test_utils {
         }
 
         /// `n` delta frames, flattened.
-        pub fn delta_frames(&mut self, n: usize, packets_each: usize) -> Vec<RtpPacket> {
+        pub fn delta_frames(
+            &mut self,
+            n: usize,
+            packets_each: usize,
+        ) -> Vec<PacketForwardingState> {
             (0..n)
                 .flat_map(|_| self.delta_frame(packets_each))
                 .collect()

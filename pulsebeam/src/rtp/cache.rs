@@ -5,7 +5,7 @@
 //! would replay the wrong window and hand the decoder a segment that does not
 //! start at a keyframe.
 
-use crate::rtp::{EncodingId as Rid, RtpPacket, SequenceNumber as SeqNo};
+use crate::rtp::{EncodingId as Rid, PacketForwardingState, SequenceNumber as SeqNo};
 use ahash::{HashMap, HashMapExt};
 use std::collections::BTreeMap;
 
@@ -84,7 +84,7 @@ pub struct StreamCache {
 #[derive(Debug)]
 pub(crate) struct PacketWindow {
     seqs: Box<[u64]>,
-    ring: Box<[Option<RtpPacket>]>,
+    ring: Box<[Option<PacketForwardingState>]>,
     newest_seq: Option<u64>,
 }
 
@@ -106,7 +106,7 @@ impl PacketWindow {
     }
 
     #[inline]
-    pub(crate) fn get(&self, seq: u64) -> Option<&RtpPacket> {
+    pub(crate) fn get(&self, seq: u64) -> Option<&PacketForwardingState> {
         let index = (seq & PACKET_WINDOW_MASK) as usize;
         if self.seqs.get(index).copied() != Some(seq) {
             return None;
@@ -119,11 +119,14 @@ impl PacketWindow {
         stored
     }
 
-    pub(crate) fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
+    pub(crate) fn push(&mut self, pkt: PacketForwardingState) -> Option<PacketForwardingState> {
         self.push_with_evicted(pkt).0
     }
 
-    fn push_with_evicted(&mut self, pkt: RtpPacket) -> (Option<RtpPacket>, Option<RtpPacket>) {
+    fn push_with_evicted(
+        &mut self,
+        pkt: PacketForwardingState,
+    ) -> (Option<PacketForwardingState>, Option<PacketForwardingState>) {
         let seq = *pkt.seq_no;
         if let Some(newest) = self.newest_seq
             && seq.wrapping_add(PACKET_WINDOW_CAPACITY as u64) <= newest
@@ -147,7 +150,7 @@ impl PacketWindow {
         self.newest_seq
     }
 
-    pub(crate) fn take_all_sorted(&mut self) -> Vec<RtpPacket> {
+    pub(crate) fn take_all_sorted(&mut self) -> Vec<PacketForwardingState> {
         let mut packets: Vec<_> = self.ring.iter_mut().filter_map(Option::take).collect();
         packets.sort_unstable_by_key(|pkt| *pkt.seq_no);
         self.seqs.fill(EMPTY_SLOT);
@@ -181,17 +184,14 @@ impl StreamCache {
 
     /// Take ownership of a packet, handing it back only when it was too old to
     /// store.
-    ///
-    /// By value because the cache holds a copy of every packet regardless, so a
-    /// caller that also needs one should read the stored copy rather than make
-    /// a second. That is not a micro-optimisation: `ExtensionValues` carries a
-    /// type-keyed map, so cloning an `RtpPacket` heap-allocates — measured at
-    /// 75ns against 35ns for one with no extensions.
-    pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
+    pub fn push(&mut self, pkt: PacketForwardingState) -> Option<PacketForwardingState> {
         self.push_with_evicted(pkt).0
     }
 
-    fn push_with_evicted(&mut self, pkt: RtpPacket) -> (Option<RtpPacket>, Option<u64>) {
+    fn push_with_evicted(
+        &mut self,
+        pkt: PacketForwardingState,
+    ) -> (Option<PacketForwardingState>, Option<u64>) {
         let seq = *pkt.seq_no;
 
         let frame_ts = pkt.rtp_ts.numer();
@@ -202,7 +202,7 @@ impl StreamCache {
         if let Some(pkt) = rejected {
             return (Some(pkt), None);
         }
-        let evicted = evicted.map(|packet| packet.provenance.packet_id);
+        let evicted = evicted.map(|packet| packet.packet_id);
         let newest = self.packets.newest_seq();
 
         // Re-anchor when the head of the same keyframe turns up late: a segment
@@ -264,7 +264,7 @@ impl StreamCache {
     /// carry SPS, PPS and an IDR — the subscriber has no jitter buffer ahead of
     /// it and the egress SSRC is shared across layers, so it cannot reorder the
     /// burst itself nor fall back on parameter sets from the previous layer.
-    pub fn replay(&self) -> Option<Vec<RtpPacket>> {
+    pub fn replay(&self) -> Option<Vec<PacketForwardingState>> {
         let segment_ts = self.segment_ts?;
         let start = self.segment_start_seq?;
         let newest = self.packets.newest_seq()?;
@@ -277,7 +277,7 @@ impl StreamCache {
         // numbers and would erase an internal gap, making a frame whose marker was
         // lost upstream read as complete. The rest arrives on the live cursor,
         // where the gap is preserved.
-        let mut segment: Vec<RtpPacket> = Vec::new();
+        let mut segment: Vec<PacketForwardingState> = Vec::new();
         let mut seq = start;
         while seq <= newest {
             match self.packets.get(seq) {
@@ -387,7 +387,7 @@ impl StreamCache {
     /// the single newly-arrived packet: the scan spans `(cursor, newest]`,
     /// clamped to the live window, which is one element when the reader is
     /// current. O(k), no allocation.
-    pub fn range_after(&self, cursor: SeqNo) -> impl Iterator<Item = &RtpPacket> + '_ {
+    pub fn range_after(&self, cursor: SeqNo) -> impl Iterator<Item = &PacketForwardingState> + '_ {
         let cursor = *cursor;
         let (lo, hi) = match self.packets.newest_seq() {
             Some(newest) if newest > cursor => {
@@ -405,7 +405,7 @@ impl StreamCache {
     ///
     /// Used by the tail drain and reorder backfill to complete a frame from a
     /// known hole: O(1) index + tag check, no scan.
-    pub fn get(&self, seq: SeqNo) -> Option<&RtpPacket> {
+    pub fn get(&self, seq: SeqNo) -> Option<&PacketForwardingState> {
         self.packets.get(*seq)
     }
 
@@ -416,11 +416,6 @@ impl StreamCache {
     }
 }
 
-/// One track's worth of cache: a `StreamCache` per simulcast encoding, keyed by
-/// `rid`. The track is the routing unit; the encoding a packet belongs to is read
-/// from `pkt.extensions.rid`. A downstream forwarder holds the whole thing so it can
-/// replay a target encoding's keyframe segment while still forwarding the current
-/// one.
 #[derive(Debug, Default)]
 pub struct TrackStreamCache {
     encodings: HashMap<Option<Rid>, StreamCache>,
@@ -435,21 +430,21 @@ impl TrackStreamCache {
         }
     }
 
-    /// Route `pkt` into its encoding's cache, reading the encoding from the
-    /// packet's `rid` (absent for non-simulcast tracks).
-    /// Returns the packet only when it was too old to store; otherwise the
-    /// cache owns it and the caller reads it back with [`Self::get`].
-    pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
-        self.encoding_mut(pkt.extensions.rid).push(pkt)
+    pub fn push(&mut self, pkt: PacketForwardingState) -> Option<PacketForwardingState> {
+        #[cfg(test)]
+        let encoding = pkt.rid;
+        #[cfg(not(test))]
+        let encoding = None;
+        self.encoding_mut(encoding).push(pkt)
     }
 
     pub fn push_forward(
         &mut self,
-        pkt: RtpPacket,
+        pkt: PacketForwardingState,
         media: crate::participant::ForwardPacket,
-    ) -> Option<(RtpPacket, crate::participant::ForwardPacket)> {
-        let packet_id = pkt.provenance.packet_id;
-        let rid = pkt.extensions.rid;
+        rid: Option<Rid>,
+    ) -> Option<(PacketForwardingState, crate::participant::ForwardPacket)> {
+        let packet_id = pkt.packet_id;
         let (rejected, evicted) = self.encoding_mut(rid).push_with_evicted(pkt);
         if let Some(rejected) = rejected {
             return Some((rejected, media));
@@ -468,27 +463,39 @@ impl TrackStreamCache {
         None
     }
 
-    pub fn media_for(&self, packet: &RtpPacket) -> Option<&pulsebeam_rtc::MediaPacket> {
+    pub fn media_for(&self, packet: &PacketForwardingState) -> Option<&pulsebeam_rtc::MediaPacket> {
         self.forward_for(packet)
             .map(crate::participant::ForwardPacket::packet)
     }
 
-    pub fn forward_for(&self, packet: &RtpPacket) -> Option<&crate::participant::ForwardPacket> {
-        let packet_id = packet.provenance.packet_id;
-        self.media
-            .get(&packet.extensions.rid)
-            .and_then(|media| media.get(&packet_id))
-            .or_else(|| self.media.values().find_map(|media| media.get(&packet_id)))
+    pub fn forward_for(
+        &self,
+        packet: &PacketForwardingState,
+    ) -> Option<&crate::participant::ForwardPacket> {
+        let packet_id = packet.packet_id;
+        self.media.values().find_map(|media| media.get(&packet_id))
     }
 
     pub fn encoding(&self, rid: Option<Rid>) -> Option<&StreamCache> {
         self.encodings.get(&rid)
     }
 
+    pub fn encoding_of(&self, packet: &PacketForwardingState) -> Option<Rid> {
+        self.encodings
+            .iter()
+            .find_map(|(rid, cache)| {
+                cache
+                    .get(packet.seq_no)
+                    .is_some_and(|candidate| candidate.packet_id == packet.packet_id)
+                    .then_some(*rid)
+            })
+            .flatten()
+    }
+
     pub(crate) fn replay<'a>(
         &'a self,
         encodings: &'a [Option<Rid>],
-    ) -> impl Iterator<Item = RtpPacket> + 'a {
+    ) -> impl Iterator<Item = PacketForwardingState> + 'a {
         encodings
             .iter()
             .filter_map(|rid| self.encoding(*rid))
@@ -730,29 +737,24 @@ mod test {
 
     #[test]
     fn a_dd_keyframe_replays_under_an_opaque_payload_without_parameter_sets() {
-        // SFrame/E2EE: the payload is opaque, so no SPS/PPS can ever be probed or
-        // synthesized. RtpPacket::default carries an opaque payload with empty NAL
-        // flags. The keyframe is known only from the Dependency Descriptor, whose
-        // presence makes the segment self-sufficient. Replay must still succeed —
-        // otherwise a switch into an encrypted encoding could never land.
         use pulsebeam_core::dd::temporal::TemporalDdGenerator;
 
         let mut g = TemporalDdGenerator::new(3);
         let mut cache = StreamCache::new();
 
-        let mut kf = RtpPacket::default();
+        let mut kf = PacketForwardingState::default();
         kf.seq_no = SeqNo::from(1u64);
         kf.rtp_ts = MediaTime::new(1000, kf.rtp_ts.frequency());
         kf.marker = true;
         kf.is_keyframe = true;
-        kf.extensions.dependency_descriptor = Some(g.next(true));
+        kf.derived.dependency_descriptor = Some(g.next(true));
         cache.push(kf);
 
-        let mut delta = RtpPacket::default();
+        let mut delta = PacketForwardingState::default();
         delta.seq_no = SeqNo::from(2u64);
         delta.rtp_ts = MediaTime::new(4000, delta.rtp_ts.frequency());
         delta.marker = true;
-        delta.extensions.dependency_descriptor = Some(g.next(false));
+        delta.derived.dependency_descriptor = Some(g.next(false));
         cache.push(delta);
 
         let replay = cache
@@ -780,9 +782,9 @@ mod test {
         let mut b = builder(ParameterSetStyle::OnceAtStreamStart);
         let mut cache = StreamCache::new();
 
-        let mut with_dd = |pkts: Vec<RtpPacket>, keyframe: bool| {
+        let mut with_dd = |pkts: Vec<PacketForwardingState>, keyframe: bool| {
             for mut p in pkts {
-                p.extensions.dependency_descriptor = Some(g.next(keyframe && p.is_keyframe));
+                p.derived.dependency_descriptor = Some(g.next(keyframe && p.is_keyframe));
                 cache.push(p.clone());
             }
         };
@@ -811,11 +813,11 @@ mod test {
     fn many_encodings_resolve_without_scanning_unrelated_streams() {
         let mut cache = TrackStreamCache::new();
         for index in 0..256u16 {
-            let mut packet = RtpPacket {
+            let mut packet = PacketForwardingState {
                 seq_no: u64::from(index).into(),
-                ..RtpPacket::default()
+                ..PacketForwardingState::default()
             };
-            packet.extensions.rid = Some(Rid::from(format!("r{index}").as_str()));
+            packet.rid = Some(Rid::from(format!("r{index}").as_str()));
             assert!(cache.push(packet).is_none());
         }
 

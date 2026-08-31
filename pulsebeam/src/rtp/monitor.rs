@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::entity::TrackKind;
-use crate::rtp::RtpPacket;
+use crate::rtp::PacketForwardingState;
 
 const SIMULCAST_LAYER_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
 const SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA: Duration = Duration::from_secs(10);
@@ -344,7 +344,7 @@ impl StreamMonitor {
         }
     }
 
-    pub fn process_packet(&mut self, packet: &RtpPacket) {
+    pub fn process_packet(&mut self, packet: &PacketForwardingState) {
         let was_inactive = self.stats.is_inactive();
         let may_activate = !self.vla_inactive;
         self.last_packet_at = packet.arrival_ts;
@@ -720,11 +720,9 @@ impl BitrateEstimate {
         }
     }
 
-    pub fn record(&mut self, pkt: &RtpPacket) {
+    pub fn record(&mut self, pkt: &PacketForwardingState) {
         self.advance_time(pkt.playout_time);
-        self.accumulated_bytes = self
-            .accumulated_bytes
-            .saturating_add(pkt.header_len.saturating_add(pkt.payload.len()));
+        self.accumulated_bytes = self.accumulated_bytes.saturating_add(pkt.size_bytes);
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -777,8 +775,8 @@ mod test {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    fn packet(seq: u64, arrival_ts: Instant) -> RtpPacket {
-        RtpPacket {
+    fn packet(seq: u64, arrival_ts: Instant) -> PacketForwardingState {
+        PacketForwardingState {
             seq_no: seq.into(),
             rtp_ts: MediaTime::new(seq * 3000, Frequency::NINETY_KHZ),
             arrival_ts,
@@ -1246,14 +1244,15 @@ mod test {
         assert_eq!(video.stats().quality(), StreamQuality::Good);
     }
 
-    fn make_packet(now: Instant, size_bytes: usize) -> RtpPacket {
-        let mut pkt = RtpPacket {
+    fn make_packet(now: Instant, size_bytes: usize) -> PacketForwardingState {
+        let mut pkt = PacketForwardingState {
             arrival_ts: now,
             playout_time: now,
             ..Default::default()
         };
-        let payload_len = size_bytes.saturating_sub(pkt.header_len);
+        let payload_len = size_bytes.saturating_sub(12);
         pkt.payload = vec![0; payload_len];
+        pkt.size_bytes = size_bytes;
         pkt
     }
 

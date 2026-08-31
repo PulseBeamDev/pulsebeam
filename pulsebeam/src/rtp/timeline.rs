@@ -8,7 +8,7 @@
 //! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
 //! the correct answer.
 
-use crate::rtp::{Frequency, MediaTime, RtpPacket, SequenceNumber as SeqNo};
+use crate::rtp::{Frequency, MediaTime, PacketForwardingState, SequenceNumber as SeqNo};
 use pulsebeam_runtime::rand::RngCore;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -125,16 +125,16 @@ impl Timeline {
     }
 
     /// Re-aligns the timeline to a new source stream starting with `packet`.
-    pub fn rebase(&mut self, packet: &RtpPacket) {
+    pub fn rebase(&mut self, packet: &PacketForwardingState) {
         self.rebase_inner(packet);
     }
 
     /// Re-aligns the timeline to a new audio stream.
-    pub fn rebase_audio(&mut self, packet: &RtpPacket) {
+    pub fn rebase_audio(&mut self, packet: &PacketForwardingState) {
         self.rebase_inner(packet);
     }
 
-    fn rebase_inner(&mut self, packet: &RtpPacket) {
+    fn rebase_inner(&mut self, packet: &PacketForwardingState) {
         let input_seq = *packet.seq_no;
         self.seq_base = self.max_output.wrapping_add(1).wrapping_sub(input_seq);
 
@@ -158,13 +158,13 @@ impl Timeline {
 
     /// Rewrite `pkt` preserving its position relative to its own stream, so gaps
     /// left by upstream loss stay visible to the subscriber.
-    pub fn rewrite(&mut self, pkt: &mut RtpPacket) {
+    pub fn rewrite(&mut self, pkt: &mut PacketForwardingState) {
         let output_seq: SeqNo = (*pkt.seq_no).wrapping_add(*self.seq_base).into();
         let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
         self.apply(pkt, output_seq, output_ts);
     }
 
-    pub fn rewrite_audio(&mut self, pkt: &mut RtpPacket) -> bool {
+    pub fn rewrite_audio(&mut self, pkt: &mut PacketForwardingState) -> bool {
         let output_seq: SeqNo = (*pkt.seq_no).wrapping_add(*self.seq_base).into();
         if self.epoch.is_some() && output_seq <= self.max_output {
             return false;
@@ -179,7 +179,7 @@ impl Timeline {
     /// Used for a replayed switch burst, which the cache has already ordered and
     /// deduplicated and which may carry synthesized parameter-set packets whose
     /// original sequence numbers are unrelated to the segment.
-    pub fn rewrite_sequential(&mut self, pkt: &mut RtpPacket) {
+    pub fn rewrite_sequential(&mut self, pkt: &mut PacketForwardingState) {
         let output_seq: SeqNo = self.max_output.wrapping_add(1);
         let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
         self.apply(pkt, output_seq, output_ts);
@@ -224,7 +224,7 @@ impl Timeline {
         self.seq_base = (*self.seq_base).wrapping_sub(1).into();
     }
 
-    fn apply(&mut self, pkt: &mut RtpPacket, output_seq: SeqNo, output_ts: u64) {
+    fn apply(&mut self, pkt: &mut PacketForwardingState, output_seq: SeqNo, output_ts: u64) {
         pkt.seq_no = output_seq;
         pkt.rtp_ts = MediaTime::new(output_ts, self.clock_rate);
 
@@ -257,8 +257,8 @@ mod test {
     use super::*;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 
-    fn pkt(seq: u64, ts: u64, at: Instant) -> RtpPacket {
-        RtpPacket {
+    fn pkt(seq: u64, ts: u64, at: Instant) -> PacketForwardingState {
+        PacketForwardingState {
             seq_no: seq.into(),
             rtp_ts: MediaTime::new(ts, Frequency::NINETY_KHZ),
             playout_time: at,
@@ -368,7 +368,7 @@ mod test {
         let t0 = Instant::now();
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
         let mut first_out = None;
-        let mut last: Option<RtpPacket> = None;
+        let mut last: Option<PacketForwardingState> = None;
 
         // Alternate between two sources every 10 frames for 100 switches, each
         // source keeping its own unrelated timestamp base.

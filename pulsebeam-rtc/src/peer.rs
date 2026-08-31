@@ -1,14 +1,12 @@
+use crate::media_packet::{
+    DependencyRewrite, EncodedStreamDescriptor, ExtendedMediaSequence, ExtendedRtpTimestamp,
+    MediaPacket, MediaPacketError, MediaRewrite, NegotiatedExtensionIds, TransitMediaPacket,
+};
 use std::{
-    cell::OnceCell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    ops::Range,
     time::{Duration, Instant},
 };
-use str0m::rtp::ExtensionSerializer as _;
-
-#[cfg(test)]
-use std::cell::Cell;
 
 use crate::{
     ChannelId, ConnectionId, DataChannelError, DataChannelEvent, DatagramProtocol, EgressDatagram,
@@ -40,585 +38,6 @@ const INGRESS_NACK_INTERVAL: Duration = Duration::from_millis(33);
 const INGRESS_NACK_WINDOW: u64 = 100;
 const INGRESS_NACK_ATTEMPTS: u8 = 5;
 const REPAIRED_RID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(transparent)]
-pub struct ExtendedMediaSequence(u64);
-
-impl ExtendedMediaSequence {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(transparent)]
-pub struct ExtendedRtpTimestamp(u64);
-
-impl ExtendedRtpTimestamp {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DependencyRewrite(Box<[u8]>);
-
-impl DependencyRewrite {
-    pub fn new(bytes: Box<[u8]>) -> Self {
-        debug_assert!(!bytes.is_empty(), "a dependency rewrite contains bytes");
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MediaRewrite {
-    pub sequence: ExtendedMediaSequence,
-    pub timestamp: ExtendedRtpTimestamp,
-    pub marker: bool,
-    pub dependency: Option<DependencyRewrite>,
-}
-
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MediaPacketError {
-    #[error("malformed H.264 payload")]
-    MalformedH264,
-    #[error("malformed Opus payload")]
-    MalformedOpus,
-    #[error("invalid absolute capture time extension")]
-    InvalidAbsoluteCaptureTime,
-    #[error("invalid audio level extension")]
-    InvalidAudioLevel,
-    #[error("invalid dependency descriptor extension")]
-    InvalidDependencyDescriptor,
-    #[error("invalid video layers allocation extension")]
-    InvalidVideoLayersAllocation,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct H264NalMetadata {
-    idr: bool,
-    sps: bool,
-    pps: bool,
-    fragment_start: bool,
-    fragment_end: bool,
-}
-
-impl H264NalMetadata {
-    pub const fn idr(self) -> bool {
-        self.idr
-    }
-
-    pub const fn sps(self) -> bool {
-        self.sps
-    }
-
-    pub const fn pps(self) -> bool {
-        self.pps
-    }
-
-    pub const fn fragment_start(self) -> bool {
-        self.fragment_start
-    }
-
-    pub const fn fragment_end(self) -> bool {
-        self.fragment_end
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MediaSemantics {
-    keyframe: bool,
-    frame_start: bool,
-    h264: Option<H264NalMetadata>,
-    opus_toc: Option<u8>,
-}
-
-impl MediaSemantics {
-    pub const fn keyframe(self) -> bool {
-        self.keyframe
-    }
-
-    pub const fn frame_start(self) -> bool {
-        self.frame_start
-    }
-
-    pub const fn h264(self) -> Option<H264NalMetadata> {
-        self.h264
-    }
-
-    pub const fn opus_toc(self) -> Option<u8> {
-        self.opus_toc
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MediaExtensions<'a> {
-    absolute_capture_time: Option<&'a [u8]>,
-    audio_level: Option<i8>,
-    dependency_descriptor: Option<&'a [u8]>,
-    video_layers_allocation: Option<&'a VideoLayersAllocation>,
-}
-
-impl<'a> MediaExtensions<'a> {
-    pub const fn absolute_capture_time(self) -> Option<&'a [u8]> {
-        self.absolute_capture_time
-    }
-
-    pub const fn audio_level(self) -> Option<i8> {
-        self.audio_level
-    }
-
-    pub const fn dependency_descriptor(self) -> Option<&'a [u8]> {
-        self.dependency_descriptor
-    }
-
-    pub const fn video_layers_allocation(self) -> Option<&'a VideoLayersAllocation> {
-        self.video_layers_allocation
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VideoLayersAllocation {
-    current_stream: u8,
-    streams: Vec<VideoStreamAllocation>,
-}
-
-impl VideoLayersAllocation {
-    pub const fn current_stream(&self) -> u8 {
-        self.current_stream
-    }
-
-    pub fn streams(&self) -> &[VideoStreamAllocation] {
-        &self.streams
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VideoStreamAllocation {
-    spatial_layers: Vec<VideoSpatialLayerAllocation>,
-}
-
-impl VideoStreamAllocation {
-    pub fn spatial_layers(&self) -> &[VideoSpatialLayerAllocation] {
-        &self.spatial_layers
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VideoSpatialLayerAllocation {
-    cumulative_temporal_kbps: Vec<u64>,
-    resolution: Option<(u16, u16, u8)>,
-}
-
-impl VideoSpatialLayerAllocation {
-    pub fn cumulative_temporal_kbps(&self) -> &[u64] {
-        &self.cumulative_temporal_kbps
-    }
-
-    pub const fn resolution(&self) -> Option<(u16, u16, u8)> {
-        self.resolution
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct NegotiatedExtensionIds {
-    absolute_capture_time: Option<u8>,
-    audio_level: Option<u8>,
-    dependency_descriptor: Option<u8>,
-    video_layers_allocation: Option<u8>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ParsedMediaExtensions {
-    absolute_capture_time: Option<Range<usize>>,
-    audio_level: Option<i8>,
-    dependency_descriptor: Option<Range<usize>>,
-    video_layers_allocation: Option<VideoLayersAllocation>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct MediaParseCounts {
-    semantics: Cell<usize>,
-    extensions: Cell<usize>,
-}
-
-#[derive(Debug)]
-pub struct MediaPacket {
-    bytes: Vec<u8>,
-    stream: IngressStream,
-    mid: String,
-    rid: Option<String>,
-    kind: MediaKind,
-    codec: NegotiatedCodec,
-    sequence: ExtendedMediaSequence,
-    timestamp: ExtendedRtpTimestamp,
-    marker: bool,
-    payload: Range<usize>,
-    received_at: Instant,
-    packet_id: u64,
-    extension_entries: Box<[crate::packet::RtpExtensionEntry]>,
-    extension_ids: NegotiatedExtensionIds,
-    semantics: OnceCell<Result<MediaSemantics, MediaPacketError>>,
-    extensions: OnceCell<Result<ParsedMediaExtensions, MediaPacketError>>,
-    #[cfg(test)]
-    parse_counts: MediaParseCounts,
-}
-
-impl MediaPacket {
-    pub const fn stream(&self) -> IngressStream {
-        self.stream
-    }
-
-    pub fn mid(&self) -> &str {
-        &self.mid
-    }
-
-    pub fn rid(&self) -> Option<&str> {
-        self.rid.as_deref()
-    }
-
-    pub const fn kind(&self) -> MediaKind {
-        self.kind
-    }
-
-    pub const fn codec(&self) -> &NegotiatedCodec {
-        &self.codec
-    }
-
-    pub const fn sequence(&self) -> ExtendedMediaSequence {
-        self.sequence
-    }
-
-    pub const fn timestamp(&self) -> ExtendedRtpTimestamp {
-        self.timestamp
-    }
-
-    pub const fn marker(&self) -> bool {
-        self.marker
-    }
-
-    pub fn payload(&self) -> &[u8] {
-        self.bytes_at(self.payload.clone())
-    }
-
-    pub const fn received_at(&self) -> Instant {
-        self.received_at
-    }
-
-    pub const fn packet_id(&self) -> u64 {
-        self.packet_id
-    }
-
-    pub fn semantics(&self) -> Result<&MediaSemantics, MediaPacketError> {
-        self.semantics
-            .get_or_init(|| {
-                #[cfg(test)]
-                self.parse_counts
-                    .semantics
-                    .set(self.parse_counts.semantics.get().saturating_add(1));
-                parse_media_semantics(&self.codec, self.payload())
-            })
-            .as_ref()
-            .map_err(Clone::clone)
-    }
-
-    pub fn extensions(&self) -> Result<MediaExtensions<'_>, MediaPacketError> {
-        let parsed = self
-            .extensions
-            .get_or_init(|| {
-                #[cfg(test)]
-                self.parse_counts
-                    .extensions
-                    .set(self.parse_counts.extensions.get().saturating_add(1));
-                parse_media_extensions(&self.bytes, &self.extension_entries, self.extension_ids)
-            })
-            .as_ref()
-            .map_err(Clone::clone)?;
-        Ok(MediaExtensions {
-            absolute_capture_time: parsed
-                .absolute_capture_time
-                .clone()
-                .map(|range| self.bytes_at(range)),
-            audio_level: parsed.audio_level,
-            dependency_descriptor: parsed
-                .dependency_descriptor
-                .clone()
-                .map(|range| self.bytes_at(range)),
-            video_layers_allocation: parsed.video_layers_allocation.as_ref(),
-        })
-    }
-
-    fn bytes_at(&self, range: Range<usize>) -> &[u8] {
-        let Some(bytes) = self.bytes.get(range) else {
-            debug_assert!(false, "validated packet ranges remain within owned storage");
-            return &[];
-        };
-        bytes
-    }
-
-    fn cached_clone_with_bytes(&self, bytes: Vec<u8>) -> Self {
-        debug_assert_eq!(bytes.len(), self.bytes.len());
-        let semantics = OnceCell::new();
-        if let Some(value) = self.semantics.get() {
-            let result = semantics.set(value.clone());
-            debug_assert!(result.is_ok(), "a new semantic cache is empty");
-        }
-        let extensions = OnceCell::new();
-        if let Some(value) = self.extensions.get() {
-            let result = extensions.set(value.clone());
-            debug_assert!(result.is_ok(), "a new extension cache is empty");
-        }
-        Self {
-            bytes,
-            stream: self.stream,
-            mid: self.mid.clone(),
-            rid: self.rid.clone(),
-            kind: self.kind,
-            codec: self.codec.clone(),
-            sequence: self.sequence,
-            timestamp: self.timestamp,
-            marker: self.marker,
-            payload: self.payload.clone(),
-            received_at: self.received_at,
-            packet_id: self.packet_id,
-            extension_entries: self.extension_entries.clone(),
-            extension_ids: self.extension_ids,
-            semantics,
-            extensions,
-            #[cfg(test)]
-            parse_counts: MediaParseCounts::default(),
-        }
-    }
-
-    #[cfg(test)]
-    fn parse_count_values(&self) -> (usize, usize) {
-        (
-            self.parse_counts.semantics.get(),
-            self.parse_counts.extensions.get(),
-        )
-    }
-}
-
-#[derive(Debug)]
-pub struct TransitMediaPacket(MediaPacket);
-
-impl TransitMediaPacket {
-    pub fn materialize(packet: &MediaPacket) -> Self {
-        let bytes = packet.bytes.to_vec();
-        debug_assert_ne!(bytes.as_ptr(), packet.bytes.as_ptr());
-        Self(packet.cached_clone_with_bytes(bytes))
-    }
-
-    pub const fn packet(&self) -> &MediaPacket {
-        &self.0
-    }
-}
-
-fn parse_media_semantics(
-    codec: &NegotiatedCodec,
-    payload: &[u8],
-) -> Result<MediaSemantics, MediaPacketError> {
-    if codec.name.eq_ignore_ascii_case("h264") {
-        return parse_h264_semantics(payload);
-    }
-    if codec.name.eq_ignore_ascii_case("opus") {
-        let toc = *payload.first().ok_or(MediaPacketError::MalformedOpus)?;
-        return Ok(MediaSemantics {
-            keyframe: true,
-            frame_start: true,
-            h264: None,
-            opus_toc: Some(toc),
-        });
-    }
-    Ok(MediaSemantics {
-        keyframe: false,
-        frame_start: true,
-        h264: None,
-        opus_toc: None,
-    })
-}
-
-fn parse_h264_semantics(payload: &[u8]) -> Result<MediaSemantics, MediaPacketError> {
-    let first = *payload.first().ok_or(MediaPacketError::MalformedH264)?;
-    let packet_type = first & 0x1f;
-    let mut nal = H264NalMetadata::default();
-    let frame_start = match packet_type {
-        1..=23 => {
-            mark_h264_type(&mut nal, packet_type);
-            true
-        }
-        24 => {
-            let mut offset = 1usize;
-            while offset < payload.len() {
-                let length_end = offset
-                    .checked_add(2)
-                    .ok_or(MediaPacketError::MalformedH264)?;
-                let length = payload
-                    .get(offset..length_end)
-                    .and_then(|value| value.try_into().ok())
-                    .map(u16::from_be_bytes)
-                    .map(usize::from)
-                    .ok_or(MediaPacketError::MalformedH264)?;
-                if length == 0 {
-                    return Err(MediaPacketError::MalformedH264);
-                }
-                let nal_start = length_end;
-                let nal_end = nal_start
-                    .checked_add(length)
-                    .ok_or(MediaPacketError::MalformedH264)?;
-                let nal_type = payload
-                    .get(nal_start..nal_end)
-                    .and_then(|value| value.first())
-                    .map(|value| value & 0x1f)
-                    .ok_or(MediaPacketError::MalformedH264)?;
-                mark_h264_type(&mut nal, nal_type);
-                offset = nal_end;
-            }
-            true
-        }
-        28 => {
-            let fu = *payload.get(1).ok_or(MediaPacketError::MalformedH264)?;
-            mark_h264_type(&mut nal, fu & 0x1f);
-            nal.fragment_start = fu & 0x80 != 0;
-            nal.fragment_end = fu & 0x40 != 0;
-            nal.idr &= nal.fragment_start;
-            nal.fragment_start
-        }
-        _ => true,
-    };
-    Ok(MediaSemantics {
-        keyframe: nal.idr,
-        frame_start,
-        h264: Some(nal),
-        opus_toc: None,
-    })
-}
-
-fn mark_h264_type(metadata: &mut H264NalMetadata, nal_type: u8) {
-    match nal_type {
-        5 => metadata.idr = true,
-        7 => metadata.sps = true,
-        8 => metadata.pps = true,
-        _ => {}
-    }
-}
-
-fn parse_media_extensions(
-    bytes: &[u8],
-    entries: &[crate::packet::RtpExtensionEntry],
-    ids: NegotiatedExtensionIds,
-) -> Result<ParsedMediaExtensions, MediaPacketError> {
-    let absolute_capture_time = ids
-        .absolute_capture_time
-        .and_then(|id| extension_range(entries, id));
-    if absolute_capture_time
-        .as_ref()
-        .is_some_and(|range| !matches!(range.len(), 8 | 16))
-    {
-        return Err(MediaPacketError::InvalidAbsoluteCaptureTime);
-    }
-    let audio_level =
-        if let Some(range) = ids.audio_level.and_then(|id| extension_range(entries, id)) {
-            let value = bytes
-                .get(range)
-                .and_then(|value| value.first())
-                .copied()
-                .ok_or(MediaPacketError::InvalidAudioLevel)?;
-            i8::try_from(value & 0x7f).ok().and_then(i8::checked_neg)
-        } else {
-            None
-        };
-    let dependency_descriptor = ids
-        .dependency_descriptor
-        .and_then(|id| extension_range(entries, id));
-    if dependency_descriptor.as_ref().is_some_and(Range::is_empty) {
-        return Err(MediaPacketError::InvalidDependencyDescriptor);
-    }
-    let video_layers_allocation = ids
-        .video_layers_allocation
-        .and_then(|id| extension_range(entries, id))
-        .map(|range| {
-            bytes
-                .get(range)
-                .and_then(parse_video_layers_allocation)
-                .ok_or(MediaPacketError::InvalidVideoLayersAllocation)
-        })
-        .transpose()?;
-    Ok(ParsedMediaExtensions {
-        absolute_capture_time,
-        audio_level,
-        dependency_descriptor,
-        video_layers_allocation,
-    })
-}
-
-fn parse_video_layers_allocation(bytes: &[u8]) -> Option<VideoLayersAllocation> {
-    let mut values = str0m::rtp::ExtensionValues::default();
-    if !str0m::rtp::vla::Serializer.parse_value(bytes, &mut values) {
-        return None;
-    }
-    let parsed = values
-        .user_values
-        .get::<str0m::rtp::vla::VideoLayersAllocation>()?;
-    debug_assert!(parsed.simulcast_streams.len() <= 5);
-    debug_assert!(
-        parsed
-            .simulcast_streams
-            .iter()
-            .all(|stream| stream.spatial_layers.len() <= 4)
-    );
-    debug_assert!(parsed.simulcast_streams.iter().all(|stream| {
-        stream
-            .spatial_layers
-            .iter()
-            .all(|spatial| spatial.temporal_layers.len() <= 5)
-    }));
-    Some(VideoLayersAllocation {
-        current_stream: parsed.current_simulcast_stream_index,
-        streams: parsed
-            .simulcast_streams
-            .iter()
-            .map(|stream| VideoStreamAllocation {
-                spatial_layers: stream
-                    .spatial_layers
-                    .iter()
-                    .map(|spatial| VideoSpatialLayerAllocation {
-                        cumulative_temporal_kbps: spatial
-                            .temporal_layers
-                            .iter()
-                            .map(|temporal| temporal.cumulative_kbps)
-                            .collect(),
-                        resolution: spatial
-                            .resolution_and_framerate
-                            .as_ref()
-                            .map(|value| (value.width, value.height, value.framerate)),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    })
-}
-
-fn extension_range(entries: &[crate::packet::RtpExtensionEntry], id: u8) -> Option<Range<usize>> {
-    entries
-        .iter()
-        .find(|entry| entry.id() == id)
-        .map(crate::packet::RtpExtensionEntry::value)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -816,6 +235,7 @@ struct IngressFacts {
     stream: IngressStream,
     section: MediaSectionId,
     rid: Option<String>,
+    descriptor: EncodedStreamDescriptor,
 }
 
 #[derive(Clone)]
@@ -1205,7 +625,8 @@ impl RtcPeer {
                 datagram.destination,
             ),
             PacketId::new(self.next_packet_id),
-        );
+        )
+        .with_playout_time(datagram.playout_time());
         self.next_packet_id = self.next_packet_id.wrapping_add(1);
         self.connection
             .handle_datagram(now, IngressPacket::new(&datagram.bytes, provenance))?;
@@ -1339,7 +760,7 @@ impl RtcPeer {
         packet: &TransitMediaPacket,
         rewrite: MediaRewrite,
     ) -> Result<(), RtcPeerError> {
-        self.forward_packet(now, slot, &packet.0, rewrite)
+        self.forward_packet(now, slot, packet.packet(), rewrite)
     }
 
     pub fn request_keyframe(
@@ -1554,10 +975,14 @@ impl RtcPeer {
         {
             return Err(RtcPeerError::InvalidRewrite);
         }
-        let destination = self.validate_forward(slot, packet)?;
+        let descriptor = self
+            .ingress_descriptor(packet.stream())
+            .ok_or(RtcPeerError::UnknownIngress)?
+            .clone();
+        let destination = self.validate_forward(slot, &descriptor)?;
         #[cfg(test)]
         {
-            self.last_forward_storage = Some(packet.bytes.as_ptr() as usize);
+            self.last_forward_storage = Some(packet.bytes().as_ptr() as usize);
         }
         debug_assert_eq!(
             destination.section,
@@ -1566,25 +991,27 @@ impl RtcPeer {
                 .map(|facts| facts.section)
                 .unwrap_or(destination.section)
         );
-        let extensions = packet.extensions()?;
+        let absolute_capture_time = packet.absolute_capture_time(&descriptor)?;
+        let audio_level = packet.audio_level(&descriptor)?;
+        let dependency_descriptor = packet.dependency_descriptor(&descriptor)?;
         let dependency_descriptor = rewrite
             .dependency
             .as_ref()
             .map(DependencyRewrite::as_bytes)
-            .or_else(|| extensions.dependency_descriptor());
+            .or(dependency_descriptor);
         self.media_egress
             .admit(
                 slot,
                 ForwardAdmission {
-                    codec: packet.codec.name(),
+                    codec: descriptor.codec().name(),
                     logical_sequence: rewrite.sequence.get(),
                     timestamp: rewrite.timestamp.get(),
                     marker: rewrite.marker,
                     payload: packet.payload(),
-                    absolute_capture_time: extensions.absolute_capture_time(),
-                    audio_level: extensions.audio_level(),
+                    absolute_capture_time,
+                    audio_level,
                     dependency_descriptor,
-                    ingress_at: packet.received_at,
+                    ingress_at: packet.received_at(),
                     admitted_at: now,
                 },
             )
@@ -1594,18 +1021,18 @@ impl RtcPeer {
     fn validate_forward(
         &self,
         slot: EgressSlot,
-        packet: &MediaPacket,
+        descriptor: &EncodedStreamDescriptor,
     ) -> Result<EgressFacts, RtcPeerError> {
         let destination = self
             .egress
             .get(&slot)
             .cloned()
             .ok_or(RtcPeerError::UnknownEgress)?;
-        if destination.kind != packet.kind
+        if destination.kind != descriptor.kind()
             || !destination
                 .codecs
                 .iter()
-                .any(|codec| codec.eq_ignore_ascii_case(packet.codec.name()))
+                .any(|codec| codec.eq_ignore_ascii_case(descriptor.codec().name()))
         {
             return Err(RtcPeerError::IncompatibleMedia);
         }
@@ -1634,16 +1061,7 @@ impl RtcPeer {
                 if packet.ssrc() == 0 {
                     return None;
                 }
-                let (
-                    section_id,
-                    mid,
-                    rid,
-                    kind,
-                    codec,
-                    extension_ids,
-                    retransmission,
-                    recovery_enabled,
-                ) = {
+                let (section_id, rid, codec, retransmission, recovery_enabled) = {
                     let section = self.known_ingress_section(packet.ssrc()).or_else(|| {
                         resolve_ingress_section(
                             self.connection.session(),
@@ -1667,11 +1085,8 @@ impl RtcPeer {
                     .and_then(|id| extension_text(&extension_entries, packet.bytes(), id));
                     (
                         section.id(),
-                        section.mid().to_owned(),
                         rid,
-                        section.kind(),
                         NegotiatedCodec::from(codec),
-                        extension_ids.media,
                         retransmission,
                         codec.nack() && codec.retransmission_payload_type().is_some(),
                     )
@@ -1720,42 +1135,21 @@ impl RtcPeer {
                 if retransmission {
                     metrics::counter!("rtc_ingress_rtx_recovered").increment(1);
                 }
-                let fields = (
-                    stream,
-                    mid,
-                    rid,
-                    kind,
-                    codec,
-                    ExtendedMediaSequence::new(sequence),
-                    ExtendedRtpTimestamp::new(timestamp),
-                    packet.marker(),
-                    payload,
-                    packet.provenance().received_at(),
-                    packet.provenance().packet_id().get(),
-                    extension_entries,
-                    extension_ids,
-                );
-                let (bytes, _) = authenticated.into_parts();
-                Some(RtcEvent::Media(MediaPacket {
+                let marker = packet.marker();
+                let raw_timestamp = packet.timestamp();
+                let (bytes, provenance) = authenticated.into_parts();
+                Some(RtcEvent::Media(MediaPacket::new(
                     bytes,
-                    stream: fields.0,
-                    mid: fields.1,
-                    rid: fields.2,
-                    kind: fields.3,
-                    codec: fields.4,
-                    sequence: fields.5,
-                    timestamp: fields.6,
-                    marker: fields.7,
-                    payload: fields.8,
-                    received_at: fields.9,
-                    packet_id: fields.10,
-                    extension_entries: fields.11,
-                    extension_ids: fields.12,
-                    semantics: OnceCell::new(),
-                    extensions: OnceCell::new(),
-                    #[cfg(test)]
-                    parse_counts: MediaParseCounts::default(),
-                }))
+                    stream,
+                    ExtendedMediaSequence::new(sequence),
+                    raw_timestamp,
+                    ExtendedRtpTimestamp::new(timestamp),
+                    marker,
+                    payload,
+                    extension_entries,
+                    provenance,
+                    provenance.playout_time(),
+                )))
             }
             PacketView::Rtcp(packet) => {
                 let received_at = authenticated.provenance().received_at();
@@ -1819,6 +1213,13 @@ impl RtcPeer {
             "new SSRCs have no previous stream mapping"
         );
         Some(stream)
+    }
+
+    fn ingress_descriptor(&self, stream: IngressStream) -> Option<&EncodedStreamDescriptor> {
+        self.ingress
+            .iter()
+            .find(|facts| facts.stream == stream)
+            .map(|facts| &facts.descriptor)
     }
 
     fn known_ingress_section(&self, ssrc: u32) -> Option<&NegotiatedMediaSection> {
@@ -2235,7 +1636,7 @@ fn build_media_facts(
     let mut next_egress = 1u32;
     for section in session.media_sections() {
         if section.kind() == MediaKind::Application {
-            media.push(negotiated_media(section, None, None, None));
+            media.push(negotiated_media(section, None, None, None, None));
             continue;
         }
         match section.direction() {
@@ -2245,28 +1646,39 @@ fn build_media_facts(
                     next_ingress = next_ingress
                         .checked_add(1)
                         .ok_or(RtcPeerError::UnknownIngress)?;
+                    let descriptor = ingress_descriptor(section, stream, None)?;
                     ingress.push(IngressFacts {
                         stream,
                         section: section.id(),
                         rid: None,
+                        descriptor: descriptor.clone(),
                     });
-                    media.push(negotiated_media(section, Some(stream), None, None));
+                    media.push(negotiated_media(
+                        section,
+                        Some(stream),
+                        None,
+                        None,
+                        Some(descriptor),
+                    ));
                 } else {
                     for rid in section.receive_rids() {
                         let stream = IngressStream::new(next_ingress);
                         next_ingress = next_ingress
                             .checked_add(1)
                             .ok_or(RtcPeerError::UnknownIngress)?;
+                        let descriptor = ingress_descriptor(section, stream, Some(rid.clone()))?;
                         ingress.push(IngressFacts {
                             stream,
                             section: section.id(),
                             rid: Some(rid.clone()),
+                            descriptor: descriptor.clone(),
                         });
                         media.push(negotiated_media(
                             section,
                             Some(stream),
                             None,
                             Some(rid.clone()),
+                            Some(descriptor),
                         ));
                     }
                 }
@@ -2297,10 +1709,10 @@ fn build_media_facts(
                             .into_boxed_slice(),
                     },
                 );
-                media.push(negotiated_media(section, None, Some(slot), None));
+                media.push(negotiated_media(section, None, Some(slot), None, None));
             }
             MediaDirection::Inactive | MediaDirection::Bidirectional => {
-                media.push(negotiated_media(section, None, None, None));
+                media.push(negotiated_media(section, None, None, None, None));
             }
         }
     }
@@ -2316,6 +1728,7 @@ fn negotiated_media(
     ingress: Option<IngressStream>,
     egress: Option<EgressSlot>,
     rid: Option<String>,
+    descriptor: Option<EncodedStreamDescriptor>,
 ) -> NegotiatedMedia {
     NegotiatedMedia {
         ingress,
@@ -2330,7 +1743,27 @@ fn negotiated_media(
             .map(NegotiatedCodec::from)
             .collect::<Vec<_>>()
             .into_boxed_slice(),
+        descriptor,
     }
+}
+
+fn ingress_descriptor(
+    section: &NegotiatedMediaSection,
+    stream: IngressStream,
+    rid: Option<String>,
+) -> Result<EncodedStreamDescriptor, RtcPeerError> {
+    let codec = section
+        .codecs()
+        .first()
+        .ok_or(RtcPeerError::UnknownIngress)?;
+    Ok(EncodedStreamDescriptor::new(
+        stream,
+        section.mid().to_owned(),
+        rid,
+        section.kind(),
+        NegotiatedCodec::from(codec),
+        negotiated_extension_ids(section).media,
+    ))
 }
 
 fn allocate_ssrc(connection_id: u64, slot: EgressSlot, used: &mut HashSet<u32>) -> u32 {
@@ -2439,6 +1872,9 @@ fn negotiated_extension_ids(section: &NegotiatedMediaSection) -> SectionExtensio
         rid: extension_id(section, |uri| uri == RID_URI),
         repaired_rid: extension_id(section, |uri| uri == REPAIRED_RID_URI),
         media: NegotiatedExtensionIds {
+            mid: extension_id(section, |uri| uri == MID_URI),
+            rid: extension_id(section, |uri| uri == RID_URI),
+            repaired_rid: extension_id(section, |uri| uri == REPAIRED_RID_URI),
             absolute_capture_time: extension_id(section, |uri| uri == ABS_CAPTURE_TIME_URI),
             audio_level: extension_id(section, |uri| uri.contains(AUDIO_LEVEL_URI)),
             dependency_descriptor: extension_id(section, |uri| {
@@ -2549,12 +1985,22 @@ fn extension_value<'a>(
     bytes.get(extension_range(entries, id)?)
 }
 
+fn extension_range(
+    entries: &[crate::packet::RtpExtensionEntry],
+    id: u8,
+) -> Option<std::ops::Range<usize>> {
+    entries
+        .iter()
+        .find(|entry| entry.id() == id)
+        .map(crate::packet::RtpExtensionEntry::value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, time::Duration};
 
     use super::*;
-    use crate::{Codec, TransportProtocol};
+    use crate::TransportProtocol;
 
     fn offer(direction: &str) -> String {
         format!(
@@ -2713,98 +2159,6 @@ mod tests {
         )
     }
 
-    fn media_packet(codec: &str, payload: &[u8], extensions: &[(u8, &[u8])]) -> MediaPacket {
-        let now = Instant::now();
-        let mut bytes = vec![0x80, 96, 0xff, 0xfe, 0xff, 0xff, 0xff, 0xfe, 0, 0, 0, 7];
-        if !extensions.is_empty() {
-            bytes[0] |= 0x10;
-            let mut extension_bytes = Vec::new();
-            for (id, value) in extensions {
-                assert!((1..15).contains(id));
-                assert!((1..=16).contains(&value.len()));
-                let encoded_length = value
-                    .len()
-                    .checked_sub(1)
-                    .and_then(|length| u8::try_from(length).ok())
-                    .expect("length");
-                extension_bytes.push((id << 4) | encoded_length);
-                extension_bytes.extend_from_slice(value);
-            }
-            while !extension_bytes.len().is_multiple_of(4) {
-                extension_bytes.push(0);
-            }
-            bytes.extend_from_slice(&0xbedeu16.to_be_bytes());
-            bytes.extend_from_slice(
-                &u16::try_from(extension_bytes.len() / 4)
-                    .expect("extension words")
-                    .to_be_bytes(),
-            );
-            bytes.extend_from_slice(&extension_bytes);
-        }
-        bytes.extend_from_slice(payload);
-        let provenance = PacketProvenance::new(
-            now,
-            TransportMetadata::new(
-                TransportProtocol::Udp,
-                SocketAddr::from(([127, 0, 0, 1], 9001)),
-                SocketAddr::from(([127, 0, 0, 1], 9000)),
-            ),
-            PacketId::new(19),
-        );
-        let packet = match IngressPacket::new(&bytes, provenance)
-            .parse()
-            .expect("RTP packet")
-        {
-            PacketView::Rtp(packet) => packet,
-            PacketView::Rtcp(_) => panic!("RTP packet"),
-        };
-        let payload = packet.payload_range();
-        let extension_entries = packet.extension_entries().expect("extensions");
-        let negotiated_codec = Codec::new(
-            96,
-            codec.to_owned(),
-            if codec.eq_ignore_ascii_case("opus") {
-                48_000
-            } else {
-                90_000
-            },
-            codec.eq_ignore_ascii_case("opus").then_some(2),
-            None,
-            false,
-            false,
-            false,
-            false,
-        );
-        MediaPacket {
-            bytes,
-            stream: IngressStream::new(1),
-            mid: "0".to_owned(),
-            rid: Some("f".to_owned()),
-            kind: if codec.eq_ignore_ascii_case("opus") {
-                MediaKind::Audio
-            } else {
-                MediaKind::Video
-            },
-            codec: NegotiatedCodec::from(&negotiated_codec),
-            sequence: ExtendedMediaSequence::new(65_534),
-            timestamp: ExtendedRtpTimestamp::new(u64::from(u32::MAX).saturating_sub(1)),
-            marker: false,
-            payload,
-            received_at: now,
-            packet_id: 19,
-            extension_entries,
-            extension_ids: NegotiatedExtensionIds {
-                absolute_capture_time: Some(1),
-                audio_level: Some(2),
-                dependency_descriptor: Some(3),
-                video_layers_allocation: Some(5),
-            },
-            semantics: OnceCell::new(),
-            extensions: OnceCell::new(),
-            parse_counts: MediaParseCounts::default(),
-        }
-    }
-
     #[test]
     fn rtc_peer_is_send() {
         fn assert_send<T: Send>() {}
@@ -2944,6 +2298,7 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 9001)),
             SocketAddr::from(([127, 0, 0, 1], 9000)),
             vec![1],
+            std::time::SystemTime::UNIX_EPOCH,
         );
 
         assert_eq!(
@@ -2974,158 +2329,6 @@ mod tests {
             DepartureReceipt,
             Instant,
         ) -> Result<Option<ForwardingLatency>, RtcPeerError> = RtcPeer::confirm_departure;
-    }
-
-    #[test]
-    fn media_components_parse_once_in_any_access_order() {
-        let stap = [24, 0, 2, 0x67, 0, 0, 2, 0x68, 0, 0, 2, 0x65, 0];
-        let capture = [1, 2, 3, 4, 5, 6, 7, 8];
-        let audio = [42];
-        let dependency = [9, 10, 11];
-        let video_layers = [0b0110_0001, 0b0101_0100, 1, 2, 4, 8, 16, 32];
-        let packet = media_packet(
-            "H264",
-            &stap,
-            &[
-                (1, &capture),
-                (2, &audio),
-                (3, &dependency),
-                (5, &video_layers),
-            ],
-        );
-
-        let extensions = packet.extensions().expect("extensions");
-        assert_eq!(extensions.absolute_capture_time(), Some(capture.as_slice()));
-        assert_eq!(extensions.audio_level(), Some(-42));
-        assert_eq!(
-            extensions.dependency_descriptor(),
-            Some(dependency.as_slice())
-        );
-        let allocation = extensions
-            .video_layers_allocation()
-            .expect("video layers allocation");
-        assert_eq!(allocation.current_stream(), 1);
-        assert_eq!(allocation.streams().len(), 3);
-        assert_eq!(
-            allocation.streams()[0].spatial_layers()[0].cumulative_temporal_kbps(),
-            &[1, 2]
-        );
-        assert_eq!(
-            allocation.streams()[1].spatial_layers()[0].cumulative_temporal_kbps(),
-            &[4, 8]
-        );
-        assert_eq!(
-            allocation.streams()[2].spatial_layers()[0].cumulative_temporal_kbps(),
-            &[16, 32]
-        );
-        let semantics = *packet.semantics().expect("H.264 semantics");
-        assert!(semantics.keyframe());
-        assert!(semantics.frame_start());
-        let nal = semantics.h264().expect("H.264 metadata");
-        assert!(nal.idr());
-        assert!(nal.sps());
-        assert!(nal.pps());
-
-        let _ = packet.semantics().expect("cached semantics");
-        let _ = packet.extensions().expect("cached extensions");
-        assert_eq!(packet.parse_count_values(), (1, 1));
-
-        let reverse = media_packet(
-            "H264",
-            &stap,
-            &[
-                (1, &capture),
-                (2, &audio),
-                (3, &dependency),
-                (5, &video_layers),
-            ],
-        );
-        let _ = reverse.semantics().expect("semantics first");
-        let _ = reverse.extensions().expect("extensions second");
-        let _ = reverse.payload();
-        let _ = reverse.rid();
-        let _ = reverse.semantics().expect("cached semantics");
-        assert_eq!(reverse.parse_count_values(), (1, 1));
-    }
-
-    #[test]
-    fn malformed_and_absent_components_are_cached() {
-        let malformed_payload = media_packet("H264", &[], &[]);
-        assert_eq!(
-            malformed_payload.semantics(),
-            Err(MediaPacketError::MalformedH264)
-        );
-        assert_eq!(
-            malformed_payload.semantics(),
-            Err(MediaPacketError::MalformedH264)
-        );
-        assert_eq!(malformed_payload.parse_count_values(), (1, 0));
-
-        let invalid_capture = [1, 2, 3];
-        let malformed_extension = media_packet("H264", &[0x61], &[(1, &invalid_capture)]);
-        assert_eq!(
-            malformed_extension.extensions(),
-            Err(MediaPacketError::InvalidAbsoluteCaptureTime)
-        );
-        assert_eq!(
-            malformed_extension.extensions(),
-            Err(MediaPacketError::InvalidAbsoluteCaptureTime)
-        );
-        assert_eq!(malformed_extension.parse_count_values(), (0, 1));
-
-        let invalid_video_layers = [0b0110_0000];
-        let malformed_video_layers = media_packet("H264", &[0x61], &[(5, &invalid_video_layers)]);
-        assert_eq!(
-            malformed_video_layers.extensions(),
-            Err(MediaPacketError::InvalidVideoLayersAllocation)
-        );
-        assert_eq!(
-            malformed_video_layers.extensions(),
-            Err(MediaPacketError::InvalidVideoLayersAllocation)
-        );
-        assert_eq!(malformed_video_layers.parse_count_values(), (0, 1));
-
-        let absent = media_packet("H264", &[0x61], &[]);
-        assert_eq!(
-            absent.extensions(),
-            Ok(MediaExtensions {
-                absolute_capture_time: None,
-                audio_level: None,
-                dependency_descriptor: None,
-                video_layers_allocation: None,
-            })
-        );
-        assert_eq!(absent.parse_count_values(), (0, 1));
-
-        let continuation = media_packet("H264", &[28, 5, 1], &[]);
-        let continuation = *continuation.semantics().expect("FU-A continuation");
-        assert!(!continuation.keyframe());
-        assert!(!continuation.frame_start());
-
-        let opus = media_packet("opus", &[0x78, 1], &[]);
-        let opus = *opus.semantics().expect("Opus semantics");
-        assert!(opus.keyframe());
-        assert!(opus.frame_start());
-        assert_eq!(opus.opus_toc(), Some(0x78));
-    }
-
-    #[test]
-    fn transit_materialization_copies_storage_once_and_preserves_caches() {
-        let packet = media_packet("H264", &[0x65, 1, 2], &[]);
-        let source_payload = packet.payload().as_ptr();
-        let _ = packet.semantics().expect("semantics");
-        let _ = packet.extensions().expect("extensions");
-
-        let transit = TransitMediaPacket::materialize(&packet);
-
-        assert_ne!(source_payload, transit.packet().payload().as_ptr());
-        assert_eq!(transit.packet().stream(), packet.stream());
-        assert_eq!(transit.packet().sequence(), packet.sequence());
-        assert_eq!(transit.packet().timestamp(), packet.timestamp());
-        assert_eq!(transit.packet().received_at(), packet.received_at());
-        let _ = transit.packet().semantics().expect("preserved semantics");
-        let _ = transit.packet().extensions().expect("preserved extensions");
-        assert_eq!(transit.packet().parse_count_values(), (0, 0));
     }
 
     #[test]
@@ -3183,54 +2386,6 @@ mod tests {
         assert_eq!(nacks.len(), 1);
         assert_eq!(nacks[0].media_ssrc(), 9);
         assert_eq!(nacks[0].sequences(), missing);
-    }
-
-    #[test]
-    fn forwarding_admission_borrows_local_and_transit_storage_for_gapped_rewrites() {
-        let now = Instant::now();
-        let (mut peer, slot) = forwarding_peer(now);
-        let packet = media_packet("H264", &[0x61, 1, 2], &[]);
-        let admitted_at = packet.received_at();
-        let local_storage = packet.bytes.as_ptr() as usize;
-
-        for sequence in [100, 102, 101] {
-            let result = peer.forward(
-                admitted_at,
-                slot,
-                &packet,
-                MediaRewrite {
-                    sequence: ExtendedMediaSequence::new(sequence),
-                    timestamp: ExtendedRtpTimestamp::new(sequence.saturating_mul(3_000)),
-                    marker: true,
-                    dependency: None,
-                },
-            );
-            assert_eq!(result, Ok(()));
-            assert_eq!(peer.last_forward_storage, Some(local_storage));
-        }
-
-        let transit = TransitMediaPacket::materialize(&packet);
-        let transit_storage = transit.packet().bytes.as_ptr() as usize;
-        assert_ne!(local_storage, transit_storage);
-        let result = peer.forward_transit(
-            admitted_at,
-            slot,
-            &transit,
-            MediaRewrite {
-                sequence: ExtendedMediaSequence::new(103),
-                timestamp: ExtendedRtpTimestamp::new(9_000),
-                marker: true,
-                dependency: None,
-            },
-        );
-        assert_eq!(result, Ok(()));
-        assert_eq!(peer.last_forward_storage, Some(transit_storage));
-
-        let audio = media_packet("opus", &[0x78, 1], &[]);
-        assert!(matches!(
-            peer.validate_forward(slot, &audio),
-            Err(RtcPeerError::IncompatibleMedia)
-        ));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::participant::{
     ForwardPacket, ParticipantInput, RoutedTrackPacket, TrackPacket, TrackPacketRef,
 };
 use crate::route::{Envelope, RouteAction, RouteRuntime};
-use crate::rtp::{RtpPacket, cache::TrackStreamCache};
+use crate::rtp::{PacketForwardingState, cache::TrackStreamCache};
 use slotmap::SecondaryMap;
 
 use super::worker::{MediaPayload, ShardFrame};
@@ -223,7 +223,9 @@ impl ShardRuntime {
                     RoutedTrackPacket {
                         key,
                         packet: TrackPacket::Rtp {
-                            packet: packet.to_transit(),
+                            packet: packet.clone(),
+                            encoding: cache.encoding_of(&packet),
+                            audio_level_extension: None,
                             media: ForwardPacket::Transit(media.materialize()),
                         },
                     },
@@ -239,7 +241,9 @@ impl ShardRuntime {
         &mut self,
         key: TrackKey,
         origin: Origin,
-        pkt: RtpPacket,
+        pkt: PacketForwardingState,
+        encoding: Option<crate::rtp::EncodingId>,
+        audio_level_extension: Option<u8>,
         media: ForwardPacket,
         plan: &crate::shard_update::TrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
@@ -248,16 +252,15 @@ impl ShardRuntime {
             debug_assert!(false, "an RTP packet must resolve to a live track");
             return;
         };
-        let rid = pkt.extensions.rid;
         let seq = pkt.seq_no;
         let too_old;
         let (packet, media, cache) = if let Some(track_cache) = runtime.cache.as_mut() {
-            too_old = track_cache.push_forward(pkt, media);
-            let Some(packet) = too_old
-                .as_ref()
-                .map(|(packet, _)| packet)
-                .or_else(|| track_cache.encoding(rid).and_then(|stream| stream.get(seq)))
-            else {
+            too_old = track_cache.push_forward(pkt, media, encoding);
+            let Some(packet) = too_old.as_ref().map(|(packet, _)| packet).or_else(|| {
+                track_cache
+                    .encoding(encoding)
+                    .and_then(|stream| stream.get(seq))
+            }) else {
                 debug_assert!(false, "a cached packet must be readable");
                 return;
             };
@@ -278,7 +281,12 @@ impl ShardRuntime {
                 ctx,
                 subscriber,
                 key,
-                TrackPacketRef::Rtp { packet, media },
+                TrackPacketRef::Rtp {
+                    packet,
+                    encoding,
+                    audio_level_extension,
+                    media,
+                },
                 cache,
             );
         });
@@ -291,7 +299,9 @@ impl ShardRuntime {
                 || RoutedTrackPacket {
                     key,
                     packet: TrackPacket::Rtp {
-                        packet: packet.to_transit(),
+                        packet: packet.clone(),
+                        encoding,
+                        audio_level_extension,
                         media: ForwardPacket::Transit(media.materialize()),
                     },
                 },
@@ -310,8 +320,22 @@ impl ShardRuntime {
     ) {
         debug_assert_eq!(packet.key, key);
         match packet.packet {
-            TrackPacket::Rtp { packet, media } => {
-                self.route_rtp_with_plan(key, origin, packet, media, plan, ctx);
+            TrackPacket::Rtp {
+                packet,
+                encoding,
+                audio_level_extension,
+                media,
+            } => {
+                self.route_rtp_with_plan(
+                    key,
+                    origin,
+                    packet,
+                    encoding,
+                    audio_level_extension,
+                    media,
+                    plan,
+                    ctx,
+                );
             }
             TrackPacket::Data { lane, bytes } => {
                 self.route_data_with_plan(key, origin, lane, bytes, plan, ctx);

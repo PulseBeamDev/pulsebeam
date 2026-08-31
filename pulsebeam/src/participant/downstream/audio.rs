@@ -7,9 +7,10 @@ use tokio::time::Instant;
 use crate::control::MAX_SEND_AUDIO_SLOTS;
 use crate::entity::{AudioOrigin, TrackId};
 use crate::log::{LogCtx, plog_debug, plog_warn};
+use crate::participant::ForwardPacket;
 use crate::participant::downstream::SlotConfig;
 use crate::participant::intent::AudioIntent;
-use crate::rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline};
+use crate::rtp::{AUDIO_FREQUENCY, PacketForwardingState, timeline::Timeline};
 use crate::track::StreamWriter;
 use std::ops::{Deref, DerefMut};
 
@@ -267,13 +268,22 @@ impl AudioAllocator {
     /// The owner of a slot is never made to re-contend for it, so a speaker holds their slot while
     /// they keep talking. A newcomer takes a dead slot if there is one, and otherwise the quietest
     /// slot not under newborn immunity, and only if it is genuinely louder than what is there.
-    pub fn on_rtp(
+    pub fn on_rtp_with_media(
         &mut self,
         origin: AudioOrigin,
-        pkt: &RtpPacket,
+        pkt: &PacketForwardingState,
+        media: &ForwardPacket,
+        audio_level_extension: Option<u8>,
         writer: &mut StreamWriter,
     ) -> Option<()> {
-        let Some(level_dbov) = pkt.extensions.audio_level else {
+        let level_dbov = media
+            .packet()
+            .audio_level_with_extension_id(audio_level_extension)
+            .ok()
+            .flatten();
+        #[cfg(test)]
+        let level_dbov = level_dbov.or(pkt.test_audio_level);
+        let Some(level_dbov) = level_dbov else {
             plog_warn!(
                 self.ctx,
                 target: crate::log::TARGET_AUDIO,
@@ -322,13 +332,58 @@ impl AudioAllocator {
             pkt.marker = true;
             slot.pending_marker = false;
         }
-        let Some(pt) = slot.payload_types.get(pkt.codec) else {
+        let Some(pt) = slot.payload_types.get(crate::rtp::Codec::Opus) else {
             debug_assert!(
                 false,
                 "forwarded audio codec must be negotiated by the egress slot"
             );
             return None;
         };
+        writer.write_audio_owned(pkt, slot.mid, slot.ssrc, pt);
+        Some(())
+    }
+
+    #[cfg(test)]
+    pub fn on_rtp(
+        &mut self,
+        origin: AudioOrigin,
+        pkt: &PacketForwardingState,
+        writer: &mut StreamWriter,
+    ) -> Option<()> {
+        let level_dbov = pkt.test_audio_level?;
+        let power = rfc6464_to_power(level_dbov);
+        let now = pkt.arrival_ts;
+        for slot in self.slots.iter_mut().flatten() {
+            slot.last_power = decayed_power(slot.last_power, slot.last_arrival_ts, now);
+        }
+        let idx = self.slot_for(origin, power, now)?;
+        let slot = self.slots.get_mut(idx).and_then(Option::as_mut)?;
+        let previous = slot.occupant;
+        let switched = previous.map(|o| o.origin) != Some(origin);
+        self.speakers_changed |= switched;
+        slot.occupant = Some(Occupant { origin, level_dbov });
+        slot.last_arrival_ts = Some(now);
+        slot.last_power = if switched {
+            power
+        } else {
+            slot.last_power.max(power)
+        };
+        let mut pkt = pkt.clone();
+        if switched {
+            if previous.is_some() {
+                slot.immunity_expiry = now.checked_add(NEWBORN_IMMUNITY).unwrap_or(now);
+            }
+            slot.timeline.rebase_audio(&pkt);
+            slot.pending_marker = true;
+        }
+        if !slot.timeline.rewrite_audio(&mut pkt) {
+            return None;
+        }
+        if slot.pending_marker {
+            pkt.marker = true;
+            slot.pending_marker = false;
+        }
+        let pt = slot.payload_types.get(crate::rtp::Codec::Opus)?;
         writer.write_audio_owned(pkt, slot.mid, slot.ssrc, pt);
         Some(())
     }
@@ -408,6 +463,7 @@ fn decayed_power(power: f32, last_arrival_ts: Option<Instant>, now: Instant) -> 
 
 #[cfg(test)]
 mod tests {
+    use crate::rtp::RtpPacket;
     // Tests assert by panicking; the process ending is the mechanism.
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
@@ -433,16 +489,16 @@ mod tests {
         }
     }
 
-    fn speaking(level_dbov: i8) -> RtpPacket {
+    fn speaking(level_dbov: i8) -> PacketForwardingState {
         let mut pkt = RtpPacket {
             codec: crate::rtp::Codec::Opus,
             ..RtpPacket::default()
         };
-        pkt.extensions.audio_level = Some(level_dbov);
+        pkt.test_audio_level = Some(level_dbov);
         pkt
     }
 
-    fn speaking_at_time(level_dbov: i8, at: Instant) -> RtpPacket {
+    fn speaking_at_time(level_dbov: i8, at: Instant) -> PacketForwardingState {
         let mut pkt = speaking(level_dbov);
         pkt.arrival_ts = at;
         pkt
@@ -507,7 +563,11 @@ mod tests {
         let mut alloc = allocator_with(1);
         assert!(
             alloc
-                .on_rtp(origin(1), &RtpPacket::default(), &mut StreamWriter::new())
+                .on_rtp(
+                    origin(1),
+                    &PacketForwardingState::default(),
+                    &mut StreamWriter::new()
+                )
                 .is_none()
         );
         assert!(heard_origins(&alloc).is_empty());

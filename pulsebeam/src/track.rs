@@ -14,8 +14,8 @@ use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::{
-    self, EncodingId as Rid, MediaSectionId as Mid, PayloadType as Pt, RtpPacket, SenderReport,
-    SimulcastEncoding, Ssrc, VideoLayersAllocation,
+    self, EncodingId as Rid, MediaSectionId as Mid, PacketForwardingState, PayloadType as Pt,
+    SenderReport, SimulcastEncoding, Ssrc, VideoLayersAllocation,
     monitor::{StreamMonitor, StreamStats},
     sync::TrackSynchronizer,
 };
@@ -30,8 +30,8 @@ pub(crate) fn packet_encoding(rid: Option<Rid>) -> Option<rtp::EncodingId> {
 }
 
 pub struct ProcessedRtp {
-    pub first: Option<RtpPacket>,
-    pub remaining: Vec<RtpPacket>,
+    pub first: Option<PacketForwardingState>,
+    pub remaining: Vec<PacketForwardingState>,
     pub request_keyframe: bool,
     pub valid_route: bool,
 }
@@ -44,14 +44,14 @@ pub const MAX_SIMULCAST_LAYERS: usize = 3;
 /// participant core's responsibility so transport output remains bounded.
 pub enum StreamWrite {
     Video {
-        pkt: RtpPacket,
+        pkt: PacketForwardingState,
         mid: Mid,
         rid: Option<Rid>,
         ssrc: Ssrc,
         pt: Pt,
     },
     Audio {
-        pkt: RtpPacket,
+        pkt: PacketForwardingState,
         mid: Mid,
         ssrc: Ssrc,
         pt: Pt,
@@ -77,7 +77,7 @@ impl StreamWriter {
 
     pub fn write_video_owned(
         &mut self,
-        pkt: RtpPacket,
+        pkt: PacketForwardingState,
         mid: Mid,
         rid: Option<Rid>,
         ssrc: Ssrc,
@@ -92,7 +92,7 @@ impl StreamWriter {
         });
     }
 
-    pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, ssrc: Ssrc, pt: Pt) {
+    pub fn write_audio_owned(&mut self, pkt: PacketForwardingState, mid: Mid, ssrc: Ssrc, pt: Pt) {
         self.pending
             .push_back(StreamWrite::Audio { pkt, mid, ssrc, pt });
     }
@@ -206,11 +206,11 @@ impl UpstreamTrackLayer {
         self.monitor.poll(now, is_any_sibling_active);
     }
 
-    fn normalize(&mut self, pkt: RtpPacket) -> Normalization {
+    fn normalize(&mut self, pkt: PacketForwardingState) -> Normalization {
         self.normalizer.normalize(pkt)
     }
 
-    fn process_normalized(&mut self, pkt: &RtpPacket, facts: StreamFacts) {
+    fn process_normalized(&mut self, pkt: &PacketForwardingState, facts: StreamFacts) {
         self.monitor.process_packet(pkt);
         if let Some(count) = facts.decode_targets {
             self.monitor.set_decode_target_count(count);
@@ -218,7 +218,7 @@ impl UpstreamTrackLayer {
     }
 
     #[cfg(test)]
-    pub fn process(&mut self, pkt: &mut RtpPacket) -> bool {
+    pub fn process(&mut self, pkt: &mut PacketForwardingState) -> bool {
         let normalization = self.normalize(std::mem::take(pkt));
         let Some((packet, facts)) = normalization.first else {
             return false;
@@ -360,12 +360,13 @@ impl UpstreamTrack {
     pub fn process(
         &mut self,
         rid: Option<&Rid>,
-        mut packet: RtpPacket,
+        ssrc: Ssrc,
+        mut packet: PacketForwardingState,
         sr: Option<SenderReport>,
     ) -> ProcessedRtp {
         // Stamp playout_time on the track's shared clock before the encoding's
         // monitor and the switcher downstream see it.
-        self.synchronizer.process(&mut packet, sr);
+        self.synchronizer.process(&mut packet, ssrc, sr);
         self.monitor.process(rid, packet)
     }
 
@@ -403,7 +404,7 @@ impl TrackMonitor {
         Self { encodings }
     }
 
-    pub fn process(&mut self, rid: Option<&Rid>, packet: RtpPacket) -> ProcessedRtp {
+    pub fn process(&mut self, rid: Option<&Rid>, packet: PacketForwardingState) -> ProcessedRtp {
         let Some(index) = self.encodings.iter().position(|s| s.rid.as_ref() == rid) else {
             return ProcessedRtp {
                 first: None,
@@ -445,9 +446,9 @@ impl TrackMonitor {
     fn process_normalized(
         &mut self,
         index: usize,
-        packet: RtpPacket,
+        packet: PacketForwardingState,
         facts: StreamFacts,
-    ) -> RtpPacket {
+    ) -> PacketForwardingState {
         let Some(encoding) = self.encodings.get_mut(index) else {
             debug_assert!(
                 false,
@@ -457,7 +458,7 @@ impl TrackMonitor {
         };
         encoding.process_normalized(&packet, facts);
 
-        if let Some(vla) = packet.extensions.video_layers_allocation.as_ref() {
+        if let Some(vla) = packet.derived.video_layers_allocation.as_ref() {
             for encoding in &mut self.encodings {
                 encoding.apply_vla(vla);
             }
@@ -1475,11 +1476,11 @@ mod dd_tests {
         }
     }
 
-    fn packet_carrying(bytes: &[u8]) -> RtpPacket {
-        let mut pkt = RtpPacket::default();
-        pkt.extensions.raw_dependency_descriptor = Some(
-            pulsebeam_core::dd::RawDependencyDescriptor(bytes.iter().copied().collect()),
-        );
+    fn packet_carrying(bytes: &[u8]) -> PacketForwardingState {
+        let mut pkt = PacketForwardingState::default();
+        pkt.derived.raw_dependency_descriptor = Some(pulsebeam_core::dd::RawDependencyDescriptor(
+            bytes.iter().copied().collect(),
+        ));
         pkt
     }
 
@@ -1495,7 +1496,7 @@ mod dd_tests {
             .unwrap();
         let mut pkt = packet_carrying(&buf[..len]);
         assert!(layer.process(&mut pkt));
-        assert!(pkt.extensions.dependency_descriptor.is_some());
+        assert!(pkt.derived.dependency_descriptor.is_some());
 
         // A later delta frame carries only a template id, so it is decodable
         // only because the layer retained the structure.
@@ -1504,7 +1505,7 @@ mod dd_tests {
         let mut pkt = packet_carrying(&buf[..len]);
         assert!(layer.process(&mut pkt));
 
-        assert_eq!(pkt.extensions.dependency_descriptor.as_ref(), Some(&sent));
+        assert_eq!(pkt.derived.dependency_descriptor.as_ref(), Some(&sent));
         assert_eq!(layer.normalizer.dd_errors(), 0);
     }
 
@@ -1571,14 +1572,14 @@ mod dd_tests {
         let mut pkt = packet_carrying(&[0xff; 12]);
 
         assert!(!layer.process(&mut pkt));
-        assert!(pkt.extensions.dependency_descriptor.is_none());
+        assert!(pkt.derived.dependency_descriptor.is_none());
         assert_eq!(layer.normalizer.dd_errors(), 1);
     }
 
     #[test]
     fn packets_without_a_descriptor_are_untouched() {
         let mut layer = layer();
-        let mut pkt = RtpPacket::default();
+        let mut pkt = PacketForwardingState::default();
 
         assert!(layer.process(&mut pkt));
         assert_eq!(layer.normalizer.dd_errors(), 0);
@@ -1692,7 +1693,7 @@ mod simulcast_pause_tests {
     // cross-core. See docs/thread-per-core.md.
     use super::*;
     use crate::entity::ParticipantId;
-    use crate::rtp::RtpPacket;
+    use crate::rtp::PacketForwardingState;
     use crate::rtp::SimulcastEncoding as SimulcastLayer;
     use std::time::Duration;
 
@@ -1713,7 +1714,7 @@ mod simulcast_pause_tests {
     }
 
     fn feed(upstream: &mut UpstreamTrack, rid: &str, at: Instant) {
-        let pkt = RtpPacket {
+        let pkt = PacketForwardingState {
             arrival_ts: at,
             ..Default::default()
         };

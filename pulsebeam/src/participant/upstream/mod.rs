@@ -6,7 +6,7 @@ use crate::keys::TrackKey;
 use crate::{
     entity::{TrackId, TrackKind},
     log::{LogCtx, plog_warn},
-    rtp::{EncodingId as Rid, MediaSectionId as Mid, RtpPacket, SenderReport, Ssrc},
+    rtp::{EncodingId as Rid, MediaSectionId as Mid, PacketForwardingState, SenderReport, Ssrc},
     track::UpstreamTrack,
 };
 use ahash::{HashMap, HashMapExt};
@@ -156,7 +156,8 @@ impl UpstreamMedia {
         index: usize,
         mid: Mid,
         rid: Option<&Rid>,
-        rtp: RtpPacket,
+        rtp: PacketForwardingState,
+        ssrc: Ssrc,
         sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {
         let Some(slot) = self.published_tracks.get_mut(index) else {
@@ -178,9 +179,7 @@ impl UpstreamMedia {
                 valid_route: false,
             };
         }
-        let mut rtp = rtp;
-        rtp.extensions.rid = rid.map(|rid| crate::rtp::EncodingId::from(&**rid));
-        slot.track.process(rid, rtp, sr)
+        slot.track.process(rid, ssrc, rtp, sr)
     }
     fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {
         let slot = self.published_tracks.iter_mut().find(|s| s.mid == mid)?;
@@ -247,16 +246,17 @@ impl Upstream {
         slot: UpstreamSlotKey,
         mid: Mid,
         rid: Option<&Rid>,
-        rtp: RtpPacket,
+        ssrc: Ssrc,
+        rtp: PacketForwardingState,
         sr: Option<SenderReport>,
     ) -> crate::track::ProcessedRtp {
         match slot {
-            UpstreamSlotKey::Audio(index) => {
-                self.audio.handle_incoming_rtp(index, mid, rid, rtp, sr)
-            }
-            UpstreamSlotKey::Video(index) => {
-                self.video.handle_incoming_rtp(index, mid, rid, rtp, sr)
-            }
+            UpstreamSlotKey::Audio(index) => self
+                .audio
+                .handle_incoming_rtp(index, mid, rid, rtp, ssrc, sr),
+            UpstreamSlotKey::Video(index) => self
+                .video
+                .handle_incoming_rtp(index, mid, rid, rtp, ssrc, sr),
         }
     }
     pub fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {

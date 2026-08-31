@@ -8,12 +8,12 @@
 
 use std::{
     net::SocketAddr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use pulsebeam_rtc::{
     DataPayload, DatagramProtocol, ExtendedMediaSequence, ExtendedRtpTimestamp, IngressDatagram,
-    MediaKind as FacadeMediaKind, MediaRewrite, NegotiatedMedia, RtcEvent, RtcPeer,
+    MediaRewrite, NegotiatedMedia, RtcEvent, RtcPeer,
 };
 use str0m_upstream::{
     Candidate, Event, Input, Output, Rtc,
@@ -224,6 +224,7 @@ impl ContractHarness {
                                 transmit.source,
                                 transmit.destination,
                                 transmit.contents.to_vec(),
+                                SystemTime::UNIX_EPOCH,
                             ),
                         )
                         .expect("peer ingress");
@@ -283,10 +284,22 @@ fn facade_negotiates_connects_authenticates_media_and_closes() {
         _ => None,
     });
     let media = media.expect("authenticated media event");
-    assert_eq!(media.kind(), FacadeMediaKind::Video);
-    assert_eq!(media.codec().name(), "H264");
+    let descriptor = harness
+        .media
+        .iter()
+        .find(|negotiated| negotiated.ingress() == Some(media.stream()))
+        .and_then(NegotiatedMedia::descriptor)
+        .expect("negotiated descriptor for authenticated media");
+    assert_eq!(descriptor.kind(), pulsebeam_rtc::MediaKind::Video);
+    assert_eq!(descriptor.codec().name(), "H264");
+    assert_eq!(media.playout_time(), SystemTime::UNIX_EPOCH);
     assert!(!media.payload().is_empty());
-    assert!(media.semantics().expect("H.264 semantics").keyframe());
+    assert!(
+        media
+            .semantics(descriptor)
+            .expect("H.264 semantics")
+            .keyframe()
+    );
 
     let position = harness
         .events
@@ -396,6 +409,7 @@ fn malformed_input_is_rejected_without_destroying_the_peer() {
         CLIENT_ADDRESS,
         SERVER_ADDRESS,
         vec![0xff],
+        SystemTime::UNIX_EPOCH,
     );
     assert!(
         harness

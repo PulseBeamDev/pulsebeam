@@ -1,14 +1,6 @@
 use std::{fmt, num::NonZeroU32, ops::Deref, time::SystemTime};
 
 use pulsebeam_core::dd::{DependencyDescriptor, RawDependencyDescriptor};
-use tokio::time::Instant;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PacketProvenance {
-    pub received_at: Instant,
-    pub packet_id: u64,
-    pub stream_id: Option<u32>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Frequency(NonZeroU32);
@@ -255,13 +247,7 @@ pub struct SenderReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PacketExtensions {
-    pub absolute_capture_time: Option<Box<[u8]>>,
-    pub mid: Option<MediaSectionId>,
-    pub rid: Option<EncodingId>,
-    pub audio_level: Option<i8>,
-    pub play_delay_min: Option<MediaTime>,
-    pub play_delay_max: Option<MediaTime>,
+pub struct PacketDerivedFacts {
     pub raw_dependency_descriptor: Option<RawDependencyDescriptor>,
     pub dependency_descriptor: Option<DependencyDescriptor>,
     pub video_layers_allocation: Option<VideoLayersAllocation>,

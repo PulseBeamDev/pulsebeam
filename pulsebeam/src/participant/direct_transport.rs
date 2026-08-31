@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, net::SocketAddr};
 
+use crate::clock::WallAnchor;
 use pulsebeam_rtc::{
     DataChannel, DataPayload, DatagramProtocol, DepartureReceipt, IngressDatagram, RtcEvent,
     RtcPeer, RtcPeerError, Transmit,
@@ -37,7 +38,11 @@ impl DirectTransport {
         self.last_ingress
     }
 
-    pub fn process_ingress(&mut self, now: Instant) -> Result<usize, RtcPeerError> {
+    pub fn process_ingress(
+        &mut self,
+        now: Instant,
+        wall: &WallAnchor,
+    ) -> Result<usize, RtcPeerError> {
         let mut processed = 0usize;
         while processed < MAX_INGRESS_PER_TICK {
             let Some(batch) = self.ingress.front_mut() else {
@@ -55,7 +60,17 @@ impl DirectTransport {
             };
             self.peer.handle_datagram(
                 now.into_std(),
-                IngressDatagram::new(protocol, source, destination, bytes.to_vec()),
+                IngressDatagram::new(
+                    protocol,
+                    source,
+                    destination,
+                    bytes.to_vec(),
+                    wall.project(now).map_err(|error| {
+                        RtcPeerError::Transport(format!(
+                            "ingress wall projection failed: {error:?}"
+                        ))
+                    })?,
+                ),
             )?;
             processed = processed.saturating_add(1);
         }

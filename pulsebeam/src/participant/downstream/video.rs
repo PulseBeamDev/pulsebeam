@@ -4,9 +4,9 @@ use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
 use crate::rtp;
 #[cfg(test)]
-use crate::rtp::PayloadType as Pt;
+use crate::rtp::PacketForwardingState;
 #[cfg(test)]
-use crate::rtp::RtpPacket;
+use crate::rtp::PayloadType as Pt;
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
@@ -694,7 +694,7 @@ impl VideoAllocator {
         &mut self,
         _slot: DownstreamSlotKey,
         track_id: TrackId,
-        pkt: &RtpPacket,
+        pkt: &PacketForwardingState,
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
@@ -1062,7 +1062,7 @@ impl Slot {
         self.switcher
             .feed(track_id, cache, arrival_ts, &mut |out, switch_replay| {
                 debug_assert!(!paused || switch_replay);
-                let Some(pt) = payload_types.get(out.codec) else {
+                let Some(pt) = payload_types.get(crate::rtp::Codec::H264) else {
                     debug_assert!(
                         false,
                         "forwarded video codec must be negotiated by the egress slot"
@@ -2865,7 +2865,7 @@ mod slot_switch_tests {
         low: TrackLayer,
         cache: TrackStreamCache,
         writer: StreamWriter,
-        emitted: Vec<RtpPacket>,
+        emitted: Vec<PacketForwardingState>,
     }
 
     impl Fixture {
@@ -2898,10 +2898,10 @@ mod slot_switch_tests {
 
         /// Mirrors `route_video`: stamp the encoding's rid (as ingress does),
         /// push into the track cache, then hand the packet to the slot.
-        fn ingest(&mut self, layer: &TrackLayer, pkt: &RtpPacket) -> bool {
+        fn ingest(&mut self, layer: &TrackLayer, pkt: &PacketForwardingState) -> bool {
             let track_id = layer.meta.id;
             let mut pkt = pkt.clone();
-            pkt.extensions.rid = layer.rid.map(|rid| crate::rtp::EncodingId::from(&*rid));
+            pkt.rid = layer.rid.map(|rid| crate::rtp::EncodingId::from(&*rid));
             self.cache.push(pkt.clone());
             let promoted = self.slot.on_rtp(
                 track_id,
@@ -2917,7 +2917,7 @@ mod slot_switch_tests {
             promoted
         }
 
-        fn ingest_all(&mut self, layer: &TrackLayer, pkts: &[RtpPacket]) -> bool {
+        fn ingest_all(&mut self, layer: &TrackLayer, pkts: &[PacketForwardingState]) -> bool {
             let mut promoted = false;
             for p in pkts {
                 promoted |= self.ingest(layer, p);

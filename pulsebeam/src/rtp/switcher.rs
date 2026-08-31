@@ -17,7 +17,7 @@ use crate::rtp::frame_selector::{
 };
 use crate::rtp::monitor::StreamStats;
 use crate::rtp::timeline::Timeline;
-use crate::rtp::{Frequency, MediaTime, RtpPacket, SequenceNumber as SeqNo};
+use crate::rtp::{Frequency, MediaTime, PacketForwardingState, SequenceNumber as SeqNo};
 use crate::track::StreamId;
 
 pub(crate) type LayerStates = HashMap<StreamId, StreamStats>;
@@ -210,7 +210,7 @@ impl Switcher {
         track_id: TrackId,
         cache: &TrackStreamCache,
         now: Instant,
-        emit: &mut impl FnMut(RtpPacket, bool),
+        emit: &mut impl FnMut(PacketForwardingState, bool),
     ) {
         if let Some(active) = self.active.filter(|s| s.0 == track_id)
             && let Some(encoding) = cache.encoding(crate::track::packet_encoding(active.1))
@@ -265,7 +265,11 @@ impl Switcher {
     /// Hot path: `range_after` yields the single just-arrived packet in the
     /// common case (O(1)), and the O(holes) backfill runs only on the rare
     /// reorder event where the forward pass produced nothing.
-    fn pull_active(&mut self, cache: &StreamCache, emit: &mut impl FnMut(RtpPacket, bool)) {
+    fn pull_active(
+        &mut self,
+        cache: &StreamCache,
+        emit: &mut impl FnMut(PacketForwardingState, bool),
+    ) {
         let mut forwarded_any = false;
 
         if let Some(cursor) = self.active_cursor {
@@ -362,7 +366,7 @@ impl Switcher {
     fn backfill_active_holes(
         &mut self,
         cache: &StreamCache,
-        emit: &mut impl FnMut(RtpPacket, bool),
+        emit: &mut impl FnMut(PacketForwardingState, bool),
     ) {
         if self.active_input_holes.is_empty() {
             return;
@@ -389,7 +393,7 @@ impl Switcher {
         &mut self,
         cache: &StreamCache,
         now: Instant,
-        emit: &mut impl FnMut(RtpPacket, bool),
+        emit: &mut impl FnMut(PacketForwardingState, bool),
     ) {
         let Some(packets) = cache.replay() else {
             // Not decodable from here yet; the slot's PLI retry keeps probing.
@@ -489,7 +493,7 @@ impl Switcher {
         &mut self,
         cache: &StreamCache,
         now: Instant,
-        emit: &mut impl FnMut(RtpPacket, bool),
+        emit: &mut impl FnMut(PacketForwardingState, bool),
     ) {
         let Some(tail) = self.tail.as_ref() else {
             self.draining = None;
@@ -662,12 +666,12 @@ mod test {
         switcher: &mut Switcher,
         stream: StreamId,
         cache: &mut TrackStreamCache,
-        packets: &[RtpPacket],
-        out: &mut Vec<RtpPacket>,
+        packets: &[PacketForwardingState],
+        out: &mut Vec<PacketForwardingState>,
     ) {
         for p in packets {
             let mut p = p.clone();
-            p.extensions.rid = crate::track::packet_encoding(stream.1);
+            p.rid = crate::track::packet_encoding(stream.1);
             let now = p.arrival_ts;
             cache.push(p);
             switcher.feed(stream.0, cache, now, &mut |o, _| out.push(o));
@@ -714,7 +718,7 @@ mod test {
             .last()
             .map_or_else(Instant::now, |packet| packet.arrival_ts);
         for mut packet in stale {
-            packet.extensions.rid = crate::track::packet_encoding(q.1);
+            packet.rid = crate::track::packet_encoding(q.1);
             cache.push(packet);
         }
         let mut out = Vec::new();
@@ -842,7 +846,7 @@ mod test {
 
     /// Stamp a parsed Dependency Descriptor on every packet of `frame`, marking it
     /// present or absent for decode-target 0 (a temporal-layer shed).
-    fn stamp_dd(frame: &mut [RtpPacket], in_dt0: bool) {
+    fn stamp_dd(frame: &mut [PacketForwardingState], in_dt0: bool) {
         use pulsebeam_core::dd::{
             DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
         };
@@ -860,7 +864,7 @@ mod test {
                 },
                 ..Default::default()
             };
-            p.extensions.dependency_descriptor = Some(dd);
+            p.derived.dependency_descriptor = Some(dd);
         }
     }
 
@@ -938,9 +942,12 @@ mod test {
 
     /// Stamp a real Dependency Descriptor (with frame number and dependencies)
     /// from a temporal generator onto every packet of `frame`.
-    fn stamp_generated_dd(frame: &mut [RtpPacket], dd: &pulsebeam_core::dd::DependencyDescriptor) {
+    fn stamp_generated_dd(
+        frame: &mut [PacketForwardingState],
+        dd: &pulsebeam_core::dd::DependencyDescriptor,
+    ) {
         for p in frame.iter_mut() {
-            p.extensions.dependency_descriptor = Some(dd.clone());
+            p.derived.dependency_descriptor = Some(dd.clone());
         }
     }
 
@@ -949,17 +956,17 @@ mod test {
     /// only to frames that were also forwarded. A keyframe (it carries the
     /// structure) is an entry point with no references. This proves the SFU shed a
     /// self-consistent set — not merely that egress RTP is well-formed.
-    fn assert_dd_decodable(forwarded: &[RtpPacket]) {
+    fn assert_dd_decodable(forwarded: &[PacketForwardingState]) {
         use std::collections::HashSet;
 
         let present: HashSet<u16> = forwarded
             .iter()
-            .filter_map(|p| p.extensions.dependency_descriptor.as_ref())
+            .filter_map(|p| p.derived.dependency_descriptor.as_ref())
             .map(|dd| dd.frame_number)
             .collect();
 
         for p in forwarded {
-            let Some(dd) = p.extensions.dependency_descriptor.as_ref() else {
+            let Some(dd) = p.derived.dependency_descriptor.as_ref() else {
                 continue;
             };
             if dd.attached_structure.is_some() {

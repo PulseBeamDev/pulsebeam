@@ -9,7 +9,7 @@
 //! the correct answer.
 
 use crate::clock::NtpTime;
-use crate::rtp::{Frequency, MediaTime, RtpPacket, SenderReport as SenderInfo, Ssrc};
+use crate::rtp::{Frequency, MediaTime, PacketForwardingState, SenderReport as SenderInfo, Ssrc};
 use ahash::HashMap;
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
@@ -582,7 +582,7 @@ impl Synchronizer {
         self.guarded.adopt_anchor(anchor);
     }
 
-    pub fn process(&mut self, packet: &mut RtpPacket, sr: Option<SenderInfo>) {
+    pub fn process(&mut self, packet: &mut PacketForwardingState, sr: Option<SenderInfo>) {
         if let Some(sr) = sr {
             self.add_sender_report(sr, packet.arrival_ts);
         }
@@ -822,13 +822,18 @@ impl TrackSynchronizer {
 
     /// Stamp `packet.playout_time` on the track's shared clock, routing it to its
     /// encoding's synchronizer and reconciling the connection anchor.
-    pub fn process(&mut self, packet: &mut RtpPacket, sr: Option<SenderInfo>) {
+    pub fn process(
+        &mut self,
+        packet: &mut PacketForwardingState,
+        ssrc: Ssrc,
+        sr: Option<SenderInfo>,
+    ) {
         let clock_rate = self.clock_rate;
         let shared = self.shared_anchor;
 
         let sync = self
             .streams
-            .entry(packet.ssrc)
+            .entry(ssrc)
             .or_insert_with(|| Synchronizer::new(clock_rate));
 
         // Pin this encoding to the connection's shared anchor before it maps the
@@ -896,10 +901,11 @@ impl TrackSynchronizer {
 
 #[cfg(test)]
 mod tests {
+    use crate::rtp::RtpPacket;
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See docs/thread-per-core.md.
     use super::*;
-    use crate::rtp::{RtpPacket, VIDEO_FREQUENCY};
+    use crate::rtp::VIDEO_FREQUENCY;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
@@ -1280,9 +1286,17 @@ mod tests {
             let t = base + Duration::from_secs(i);
             let ntp = ntp0 + Duration::from_secs(i);
             let mut lo = frame(LOW, LOW_RTP_BASE + i * 90_000, t);
-            track.process(&mut lo, Some(sr(LOW, LOW_RTP_BASE + i * 90_000, ntp)));
+            track.process(
+                &mut lo,
+                LOW.into(),
+                Some(sr(LOW, LOW_RTP_BASE + i * 90_000, ntp)),
+            );
             let mut hi = frame(HIGH, HIGH_RTP_BASE + i * 90_000, t + HIGH_DELAY);
-            track.process(&mut hi, Some(sr(HIGH, HIGH_RTP_BASE + i * 90_000, ntp)));
+            track.process(
+                &mut hi,
+                HIGH.into(),
+                Some(sr(HIGH, HIGH_RTP_BASE + i * 90_000, ntp)),
+            );
         }
 
         // A frame from each encoding at the same wall-clock instant (10s in). Both
@@ -1291,9 +1305,9 @@ mod tests {
         // `HIGH_DELAY` behind — the exact seam step a switch must never introduce.
         let event = base + Duration::from_secs(10);
         let mut lo = frame(LOW, LOW_RTP_BASE + 10 * 90_000, event);
-        track.process(&mut lo, None);
+        track.process(&mut lo, LOW.into(), None);
         let mut hi = frame(HIGH, HIGH_RTP_BASE + 10 * 90_000, event + HIGH_DELAY);
-        track.process(&mut hi, None);
+        track.process(&mut hi, HIGH.into(), None);
 
         let delta = if hi.playout_time > lo.playout_time {
             hi.playout_time - lo.playout_time

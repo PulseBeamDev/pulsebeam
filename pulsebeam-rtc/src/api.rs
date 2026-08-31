@@ -1,9 +1,12 @@
+pub use crate::media_packet::{
+    DependencyRewrite, EncodedStreamDescriptor, ExtendedMediaSequence, ExtendedRtpTimestamp,
+    H264NalMetadata, MediaPacket, MediaPacketError, MediaRewrite, MediaSemantics,
+    NegotiatedExtensionIds, TransitMediaPacket, VideoLayersAllocation, VideoSpatialLayerAllocation,
+    VideoStreamAllocation,
+};
 pub use crate::peer::{
     BweCapacity, DataBackpressure, DataChannel, DataChannelMode, DataPayload, DepartureReceipt,
-    DependencyRewrite, ExtendedMediaSequence, ExtendedRtpTimestamp, ForwardingLatency,
-    H264NalMetadata, MediaExtensions, MediaPacket, MediaPacketError, MediaRewrite, MediaSemantics,
-    RtcConnectionState, RtcEvent, RtcPeer, RtcPeerError, TransitMediaPacket, Transmit,
-    VideoLayersAllocation, VideoSpatialLayerAllocation, VideoStreamAllocation,
+    ForwardingLatency, RtcConnectionState, RtcEvent, RtcPeer, RtcPeerError, Transmit,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +103,7 @@ pub enum MediaDirection {
     Inactive,
     Bidirectional,
 }
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::SystemTime};
 
 use crate::{Codec, TransportProtocol};
 
@@ -132,6 +135,7 @@ pub struct IngressDatagram {
     pub(crate) source: SocketAddr,
     pub(crate) destination: SocketAddr,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) playout_time: SystemTime,
 }
 
 impl IngressDatagram {
@@ -140,6 +144,7 @@ impl IngressDatagram {
         source: SocketAddr,
         destination: SocketAddr,
         bytes: Vec<u8>,
+        playout_time: SystemTime,
     ) -> Self {
         debug_assert!(!bytes.is_empty(), "an ingress datagram contains bytes");
         Self {
@@ -147,6 +152,7 @@ impl IngressDatagram {
             source,
             destination,
             bytes,
+            playout_time,
         }
     }
 
@@ -164,6 +170,10 @@ impl IngressDatagram {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub const fn playout_time(&self) -> SystemTime {
+        self.playout_time
     }
 }
 
@@ -188,13 +198,19 @@ opaque_handle!(EgressSlot);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NegotiatedCodec {
     pub(crate) name: String,
+    payload_type: u8,
     clock_rate: u32,
     channels: Option<u8>,
+    retransmission_payload_type: Option<u8>,
 }
 
 impl NegotiatedCodec {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub const fn payload_type(&self) -> u8 {
+        self.payload_type
     }
 
     pub const fn clock_rate(&self) -> u32 {
@@ -204,14 +220,20 @@ impl NegotiatedCodec {
     pub const fn channels(&self) -> Option<u8> {
         self.channels
     }
+
+    pub const fn retransmission_payload_type(&self) -> Option<u8> {
+        self.retransmission_payload_type
+    }
 }
 
 impl From<&Codec> for NegotiatedCodec {
     fn from(codec: &Codec) -> Self {
         Self {
             name: codec.name().to_owned(),
+            payload_type: codec.payload_type(),
             clock_rate: codec.clock_rate(),
             channels: codec.channels(),
+            retransmission_payload_type: codec.retransmission_payload_type(),
         }
     }
 }
@@ -225,6 +247,7 @@ pub struct NegotiatedMedia {
     pub(crate) kind: MediaKind,
     pub(crate) direction: MediaDirection,
     pub(crate) codecs: Box<[NegotiatedCodec]>,
+    pub(crate) descriptor: Option<EncodedStreamDescriptor>,
 }
 
 impl NegotiatedMedia {
@@ -254,6 +277,14 @@ impl NegotiatedMedia {
 
     pub fn codecs(&self) -> &[NegotiatedCodec] {
         &self.codecs
+    }
+
+    pub fn packet_descriptor(&self) -> Option<&EncodedStreamDescriptor> {
+        self.descriptor.as_ref()
+    }
+
+    pub fn descriptor(&self) -> Option<&EncodedStreamDescriptor> {
+        self.packet_descriptor()
     }
 }
 
