@@ -17,6 +17,11 @@ use std::net::{Ipv6Addr, SocketAddr};
     reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
 )]
 use std::sync::Arc;
+#[allow(
+    clippy::disallowed_types,
+    reason = "one control-plane health flag is published to the health handler and monitor"
+)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
@@ -33,6 +38,43 @@ use crate::id::ShardId;
 use crate::shard::ShardContext;
 use crate::shard::metrics::ShardMetrics;
 use crate::shard::worker::ShardWorker;
+
+pub const CLOCK_DRIFT_HEALTH_LIMIT: Duration = Duration::from_millis(250);
+
+#[derive(Clone)]
+struct NodeHealth {
+    healthy: Arc<AtomicBool>,
+}
+
+impl NodeHealth {
+    fn new() -> Self {
+        Self {
+            healthy: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    fn observe_clock(&self, anchor: WallAnchor, wall: SystemTime, mono: Instant) {
+        let drift = clock_drift(anchor, wall, mono);
+        let healthy = drift.is_some_and(|value| value <= CLOCK_DRIFT_HEALTH_LIMIT);
+        self.healthy.store(healthy, Ordering::Relaxed);
+        metrics::gauge!("node_clock_healthy").set(if healthy { 1.0 } else { 0.0 });
+        if let Some(drift) = drift {
+            metrics::gauge!("node_clock_drift_ms").set(drift.as_secs_f64() * 1_000.0);
+        }
+    }
+}
+
+fn clock_drift(anchor: WallAnchor, wall: SystemTime, mono: Instant) -> Option<Duration> {
+    anchor.project(mono).ok().map(|projected| {
+        projected
+            .duration_since(wall)
+            .unwrap_or_else(|error| error.duration())
+    })
+}
 
 /// Defines how a service listener is acquired.
 enum ListenerSource {
@@ -624,6 +666,12 @@ impl NodeBuilder {
             ));
         }
 
+        pulsebeam_runtime::clock::ensure_synchronized()
+            .context("kernel clock is not synchronized")?;
+        let wall_anchor = WallAnchor::try_new(SystemTime::now(), Instant::now())
+            .map_err(|error| anyhow::anyhow!("cannot capture node clock anchor: {error:?}"))?;
+        let node_health = NodeHealth::new();
+
         let advertised_addrs = self.external_addrs;
 
         let mut deduped = Vec::with_capacity(advertised_addrs.len());
@@ -795,10 +843,6 @@ impl NodeBuilder {
 
         let controller_rng = rand::Rng::seed_from_u64(rng.next_u64());
 
-        // One NTP<->Instant anchor for the whole node: read the wall clock once,
-        // here, so every shard shares a timeline and nothing reads it again.
-        let wall_anchor = WallAnchor::new(SystemTime::now(), Instant::now());
-
         let mut shard_contexts = Vec::with_capacity(shard_count);
 
         // Only built when something will scrape it, so a node without the
@@ -866,6 +910,8 @@ impl NodeBuilder {
                 shard_count,
                 stats_rx,
                 shutdown.child_token(),
+                wall_anchor,
+                node_health.clone(),
             )));
         }
 
@@ -1137,7 +1183,7 @@ mod internal {
     use anyhow::Result;
     use axum::{
         Router,
-        extract::Query,
+        extract::{Query, State},
         response::{Html, IntoResponse},
         routing::get,
     };
@@ -1205,6 +1251,8 @@ mod internal {
             shard_count: usize,
             stats_rx: mailbox::Receiver<Box<crate::shard::recorder::ShardStatsReport>>,
             shutdown: CancellationToken,
+            wall_anchor: WallAnchor,
+            node_health: NodeHealth,
         ) -> Result<()> {
             const INDEX_HTML: &str = r#"
 <ul>
@@ -1231,7 +1279,6 @@ mod internal {
                 let prometheus = self.prometheus.clone();
                 Router::new()
                     .route("/debug/pprof/profile", get(pprof_profile))
-                    // .route("/debug/pprof/allocs", get(heap_profile))
                     .route("/healthz", get(healthcheck))
                     .route("/", get(async move || Html(INDEX_HTML)))
                     .route(
@@ -1244,8 +1291,13 @@ mod internal {
                             format!("{}{shards}", prometheus.render())
                         }),
                     )
+                    .with_state(node_health.clone())
             };
-            let rt_monitor_join = tokio::spawn(rt_background_monitor(self.prometheus));
+            let rt_monitor_join = tokio::spawn(rt_background_monitor(
+                self.prometheus,
+                wall_anchor,
+                node_health,
+            ));
 
             tracing::info!(
                 "internal metrics listening on {:?}",
@@ -1282,7 +1334,11 @@ mod internal {
         rx.await.unwrap_or_default()
     }
 
-    async fn rt_background_monitor(prometheus: PrometheusHandle) {
+    async fn rt_background_monitor(
+        prometheus: PrometheusHandle,
+        wall_anchor: WallAnchor,
+        node_health: NodeHealth,
+    ) {
         // This task is spawned on the caller/control runtime, and these metric
         // names have always described that runtime. Data-runtime metrics, if
         // added, should use a separate prefix rather than changing this meaning.
@@ -1355,6 +1411,8 @@ mod internal {
 
         loop {
             interval.tick().await;
+
+            node_health.observe_clock(wall_anchor, SystemTime::now(), Instant::now());
 
             // Current State (Gauges)
             gauge!("tokio_num_alive_tasks").set(metrics.num_alive_tasks() as f64);
@@ -1516,8 +1574,12 @@ mod internal {
         Ok(resp)
     }
 
-    async fn healthcheck() -> impl IntoResponse {
-        StatusCode::OK
+    async fn healthcheck(State(node_health): State<NodeHealth>) -> impl IntoResponse {
+        if node_health.is_healthy() {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
     }
 }
 
@@ -1608,6 +1670,24 @@ mod tests {
             builder.room_placement,
             crate::control::core::RoomPlacement::RoundRobin
         ));
+    }
+
+    #[test]
+    fn clock_health_accepts_the_limit_and_rejects_excess_drift() {
+        let mono = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let anchor = WallAnchor::try_new(wall, mono).unwrap();
+        let health = NodeHealth::new();
+        let sample_mono = mono + Duration::from_secs(3);
+        let projected = anchor.project(sample_mono).unwrap();
+
+        let at_limit = projected.checked_add(CLOCK_DRIFT_HEALTH_LIMIT).unwrap();
+        health.observe_clock(anchor, at_limit, sample_mono);
+        assert!(health.is_healthy());
+
+        let beyond_limit = at_limit.checked_add(Duration::from_nanos(1)).unwrap();
+        health.observe_clock(anchor, beyond_limit, sample_mono);
+        assert!(!health.is_healthy());
     }
 
     #[test]

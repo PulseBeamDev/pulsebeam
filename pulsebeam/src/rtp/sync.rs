@@ -11,12 +11,468 @@
 use crate::clock::NtpTime;
 use crate::rtp::{Frequency, MediaTime, RtpPacket, SenderReport as SenderInfo, Ssrc};
 use ahash::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 const MIN_SR_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_DRIFT_PPM: f64 = 50_000.0;
 const MAX_RTP_GAP_SECS: f64 = 10.0;
+const MIN_GUARDED_SR_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_GUARDED_SR_INTERVAL: Duration = Duration::from_secs(10);
+const GUARDED_RATE_DRIFT_PPM: u128 = 50_000;
+const PPM_SCALE: u128 = 1_000_000;
+const GUARDED_MAX_FORWARD_GAP_SECS: u64 = 10;
+const GUARDED_MAX_BACKWARD_GAP_SECS: u64 = 2;
+const GUARDED_CORRECTION_SLEW_PPM: u128 = 50_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochTransition {
+    generation: u64,
+}
+
+impl EpochTransition {
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketMapping {
+    playout_time: SystemTime,
+    epoch_transition: Option<EpochTransition>,
+}
+
+impl PacketMapping {
+    pub const fn playout_time(self) -> SystemTime {
+        self.playout_time
+    }
+
+    pub const fn epoch_transition(self) -> Option<EpochTransition> {
+        self.epoch_transition
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuardedSenderSample {
+    rtp: u32,
+    ntp: NtpTime,
+    arrival: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuardedAnchor {
+    ntp: NtpTime,
+    cluster_time: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiscontinuityCandidate {
+    current: GuardedSenderSample,
+    count: u8,
+}
+
+#[derive(Debug)]
+struct GuardedMapper {
+    clock_rate: Frequency,
+    latest: Option<GuardedSenderSample>,
+    rate_ppm: i64,
+    provisional: Option<(u32, SystemTime)>,
+    last_assignment: Option<SystemTime>,
+    anchor: Option<GuardedAnchor>,
+    minimum_delay_anchor: Option<GuardedAnchor>,
+    applied_correction_ns: i128,
+    target_correction_ns: i128,
+    last_slew_time: Option<SystemTime>,
+    candidate: Option<DiscontinuityCandidate>,
+    pending_epoch: Option<GuardedSenderSample>,
+    epoch_generation: u64,
+}
+
+impl GuardedMapper {
+    fn new(clock_rate: Frequency) -> Self {
+        Self {
+            clock_rate,
+            latest: None,
+            rate_ppm: 0,
+            provisional: None,
+            last_assignment: None,
+            anchor: None,
+            minimum_delay_anchor: None,
+            applied_correction_ns: 0,
+            target_correction_ns: 0,
+            last_slew_time: None,
+            candidate: None,
+            pending_epoch: None,
+            epoch_generation: 0,
+        }
+    }
+
+    fn observe(&mut self, report: pulsebeam_rtc::SenderReport, arrival: SystemTime) {
+        let current = GuardedSenderSample {
+            rtp: report.rtp_timestamp(),
+            ntp: NtpTime::from_raw(report.ntp_timestamp()),
+            arrival,
+        };
+
+        let Some(previous) = self.latest else {
+            self.latest = Some(current);
+            self.provisional = Some((current.rtp, arrival));
+            self.install_initial_anchor(current);
+            return;
+        };
+
+        let comparison = self
+            .candidate
+            .map_or(previous, |candidate| candidate.current);
+
+        let Some(arrival_delta) = arrival.duration_since(comparison.arrival).ok() else {
+            return;
+        };
+        if !(MIN_GUARDED_SR_INTERVAL..=MAX_GUARDED_SR_INTERVAL).contains(&arrival_delta) {
+            return;
+        }
+
+        let rtp_delta = i64::from(current.rtp.wrapping_sub(comparison.rtp).cast_signed());
+        let ntp_delta = current.ntp.saturating_duration_since(comparison.ntp);
+        if current.ntp.units_since(comparison.ntp) <= 0 || rtp_delta <= 0 {
+            self.candidate = None;
+            return;
+        }
+
+        let client_rate_is_plausible = self.rate_is_plausible(rtp_delta.unsigned_abs(), ntp_delta);
+        if self.candidate.is_none() && client_rate_is_plausible {
+            self.rate_ppm = rate_ppm(self.clock_rate, rtp_delta.unsigned_abs(), ntp_delta);
+            self.latest = Some(current);
+            self.provisional = None;
+            self.update_minimum_delay(current);
+            return;
+        }
+
+        if self.candidate.is_some() && client_rate_is_plausible {
+            let count = self
+                .candidate
+                .map_or(1, |candidate| candidate.count.saturating_add(1));
+            self.candidate = Some(DiscontinuityCandidate { current, count });
+            if count >= 3 {
+                self.pending_epoch = Some(current);
+            }
+        } else if self.candidate.is_none() {
+            self.candidate = Some(DiscontinuityCandidate { current, count: 1 });
+        }
+    }
+
+    fn install_initial_anchor(&mut self, sample: GuardedSenderSample) {
+        self.anchor = Some(GuardedAnchor {
+            ntp: sample.ntp,
+            cluster_time: sample.arrival,
+        });
+        self.minimum_delay_anchor = self.anchor;
+        self.last_slew_time = Some(sample.arrival);
+    }
+
+    fn update_minimum_delay(&mut self, sample: GuardedSenderSample) {
+        let Some(anchor) = self.anchor else {
+            self.install_initial_anchor(sample);
+            return;
+        };
+        let raw = project_ntp(anchor, sample.ntp, 0);
+        let offset = signed_nanos(sample.arrival, raw);
+        if offset < self.target_correction_ns {
+            self.target_correction_ns = offset;
+            self.minimum_delay_anchor = Some(GuardedAnchor {
+                ntp: sample.ntp,
+                cluster_time: sample.arrival,
+            });
+        }
+        debug_assert_ne!(self.target_correction_ns, i128::MIN);
+    }
+
+    fn slew(&mut self, now: SystemTime) {
+        let Some(last) = self.last_slew_time else {
+            self.last_slew_time = Some(now);
+            return;
+        };
+        let Some(elapsed) = now.duration_since(last).ok() else {
+            return;
+        };
+        let max_step = i128::try_from(
+            elapsed
+                .as_nanos()
+                .saturating_mul(GUARDED_CORRECTION_SLEW_PPM)
+                .saturating_div(PPM_SCALE),
+        )
+        .unwrap_or(i128::MAX);
+        let delta = self
+            .target_correction_ns
+            .saturating_sub(self.applied_correction_ns);
+        let step = delta.clamp(-max_step, max_step);
+        self.applied_correction_ns = self.applied_correction_ns.saturating_add(step);
+        self.last_slew_time = Some(now);
+        debug_assert_ne!(self.applied_correction_ns, i128::MIN);
+        debug_assert_ne!(self.target_correction_ns, i128::MIN);
+    }
+
+    fn anchor(&self) -> Option<GuardedAnchor> {
+        self.minimum_delay_anchor
+    }
+
+    fn adopt_anchor(&mut self, anchor: GuardedAnchor) {
+        if self.anchor == Some(anchor) {
+            return;
+        }
+        let Some(old_anchor) = self.anchor else {
+            self.anchor = Some(anchor);
+            self.minimum_delay_anchor = Some(anchor);
+            self.applied_correction_ns = 0;
+            self.target_correction_ns = 0;
+            self.last_slew_time = Some(anchor.cluster_time);
+            return;
+        };
+        if self.last_assignment.is_none() {
+            self.anchor = Some(anchor);
+            self.minimum_delay_anchor = Some(anchor);
+            self.applied_correction_ns = 0;
+            self.target_correction_ns = 0;
+            self.last_slew_time = Some(anchor.cluster_time);
+            return;
+        }
+        let Some(reference) = self.latest else {
+            self.anchor = Some(anchor);
+            self.minimum_delay_anchor = Some(anchor);
+            return;
+        };
+        let old = project_ntp(old_anchor, reference.ntp, self.applied_correction_ns);
+        let raw = project_ntp(anchor, reference.ntp, 0);
+        self.anchor = Some(anchor);
+        self.minimum_delay_anchor = Some(anchor);
+        self.applied_correction_ns = signed_nanos(old, raw);
+        self.target_correction_ns = 0;
+        debug_assert_ne!(self.applied_correction_ns, i128::MIN);
+    }
+
+    fn rate_is_plausible(&self, rtp_delta: u64, ntp_delta: Duration) -> bool {
+        let expected = u128::from(self.clock_rate.get())
+            .saturating_mul(ntp_delta.as_nanos())
+            .saturating_div(1_000_000_000);
+        if expected == 0 {
+            return false;
+        }
+        let lower = expected.saturating_mul(PPM_SCALE.saturating_sub(GUARDED_RATE_DRIFT_PPM));
+        let upper = expected.saturating_mul(PPM_SCALE.saturating_add(GUARDED_RATE_DRIFT_PPM));
+        let measured = u128::from(rtp_delta).saturating_mul(PPM_SCALE);
+        measured >= lower && measured <= upper
+    }
+
+    fn map(&mut self, rtp: MediaTime, arrival: SystemTime) -> PacketMapping {
+        debug_assert_eq!(rtp.frequency(), self.clock_rate);
+        let rtp = {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "RTP packet timestamps are the low 32-bit sender clock"
+            )]
+            {
+                rtp.numer() as u32
+            }
+        };
+        let mut transition = None;
+        if let Some(epoch) = self.pending_epoch.take() {
+            self.latest = Some(epoch);
+            self.rate_ppm = 0;
+            self.candidate = None;
+            self.provisional = None;
+            self.anchor = Some(GuardedAnchor {
+                ntp: epoch.ntp,
+                cluster_time: epoch.arrival,
+            });
+            self.minimum_delay_anchor = self.anchor;
+            self.applied_correction_ns = 0;
+            self.target_correction_ns = 0;
+            self.last_slew_time = Some(epoch.arrival);
+            self.epoch_generation = self.epoch_generation.saturating_add(1);
+            transition = Some(EpochTransition {
+                generation: self.epoch_generation,
+            });
+        }
+
+        self.slew(arrival);
+        let max_forward = i64::from(
+            self.clock_rate
+                .get()
+                .saturating_mul(u32::try_from(GUARDED_MAX_FORWARD_GAP_SECS).unwrap_or(u32::MAX)),
+        );
+        let max_backward = i64::from(
+            self.clock_rate
+                .get()
+                .saturating_mul(u32::try_from(GUARDED_MAX_BACKWARD_GAP_SECS).unwrap_or(u32::MAX)),
+        );
+        debug_assert!(max_forward > 0);
+        debug_assert!(max_backward > 0);
+        let mut mapped = if let Some(reference) = self.latest {
+            let delta = i64::from(rtp.wrapping_sub(reference.rtp).cast_signed());
+            if delta > max_forward || delta < -max_backward {
+                arrival
+            } else if let Some(anchor) = self.anchor {
+                let ntp_delta = rtp_duration(delta.unsigned_abs(), self.clock_rate, self.rate_ppm);
+                let packet_ntp = if delta.is_positive() {
+                    reference.ntp.wrapping_add(ntp_delta)
+                } else {
+                    reference.ntp.wrapping_sub(ntp_delta)
+                };
+                project_ntp(anchor, packet_ntp, self.applied_correction_ns)
+            } else {
+                arrival
+            }
+        } else if let Some((reference_rtp, reference_time)) = self.provisional {
+            let delta = i64::from(rtp.wrapping_sub(reference_rtp).cast_signed());
+            if delta > max_forward || delta < -max_backward {
+                arrival
+            } else {
+                shift_system_time(reference_time, delta, self.clock_rate, 0)
+            }
+        } else {
+            self.provisional = Some((rtp, arrival));
+            arrival
+        };
+
+        if mapped < arrival {
+            mapped = arrival;
+        }
+        debug_assert!(mapped >= arrival);
+        if let Some(last) = self.last_assignment {
+            if mapped < last {
+                mapped = last;
+            }
+            debug_assert!(mapped >= last);
+        }
+        self.last_assignment = Some(mapped);
+        PacketMapping {
+            playout_time: mapped,
+            epoch_transition: transition,
+        }
+    }
+}
+
+fn signed_nanos(later: SystemTime, earlier: SystemTime) -> i128 {
+    match later.duration_since(earlier) {
+        Ok(duration) => i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX),
+        Err(error) => -i128::try_from(error.duration().as_nanos()).unwrap_or(i128::MAX),
+    }
+}
+
+fn duration_from_nanos(nanos: i128) -> Duration {
+    let magnitude = u128::try_from(nanos.unsigned_abs()).unwrap_or(u128::MAX);
+    Duration::from_nanos(u64::try_from(magnitude).unwrap_or(u64::MAX))
+}
+
+fn project_ntp(anchor: GuardedAnchor, ntp: NtpTime, correction_ns: i128) -> SystemTime {
+    let delta = ntp.duration_since(anchor.ntp);
+    let projected = match delta {
+        Ok(duration) => anchor.cluster_time.checked_add(duration),
+        Err(duration) => anchor.cluster_time.checked_sub(duration),
+    }
+    .unwrap_or(anchor.cluster_time);
+    if correction_ns.is_negative() {
+        projected
+            .checked_sub(duration_from_nanos(correction_ns))
+            .unwrap_or(projected)
+    } else {
+        projected
+            .checked_add(duration_from_nanos(correction_ns))
+            .unwrap_or(projected)
+    }
+}
+
+fn rtp_duration(rtp_delta: u64, clock_rate: Frequency, rate_ppm: i64) -> Duration {
+    let denominator = u128::from(clock_rate.get())
+        .saturating_mul(u128::try_from(rate_ppm.saturating_add(1_000_000)).unwrap_or(1));
+    let nanos = u128::from(rtp_delta)
+        .saturating_mul(1_000_000_000)
+        .saturating_mul(PPM_SCALE)
+        .checked_div(denominator.max(1))
+        .unwrap_or(u128::MAX);
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+impl GuardedAnchor {
+    fn lower_delay(self, other: Self) -> Self {
+        match other.ntp.duration_since(self.ntp) {
+            Ok(delta) => {
+                if other.cluster_time
+                    < self
+                        .cluster_time
+                        .checked_add(delta)
+                        .unwrap_or(self.cluster_time)
+                {
+                    other
+                } else {
+                    self
+                }
+            }
+            Err(delta) => {
+                if other
+                    .cluster_time
+                    .checked_add(delta)
+                    .unwrap_or(other.cluster_time)
+                    < self.cluster_time
+                {
+                    other
+                } else {
+                    self
+                }
+            }
+        }
+    }
+}
+
+fn rate_ppm(clock_rate: Frequency, rtp_delta: u64, ntp_delta: Duration) -> i64 {
+    let expected = u128::from(clock_rate.get())
+        .saturating_mul(ntp_delta.as_nanos())
+        .saturating_div(1_000_000_000);
+    if expected == 0 {
+        return 0;
+    }
+    let measured = u128::from(rtp_delta);
+    let signed = if measured >= expected {
+        i128::try_from(measured.saturating_sub(expected)).unwrap_or(i128::MAX)
+    } else {
+        -i128::try_from(expected.saturating_sub(measured)).unwrap_or(i128::MAX)
+    };
+    let value = signed
+        .saturating_mul(i128::try_from(PPM_SCALE).unwrap_or(i128::MAX))
+        .checked_div(i128::try_from(expected).unwrap_or(1))
+        .unwrap_or(0);
+    i64::try_from(value).unwrap_or_else(|_| {
+        if value.is_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    })
+}
+
+fn shift_system_time(
+    base: SystemTime,
+    rtp_delta: i64,
+    clock_rate: Frequency,
+    rate_ppm: i64,
+) -> SystemTime {
+    if rtp_delta == 0 {
+        return base;
+    }
+    let ppm = u128::try_from(rate_ppm.saturating_add(1_000_000)).unwrap_or(1);
+    let nanos = u128::from(rtp_delta.unsigned_abs())
+        .saturating_mul(1_000_000_000)
+        .saturating_mul(PPM_SCALE)
+        .checked_div(u128::from(clock_rate.get()).saturating_mul(ppm))
+        .unwrap_or(u128::MAX);
+    let nanos = u64::try_from(nanos).unwrap_or(u64::MAX);
+    let duration = Duration::from_nanos(nanos);
+    if rtp_delta.is_positive() {
+        base.checked_add(duration).unwrap_or(base)
+    } else {
+        base.checked_sub(duration).unwrap_or(base)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ClockReference {
@@ -79,6 +535,7 @@ impl ClockReference {
 #[derive(Debug)]
 pub struct Synchronizer {
     clock_rate: Frequency,
+    guarded: GuardedMapper,
     first_sr: Option<ClockReference>,
     latest_sr: Option<ClockReference>,
     last_sr_time: Option<Instant>,
@@ -94,6 +551,7 @@ impl Synchronizer {
     pub fn new(clock_rate: Frequency) -> Self {
         Self {
             clock_rate,
+            guarded: GuardedMapper::new(clock_rate),
             first_sr: None,
             latest_sr: None,
             last_sr_time: None,
@@ -102,6 +560,26 @@ impl Synchronizer {
             estimated_clock_drift_ppm: 0.0,
             ntp_anchor: None,
         }
+    }
+
+    pub fn observe_sender_report(
+        &mut self,
+        report: pulsebeam_rtc::SenderReport,
+        arrival: SystemTime,
+    ) {
+        self.guarded.observe(report, arrival);
+    }
+
+    pub fn map_packet(&mut self, rtp: MediaTime, arrival: SystemTime) -> PacketMapping {
+        self.guarded.map(rtp, arrival)
+    }
+
+    fn guarded_anchor(&self) -> Option<GuardedAnchor> {
+        self.guarded.anchor()
+    }
+
+    fn adopt_guarded_anchor(&mut self, anchor: GuardedAnchor) {
+        self.guarded.adopt_anchor(anchor);
     }
 
     pub fn process(&mut self, packet: &mut RtpPacket, sr: Option<SenderInfo>) {
@@ -329,6 +807,7 @@ pub struct TrackSynchronizer {
     /// The connection-wide anchor: the lowest-delay NTP↔server reference any
     /// encoding has reported. Shared into every per-SSRC synchronizer.
     shared_anchor: Option<ClockReference>,
+    guarded_shared_anchor: Option<GuardedAnchor>,
 }
 
 impl TrackSynchronizer {
@@ -337,6 +816,7 @@ impl TrackSynchronizer {
             clock_rate,
             streams: HashMap::default(),
             shared_anchor: None,
+            guarded_shared_anchor: None,
         }
     }
 
@@ -365,6 +845,47 @@ impl TrackSynchronizer {
                 Some(current) => current.lower_delay(anchor),
                 None => anchor,
             });
+        }
+    }
+
+    pub fn observe_sender_report(
+        &mut self,
+        report: pulsebeam_rtc::SenderReport,
+        arrival: SystemTime,
+    ) {
+        let ssrc = Ssrc::from(report.ssrc());
+        let anchor = {
+            let sync = self
+                .streams
+                .entry(ssrc)
+                .or_insert_with(|| Synchronizer::new(self.clock_rate));
+            sync.observe_sender_report(report, arrival);
+            sync.guarded_anchor()
+        };
+        if let Some(anchor) = anchor {
+            self.guarded_shared_anchor = Some(match self.guarded_shared_anchor {
+                Some(current) => current.lower_delay(anchor),
+                None => anchor,
+            });
+        }
+        self.reconcile_guarded_anchor();
+    }
+
+    pub fn map_packet(&mut self, ssrc: Ssrc, rtp: MediaTime, arrival: SystemTime) -> PacketMapping {
+        self.reconcile_guarded_anchor();
+        let sync = self
+            .streams
+            .entry(ssrc)
+            .or_insert_with(|| Synchronizer::new(self.clock_rate));
+        sync.map_packet(rtp, arrival)
+    }
+
+    fn reconcile_guarded_anchor(&mut self) {
+        let Some(anchor) = self.guarded_shared_anchor else {
+            return;
+        };
+        for sync in self.streams.values_mut() {
+            sync.adopt_guarded_anchor(anchor);
         }
     }
 
@@ -783,5 +1304,280 @@ mod tests {
             delta < Duration::from_millis(10),
             "encodings of one track must share a clock, got {delta:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hostile_clock_contract_tests {
+    use super::*;
+    use crate::rtp::VIDEO_FREQUENCY;
+    use pulsebeam_rtc::SenderReport;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
+
+    fn sender_report(ssrc: u32, rtp: u32, ntp_secs: u64) -> SenderReport {
+        sender_report_with_ntp(ssrc, rtp, ntp_secs << 32)
+    }
+
+    fn sender_report_with_ntp(ssrc: u32, rtp: u32, ntp_timestamp: u64) -> SenderReport {
+        SenderReport::new(
+            ssrc,
+            (NTP_UNIX_OFFSET_SECS << 32) + ntp_timestamp,
+            rtp,
+            0,
+            0,
+        )
+    }
+
+    fn wall(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000 + seconds)
+    }
+
+    fn wall_ms(seconds: u64, millis: u64) -> SystemTime {
+        wall(seconds) + Duration::from_millis(millis)
+    }
+
+    fn as_system_time(value: SystemTime) -> SystemTime {
+        value
+    }
+
+    #[test]
+    fn no_sender_report_uses_a_conservative_ingress_anchor() {
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+        let first = sync.map_packet(MediaTime::from_90khz(10_000), wall(1));
+        let later = sync.map_packet(MediaTime::from_90khz(100_000), wall(3));
+
+        assert!(first.playout_time() >= wall(1));
+        assert!(later.playout_time() >= wall(3));
+        assert!(first.epoch_transition().is_none());
+    }
+
+    #[test]
+    fn sender_report_cadence_does_not_depend_on_client_absolute_wall_origin() {
+        let mut left = Synchronizer::new(VIDEO_FREQUENCY);
+        let mut right = Synchronizer::new(VIDEO_FREQUENCY);
+        let _ = left.map_packet(MediaTime::from_90khz(0), wall(0));
+        let _ = right.map_packet(MediaTime::from_90khz(0), wall(0));
+
+        for step in 0..4u32 {
+            let rtp = (step + 1) * 90_090;
+            let arrival = wall(u64::from(step + 1));
+            left.observe_sender_report(sender_report(1, rtp, 10_000 + u64::from(step)), arrival);
+            right.observe_sender_report(sender_report(2, rtp, 40_000 + u64::from(step)), arrival);
+        }
+
+        let left_mapping = left.map_packet(MediaTime::from_90khz(450_450), wall(6));
+        let right_mapping = right.map_packet(MediaTime::from_90khz(450_450), wall(6));
+        assert_eq!(left_mapping.playout_time(), right_mapping.playout_time());
+    }
+
+    #[test]
+    fn sender_rate_uses_rtp_ntp_cadence_when_arrival_delay_changes() {
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+        sync.observe_sender_report(sender_report(1, 0, 10_000), wall_ms(1, 20));
+        sync.observe_sender_report(sender_report(1, 90_090, 10_001), wall(2));
+
+        let mapping = sync.map_packet(MediaTime::from_90khz(450_450), wall(5));
+        let expected = wall(6);
+        let error = mapping
+            .playout_time()
+            .duration_since(expected)
+            .unwrap_or_else(|error| error.duration());
+        assert!(
+            error <= Duration::from_millis(2),
+            "arrival jitter became clock drift: {error:?}, mapped={:?}",
+            mapping.playout_time()
+        );
+    }
+
+    #[test]
+    fn stale_regressing_repeated_implausible_and_outlier_reports_are_inert() {
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+        for step in 0..4u32 {
+            let rtp = (step + 1) * 90_000;
+            sync.observe_sender_report(
+                sender_report(1, rtp, 20_000 + u64::from(step)),
+                wall(u64::from(step + 1)),
+            );
+        }
+
+        let historical = sync
+            .map_packet(MediaTime::from_90khz(360_000), wall(5))
+            .playout_time();
+        let historical_saved = historical;
+        let expected_future = sync
+            .map_packet(MediaTime::from_90khz(540_000), wall(7))
+            .playout_time();
+        let attacks = [
+            (270_000, 20_002),
+            (360_000, 20_003),
+            (450_000, 20_003),
+            (900_000, 20_004),
+            (180_000, 80_000),
+        ];
+        for (rtp, ntp_secs) in attacks {
+            sync.observe_sender_report(sender_report(1, rtp, ntp_secs), wall(6));
+        }
+
+        let future = sync
+            .map_packet(MediaTime::from_90khz(540_000), wall(7))
+            .playout_time();
+        assert!(future >= historical);
+        assert_eq!(future, expected_future);
+        assert_eq!(historical, historical_saved);
+
+        let bounded = sync.map_packet(MediaTime::from_90khz(u64::from(u32::MAX)), wall(8));
+        assert!(bounded.playout_time() <= wall(8) + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn small_sender_report_corrections_are_continuous_and_future_only() {
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+        sync.observe_sender_report(sender_report(1, 0, 30_000), wall(1));
+        sync.observe_sender_report(
+            sender_report_with_ntp(1, 90_000, (31_000 << 32) + (1 << 22)),
+            wall(2),
+        );
+        let historical = sync
+            .map_packet(MediaTime::from_90khz(90_000), wall(2))
+            .playout_time();
+
+        sync.observe_sender_report(sender_report(1, 180_000, 32_000), wall(3));
+        sync.observe_sender_report(sender_report(1, 270_000, 33_000), wall(4));
+        let future_mapping = sync.map_packet(MediaTime::from_90khz(360_000), wall(5));
+        let future = future_mapping.playout_time();
+
+        assert!(future >= historical);
+        assert!(future_mapping.epoch_transition().is_none());
+        let elapsed = future.duration_since(historical).unwrap();
+        assert!(elapsed >= Duration::from_millis(2_980));
+        assert!(elapsed <= Duration::from_millis(3_020));
+    }
+
+    #[test]
+    fn large_startup_delay_converges_without_revising_assignments() {
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+        sync.observe_sender_report(sender_report(1, 0, 10_000), wall_ms(0, 500));
+
+        let historical = sync
+            .map_packet(MediaTime::from_90khz(0), wall_ms(0, 500))
+            .playout_time();
+        sync.observe_sender_report(sender_report(1, 90_000, 10_001), wall(1));
+        let mut previous = sync
+            .map_packet(MediaTime::from_90khz(90_000), wall(1))
+            .playout_time();
+        let max_correction_step_ms = 1_000u128
+            .saturating_mul(GUARDED_CORRECTION_SLEW_PPM)
+            .saturating_div(PPM_SCALE);
+        let min_advance = Duration::from_millis(
+            u64::try_from(1_000u128.saturating_sub(max_correction_step_ms)).unwrap_or(0),
+        );
+
+        for second in 2..=16u32 {
+            sync.observe_sender_report(
+                sender_report(1, second * 90_000, 10_000 + u64::from(second)),
+                wall(u64::from(second)),
+            );
+            let current = sync
+                .map_packet(
+                    MediaTime::from_90khz(u64::from(second) * 90_000),
+                    wall(u64::from(second)),
+                )
+                .playout_time();
+            let advance = current.duration_since(previous).unwrap();
+            assert!(advance >= min_advance);
+            assert!(advance <= Duration::from_secs(1));
+            previous = current;
+        }
+
+        assert!(previous >= historical);
+        assert!(previous <= wall(16) + Duration::from_millis(20));
+    }
+
+    #[test]
+    fn large_validated_discontinuity_returns_an_explicit_epoch_transition() {
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+        sync.observe_sender_report(sender_report(1, 0, 50_000), wall(1));
+        sync.observe_sender_report(sender_report(1, 90_000, 50_001), wall(2));
+        let established = sync.map_packet(MediaTime::from_90khz(180_000), wall(3));
+        assert!(established.epoch_transition().is_none());
+
+        sync.observe_sender_report(sender_report(1, 2_000_000, 60_000), wall(4));
+        let first_candidate = sync.map_packet(MediaTime::from_90khz(2_000_000), wall(4));
+        assert!(first_candidate.epoch_transition().is_none());
+
+        sync.observe_sender_report(sender_report(1, 2_090_000, 60_001), wall(5));
+        let second_candidate = sync.map_packet(MediaTime::from_90khz(2_090_000), wall(5));
+        assert!(second_candidate.epoch_transition().is_none());
+
+        sync.observe_sender_report(sender_report(1, 2_180_000, 60_002), wall(6));
+        let discontinuity = sync.map_packet(MediaTime::from_90khz(2_180_000), wall(6));
+        assert!(discontinuity.epoch_transition().is_some());
+    }
+
+    #[test]
+    fn sibling_encodings_align_with_independent_rtp_bases() {
+        let mut track = TrackSynchronizer::new(VIDEO_FREQUENCY);
+        for step in 0..3u32 {
+            let low_arrival = wall_ms(u64::from(step + 1), 20);
+            let high_arrival = wall_ms(u64::from(step + 1), 180);
+            track.observe_sender_report(
+                sender_report(10, 1_000_000 + step * 90_000, 60_000 + u64::from(step)),
+                low_arrival,
+            );
+            track.observe_sender_report(
+                sender_report(20, 7_000_000 + step * 90_000, 60_000 + u64::from(step)),
+                high_arrival,
+            );
+        }
+
+        let low = track.map_packet(10.into(), MediaTime::from_90khz(1_360_000), wall(5));
+        let high = track.map_packet(20.into(), MediaTime::from_90khz(7_360_000), wall(5));
+        let low_time = as_system_time(low.playout_time());
+        let high_time = as_system_time(high.playout_time());
+        let delta = low_time
+            .duration_since(high_time)
+            .unwrap_or_else(|error| error.duration());
+        assert!(delta <= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn later_minimum_delay_observations_align_mapped_siblings() {
+        let mut track = TrackSynchronizer::new(VIDEO_FREQUENCY);
+
+        for step in 0..2u32 {
+            let ntp = 10_000 + u64::from(step);
+            let rtp = step * 90_000;
+            track.observe_sender_report(sender_report(10, rtp, ntp), wall_ms(u64::from(step), 500));
+            track.observe_sender_report(
+                sender_report(20, rtp + 7_000_000, ntp),
+                wall_ms(u64::from(step), 500),
+            );
+        }
+
+        let initial_low =
+            track.map_packet(10.into(), MediaTime::from_90khz(90_000), wall_ms(1, 500));
+        let initial_high =
+            track.map_packet(20.into(), MediaTime::from_90khz(7_090_000), wall_ms(1, 500));
+
+        track.observe_sender_report(sender_report(10, 180_000, 10_002), wall_ms(2, 100));
+        track.observe_sender_report(sender_report(20, 7_180_000, 10_002), wall_ms(2, 500));
+
+        let event = wall_ms(2, 600);
+        let low = track.map_packet(10.into(), MediaTime::from_90khz(270_000), event);
+        let high = track.map_packet(20.into(), MediaTime::from_90khz(7_270_000), event);
+        let delta = low
+            .playout_time()
+            .duration_since(high.playout_time())
+            .unwrap_or_else(|error| error.duration());
+
+        assert!(initial_low.playout_time() >= wall_ms(1, 500));
+        assert!(initial_high.playout_time() >= wall_ms(1, 500));
+        assert!(low.playout_time() >= initial_low.playout_time());
+        assert!(high.playout_time() >= initial_high.playout_time());
+        assert!(low.playout_time() > event);
+        assert!(high.playout_time() > event);
+        assert!(delta <= Duration::from_millis(1));
     }
 }

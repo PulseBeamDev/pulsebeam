@@ -6,6 +6,53 @@ pub use crate::peer::{
     VideoLayersAllocation, VideoSpatialLayerAllocation, VideoStreamAllocation,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SenderReport {
+    ssrc: u32,
+    ntp_timestamp: u64,
+    rtp_timestamp: u32,
+    packet_count: u32,
+    octet_count: u32,
+}
+
+impl SenderReport {
+    pub const fn new(
+        ssrc: u32,
+        ntp_timestamp: u64,
+        rtp_timestamp: u32,
+        packet_count: u32,
+        octet_count: u32,
+    ) -> Self {
+        Self {
+            ssrc,
+            ntp_timestamp,
+            rtp_timestamp,
+            packet_count,
+            octet_count,
+        }
+    }
+
+    pub const fn ssrc(self) -> u32 {
+        self.ssrc
+    }
+
+    pub const fn ntp_timestamp(self) -> u64 {
+        self.ntp_timestamp
+    }
+
+    pub const fn rtp_timestamp(self) -> u32 {
+        self.rtp_timestamp
+    }
+
+    pub const fn packet_count(self) -> u32 {
+        self.packet_count
+    }
+
+    pub const fn octet_count(self) -> u32 {
+        self.octet_count
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IceCandidate(String);
 

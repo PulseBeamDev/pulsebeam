@@ -16,7 +16,7 @@ pub use api::{
     ForwardingLatency, H264NalMetadata, IceCandidate, IngressDatagram, IngressStream,
     MediaDirection, MediaExtensions, MediaKind, MediaPacket, MediaPacketError, MediaRewrite,
     MediaSemantics, NegotiatedCodec, NegotiatedMedia, RtcConnectionState, RtcEvent, RtcNegotiation,
-    RtcPeer, RtcPeerError, TransitMediaPacket, Transmit, VideoLayersAllocation,
+    RtcPeer, RtcPeerError, SenderReport, TransitMediaPacket, Transmit, VideoLayersAllocation,
     VideoSpatialLayerAllocation, VideoStreamAllocation,
 };
 pub(crate) use data_channel::{DataChannelAssociation, DataChannelError, DataChannelEvent};

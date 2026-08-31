@@ -215,23 +215,75 @@ fn units_to_duration(raw: u64) -> Duration {
 ///
 /// Captured once per node at startup and shared by every shard, so all of a
 /// node's shards place the same `Instant` at the same NTP instant. It is never
-/// refreshed: the wall clock is read exactly once in the process lifetime.
+/// refreshed during the node lifetime.
 #[derive(Debug, Clone, Copy)]
 pub struct WallAnchor {
     ntp: NtpTime,
     mono: Instant,
+    wall: SystemTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorError {
+    BeforeUnixEpoch,
+    ProjectionOverflow,
+    DeadlineBeforeUnixEpoch,
+    DeadlineOverflow,
+    MonotonicOverflow,
 }
 
 impl WallAnchor {
-    pub fn new(wall: SystemTime, mono: Instant) -> Self {
-        Self {
+    pub fn try_new(wall: SystemTime, mono: Instant) -> Result<Self, AnchorError> {
+        if wall.duration_since(UNIX_EPOCH).is_err() {
+            return Err(AnchorError::BeforeUnixEpoch);
+        }
+        Ok(Self {
             ntp: NtpTime::from_system_time(wall),
             mono,
-        }
+            wall,
+        })
     }
 
     pub fn ntp(&self) -> NtpTime {
         self.ntp
+    }
+
+    pub fn project(&self, t: Instant) -> Result<SystemTime, AnchorError> {
+        if t >= self.mono {
+            self.wall
+                .checked_add(t.duration_since(self.mono))
+                .ok_or(AnchorError::ProjectionOverflow)
+        } else {
+            self.wall
+                .checked_sub(self.mono.duration_since(t))
+                .ok_or(AnchorError::ProjectionOverflow)
+        }
+    }
+
+    pub fn deadline(
+        &self,
+        playout: SystemTime,
+        max_delay: Duration,
+    ) -> Result<Instant, AnchorError> {
+        let delay = playout
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| AnchorError::DeadlineBeforeUnixEpoch)?;
+        let target = delay
+            .checked_add(max_delay)
+            .ok_or(AnchorError::DeadlineOverflow)?;
+        let anchor = self
+            .wall
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| AnchorError::BeforeUnixEpoch)?;
+        if target >= anchor {
+            self.mono
+                .checked_add(target - anchor)
+                .ok_or(AnchorError::MonotonicOverflow)
+        } else {
+            self.mono
+                .checked_sub(anchor - target)
+                .ok_or(AnchorError::MonotonicOverflow)
+        }
     }
 
     pub fn to_ntp(&self, t: Instant) -> NtpTime {
@@ -448,7 +500,7 @@ mod tests {
     fn anchor_conversion_stays_correct_across_the_era_rollover() {
         let before = ntp(u32::MAX as u64, 0);
         let mono = Instant::now();
-        let anchor = WallAnchor { ntp: before, mono };
+        let anchor = WallAnchor::try_new(before.to_system_time(), mono).unwrap();
 
         let after = before.wrapping_add(Duration::from_secs(2));
         assert_eq!(
@@ -510,12 +562,122 @@ mod tests {
     async fn anchor_round_trips_instants() {
         let mono = Instant::now();
         let wall = UNIX_EPOCH + Duration::new(1_700_000_000, 0);
-        let anchor = WallAnchor::new(wall, mono);
+        let anchor = WallAnchor::try_new(wall, mono).unwrap();
 
         let later = mono + Duration::from_millis(250);
         assert_eq!(anchor.to_instant(anchor.to_ntp(later)), later);
 
         let earlier = mono - Duration::from_millis(250);
         assert_eq!(anchor.to_instant(anchor.to_ntp(earlier)), earlier);
+    }
+
+    #[test]
+    fn captured_readings_project_elapsed_monotonic_time_to_system_time() {
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH + Duration::new(1_700_000_000, 17);
+        let elapsed = Duration::new(12, 345_678_901);
+        let anchor = WallAnchor::try_new(wall, mono).expect("supplied readings are valid");
+
+        let projected: SystemTime = anchor
+            .project(mono + elapsed)
+            .expect("supplied projection is representable");
+        let expected = wall
+            .checked_add(elapsed)
+            .expect("fixed projection must fit in SystemTime");
+        assert_eq!(projected, expected);
+    }
+
+    #[test]
+    fn established_anchor_ignores_a_later_wall_clock_step() {
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH + Duration::new(1_700_000_000, 0);
+        let anchor = WallAnchor::try_new(wall, mono).expect("supplied readings are valid");
+        let elapsed = Duration::from_secs(4);
+        let stepped_wall = wall
+            .checked_add(Duration::from_secs(90))
+            .expect("fixed wall step must fit in SystemTime");
+        assert_ne!(stepped_wall, wall);
+
+        let projected: SystemTime = anchor
+            .project(mono + elapsed)
+            .expect("supplied projection is representable");
+        let expected = wall
+            .checked_add(elapsed)
+            .expect("fixed projection must fit in SystemTime");
+        assert_eq!(projected, expected);
+    }
+
+    #[test]
+    fn synchronized_nodes_preserve_routed_playout_and_local_deadline() {
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH + Duration::new(1_700_000_000, 0);
+        let source = WallAnchor::try_new(wall, mono).expect("supplied readings are valid");
+        let destination_mono = mono
+            .checked_add(Duration::from_secs(3))
+            .expect("fixed monotonic reading must fit");
+        let destination =
+            WallAnchor::try_new(wall, destination_mono).expect("supplied readings are valid");
+        let ingress_elapsed = Duration::new(8, 123_456_789);
+        let ingress = mono + ingress_elapsed;
+        let playout: SystemTime = source
+            .project(ingress)
+            .expect("supplied projection is representable");
+        let routed_playout: SystemTime = playout;
+        assert_eq!(routed_playout, playout);
+
+        let max_delay = Duration::from_millis(250);
+        let source_deadline = source
+            .deadline(playout, max_delay)
+            .expect("supplied source deadline is representable");
+        let destination_deadline = destination
+            .deadline(routed_playout, max_delay)
+            .expect("supplied destination deadline is representable");
+        assert_eq!(
+            source_deadline.saturating_duration_since(mono),
+            destination_deadline.saturating_duration_since(destination_mono)
+        );
+    }
+
+    #[test]
+    fn construction_rejects_pre_epoch_wall_readings() {
+        let mono = Instant::now();
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_nanos(1))
+            .expect("fixed pre-epoch reading must be representable");
+        assert!(WallAnchor::try_new(before_epoch, mono).is_err());
+    }
+
+    #[test]
+    fn projection_rejects_wall_clock_overflow() {
+        let mono = Instant::now();
+        let near_system_time_limit = UNIX_EPOCH
+            .checked_add(Duration::from_secs(
+                u64::try_from(i64::MAX).expect("i64::MAX fits in u64"),
+            ))
+            .expect("fixed near-limit reading must be representable");
+        let anchor =
+            WallAnchor::try_new(near_system_time_limit, mono).expect("wall reading is valid");
+        let after_anchor = mono
+            .checked_add(Duration::from_secs(1))
+            .expect("fixed monotonic reading must fit");
+        assert!(anchor.project(after_anchor).is_err());
+    }
+
+    #[test]
+    fn deadline_rejects_unrepresentable_system_time() {
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH + Duration::new(1_700_000_000, 0);
+        let anchor = WallAnchor::try_new(wall, mono).expect("supplied readings are valid");
+        let unrepresentable = UNIX_EPOCH
+            .checked_sub(Duration::from_nanos(1))
+            .expect("fixed pre-epoch deadline must be representable");
+        assert!(
+            anchor.deadline(unrepresentable, Duration::ZERO).is_err(),
+            "a pre-epoch deadline must fail explicitly"
+        );
+        assert!(
+            anchor.deadline(wall, Duration::MAX).is_err(),
+            "an overflowing deadline must fail explicitly"
+        );
     }
 }

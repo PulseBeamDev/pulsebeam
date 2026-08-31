@@ -948,7 +948,7 @@ mod wrong_owner_tests {
             shard,
             4,
             4,
-            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            WallAnchor::try_new(std::time::SystemTime::UNIX_EPOCH, Instant::now()).unwrap(),
             update_rx,
         );
 
@@ -992,7 +992,7 @@ mod wrong_owner_tests {
             shard,
             4,
             4,
-            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            WallAnchor::try_new(std::time::SystemTime::UNIX_EPOCH, Instant::now()).unwrap(),
             update_rx,
         );
         let router = CaptureTransport {
@@ -1030,7 +1030,7 @@ mod wrong_owner_tests {
             shard,
             4,
             1,
-            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            WallAnchor::try_new(std::time::SystemTime::UNIX_EPOCH, Instant::now()).unwrap(),
             update_rx,
         );
         let mut track_keys = slotmap::SlotMap::<crate::keys::TrackKey, ()>::with_key();
@@ -1065,7 +1065,7 @@ mod wrong_owner_tests {
             shard,
             4,
             1,
-            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            WallAnchor::try_new(std::time::SystemTime::UNIX_EPOCH, Instant::now()).unwrap(),
             update_rx,
         );
         let route = crate::route::RouteHandle::new(crate::route::RouteId::new(shard, 8), 1);

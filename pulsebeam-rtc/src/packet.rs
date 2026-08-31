@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, ops::Range, time::Instant};
 
-use crate::{NegotiatedMediaSection, PacketId, StreamId};
+use crate::{NegotiatedMediaSection, PacketId, SenderReport, StreamId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportProtocol {
@@ -708,33 +708,6 @@ pub struct RtcpPacketView<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SenderReport {
-    ssrc: u32,
-    ntp_timestamp: u64,
-    rtp_timestamp: u32,
-    packet_count: u32,
-    octet_count: u32,
-}
-
-impl SenderReport {
-    pub const fn ssrc(self) -> u32 {
-        self.ssrc
-    }
-    pub const fn ntp_timestamp(self) -> u64 {
-        self.ntp_timestamp
-    }
-    pub const fn rtp_timestamp(self) -> u32 {
-        self.rtp_timestamp
-    }
-    pub const fn packet_count(self) -> u32 {
-        self.packet_count
-    }
-    pub const fn octet_count(self) -> u32 {
-        self.octet_count
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RtcpFeedback {
     sender_ssrc: u32,
     media_ssrc: u32,
@@ -803,13 +776,13 @@ impl<'a> RtcpPacketView<'a> {
         if bytes.len() < 28 {
             return Err(PacketError::Truncated);
         }
-        Ok(Some(SenderReport {
-            ssrc: read_u32(bytes, 4)?,
-            ntp_timestamp: (u64::from(read_u32(bytes, 8)?) << 32) | u64::from(read_u32(bytes, 12)?),
-            rtp_timestamp: read_u32(bytes, 16)?,
-            packet_count: read_u32(bytes, 20)?,
-            octet_count: read_u32(bytes, 24)?,
-        }))
+        Ok(Some(crate::SenderReport::new(
+            read_u32(bytes, 4)?,
+            (u64::from(read_u32(bytes, 8)?) << 32) | u64::from(read_u32(bytes, 12)?),
+            read_u32(bytes, 16)?,
+            read_u32(bytes, 20)?,
+            read_u32(bytes, 24)?,
+        )))
     }
 
     pub fn feedback(&self) -> Result<Option<RtcpFeedback>, PacketError> {
