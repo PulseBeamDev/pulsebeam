@@ -1,5 +1,5 @@
 [package]
-name = "pulsebeam-agent-web"
+name = "pulsebeam-agent-wasm"
 version = "0.1.0"
 edition = "2024"
 
@@ -14,11 +14,16 @@ workspace = true
 
 [dependencies]
 agent_core = { package = "pulsebeam-agent-core", version = "0.1.0", path = "../pulsebeam-agent-core" }
-gloo-net = "0.6"
-gloo-timers = "0.3"
+gloo-net = "0.7"
+gloo-timers = "0.4"
 js-sys = "0.3"
 log = { version = "0.4", default-features = false }
-spin = "0.9.9"
+serde = { version = "1", default-features = false, features = [
+  "derive",
+  "alloc",
+] }
+serde-wasm-bindgen = "0.6.5"
+spin = "0.12.3"
 thiserror = "2.0"
 wasm-bindgen = "0.2.127"
 wasm-bindgen-futures = "0.4"

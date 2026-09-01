@@ -1,11 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/pulsebeam-agent-core",
+  "bindings/pulsebeam-agent-wasm",
   "pulsebeam",
   "pulsebeam-agent",
-  "pulsebeam-agent-core",
-  "pulsebeam-agent-web",
-  "pulsebeam-agent-browser-test",
   "pulsebeam-cli",
   "pulsebeam-core",
   "pulsebeam-ebpf",
