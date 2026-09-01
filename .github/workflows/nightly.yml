@@ -35,10 +35,10 @@ jobs:
     # exists so a hung plan cannot burn the runner.
     timeout-minutes: 120
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
     - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: mozilla-actions/sccache-action@v0.0.11
     - uses: taiki-e/install-action@v2
       with:
         tool: nextest

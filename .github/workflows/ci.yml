@@ -20,7 +20,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -46,7 +46,7 @@ jobs:
       run_ebpf_smoke: ${{ steps.layout.outputs.run_ebpf_smoke }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Detect repository layout
         id: layout
@@ -86,9 +86,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -118,7 +118,7 @@ jobs:
     if: needs.build.outputs.run_ebpf_smoke == 'true'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
