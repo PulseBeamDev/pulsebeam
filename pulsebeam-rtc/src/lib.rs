@@ -6,6 +6,7 @@ mod negotiation;
 pub mod packet;
 pub mod rtcp;
 mod session;
+pub mod transport;
 
 pub use api::{
     ApplicationCommand, CloseReason, DataChannelMode, DataPayload, DatagramProtocol,
