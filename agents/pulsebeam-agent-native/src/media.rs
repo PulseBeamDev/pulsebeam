@@ -748,31 +748,6 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn suppressed_natural_repeats_hold_on_delta_until_keyframe_reset() {
-        let data = [
-            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x06, 0, 0, 0, 1, 0x65,
-            0x80, 0x11, 0, 0, 0, 1, 0x41, 0x80, 0x22,
-        ];
-        let asset = Arc::new(SharedH264Asset::new(&data));
-        assert_eq!(asset.frames.len(), 2);
-        assert_eq!(asset.first_idr, 0);
-        let mut looper = H264Looper::new_shared(asset, 30).without_natural_keyframe_repeats();
-
-        let keyframe = looper.next();
-        let delta = looper.next();
-        assert_eq!(looper.next(), delta);
-        assert_eq!(looper.next(), delta);
-
-        looper.reset_to_keyframe();
-        assert_eq!(looper.next(), keyframe);
-    }
-}
-
 /// A synthetic audio source: fixed-size packets at a steady cadence, with a declared loudness.
 ///
 /// Enough to exercise forwarding and speaker selection, which is what the SFU does with audio. It
@@ -905,5 +880,30 @@ impl AudioLooper {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suppressed_natural_repeats_hold_on_delta_until_keyframe_reset() {
+        let data = [
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x06, 0, 0, 0, 1, 0x65,
+            0x80, 0x11, 0, 0, 0, 1, 0x41, 0x80, 0x22,
+        ];
+        let asset = Arc::new(SharedH264Asset::new(&data));
+        assert_eq!(asset.frames.len(), 2);
+        assert_eq!(asset.first_idr, 0);
+        let mut looper = H264Looper::new_shared(asset, 30).without_natural_keyframe_repeats();
+
+        let keyframe = looper.next();
+        let delta = looper.next();
+        assert_eq!(looper.next(), delta);
+        assert_eq!(looper.next(), delta);
+
+        looper.reset_to_keyframe();
+        assert_eq!(looper.next(), keyframe);
     }
 }

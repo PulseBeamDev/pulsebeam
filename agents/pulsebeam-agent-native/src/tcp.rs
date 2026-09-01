@@ -28,6 +28,7 @@ pub(crate) struct TcpSession {
 impl TcpSession {
     /// RFC 4571's length field is the complete 16-bit unsigned range.
     const MAX_FRAME: usize = u16::MAX as usize;
+    const MAX_PENDING_WRITE: usize = Self::MAX_FRAME.saturating_mul(8);
 
     /// No TCP connectivity; the select arm for this session parks indefinitely.
     pub(crate) fn inactive() -> Self {
@@ -60,6 +61,10 @@ impl TcpSession {
         self.server_addr
     }
 
+    pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
+    }
+
     /// Await readable data on the stream.  Parks forever when there is no
     /// stream, which causes the `tokio::select!` arm to never fire.
     pub(crate) async fn wait_recv(&mut self) -> io::Result<usize> {
@@ -74,6 +79,19 @@ impl TcpSession {
     /// frames and delivers them to `rtc` as `Input::Receive`.  Closes the
     /// stream on EOF or I/O error.
     pub(crate) fn on_recv(&mut self, result: io::Result<usize>, rtc: &mut Rtc) {
+        let frames = self.receive_frames(result);
+        let (Some(source), Some(destination)) = (self.server_addr, self.local_addr) else {
+            return;
+        };
+        for frame in frames {
+            if let Ok(receive) = Receive::new(Protocol::Tcp, source, destination, &frame) {
+                let _ = rtc.handle_input(Input::Receive(Instant::now().into(), receive));
+            }
+        }
+    }
+
+    pub(crate) fn receive_frames(&mut self, result: io::Result<usize>) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
         match result {
             Ok(0) => {
                 tracing::warn!("TCP stream closed by server");
@@ -82,7 +100,7 @@ impl TcpSession {
             Ok(n) => {
                 let Some(chunk) = self.buf.get(..n) else {
                     debug_assert!(false, "recv reported {n} bytes into a smaller buffer");
-                    return;
+                    return frames;
                 };
                 self.recv_accum.extend_from_slice(chunk);
                 loop {
@@ -104,19 +122,7 @@ impl TcpSession {
                     }
                     self.recv_accum.advance(2);
                     let frame = self.recv_accum.split_to(len);
-                    if let (Ok(contents), Some(src), Some(dst)) =
-                        (frame[..].try_into(), self.server_addr, self.local_addr)
-                    {
-                        let _ = rtc.handle_input(Input::Receive(
-                            Instant::now().into(),
-                            Receive {
-                                proto: Protocol::Tcp,
-                                source: src,
-                                destination: dst,
-                                contents,
-                            },
-                        ));
-                    }
+                    frames.push(frame.to_vec());
                 }
             }
             Err(e) => {
@@ -124,6 +130,7 @@ impl TcpSession {
                 self.close();
             }
         }
+        frames
     }
 
     pub(crate) fn try_send(&mut self, payload: &[u8]) {
@@ -146,6 +153,12 @@ impl TcpSession {
         let mut packet = Vec::with_capacity(header.len().saturating_add(payload.len()));
         packet.extend_from_slice(&header);
         packet.extend_from_slice(payload);
+        let pending = self.pending_write.len().saturating_add(packet.len());
+        if pending > Self::MAX_PENDING_WRITE {
+            tracing::warn!(pending, "TCP write queue is full, dropping frame");
+            return;
+        }
+        self.pending_write.extend_from_slice(&packet);
 
         while !self.pending_write.is_empty() {
             match stream.try_write(&self.pending_write) {
@@ -170,30 +183,49 @@ impl TcpSession {
             }
         }
 
-        match stream.try_write(&packet) {
-            Ok(n) if n == packet.len() => {}
-            Ok(n) => {
-                debug_assert!(n < packet.len());
-                let Some(remainder) = packet.get(n..) else {
-                    self.close();
-                    return;
-                };
-                self.pending_write.extend_from_slice(remainder);
-                debug_assert!(self.pending_write.len() <= Self::MAX_FRAME.saturating_add(2));
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                tracing::debug!("TCP write would block, frame dropped lossily");
-            }
-            Err(e) => {
-                tracing::warn!("TCP write failed, closing stream: {:?}", e);
-                self.close();
-            }
-        }
+        debug_assert!(self.pending_write.len() <= Self::MAX_PENDING_WRITE);
     }
 
     pub(crate) fn close(&mut self) {
         self.stream = None;
         self.recv_accum.clear();
         self.pending_write.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(payload.len()).unwrap();
+        let mut frame = length.to_be_bytes().to_vec();
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn receive_reassembles_partial_and_consecutive_frames() {
+        let first = vec![7; 5_635];
+        let second = vec![9; 37];
+        let bytes = [framed(&first), framed(&second)].concat();
+        let split = 2_001;
+        let mut tcp = TcpSession::inactive();
+
+        tcp.buf = bytes[..split].to_vec();
+        assert!(tcp.receive_frames(Ok(split)).is_empty());
+        tcp.buf = bytes[split..].to_vec();
+        let frames = tcp.receive_frames(Ok(bytes.len() - split));
+
+        assert_eq!(frames, vec![first, second]);
+    }
+
+    #[test]
+    fn receive_rejects_zero_length_frames() {
+        let mut tcp = TcpSession::inactive();
+        tcp.buf = vec![0, 0];
+
+        assert!(tcp.receive_frames(Ok(2)).is_empty());
+        assert!(tcp.recv_accum.is_empty());
     }
 }

@@ -8,7 +8,25 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["pulsebeam-core/reqwest"]
+sim = ["pulsebeam-core/sim"]
+
 [dependencies]
+agent_core = { package = "pulsebeam-agent-core", path = "../pulsebeam-agent-core" }
+bytes.workspace = true
+flume = "0.12.0"
+http = "1.4.1"
+if-addrs = "0.15.0"
+pulsebeam-core = { path = "../../crates/pulsebeam-core", features = ["str0m"] }
+pulsebeam-proto = { path = "../../crates/pulsebeam-proto" }
+str0m.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pulsebeam-testdata = { path = "../../crates/pulsebeam-testdata" }
 
 [lints]
 workspace = true

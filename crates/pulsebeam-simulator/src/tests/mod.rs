@@ -4,6 +4,7 @@ pub mod common;
 pub mod connectivity;
 pub mod cross_shard;
 pub mod data_channel;
+pub mod native_runtime;
 pub mod properties;
 pub mod room_isolation;
 pub mod subscriptions;
