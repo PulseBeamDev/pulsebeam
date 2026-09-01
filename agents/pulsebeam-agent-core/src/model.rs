@@ -5,7 +5,7 @@ use alloc::{
 };
 use core::time::Duration;
 
-use crate::Generation;
+use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
 
 pub const MAX_LOCAL_VIDEO_SLOTS: usize = 2;
 pub const MAX_LOCAL_AUDIO_SLOTS: usize = 2;
@@ -56,6 +56,7 @@ pub struct DesiredState {
     pub video: Vec<VideoSubscription>,
     pub audio: AudioSubscription,
     pub playout_delay: PlayoutDelay,
+    pub topics: TopicRegistrations,
 }
 
 impl Default for DesiredState {
@@ -67,6 +68,7 @@ impl Default for DesiredState {
             video: Vec::new(),
             audio: AudioSubscription::default(),
             playout_delay: PlayoutDelay::Adaptive,
+            topics: TopicRegistrations::default(),
         }
     }
 }
@@ -184,6 +186,7 @@ pub struct Snapshot {
     pub publications: BTreeMap<String, Publication>,
     pub video: BTreeMap<String, VideoBinding>,
     pub audio: Vec<AudioBinding>,
+    pub topics: TopicSnapshot,
     pub terminal_failure: Option<Failure>,
 }
 
@@ -199,6 +202,7 @@ impl Default for Snapshot {
             publications: BTreeMap::new(),
             video: BTreeMap::new(),
             audio: Vec::new(),
+            topics: TopicSnapshot::default(),
             terminal_failure: None,
         }
     }
@@ -235,6 +239,7 @@ pub enum Notification {
         binding: Option<VideoBinding>,
     },
     AudioBindingsChanged(Vec<AudioBinding>),
+    Topic(TopicNotification),
     Failure(Failure),
     ServerError(String),
 }
@@ -263,6 +268,12 @@ pub enum ValidationError {
     PlayoutDelay,
     #[error("retry policy is invalid")]
     RetryPolicy,
+    #[error("topic name is invalid: {0}")]
+    Topic(String),
+    #[error("topic publisher scope is invalid: {0}")]
+    TopicScope(String),
+    #[error("topic registrations exceed the {maximum}-channel limit: {actual}")]
+    TopicChannelLimit { actual: usize, maximum: usize },
 }
 
 impl AgentConfig {
@@ -338,6 +349,10 @@ impl MediaTopology {
 }
 
 impl DesiredState {
+    pub(crate) fn normalize(&mut self) {
+        self.topics.normalize();
+    }
+
     pub(crate) fn validate(&self, topology: &MediaTopology) -> Result<(), ValidationError> {
         let local: BTreeSet<&str> = topology
             .local_video
@@ -400,6 +415,7 @@ impl DesiredState {
         {
             return Err(ValidationError::PlayoutDelay);
         }
+        self.topics.validate()?;
         Ok(())
     }
 }

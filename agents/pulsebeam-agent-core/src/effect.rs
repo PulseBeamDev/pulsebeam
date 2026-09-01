@@ -74,4 +74,11 @@ pub enum DataChannelReliability {
 pub struct OfferResources {
     pub slots: Vec<SlotBinding>,
     pub signaling_channel: ChannelId,
+    pub data_channels: Vec<DataChannelBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataChannelBinding {
+    pub label: String,
+    pub channel: ChannelId,
 }

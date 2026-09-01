@@ -18,6 +18,7 @@ mod http;
 mod id;
 mod model;
 mod signaling;
+mod topic;
 
 pub use agent::*;
 pub use effect::*;
@@ -26,6 +27,7 @@ pub use http::*;
 pub use id::*;
 pub use model::*;
 pub use signaling::SignalingError;
+pub use topic::*;
 
 #[cfg(test)]
 mod tests;

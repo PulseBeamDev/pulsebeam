@@ -11,9 +11,11 @@ use crate::{
     DataChannelReliability, DataChannelSpec, DesiredState, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpRequest,
     HttpResponse, MediaSlot, Notification, OfferResources, OperationId, PlayoutDelay, RtcEffect,
-    RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, ValidationError,
+    RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicDropReason, TopicError,
+    TopicSend, ValidationError,
     id::IdGenerator,
     signaling::{self, ServerOutput, SignalingError},
+    topic::Topics,
 };
 
 const CONTENT_TYPE: &str = "Content-Type";
@@ -23,6 +25,7 @@ const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
     ReplaceDesired(DesiredState),
+    SendTopic(TopicSend),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -39,6 +42,8 @@ pub enum AgentError {
     InvalidOffer(&'static str),
     #[error(transparent)]
     InvalidSignaling(#[from] SignalingError),
+    #[error(transparent)]
+    InvalidTopic(#[from] TopicError),
 }
 
 #[derive(Clone)]
@@ -80,6 +85,8 @@ struct Attempt {
     answer_applied: bool,
     transport_connected: bool,
     signaling_open: bool,
+    topic_registrations: crate::TopicRegistrations,
+    open_channels: BTreeSet<ChannelId>,
 }
 
 struct Retry {
@@ -115,6 +122,7 @@ pub struct Agent {
     intent_dirty: bool,
     closing: Option<Closing>,
     orphaned_creates: BTreeSet<OperationId>,
+    topics: Topics,
 }
 
 impl Agent {
@@ -136,12 +144,23 @@ impl Agent {
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeSet::new(),
+            topics: Topics::default(),
         })
     }
 
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
+            AgentCommand::SendTopic(send) => self
+                .topics
+                .send(
+                    send,
+                    &mut self.ids,
+                    &mut self.effects,
+                    &mut self.snapshot,
+                    &mut self.notifications,
+                )
+                .map_err(AgentError::from),
         };
         if let Err(error) = &result {
             log::warn!("agent command rejected: {error}");
@@ -174,7 +193,8 @@ impl Agent {
         self.notifications.pop_front()
     }
 
-    fn replace_desired(&mut self, desired: DesiredState) -> Result<(), AgentError> {
+    fn replace_desired(&mut self, mut desired: DesiredState) -> Result<(), AgentError> {
+        desired.normalize();
         desired.validate(&self.config.topology)?;
         if desired.revision < self.desired.revision {
             return Err(AgentError::StaleDesiredRevision {
@@ -201,6 +221,7 @@ impl Agent {
             || self.desired.video != desired.video
             || self.desired.audio != desired.audio
             || self.desired.playout_delay != desired.playout_delay;
+        let topics_changed = self.desired.topics != desired.topics;
         self.desired = desired;
         self.snapshot.desired_revision = self.desired.revision;
         self.bump_snapshot();
@@ -212,6 +233,13 @@ impl Agent {
             self.desired.video.len(),
             self.desired.audio.pinned.len(),
         );
+        if topics_changed {
+            self.topics.reconcile(
+                &self.desired.topics,
+                &mut self.snapshot,
+                &mut self.notifications,
+            );
+        }
         if intent_changed {
             self.intent_dirty = true;
         }
@@ -228,6 +256,8 @@ impl Agent {
                     self.start_attempt(mode);
                 } else if self.active.is_none() {
                     self.start_attempt(AttemptMode::Fresh);
+                } else if topics_changed {
+                    self.start_attempt(AttemptMode::Replace);
                 } else {
                     self.send_intent_if_ready();
                 }
@@ -243,6 +273,7 @@ impl Agent {
     fn start_attempt(&mut self, mode: AttemptMode) {
         debug_assert!(self.attempt.is_none());
         let generation = self.ids.generation();
+        let topic_registrations = self.desired.topics.clone();
         log::info!(
             "starting connection attempt mode={mode:?} generation={}",
             generation.get()
@@ -257,15 +288,19 @@ impl Agent {
             answer_applied: false,
             transport_connected: false,
             signaling_open: false,
+            topic_registrations: topic_registrations.clone(),
+            open_channels: BTreeSet::new(),
         });
+        let mut data_channels = vec![DataChannelSpec {
+            label: signaling::SIGNALING_LABEL.to_string(),
+            ordered: true,
+            reliability: DataChannelReliability::Reliable,
+        }];
+        data_channels.extend(Topics::channel_specs(&topic_registrations));
         self.effects.push_back(Effect::Rtc(RtcEffect::CreateOffer {
             generation,
             topology: self.config.topology.clone(),
-            data_channels: vec![DataChannelSpec {
-                label: signaling::SIGNALING_LABEL.to_string(),
-                ordered: true,
-                reliability: DataChannelReliability::Reliable,
-            }],
+            data_channels,
         }));
         if mode == AttemptMode::Fresh && self.active.is_none() {
             self.snapshot.generation = Some(generation);
@@ -317,6 +352,12 @@ impl Agent {
                     && self.attempt.is_none()
                     && self.retry.is_none()
                 {
+                    self.topics.unbind_generation(
+                        generation,
+                        TopicDropReason::TransportReplaced,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                    );
                     self.start_attempt(AttemptMode::Replace);
                 }
                 Ok(())
@@ -343,7 +384,12 @@ impl Agent {
         if attempt.generation != generation || attempt.stage != AttemptStage::Offering {
             return Ok(());
         }
-        validate_offer(&offer, &resources, &self.config)?;
+        validate_offer(
+            &offer,
+            &resources,
+            &self.config,
+            &attempt.topic_registrations,
+        )?;
         let mode = attempt.mode;
         let operation = self.ids.operation();
         let request = match mode {
@@ -505,27 +551,93 @@ impl Agent {
             } => {
                 if let Some(attempt) = self.attempt.as_mut()
                     && attempt.generation == generation
-                    && attempt
+                {
+                    let recognized = if attempt
                         .resources
                         .as_ref()
                         .is_some_and(|resources| resources.signaling_channel == channel)
-                {
-                    attempt.signaling_open = true;
+                    {
+                        attempt.signaling_open = true;
+                        true
+                    } else if attempt.resources.as_ref().is_some_and(|resources| {
+                        resources
+                            .data_channels
+                            .iter()
+                            .any(|binding| binding.channel == channel)
+                    }) {
+                        let _ = attempt.open_channels.insert(channel);
+                        true
+                    } else {
+                        false
+                    };
+                    if !recognized {
+                        return Err(TopicError::UnknownChannel.into());
+                    }
                     self.update_attempt_state();
                     self.try_activate();
+                } else if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.generation == generation)
+                    && !self.active.as_ref().is_some_and(|active| {
+                        active.signaling_channel == channel
+                            || self.topics.has_channel(generation, channel)
+                    })
+                {
+                    return Err(TopicError::UnknownChannel.into());
                 }
             }
             DataChannelEvent::Closed {
                 generation,
                 channel,
             } => {
+                let candidate_channel = self.attempt.as_ref().is_some_and(|attempt| {
+                    attempt.generation == generation
+                        && attempt.resources.as_ref().is_some_and(|resources| {
+                            resources.signaling_channel == channel
+                                || resources
+                                    .data_channels
+                                    .iter()
+                                    .any(|binding| binding.channel == channel)
+                        })
+                });
+                if candidate_channel {
+                    self.fail_attempt(Failure::transient("candidate data channel closed"));
+                    return Ok(());
+                }
                 if self.active.as_ref().is_some_and(|session| {
                     session.generation == generation && session.signaling_channel == channel
                 }) && self.desired.connected
                     && self.attempt.is_none()
                     && self.retry.is_none()
                 {
+                    self.topics.unbind_generation(
+                        generation,
+                        TopicDropReason::ChannelClosed,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                    );
                     self.start_attempt(AttemptMode::Replace);
+                } else {
+                    let topic_closed = self.topics.channel_closed(
+                        generation,
+                        channel,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                    );
+                    if topic_closed
+                        && self.desired.connected
+                        && self.attempt.is_none()
+                        && self.retry.is_none()
+                    {
+                        self.topics.unbind_generation(
+                            generation,
+                            TopicDropReason::TransportReplaced,
+                            &mut self.snapshot,
+                            &mut self.notifications,
+                        );
+                        self.start_attempt(AttemptMode::Replace);
+                    }
                 }
             }
             DataChannelEvent::Message {
@@ -536,7 +648,19 @@ impl Agent {
                 let Some(active) = self.active.as_ref() else {
                     return Ok(());
                 };
-                if active.generation != generation || active.signaling_channel != channel {
+                if active.generation != generation {
+                    return Ok(());
+                }
+                if active.signaling_channel != channel {
+                    let _ = self.topics.handle_message(
+                        generation,
+                        channel,
+                        payload,
+                        &mut self.ids,
+                        &mut self.effects,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                    )?;
                     return Ok(());
                 }
                 match signaling::apply_server_message(
@@ -583,6 +707,16 @@ impl Agent {
                     );
                     self.pending_signal = None;
                     self.send_intent_if_ready();
+                } else {
+                    let _ = self.topics.handle_sent(
+                        operation,
+                        generation,
+                        channel,
+                        &mut self.ids,
+                        &mut self.effects,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                    );
                 }
             }
             DataChannelEvent::SendFailed {
@@ -606,6 +740,17 @@ impl Agent {
                     self.intent_dirty = true;
                     self.notify_failure(Failure::transient(message));
                     self.schedule_signal_retry();
+                } else {
+                    let _ = self.topics.handle_send_failed(
+                        operation,
+                        generation,
+                        channel,
+                        message,
+                        &mut self.ids,
+                        &mut self.effects,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                    );
                 }
             }
         }
@@ -619,6 +764,12 @@ impl Agent {
                 && attempt.answer_applied
                 && attempt.transport_connected
                 && attempt.signaling_open
+                && attempt.resources.as_ref().is_some_and(|resources| {
+                    resources
+                        .data_channels
+                        .iter()
+                        .all(|binding| attempt.open_channels.contains(&binding.channel))
+                })
         });
         if !ready {
             return;
@@ -634,6 +785,7 @@ impl Agent {
             debug_assert!(false, "ready attempt must have offer resources");
             return;
         };
+        let topic_bindings = resources.data_channels.clone();
         let mids = resources
             .slots
             .into_iter()
@@ -665,10 +817,21 @@ impl Agent {
         if let Some(active) = &self.active {
             self.snapshot.generation = Some(active.generation);
             self.snapshot.participant_id = Some(active.participant_id.clone());
+            self.topics.bind(
+                active.generation,
+                active.participant_id.clone(),
+                &attempt.topic_registrations,
+                topic_bindings,
+                &mut self.snapshot,
+                &mut self.notifications,
+            );
         }
         self.snapshot.terminal_failure = None;
         self.set_connection_state(ConnectionState::Connected);
         self.send_intent_if_ready();
+        if attempt.topic_registrations != self.desired.topics {
+            self.start_attempt(AttemptMode::Replace);
+        }
     }
 
     fn update_attempt_state(&mut self) {
@@ -866,6 +1029,14 @@ impl Agent {
         }
         self.cancel_signal_retry();
         self.pending_signal = None;
+        if let Some(active) = self.active.as_ref() {
+            self.topics.unbind_generation(
+                active.generation,
+                TopicDropReason::ChannelClosed,
+                &mut self.snapshot,
+                &mut self.notifications,
+            );
+        }
         let mut closing = Closing::default();
         if let Some(mut attempt) = self.attempt.take() {
             let _ = closing.generations.insert(attempt.generation);
@@ -1046,6 +1217,7 @@ fn validate_offer(
     offer: &str,
     resources: &OfferResources,
     config: &AgentConfig,
+    registrations: &crate::TopicRegistrations,
 ) -> Result<(), AgentError> {
     const MAX_SDP_BYTES: usize = 1_048_576;
     if offer.is_empty() || offer.len() > MAX_SDP_BYTES {
@@ -1072,6 +1244,27 @@ fn validate_offer(
     if actual != expected {
         return Err(AgentError::InvalidOffer(
             "slot mapping does not match configured topology",
+        ));
+    }
+    let expected_labels = Topics::expected_labels(registrations);
+    let mut actual_labels = BTreeSet::new();
+    let mut channels = BTreeSet::new();
+    let _ = channels.insert(resources.signaling_channel);
+    for binding in &resources.data_channels {
+        if !actual_labels.insert(binding.label.clone()) {
+            return Err(AgentError::InvalidOffer(
+                "data channel label is mapped more than once",
+            ));
+        }
+        if !channels.insert(binding.channel) {
+            return Err(AgentError::InvalidOffer(
+                "data channel is mapped more than once",
+            ));
+        }
+    }
+    if actual_labels != expected_labels {
+        return Err(AgentError::InvalidOffer(
+            "data channel mapping does not match topic registrations",
         ));
     }
     Ok(())
