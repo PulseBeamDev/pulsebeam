@@ -3162,6 +3162,7 @@ dependencies = [
  "js-sys",
  "log",
  "pulsebeam-agent-core",
+ "spin 0.9.9",
  "thiserror 2.0.20",
  "wasm-bindgen",
  "wasm-bindgen-futures",

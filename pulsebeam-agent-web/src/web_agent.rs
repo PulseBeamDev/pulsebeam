@@ -9,12 +9,10 @@ use agent_core::{
     Publication, StateError, TopicError, TopicRegistration,
 };
 
-#[cfg(any(test, target_arch = "wasm32"))]
 use agent_core::{AgentEvent, EventDisposition};
 
 use crate::watch::{self, Sender, TryRecvError};
 
-#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
 pub struct WebAgent {
@@ -229,7 +227,6 @@ impl Inner {
         Ok(TopicSendResult::Sent)
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn track(this: &Weak<Self>, mid: String, track: web_sys::MediaStreamTrack) {
         let Some(inner) = this.upgrade() else {
             return;
@@ -262,14 +259,12 @@ impl Actor {
         Ok(())
     }
 
-    #[cfg(any(test, target_arch = "wasm32"))]
     fn feed(&mut self, event: AgentEvent) -> EventDisposition {
         let disposition = self.core.handle(event);
         self.drain_effects();
         disposition
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn track(&mut self, mid: String, track: web_sys::MediaStreamTrack) {
         self.remote.tracks.insert(mid, track);
         self.sync_snapshot();
@@ -363,25 +358,6 @@ impl RemoteRegistry {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-struct BrowserRuntime;
-
-#[cfg(not(target_arch = "wasm32"))]
-impl BrowserRuntime {
-    fn new() -> Self {
-        Self
-    }
-
-    fn execute(&mut self, _: AgentEffect, _: Weak<Inner>) {}
-
-    fn reconcile_media(&mut self, _: &[LocalSlotTracks], _: &[agent_core::LocalSlotIntent]) {}
-
-    fn can_send(&self, _: &TopicRegistration, _: usize) -> bool {
-        true
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
 struct BrowserRuntime {
     transport: Option<Transport>,
     timers: std::collections::BTreeMap<agent_core::TimerId, gloo_timers::callback::Timeout>,
@@ -390,7 +366,6 @@ struct BrowserRuntime {
     local_slots: Vec<agent_core::LocalSlotIntent>,
 }
 
-#[cfg(target_arch = "wasm32")]
 struct Transport {
     generation: agent_core::Generation,
     peer: web_sys::RtcPeerConnection,
@@ -400,7 +375,6 @@ struct Transport {
     _topology: WebTopology,
 }
 
-#[cfg(target_arch = "wasm32")]
 #[derive(Clone)]
 struct WebTopology {
     upstream: Vec<(
@@ -412,7 +386,6 @@ struct WebTopology {
     audio: Vec<web_sys::RtcRtpTransceiver>,
 }
 
-#[cfg(target_arch = "wasm32")]
 struct Channel {
     channel: web_sys::RtcDataChannel,
     label: String,
@@ -421,7 +394,6 @@ struct Channel {
     _message_callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>,
 }
 
-#[cfg(target_arch = "wasm32")]
 impl BrowserRuntime {
     fn new() -> Self {
         Self {
@@ -845,7 +817,6 @@ impl BrowserRuntime {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 impl WebTopology {
     fn create(peer: &web_sys::RtcPeerConnection, topology: &agent_core::Topology) -> Self {
         let upstream = topology
@@ -899,7 +870,6 @@ impl WebTopology {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn transceiver(
     peer: &web_sys::RtcPeerConnection,
     kind: &str,

@@ -1,10 +1,10 @@
-//! Single-threaded latest-value channel.
+//! Single-threaded, multi-producer latest-value channel.
 //!
 //! Intended for local async executors such as browser WASM.
 //! This type is deliberately `!Send` and `!Sync`.
 //!
 //! Semantics:
-//! - Single producer, single consumer.
+//! - Multiple producers, single consumer.
 //! - At most one value is buffered.
 //! - `send()` replaces any unconsumed value.
 //! - `recv().await` consumes the latest buffered value.
@@ -13,16 +13,16 @@
 
 use alloc::rc::Rc;
 use core::{
-    cell::RefCell,
     fmt,
     future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+use spin::Mutex;
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Rc::new(Shared {
-        state: RefCell::new(State {
+        state: Mutex::new(State {
             value: None,
             waker: None,
             sender_alive: true,
@@ -39,7 +39,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 struct Shared<T> {
-    state: RefCell<State<T>>,
+    state: Mutex<State<T>>,
 }
 
 struct State<T> {
@@ -49,6 +49,7 @@ struct State<T> {
     receiver_alive: bool,
 }
 
+#[derive(Clone)]
 pub struct Sender<T> {
     shared: Rc<Shared<T>>,
 }
@@ -94,7 +95,7 @@ impl<T> Sender<T> {
     /// discarded and replaced by `value`.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         let (old_value, waker) = {
-            let mut state = self.shared.state.borrow_mut();
+            let mut state = self.shared.state.lock();
 
             if !state.receiver_alive {
                 return Err(SendError(value));
@@ -106,8 +107,6 @@ impl<T> Sender<T> {
             (old_value, waker)
         };
 
-        // Important: don't run arbitrary T::drop() or Waker code while the
-        // RefCell is borrowed. Either may theoretically re-enter user code.
         drop(old_value);
 
         if let Some(waker) = waker {
@@ -118,19 +117,22 @@ impl<T> Sender<T> {
     }
 
     pub fn is_closed(&self) -> bool {
-        !self.shared.state.borrow().receiver_alive
+        !self.shared.state.lock().receiver_alive
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
+        if Rc::strong_count(&self.shared) != 2 {
+            return;
+        }
+
         let waker = {
-            let mut state = self.shared.state.borrow_mut();
+            let mut state = self.shared.state.lock();
             state.sender_alive = false;
             state.waker.take()
         };
 
-        // Never invoke a Waker while holding our RefCell borrow.
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -146,7 +148,7 @@ impl<T> Receiver<T> {
     }
 
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        let mut state = self.shared.state.borrow_mut();
+        let mut state = self.shared.state.lock();
 
         if let Some(value) = state.value.take() {
             return Ok(value);
@@ -164,21 +166,20 @@ impl<T> Receiver<T> {
     /// There may still be one buffered value available after this becomes
     /// true.
     pub fn is_closed(&self) -> bool {
-        !self.shared.state.borrow().sender_alive
+        !self.shared.state.lock().sender_alive
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let (value, waker) = {
-            let mut state = self.shared.state.borrow_mut();
+            let mut state = self.shared.state.lock();
 
             state.receiver_alive = false;
 
             (state.value.take(), state.waker.take())
         };
 
-        // As with send(), destructors run outside the RefCell borrow.
         drop(value);
         drop(waker);
     }
@@ -201,7 +202,7 @@ impl<T> Future for Recv<'_, T> {
         let this = &mut *self;
 
         let (result, old_waker) = {
-            let mut state = this.receiver.shared.state.borrow_mut();
+            let mut state = this.receiver.shared.state.lock();
 
             if let Some(value) = state.value.take() {
                 let old_waker = state.waker.take();
@@ -227,7 +228,6 @@ impl<T> Future for Recv<'_, T> {
             }
         };
 
-        // A Waker is arbitrary user/executor code from our perspective.
         drop(old_waker);
 
         match result {
@@ -246,9 +246,7 @@ impl<T> Drop for Recv<'_, T> {
             return;
         }
 
-        // There can only be one Recv because it exclusively borrows Receiver,
-        // so any registered waker belongs to this future.
-        let waker = self.receiver.shared.state.borrow_mut().waker.take();
+        let waker = self.receiver.shared.state.lock().waker.take();
 
         drop(waker);
     }
@@ -343,6 +341,23 @@ mod tests {
 
         assert_eq!(rx.try_recv(), Ok(3));
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn cloned_senders_coalesce_and_close_after_the_last_drop() {
+        let (first, mut receiver) = channel();
+        let second = first.clone();
+
+        first.send(1).unwrap();
+        second.send(2).unwrap();
+        drop(first);
+
+        assert_eq!(receiver.try_recv(), Ok(2));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+
+        drop(second);
+
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
     }
 
     #[test]
