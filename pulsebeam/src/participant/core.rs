@@ -551,8 +551,8 @@ impl Participant {
                 }
                 AppliedMutation::KeyframeRequested { .. }
                 | AppliedMutation::Applied
-                | AppliedMutation::RtpWritten => {}
-                AppliedMutation::RtpNotWritten => {}
+                | AppliedMutation::RtpWritten
+                | AppliedMutation::RtpNotWritten => {}
             }
             return true;
         }
@@ -750,14 +750,11 @@ impl Participant {
             Event::MediaChanged(_) => self.upstream.clear_routes(),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => {
-                if let Some(layer) = self.downstream.handle_keyframe_request(req) {
-                    let stream_id = layer.stream_id();
-                    if let Some(fanout) = self.upstream.track_fanout(stream_id.0) {
-                        events.request_reverse(
-                            fanout,
-                            ReversePacket::keyframe(stream_id.1, KeyframeRequestKind::Pli),
-                        );
-                    }
+                if let Some((fanout, layer)) = self.downstream.handle_keyframe_request(req) {
+                    events.request_reverse(
+                        fanout,
+                        ReversePacket::keyframe(layer.rid, KeyframeRequestKind::Pli),
+                    );
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {

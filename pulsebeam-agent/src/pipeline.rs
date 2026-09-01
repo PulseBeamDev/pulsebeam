@@ -563,7 +563,18 @@ impl FrameReceiver {
             .prev_last_seq
             .is_none_or(|p| first_seq == p.saturating_add(1));
         self.prev_last_seq = Some(last_seq);
-        let is_keyframe = meta.is_keyframe || annex_b_has_idr(&data);
+        let has_idr = annex_b_has_idr(&data);
+        let is_keyframe = meta.is_keyframe || has_idr;
+        if self.h264_depacketizer.is_some() && !self.has_keyframe {
+            let parameterized_keyframe = is_keyframe
+                && has_idr
+                && annex_b_has_nal_type(&data, 7)
+                && annex_b_has_nal_type(&data, 8);
+            if !parameterized_keyframe {
+                self.awaiting_keyframe = true;
+                return None;
+            }
+        }
 
         Some(MediaFrame {
             audio_level: None,
@@ -593,17 +604,26 @@ impl FrameReceiver {
 }
 
 fn annex_b_has_idr(data: &[u8]) -> bool {
+    annex_b_has_nal_type(data, 5)
+}
+
+fn annex_b_has_nal_type(data: &[u8], wanted_type: u8) -> bool {
     let mut index = 0usize;
-    while index.saturating_add(4) <= data.len() {
-        let header = if data.get(index..index.saturating_add(4)) == Some(&[0, 0, 0, 1]) {
-            index.saturating_add(4)
-        } else if data.get(index..index.saturating_add(3)) == Some(&[0, 0, 1]) {
-            index.saturating_add(3)
-        } else {
+    while index.saturating_add(3) <= data.len() {
+        let Some(start_len) = (data.get(index..index.saturating_add(4)) == Some(&[0, 0, 0, 1]))
+            .then_some(4)
+            .or_else(|| {
+                (data.get(index..index.saturating_add(3)) == Some(&[0, 0, 1])).then_some(3)
+            })
+        else {
             index = index.saturating_add(1);
             continue;
         };
-        if data.get(header).is_some_and(|byte| byte & 0x1f == 5) {
+        let header = index.saturating_add(start_len);
+        if data
+            .get(header)
+            .is_some_and(|byte| byte & 0x1f == wanted_type)
+        {
             return true;
         }
         index = header;
@@ -837,6 +857,71 @@ mod tests {
         frames.extend(receiver.flush());
         assert_eq!(frames.len(), 1);
         assert_eq!(&*frames[0].data, &access_unit);
+    }
+
+    #[test]
+    fn h264_receiver_waits_for_parameter_sets_before_accepting_an_initial_idr() {
+        let incomplete_idr = [0, 0, 0, 1, 0x65, 0x01, 0x02];
+        let complete_keyframe = [
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x06, 0, 0, 0, 1, 0x65,
+            0x03, 0x04,
+        ];
+        let delta = [0, 0, 0, 1, 0x41, 0x05];
+        let mut sender = FrameSender::h264(Mid::from("v0"), None, 1, 1);
+        let mut receiver = FrameReceiver::with_h264();
+
+        let incomplete_packets = sender.packetize(&frame(incomplete_idr.to_vec(), true));
+        assert_eq!(incomplete_packets.len(), 1);
+        assert!(receiver.push(incomplete_packets[0].clone()).is_empty());
+        assert!(receiver.flush().is_empty());
+        assert!(receiver.needs_keyframe());
+
+        let mut frames = Vec::new();
+        for packet in sender.packetize(&frame(complete_keyframe.to_vec(), true)) {
+            frames.extend(receiver.push(packet));
+        }
+        for packet in sender.packetize(&frame(delta.to_vec(), false)) {
+            frames.extend(receiver.push(packet));
+        }
+        frames.extend(receiver.flush());
+
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].is_keyframe);
+        assert_eq!(&*frames[0].data, &complete_keyframe);
+        assert!(!frames[1].is_keyframe);
+        assert_eq!(&*frames[1].data, &delta);
+        assert!(!receiver.needs_keyframe());
+    }
+
+    #[test]
+    fn h264_receiver_waits_for_a_keyframe_when_joining_on_delta_frames() {
+        let delta = [0, 0, 0, 1, 0x41, 0x05];
+        let complete_keyframe = [
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x06, 0, 0, 0, 1, 0x65,
+            0x03, 0x04,
+        ];
+        let mut sender = FrameSender::h264(Mid::from("v0"), None, 1, 1);
+        let mut receiver = FrameReceiver::with_h264();
+
+        let initial_keyframe = frame(complete_keyframe.to_vec(), true);
+        assert!(!sender.packetize(&initial_keyframe).is_empty());
+        let delta_packets = sender.packetize(&frame(delta.to_vec(), false));
+        assert!(!delta_packets.is_empty());
+        for packet in delta_packets {
+            assert!(receiver.push(packet).is_empty());
+        }
+        assert!(receiver.flush().is_empty());
+        assert!(receiver.needs_keyframe());
+
+        let mut frames = Vec::new();
+        for packet in sender.packetize(&frame(complete_keyframe.to_vec(), true)) {
+            frames.extend(receiver.push(packet));
+        }
+        frames.extend(receiver.flush());
+
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_keyframe);
+        assert!(!receiver.needs_keyframe());
     }
 
     #[test]

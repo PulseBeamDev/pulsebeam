@@ -577,7 +577,10 @@ impl Downstream {
         self.audio.assignments()
     }
 
-    pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) -> Option<&TrackLayer> {
+    pub fn handle_keyframe_request(
+        &mut self,
+        req: KeyframeRequest,
+    ) -> Option<(TrackKey, &TrackLayer)> {
         self.video.handle_keyframe_request(req)
     }
 }

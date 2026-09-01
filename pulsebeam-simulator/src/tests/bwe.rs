@@ -861,7 +861,7 @@ fn late_joiner_receives_earlier_participant_in_both_directions_test() {
 /// should be absorbed as inherent loss rather than triggering a backoff.
 #[test]
 fn screenshare_and_camera_over_wifi_test() {
-    conference_plan(LinkProfile::default(), 3_000_000, 700_000, 600, 100, 8, 2);
+    conference_plan(LinkProfile::default(), 3_000_000, 700_000, 600, 96, 8, 2);
 }
 
 /// The same call over mobile: ~50ms latency and 1% loss.

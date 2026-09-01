@@ -527,10 +527,12 @@ impl VideoAllocator {
         self.current_allocation
     }
 
-    pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
+    pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<(TrackKey, &TrackLayer)> {
         for slot in self.slots.values() {
             if slot.mid == req.mid && slot.rid == req.rid {
-                return slot.target();
+                let layer = slot.target()?;
+                let fanout = self.active_track_keys.get(&layer.meta.id).copied()?;
+                return Some((fanout, layer));
             }
         }
         None
@@ -2080,6 +2082,11 @@ mod assignment_tests {
         let slot = allocator.slots.values_mut().next().unwrap();
         slot.set_roles_for_test(None, Some(&low));
         slot.paused = false;
+        let request = KeyframeRequest {
+            mid: slot.mid,
+            rid: slot.rid,
+            kind: str0m::media::KeyframeRequestKind::Pli,
+        };
 
         let now = Instant::now();
         let mut queue = MockParticipantSink::new();
@@ -2097,6 +2104,14 @@ mod assignment_tests {
             1,
             "retry_keyframe_requests should not send an immediate duplicate PLI after reconcile_routes"
         );
+        let (fanout, requested_layer) = allocator
+            .handle_keyframe_request(request)
+            .expect("an active downstream target must resolve its reverse route");
+        assert_eq!(
+            fanout,
+            allocator.active_track_keys[&requested_layer.meta.id]
+        );
+        assert_eq!(requested_layer.stream_id(), low.stream_id());
 
         // Before the view delta lands there is nothing to address the request
         // to, and the shard would only drop it. Issuing anyway burns a retry,
