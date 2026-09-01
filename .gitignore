@@ -1,7 +1,5 @@
 /target
 node_modules
-browser/.playwright
-browser/test-results
 dist
 **/target
 *.data

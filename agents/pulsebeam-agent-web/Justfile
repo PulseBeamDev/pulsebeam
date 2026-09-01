@@ -1,0 +1,10 @@
+set shell := ["bash", "-euc"]
+set tempdir := "/tmp"
+
+# Build the browser package.
+build:
+    wasm-pack build --target web
+
+# Serve the generated package and local example.
+serve:
+    python3 -m http.server

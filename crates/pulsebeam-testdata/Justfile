@@ -1,0 +1,35 @@
+set shell := ["bash", "-euc"]
+set tempdir := "/tmp"
+
+# Generate the three CBR H.264 fixtures from a local source video.
+fixtures source="src/driving.mp4":
+    scripts/generate-fixtures.sh "{{ source }}"
+
+# Regenerate the deterministic encoded and decoded quality corpus.
+quality-corpus:
+    scripts/generate-quality-corpus.sh
+    scripts/verify-quality-corpus.sh
+
+# Verify committed corpus hashes and lengths without regenerating it.
+verify-corpus:
+    scripts/verify-quality-corpus.sh
+
+# Encode the committed screen-share fixture.
+screenshare:
+    python3 src/encode_screencast.py --input src/screencast.mp4 --output src/screen_f_vbr.h264 --height 1080 --bitrate 2500 --fps 8 --idle-fps 0.5
+
+# Encode and analyze the screen-share fixture.
+analyze: screenshare
+    python3 src/analyze_screencast.py --source src/screencast.mp4 --stream f:2500:src/screen_f_vbr.h264
+
+# Print one encoded H.264 access-unit size per line.
+estimate input="src/full_f_cbr.h264":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -f "{{ input }}" || { echo "input not found: {{ input }}" >&2; exit 1; }
+    gst-launch-1.0 -v filesrc location="{{ input }}" ! h264parse ! fakesink silent=false 2>&1 \
+      | grep -oP '\(\K[0-9]+(?=\s*bytes)'
+
+# Remove locally regenerated video outputs.
+clean:
+    rm -f src/*_cbr.h264 src/screen_*_vbr.h264 src/screen_*_vbr.timing src/driving.mp4

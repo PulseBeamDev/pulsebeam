@@ -1,5 +1,6 @@
 FROM docker.io/library/rust:1.92.0 AS builder
 RUN apt update && apt install -y protobuf-compiler libprotobuf-dev
+RUN cargo install just --version 1.58.0 --locked
 WORKDIR /app
 
 COPY . .
@@ -7,7 +8,7 @@ COPY . .
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    make release && \
+    just build release && \
     cp /app/target/release/pulsebeam /app/pulsebeam-bin
 
 

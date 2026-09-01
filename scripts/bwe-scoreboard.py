@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn a `make test-sim` run into a stable, diffable scoreboard.
+"""Turn a `just test` run into a stable, diffable scoreboard.
 
 Reads nextest output on stdin and writes one block per plan: the plan's name, its outcome, and
 the measured behaviour of every participant's link.
@@ -59,7 +59,7 @@ def main() -> int:
             pending = []
 
     if not blocks:
-        print("no plans found - was this the output of `make test-sim`?", file=sys.stderr)
+        print("no plans found - was this the output of `just test`?", file=sys.stderr)
         return 1
 
     for name in sorted(blocks):

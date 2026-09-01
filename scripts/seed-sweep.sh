@@ -118,7 +118,7 @@ echo "${#failed_seeds[@]} of ${SEEDS} seeds failed:"
 for seed in "${failed_seeds[@]}"; do
     echo
     echo "  seed ${seed} — replay with:"
-    echo "      make test-sim-seed SEED=${seed}${TEST:+ TEST='${TEST}'}"
+    echo "      just --justfile crates/pulsebeam-simulator/Justfile replay ${seed}${TEST:+ '${TEST}'}"
     grep -E '^\s+(FAIL|TRY [0-9]+ FAIL)' "${log_dir}/seed-${seed}.log" \
         | sed 's/^/        /' | sort -u | head -20
 done

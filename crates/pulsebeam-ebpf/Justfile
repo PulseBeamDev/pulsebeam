@@ -1,0 +1,15 @@
+set shell := ["bash", "-euc"]
+set tempdir := "/tmp"
+
+root := "../.."
+
+# Build the BPF programs with the verifier target.
+build:
+    cd {{ root }} && cargo +nightly build -Z build-std=core --target bpfel-unknown-none -p pulsebeam-ebpf --release
+
+# Load and attach the compiled program to a real reuseport group.
+smoke:
+    cd {{ root }} && sudo env "PATH=$PATH" RUSTC_WRAPPER= SCCACHE_GHA_ENABLED=false cargo test -p pulsebeam --lib ebpf::tests::loader_attaches_to_a_reuseport_group --release -- --ignored --test-threads=1
+
+# Run the complete eBPF CI boundary.
+ci: build smoke

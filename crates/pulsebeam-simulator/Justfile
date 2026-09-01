@@ -1,0 +1,35 @@
+set shell := ["bash", "-euc"]
+set tempdir := "/tmp"
+
+root := "../.."
+
+# Run deterministic simulation plans, optionally filtered.
+test filter="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    args=(nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast)
+    if [[ -n "{{ filter }}" ]]; then args+=("{{ filter }}"); fi
+    cargo "${args[@]}"
+
+# Replay one exact simulation seed.
+replay seed filter="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    args=(nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast)
+    if [[ -n "{{ filter }}" ]]; then args+=("{{ filter }}"); fi
+    PULSEBEAM_SIM_SEED="{{ seed }}" cargo "${args[@]}"
+
+# Search a deterministic range of simulation seeds.
+sweep seeds="20" from="1" filter="":
+    cd {{ root }} && SEEDS="{{ seeds }}" FROM="{{ from }}" TEST="{{ filter }}" scripts/seed-sweep.sh
+
+# Regenerate the committed BWE behavior scoreboard.
+baseline:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd "{{ root }}"
+    cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-capture --no-fail-fast 2>&1 \
+      | python3 scripts/bwe-scoreboard.py > bwe-baseline.txt
+    git --no-pager diff --stat bwe-baseline.txt || true

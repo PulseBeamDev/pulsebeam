@@ -1,0 +1,20 @@
+# `pulsebeam-simulator`
+
+Deterministic end-to-end verification of the PulseBeam SFU and native agents.
+Each authored plan runs in an isolated process with virtual time, seeded process-
+wide randomness, shaped networks, real signaling, and invariant-based oracles.
+
+A seed-dependent failure is a reproducible behavior difference, not flakiness.
+Do not weaken an oracle or add wall-clock waiting to make a plan pass.
+
+Read the [simulation contract](docs/sim.md) before changing the harness and the
+[testing guide](docs/simulation.md) before adding plans, randomness, thresholds,
+or failure injection.
+
+## Commands
+
+- Root `just test` runs the committed deterministic suite.
+- `just --justfile crates/pulsebeam-simulator/Justfile replay <seed> [filter]`
+  reproduces one seed.
+- The local `sweep` and `baseline` recipes search seeds and regenerate the
+  diffable BWE scoreboard.

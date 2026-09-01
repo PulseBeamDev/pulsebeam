@@ -1,0 +1,11 @@
+[package]
+name = "pulsebeam-agent-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lz4_flex = { version = "0.14", default-features = false, features = ["alloc"] }
+log = { version = "0.4", default-features = false }
+spin = "0.12.3"
+thiserror = { version = "2.0.20", default-features = false }
+pulsebeam-proto.workspace = true

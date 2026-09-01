@@ -1,0 +1,88 @@
+set shell := ["bash", "-euc"]
+set tempdir := "/tmp"
+
+root := "../.."
+
+# Build the server with dev, release, or profiling settings.
+build profile="dev":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    case "{{ profile }}" in
+        dev) cargo build ;;
+        release) cargo build --verbose --release -p pulsebeam ;;
+        profiling) cargo build --profile profiling -p pulsebeam ;;
+        *) echo "profile must be dev, release, or profiling" >&2; exit 2 ;;
+    esac
+
+# Run the development server.
+dev interface="enp0s13f0u1u2":
+    cd {{ root }} && cargo run -p pulsebeam -- --dev -i "{{ interface }}"
+
+# Run the profiling build.
+run-profile: (build "profiling")
+    {{ root }}/target/profiling/pulsebeam
+
+# Generate a CPU flamegraph from a profiling build.
+flamegraph: (build "profiling")
+    cd {{ root }} && taskset -c 2-5 cargo flamegraph --profile profiling -p pulsebeam --bin pulsebeam
+
+# Record the running server process for 60 seconds.
+perf-server:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    pids="$(pgrep -x pulsebeam | paste -sd, -)"
+    test -n "$pids" || { echo "pulsebeam is not running" >&2; exit 1; }
+    sudo sysctl -w kernel.perf_event_max_stack=64
+    sudo sysctl -w kernel.kptr_restrict=0
+    sudo sysctl -w kernel.perf_event_paranoid=-1
+    perf record -p "$pids" -g -e cycles --call-graph fp -F 999 -m 256M -o perf.data -- sleep 60
+
+# Record all cores until interrupted.
+perf-system:
+    cd {{ root }} && sudo perf record -a -F 99 -e cycles -g --call-graph fp -m 128M -o perf-system.data
+
+# Measure cache, TLB, instruction, and cycle counters for the running server.
+stats:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pids="$(pgrep -x pulsebeam | paste -sd, -)"
+    test -n "$pids" || { echo "pulsebeam is not running" >&2; exit 1; }
+    perf stat \
+      -e cpu_core/L1-dcache-loads/ \
+      -e cpu_core/L1-dcache-load-misses/ \
+      -e cpu_core/L1-dcache-stores/ \
+      -e cpu_core/L1-dcache-store-misses/ \
+      -e cpu_core/l2_rqsts.miss/ \
+      -e cpu_core/LLC-loads/,cpu_core/LLC-load-misses/ \
+      -e dtlb-load-misses,dtlb-store-misses \
+      -e instructions,cpu-cycles \
+      -p "$pids" -- sleep 30
+
+# Run the server binary built in release mode.
+run-server args="--dev":
+    cd {{ root }} && ./target/release/pulsebeam {{ args }}
+
+# Run the benchmark client binary built in release mode.
+run-client args="--api-url http://127.0.0.1:7070 bench --rooms 1 --max-rooms 120 --users-per-room 4 --arrival-rate 10 --join-spread-secs 30 --session-duration 7200":
+    cd {{ root }} && ./target/release/pulsebeam-cli {{ args }}
+
+# Apply localhost traffic shaping after clearing any existing qdisc.
+net-apply rate="10mbit" latency="0ms" loss="0%": net-clear
+    sudo tc qdisc add dev lo root netem rate "{{ rate }}" delay "{{ latency }}" loss "{{ loss }}"
+
+# Remove localhost traffic shaping.
+net-clear:
+    sudo tc qdisc del dev lo root 2>/dev/null || true
+
+# Apply the congested Wi-Fi preset.
+net-wifi: (net-apply "10mbit" "25ms" "0.3%")
+
+# Apply the one-bar mobile preset.
+net-mobile: (net-apply "3mbit" "45ms" "0.5%")
+
+# Remove Cargo and local profiling outputs.
+clean:
+    cd {{ root }} && cargo clean
+    rm -f {{ root }}/perf.data {{ root }}/perf-system.data {{ root }}/flamegraph.svg

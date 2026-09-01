@@ -1,0 +1,94 @@
+set shell := ["bash", "-euc"]
+set tempdir := "/tmp"
+
+root := ".."
+
+# Apply automated Rust fixes and formatting, then run the static gate.
+fix:
+    cd {{ root }} && cargo fix --allow-dirty
+    cd {{ root }} && cargo clippy --fix --allow-dirty --all-targets --workspace --features pulsebeam/sim
+    cd {{ root }} && cargo fmt --all
+    cd {{ root }} && just check
+
+# Find unused Cargo dependencies.
+unused:
+    cd {{ root }} && cargo machete
+
+# Preview repository Markdown through the GitHub CLI extension.
+preview-markdown:
+    cd {{ root }} && gh markdown-preview
+
+# Execute the local cargo-release workflow.
+crate-release:
+    cd {{ root }} && cargo release -v --execute
+
+# Produce the cargo-dist plan manifest and workflow output.
+release-plan tag="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    if [[ -n "{{ tag }}" ]]; then
+        dist host --steps=create --tag="{{ tag }}" --output-format=json > plan-dist-manifest.json
+    else
+        dist plan --output-format=json > plan-dist-manifest.json
+    fi
+    cat plan-dist-manifest.json
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        echo "manifest=$(jq -c . plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+    fi
+
+# Build and report one cargo-dist local artifact matrix entry.
+release-local build_manifest tag *dist_args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    args=(build --print=linkage --output-format=json)
+    if [[ "{{ tag }}" != "-" ]]; then args+=(--tag="{{ tag }}"); fi
+    args+=({{ dist_args }})
+    dist "${args[@]}" > dist-manifest.json
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        echo 'paths<<EOF' >> "$GITHUB_OUTPUT"
+        dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+        echo 'EOF' >> "$GITHUB_OUTPUT"
+    fi
+    cp dist-manifest.json "{{ build_manifest }}"
+
+# Build and report cargo-dist global artifacts.
+release-global build_manifest tag="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    args=(build --output-format=json --artifacts=global)
+    if [[ -n "{{ tag }}" && "{{ tag }}" != "-" ]]; then args+=(--tag="{{ tag }}"); fi
+    dist "${args[@]}" > dist-manifest.json
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        echo 'paths<<EOF' >> "$GITHUB_OUTPUT"
+        jq --raw-output '.upload_files[]' dist-manifest.json >> "$GITHUB_OUTPUT"
+        echo 'EOF' >> "$GITHUB_OUTPUT"
+    fi
+    cp dist-manifest.json "{{ build_manifest }}"
+
+# Upload cargo-dist artifacts and report the release manifest.
+release-host tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    dist host --tag="{{ tag }}" --steps=upload --steps=release --output-format=json > dist-manifest.json
+    cat dist-manifest.json
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        echo "manifest=$(jq -c . dist-manifest.json)" >> "$GITHUB_OUTPUT"
+    fi
+
+# Create the final GitHub release from assembled artifacts.
+release-publish tag commit artifacts_dir="artifacts":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ root }}"
+    notes_file="${RUNNER_TEMP:-/tmp}/pulsebeam-release-notes.txt"
+    printf '%s' "${ANNOUNCEMENT_BODY:?ANNOUNCEMENT_BODY is required}" > "$notes_file"
+    args=(release create "{{ tag }}" --target "{{ commit }}" --title "${ANNOUNCEMENT_TITLE:?ANNOUNCEMENT_TITLE is required}" --notes-file "$notes_file")
+    if [[ -n "${PRERELEASE_FLAG:-}" ]]; then args+=("$PRERELEASE_FLAG"); fi
+    shopt -s nullglob
+    artifacts=("{{ artifacts_dir }}"/*)
+    ((${#artifacts[@]} > 0)) || { echo "no release artifacts found" >&2; exit 1; }
+    gh "${args[@]}" "${artifacts[@]}"

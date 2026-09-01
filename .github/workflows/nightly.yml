@@ -6,7 +6,8 @@
 #
 # It must never block a merge. A failure here is a lead, not a broken build —
 # the output is a seed to reproduce, fix, and then promote into a plan's seed
-# list so `ci.yml` guards it from then on. See docs/simulation.md.
+# list so `ci.yml` guards it from then on. See
+# crates/pulsebeam-simulator/docs/simulation.md.
 name: Nightly seed sweep
 
 on:
@@ -42,6 +43,9 @@ jobs:
     - uses: taiki-e/install-action@v2
       with:
         tool: nextest
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: just
     # The seed window advances every night rather than replaying the same one,
     # which is the whole point — a fixed window would just be slower CI. Derived
     # from the run number so it is still a known range, not a mystery.
@@ -52,4 +56,4 @@ jobs:
         if [ -z "$from" ]; then
           from=$(( ${{ github.run_number }} * seeds + 1 ))
         fi
-        SEEDS="$seeds" FROM="$from" make sim-sweep
+        just sweep "$seeds" "$from"

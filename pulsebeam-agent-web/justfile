@@ -1,9 +1,0 @@
-build:
-  wasm-pack build --target web
-
-serve:
-  python -m http.server
-
-install:
-  brew install wasm-pack
-

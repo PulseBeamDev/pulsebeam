@@ -1,19 +1,19 @@
 [workspace]
 resolver = "3"
 members = [
-  "pulsebeam",
-  "pulsebeam-agent",
-  "pulsebeam-agent-core",
-  "pulsebeam-agent-web",
-  "pulsebeam-cli",
-  "pulsebeam-core",
-  "pulsebeam-ebpf",
-  "pulsebeam-proto",
-  "pulsebeam-routing",
-  "pulsebeam-rtc",
-  "pulsebeam-runtime",
-  "pulsebeam-simulator",
-  "pulsebeam-testdata",
+  "crates/pulsebeam",
+  "crates/pulsebeam-agent",
+  "crates/pulsebeam-cli",
+  "crates/pulsebeam-core",
+  "crates/pulsebeam-ebpf",
+  "crates/pulsebeam-proto",
+  "crates/pulsebeam-routing",
+  "crates/pulsebeam-rtc",
+  "crates/pulsebeam-runtime",
+  "crates/pulsebeam-simulator",
+  "crates/pulsebeam-testdata",
+  "agents/pulsebeam-agent-core",
+  "agents/pulsebeam-agent-web",
 ]
 
 [workspace.package]
@@ -37,7 +37,9 @@ futures-lite = "2.6.1"
 more-asserts = "0.3.1"
 openh264 = "=0.9.8"
 opus = "=0.4.0"
-opusic-sys = { version = "=0.7.3", default-features = false, features = ["bundled"] }
+opusic-sys = { version = "=0.7.3", default-features = false, features = [
+  "bundled",
+] }
 rand = "0.10.1"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
@@ -54,6 +56,9 @@ tokio-util = "0.7.18"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 turmoil = "0.7.2"
 zstd = "0.13"
+
+pulsebeam-proto = { package = "pulsebeam-proto", version = "0.3.2", path = "crates/pulsebeam-proto" }
+
 
 [patch.crates-io]
 # dimpl = { git = "https://github.com/PulseBeamDev/dimpl.git", branch = "patch/0.2.1" }
@@ -99,10 +104,10 @@ overflow-checks = true
 # Enough symbols for useful backtraces/profiling.
 debug = 1
 
-# Lints shared by every hand-written crate. `make lint-check` gates on these.
+# Lints shared by every hand-written crate. `just check` gates on these.
 #
 # Three tiers, and the tiering is measured rather than guessed — the counts came
-# from a clippy JSON run over `pulsebeam/src`, split at each file's first
+# from a clippy JSON run over `crates/pulsebeam/src`, split at each file's first
 # `#[cfg(test)]`:
 #
 #   deny     already clean, so the gate stays green and a regression is loud.

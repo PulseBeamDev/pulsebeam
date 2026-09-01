@@ -30,7 +30,7 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 
 This is a **thread-per-core** system that isolates the data plane from the control plane. It follows a shared-nothing design, keeping the fast path lock-free and cache-local.
 
-![architecture](./docs/architecture.png)
+![architecture](./crates/pulsebeam/docs/architecture.png)
 
 ## Quickstart
 
