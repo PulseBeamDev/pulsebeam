@@ -9,7 +9,7 @@ pub struct WebAgentConfig {
 }
 
 impl WebAgent {
-    pub fn new(config: WebAgentConfig) -> Self {
+    pub fn new(_config: WebAgentConfig) -> Self {
         todo!()
     }
 
@@ -36,12 +36,12 @@ pub struct WebAgentState {
     pub client: WebClientState,
 }
 
-impl Into<agent_core::ClientState> for WebAgentState {
-    fn into(self) -> agent_core::ClientState {
-        let connection = match self.connection {
+impl From<WebAgentState> for agent_core::ClientState {
+    fn from(val: WebAgentState) -> Self {
+        let connection = match val.connection {
             // TODO:
             ConnectionState::Connected { .. } => agent_core::ClientConnectionState::Connected,
-            ConnectionState::Disconnected { .. } => agent_core::ClientConnectionState::Disconnected,
+            ConnectionState::Disconnected => agent_core::ClientConnectionState::Disconnected,
         };
         agent_core::ClientState { connection }
     }

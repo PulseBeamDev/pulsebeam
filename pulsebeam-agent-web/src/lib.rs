@@ -18,4 +18,4 @@ pub fn start() {
 }
 
 #[wasm_bindgen]
-pub fn greet(name: &str) {}
+pub fn greet(_name: &str) {}

@@ -22,13 +22,8 @@ pub enum ClientConnectionState {
     Disconnected,
 }
 
+#[derive(Default)]
 pub struct AgentConfig {}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {}
-    }
-}
 
 pub struct Agent {
     cx: AgentContext,
@@ -45,7 +40,7 @@ impl Default for Agent {
 }
 
 impl Agent {
-    pub fn new(config: AgentConfig) -> Self {
+    pub fn new(_config: AgentConfig) -> Self {
         let desired = ClientState::default();
         Self {
             cx: AgentContext::new(),

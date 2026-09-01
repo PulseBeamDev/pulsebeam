@@ -55,7 +55,7 @@ impl Connection {
         }
     }
 
-    pub(super) fn handle(&mut self, ev: &AgentEvent, cx: &mut AgentContext) {}
+    pub(super) fn handle(&mut self, _ev: &AgentEvent, _cx: &mut AgentContext) {}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,7 +82,7 @@ pub(super) struct WaitingOffer {
 }
 
 impl WaitingOffer {
-    pub(super) fn offer(self, offer: String, cx: &mut AgentContext) -> Connecting {
+    pub(super) fn offer(self, _offer: String, _cx: &mut AgentContext) -> Connecting {
         Connecting {
             generation: self.generation,
         }
@@ -99,7 +99,7 @@ pub(super) struct Connecting {
 }
 
 impl Connecting {
-    fn connected(self, resp: HttpResponse, cx: &mut AgentContext) -> Connected {
+    fn connected(self, _resp: HttpResponse, _cx: &mut AgentContext) -> Connected {
         todo!("parse HttpResponse");
         Connected {
             generation: self.generation,
@@ -117,7 +117,7 @@ pub(super) struct Connected {
 }
 
 impl Connected {
-    fn disconnected(self, cx: &mut AgentContext) -> ReconnectWait {
+    fn disconnected(self, _cx: &mut AgentContext) -> ReconnectWait {
         ReconnectWait {}
     }
 }

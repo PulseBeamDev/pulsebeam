@@ -472,7 +472,7 @@ impl StreamCache {
             };
             dd.start_of_frame = index == 0;
             dd.end_of_frame = index == last;
-            packet.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+            packet.ext_vals.user_values.set(dd);
         }
     }
 

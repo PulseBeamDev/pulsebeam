@@ -1,7 +1,7 @@
 mod effect;
 mod event;
 
-use alloc::{collections::vec_deque::VecDeque, vec::Vec};
+use alloc::collections::vec_deque::VecDeque;
 pub use effect::*;
 pub use event::*;
 
