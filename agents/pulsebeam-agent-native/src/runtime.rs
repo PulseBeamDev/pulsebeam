@@ -79,10 +79,12 @@ pub enum AgentEvent {
     RuntimeFailed(String),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TransportStatistics {
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub round_trip_time: Option<Duration>,
+    pub receive_loss: Option<f32>,
     pub keyframe_requests: u64,
     pub received_packets: u64,
     pub sent_packets: u64,
@@ -431,6 +433,7 @@ struct Actor {
     timer_rx: mpsc::UnboundedReceiver<TimerId>,
     outgoing_media_tx: mpsc::UnboundedSender<OutgoingMedia>,
     outgoing_media_rx: mpsc::UnboundedReceiver<OutgoingMedia>,
+    ingress_loss: HashMap<(Mid, Option<Rid>), Option<f32>>,
     observers: BTreeMap<MediaSlot, Vec<Observer>>,
     active_publications: BTreeSet<MediaSlot>,
     close_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
@@ -477,6 +480,7 @@ impl Actor {
             timer_rx,
             outgoing_media_tx,
             outgoing_media_rx,
+            ingress_loss: HashMap::new(),
             observers: BTreeMap::new(),
             active_publications: BTreeSet::new(),
             close_waiters: Vec::new(),
@@ -1194,6 +1198,18 @@ impl Actor {
                 self.statistics.send_if_modified(|statistics| {
                     statistics.bytes_sent = stats.bytes_tx;
                     statistics.bytes_received = stats.bytes_rx;
+                    statistics.round_trip_time = stats
+                        .selected_candidate_pair
+                        .as_ref()
+                        .and_then(|pair| pair.current_round_trip_time);
+                    true
+                });
+            }
+            RtcOutputEvent::MediaIngressStats(stats) => {
+                self.ingress_loss.insert((stats.mid, stats.rid), stats.loss);
+                let receive_loss = self.ingress_loss.values().find_map(|loss| *loss);
+                self.statistics.send_if_modified(|statistics| {
+                    statistics.receive_loss = receive_loss;
                     true
                 });
             }

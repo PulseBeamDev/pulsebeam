@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
   "crates/pulsebeam",
-  "crates/pulsebeam-agent",
   "crates/pulsebeam-cli",
   "crates/pulsebeam-core",
   "crates/pulsebeam-ebpf",
@@ -13,7 +12,8 @@ members = [
   "crates/pulsebeam-simulator",
   "crates/pulsebeam-testdata",
   "agents/pulsebeam-agent-core",
-  "agents/pulsebeam-agent-web", "agents/pulsebeam-agent-native",
+  "agents/pulsebeam-agent-web",
+  "agents/pulsebeam-agent-native",
 ]
 
 [workspace.package]

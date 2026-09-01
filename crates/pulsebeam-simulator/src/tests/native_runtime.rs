@@ -2,8 +2,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pulsebeam_agent_native::str0m::media::{Frequency, MediaTime};
-use pulsebeam_agent_native::{Agent, Config, Host, MediaFrame};
+use pulsebeam_agent_native::{Agent, Config, Frequency, Host, MediaFrame, MediaTime};
 use pulsebeam_core::net::UdpSocket;
 
 use super::common::client::create_http_client;

@@ -17,7 +17,7 @@ workspace = true
 anyhow.workspace = true
 clap = { version = "4.6.1", features = ["derive"] }
 mimalloc = { version = "0.1.52" }
-pulsebeam-agent = { path = "../pulsebeam-agent" }
+pulsebeam-agent-native = { path = "../../agents/pulsebeam-agent-native" }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["reqwest"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 rand.workspace = true

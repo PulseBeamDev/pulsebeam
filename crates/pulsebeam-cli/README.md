@@ -1,8 +1,9 @@
 # `pulsebeam-cli`
 
 Headless load and benchmark client for a running PulseBeam server. The current
-`bench` command creates rooms of native `pulsebeam-agent` peers, publishes the
-embedded media fixtures, and records latency and transport snapshots as CSV.
+`bench` creates rooms of `pulsebeam-agent-native` peers, publishes the embedded
+encoded fixtures, automatically subscribes each peer to remote video, and
+records latency and transport snapshots as CSV.
 
 This binary is a client only; it does not run or administer the SFU.
 

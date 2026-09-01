@@ -15,52 +15,22 @@
 )]
 
 pub use agent_core;
-pub use bytes::Bytes;
 use std::sync::Arc;
 use std::time::SystemTime;
-pub use str0m;
-pub use str0m::Candidate;
-pub use str0m::IceConnectionState;
-pub use str0m::media::{MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
+pub use str0m::media::{Frequency, MediaTime, Mid, Rid, SimulcastLayer};
 pub use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use tokio::time::Instant;
 
 pub mod clock;
-
-pub use agent::{
-    Agent as LegacyAgent, AgentBuilder, AgentError as LegacyAgentError, AgentRunner, Connection,
-    ConnectionState as LegacyConnectionState, LocalEncoding, LocalTrack, Media, Participant,
-    ParticipantChange, Participants, RemoteTrack as LegacyRemoteTrack, RemoteVideo, Statistics,
-    StatisticsSnapshot, VideoSubscriber,
-};
 pub use clock::wallclock_at;
 pub use pipeline::{FrameReceiver, FrameSender, JitterBuffer};
 
-pub mod actor;
-pub mod agent;
-pub mod api;
-pub(crate) mod manager;
 pub mod media;
 pub mod pipeline;
 mod runtime;
 pub(crate) mod tcp;
 
 pub use runtime::*;
-
-#[doc(hidden)]
-pub mod legacy {
-    pub use crate::agent::{
-        Agent, AgentBuilder, AgentError, AgentRunner, Connection, ConnectionState, LocalEncoding,
-        LocalTrack, Media, Participant, ParticipantChange, Participants, RemoteTrack, RemoteVideo,
-        Statistics, StatisticsSnapshot, VideoSubscriber,
-    };
-    pub use crate::clock::wallclock_at;
-    pub use crate::pipeline::{FrameReceiver, FrameSender, JitterBuffer};
-    pub use crate::{
-        Bytes, Candidate, ExtensionValues, IceConnectionState, MediaFrame, MediaKind, MediaTime,
-        Mid, Rid, RtpPacket, SeqNo, SimulcastLayer, Ssrc, TransceiverDirection, str0m,
-    };
-}
 
 /// One RTP packet — the currency of the agent's media API.
 ///
@@ -132,10 +102,4 @@ pub struct MediaFrame {
     /// sender declare a per-temporal Video Layers Allocation so the SFU can cost
     /// each decode target instead of estimating. `None` for a non-scalable source.
     pub temporal_layers: Option<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransceiverDirection {
-    SendOnly,
-    RecvOnly,
 }

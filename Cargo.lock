@@ -3022,13 +3022,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulsebeam-agent"
-version = "0.3.2"
-dependencies = [
- "pulsebeam-agent-native",
-]
-
-[[package]]
 name = "pulsebeam-agent-core"
 version = "0.1.0"
 dependencies = [
@@ -3070,7 +3063,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mimalloc",
- "pulsebeam-agent",
+ "pulsebeam-agent-native",
  "pulsebeam-core",
  "pulsebeam-testdata",
  "rand 0.10.2",

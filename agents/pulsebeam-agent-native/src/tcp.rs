@@ -1,11 +1,6 @@
 use bytes::{Buf, BytesMut};
 use std::io;
 use std::net::SocketAddr;
-use str0m::{
-    Input, Rtc,
-    net::{Protocol, Receive},
-};
-use tokio::time::Instant;
 
 /// RFC 4571 framing over a single active TCP connection (RFC 6544 client role).
 ///
@@ -72,21 +67,6 @@ impl TcpSession {
         match &mut self.stream {
             None => std::future::pending().await,
             Some(s) => s.read(self.buf.as_mut_slice()).await,
-        }
-    }
-
-    /// Handle the result of a `wait_recv` call.  Decodes all complete RFC 4571
-    /// frames and delivers them to `rtc` as `Input::Receive`.  Closes the
-    /// stream on EOF or I/O error.
-    pub(crate) fn on_recv(&mut self, result: io::Result<usize>, rtc: &mut Rtc) {
-        let frames = self.receive_frames(result);
-        let (Some(source), Some(destination)) = (self.server_addr, self.local_addr) else {
-            return;
-        };
-        for frame in frames {
-            if let Ok(receive) = Receive::new(Protocol::Tcp, source, destination, &frame) {
-                let _ = rtc.handle_input(Input::Receive(Instant::now().into(), receive));
-            }
         }
     }
 

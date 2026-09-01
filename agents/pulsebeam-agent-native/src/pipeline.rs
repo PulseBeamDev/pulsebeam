@@ -36,6 +36,21 @@ use crate::{MediaFrame, RtpPacket};
 const START_OF_FRAME_BIT: u8 = 0b1000_0000;
 const END_OF_FRAME_BIT: u8 = 0b0100_0000;
 
+fn saturating_u64_from_f64(value: f64) -> u64 {
+    debug_assert!(value.is_finite());
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the finite positive value is clamped to the target integer range"
+    )]
+    {
+        value.min(u64::MAX as f64) as u64
+    }
+}
+
 /// Packetizes one outgoing stream's frames into RTP.
 ///
 /// Owns the stream's RTP sequence numbering and its Dependency Descriptor source,
@@ -675,7 +690,7 @@ fn temporal_cumulative_kbps(
         .map(|k| {
             let frac = 0.5 + 0.5 * (k as f64) / (layers.saturating_sub(1) as f64);
             TemporalLayerAllocation {
-                cumulative_kbps: crate::media::saturating_u64_from_f64((full_kbps as f64) * frac),
+                cumulative_kbps: saturating_u64_from_f64((full_kbps as f64) * frac),
             }
         })
         .collect()
