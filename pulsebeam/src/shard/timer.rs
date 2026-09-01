@@ -1,5 +1,5 @@
 use slotmap::SecondaryMap;
-use std::{array, time::Duration};
+use std::time::Duration;
 use tokio::time::Instant;
 
 use super::participants::ParticipantKey;
@@ -62,7 +62,7 @@ pub struct TimerWheel {
     epoch: Instant,
     last_now: Instant,
     current_tick: u64,
-    heads: [Option<ParticipantKey>; SLOT_COUNT],
+    heads: Box<[Option<ParticipantKey>]>,
     due_head: Option<ParticipantKey>,
     occupied: [u64; OCCUPANCY_WORDS],
     nodes: SecondaryMap<ParticipantKey, TimerNode>,
@@ -75,7 +75,7 @@ impl TimerWheel {
             epoch,
             last_now: epoch,
             current_tick: 0,
-            heads: array::from_fn(|_| None),
+            heads: vec![None; SLOT_COUNT].into_boxed_slice(),
             due_head: None,
             occupied: [0; OCCUPANCY_WORDS],
             nodes: SecondaryMap::with_capacity(capacity),
@@ -492,6 +492,25 @@ mod tests {
         );
         let mut expired = Vec::new();
         wheel.drain_expired(start + Duration::from_millis(10), |entry| {
+            expired.push(entry);
+        });
+        assert_eq!(expired, vec![key]);
+    }
+
+    #[test]
+    fn deadlines_fire_after_a_slot_wrap() {
+        let mut wheel = TimerWheel::new(16);
+        let key = keys(1)[0];
+        let start = wheel.epoch;
+        wheel.drain_expired(start + Duration::from_millis(255), |_| {});
+        wheel.schedule(key, start + Duration::from_millis(260));
+
+        let mut expired = Vec::new();
+        wheel.drain_expired(start + Duration::from_millis(259), |entry| {
+            expired.push(entry);
+        });
+        assert!(expired.is_empty());
+        wheel.drain_expired(start + Duration::from_millis(260), |entry| {
             expired.push(entry);
         });
         assert_eq!(expired, vec![key]);
