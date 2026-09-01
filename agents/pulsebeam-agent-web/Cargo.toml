@@ -8,10 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 agent_core = { package = "pulsebeam-agent-core", version = "0.1.0", path = "../pulsebeam-agent-core" }
-log = { version = "0.4", default-features = false }
 wasm-bindgen = "0.2.127"
-web-sys = { version = "0.3.104", features = [
-  "Performance",
-  "Window",
-  "console",
-] }

@@ -1,10 +1,5 @@
-use alloc::string::String;
-
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Generation(u64);
-
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct RequestId(u64);
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct OperationId(u64);
@@ -13,10 +8,35 @@ pub struct OperationId(u64);
 pub struct TimerId(u64);
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct DataChannelId(u16);
+pub struct ChannelId(u64);
 
-#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct DataChannelLabel(String);
+impl ChannelId {
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Generation {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl OperationId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TimerId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 pub(crate) struct IdGenerator {
     next: u64,
@@ -29,21 +49,20 @@ impl IdGenerator {
 
     fn next(&mut self) -> u64 {
         let id = self.next;
-
-        self.next = self.next.checked_add(1).expect("ID space exhausted");
-
+        debug_assert_ne!(id, u64::MAX, "agent correlation ID space exhausted");
+        self.next = self.next.wrapping_add(1).max(1);
         id
-    }
-
-    pub(crate) fn request(&mut self) -> RequestId {
-        RequestId(self.next())
-    }
-
-    pub(crate) fn timer(&mut self) -> TimerId {
-        TimerId(self.next())
     }
 
     pub(crate) fn generation(&mut self) -> Generation {
         Generation(self.next())
+    }
+
+    pub(crate) fn operation(&mut self) -> OperationId {
+        OperationId(self.next())
+    }
+
+    pub(crate) fn timer(&mut self) -> TimerId {
+        TimerId(self.next())
     }
 }
