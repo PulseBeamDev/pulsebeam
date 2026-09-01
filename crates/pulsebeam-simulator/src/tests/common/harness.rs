@@ -1,16 +1,19 @@
 use crate::tests::common::client::{
-    AudioReceiveLog, MAX_CONCEALABLE_GAP, QualityVideoReference, SimClientBuilder, VideoReceiveLog,
-    VideoReceiveStats,
+    AudioReceiveLog, MAX_CONCEALABLE_GAP, QualityVideoReference, RequestedVideo, SimClientBuilder,
+    VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::decoder::{
     MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
 };
+use crate::tests::common::media::VbrProfile;
 use crate::tests::common::{
     DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
     subnet_ip_v6,
 };
-use pulsebeam_agent::SimulcastLayer;
-use pulsebeam_agent::media::VbrProfile;
+use pulsebeam_agent_native::SimulcastLayer;
+use pulsebeam_agent_native::agent_core::{
+    TopicMode, TopicPublisher, TopicRegistrations, TopicSubscriber,
+};
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
 use pulsebeam_testdata::{QualityVideoLayer, QualityVideoSource};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -22,7 +25,6 @@ use tokio::sync::mpsc;
 // so a stamp taken on the coordinator cannot be compared with one taken inside a participant.
 // That mismatch reported every time-to-first-frame as ~5s regardless of what happened.
 use std::time::Instant;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 pub enum Role {
@@ -925,6 +927,7 @@ enum ParticipantCmd {
 
 // ── Pending driver operations (queued by coordinator, drained on drive tick) ─
 
+#[derive(Clone)]
 enum PendingDriverOp {
     SetSubscriptions(Vec<VideoSubscription>),
     DeclarePublishTopic(String),
@@ -1110,16 +1113,28 @@ impl ParticipantHandle {
 
 // ── Participant task ────────────────────────────────────────────────────────
 
-async fn run_participant(
+struct ParticipantTask {
     ip: IpAddr,
     server_ip: IpAddr,
     config: Participant,
     room_name: &'static str,
+    tcp_only: bool,
+    initial_topics: TopicRegistrations,
+}
+
+async fn run_participant(
+    task: ParticipantTask,
     shared: Arc<ParticipantShared>,
     mut cmd_rx: mpsc::Receiver<ParticipantCmd>,
-    tcp_only: bool,
 ) -> anyhow::Result<()> {
-    // Participants declared starts_disconnected wait for a Join/Reconnect command.
+    let ParticipantTask {
+        ip,
+        server_ip,
+        config,
+        room_name,
+        tcp_only,
+        initial_topics,
+    } = task;
     if config.starts_disconnected {
         match cmd_rx.recv().await {
             Some(ParticipantCmd::Reconnect) => {}
@@ -1132,26 +1147,32 @@ async fn run_participant(
             SimClientBuilder::bind_tcp(ip, server_ip).await?
         } else {
             SimClientBuilder::bind(ip, server_ip).await?
-        };
-        builder = builder.with_quality_references(shared.quality_references.clone());
-        builder = builder.with_h264_publishers(shared.h264_publishers.clone());
+        }
+        .with_quality_references(shared.quality_references.clone())
+        .with_h264_publishers(shared.h264_publishers.clone())
+        .with_paused_publishers(shared.paused_publishers.clone())
+        .with_audio_rx(shared.audio_rx.clone())
+        .with_video_rx(shared.video_rx.clone())
+        .with_initial_topics(initial_topics.clone());
+
         if config.suppress_natural_keyframe_repeats {
             builder = builder.suppress_natural_keyframe_repeats();
         }
         if config.marker_only {
             builder = builder.without_dependency_descriptor();
         }
-
         match config.role {
             Role::Publisher => {
                 if let Some((source, layer)) = config.quality_video {
                     builder = builder.publish_quality_video(source, layer);
                 } else {
-                    let layers = if config.rids.is_empty() {
-                        None
-                    } else {
-                        Some(config.rids.iter().map(|r| SimulcastLayer::new(r)).collect())
-                    };
+                    let layers = (!config.rids.is_empty()).then(|| {
+                        config
+                            .rids
+                            .iter()
+                            .map(|rid| SimulcastLayer::new(rid))
+                            .collect()
+                    });
                     builder = builder.publish_video(layers);
                     if let Some(profile) = config.vbr {
                         builder = builder.with_vbr(profile);
@@ -1176,13 +1197,8 @@ async fn run_participant(
                     builder = builder.with_corrupt_video_payload();
                 }
             }
-            Role::DataOnly => {
-                // No tracks; data channels only.
-            }
+            Role::DataOnly => {}
         }
-
-        // After the role's video slots. Transceivers are reserved in order, so putting audio first
-        // shifts the mids the video paths are matched on and the viewer receives nothing at all.
         if let Some(level) = config.audio_level_dbov {
             builder = builder.publish_audio(level, config.audio_phase_offset);
         }
@@ -1192,21 +1208,11 @@ async fn run_participant(
         if config.audio_slots > 0 {
             builder = builder.receive_audio(config.audio_slots);
         }
-
         if !config.auto_subscribe {
             builder = builder.manual_subscriptions();
         }
 
-        let auto_subscribe =
-            config.auto_subscribe && (matches!(config.role, Role::Subscriber) || config.subscribes);
-        let shared_clone = shared.clone();
-        let mut client = match builder
-            .with_paused_publishers(shared.paused_publishers.clone())
-            .with_audio_rx(shared.audio_rx.clone())
-            .with_video_rx(shared.video_rx.clone())
-            .connect(room_name)
-            .await
-        {
+        let mut client = match builder.connect(room_name).await {
             Ok(client) => client,
             Err(error) if config.starts_disconnected => {
                 *shared.connected.lock().unwrap() = false;
@@ -1218,321 +1224,110 @@ async fn run_participant(
             }
             Err(error) => return Err(error),
         };
-
-        {
-            let id = client.ctx.agent.participant_id().clone();
+        if let Some(id) = client.ctx.participant_id() {
             *shared.participant_id.lock().unwrap() = Some(id.clone());
             shared.incarnations.lock().unwrap().push(id);
         }
         *shared.connected.lock().unwrap() = true;
 
-        // Drive until cancelled or a lifecycle command arrives.
-        let token = CancellationToken::new();
-        let ops_token = token.clone();
-        let cmd = {
-            let mut drive_fut = Box::pin(client.drive_until_cancelled(token.clone(), move |ctx| {
-                // 1. Drain pending ops.
-                let ops: Vec<PendingDriverOp> =
-                    shared_clone.pending_ops.lock().unwrap().drain(..).collect();
-                let mut retry_ops: Vec<PendingDriverOp> = Vec::new();
-                for op in ops {
-                    match op {
-                        PendingDriverOp::SetSubscriptions(subs) => {
-                            let incoming_tracks = ctx.incoming_track_tx.clone();
-                            // Every subscription is (re-)issued, including ones for a track that
-                            // is already subscribed. `SetSubscriptions` is a declarative step, and
-                            // a plan's whole point may be to change the *height* of an existing
-                            // subscription. Filtering on participant id alone silently dropped
-                            // those: a subscriber participant auto-subscribes at 720 as soon as it
-                            // discovers a track, so any later `SubscribeTo` naming that track was
-                            // a no-op and the plan quietly tested 720p instead of what it asked
-                            // for.
-                            let new_subscriptions: Vec<_> = subs.to_vec();
-                            for subscription in &subs {
-                                ctx.requested_tracks
-                                    .insert(subscription.participant_id.clone());
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        let command = loop {
+            tokio::select! {
+                command = cmd_rx.recv() => break command,
+                _ = interval.tick() => {
+                    let operations = shared.pending_ops.lock().unwrap().drain(..).collect::<Vec<_>>();
+                    let mut retry = Vec::new();
+                    for operation in operations {
+                        let complete = match operation.clone() {
+                            PendingDriverOp::SetSubscriptions(subscriptions) => client
+                                .ctx
+                                .set_video_subscriptions(subscriptions.into_iter().map(|subscription| RequestedVideo {
+                                    participant_id: subscription.participant_id,
+                                    height: subscription.height,
+                                    min_height: subscription.min_height,
+                                    priority: subscription.priority,
+                                }).collect())
+                                .await?,
+                            PendingDriverOp::DeclarePublishTopic(topic) => {
+                                client.ctx.register_publisher(topic, TopicMode::Latest).await?
                             }
-                            for subscription in new_subscriptions {
-                                let agent = ctx.agent.clone();
-                                let incoming_tracks = incoming_tracks.clone();
-                                let token = ops_token.clone();
-                                tokio::spawn(async move {
-                                    let participant = subscription.participant_id.clone();
-                                    // A subscribe that never resolves would otherwise sit here
-                                    // until the plan ends and the agent closes, then panic during
-                                    // teardown - long after the step that issued it, and pointing
-                                    // at shutdown rather than at the subscription that hung.
-                                    let result = tokio::select! {
-                                        _ = token.cancelled() => {
-                                            panic!(
-                                                "subscribe to {participant} never resolved; it was \
-                                                 still pending when the plan finished"
-                                            );
-                                        }
-                                        result = agent
-                                            .participant(subscription.participant_id)
-                                            .video()
-                                            .subscribe()
-                                            .target_height(subscription.height)
-                                            .minimum_height(subscription.min_height)
-                                            .priority(subscription.priority) => result,
-                                    };
-                                    let track = result.unwrap_or_else(|e| {
-                                        panic!("failed to subscribe to {participant}: {e:?}")
-                                    });
-                                    if incoming_tracks.send(track).await.is_err() {
-                                        // The client is shutting down and no longer reading; the
-                                        // subscription itself succeeded, so this is not a failure.
-                                    }
-                                });
+                            PendingDriverOp::DeclareSubscribeTopic(topic, publisher_id) => {
+                                client.ctx.register_subscriber(topic, TopicMode::Latest, publisher_id).await?
                             }
-                        }
-                        PendingDriverOp::DeclarePublishTopic(t) => {
-                            let agent = ctx.agent.clone();
-                            let publishers = ctx.published_topics.clone();
-                            tokio::spawn(async move {
-                                let publisher = agent
-                                    .topic(t.clone())
-                                    .expect("invalid topic")
-                                    .publisher()
-                                    .latest()
-                                    .await
-                                    .expect("failed to declare publisher");
-                                publishers.lock().unwrap().insert(t, publisher);
-                            });
-                        }
-                        PendingDriverOp::DeclareSubscribeTopic(t, pub_id) => {
-                            let agent = ctx.agent.clone();
-                            let subscribers = ctx.subscribed_topics.clone();
-                            tokio::spawn(async move {
-                                let builder = agent
-                                    .topic(t.clone())
-                                    .expect("invalid topic")
-                                    .subscriber()
-                                    .latest();
-                                let builder = match pub_id.as_deref() {
-                                    Some(publisher_id) => builder.from_publisher(publisher_id),
-                                    None => builder,
-                                };
-                                let subscriber =
-                                    builder.await.expect("failed to declare subscriber");
-                                subscribers.lock().unwrap().insert((t, pub_id), subscriber);
-                            });
-                        }
-                        PendingDriverOp::PublishData(ref topic, ref data) => {
-                            if let Some(publisher) = ctx.published_topics.lock().unwrap().get(topic)
-                            {
-                                if publisher.try_send(data.clone()).is_err() {
-                                    retry_ops.push(op);
-                                }
-                            } else {
-                                retry_ops.push(op);
+                            PendingDriverOp::PublishData(topic, data) => {
+                                client.ctx.send_topic(&topic, TopicMode::Latest, data).await?
                             }
-                        }
-                        PendingDriverOp::DeclareOrderedPublisher(t) => {
-                            let agent = ctx.agent.clone();
-                            let publishers = ctx.ordered_publishers.clone();
-                            tokio::spawn(async move {
-                                let publisher = agent
-                                    .topic(t.clone())
-                                    .expect("invalid topic")
-                                    .publisher()
-                                    .ordered()
-                                    .await
-                                    .expect("failed to declare ordered publisher");
-                                publishers.lock().unwrap().insert(t, publisher);
-                            });
-                        }
-                        PendingDriverOp::DeclareOrderedSubscriber(t) => {
-                            let agent = ctx.agent.clone();
-                            let subscribers = ctx.ordered_subscribers.clone();
-                            tokio::spawn(async move {
-                                let subscriber = agent
-                                    .topic(t.clone())
-                                    .expect("invalid topic")
-                                    .subscriber()
-                                    .ordered()
-                                    .await
-                                    .expect("failed to declare ordered subscriber");
-                                subscribers.lock().unwrap().insert(t, subscriber);
-                            });
-                        }
-                        PendingDriverOp::PublishOrdered(ref topic, ref data) => {
-                            if let Some(publisher) =
-                                ctx.ordered_publishers.lock().unwrap().get(topic)
-                            {
-                                if publisher.try_send(data.clone()).is_err() {
-                                    retry_ops.push(op);
-                                }
-                            } else {
-                                retry_ops.push(op);
+                            PendingDriverOp::DeclareOrderedPublisher(topic) => {
+                                client.ctx.register_publisher(topic, TopicMode::Ordered).await?
                             }
-                        }
-                        PendingDriverOp::SetAudioIntent(ref publishers, auto) => {
-                            // The wire pins tracks, so each publisher resolves through what this
-                            // agent has actually been told it publishes. A pin for somebody whose
-                            // audio it has not discovered yet is retried rather than sent empty -
-                            // an intent missing its pin would look like a passing plan that
-                            // asserted nothing.
-                            let mut pinned = Vec::new();
-                            let mut unresolved = false;
-                            for id in publishers {
-                                let tracks = ctx.agent.participant(id.clone()).audio_tracks();
-                                if tracks.is_empty() {
-                                    unresolved = true;
-                                    break;
-                                }
-                                pinned.extend(tracks);
+                            PendingDriverOp::DeclareOrderedSubscriber(topic) => {
+                                client.ctx.register_subscriber(topic, TopicMode::Ordered, None).await?
                             }
-                            if unresolved {
-                                retry_ops.push(op);
-                            } else {
-                                let agent = ctx.agent.clone();
-                                tokio::spawn(async move {
-                                    let _ = agent
-                                        .media()
-                                        .set_audio_intent(pulsebeam_agent::agent::AudioIntent {
-                                            pinned,
-                                            auto,
-                                        })
-                                        .await;
-                                });
+                            PendingDriverOp::PublishOrdered(topic, data) => {
+                                client.ctx.send_topic(&topic, TopicMode::Ordered, data).await?
                             }
+                            PendingDriverOp::SetAudioIntent(participants, automatic) => {
+                                client.ctx.set_audio_intent(&participants, automatic).await?
+                            }
+                        };
+                        if !complete {
+                            retry.push(operation);
                         }
                     }
-                }
-                if !retry_ops.is_empty() {
-                    let mut guard = shared_clone.pending_ops.lock().unwrap();
-                    // Prepend so retries are tried first next tick.
-                    retry_ops.extend(guard.drain(..));
-                    *guard = retry_ops;
-                }
-
-                // 1b. Auto-subscribe: for subscriber participants, subscribe to any
-                // newly-discovered tracks so tests that have no explicit SubscribeAll
-                // step still receive video.
-                if auto_subscribe {
-                    let incoming_tracks = ctx.incoming_track_tx.clone();
-                    let new_track_ids: Vec<String> = ctx
-                        .discovered_tracks
-                        .iter()
-                        .filter(|id| !ctx.requested_tracks.contains(*id))
-                        .cloned()
-                        .collect();
-                    for participant_id in new_track_ids {
-                        ctx.requested_tracks.insert(participant_id.clone());
-                        let agent = ctx.agent.clone();
-                        let incoming_tracks = incoming_tracks.clone();
-                        tokio::spawn(async move {
-                            // Subscribing can legitimately fail when the publisher
-                            // has already left (churn, abrupt exit). That is not a
-                            // test failure — just skip it.
-                            let Ok(track) = agent
-                                .participant(participant_id)
-                                .video()
-                                .subscribe()
-                                .target_height(720)
-                                .minimum_height(0)
-                                .priority(0)
-                                .await
-                            else {
-                                return;
-                            };
-                            let _ = incoming_tracks.send(track).await;
-                        });
+                    if !retry.is_empty() {
+                        let mut pending = shared.pending_ops.lock().unwrap();
+                        retry.append(&mut pending);
+                        *pending = retry;
                     }
-                }
 
-                // 2. Drain received data from all known subscribers.
-                {
-                    let mut data_received = shared_clone.data_received.lock().unwrap();
-                    for ((topic, _scope), subscriber) in
-                        ctx.subscribed_topics.lock().unwrap().iter_mut()
+                    client.tick().await?;
                     {
-                        while let Ok(payload) = subscriber.try_recv() {
-                            data_received
-                                .entry(topic.clone())
-                                .or_default()
-                                .push(payload);
+                        let mut received = shared.data_received.lock().unwrap();
+                        for (topic, payload) in client.ctx.received_data.drain(..) {
+                            received.entry(topic).or_default().push(payload);
                         }
                     }
-                    for (topic, subscriber) in ctx.ordered_subscribers.lock().unwrap().iter_mut() {
-                        while let Ok(delivery) = subscriber.try_recv() {
-                            if let pulsebeam_agent::agent::OrderedTopicDelivery::Message(message) =
-                                delivery
-                            {
-                                data_received
-                                    .entry(topic.clone())
-                                    .or_default()
-                                    .push(message.payload);
-                            }
-                        }
-                    }
+                    *shared.discovered_tracks.lock().unwrap() = client.ctx.discovered_tracks.clone();
+                    *shared.media_kinds.lock().unwrap() = client.ctx.media_kinds.clone();
+                    let stats = client.ctx.statistics();
+                    *shared.tx_bytes.lock().unwrap() = stats.bytes_sent;
+                    *shared.rx_bytes.lock().unwrap() = stats.bytes_received;
+                    *shared.connected.lock().unwrap() = client.ctx.connected();
+                    *shared.keyframe_requests.lock().unwrap() = stats.keyframe_requests;
+                    *shared.unroutable_media_dropped.lock().unwrap() = stats.unroutable_media_dropped;
                 }
-
-                // 3. Snapshot discovered tracks, and what kind of media each is believed to have.
-                {
-                    *shared_clone.discovered_tracks.lock().unwrap() = ctx.discovered_tracks.clone();
-                    let mut kinds = shared_clone.media_kinds.lock().unwrap();
-                    kinds.clear();
-                    for id in &ctx.discovered_tracks {
-                        let participant = ctx.agent.participant(id.clone());
-                        kinds.insert(
-                            id.clone(),
-                            (participant.has_video(), participant.has_audio()),
-                        );
-                    }
-                }
-
-                // 4. Update stats.
-                let stats = ctx.agent.stats().current();
-                *shared_clone.tx_bytes.lock().unwrap() = stats.total_tx_bytes();
-                *shared_clone.rx_bytes.lock().unwrap() = stats.total_rx_bytes();
-                *shared_clone.connected.lock().unwrap() = stats.is_connected();
-                *shared_clone.keyframe_requests.lock().unwrap() =
-                    stats.keyframe_requests_received();
-                *shared_clone.unroutable_media_dropped.lock().unwrap() =
-                    stats.unroutable_media_dropped();
-                false
-            }));
-
-            let received = tokio::select! {
-                _ = drive_fut.as_mut() => None,
-                c = cmd_rx.recv() => { token.cancel(); c }
-            };
-            drop(drive_fut); // release &mut client borrow
-            received
+            }
         };
 
-        // Update stats one final time before handling the command.
-        {
-            let stats = client.ctx.agent.stats().current();
-            *shared.tx_bytes.lock().unwrap() = stats.total_tx_bytes();
-            *shared.rx_bytes.lock().unwrap() = stats.total_rx_bytes();
-        }
+        let stats = client.ctx.statistics();
+        *shared.tx_bytes.lock().unwrap() = stats.bytes_sent;
+        *shared.rx_bytes.lock().unwrap() = stats.bytes_received;
         *shared.connected.lock().unwrap() = false;
-
-        match cmd {
-            None | Some(ParticipantCmd::Done) => break,
+        match command {
+            None | Some(ParticipantCmd::Done) => {
+                client.abort().await?;
+                break;
+            }
             Some(ParticipantCmd::Shutdown) => {
-                client.ctx.agent.close().await?;
-                drop(client);
+                client.close().await?;
                 match cmd_rx.recv().await {
                     Some(ParticipantCmd::Reconnect) => continue,
                     _ => break,
                 }
             }
             Some(ParticipantCmd::Drop) => {
-                drop(client);
+                client.abort().await?;
                 match cmd_rx.recv().await {
                     Some(ParticipantCmd::Reconnect) => continue,
                     _ => break,
                 }
             }
-            Some(ParticipantCmd::Reconnect) => continue,
+            Some(ParticipantCmd::Reconnect) => {
+                client.abort().await?;
+                continue;
+            }
         }
     }
-
     Ok(())
 }
 
@@ -4302,6 +4097,74 @@ pub struct FeedbackProfile {
     pub reorder: Reorder,
 }
 
+fn initial_topic_registrations(plan: &[Step]) -> BTreeMap<&'static str, TopicRegistrations> {
+    // Data-channel labels are transport topology; scenario steps still control when each API
+    // declaration becomes observable, but fixed labels belong in the initial offer.
+    let mut by_participant = BTreeMap::<_, TopicRegistrations>::new();
+    for step in plan {
+        let (participant, publisher, subscriber) = match step {
+            Step::DeclarePublishTopic {
+                participant, topic, ..
+            } => (
+                *participant,
+                Some(TopicPublisher {
+                    topic: (*topic).to_string(),
+                    mode: TopicMode::Latest,
+                }),
+                None,
+            ),
+            Step::DeclareSubscribeTopic {
+                participant,
+                topic,
+                scoped_to: None,
+                ..
+            } => (
+                *participant,
+                None,
+                Some(TopicSubscriber {
+                    topic: (*topic).to_string(),
+                    mode: TopicMode::Latest,
+                    publisher_id: None,
+                }),
+            ),
+            Step::DeclareOrderedPublisher {
+                participant, topic, ..
+            } => (
+                *participant,
+                Some(TopicPublisher {
+                    topic: (*topic).to_string(),
+                    mode: TopicMode::Ordered,
+                }),
+                None,
+            ),
+            Step::DeclareOrderedSubscriber {
+                participant, topic, ..
+            } => (
+                *participant,
+                None,
+                Some(TopicSubscriber {
+                    topic: (*topic).to_string(),
+                    mode: TopicMode::Ordered,
+                    publisher_id: None,
+                }),
+            ),
+            _ => continue,
+        };
+        let registrations = by_participant.entry(participant).or_default();
+        if let Some(publisher) = publisher
+            && !registrations.publishers.contains(&publisher)
+        {
+            registrations.publishers.push(publisher);
+        }
+        if let Some(subscriber) = subscriber
+            && !registrations.subscribers.contains(&subscriber)
+        {
+            registrations.subscribers.push(subscriber);
+        }
+    }
+    by_participant
+}
+
 impl FeedbackProfile {
     /// Feedback degraded about as much as the forward path on the same wireless link.
     pub fn wifi() -> Self {
@@ -4551,6 +4414,7 @@ impl LocalNodeSim {
         let seed = self.rng_seed;
         let tcp_only = self.tcp_only;
         let num_shards = self.num_shards;
+        let initial_topics = initial_topic_registrations(&plan);
 
         sim.host(server_ip, move || async move {
             let rng = pulsebeam_runtime::rand::seeded_rng(seed);
@@ -4636,11 +4500,20 @@ impl LocalNodeSim {
                     },
                 );
 
-                let config = participant.clone();
-                let room_name = room.name;
+                let task = ParticipantTask {
+                    ip,
+                    server_ip,
+                    config: participant.clone(),
+                    room_name: room.name,
+                    tcp_only,
+                    initial_topics: initial_topics
+                        .get(participant.name)
+                        .cloned()
+                        .unwrap_or_default(),
+                };
 
                 sim.client(ip, async move {
-                    run_participant(ip, server_ip, config, room_name, shared, cmd_rx, tcp_only)
+                    run_participant(task, shared, cmd_rx)
                         .await
                         .map_err(Into::into)
                 });

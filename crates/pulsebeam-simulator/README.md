@@ -11,6 +11,13 @@ Read the [simulation contract](docs/sim.md) before changing the harness and the
 [testing guide](docs/simulation.md) before adding plans, randomness, thresholds,
 or failure injection.
 
+## Contributor map
+
+- `src/tests/common/client.rs` adapts scenario operations to complete native-agent desired-state revisions and coherent snapshots.
+- `src/tests/common/media.rs` owns deterministic encoded video and audio source behavior used only by simulation.
+- `src/tests/common/harness.rs` owns automatic discovery/subscription policy, lifecycle commands, reports, and oracles.
+- `src/tests/native_runtime.rs` is the narrow native-runtime vertical slice; the authored scenarios exercise the same runtime through the common harness.
+
 ## Commands
 
 - Root `just test` runs the committed deterministic suite.

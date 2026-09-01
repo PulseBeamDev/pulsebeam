@@ -1,16 +1,14 @@
 use super::decoder::{DecodeError, H264ReferenceDecoder, OpusReferenceDecoder, ReferenceError};
+use super::media::{VbrProfile, VbrSource, VideoSource};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use pulsebeam_agent::actor::AgentBuilder;
-use pulsebeam_agent::agent::{
-    DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
+use pulsebeam_agent_native::agent_core::{
+    AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind, MediaTopology,
+    PublicationIntent, TopicMessage, TopicMode, TopicNotification, TopicPublisher, TopicSend,
+    TopicSubscriber, VideoSubscription,
 };
-use pulsebeam_agent::api::HttpApiClient;
-use pulsebeam_agent::media::{H264Looper, VbrLooper, VbrProfile};
-use pulsebeam_agent::{
-    Agent, LocalTrack, ParticipantChange, Participants, RemoteTrack, SimulcastLayer,
-};
+use pulsebeam_agent_native::{Agent, AgentEvent, Config, Host, MediaFrame, SimulcastLayer};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -22,12 +20,16 @@ use tokio::task::JoinSet;
 // host, so a timestamp taken here cannot be compared with one taken on the coordinator. See
 // `sim_clock`, which shims `clock_gettime` for the whole process.
 use std::time::Instant;
-use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 
 pub struct SimClientBuilder {
     ip: IpAddr,
-    agent_builder: AgentBuilder,
+    host: Host,
+    endpoint: String,
+    tcp_server: Option<SocketAddr>,
+    video_layers: Option<Vec<SimulcastLayer>>,
+    video_slots: usize,
+    audio_slots: usize,
+    manual_subscriptions: bool,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
     audio_rx: Option<Arc<Mutex<AudioReceiveLog>>>,
     paused_publishers: Option<Arc<Mutex<std::collections::BTreeSet<String>>>>,
@@ -39,7 +41,6 @@ pub struct SimClientBuilder {
     /// Publish audio at this loudness, in negative dBov. `None` publishes no audio.
     audio_level_dbov: Option<i8>,
     audio_phase_offset: u64,
-    receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
     quality_video: Option<(
@@ -49,6 +50,7 @@ pub struct SimClientBuilder {
     corrupt_video_payload: bool,
     corrupt_audio_payload: bool,
     suppress_natural_keyframe_repeats: bool,
+    initial_topics: pulsebeam_agent_native::agent_core::TopicRegistrations,
     quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
 }
@@ -96,15 +98,16 @@ fn unspecified_addr(ip: IpAddr) -> SocketAddr {
 
 impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
-        let client = create_http_client();
-        let server_base_uri = http_base_uri(server_ip, 7070);
-        let api = HttpApiClient::new(client, &server_base_uri)?;
-
         let socket = UdpSocket::bind(unspecified_addr(ip)).await?;
-
         Ok(Self {
             ip,
-            agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
+            host: Host::new(create_http_client(), socket),
+            endpoint: http_base_uri(server_ip, 7070),
+            tcp_server: None,
+            video_layers: None,
+            video_slots: 0,
+            audio_slots: 0,
+            manual_subscriptions: false,
             video_rx: None,
             audio_rx: None,
             paused_publishers: None,
@@ -113,12 +116,12 @@ impl SimClientBuilder {
             temporal_dd: None,
             audio_level_dbov: None,
             audio_phase_offset: 0,
-            receives_audio: false,
             opaque_payload: false,
             quality_video: None,
             corrupt_video_payload: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
+            initial_topics: Default::default(),
             quality_references: Arc::new(Mutex::new(BTreeMap::new())),
             h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
         })
@@ -127,18 +130,16 @@ impl SimClientBuilder {
     /// Like `bind` but also configures a TCP active stream to the server's ICE
     /// port (3478).  Use with `start_sfu_node_tcp_only` to test TCP connectivity.
     pub async fn bind_tcp(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
-        let client = create_http_client();
-        let server_base_uri = http_base_uri(server_ip, 7070);
-        let api = HttpApiClient::new(client, &server_base_uri)?;
-
         let socket = UdpSocket::bind(unspecified_addr(ip)).await?;
-        let server_tcp_addr = std::net::SocketAddr::new(server_ip, 3478);
-
         Ok(Self {
             ip,
-            agent_builder: AgentBuilder::new(api, socket)
-                .with_local_ip(ip)
-                .with_tcp_server_addr(server_tcp_addr),
+            host: Host::new(create_http_client(), socket),
+            endpoint: http_base_uri(server_ip, 7070),
+            tcp_server: Some(SocketAddr::new(server_ip, 3478)),
+            video_layers: None,
+            video_slots: 0,
+            audio_slots: 0,
+            manual_subscriptions: false,
             video_rx: None,
             audio_rx: None,
             paused_publishers: None,
@@ -147,19 +148,19 @@ impl SimClientBuilder {
             temporal_dd: None,
             audio_level_dbov: None,
             audio_phase_offset: 0,
-            receives_audio: false,
             opaque_payload: false,
             quality_video: None,
             corrupt_video_payload: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
+            initial_topics: Default::default(),
             quality_references: Arc::new(Mutex::new(BTreeMap::new())),
             h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
     pub fn publish_video(mut self, simulcast_layers: Option<Vec<SimulcastLayer>>) -> Self {
-        self.agent_builder = self.agent_builder.video_upstream_slots(1, simulcast_layers);
+        self.video_layers = simulcast_layers;
         self.publishes_video = true;
         self
     }
@@ -169,7 +170,6 @@ impl SimClientBuilder {
         source: pulsebeam_testdata::QualityVideoSource,
         layer: pulsebeam_testdata::QualityVideoLayer,
     ) -> Self {
-        self.agent_builder = self.agent_builder.video_upstream_slots(1, None);
         self.publishes_video = true;
         self.quality_video = Some((source, layer));
         self
@@ -180,15 +180,13 @@ impl SimClientBuilder {
     /// The SFU forwards only the loudest few speakers, so this is how many it can send at once -
     /// the receiving end of `TopNAudioSelector`'s slots.
     pub fn receive_audio(mut self, capacity: usize) -> Self {
-        self.agent_builder = self.agent_builder.audio_downstream_slots(capacity);
-        self.receives_audio = true;
+        self.audio_slots = capacity;
         self
     }
 
     /// Publish audio at the given loudness in negative dBov: around -30 is ordinary speech,
     /// below about -60 reads as a quiet room.
     pub fn publish_audio(mut self, level_dbov: i8, phase_offset: u64) -> Self {
-        self.agent_builder = self.agent_builder.audio_upstream_slots(1);
         self.audio_level_dbov = Some(level_dbov);
         self.audio_phase_offset = phase_offset;
         self
@@ -227,19 +225,27 @@ impl SimClientBuilder {
         self
     }
 
+    pub(crate) fn with_initial_topics(
+        mut self,
+        topics: pulsebeam_agent_native::agent_core::TopicRegistrations,
+    ) -> Self {
+        self.initial_topics = topics;
+        self
+    }
+
     pub fn receive_video(mut self, capacity: usize) -> Self {
-        self.agent_builder = self.agent_builder.video_downstream_slots(capacity);
+        self.video_slots = capacity;
         self
     }
 
     pub fn manual_subscriptions(mut self) -> Self {
-        self.agent_builder = self.agent_builder.manual_subscriptions();
+        self.manual_subscriptions = true;
         self
     }
 
     /// Model a marker/deep-inspection-only peer that never negotiates DD.
     pub fn without_dependency_descriptor(mut self) -> Self {
-        self.agent_builder = self.agent_builder.without_dependency_descriptor();
+        self.temporal_dd = Some(0);
         self
     }
 
@@ -277,12 +283,75 @@ impl SimClientBuilder {
     }
 
     pub(crate) async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
-        let (agent, runner) = self.agent_builder.connect_unmanaged(room).await?;
+        let topology = MediaTopology {
+            local_video: self
+                .publishes_video
+                .then(|| "video".to_owned())
+                .into_iter()
+                .collect(),
+            local_audio: self
+                .audio_level_dbov
+                .map(|_| "audio".to_owned())
+                .into_iter()
+                .collect(),
+            remote_video: u8::try_from(self.video_slots)?,
+            remote_audio: u8::try_from(self.audio_slots)?,
+        };
+        let session = AgentConfig {
+            endpoint: self.endpoint,
+            room_id: room.to_owned(),
+            topology,
+            manual_subscriptions: self.manual_subscriptions,
+            retry: Default::default(),
+        };
+        let mut config = Config::new(session);
+        config.local_ips.push(self.ip);
+        config.tcp_server = self.tcp_server;
+        config.dependency_descriptor = self.temporal_dd != Some(0);
+        if let Some(layers) = self.video_layers.clone() {
+            config.video_encodings.insert("video".into(), layers);
+        }
+        if let Some(layers) = self.temporal_dd.filter(|layers| *layers > 0) {
+            config.video_temporal_layers.insert("video".into(), layers);
+        }
+
+        let agent = Agent::spawn(config, self.host).await?;
+        let desired = DesiredState {
+            revision: 1,
+            connected: true,
+            publications: self
+                .publishes_video
+                .then(|| PublicationIntent {
+                    slot: "video".into(),
+                    active: true,
+                })
+                .into_iter()
+                .chain(self.audio_level_dbov.map(|_| PublicationIntent {
+                    slot: "audio".into(),
+                    active: true,
+                }))
+                .collect(),
+            topics: self.initial_topics,
+            ..DesiredState::default()
+        };
+        agent.replace_desired(desired.clone()).await?;
+
+        let mut snapshots = agent.snapshots();
+        while snapshots.borrow().participant_id.is_none()
+            || snapshots.borrow().connection != ConnectionState::Connected
+        {
+            snapshots.changed().await?;
+        }
+        let participant_id = snapshots
+            .borrow()
+            .participant_id
+            .clone()
+            .expect("connected snapshot has an identity");
         if self.publishes_video && !self.opaque_payload {
             self.h264_publishers
                 .lock()
                 .unwrap()
-                .insert(agent.participant_id().to_string());
+                .insert(participant_id.clone());
         }
         if let Some((source, layer)) = self.quality_video {
             let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
@@ -297,7 +366,7 @@ impl SimClientBuilder {
                 })
                 .collect();
             self.quality_references.lock().unwrap().insert(
-                agent.participant_id().clone(),
+                participant_id,
                 QualityVideoReference {
                     source,
                     layer,
@@ -307,149 +376,123 @@ impl SimClientBuilder {
                 },
             );
         }
-        let mut join_set = JoinSet::new();
-        join_set.spawn(async move {
-            runner.run().await.expect("agent runner failed");
-        });
-        let local_video = if self.publishes_video {
-            Some(agent.media().publish_video().await?)
-        } else {
-            None
-        };
-        let local_audio = match self.audio_level_dbov {
-            Some(level) => Some((agent.media().publish_audio().await?, level)),
-            None => None,
-        };
-        let (incoming_track_tx, incoming_tracks) = tokio::sync::mpsc::channel(32);
-        let participants = agent.participants();
-        let audio_tracks = if self.receives_audio {
-            // Registered before anything is heard: audio has no per-speaker subscription, so
-            // whoever the SFU picks arrives unasked and there is nowhere to put them otherwise.
-            Some(agent.media().receive_audio().await?)
-        } else {
-            None
-        };
-        let speakers = self.receives_audio.then(|| agent.media().speakers());
-        tracing::info!("connected to {room}");
+
         let video_rx = self
             .video_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
         let audio_rx = self
             .audio_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
-        let ctx_paused_publishers = self
-            .paused_publishers
-            .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::BTreeSet::new())));
         let mut ctx = ClientContext {
-            ip: self.ip,
-            agent,
-            incoming_tracks,
-            incoming_track_tx,
-            participants,
+            agent: agent.clone(),
+            desired,
+            video_capacity: self.video_slots,
+            auto_subscribe: !self.manual_subscriptions,
+            requested_video: None,
             discovered_tracks: HashSet::new(),
-            published_topics: Arc::new(Mutex::new(HashMap::new())),
-            subscribed_topics: Arc::new(Mutex::new(HashMap::new())),
-            ordered_publishers: Arc::new(Mutex::new(HashMap::new())),
-            ordered_subscribers: Arc::new(Mutex::new(HashMap::new())),
             remote_tracks: HashMap::new(),
-            paused_publishers: ctx_paused_publishers,
-            requested_tracks: HashSet::new(),
+            paused_publishers: self
+                .paused_publishers
+                .unwrap_or_else(|| Arc::new(Mutex::new(BTreeSet::new()))),
             received_data: Vec::new(),
+            media_kinds: HashMap::new(),
             video_rx,
             audio_rx,
             quality_references: self.quality_references.clone(),
             h264_publishers: self.h264_publishers.clone(),
             corrupt_video_payload: self.corrupt_video_payload,
-            local_publications: local_video.into_iter().collect(),
+            events: agent.events(),
         };
-        if let Some(mut audio_tracks) = audio_tracks {
+        let mut join_set = JoinSet::new();
+
+        for slot in 0..self.video_slots {
+            let remote = agent.remote_video(u8::try_from(slot)?).await?;
+            spawn_video_receiver(&mut join_set, remote, &ctx, agent.clone());
+        }
+        for slot in 0..self.audio_slots {
+            let mut remote = agent.remote_audio(u8::try_from(slot)?).await?;
             let log = ctx.audio_rx.clone();
-            let corrupt_payload = self.corrupt_audio_payload;
+            let observed_agent = agent.clone();
+            let corrupt = self.corrupt_audio_payload;
             join_set.spawn(async move {
-                while let Ok(mut track) = audio_tracks.next().await {
-                    let publisher = track.publisher_id().to_owned();
-                    let log = log.clone();
-                    tokio::spawn(async move {
-                        let mut decoder = OpusReceiver::new(&publisher);
-                        while let Ok(rtp) = track.recv().await {
-                            let mut rtp = rtp;
-                            if corrupt_payload {
-                                let payload = Arc::make_mut(&mut rtp.payload);
-                                payload.fill(0xff);
-                            }
-                            log.lock().unwrap().record(
-                                &publisher,
-                                rtp.ssrc.map_or(0, |s| *s),
-                                *rtp.seq,
-                                rtp.payload.len(),
-                                Instant::now(),
-                            );
-                            decoder.push(&rtp, &log, &publisher);
-                        }
-                    });
+                let mut decoders = HashMap::<String, OpusReceiver>::new();
+                while let Ok(mut packet) = remote.recv_packet().await {
+                    let Some(binding) = remote.audio_binding() else {
+                        continue;
+                    };
+                    let snapshot = observed_agent.snapshot();
+                    let Some(publisher) = snapshot
+                        .publications
+                        .get(&binding.track_id)
+                        .map(|publication| publication.participant_id.clone())
+                    else {
+                        continue;
+                    };
+                    if corrupt {
+                        Arc::make_mut(&mut packet.payload).fill(0xff);
+                    }
+                    log.lock().unwrap().record(
+                        &publisher,
+                        packet.ssrc.map_or(0, |ssrc| *ssrc),
+                        *packet.seq,
+                        packet.payload.len(),
+                        Instant::now(),
+                    );
+                    decoders
+                        .entry(publisher.clone())
+                        .or_insert_with(|| OpusReceiver::new(&publisher))
+                        .push(&packet, &log, &publisher);
                 }
             });
         }
-        if let Some(mut speakers) = speakers {
-            let log = ctx.audio_rx.clone();
-            join_set.spawn(async move {
-                loop {
-                    for speaker in speakers.current().iter() {
-                        log.lock()
-                            .unwrap()
-                            .record_rank(&speaker.participant_id, speaker.rank);
-                    }
-                    if speakers.changed().await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-        for publication in &ctx.local_publications {
-            for sender in publication.encodings().iter().cloned() {
-                let rid = sender.rid();
+
+        if self.publishes_video {
+            let media = agent.local_media("video");
+            let encodings: Vec<Option<String>> = self
+                .video_layers
+                .as_ref()
+                .map(|layers| {
+                    layers
+                        .iter()
+                        .map(|layer| Some(layer.rid.to_string()))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![None]);
+            for encoding in encodings {
                 if let Some((source, layer)) = self.quality_video {
-                    let looper = create_quality_h264_looper(source, layer);
-                    join_set.spawn(looper.run(sender));
+                    join_set.spawn(create_quality_video_source(source, layer).run(
+                        media.clone(),
+                        encoding,
+                        agent.events(),
+                    ));
+                } else if let Some(profile) = self.vbr_profile {
+                    join_set.spawn(create_vbr_source(encoding.as_deref(), profile).run(
+                        media.clone(),
+                        encoding,
+                        agent.events(),
+                    ));
                 } else {
-                    match self.vbr_profile {
-                        Some(profile) => {
-                            let looper = create_vbr_looper_for_rid(rid, profile);
-                            join_set.spawn(looper.run(sender));
-                        }
-                        None => {
-                            let mut looper = create_h264_looper_for_rid(rid);
-                            if self.suppress_natural_keyframe_repeats {
-                                looper = looper.without_natural_keyframe_repeats();
-                            }
-                            if let Some(layers) = self.temporal_dd {
-                                looper = looper.with_temporal_layers(layers);
-                            }
-                            if self.opaque_payload {
-                                looper = looper.with_opaque_payload();
-                            }
-                            join_set.spawn(looper.run(sender));
-                        }
+                    let mut source = create_video_source(encoding.as_deref());
+                    if self.suppress_natural_keyframe_repeats {
+                        source = source.without_natural_keyframe_repeats();
                     }
+                    if self.opaque_payload {
+                        source = source.opaque();
+                    }
+                    join_set.spawn(source.run(media.clone(), encoding, agent.events()));
                 }
             }
         }
-        if let Some((publication, level)) = local_audio {
-            for sender in publication.encodings().iter().cloned() {
-                join_set.spawn(
-                    QualityAudioLooper {
-                        level_dbov: level,
-                        phase_offset: self.audio_phase_offset,
-                    }
-                    .run(sender),
-                );
-            }
-            // The handle has to outlive the loopers. Dropping a `LocalTrack` unpublishes it, so
-            // letting it fall out of scope here declared the track inactive the moment it was
-            // created: the packets still flowed into cloned senders, and the SFU - told the mid
-            // was inactive - never registered a track to route them to.
-            ctx.local_publications.push(publication);
+        if let Some(level) = self.audio_level_dbov {
+            join_set.spawn(
+                QualityAudioLooper {
+                    level_dbov: level,
+                    phase_offset: self.audio_phase_offset,
+                }
+                .run(agent.local_audio("audio")),
+            );
         }
+        ctx.refresh().await?;
         Ok(SimClient { ctx, join_set })
     }
 }
@@ -846,7 +889,7 @@ impl VideoReceiveLog {
         }
     }
 
-    fn record(&mut self, publisher: &str, frame: &pulsebeam_agent::MediaFrame) {
+    fn record(&mut self, publisher: &str, frame: &MediaFrame) {
         *self.by_publisher.entry(publisher.to_owned()).or_default() += 1;
         self.bytes += frame.data.len() as u64;
         if !frame.contiguous {
@@ -931,42 +974,16 @@ impl VideoReceiveLog {
     }
 }
 
-type SubscribedTopics = Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>;
-
 struct QualityAudioLooper {
     level_dbov: i8,
     phase_offset: u64,
 }
 
-fn create_quality_h264_looper(
-    source: pulsebeam_testdata::QualityVideoSource,
-    layer: pulsebeam_testdata::QualityVideoLayer,
-) -> H264Looper {
-    let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
-    debug_assert!(!corpus.is_empty());
-    let mut data = Vec::new();
-    for index in 0..corpus.len() {
-        let Some(frame) = corpus.frame(index) else {
-            debug_assert!(false, "quality H.264 corpus cursor escaped its bounds");
-            continue;
-        };
-        debug_assert!(!frame.encoded.is_empty());
-        data.extend_from_slice(frame.encoded);
-    }
-    debug_assert!(!data.is_empty());
-    H264Looper::new(&data, pulsebeam_testdata::QUALITY_VIDEO_FPS)
-}
-
 impl QualityAudioLooper {
-    async fn run(self, sender: pulsebeam_agent::agent::LocalEncoding) {
+    async fn run(self, sender: pulsebeam_agent_native::LocalMedia) {
         let corpus =
             pulsebeam_testdata::quality_corpus_audio(pulsebeam_testdata::QualityAudioSource::Zero);
         debug_assert!(!corpus.is_empty());
-        let mut packetizer = pulsebeam_agent::pipeline::FrameSender::without_dependency_descriptor(
-            str0m::media::Mid::from("a0"),
-            None,
-            1,
-        );
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         let mut counter = 0u64;
         loop {
@@ -985,7 +1002,7 @@ impl QualityAudioLooper {
                     corpus_frame.region,
                     pulsebeam_testdata::QualityAudioRegion::Active
                 );
-            let frame = pulsebeam_agent::MediaFrame {
+            let frame = MediaFrame {
                 audio_level: Some(if speaking { self.level_dbov } else { -70 }),
                 voice_activity: Some(speaking),
                 ts: str0m::media::MediaTime::new(
@@ -997,7 +1014,7 @@ impl QualityAudioLooper {
                 ),
                 data: Arc::from(corpus_frame.opus_packet),
                 capture_time,
-                abs_capture_time: Some(pulsebeam_agent::clock::capture_wallclock()),
+                abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
                 contiguous: true,
                 is_keyframe: false,
                 target_bitrate_bps: None,
@@ -1005,11 +1022,7 @@ impl QualityAudioLooper {
                 dependency_descriptor: None,
                 temporal_layers: None,
             };
-            for packet in packetizer.packetize(&frame) {
-                if sender.send(packet).await.is_err() {
-                    return;
-                }
-            }
+            let _ = sender.send(frame).await;
             counter = counter.saturating_add(1);
         }
     }
@@ -1027,7 +1040,7 @@ fn record_video_frame(
     decoder: &mut H264ReferenceDecoder,
     decoder_ready: &mut bool,
     publisher: &str,
-    frame: pulsebeam_agent::MediaFrame,
+    frame: MediaFrame,
     corrupt_payload: bool,
 ) {
     log.lock().unwrap().record(publisher, &frame);
@@ -1107,7 +1120,7 @@ mod tests {
         let references = Arc::new(Mutex::new(BTreeMap::new()));
         let mut decoder = H264ReferenceDecoder::new("source", "video");
         let mut decoder_ready = false;
-        let frame = pulsebeam_agent::MediaFrame {
+        let frame = MediaFrame {
             audio_level: None,
             voice_activity: None,
             ts: str0m::media::MediaTime::from_90khz(0),
@@ -1175,7 +1188,7 @@ impl OpusReceiver {
 
     fn push(
         &mut self,
-        packet: &pulsebeam_agent::RtpPacket,
+        packet: &pulsebeam_agent_native::RtpPacket,
         log: &Arc<Mutex<AudioReceiveLog>>,
         publisher: &str,
     ) {
@@ -1200,41 +1213,278 @@ impl OpusReceiver {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestedVideo {
+    pub participant_id: String,
+    pub height: u32,
+    pub min_height: u32,
+    pub priority: u32,
+}
+
 pub struct ClientContext {
-    pub ip: IpAddr,
     pub agent: Agent,
-    incoming_tracks: tokio::sync::mpsc::Receiver<RemoteTrack>,
-    pub(crate) incoming_track_tx: tokio::sync::mpsc::Sender<RemoteTrack>,
-    participants: Participants,
-    /// Aggregated decode-side view of every remote video track.
+    desired: DesiredState,
+    video_capacity: usize,
+    auto_subscribe: bool,
+    requested_video: Option<Vec<RequestedVideo>>,
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
-    /// What this listener heard, per speaker. Shared with the harness like `video_rx`.
     pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
     corrupt_video_payload: bool,
-    local_publications: Vec<LocalTrack>,
-
-    /// Remote track IDs that have been discovered from signaling updates.
     pub discovered_tracks: HashSet<String>,
-    /// Remote tracks that have been assigned to a slot and are actively streaming.
     pub remote_tracks: HashMap<String, String>,
-    /// Publishers the SFU told this viewer it had stopped forwarding, at any point in the run.
-    ///
-    /// The distinction the whole pause signal exists for: a stream can stop because the SFU shed
-    /// it or because the connection died, and from the media alone those are identical. Recording
-    /// the signal lets a plan assert the viewer was *told*, not merely that packets stopped.
-    ///
-    /// Shared with the harness the same way `video_rx` is, so a plan can read it after the run.
-    pub paused_publishers: Arc<Mutex<std::collections::BTreeSet<String>>>,
-    pub(crate) requested_tracks: HashSet<String>,
-    pub published_topics: Arc<Mutex<HashMap<String, DataPublisher>>>,
-    pub subscribed_topics: SubscribedTopics,
-    pub ordered_publishers: Arc<Mutex<HashMap<String, OrderedTopicPublisher>>>,
-    pub ordered_subscribers: Arc<Mutex<HashMap<String, OrderedTopicSubscriber>>>,
-    /// Data channel payloads received by topic.
-    #[allow(dead_code)]
+    pub paused_publishers: Arc<Mutex<BTreeSet<String>>>,
     pub received_data: Vec<(String, Vec<u8>)>,
+    pub media_kinds: HashMap<String, (bool, bool)>,
+    events: tokio::sync::broadcast::Receiver<AgentEvent>,
+}
+
+impl ClientContext {
+    pub fn participant_id(&self) -> Option<String> {
+        self.agent.snapshot().participant_id
+    }
+
+    pub fn statistics(&self) -> pulsebeam_agent_native::TransportStatistics {
+        self.agent.statistics().borrow().clone()
+    }
+
+    pub fn connected(&self) -> bool {
+        self.agent.snapshot().connection == ConnectionState::Connected
+    }
+
+    pub async fn refresh(&mut self) -> anyhow::Result<()> {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                AgentEvent::Core(pulsebeam_agent_native::agent_core::Notification::Topic(
+                    TopicNotification::Message(message),
+                )) => match message {
+                    TopicMessage::Latest { topic, payload, .. }
+                    | TopicMessage::Ordered { topic, payload, .. } => {
+                        self.received_data.push((topic, payload));
+                    }
+                },
+                AgentEvent::RuntimeFailed(message) => anyhow::bail!(message),
+                _ => {}
+            }
+        }
+
+        let snapshot = self.agent.snapshot();
+        self.discovered_tracks.clear();
+        self.media_kinds.clear();
+        for publication in snapshot.publications.values() {
+            if snapshot.participant_id.as_deref() == Some(&publication.participant_id) {
+                continue;
+            }
+            self.discovered_tracks
+                .insert(publication.participant_id.clone());
+            let kinds = self
+                .media_kinds
+                .entry(publication.participant_id.clone())
+                .or_insert((false, false));
+            match publication.kind {
+                MediaKind::Video => kinds.0 = true,
+                MediaKind::Audio => kinds.1 = true,
+            }
+        }
+        self.remote_tracks = snapshot
+            .video
+            .values()
+            .filter_map(|binding| {
+                snapshot
+                    .publications
+                    .get(&binding.track_id)
+                    .map(|publication| {
+                        if binding.paused {
+                            self.paused_publishers
+                                .lock()
+                                .unwrap()
+                                .insert(publication.participant_id.clone());
+                        }
+                        (publication.participant_id.clone(), binding.track_id.clone())
+                    })
+            })
+            .collect();
+        for (rank, binding) in snapshot.audio.iter().enumerate() {
+            if let Some(publication) = snapshot.publications.get(&binding.track_id) {
+                self.audio_rx.lock().unwrap().record_rank(
+                    &publication.participant_id,
+                    u32::try_from(rank).unwrap_or(u32::MAX),
+                );
+            }
+        }
+        self.sync_video_desired(&snapshot).await.map(|_| ())
+    }
+
+    pub async fn set_video_subscriptions(
+        &mut self,
+        subscriptions: Vec<RequestedVideo>,
+    ) -> anyhow::Result<bool> {
+        self.requested_video = Some(subscriptions);
+        let snapshot = self.agent.snapshot();
+        self.sync_video_desired(&snapshot).await
+    }
+
+    async fn sync_video_desired(
+        &mut self,
+        snapshot: &pulsebeam_agent_native::agent_core::Snapshot,
+    ) -> anyhow::Result<bool> {
+        let mut requests = self.requested_video.clone().unwrap_or_default();
+        if self.auto_subscribe {
+            let requested = requests
+                .iter()
+                .map(|request| request.participant_id.as_str())
+                .collect::<HashSet<_>>();
+            let mut automatic = self
+                .discovered_tracks
+                .iter()
+                .filter(|participant| !requested.contains(participant.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            automatic.sort();
+            requests.extend(automatic.into_iter().map(|participant_id| RequestedVideo {
+                participant_id,
+                height: 720,
+                min_height: 0,
+                priority: 0,
+            }));
+        }
+        let mut resolved = Vec::with_capacity(requests.len());
+        let mut all_resolved = true;
+        for request in requests {
+            if resolved.len() == self.video_capacity {
+                break;
+            }
+            let track_id = snapshot
+                .publications
+                .values()
+                .find(|publication| {
+                    publication.participant_id == request.participant_id
+                        && publication.kind == MediaKind::Video
+                })
+                .map(|publication| publication.id.clone());
+            let Some(track_id) = track_id else {
+                all_resolved = false;
+                continue;
+            };
+            resolved.push(VideoSubscription {
+                slot: u8::try_from(resolved.len())?,
+                track_id,
+                height: request.height,
+                min_height: request.min_height,
+                min_fps: 0,
+                priority: request.priority,
+            });
+        }
+        if self.desired.video != resolved {
+            let mut desired = self.desired.clone();
+            desired.video = resolved;
+            self.replace_desired(desired).await?;
+        }
+        Ok(all_resolved)
+    }
+
+    pub async fn set_audio_intent(
+        &mut self,
+        participants: &[String],
+        automatic: bool,
+    ) -> anyhow::Result<bool> {
+        let snapshot = self.agent.snapshot();
+        let mut pinned = Vec::new();
+        for participant in participants {
+            let Some(publication) = snapshot.publications.values().find(|publication| {
+                publication.participant_id == *participant && publication.kind == MediaKind::Audio
+            }) else {
+                return Ok(false);
+            };
+            pinned.push(publication.id.clone());
+        }
+        let audio = AudioSubscription { pinned, automatic };
+        if self.desired.audio != audio {
+            let mut desired = self.desired.clone();
+            desired.audio = audio;
+            self.replace_desired(desired).await?;
+        }
+        Ok(true)
+    }
+
+    pub async fn register_publisher(
+        &mut self,
+        topic: String,
+        mode: TopicMode,
+    ) -> anyhow::Result<bool> {
+        let registration = TopicPublisher { topic, mode };
+        if !self.desired.topics.publishers.contains(&registration) {
+            let mut desired = self.desired.clone();
+            desired.topics.publishers.push(registration.clone());
+            self.replace_desired(desired).await?;
+        }
+        Ok(self
+            .agent
+            .snapshot()
+            .topics
+            .publishers
+            .iter()
+            .any(|status| status.registration == registration && status.channel.is_some()))
+    }
+
+    pub async fn register_subscriber(
+        &mut self,
+        topic: String,
+        mode: TopicMode,
+        publisher_id: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let registration = TopicSubscriber {
+            topic,
+            mode,
+            publisher_id,
+        };
+        if !self.desired.topics.subscribers.contains(&registration) {
+            let mut desired = self.desired.clone();
+            desired.topics.subscribers.push(registration.clone());
+            self.replace_desired(desired).await?;
+        }
+        Ok(self
+            .agent
+            .snapshot()
+            .topics
+            .subscribers
+            .iter()
+            .any(|status| status.registration == registration && status.channel.is_some()))
+    }
+
+    pub async fn send_topic(
+        &self,
+        topic: &str,
+        mode: TopicMode,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<bool> {
+        let publisher = TopicPublisher {
+            topic: topic.to_owned(),
+            mode,
+        };
+        let ready = self
+            .agent
+            .snapshot()
+            .topics
+            .publishers
+            .iter()
+            .any(|status| status.registration == publisher && status.channel.is_some());
+        if !ready {
+            return Ok(false);
+        }
+        self.agent
+            .send_topic(TopicSend { publisher, payload })
+            .await?;
+        Ok(true)
+    }
+
+    async fn replace_desired(&mut self, mut desired: DesiredState) -> anyhow::Result<()> {
+        desired.revision = self.desired.revision.saturating_add(1);
+        self.agent.replace_desired(desired.clone()).await?;
+        self.desired = desired;
+        Ok(())
+    }
 }
 
 pub struct SimClient {
@@ -1242,240 +1492,133 @@ pub struct SimClient {
     join_set: JoinSet<()>,
 }
 
-#[allow(dead_code)]
 impl SimClient {
-    pub async fn drive(&mut self, token: CancellationToken) -> anyhow::Result<()> {
-        self.drive_until_cancelled(token, |_| false).await
+    pub async fn tick(&mut self) -> anyhow::Result<()> {
+        self.ctx.refresh().await
     }
 
-    pub async fn drive_for(&mut self, timeout: Duration) -> anyhow::Result<()> {
-        let token = CancellationToken::new();
-        let mut driver = Box::pin(self.drive_until_cancelled(token.clone(), |_| false));
-
-        tokio::select! {
-            _ = tokio::time::sleep(timeout) => {
-                token.cancel();
-            }
-            res = &mut driver => {
-                return res;
-            }
-        }
-
-        driver.await
+    pub async fn close(mut self) -> anyhow::Result<()> {
+        self.join_set.abort_all();
+        self.ctx.agent.close().await?;
+        Ok(())
     }
 
-    pub async fn drive_until<F>(&mut self, timeout: Duration, predicate: F) -> anyhow::Result<()>
-    where
-        F: FnMut(&mut ClientContext) -> bool,
-    {
-        let token = CancellationToken::new();
-        let _guard = token.clone().drop_guard();
-        tokio::select! {
-            _ = tokio::time::sleep(timeout) => {
-                let stats = self.ctx.agent.stats().current();
-                anyhow::bail!(
-                    "Client {} timed out ({:?}). Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
-                    self.ctx.ip,
-                    timeout,
-                    stats,
-                    self.ctx.discovered_tracks,
-                    self.ctx.remote_tracks
+    pub async fn abort(mut self) -> anyhow::Result<()> {
+        self.join_set.abort_all();
+        self.ctx.agent.abort().await?;
+        Ok(())
+    }
+}
+
+fn spawn_video_receiver(
+    join_set: &mut JoinSet<()>,
+    mut remote: pulsebeam_agent_native::RemoteMedia,
+    ctx: &ClientContext,
+    agent: Agent,
+) {
+    let log = ctx.video_rx.clone();
+    let references = ctx.quality_references.clone();
+    let h264_publishers = ctx.h264_publishers.clone();
+    let corrupt = ctx.corrupt_video_payload;
+    join_set.spawn(async move {
+        let mut streams = HashMap::<String, VideoStreamReceiver>::new();
+        while let Ok(packet) = remote.recv_packet().await {
+            let Some(binding) = remote.video_binding() else {
+                continue;
+            };
+            let snapshot = agent.snapshot();
+            let Some(publisher) = snapshot
+                .publications
+                .get(&binding.track_id)
+                .map(|publication| publication.participant_id.clone())
+            else {
+                continue;
+            };
+            let stream = streams
+                .entry(publisher.clone())
+                .or_insert_with(|| VideoStreamReceiver {
+                    frames: if h264_publishers.lock().unwrap().contains(&publisher) {
+                        pulsebeam_agent_native::FrameReceiver::with_h264()
+                    } else {
+                        pulsebeam_agent_native::FrameReceiver::new()
+                    },
+                    decoder: H264ReferenceDecoder::new(&publisher, "video"),
+                    decoder_ready: false,
+                    last_keyframe_request: None,
+                });
+            let ssrc = packet.ssrc;
+            let frames = stream.frames.push(packet);
+            let now = tokio::time::Instant::now();
+            let should_request_keyframe = stream.frames.needs_keyframe()
+                && stream
+                    .last_keyframe_request
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(500));
+            if should_request_keyframe
+                && let Some(ssrc) = ssrc
+                && remote.request_keyframe(ssrc).await.is_ok()
+            {
+                stream.last_keyframe_request = Some(now);
+            } else if !stream.frames.needs_keyframe() {
+                stream.last_keyframe_request = None;
+            }
+            for frame in frames {
+                record_video_frame(
+                    &log,
+                    &references,
+                    &mut stream.decoder,
+                    &mut stream.decoder_ready,
+                    &publisher,
+                    frame,
+                    corrupt,
                 );
             }
-            result = self.drive_until_cancelled(token, predicate) => result
+        }
+    });
+}
+
+struct VideoStreamReceiver {
+    frames: pulsebeam_agent_native::FrameReceiver,
+    decoder: H264ReferenceDecoder,
+    decoder_ready: bool,
+    last_keyframe_request: Option<tokio::time::Instant>,
+}
+
+fn create_video_source(encoding: Option<&str>) -> VideoSource {
+    let data = match encoding {
+        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
+        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
+        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+    };
+    VideoSource::new(data, 30)
+}
+
+fn create_quality_video_source(
+    source: pulsebeam_testdata::QualityVideoSource,
+    layer: pulsebeam_testdata::QualityVideoLayer,
+) -> VideoSource {
+    let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
+    let mut data = Vec::new();
+    for index in 0..corpus.len() {
+        if let Some(frame) = corpus.frame(index) {
+            data.extend_from_slice(frame.encoded);
         }
     }
+    VideoSource::new(&data, pulsebeam_testdata::QUALITY_VIDEO_FPS)
+}
 
-    pub async fn drive_with<F>(&mut self, predicate: F) -> anyhow::Result<()>
-    where
-        F: FnMut(&mut ClientContext) -> bool,
-    {
-        self.drive_until_cancelled_with_interval(
-            CancellationToken::new(),
-            Duration::from_millis(200),
-            predicate,
-        )
-        .await
-    }
-
-    pub async fn drive_with_interval<F>(
-        &mut self,
-        check_interval: Duration,
-        predicate: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnMut(&mut ClientContext) -> bool,
-    {
-        self.drive_until_cancelled_with_interval(
-            CancellationToken::new(),
-            check_interval,
-            predicate,
-        )
-        .await
-    }
-
-    pub async fn drive_until_cancelled<F>(
-        &mut self,
-        token: CancellationToken,
-        predicate: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnMut(&mut ClientContext) -> bool,
-    {
-        self.drive_until_cancelled_with_interval(token, Duration::from_millis(10), predicate)
-            .await
-    }
-
-    async fn drive_until_cancelled_with_interval<F>(
-        &mut self,
-        token: CancellationToken,
-        check_every: Duration,
-        mut predicate: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnMut(&mut ClientContext) -> bool,
-    {
-        let span = tracing::info_span!("drive_until_cancelled", ip = %self.ctx.ip, participant_id = %self.ctx.agent.participant_id());
-        async move {
-            let mut check_interval = tokio::time::interval(check_every);
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => {
-                        return Ok(());
-                    }
-                    result = self.ctx.participants.next() => {
-                        // The change feed errors when this agent is torn down
-                        // (e.g. an abrupt exit racing teardown); the drive is done.
-                        let Ok(change) = result else {
-                            return Ok(());
-                        };
-                        match change {
-                            ParticipantChange::Joined(participant)
-                            | ParticipantChange::Updated(participant) => {
-                                if participant.video_paused()
-                                    && let Ok(mut seen) = self.ctx.paused_publishers.lock()
-                                {
-                                    seen.insert(participant.id().to_string());
-                                }
-                                self.ctx
-                                    .discovered_tracks
-                                    .insert(participant.id().clone());
-                            }
-                            ParticipantChange::Left(participant_id) => {
-                                self.ctx.discovered_tracks.remove(&participant_id);
-                            }
-                        }
-                        if predicate(&mut self.ctx) {
-                            return Ok(());
-                        }
-                    }
-                    Some(mut track) = self.ctx.incoming_tracks.recv() => {
-                        let publication_id = track.publisher_id().to_owned();
-                        self.ctx
-                            .remote_tracks
-                            .insert(publication_id.clone(), publication_id);
-                        let publisher_id = track.publisher_id().to_owned();
-                        let log = self.ctx.video_rx.clone();
-                        let quality_references = self.ctx.quality_references.clone();
-                        let h264_publishers = self.ctx.h264_publishers.clone();
-                        let corrupt_payload = self.ctx.corrupt_video_payload;
-                        self.join_set.spawn(async move {
-                            // The agent forwards RTP; reassemble frames here (the
-                            // "higher layer") before logging QoE.
-                            let mut receiver = None;
-                            let mut decoder = H264ReferenceDecoder::new(&publisher_id, "video");
-                            let mut decoder_ready = false;
-                            let mut last_keyframe_request = None;
-                            while let Ok(rtp) = track.recv().await {
-                                let receiver = receiver.get_or_insert_with(|| {
-                                    let h264_packetized = h264_publishers
-                                        .lock()
-                                        .unwrap()
-                                        .contains(&publisher_id);
-                                    if h264_packetized {
-                                        pulsebeam_agent::FrameReceiver::with_h264()
-                                    } else {
-                                        pulsebeam_agent::FrameReceiver::new()
-                                    }
-                                });
-                                let frames = receiver.push(rtp);
-                                if !receiver.needs_keyframe() {
-                                    last_keyframe_request = None;
-                                } else if last_keyframe_request.is_none_or(|last| {
-                                    tokio::time::Instant::now().duration_since(last)
-                                        >= Duration::from_millis(500)
-                                }) && track.request_keyframe()
-                                {
-                                    last_keyframe_request = Some(tokio::time::Instant::now());
-                                }
-                                for frame in frames {
-                                    record_video_frame(
-                                        &log,
-                                        &quality_references,
-                                        &mut decoder,
-                                        &mut decoder_ready,
-                                        &publisher_id,
-                                        frame,
-                                        corrupt_payload,
-                                    );
-                                }
-                            }
-                            if let Some(mut receiver) = receiver {
-                                for frame in receiver.flush() {
-                                    record_video_frame(
-                                        &log,
-                                        &quality_references,
-                                        &mut decoder,
-                                        &mut decoder_ready,
-                                        &publisher_id,
-                                        frame,
-                                        corrupt_payload,
-                                    );
-                                }
-                            }
-                        });
-
-                        // Re-check the predicate after processing an event, since a new
-                        // event may indicate the desired state has been reached.
-                        if predicate(&mut self.ctx) {
-                            return Ok(());
-                        }
-                    }
-                    _ = check_interval.tick() => {
-                        if predicate(&mut self.ctx) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-        .instrument(span)
-        .await
-    }
+fn create_vbr_source(encoding: Option<&str>, profile: VbrProfile) -> VbrSource {
+    debug_assert_eq!(encoding, Some("f"));
+    VbrSource::scheduled(
+        pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
+        pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
+        profile,
+    )
 }
 
 pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
     let client = Client::builder(TokioExecutor::new()).build(connector::connector());
     let client = HyperClientWrapper(client);
     Box::new(client)
-}
-
-pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
-    let data = match rid {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
-        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
-    };
-    H264Looper::new(data, 30)
-}
-
-pub fn create_vbr_looper_for_rid(rid: Option<&str>, profile: VbrProfile) -> VbrLooper {
-    debug_assert_eq!(rid, Some("f"));
-    VbrLooper::new_scheduled(
-        pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
-        pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
-        profile,
-    )
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

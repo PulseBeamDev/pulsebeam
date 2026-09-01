@@ -30,6 +30,7 @@ use crate::{FrameReceiver, FrameSender, MediaFrame, RtpPacket};
 const COMMAND_CAPACITY: usize = 256;
 const EVENT_CAPACITY: usize = 256;
 const MEDIA_CAPACITY: usize = 256;
+const MAX_MEDIA_PACKETS_PER_TURN: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -37,6 +38,7 @@ pub struct Config {
     pub local_ips: Vec<IpAddr>,
     pub tcp_server: Option<SocketAddr>,
     pub video_encodings: BTreeMap<String, Vec<SimulcastLayer>>,
+    pub video_temporal_layers: BTreeMap<String, u8>,
     pub dependency_descriptor: bool,
 }
 
@@ -47,6 +49,7 @@ impl Config {
             local_ips: Vec::new(),
             tcp_server: None,
             video_encodings: BTreeMap::new(),
+            video_temporal_layers: BTreeMap::new(),
             dependency_descriptor: true,
         }
     }
@@ -83,6 +86,7 @@ pub struct TransportStatistics {
     pub keyframe_requests: u64,
     pub received_packets: u64,
     pub sent_packets: u64,
+    pub unroutable_media_dropped: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +139,7 @@ enum Command {
     Close {
         response: oneshot::Sender<Result<(), Error>>,
     },
+    Abort,
 }
 
 #[derive(Clone)]
@@ -265,6 +270,13 @@ impl Agent {
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
     }
+
+    pub async fn abort(&self) -> Result<(), Error> {
+        self.commands
+            .send(Command::Abort)
+            .await
+            .map_err(|_| Error::Closed)
+    }
 }
 
 #[derive(Clone)]
@@ -303,10 +315,12 @@ impl LocalMedia {
 
 pub struct RemoteMedia {
     slot: MediaSlot,
+    mid: watch::Receiver<Option<String>>,
     packets: flume::Receiver<RtpPacket>,
     frames: FrameReceiver,
     ready: VecDeque<MediaFrame>,
     commands: mpsc::Sender<Command>,
+    snapshot: watch::Receiver<Snapshot>,
 }
 
 impl RemoteMedia {
@@ -314,8 +328,33 @@ impl RemoteMedia {
         &self.slot
     }
 
+    pub fn video_binding(&self) -> Option<agent_core::VideoBinding> {
+        let mid = self.mid.borrow().clone()?;
+        self.snapshot.borrow().video.get(&mid).cloned()
+    }
+
+    pub fn audio_binding(&self) -> Option<agent_core::AudioBinding> {
+        let mid = self.mid.borrow().clone()?;
+        self.snapshot
+            .borrow()
+            .audio
+            .iter()
+            .find(|binding| binding.mid == mid)
+            .cloned()
+    }
+
     pub async fn recv_packet(&mut self) -> Result<RtpPacket, Error> {
         self.packets.recv_async().await.map_err(|_| Error::Closed)
+    }
+
+    pub async fn request_keyframe(&self, ssrc: Ssrc) -> Result<(), Error> {
+        self.commands
+            .send(Command::RequestKeyframe {
+                slot: self.slot.clone(),
+                ssrc,
+            })
+            .await
+            .map_err(|_| Error::Closed)
     }
 
     pub async fn recv_frame(&mut self) -> Result<MediaFrame, Error> {
@@ -346,12 +385,24 @@ struct HttpCompletion {
     result: Result<agent_core::HttpResponse, String>,
 }
 
+struct OutgoingMedia {
+    generation: Generation,
+    packet: RtpPacket,
+    completion: Option<oneshot::Sender<Result<(), Error>>>,
+}
+
+struct Observer {
+    packets: flume::Sender<RtpPacket>,
+    mid: watch::Sender<Option<String>>,
+}
+
 struct Peer {
     rtc: Rtc,
     pending_answer: Option<SdpPendingOffer>,
     channels: BTreeMap<ChannelId, RtcChannelId>,
     reverse_channels: HashMap<RtcChannelId, ChannelId>,
     reverse_mids: HashMap<Mid, MediaSlot>,
+    mids: BTreeMap<MediaSlot, Mid>,
     packetizers: BTreeMap<(MediaSlot, Option<String>), FrameSender>,
     timeout: Option<Instant>,
 }
@@ -370,13 +421,17 @@ struct Actor {
     statistics: watch::Sender<TransportStatistics>,
     events: broadcast::Sender<AgentEvent>,
     peers: BTreeMap<Generation, Peer>,
+    rtc_started: bool,
+    reconnect_tcp_on_answer: Option<Generation>,
     http_tasks: BTreeMap<OperationId, JoinHandle<()>>,
     http_tx: mpsc::UnboundedSender<HttpCompletion>,
     http_rx: mpsc::UnboundedReceiver<HttpCompletion>,
     timer_tasks: BTreeMap<TimerId, JoinHandle<()>>,
     timer_tx: mpsc::UnboundedSender<TimerId>,
     timer_rx: mpsc::UnboundedReceiver<TimerId>,
-    observers: BTreeMap<MediaSlot, Vec<flume::Sender<RtpPacket>>>,
+    outgoing_media_tx: mpsc::UnboundedSender<OutgoingMedia>,
+    outgoing_media_rx: mpsc::UnboundedReceiver<OutgoingMedia>,
+    observers: BTreeMap<MediaSlot, Vec<Observer>>,
     active_publications: BTreeSet<MediaSlot>,
     close_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
 }
@@ -397,6 +452,7 @@ impl Actor {
     ) -> Self {
         let (http_tx, http_rx) = mpsc::unbounded_channel();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
+        let (outgoing_media_tx, outgoing_media_rx) = mpsc::unbounded_channel();
         Self {
             config,
             http: host.http,
@@ -411,12 +467,16 @@ impl Actor {
             statistics,
             events,
             peers: BTreeMap::new(),
+            rtc_started: false,
+            reconnect_tcp_on_answer: None,
             http_tasks: BTreeMap::new(),
             http_tx,
             http_rx,
             timer_tasks: BTreeMap::new(),
             timer_tx,
             timer_rx,
+            outgoing_media_tx,
+            outgoing_media_rx,
             observers: BTreeMap::new(),
             active_publications: BTreeSet::new(),
             close_waiters: Vec::new(),
@@ -425,7 +485,7 @@ impl Actor {
 
     async fn run(mut self) {
         loop {
-            if let Err(error) = self.drain_effects() {
+            if let Err(error) = self.drain_effects().await {
                 self.fail(error);
             }
             self.publish_state();
@@ -442,11 +502,48 @@ impl Actor {
                         .unwrap_or_else(Instant::now)
                 });
             tokio::select! {
+                received = self.udp.recv_from(&mut self.datagram_buffer) => {
+                    match received {
+                        Ok((len, source)) => {
+                            if let Some(datagram) = self.datagram_buffer.get(..len) {
+                                Self::receive_packet(
+                                    &mut self.peers,
+                                    Protocol::Udp,
+                                    source,
+                                    self.local_addr,
+                                    datagram,
+                                );
+                            } else {
+                                debug_assert!(false, "UDP receive exceeded its destination buffer");
+                                tracing::warn!(len, "discarding invalid UDP receive length");
+                            }
+                        }
+                        Err(error) => self.fail(Error::Io(error)),
+                    }
+                }
+                received = self.tcp.wait_recv() => {
+                    self.receive_tcp(received);
+                }
+                outgoing = self.outgoing_media_rx.recv() => {
+                    if let Some(outgoing) = outgoing {
+                        self.send_packet(outgoing);
+                        for _ in 1..MAX_MEDIA_PACKETS_PER_TURN {
+                            let Ok(outgoing) = self.outgoing_media_rx.try_recv() else {
+                                break;
+                            };
+                            self.send_packet(outgoing);
+                        }
+                    }
+                }
                 command = self.commands.recv() => {
                     let Some(command) = command else {
                         self.shutdown_hosts();
                         return;
                     };
+                    if matches!(command, Command::Abort) {
+                        self.shutdown_hosts();
+                        return;
+                    }
                     self.handle_command(command);
                 }
                 completion = self.http_rx.recv() => {
@@ -470,28 +567,6 @@ impl Actor {
                         self.timer_tasks.remove(&timer);
                         self.accept(HostEvent::Timer(TimerEvent::Fired { timer }));
                     }
-                }
-                received = self.udp.recv_from(&mut self.datagram_buffer) => {
-                    match received {
-                        Ok((len, source)) => {
-                            if let Some(datagram) = self.datagram_buffer.get(..len) {
-                                Self::receive_packet(
-                                    &mut self.peers,
-                                    Protocol::Udp,
-                                    source,
-                                    self.local_addr,
-                                    datagram,
-                                );
-                            } else {
-                                debug_assert!(false, "UDP receive exceeded its destination buffer");
-                                tracing::warn!(len, "discarding invalid UDP receive length");
-                            }
-                        }
-                        Err(error) => self.fail(Error::Io(error)),
-                    }
-                }
-                received = self.tcp.wait_recv() => {
-                    self.receive_tcp(received);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let now = Instant::now();
@@ -559,13 +634,26 @@ impl Actor {
                 frame,
                 response,
             } => {
-                let result = self.send_frame(&slot, encoding.as_deref(), &frame);
-                let _ = response.send(result);
+                self.send_frame(&slot, encoding.as_deref(), &frame, response);
             }
             Command::Observe { slot, response } => {
                 let result = if self.slot_exists(&slot) {
                     let (sender, packets) = flume::bounded(MEDIA_CAPACITY);
-                    self.observers.entry(slot.clone()).or_default().push(sender);
+                    let current_mid = self
+                        .core
+                        .snapshot()
+                        .generation
+                        .and_then(|generation| self.peers.get(&generation))
+                        .and_then(|peer| peer.mids.get(&slot))
+                        .map(ToString::to_string);
+                    let (mid, mid_rx) = watch::channel(current_mid);
+                    self.observers
+                        .entry(slot.clone())
+                        .or_default()
+                        .push(Observer {
+                            packets: sender,
+                            mid,
+                        });
                     let frames = if matches!(slot, MediaSlot::RemoteVideo(_)) {
                         FrameReceiver::with_h264()
                     } else {
@@ -573,10 +661,12 @@ impl Actor {
                     };
                     Ok(RemoteMedia {
                         slot,
+                        mid: mid_rx,
                         packets,
                         frames,
                         ready: VecDeque::new(),
                         commands: self.command_tx.clone(),
+                        snapshot: self.snapshot.subscribe(),
                     })
                 } else {
                     Err(Error::UnknownSlot(slot))
@@ -608,6 +698,7 @@ impl Actor {
                     }
                 }
             }
+            Command::Abort => self.shutdown_hosts(),
         }
     }
 
@@ -633,10 +724,10 @@ impl Actor {
         }
     }
 
-    fn drain_effects(&mut self) -> Result<(), Error> {
+    async fn drain_effects(&mut self) -> Result<(), Error> {
         while let Some(effect) = self.core.next_effect() {
             match effect {
-                Effect::Rtc(effect) => self.execute_rtc(effect)?,
+                Effect::Rtc(effect) => self.execute_rtc(effect).await?,
                 Effect::Http(effect) => self.execute_http(effect)?,
                 Effect::Timer(effect) => self.execute_timer(effect),
                 Effect::DataChannel(effect) => self.execute_data_channel(effect),
@@ -645,14 +736,25 @@ impl Actor {
         Ok(())
     }
 
-    fn execute_rtc(&mut self, effect: RtcEffect) -> Result<(), Error> {
+    async fn execute_rtc(&mut self, effect: RtcEffect) -> Result<(), Error> {
         match effect {
             RtcEffect::CreateOffer {
                 generation,
                 topology,
                 data_channels,
             } => {
+                if self.rtc_started && self.config.tcp_server.is_some() {
+                    self.reconnect_tcp_on_answer = Some(generation);
+                }
+                self.rtc_started = true;
                 let (peer, offer, resources) = self.build_peer(&topology, &data_channels)?;
+                for (slot, mid) in &peer.mids {
+                    if let Some(observers) = self.observers.get_mut(slot) {
+                        for observer in observers {
+                            observer.mid.send_replace(Some(mid.to_string()));
+                        }
+                    }
+                }
                 debug_assert!(self.peers.insert(generation, peer).is_none());
                 self.accept(HostEvent::Rtc(RtcEvent::OfferCreated {
                     generation,
@@ -677,6 +779,10 @@ impl Actor {
                     .sdp_api()
                     .accept_answer(pending, answer)
                     .map_err(|error| Error::Rtc(error.to_string()))?;
+                if self.reconnect_tcp_on_answer == Some(generation) {
+                    self.reconnect_tcp_on_answer = None;
+                    self.reconnect_transport().await?;
+                }
                 self.accept(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }));
             }
             RtcEffect::Close { generation } => {
@@ -803,7 +909,16 @@ impl Actor {
                 for encoding in encodings {
                     let rid = encoding.as_deref().map(Rid::from);
                     let packetizer = if kind == MediaKind::Video {
-                        FrameSender::h264(mid, rid, encoding_count, 1)
+                        let temporal_layers = match &slot {
+                            MediaSlot::LocalVideo(name) => self
+                                .config
+                                .video_temporal_layers
+                                .get(name)
+                                .copied()
+                                .unwrap_or(1),
+                            _ => 1,
+                        };
+                        FrameSender::h264(mid, rid, encoding_count, temporal_layers)
                     } else {
                         FrameSender::without_dependency_descriptor(mid, rid, encoding_count)
                     };
@@ -833,6 +948,7 @@ impl Actor {
             channels,
             reverse_channels,
             reverse_mids,
+            mids,
             packetizers,
             timeout: None,
         };
@@ -1057,6 +1173,12 @@ impl Actor {
                     .get(&generation)
                     .and_then(|peer| peer.reverse_mids.get(&request.mid))
                 {
+                    tracing::debug!(
+                        generation = generation.get(),
+                        slot = %slot_name(slot),
+                        encoding = ?request.rid,
+                        "received keyframe request"
+                    );
                     let _ = self.events.send(AgentEvent::KeyframeRequested {
                         slot: slot_name(slot),
                         encoding: request.rid.map(|rid| rid.to_string()),
@@ -1108,14 +1230,23 @@ impl Actor {
             ext_vals: rtp.header.ext_vals,
             arrival: rtp.timestamp.into(),
         };
+        let mut delivered = false;
         if let Some(observers) = self.observers.get_mut(&slot) {
-            observers.retain(|observer| match observer.try_send(packet.clone()) {
-                Ok(()) | Err(flume::TrySendError::Full(_)) => true,
+            observers.retain(|observer| match observer.packets.try_send(packet.clone()) {
+                Ok(()) => {
+                    delivered = true;
+                    true
+                }
+                Err(flume::TrySendError::Full(_)) => true,
                 Err(flume::TrySendError::Disconnected(_)) => false,
             });
         }
         self.statistics.send_if_modified(|statistics| {
             statistics.received_packets = statistics.received_packets.saturating_add(1);
+            if !delivered {
+                statistics.unroutable_media_dropped =
+                    statistics.unroutable_media_dropped.saturating_add(1);
+            }
             true
         });
     }
@@ -1161,7 +1292,54 @@ impl Actor {
         slot: &MediaSlot,
         encoding: Option<&str>,
         frame: &MediaFrame,
-    ) -> Result<(), Error> {
+        response: oneshot::Sender<Result<(), Error>>,
+    ) {
+        let result = self.packetize_frame(slot, encoding, frame);
+        let (generation, mut packets) = match result {
+            Ok(packets) => packets,
+            Err(error) => {
+                let _ = response.send(Err(error));
+                return;
+            }
+        };
+        let Some(last) = packets.pop() else {
+            let _ = response.send(Ok(()));
+            return;
+        };
+        for packet in packets {
+            if self
+                .outgoing_media_tx
+                .send(OutgoingMedia {
+                    generation,
+                    packet,
+                    completion: None,
+                })
+                .is_err()
+            {
+                debug_assert!(false, "actor must retain its outgoing media receiver");
+                let _ = response.send(Err(Error::Closed));
+                return;
+            }
+        }
+        if self
+            .outgoing_media_tx
+            .send(OutgoingMedia {
+                generation,
+                packet: last,
+                completion: Some(response),
+            })
+            .is_err()
+        {
+            debug_assert!(false, "actor must retain its outgoing media receiver");
+        }
+    }
+
+    fn packetize_frame(
+        &mut self,
+        slot: &MediaSlot,
+        encoding: Option<&str>,
+        frame: &MediaFrame,
+    ) -> Result<(Generation, Vec<RtpPacket>), Error> {
         if !self.active_publications.contains(slot) {
             return Err(Error::InactiveSlot(slot.clone()));
         }
@@ -1183,37 +1361,61 @@ impl Actor {
                 slot: slot.clone(),
                 encoding: encoding.clone(),
             })?;
-        let packets = packetizer.packetize(frame);
-        for packet in packets {
-            let Some(payload_type) = peer
-                .rtc
-                .media(packet.mid)
-                .and_then(|media| media.remote_pts().first().copied())
-            else {
-                continue;
-            };
-            let mut direct = peer.rtc.direct_api();
-            let Some(stream) = direct.stream_tx_by_mid(packet.mid, packet.rid) else {
-                continue;
-            };
-            let timestamp = u32::try_from(packet.ts.numer() & u64::from(u32::MAX)).unwrap_or(0);
-            stream.write_rtp(
-                RtpWrite::new(
-                    payload_type,
-                    packet.seq,
-                    timestamp,
-                    packet.arrival.into(),
-                    packet.payload,
-                )
-                .marker(packet.marker)
-                .nackable(true)
-                .ext_vals(packet.ext_vals),
-            );
-            self.statistics.send_if_modified(|statistics| {
-                statistics.sent_packets = statistics.sent_packets.saturating_add(1);
-                true
-            });
+        Ok((generation, packetizer.packetize(frame)))
+    }
+
+    fn send_packet(&mut self, mut outgoing: OutgoingMedia) {
+        self.write_packet(&outgoing);
+        if let Some(completion) = outgoing.completion.take() {
+            let _ = completion.send(Ok(()));
         }
+    }
+
+    fn write_packet(&mut self, outgoing: &OutgoingMedia) {
+        let Some(peer) = self.peers.get_mut(&outgoing.generation) else {
+            return;
+        };
+        let packet = &outgoing.packet;
+        let Some(payload_type) = peer
+            .rtc
+            .media(packet.mid)
+            .and_then(|media| media.remote_pts().first().copied())
+        else {
+            return;
+        };
+        let mut direct = peer.rtc.direct_api();
+        let Some(stream) = direct.stream_tx_by_mid(packet.mid, packet.rid) else {
+            return;
+        };
+        let timestamp = u32::try_from(packet.ts.numer() & u64::from(u32::MAX)).unwrap_or(0);
+        stream.write_rtp(
+            RtpWrite::new(
+                payload_type,
+                packet.seq,
+                timestamp,
+                packet.arrival.into(),
+                packet.payload.clone(),
+            )
+            .marker(packet.marker)
+            .nackable(true)
+            .ext_vals(packet.ext_vals.clone()),
+        );
+        self.statistics.send_if_modified(|statistics| {
+            statistics.sent_packets = statistics.sent_packets.saturating_add(1);
+            true
+        });
+    }
+
+    async fn reconnect_transport(&mut self) -> Result<(), Error> {
+        let Some(server) = self.config.tcp_server else {
+            return Ok(());
+        };
+        self.tcp.close();
+        let stream = pulsebeam_core::net::TcpStream::connect(server).await?;
+        stream.set_nodelay(true)?;
+        let local = stream.local_addr().ok();
+        tracing::debug!(?local, %server, "reopened TCP transport");
+        self.tcp = TcpSession::new(stream, local, server);
         Ok(())
     }
 

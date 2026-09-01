@@ -3185,7 +3185,6 @@ dependencies = [
  "pin-project-lite",
  "proptest",
  "pulsebeam",
- "pulsebeam-agent",
  "pulsebeam-agent-core",
  "pulsebeam-agent-native",
  "pulsebeam-core",

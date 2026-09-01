@@ -1,6 +1,7 @@
 pub mod client;
 pub mod decoder;
 pub mod harness;
+pub mod media;
 
 pub use harness::{
     Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Loss,

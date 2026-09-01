@@ -352,7 +352,7 @@ fn combine_errors(errors: [ReferenceError; 3]) -> ReferenceError {
 #[cfg(test)]
 mod tests {
     use super::{H264ReferenceDecoder, OpusReferenceDecoder};
-    use pulsebeam_agent::{FrameReceiver, FrameSender, MediaFrame, MediaTime};
+    use pulsebeam_agent_native::{FrameReceiver, FrameSender, MediaFrame, MediaTime};
     use pulsebeam_testdata::{
         QualityVideoLayer, QualityVideoSource, RAW_H264_FULL_CBR, RAW_H264_HALF_CBR,
         RAW_H264_QUARTER_CBR, quality_corpus_audio, quality_corpus_video,
@@ -404,11 +404,12 @@ mod tests {
 
     #[test]
     fn raw_h264_round_trips_through_agent_pipeline_and_decodes() {
-        let access_units: Vec<_> = pulsebeam_agent::media::H264FrameSlicer::new(RAW_H264_FULL_CBR)
-            .take(180)
-            .collect();
+        let access_units: Vec<_> =
+            pulsebeam_agent_native::media::H264FrameSlicer::new(RAW_H264_FULL_CBR)
+                .take(180)
+                .collect();
         assert!(access_units.len() >= 100);
-        let mut sender = FrameSender::h264(pulsebeam_agent::Mid::from("v0"), None, 1, 1);
+        let mut sender = FrameSender::h264(pulsebeam_agent_native::Mid::from("v0"), None, 1, 1);
         let mut receiver = FrameReceiver::with_h264();
         let mut decoder = H264ReferenceDecoder::new("raw", "video");
         let mut decoded = 0usize;
@@ -454,7 +455,7 @@ mod tests {
             ("half", RAW_H264_HALF_CBR),
             ("quarter", RAW_H264_QUARTER_CBR),
         ] {
-            let frame = pulsebeam_agent::media::H264FrameSlicer::new(data)
+            let frame = pulsebeam_agent_native::media::H264FrameSlicer::new(data)
                 .next()
                 .expect("raw H264 fixture has a first access unit");
             let mut decoder = H264ReferenceDecoder::new(name, "video");

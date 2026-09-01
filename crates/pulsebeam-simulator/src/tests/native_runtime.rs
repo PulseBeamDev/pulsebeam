@@ -164,32 +164,36 @@ async fn run_peer(
         topic: "ordered-events".into(),
         mode: pulsebeam_agent_core::TopicMode::Ordered,
     };
-    let mut desired = pulsebeam_agent_core::DesiredState::default();
-    desired.revision = 1;
-    desired.connected = true;
-    desired.publications = vec![
-        pulsebeam_agent_core::PublicationIntent {
-            slot: "camera".into(),
-            active: true,
+    let mut desired = pulsebeam_agent_core::DesiredState {
+        revision: 1,
+        connected: true,
+        publications: vec![
+            pulsebeam_agent_core::PublicationIntent {
+                slot: "camera".into(),
+                active: true,
+            },
+            pulsebeam_agent_core::PublicationIntent {
+                slot: "microphone".into(),
+                active: true,
+            },
+        ],
+        topics: pulsebeam_agent_core::TopicRegistrations {
+            publishers: vec![latest.clone(), ordered.clone()],
+            subscribers: vec![
+                pulsebeam_agent_core::TopicSubscriber {
+                    topic: latest.topic.clone(),
+                    mode: latest.mode,
+                    publisher_id: None,
+                },
+                pulsebeam_agent_core::TopicSubscriber {
+                    topic: ordered.topic.clone(),
+                    mode: ordered.mode,
+                    publisher_id: None,
+                },
+            ],
         },
-        pulsebeam_agent_core::PublicationIntent {
-            slot: "microphone".into(),
-            active: true,
-        },
-    ];
-    desired.topics.publishers = vec![latest.clone(), ordered.clone()];
-    desired.topics.subscribers = vec![
-        pulsebeam_agent_core::TopicSubscriber {
-            topic: latest.topic.clone(),
-            mode: latest.mode,
-            publisher_id: None,
-        },
-        pulsebeam_agent_core::TopicSubscriber {
-            topic: ordered.topic.clone(),
-            mode: ordered.mode,
-            publisher_id: None,
-        },
-    ];
+        ..Default::default()
+    };
     agent.replace_desired(desired.clone()).await?;
 
     let initial = wait_ready(&agent, None).await?;

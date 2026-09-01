@@ -16,7 +16,7 @@ Native runtime for the PulseBeam agent.
 
 ## Contributor map
 
-* `runtime`: the small public API and the serial owner of core effects, RTC generations, HTTP, timers, sockets, media endpoints, and teardown;
+* `runtime`: the small public API and the serial owner of core effects, RTC generations, HTTP, timers, sockets, media endpoints, coherent media bindings, and graceful or abrupt teardown;
 * `media` and `pipeline`: RTP packetization, frame assembly, jitter handling, and media metadata;
 * `tcp`: RFC 4571 framing and bounded partial-write handling;
 * `agent`, `api`, `manager`, and `actor`: the temporarily retained legacy implementation used by the deprecated compatibility crate.
@@ -38,3 +38,4 @@ Rust / Swift / Kotlin / other hosts
 ```
 
 Run `cargo test -p pulsebeam-agent-native` for focused work. The real-server deterministic scenario is `tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close` in `pulsebeam-simulator`.
+The full simulator harness also uses this runtime directly; it does not depend on the deprecated compatibility crate.
