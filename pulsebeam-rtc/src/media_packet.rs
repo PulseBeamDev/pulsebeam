@@ -1,14 +1,51 @@
 use std::{
     cell::{Cell, OnceCell},
+    fmt,
     marker::PhantomData,
     ops::Range,
-    time::SystemTime,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
-    HeaderExtension, IngressStream, MediaKind,
+    ClockError, HeaderExtension, IngressStream, MediaKind, RtpClockMapper,
     packet::{PacketError, RtpPacket},
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MediaPacketClockError {
+    Packet(PacketError),
+    Clock(ClockError),
+}
+
+impl fmt::Display for MediaPacketClockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Packet(error) => error.fmt(f),
+            Self::Clock(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for MediaPacketClockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Packet(error) => Some(error),
+            Self::Clock(error) => Some(error),
+        }
+    }
+}
+
+impl From<PacketError> for MediaPacketClockError {
+    fn from(error: PacketError) -> Self {
+        Self::Packet(error)
+    }
+}
+
+impl From<ClockError> for MediaPacketClockError {
+    fn from(error: ClockError) -> Self {
+        Self::Clock(error)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SemanticFamily {
@@ -386,6 +423,42 @@ const _: fn() = || {
 };
 
 impl MediaPacket {
+    pub fn from_rtp_at(
+        bytes: Vec<u8>,
+        stream: IngressStream,
+        sequence: u64,
+        packet_id: u64,
+        arrival: Instant,
+        mapper: &mut RtpClockMapper,
+    ) -> Result<Self, MediaPacketClockError> {
+        let (payload, extension_block, extension_profile, ssrc, timestamp, marker) = {
+            let parsed = RtpPacket::parse(&bytes)?;
+            (
+                parsed.payload_range(),
+                parsed.extension_range(),
+                parsed.extension_profile(),
+                parsed.ssrc(),
+                parsed.timestamp(),
+                parsed.marker(),
+            )
+        };
+        let playout_time = mapper.map_packet(timestamp, arrival)?.playout_time();
+        Self::from_rtp_parts(
+            bytes,
+            stream,
+            sequence,
+            packet_id,
+            playout_time,
+            payload,
+            extension_block,
+            extension_profile,
+            ssrc,
+            timestamp,
+            marker,
+        )
+        .map_err(Into::into)
+    }
+
     pub fn from_rtp(
         bytes: Vec<u8>,
         stream: IngressStream,
@@ -404,6 +477,39 @@ impl MediaPacket {
                 parsed.marker(),
             )
         };
+        Self::from_rtp_parts(
+            bytes,
+            stream,
+            sequence,
+            packet_id,
+            playout_time,
+            payload,
+            extension_block,
+            extension_profile,
+            ssrc,
+            timestamp,
+            marker,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "metadata is one parser result")]
+    fn from_rtp_parts(
+        bytes: Vec<u8>,
+        stream: IngressStream,
+        sequence: u64,
+        packet_id: u64,
+        playout_time: SystemTime,
+        payload: Range<usize>,
+        extension_block: Option<Range<usize>>,
+        extension_profile: Option<u16>,
+        ssrc: u32,
+        timestamp: u32,
+        marker: bool,
+    ) -> Result<Self, PacketError> {
+        if playout_time.duration_since(UNIX_EPOCH).is_err() {
+            return Err(PacketError::InvalidValue);
+        }
+        debug_assert!(playout_time >= UNIX_EPOCH);
         let packet = Self {
             bytes,
             payload,
@@ -744,6 +850,10 @@ impl OwnedMediaPacket {
         self.playout_time
     }
     pub fn into_media_packet(self) -> Result<MediaPacket, PacketError> {
+        if self.playout_time.duration_since(UNIX_EPOCH).is_err() {
+            return Err(PacketError::InvalidValue);
+        }
+        debug_assert!(self.playout_time >= UNIX_EPOCH);
         let packet = MediaPacket {
             bytes: self.bytes,
             payload: self.payload,
@@ -1593,6 +1703,42 @@ mod tests {
             roundtrip.payload().as_ptr(),
             roundtrip.bytes().as_ptr().wrapping_add(20)
         );
+    }
+
+    #[test]
+    fn construction_from_arrival_uses_the_explicit_media_clock() {
+        let monotonic = Instant::now();
+        let anchor =
+            crate::ClockAnchor::new(monotonic, UNIX_EPOCH + std::time::Duration::from_secs(2))
+                .unwrap();
+        let mut mapper = crate::RtpClockMapper::new(anchor, 3, 90_000).unwrap();
+        let packet = MediaPacket::from_rtp_at(
+            packet(&[1, 2, 3]),
+            stream(),
+            1,
+            2,
+            monotonic + std::time::Duration::from_millis(20),
+            &mut mapper,
+        )
+        .unwrap();
+        assert_eq!(
+            packet.playout_time(),
+            UNIX_EPOCH + std::time::Duration::from_secs(2) + std::time::Duration::from_millis(20)
+        );
+    }
+
+    #[test]
+    fn direct_construction_rejects_pre_unix_playout_time() {
+        assert!(matches!(
+            MediaPacket::from_rtp(
+                packet(&[1]),
+                stream(),
+                1,
+                2,
+                UNIX_EPOCH - std::time::Duration::from_nanos(1),
+            ),
+            Err(PacketError::InvalidValue)
+        ));
     }
 
     #[test]
