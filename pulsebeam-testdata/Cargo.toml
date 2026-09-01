@@ -13,3 +13,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+sha2.workspace = true
+zstd.workspace = true

@@ -1,0 +1,29 @@
+format=1
+generator.ffmpeg=8.1.2
+generator.gstreamer=1.26.7
+generator.zstd=1.5.7
+video.codec=H264 constrained-baseline Annex-B
+video.arguments=fps=30 frames=180 epochs=2 epoch_frames=90 bframes=0 open_gop=0 repeat_headers=1 aud=1 threads=1 pixel_format=yuv420p
+video.sources=2
+video.layers=180:320x180:180000,360:640x360:600000,720:1280x720:1800000
+video.idr_frames=0,90
+video.identity=source,layer,epoch,frame duplicated by text and source-specific moving reference region
+audio.codec=Opus mono 48000Hz 20ms DTX
+audio.arguments=frames=300 active=0-2s,3-5s silence_dtx=2-3s,5-6s source0=697/770Hz source1=941/1209Hz vbr=48000
+audio.sources=2
+file=d618a5e2ed380f5b461fabbece22e74546233d40cf3f081344f4f208684fc9d7,152886,quality_s0_180p.h264
+file=a9e798570a9f013619b42a5e1a8fdbe04010c605fdc111674433590c9740c680,480618,quality_s0_360p.h264
+file=81fc2271d97f607a401d98e427af310b082489ee6a2b58c268e8959060154b46,1425399,quality_s0_720p.h264
+file=d7b32a76af4a251776e1c1b97d919047bea100edf6bdf0e9fc281c77afb98612,71369,quality_s1_180p.h264
+file=dfe5c8bbc0a8f0272add2f94ad0007d519cda0b5704ecbb4b49dd07d8029ccc8,158551,quality_s1_360p.h264
+file=75dd83f17e8f88ee3267aa6ef449ef59c08871fa9d711450ade8a408f4d81746,335978,quality_s1_720p.h264
+file=f28e918ffc87dcaabe38a2d56435c2e628b3b6048baf6d0d2d018f0fc324f280,1022499,quality_s0_180p.yuv420p.zst
+file=df5a4bda9483e21254b9f4d6a83fc6f53b80eb79b949fead796a1c1bf7efa28b,3059728,quality_s0_360p.yuv420p.zst
+file=deb86bd1f2cde163873cf2ad98b16839ccdf599464519690d31b4960f120daa6,8331816,quality_s0_720p.yuv420p.zst
+file=f87ca4603f1d0dca1ce73a42fd276f3df608e9d7e3dd9fb1dfbeda4023241658,73572,quality_s1_180p.yuv420p.zst
+file=fc0992ac25675e618f3cc9f1a7ccd2d3058cc09e78f59106f3d2669cdfa938d5,104088,quality_s1_360p.yuv420p.zst
+file=3c8359ae69a16565d796d1efab3ab2b9518f5360467bb37a63bdacc9971cc782,223162,quality_s1_720p.yuv420p.zst
+file=4f9375fd29444175c53c9dbc8c7fc0d020354ef23b7b83698a9ca1284ec11b92,38731,quality_a0_48k_mono.opus
+file=2911a254b8a65dcdc59302c12eabbc9c955585f793e81f9d6ed9172ebddaff93,38420,quality_a1_48k_mono.opus
+file=d4ff7f4c1480ac4f677bbb22a0a50c44cd24620c6a7529ab2fec87ee386ca2e7,343903,quality_a0_48k_mono.s16le.zst
+file=c9f7a14c68b58fcde66c746bd47e7bb4a26767d4600456019a08c5b4ff2c75e1,356286,quality_a1_48k_mono.s16le.zst
