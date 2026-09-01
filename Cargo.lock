@@ -3261,6 +3261,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-agent"
+version = "0.3.2"
+dependencies = [
+ "bytes",
+ "flume",
+ "http",
+ "if-addrs",
+ "pulsebeam-core",
+ "pulsebeam-proto",
+ "pulsebeam-testdata",
+ "str0m 0.22.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pulsebeam-agent-core"
 version = "0.1.0"
 dependencies = [
