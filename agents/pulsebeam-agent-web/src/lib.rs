@@ -1,12 +1,23 @@
-#![no_std]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used,
+    )
+)]
 
-extern crate alloc;
+#[cfg(any(target_arch = "wasm32", test))]
+mod engine;
 
-mod watch;
-use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+mod browser;
+#[cfg(target_arch = "wasm32")]
+mod logger;
 
-#[wasm_bindgen(start)]
-pub fn start() {}
-
-#[wasm_bindgen]
-pub fn greet(_name: &str) {}
+#[cfg(target_arch = "wasm32")]
+pub use browser::BrowserRuntime;
+#[cfg(target_arch = "wasm32")]
+pub use logger::configure_logging;

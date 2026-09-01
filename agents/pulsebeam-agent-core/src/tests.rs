@@ -23,6 +23,7 @@ fn config() -> AgentConfig {
     AgentConfig {
         endpoint: "https://sfu.test/".to_string(),
         room_id: "room".to_string(),
+        request_headers: vec![],
         topology: MediaTopology {
             local_video: vec!["camera".to_string()],
             local_audio: vec!["microphone".to_string()],
@@ -405,6 +406,61 @@ fn construction_and_desired_state_validate_complete_external_input() {
         ))
     ));
 
+    let mut protocol_header = config();
+    protocol_header.request_headers.push(HttpHeader {
+        name: "Content-Type".to_string(),
+        value: "text/plain".to_string(),
+    });
+    assert!(matches!(
+        Agent::new(protocol_header),
+        Err(AgentError::InvalidConfiguration(
+            ValidationError::RequestHeader(_)
+        ))
+    ));
+
+    let mut control_header = config();
+    control_header.request_headers.push(HttpHeader {
+        name: "X-Test".to_string(),
+        value: "invalid\u{1}".to_string(),
+    });
+    assert!(matches!(
+        Agent::new(control_header),
+        Err(AgentError::InvalidConfiguration(
+            ValidationError::RequestHeader(_)
+        ))
+    ));
+
+    let mut injected_header = config();
+    injected_header.request_headers.push(HttpHeader {
+        name: "Authorization".to_string(),
+        value: "Bearer redacted".to_string(),
+    });
+    let mut agent = Agent::new(injected_header).unwrap();
+    agent
+        .command(AgentCommand::ReplaceDesired(desired(1)))
+        .unwrap();
+    let generation = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+        effect => panic!("expected offer, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: "offer".to_string(),
+            resources: resources(channel(99)),
+        }))
+        .unwrap();
+    let request = match next_effect(&mut agent) {
+        Effect::Http(HttpEffect::Request { request, .. }) => request,
+        effect => panic!("expected request, got {effect:?}"),
+    };
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| { header.name == "Authorization" && header.value == "Bearer redacted" })
+    );
+
     let mut agent = Agent::new(config()).unwrap();
     let mut invalid_desired = desired(1);
     invalid_desired.video[0].min_height = 721;
@@ -428,6 +484,45 @@ fn construction_and_desired_state_validate_complete_external_input() {
             ValidationError::PlayoutDelay
         ))
     );
+}
+
+#[test]
+fn rtc_host_failure_closes_the_generation_and_uses_core_retry_policy() {
+    let mut agent = Agent::new(config()).unwrap();
+    agent
+        .command(AgentCommand::ReplaceDesired(desired(1)))
+        .unwrap();
+    let generation = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+        effect => panic!("expected offer, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Failed {
+            generation,
+            message: "createOffer rejected".to_string(),
+        }))
+        .unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation })
+    );
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Timer(TimerEffect::Schedule { .. })
+    ));
+    assert!(matches!(
+        agent.snapshot().connection,
+        ConnectionState::RetryWaiting { attempt: 1, .. }
+    ));
+    assert!(drain_notifications(&mut agent).iter().any(|notification| {
+        matches!(
+            notification,
+            Notification::Failure(Failure {
+                class: FailureClass::Transient,
+                message,
+            }) if message == "createOffer rejected"
+        )
+    }));
 }
 
 #[test]

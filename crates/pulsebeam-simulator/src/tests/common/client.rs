@@ -300,6 +300,7 @@ impl SimClientBuilder {
         let session = AgentConfig {
             endpoint: self.endpoint,
             room_id: room.to_owned(),
+            request_headers: Vec::new(),
             topology,
             manual_subscriptions: self.manual_subscriptions,
             retry: Default::default(),

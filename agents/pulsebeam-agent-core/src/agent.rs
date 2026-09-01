@@ -362,6 +362,29 @@ impl Agent {
                 }
                 Ok(())
             }
+            RtcEvent::Failed {
+                generation,
+                message,
+            } => {
+                if self
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.generation == generation)
+                {
+                    self.fail_attempt(Failure::transient(message));
+                } else if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|session| session.generation == generation)
+                    && self.desired.connected
+                    && self.attempt.is_none()
+                    && self.retry.is_none()
+                {
+                    self.notify_failure(Failure::transient(message));
+                    self.start_attempt(AttemptMode::Replace);
+                }
+                Ok(())
+            }
             RtcEvent::Closed { generation } => {
                 if let Some(closing) = self.closing.as_mut() {
                     let _ = closing.generations.remove(&generation);
@@ -399,7 +422,7 @@ impl Agent {
                     debug_assert!(false, "replacement requires an active session");
                     return Ok(());
                 };
-                update_request(active, &offer)
+                update_request(active, &offer, &self.config.request_headers)
             }
         };
         if let Some(attempt) = self.attempt.as_mut() {
@@ -1079,7 +1102,7 @@ impl Agent {
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
             generation: None,
-            request: delete_request(resource_uri),
+            request: delete_request(resource_uri, &self.config.request_headers),
         }));
     }
 
@@ -1088,7 +1111,7 @@ impl Agent {
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
             generation: None,
-            request: delete_request(resource_uri),
+            request: delete_request(resource_uri, &self.config.request_headers),
         }));
     }
 
@@ -1165,13 +1188,15 @@ impl Agent {
         if self.config.manual_subscriptions {
             uri.push_str("?manual_sub=true");
         }
+        let mut headers = self.config.request_headers.clone();
+        headers.push(HttpHeader {
+            name: CONTENT_TYPE.to_string(),
+            value: SDP_CONTENT_TYPE.to_string(),
+        });
         HttpRequest {
             method: HttpMethod::Post,
             uri,
-            headers: vec![HttpHeader {
-                name: CONTENT_TYPE.to_string(),
-                value: SDP_CONTENT_TYPE.to_string(),
-            }],
+            headers,
             body: offer.as_bytes().to_vec(),
         }
     }
@@ -1270,29 +1295,31 @@ fn validate_offer(
     Ok(())
 }
 
-fn update_request(active: &Session, offer: &str) -> HttpRequest {
+fn update_request(active: &Session, offer: &str, request_headers: &[HttpHeader]) -> HttpRequest {
+    let mut headers = request_headers.to_vec();
+    headers.extend([
+        HttpHeader {
+            name: CONTENT_TYPE.to_string(),
+            value: SDP_CONTENT_TYPE.to_string(),
+        },
+        HttpHeader {
+            name: "If-Match".to_string(),
+            value: active.etag.clone(),
+        },
+    ]);
     HttpRequest {
         method: HttpMethod::Patch,
         uri: active.resource_uri.clone(),
-        headers: vec![
-            HttpHeader {
-                name: CONTENT_TYPE.to_string(),
-                value: SDP_CONTENT_TYPE.to_string(),
-            },
-            HttpHeader {
-                name: "If-Match".to_string(),
-                value: active.etag.clone(),
-            },
-        ],
+        headers,
         body: offer.as_bytes().to_vec(),
     }
 }
 
-fn delete_request(resource_uri: String) -> HttpRequest {
+fn delete_request(resource_uri: String, request_headers: &[HttpHeader]) -> HttpRequest {
     HttpRequest {
         method: HttpMethod::Delete,
         uri: resource_uri,
-        headers: vec![],
+        headers: request_headers.to_vec(),
         body: vec![],
     }
 }

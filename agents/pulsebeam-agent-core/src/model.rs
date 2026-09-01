@@ -5,7 +5,7 @@ use alloc::{
 };
 use core::time::Duration;
 
-use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
+use crate::{Generation, HttpHeader, TopicNotification, TopicRegistrations, TopicSnapshot};
 
 pub const MAX_LOCAL_VIDEO_SLOTS: usize = 2;
 pub const MAX_LOCAL_AUDIO_SLOTS: usize = 2;
@@ -18,6 +18,7 @@ pub const MAX_PLAYOUT_DELAY_MS: u32 = 40_950;
 pub struct AgentConfig {
     pub endpoint: String,
     pub room_id: String,
+    pub request_headers: Vec<HttpHeader>,
     pub topology: MediaTopology,
     pub manual_subscriptions: bool,
     pub retry: RetryPolicy,
@@ -268,6 +269,8 @@ pub enum ValidationError {
     PlayoutDelay,
     #[error("retry policy is invalid")]
     RetryPolicy,
+    #[error("request header is invalid or protocol-owned: {0}")]
+    RequestHeader(String),
     #[error("topic name is invalid: {0}")]
     Topic(String),
     #[error("topic publisher scope is invalid: {0}")]
@@ -294,6 +297,9 @@ impl AgentConfig {
             return Err(ValidationError::Endpoint);
         }
         validate_identifier("room_id", &self.room_id, 256, false)?;
+        for header in &self.request_headers {
+            validate_request_header(header)?;
+        }
         self.topology.validate()?;
         if self.retry.maximum_attempts == 0
             || self.retry.initial_delay > self.retry.maximum_delay
@@ -303,6 +309,46 @@ impl AgentConfig {
         }
         Ok(())
     }
+}
+
+fn validate_request_header(header: &HttpHeader) -> Result<(), ValidationError> {
+    let name = header.name.as_str();
+    let protocol_owned = ["content-type", "content-length", "host", "if-match"];
+    let valid_name = !name.is_empty()
+        && name.is_ascii()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        });
+    let valid_value = header
+        .value
+        .bytes()
+        .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte));
+    if !valid_name
+        || !valid_value
+        || protocol_owned
+            .iter()
+            .any(|owned| name.eq_ignore_ascii_case(owned))
+    {
+        return Err(ValidationError::RequestHeader(header.name.clone()));
+    }
+    Ok(())
 }
 
 impl MediaTopology {

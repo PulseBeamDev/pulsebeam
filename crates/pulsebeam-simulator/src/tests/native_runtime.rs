@@ -136,6 +136,7 @@ async fn run_peer(
     let session = pulsebeam_agent_core::AgentConfig {
         endpoint,
         room_id: "native-vertical".into(),
+        request_headers: Vec::new(),
         topology: pulsebeam_agent_core::MediaTopology {
             local_video: vec!["camera".into()],
             local_audio: vec!["microphone".into()],

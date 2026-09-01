@@ -26,6 +26,10 @@ pub enum RtcEvent {
     Disconnected {
         generation: Generation,
     },
+    Failed {
+        generation: Generation,
+        message: String,
+    },
     Closed {
         generation: Generation,
     },

@@ -347,6 +347,7 @@ async fn spawn_agent(
     let session = AgentConfig {
         endpoint: ctx.api_url.clone(),
         room_id: room_name,
+        request_headers: Vec::new(),
         topology: MediaTopology {
             local_video: vec!["camera".into()],
             local_audio: vec!["microphone".into()],

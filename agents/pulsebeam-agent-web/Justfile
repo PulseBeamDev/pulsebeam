@@ -1,10 +1,24 @@
 set shell := ["bash", "-euc"]
 set tempdir := "/tmp"
 
-# Build the browser package.
+# Build the private WASM artifact and public TypeScript package.
 build:
-    wasm-pack build --target web
+    pnpm run build
+
+# Check Rust/WASM and the handwritten TypeScript boundary.
+check:
+    cargo check -p pulsebeam-agent-web --target wasm32-unknown-unknown
+    pnpm run check
+
+# Run browser-runtime unit and deterministic host-boundary tests.
+test: build
+    cargo test -p pulsebeam-agent-web
+    cargo test -p pulsebeam-agent-web --features browser-tests --test browser
+
+# Run the real-server browser vertical slice against an already-running local SFU.
+server-test: build
+    PULSEBEAM_BROWSER_SERVER=1 cargo test -p pulsebeam-agent-web --features browser-tests --test browser
 
 # Serve the generated package and local example.
 serve:
-    python3 -m http.server
+    python3 -m http.server 4173 --bind 127.0.0.1

@@ -1560,6 +1560,7 @@ mod tests {
         let session = agent_core::AgentConfig {
             endpoint: "http://pulsebeam.test".into(),
             room_id: "room".into(),
+            request_headers: Vec::new(),
             topology: agent_core::MediaTopology {
                 local_video: vec!["camera".into()],
                 local_audio: vec!["microphone".into()],
