@@ -38,7 +38,7 @@ const UNROUTED_MAX_WAIT: Duration = Duration::from_secs(3);
 
 use pulsebeam_proto::signaling::Publication as Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
@@ -454,6 +454,7 @@ struct MediaSubsystem {
     /// carries only the SSRC, so the mapping is resolved once via the DirectApi and
     /// reused. Mirrors the SFU's `incoming_rtp_routes`.
     incoming_rtp_routes: HashMap<Ssrc, (Mid, Option<Rid>)>,
+    incoming_keyframe_requests: HashSet<Ssrc>,
     media_targets_by_track: HashMap<String, mailbox::Sender<RtpPacket>>,
     upstream_slots: HashMap<Mid, UpstreamSlot>,
     upstream_order: Vec<Mid>,
@@ -607,6 +608,7 @@ impl AgentDriver {
                 media_targets: HashMap::new(),
                 publication_sources: HashMap::new(),
                 incoming_rtp_routes: HashMap::new(),
+                incoming_keyframe_requests: HashSet::new(),
                 media_targets_by_track: HashMap::new(),
                 upstream_slots: HashMap::new(),
                 upstream_order: Vec::new(),
@@ -1074,6 +1076,13 @@ impl AgentDriver {
                 .ext_vals(packet.ext_vals);
                 stream.write_rtp(rtp);
             }
+            OutgoingCommand::RequestKeyframe { ssrc } => {
+                let mut api = self.rtc.direct_api();
+                if let Some(stream) = api.stream_rx(&ssrc) {
+                    stream.request_keyframe(KeyframeRequestKind::Pli);
+                }
+                let _ = self.rtc.handle_input(Input::Timeout(self.now.into()));
+            }
             OutgoingCommand::SetPlayoutDelay(bounds) => {
                 self.set_playout_delay(bounds);
             }
@@ -1108,7 +1117,8 @@ impl AgentDriver {
                             .media_targets_by_track
                             .insert(track_id.clone(), tx);
                     }
-                    let _ = response.send(Ok(RemoteTrack::new(track, rx)));
+                    let _ =
+                        response.send(Ok(RemoteTrack::new(track, rx, self.outgoing_tx.clone())));
                     self.deliver_unrouted();
                     self.subscriptions.parked_subscriptions.remove(&track_id);
                     self.subscriptions
@@ -1149,7 +1159,8 @@ impl AgentDriver {
                     self.media
                         .pending_media_targets
                         .insert(track_id.clone(), tx);
-                    let _ = response.send(Ok(RemoteTrack::new(track, rx)));
+                    let _ =
+                        response.send(Ok(RemoteTrack::new(track, rx, self.outgoing_tx.clone())));
                 } else {
                     self.media
                         .pending_media_subscriptions
@@ -1261,6 +1272,25 @@ impl AgentDriver {
                         };
                         if let Some((mid, rid)) = route {
                             self.media.incoming_rtp_routes.insert(ssrc, (mid, rid));
+                            let request_keyframe = self
+                                .rtc
+                                .media(mid)
+                                .is_some_and(|media| media.kind() == MediaKind::Video)
+                                && rtp
+                                    .header
+                                    .ext_vals
+                                    .user_values
+                                    .get::<pulsebeam_core::dd::RawDependencyDescriptor>()
+                                    .and_then(|raw| pulsebeam_core::dd::read_mandatory(&raw.0).ok())
+                                    .is_some_and(|mandatory| !mandatory.start_of_frame)
+                                && self.media.incoming_keyframe_requests.insert(ssrc);
+                            if request_keyframe {
+                                let mut api = self.rtc.direct_api();
+                                if let Some(stream) = api.stream_rx_by_mid(mid, rid) {
+                                    stream.request_keyframe(KeyframeRequestKind::Pli);
+                                }
+                                let _ = self.rtc.handle_input(Input::Timeout(self.now.into()));
+                            }
                             let packet = RtpPacket {
                                 mid,
                                 rid,
@@ -1479,7 +1509,8 @@ impl AgentDriver {
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
                     if let Some(sink) = &self.media.audio_sink {
-                        let _ = sink.try_send(RemoteTrack::new(track, rx));
+                        let _ =
+                            sink.try_send(RemoteTrack::new(track, rx, self.outgoing_tx.clone()));
                     }
                 }
                 for (mid, track) in assignments {
@@ -1505,7 +1536,7 @@ impl AgentDriver {
                         .media_targets_by_track
                         .insert(track_id.clone(), tx.clone());
                     self.media.media_targets.insert(mid, tx);
-                    let remote_track = RemoteTrack::new(track, rx);
+                    let remote_track = RemoteTrack::new(track, rx, self.outgoing_tx.clone());
                     if let Some(response) = self.media.pending_media_subscriptions.remove(&track_id)
                     {
                         let _ = response.send(Ok(remote_track));

@@ -942,14 +942,14 @@ fn conference_plan(
                 participant: "screen",
                 quality: VideoQuality::min_frames(camera_min_frames)
                     .allow_gaps(allowed_gaps)
-                    .allow_missing_parameter_sets(allowed_missing_parameter_sets),
+                    .allow_keyframe_parameter_set_losses(allowed_missing_parameter_sets),
             },
             Step::CheckVideoQuality {
                 description: "Camera participant renders the screen share without freezes",
                 participant: "camera",
                 quality: VideoQuality::min_frames(screen_min_frames)
                     .allow_gaps(allowed_gaps)
-                    .allow_missing_parameter_sets(allowed_missing_parameter_sets),
+                    .allow_keyframe_parameter_set_losses(allowed_missing_parameter_sets),
             },
         ]);
 }

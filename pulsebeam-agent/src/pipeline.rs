@@ -20,8 +20,8 @@ use pulsebeam_core::dd::{
     DdWriteError, DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory,
 };
 use pulsebeam_core::{
-    framing::{FrameDepacketizer, FramePacketizer},
-    h264::Packetizer as H264Packetizer,
+    framing::{FramePacketizer, MAX_FRAME_SIZE},
+    h264::{Depacketizer as H264Depacketizer, Packetizer as H264Packetizer},
 };
 use str0m::media::{MediaTime, Mid, Rid};
 use str0m::rtp::vla::{
@@ -208,6 +208,17 @@ pub const DEFAULT_JITTER_MAX_WAIT: Duration = Duration::from_secs(5);
 /// anything but a fixed wait. A viewer joins a call and the tile is blank for five seconds.
 pub const DEFAULT_INITIAL_COMMIT_WAIT: Duration = Duration::from_millis(100);
 
+pub const MAX_JITTER_BUFFER_PACKETS: usize = 16_384;
+pub const MAX_JITTER_BUFFER_BYTES: usize = MAX_FRAME_SIZE * 2;
+pub const MAX_JITTER_SEQUENCE_WINDOW: u64 = 1 << 20;
+
+#[derive(Clone, Copy)]
+struct JitterLimits {
+    max_packets: usize,
+    max_bytes: usize,
+    max_sequence_window: u64,
+}
+
 /// A time-bounded reorder / jitter buffer.
 ///
 /// Holds incoming RTP briefly so out-of-order and retransmitted (NACK/RTX)
@@ -218,10 +229,12 @@ pub const DEFAULT_INITIAL_COMMIT_WAIT: Duration = Duration::from_millis(100);
 /// `initial_wait` — see [`DEFAULT_INITIAL_COMMIT_WAIT`].
 pub struct JitterBuffer {
     buf: BTreeMap<u64, RtpPacket>,
+    buffered_bytes: usize,
     next: Option<u64>,
     latest_arrival: Option<Instant>,
     max_wait: Duration,
     initial_wait: Duration,
+    limits: JitterLimits,
     /// Whether anything has reached the screen yet. See the gap budget in [`Self::pop`].
     delivered_frame: bool,
 }
@@ -230,20 +243,72 @@ impl JitterBuffer {
     pub fn new(max_wait: Duration) -> Self {
         Self {
             buf: BTreeMap::new(),
+            buffered_bytes: 0,
             next: None,
             latest_arrival: None,
             max_wait,
             // Never longer than the gap budget: a caller that asked for a tight budget wants low
             // latency, and handing it a slower start than it asked for would be perverse.
             initial_wait: DEFAULT_INITIAL_COMMIT_WAIT.min(max_wait),
+            limits: JitterLimits {
+                max_packets: MAX_JITTER_BUFFER_PACKETS,
+                max_bytes: MAX_JITTER_BUFFER_BYTES,
+                max_sequence_window: MAX_JITTER_SEQUENCE_WINDOW,
+            },
             delivered_frame: false,
         }
     }
 
-    pub fn push(&mut self, rtp: RtpPacket) {
+    #[cfg(test)]
+    fn with_limits(
+        max_wait: Duration,
+        max_packets: usize,
+        max_bytes: usize,
+        max_sequence_window: u64,
+    ) -> Self {
+        let mut jitter = Self::new(max_wait);
+        jitter.limits = JitterLimits {
+            max_packets,
+            max_bytes,
+            max_sequence_window,
+        };
+        jitter
+    }
+
+    pub fn push(&mut self, rtp: RtpPacket) -> bool {
         let arrival = rtp.arrival;
         self.latest_arrival = Some(self.latest_arrival.map_or(arrival, |l| l.max(arrival)));
-        self.buf.insert(*rtp.seq, rtp);
+        let seq = *rtp.seq;
+        if self.buf.contains_key(&seq) {
+            debug_assert!(self.buf.contains_key(&seq));
+            return false;
+        }
+        if let Some(next) = self.next {
+            if seq < next
+                || seq
+                    .checked_sub(next)
+                    .is_none_or(|distance| distance > self.limits.max_sequence_window)
+            {
+                return false;
+            }
+        } else if let Some((&first, _)) = self.buf.first_key_value()
+            && seq.abs_diff(first) > self.limits.max_sequence_window
+        {
+            return false;
+        }
+        let payload_len = rtp.payload.len();
+        let Some(new_bytes) = self.buffered_bytes.checked_add(payload_len) else {
+            return false;
+        };
+        if self.buf.len() >= self.limits.max_packets || new_bytes > self.limits.max_bytes {
+            return false;
+        }
+        debug_assert!(self.buf.len() < self.limits.max_packets);
+        debug_assert!(new_bytes <= self.limits.max_bytes);
+        self.buffered_bytes = new_bytes;
+        let replaced = self.buf.insert(seq, rtp);
+        debug_assert!(replaced.is_none());
+        true
     }
 
     /// Release the next in-order packet that is ready, or `None` while still
@@ -264,6 +329,9 @@ impl JitterBuffer {
             }
         };
         if let Some(pkt) = self.buf.remove(&next) {
+            debug_assert!(self.buffered_bytes >= pkt.payload.len());
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(pkt.payload.len());
+            debug_assert!(self.buffered_bytes <= self.limits.max_bytes);
             self.next = Some(next.wrapping_add(1));
             return Some(pkt);
         }
@@ -286,6 +354,9 @@ impl JitterBuffer {
             return None;
         }
         let (head_seq, pkt) = self.buf.pop_first()?;
+        debug_assert!(self.buffered_bytes >= pkt.payload.len());
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(pkt.payload.len());
+        debug_assert!(self.buffered_bytes <= self.limits.max_bytes);
         self.next = Some(head_seq.wrapping_add(1));
         Some(pkt)
     }
@@ -297,7 +368,10 @@ impl JitterBuffer {
 
     /// Release everything still buffered, in sequence order (end of stream).
     pub fn drain(&mut self) -> impl Iterator<Item = RtpPacket> {
-        std::mem::take(&mut self.buf).into_values()
+        let drained = std::mem::take(&mut self.buf);
+        self.buffered_bytes = 0;
+        debug_assert!(self.buf.is_empty());
+        drained.into_values()
     }
 }
 
@@ -308,10 +382,14 @@ impl JitterBuffer {
 /// stream using the DD's per-packet start/end-of-frame flags.
 pub struct FrameReceiver {
     jitter: JitterBuffer,
-    depacketizer: FrameDepacketizer,
+    frame_data: Vec<u8>,
+    frame_first_seq: Option<u64>,
+    frame_last_seq: Option<u64>,
+    frame_meta: Option<PendingFrame>,
+    h264_depacketizer: Option<H264Depacketizer>,
     dd_reader: DependencyDescriptorReader,
-    /// Metadata captured at each frame's start packet, keyed by its sequence.
-    pending: BTreeMap<u64, PendingFrame>,
+    awaiting_keyframe: bool,
+    has_keyframe: bool,
     /// Last emitted frame's final sequence, to judge inter-frame continuity.
     prev_last_seq: Option<u64>,
 }
@@ -344,23 +422,52 @@ impl FrameReceiver {
     /// as your links' worst-case NACK+RTX round-trip. The default
     /// ([`DEFAULT_JITTER_MAX_WAIT`], 5s) sits comfortably above that.
     pub fn with_max_wait(max_wait: Duration) -> Self {
+        Self::with_max_wait_and_codec(max_wait, false)
+    }
+
+    pub fn with_h264() -> Self {
+        Self::with_max_wait_and_codec(DEFAULT_JITTER_MAX_WAIT, true)
+    }
+
+    fn with_max_wait_and_codec(max_wait: Duration, h264: bool) -> Self {
         Self {
             jitter: JitterBuffer::new(max_wait),
-            depacketizer: FrameDepacketizer::default(),
+            frame_data: Vec::new(),
+            frame_first_seq: None,
+            frame_last_seq: None,
+            frame_meta: None,
+            h264_depacketizer: h264.then(H264Depacketizer::new),
             dd_reader: DependencyDescriptorReader::new(),
-            pending: BTreeMap::new(),
             prev_last_seq: None,
+            awaiting_keyframe: false,
+            has_keyframe: false,
         }
+    }
+
+    pub fn needs_keyframe(&self) -> bool {
+        self.awaiting_keyframe
     }
 
     /// Feed one RTP packet; returns any frames that became ready (0+). Frames may
     /// be released now or on a later push once the jitter buffer's delay elapses.
     pub fn push(&mut self, rtp: RtpPacket) -> Vec<MediaFrame> {
+        if !self.has_keyframe
+            && let Some(raw) = rtp.ext_vals.user_values.get::<RawDependencyDescriptor>()
+            && read_mandatory(&raw.0)
+                .map(|mandatory| !mandatory.start_of_frame)
+                .unwrap_or(false)
+        {
+            self.awaiting_keyframe = true;
+        }
         self.jitter.push(rtp);
         let mut frames = Vec::new();
         while let Some(ordered) = self.jitter.pop() {
             if let Some(frame) = self.reassemble(ordered) {
                 self.jitter.note_frame_delivered();
+                if frame.is_keyframe {
+                    self.has_keyframe = true;
+                    self.awaiting_keyframe = false;
+                }
                 frames.push(frame);
             }
         }
@@ -374,6 +481,10 @@ impl FrameReceiver {
         let mut frames = Vec::new();
         for ordered in drained {
             if let Some(frame) = self.reassemble(ordered) {
+                if frame.is_keyframe {
+                    self.has_keyframe = true;
+                    self.awaiting_keyframe = false;
+                }
                 frames.push(frame);
             }
         }
@@ -399,53 +510,105 @@ impl FrameReceiver {
             Some(r) => read_mandatory(&r.0)
                 .map(|m| (m.start_of_frame, m.end_of_frame))
                 .unwrap_or((true, true)),
+            None if self.h264_depacketizer.is_some() => {
+                (self.frame_first_seq.is_none(), rtp.marker)
+            }
             None => (true, true),
         };
 
         if start_of_frame {
+            self.reset_frame();
             let is_keyframe = raw
                 .and_then(|r| self.dd_reader.read(&r.0).ok())
                 .map(|dd| dd.attached_structure.is_some())
                 .unwrap_or(false);
-            self.pending.insert(
-                seq,
-                PendingFrame {
-                    is_keyframe,
-                    ts: rtp.ts,
-                    capture_time: rtp.arrival,
-                    abs_capture_time: rtp.ext_vals.abs_capture_time.map(|a| a.capture_time),
-                },
-            );
-            while self.pending.len() > 256 {
-                self.pending.pop_first();
-            }
+            self.frame_meta = Some(PendingFrame {
+                is_keyframe,
+                ts: rtp.ts,
+                capture_time: rtp.arrival,
+                abs_capture_time: rtp.ext_vals.abs_capture_time.map(|a| a.capture_time),
+            });
+            self.frame_first_seq = Some(seq);
+        } else if self.frame_first_seq.is_none()
+            || self
+                .frame_last_seq
+                .is_some_and(|last| seq != last.saturating_add(1))
+        {
+            self.reset_frame();
+            return None;
         }
 
-        let frame = self
-            .depacketizer
-            .push(seq, &rtp.payload, start_of_frame, end_of_frame)?;
-
-        let meta = self.pending.remove(&frame.first_seq)?;
+        self.frame_last_seq = Some(seq);
+        let data = if let Some(depacketizer) = self.h264_depacketizer.as_mut() {
+            match depacketizer.push(&rtp.payload, start_of_frame, end_of_frame) {
+                Ok(data) => data,
+                Err(_) => {
+                    self.reset_frame();
+                    return None;
+                }
+            }
+        } else {
+            let next_size = self.frame_data.len().checked_add(rtp.payload.len());
+            if next_size.is_none_or(|size| size > MAX_FRAME_SIZE) {
+                self.reset_frame();
+                return None;
+            }
+            self.frame_data.extend_from_slice(&rtp.payload);
+            end_of_frame.then(|| std::mem::take(&mut self.frame_data))
+        }?;
+        let first_seq = self.frame_first_seq.take()?;
+        let last_seq = self.frame_last_seq.take()?;
+        let meta = self.frame_meta.take()?;
         let contiguous = self
             .prev_last_seq
-            .is_none_or(|p| frame.first_seq == p.saturating_add(1));
-        self.prev_last_seq = Some(frame.last_seq);
+            .is_none_or(|p| first_seq == p.saturating_add(1));
+        self.prev_last_seq = Some(last_seq);
+        let is_keyframe = meta.is_keyframe || annex_b_has_idr(&data);
 
         Some(MediaFrame {
             audio_level: None,
             voice_activity: None,
             ts: meta.ts,
-            data: Arc::from(frame.data.as_slice()),
+            data: Arc::from(data),
             capture_time: meta.capture_time,
             abs_capture_time: meta.abs_capture_time,
             contiguous,
-            is_keyframe: meta.is_keyframe,
+            is_keyframe,
             target_bitrate_bps: None,
             resolution: None,
             dependency_descriptor: None,
             temporal_layers: None,
         })
     }
+
+    fn reset_frame(&mut self) {
+        self.frame_data.clear();
+        self.frame_first_seq = None;
+        self.frame_last_seq = None;
+        self.frame_meta = None;
+        if let Some(depacketizer) = self.h264_depacketizer.as_mut() {
+            depacketizer.reset();
+        }
+    }
+}
+
+fn annex_b_has_idr(data: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index.saturating_add(4) <= data.len() {
+        let header = if data.get(index..index.saturating_add(4)) == Some(&[0, 0, 0, 1]) {
+            index.saturating_add(4)
+        } else if data.get(index..index.saturating_add(3)) == Some(&[0, 0, 1]) {
+            index.saturating_add(3)
+        } else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if data.get(header).is_some_and(|byte| byte & 0x1f == 5) {
+            return true;
+        }
+        index = header;
+    }
+    false
 }
 
 /// A single-encoding stream's Video Layers Allocation, declaring the encoder's
@@ -549,6 +712,23 @@ mod tests {
     }
 
     #[test]
+    fn receiver_requests_a_keyframe_when_the_first_packet_is_mid_frame() {
+        let mid = Mid::from("v0");
+        let mut sender = FrameSender::new(mid, None, 1, 1);
+        let payload: Vec<u8> = (0..3000u32)
+            .map(|i| u8::try_from((i * 5 + 1) % 256).expect("masked to a byte"))
+            .collect();
+        let packets = sender.packetize(&frame(payload, true));
+        assert!(packets.len() > 2, "fixture must have a recoverable middle");
+
+        let mut receiver = FrameReceiver::new();
+        for packet in packets.iter().skip(1) {
+            let _ = receiver.push(packet.clone());
+        }
+        assert!(receiver.needs_keyframe());
+    }
+
+    #[test]
     fn dependency_descriptor_sender_waits_for_its_first_keyframe() {
         let mid = Mid::from("v0");
         let mut sender = FrameSender::new(mid, None, 1, 1);
@@ -640,6 +820,44 @@ mod tests {
     }
 
     #[test]
+    fn h264_packetization_round_trips_through_frame_receiver() {
+        let mut access_unit = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f];
+        access_unit.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x06]);
+        access_unit.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        access_unit.extend(std::iter::repeat_n(0x55, 2_500));
+        let mut sender = FrameSender::h264(Mid::from("v0"), None, 1, 1);
+        let mut packets = sender.packetize(&frame(access_unit.clone(), true));
+        assert!(packets.len() > 2);
+        packets.reverse();
+        let mut receiver = FrameReceiver::with_h264();
+        let mut frames = Vec::new();
+        for packet in packets {
+            frames.extend(receiver.push(packet));
+        }
+        frames.extend(receiver.flush());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(&*frames[0].data, &access_unit);
+    }
+
+    #[test]
+    fn generic_frame_assembly_is_bounded() {
+        let packet = RtpPacket {
+            ssrc: None,
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(0),
+            ts: MediaTime::from_90khz(0),
+            marker: true,
+            payload: Arc::from(vec![0; MAX_FRAME_SIZE.saturating_add(1)]),
+            ext_vals: ExtensionValues::default(),
+            arrival: tokio::time::Instant::now(),
+        };
+        let mut receiver = FrameReceiver::new();
+        assert!(receiver.push(packet).is_empty());
+        assert!(receiver.flush().is_empty());
+    }
+
+    #[test]
     fn distinct_frames_are_flagged_by_keyframe_and_stay_contiguous() {
         let mid = Mid::from("v0");
         let mut sender = FrameSender::new(mid, None, 1, 3);
@@ -694,6 +912,59 @@ mod tests {
         }
         // 1 was never delivered; after the wait it is skipped and 2,3 follow in order.
         assert_eq!(seqs, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn jitter_buffer_keeps_first_duplicate_and_rejects_far_packets() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let pkt = |seq: u64, value: u8| RtpPacket {
+            ssrc: None,
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload: Arc::from([value].as_slice()),
+            ext_vals: ExtensionValues::default(),
+            arrival: base,
+        };
+
+        let mut jb = JitterBuffer::with_limits(Duration::ZERO, 1, 16, 4);
+        assert!(jb.push(pkt(0, 1)));
+        assert!(!jb.push(pkt(0, 9)));
+        assert!(!jb.push(pkt(1, 2)));
+        assert!(!jb.push(pkt(5, 2)));
+        assert_eq!(jb.pop().unwrap().payload.as_ref(), &[1]);
+        assert!(jb.buf.is_empty());
+        assert_eq!(jb.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn jitter_buffer_rejects_byte_overflow_without_replacing_buffered_data() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let packet = |seq: u64, len: usize| RtpPacket {
+            ssrc: None,
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq * 3000),
+            marker: true,
+            payload: Arc::from(vec![0; len]),
+            ext_vals: ExtensionValues::default(),
+            arrival: base,
+        };
+
+        let mut jb = JitterBuffer::with_limits(Duration::ZERO, 4, 2, 4);
+        assert!(jb.push(packet(0, 2)));
+        assert!(!jb.push(packet(1, 1)));
+        assert_eq!(jb.buf.len(), 1);
+        assert_eq!(jb.buffered_bytes, 2);
+        assert_eq!(jb.pop().unwrap().payload.len(), 2);
+        assert_eq!(jb.buffered_bytes, 0);
     }
 
     /// Opening a stream costs the reordering window, not the loss-recovery budget.

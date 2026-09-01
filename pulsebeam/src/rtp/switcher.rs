@@ -693,6 +693,85 @@ mod test {
     }
 
     #[test]
+    fn replayed_parameter_sets_are_one_ordered_egress_frame() {
+        use pulsebeam_core::dd::{DependencyDescriptor, temporal::TemporalDdGenerator};
+
+        let (q, h) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
+        let mut cache = TrackStreamCache::new();
+        let mut active_builder = builder(1);
+        let mut staged_builder = H264StreamBuilder::new(2, 1000, 90_000, Instant::now())
+            .with_parameter_sets(ParameterSetStyle::OnceAtStreamStart);
+        let mut dd = TemporalDdGenerator::new(1);
+        let mut out = Vec::new();
+
+        switcher.switch_to(q);
+        ingest(
+            &mut switcher,
+            q,
+            &mut cache,
+            &active_builder.keyframe(2),
+            &mut out,
+        );
+
+        let mut stamp = |packets: Vec<RtpPacket>, keyframe: bool| {
+            packets
+                .into_iter()
+                .map(|mut packet| {
+                    packet
+                        .ext_vals
+                        .user_values
+                        .set_arc(std::sync::Arc::new(dd.next(keyframe && packet.is_keyframe)));
+                    packet
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = stamp(staged_builder.keyframe(2), true);
+        ingest(&mut switcher, h, &mut cache, &first, &mut out);
+        for _ in 0..2 {
+            let frame = staged_builder.delta_frame(2);
+            ingest(&mut switcher, h, &mut cache, &stamp(frame, false), &mut out);
+        }
+        let later_keyframe = stamp(staged_builder.keyframe(2), true);
+        ingest(&mut switcher, h, &mut cache, &later_keyframe, &mut out);
+
+        let replay_start = out.len();
+        switcher.switch_to(h);
+        switcher.feed(h.0, &cache, Instant::now(), &mut |packet| out.push(packet));
+        let replay = &out[replay_start..];
+        assert!(
+            replay.len() >= 3,
+            "replay must include prefix and IDR burst: len={} active={:?} staging={:?}",
+            replay.len(),
+            switcher.active_stream(),
+            switcher.staging_stream()
+        );
+        assert!(replay[0].nal.sps() && replay[0].nal.pps());
+        assert!(replay.iter().any(|packet| packet.nal.idr()));
+        assert!(replay.windows(2).all(|window| {
+            *window[1].seq_no == window[0].seq_no.saturating_add(1)
+                && window[1].rtp_ts == window[0].rtp_ts
+        }));
+        assert!(replay.first().is_some_and(|packet| packet.is_frame_start));
+        assert!(replay.iter().skip(1).all(|packet| !packet.is_frame_start));
+        assert!(replay.last().is_some_and(|packet| packet.marker));
+        assert!(
+            replay[..replay.len() - 1]
+                .iter()
+                .all(|packet| !packet.marker)
+        );
+
+        let descriptors: Vec<_> = replay
+            .iter()
+            .filter_map(|packet| packet.ext_vals.user_values.get::<DependencyDescriptor>())
+            .collect();
+        assert!(!descriptors.is_empty());
+        assert!(descriptors[0].start_of_frame);
+        assert!(descriptors.iter().skip(1).all(|dd| !dd.start_of_frame));
+        assert!(descriptors.last().is_some_and(|dd| dd.end_of_frame));
+    }
+
+    #[test]
     fn live_upstream_loss_stays_visible_as_a_gap() {
         let (q, _) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);

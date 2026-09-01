@@ -1,5 +1,5 @@
 use super::signaling::Signaling;
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::reliable::{RelControl, rel_control};
 use pulsebeam_runtime::net::{self};
@@ -131,6 +131,7 @@ pub struct Participant {
     upstream: UpstreamAllocator,
     pub(crate) participant_id: entity::ParticipantId,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
+    pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
     /// The compiled stream a published channel forwards into, recorded by the
     /// shard once it has minted one. Keyed by channel so an arriving SCTP
@@ -198,6 +199,7 @@ impl Participant {
             signaling,
             last_slow_poll: now,
             last_keyframe_request: HashMap::new(),
+            pending_keyframe_requests: HashSet::new(),
             data: DataState::new(),
             room_id: cfg.room_id,
             shard_id,
@@ -424,8 +426,8 @@ impl Participant {
         removed
     }
 
-    fn enqueue_fanout(&mut self, work: TransportMutation) {
-        self.transport.enqueue_mutation(work);
+    fn enqueue_fanout(&mut self, work: TransportMutation) -> bool {
+        self.transport.enqueue_mutation(work)
     }
 
     fn on_reverse(&mut self, stream: TrackKey, packet: ReversePacket) {
@@ -463,6 +465,14 @@ impl Participant {
         };
         let key = (mid, stream_id.1);
         let now = Instant::now();
+        if self.pending_keyframe_requests.contains(&key) {
+            plog_debug!(
+                self.log_ctx(),
+                ?stream_id,
+                "deduplicated pending keyframe request"
+            );
+            return;
+        }
         if let Some(last) = self.last_keyframe_request.get(&key)
             && now.duration_since(*last) < KEYFRAME_DEBOUNCE
         {
@@ -473,12 +483,13 @@ impl Participant {
             );
             return;
         }
-        self.last_keyframe_request.insert(key, now);
-        self.enqueue_fanout(TransportMutation::Keyframe {
+        if self.enqueue_fanout(TransportMutation::Keyframe {
             mid,
             rid: stream_id.1,
             kind,
-        });
+        }) {
+            debug_assert!(self.pending_keyframe_requests.insert(key));
+        }
     }
 
     fn poll_slow(&mut self, now: Instant, events: &mut impl ParticipantSink) {
@@ -535,13 +546,28 @@ impl Participant {
                 AppliedMutation::RtpWritten if playout_delay.is_some() => {
                     self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
                 }
-                AppliedMutation::Applied
-                | AppliedMutation::RtpNotWritten
+                AppliedMutation::KeyframeUnavailable { mid, rid } => {
+                    debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
+                }
+                AppliedMutation::KeyframeRequested { .. }
+                | AppliedMutation::Applied
                 | AppliedMutation::RtpWritten => {}
+                AppliedMutation::RtpNotWritten => {}
             }
             return true;
         }
-        self.transport.apply_next_mutation(now).is_some()
+        let applied = self.transport.apply_next_mutation(now);
+        match applied {
+            Some(AppliedMutation::KeyframeRequested { mid, rid }) => {
+                debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
+                self.last_keyframe_request.insert((mid, rid), now);
+            }
+            Some(AppliedMutation::KeyframeUnavailable { mid, rid }) => {
+                debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
+            }
+            _ => {}
+        }
+        applied.is_some()
     }
 
     pub(crate) fn poll(

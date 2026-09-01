@@ -23,6 +23,9 @@ const FUB_HEADER_SIZE: usize = 4;
 
 const FU_START_MASK: u8 = 0x80;
 const FU_END_MASK: u8 = 0x40;
+const FU_RESERVED_MASK: u8 = 0x20;
+const ANNEX_B_START_CODE: [u8; 4] = [0, 0, 0, 1];
+pub const MAX_ACCESS_UNIT_SIZE: usize = crate::framing::MAX_FRAME_SIZE;
 
 const FLAG_SPS: u8 = 1 << 0;
 const FLAG_PPS: u8 = 1 << 1;
@@ -149,6 +152,229 @@ pub struct PacketizedChunk {
     pub payload: Vec<u8>,
     pub start_of_frame: bool,
     pub end_of_frame: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepacketizationError {
+    EmptyPayload,
+    InvalidNalType(u8),
+    InvalidStapA,
+    InvalidFuA,
+    UnexpectedFuA,
+    IncompleteFuA,
+    UnexpectedFrameBoundary,
+    AccessUnitTooLarge,
+}
+
+#[derive(Debug)]
+pub struct Depacketizer {
+    frame: Vec<u8>,
+    fua: Option<(u8, Vec<u8>)>,
+    started: bool,
+    max_access_unit_size: usize,
+}
+
+impl Default for Depacketizer {
+    fn default() -> Self {
+        Self {
+            frame: Vec::new(),
+            fua: None,
+            started: false,
+            max_access_unit_size: MAX_ACCESS_UNIT_SIZE,
+        }
+    }
+}
+
+impl Depacketizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_max_access_unit_size(max_access_unit_size: usize) -> Self {
+        debug_assert!(max_access_unit_size > 0);
+        Self {
+            max_access_unit_size: max_access_unit_size.max(1),
+            ..Self::default()
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.frame.clear();
+        self.fua = None;
+        self.started = false;
+    }
+
+    pub fn push(
+        &mut self,
+        payload: &[u8],
+        start_of_frame: bool,
+        end_of_frame: bool,
+    ) -> Result<Option<Vec<u8>>, DepacketizationError> {
+        if start_of_frame {
+            self.reset();
+            self.started = true;
+        } else if !self.started {
+            return Err(self.fail(DepacketizationError::UnexpectedFrameBoundary));
+        }
+        let result = self.push_payload(payload);
+        if let Err(error) = result {
+            self.reset();
+            return Err(error);
+        }
+        if end_of_frame {
+            if self.fua.is_some() {
+                self.reset();
+                return Err(DepacketizationError::IncompleteFuA);
+            }
+            if self.frame.is_empty() {
+                self.reset();
+                return Err(DepacketizationError::EmptyPayload);
+            }
+            let frame = std::mem::take(&mut self.frame);
+            self.started = false;
+            return Ok(Some(frame));
+        }
+        Ok(None)
+    }
+
+    fn push_payload(&mut self, payload: &[u8]) -> Result<(), DepacketizationError> {
+        let Some(&indicator) = payload.first() else {
+            return Err(DepacketizationError::EmptyPayload);
+        };
+        match indicator & NALU_TYPE_MASK {
+            1..=23 => {
+                if self.fua.is_some() || indicator & 0x80 != 0 {
+                    return Err(DepacketizationError::UnexpectedFuA);
+                }
+                self.ensure_capacity(ANNEX_B_START_CODE.len().saturating_add(payload.len()))?;
+                self.frame.extend_from_slice(&ANNEX_B_START_CODE);
+                self.frame.extend_from_slice(payload);
+            }
+            STAPA_NALU_TYPE => {
+                if self.fua.is_some() || indicator & 0x80 != 0 || payload.len() < STAPA_HEADER_SIZE
+                {
+                    return Err(DepacketizationError::InvalidStapA);
+                }
+                let mut offset = STAPA_HEADER_SIZE;
+                let mut units = Vec::new();
+                while offset < payload.len() {
+                    let length_end = offset
+                        .checked_add(STAPA_NALU_LENGTH_SIZE)
+                        .ok_or(DepacketizationError::InvalidStapA)?;
+                    let Some(&[hi, lo]) = payload.get(offset..length_end) else {
+                        return Err(DepacketizationError::InvalidStapA);
+                    };
+                    let length = usize::from(u16::from_be_bytes([hi, lo]));
+                    offset = length_end;
+                    let unit_end = offset
+                        .checked_add(length)
+                        .ok_or(DepacketizationError::InvalidStapA)?;
+                    let unit = payload
+                        .get(offset..unit_end)
+                        .ok_or(DepacketizationError::InvalidStapA)?;
+                    let Some(&header) = unit.first() else {
+                        return Err(DepacketizationError::InvalidStapA);
+                    };
+                    if header & 0x80 != 0 || !(1..=23).contains(&(header & NALU_TYPE_MASK)) {
+                        return Err(DepacketizationError::InvalidStapA);
+                    }
+                    units.push(unit);
+                    offset = unit_end;
+                }
+                if units.is_empty() {
+                    return Err(DepacketizationError::InvalidStapA);
+                }
+                let size = units.iter().try_fold(0usize, |total, unit| {
+                    total
+                        .checked_add(ANNEX_B_START_CODE.len())
+                        .and_then(|total| total.checked_add(unit.len()))
+                });
+                self.ensure_capacity(size.ok_or(DepacketizationError::AccessUnitTooLarge)?)?;
+                for unit in units {
+                    self.frame.extend_from_slice(&ANNEX_B_START_CODE);
+                    self.frame.extend_from_slice(unit);
+                }
+            }
+            FUA_NALU_TYPE => self.push_fua(payload, indicator)?,
+            FUB_NALU_TYPE => return Err(DepacketizationError::InvalidFuA),
+            nalu_type => return Err(DepacketizationError::InvalidNalType(nalu_type)),
+        }
+        Ok(())
+    }
+
+    fn push_fua(&mut self, payload: &[u8], indicator: u8) -> Result<(), DepacketizationError> {
+        let Some((&fu_header, body)) = payload.get(1..).and_then(|rest| rest.split_first()) else {
+            return Err(DepacketizationError::InvalidFuA);
+        };
+        let nalu_type = fu_header & NALU_TYPE_MASK;
+        if !(1..=23).contains(&nalu_type) || body.is_empty() {
+            return Err(DepacketizationError::InvalidFuA);
+        }
+        let is_start = fu_header & FU_START_MASK != 0;
+        let is_end = fu_header & FU_END_MASK != 0;
+        if indicator & 0x80 != 0 || fu_header & FU_RESERVED_MASK != 0 || is_start && is_end {
+            return Err(DepacketizationError::InvalidFuA);
+        }
+        if is_start {
+            if self.fua.is_some() {
+                return Err(DepacketizationError::InvalidFuA);
+            }
+            let header = (indicator & 0xe0) | nalu_type;
+            self.ensure_capacity(
+                ANNEX_B_START_CODE
+                    .len()
+                    .saturating_add(1)
+                    .saturating_add(body.len()),
+            )?;
+            let mut data = Vec::with_capacity(body.len().saturating_add(1));
+            data.push(header);
+            data.extend_from_slice(body);
+            self.fua = Some((header, data));
+        } else {
+            let Some((header, data)) = self.fua.as_mut() else {
+                return Err(DepacketizationError::InvalidFuA);
+            };
+            if *header & 0x1f != nalu_type || *header & 0xe0 != indicator & 0xe0 {
+                return Err(DepacketizationError::InvalidFuA);
+            }
+            let next_size = self
+                .frame
+                .len()
+                .checked_add(ANNEX_B_START_CODE.len())
+                .and_then(|size| size.checked_add(data.len()))
+                .and_then(|size| size.checked_add(body.len()));
+            if next_size.is_none_or(|size| size > self.max_access_unit_size) {
+                return Err(DepacketizationError::AccessUnitTooLarge);
+            }
+            data.extend_from_slice(body);
+        }
+        if is_end {
+            let Some((_, data)) = self.fua.take() else {
+                return Err(DepacketizationError::InvalidFuA);
+            };
+            self.frame.extend_from_slice(&ANNEX_B_START_CODE);
+            self.frame.extend_from_slice(&data);
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, error: DepacketizationError) -> DepacketizationError {
+        self.reset();
+        error
+    }
+
+    fn ensure_capacity(&self, additional: usize) -> Result<(), DepacketizationError> {
+        let size = self
+            .frame
+            .len()
+            .checked_add(additional)
+            .ok_or(DepacketizationError::AccessUnitTooLarge)?;
+        debug_assert!(size >= self.frame.len());
+        if size > self.max_access_unit_size {
+            return Err(DepacketizationError::AccessUnitTooLarge);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -368,8 +594,8 @@ mod tests {
     #[test]
     fn annex_b_access_units_become_mode_one_h264_rtp_payloads() {
         let mut access_unit = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f];
-        access_unit.extend_from_slice(&[0, 0, 1, 0x68, 0xce, 0x06]);
-        access_unit.extend_from_slice(&[0, 0, 1, 0x65]);
+        access_unit.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x06]);
+        access_unit.extend_from_slice(&[0, 0, 0, 1, 0x65]);
         access_unit.extend(std::iter::repeat_n(0x55, 2_500));
 
         let chunks = Packetizer::new(1_100).packetize(&access_unit);
@@ -401,6 +627,136 @@ mod tests {
             idr.last()
                 .is_some_and(|chunk| chunk.payload[1] & FU_END_MASK != 0)
         );
+    }
+
+    #[test]
+    fn packetizer_depacketizer_round_trip() {
+        let mut access_unit = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f];
+        access_unit.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x06]);
+        access_unit.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        access_unit.extend(std::iter::repeat_n(0x55, 2_500));
+        let chunks = Packetizer::new(1_100).packetize(&access_unit);
+        let mut depacketizer = Depacketizer::new();
+        let mut result = None;
+        for chunk in chunks {
+            result = depacketizer
+                .push(&chunk.payload, chunk.start_of_frame, chunk.end_of_frame)
+                .expect("valid H.264 packetization");
+        }
+        assert_eq!(result.as_deref(), Some(access_unit.as_slice()));
+    }
+
+    #[test]
+    fn stap_a_depacketizes_to_annex_b() {
+        let payload = stapa(&[&[0x67, 0x42], &[0x68, 0xce], &[0x65, 0x80]]);
+        let expected = [
+            0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x80,
+        ];
+        let mut depacketizer = Depacketizer::new();
+        let result = depacketizer
+            .push(&payload, true, true)
+            .expect("valid STAP-A");
+        assert_eq!(result.as_deref(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn malformed_stap_and_fu_reset_state() {
+        let mut depacketizer = Depacketizer::new();
+        assert_eq!(
+            depacketizer.push(&[STAPA_NALU_TYPE, 0, 4, 0x67], true, true),
+            Err(DepacketizationError::InvalidStapA)
+        );
+        assert_eq!(
+            depacketizer.push(
+                &[FUA_NALU_TYPE, FU_START_MASK | IDR_NALU_TYPE, 1],
+                true,
+                false
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            depacketizer.push(&[FUA_NALU_TYPE, IDR_NALU_TYPE, 2], false, true),
+            Err(DepacketizationError::IncompleteFuA)
+        );
+        assert_eq!(
+            depacketizer.push(&[FUA_NALU_TYPE, IDR_NALU_TYPE, 2], false, true),
+            Err(DepacketizationError::UnexpectedFrameBoundary)
+        );
+        assert_eq!(
+            Depacketizer::new().push(
+                &[
+                    FUA_NALU_TYPE,
+                    FU_START_MASK | FU_END_MASK | IDR_NALU_TYPE,
+                    1
+                ],
+                true,
+                true,
+            ),
+            Err(DepacketizationError::InvalidFuA)
+        );
+        assert_eq!(
+            Depacketizer::new().push(
+                &[
+                    FUA_NALU_TYPE,
+                    FU_START_MASK | FU_RESERVED_MASK | IDR_NALU_TYPE,
+                    1
+                ],
+                true,
+                false,
+            ),
+            Err(DepacketizationError::InvalidFuA)
+        );
+    }
+
+    #[test]
+    fn access_unit_limit_resets_fragment_state() {
+        let mut depacketizer = Depacketizer::with_max_access_unit_size(7);
+        assert_eq!(
+            depacketizer.push(
+                &[FUA_NALU_TYPE, FU_START_MASK | IDR_NALU_TYPE, 1],
+                true,
+                false
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            depacketizer.push(&[FUA_NALU_TYPE, IDR_NALU_TYPE, 1, 2, 3], false, false),
+            Err(DepacketizationError::AccessUnitTooLarge)
+        );
+        let valid = [0x65, 0x80];
+        let result = depacketizer.push(&valid, true, true).expect("state reset");
+        assert_eq!(result.as_deref(), Some(&[0, 0, 0, 1, 0x65, 0x80][..]));
+
+        let mut depacketizer = Depacketizer::with_max_access_unit_size(7);
+        assert_eq!(depacketizer.push(&[0x67, 0x42], true, false), Ok(None));
+        assert_eq!(
+            depacketizer.push(
+                &[FUA_NALU_TYPE, FU_START_MASK | IDR_NALU_TYPE, 1],
+                false,
+                false
+            ),
+            Err(DepacketizationError::AccessUnitTooLarge)
+        );
+    }
+
+    #[test]
+    fn arbitrary_depacketizer_payloads_never_panic() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..4_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = usize::try_from(state % 32).expect("a value below 32 fits usize");
+            let payload: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    u8::try_from(state & 0xff).expect("masked to a byte")
+                })
+                .collect();
+            let _ = Depacketizer::new().push(&payload, true, true);
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ use pulsebeam_core::dd::{
     DdReadError, DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory,
 };
 
-use crate::rtp::{RtpPacket, cache::PacketWindow};
+use crate::rtp::{RtpPacket, cache::PACKET_WINDOW_CAPACITY, cache::PacketWindow};
 
 /// What normalizing a packet taught us about its stream.
 ///
@@ -45,6 +45,8 @@ pub struct StreamNormalizer {
     /// Templates only arrive on keyframes and are referenced by later packets.
     dd: DependencyDescriptorReader,
     pending_dd: PacketWindow,
+    cold_keyframe_requested: bool,
+    cold_packets_since_request: usize,
     dd_errors: u64,
     /// The Video Layers Allocation simulcast-stream index this stream is sent
     /// on, learned from its own packets, so a VLA carried on any sibling's
@@ -59,6 +61,8 @@ impl StreamNormalizer {
             rid,
             dd: DependencyDescriptorReader::new(),
             pending_dd: PacketWindow::new(),
+            cold_keyframe_requested: false,
+            cold_packets_since_request: 0,
             dd_errors: 0,
             vla_index: None,
         }
@@ -93,10 +97,20 @@ impl StreamNormalizer {
             };
             return match error {
                 DdReadError::NoStructure if cold => {
-                    let request_keyframe = self.pending_dd.push(pkt).is_some();
-                    if request_keyframe {
+                    let _ = self.pending_dd.push(pkt);
+                    self.cold_packets_since_request =
+                        self.cold_packets_since_request.saturating_add(1);
+                    let periodic_retry = self.cold_packets_since_request >= PACKET_WINDOW_CAPACITY;
+                    if periodic_retry {
                         self.pending_dd.clear();
+                        self.cold_packets_since_request = 0;
                     }
+                    let request_keyframe = if !self.cold_keyframe_requested || periodic_retry {
+                        self.cold_keyframe_requested = true;
+                        true
+                    } else {
+                        false
+                    };
                     Normalization {
                         first: None,
                         remaining: Vec::new(),
@@ -123,6 +137,8 @@ impl StreamNormalizer {
             };
         };
         if cold && carries_dd {
+            self.cold_keyframe_requested = false;
+            self.cold_packets_since_request = 0;
             self.release_cold_start(pkt, facts)
         } else {
             Normalization {
@@ -266,18 +282,22 @@ mod tests {
         let delayed_head = packet(10, descriptors[1].clone());
         let result = normalizer.normalize(delayed_head);
         assert!(result.first.is_none());
+        assert!(result.request_keyframe);
+
+        let result = normalizer.normalize(packet(11, descriptors[2].clone()));
+        assert!(result.first.is_none());
         assert!(!result.request_keyframe);
 
         let result = normalizer.normalize(packet(9, descriptors[0].clone()));
         assert!(!result.request_keyframe);
         let packets: Vec<_> = result.first.into_iter().chain(result.remaining).collect();
-        assert_eq!(packets.len(), 2, "the template releases held fragments");
+        assert_eq!(packets.len(), 3, "the template releases held fragments");
         assert_eq!(
             packets
                 .iter()
                 .map(|(packet, _)| *packet.seq_no)
                 .collect::<Vec<_>>(),
-            vec![9, 10]
+            vec![9, 10, 11]
         );
         assert!(packets[0].0.is_keyframe);
         assert!(packets[0].0.is_frame_start);
@@ -286,5 +306,39 @@ mod tests {
         assert!(result.first.is_some());
         assert!(result.remaining.is_empty());
         assert!(!result.request_keyframe);
+    }
+
+    #[test]
+    fn retries_a_cold_keyframe_request_after_a_bounded_run() {
+        let mut source = TemporalDdSource::new(1);
+        let descriptors = source
+            .next_frame(true, 2)
+            .expect("keyframe descriptors encode");
+        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+
+        assert!(
+            normalizer
+                .normalize(packet(1, descriptors[1].clone()))
+                .request_keyframe
+        );
+        for seq in 2..PACKET_WINDOW_CAPACITY {
+            assert!(
+                !normalizer
+                    .normalize(packet(seq as u64, descriptors[1].clone()))
+                    .request_keyframe
+            );
+        }
+        assert!(
+            normalizer
+                .normalize(packet(
+                    PACKET_WINDOW_CAPACITY as u64 + 1,
+                    descriptors[1].clone()
+                ))
+                .request_keyframe
+        );
+
+        let result = normalizer.normalize(packet(1000, descriptors[0].clone()));
+        assert!(!result.request_keyframe);
+        assert!(result.first.is_some());
     }
 }

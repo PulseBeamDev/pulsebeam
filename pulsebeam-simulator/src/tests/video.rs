@@ -1,10 +1,45 @@
 use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
+use pulsebeam_testdata::{QualityVideoLayer, QualityVideoSource};
 use std::time::Duration;
 
 fn cross_shard_video_room() -> super::common::Room {
     super::common::Room::new("cross-shard-video")
         .with_participant(super::common::Participant::single_publisher("publisher"))
         .with_participant(super::common::Participant::subscriber("subscriber"))
+}
+
+#[test]
+fn every_quality_layer_has_explicit_decoded_reference_facts_test() {
+    for layer in [
+        QualityVideoLayer::P180,
+        QualityVideoLayer::P360,
+        QualityVideoLayer::P720,
+    ] {
+        let (width, height) = layer.dimensions();
+        LocalNodeSim::new()
+            .with_room(
+                Room::new("decoded-quality-layers")
+                    .with_participant(Participant::quality_publisher_at(
+                        "quality-source",
+                        QualityVideoSource::Zero,
+                        layer,
+                    ))
+                    .with_participant(Participant::subscriber("quality-viewer")),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Deliver corpus-backed H264 on the selected layer",
+                    duration: Duration::from_secs(5),
+                },
+                Step::CheckVideoDecodedFrom {
+                    description: "Decode dimensions and bounded reference facts",
+                    participant: "quality-viewer",
+                    publisher: "quality-source",
+                    min_frames: 20,
+                    min_resolution: (width, height),
+                },
+            ]);
+    }
 }
 
 #[test]
@@ -33,6 +68,138 @@ fn video_does_not_loop_back_to_publisher_test() {
                 description: "Publisher receives no looped-back video",
                 participant: "publisher",
                 publisher: "publisher",
+            },
+        ]);
+}
+
+#[test]
+fn each_viewer_must_report_decoded_selected_source_independently_test() {
+    let (width, height) = QualityVideoLayer::P180.dimensions();
+    LocalNodeSim::new()
+        .with_link(LinkProfile::wifi())
+        .with_room(
+            Room::new("decoded-viewer-boundary")
+                .with_participant(Participant::quality_publisher(
+                    "source-zero",
+                    QualityVideoSource::Zero,
+                ))
+                .with_participant(Participant::quality_publisher(
+                    "source-one",
+                    QualityVideoSource::One,
+                ))
+                .with_participant(Participant::manual_subscriber("viewer-a", 1))
+                .with_participant(
+                    Participant::manual_subscriber("viewer-b", 1).with_corrupt_video_payload(),
+                ),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish both sources and independent viewers",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeTo {
+                description: "Viewer A selects source zero",
+                participant: "viewer-a",
+                targets: &[("source-zero", 180)],
+            },
+            Step::SubscribeTo {
+                description: "Viewer B selects source zero",
+                participant: "viewer-b",
+                targets: &[("source-zero", 180)],
+            },
+            Step::Run {
+                description: "Deliver the first source through loss and reordering",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Viewer A packet oracle sees source zero frames",
+                participant: "viewer-a",
+                publisher: "source-zero",
+                min_frames: 20,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Viewer B packet oracle sees source zero frames",
+                participant: "viewer-b",
+                publisher: "source-zero",
+                min_frames: 20,
+            },
+            Step::CheckVideoDecodedFrom {
+                description: "Viewer A reports decoded source identity and resolution",
+                participant: "viewer-a",
+                publisher: "source-zero",
+                min_frames: 20,
+                min_resolution: (width, height),
+            },
+            Step::CheckVideoNotRenderedFrom {
+                description: "Viewer B's corrupt receiver has no rendered progress",
+                participant: "viewer-b",
+                publisher: "source-zero",
+            },
+            Step::Disconnect {
+                description: "Reset viewer A without resetting viewer B",
+                participant: "viewer-a",
+            },
+            Step::Reconnect {
+                description: "Reconnect viewer A with a fresh receiver boundary",
+                participant: "viewer-a",
+            },
+            Step::Run {
+                description: "Allow viewer A's reset receiver to settle",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeTo {
+                description: "Viewer A atomically selects source one after its reset",
+                participant: "viewer-a",
+                targets: &[("source-one", 180)],
+            },
+            Step::Run {
+                description: "Switch only viewer A to the second source",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "Viewer A packet oracle sees source one frames",
+                participant: "viewer-a",
+                publisher: "source-one",
+                min_frames: 20,
+            },
+            Step::CheckVideoDecodedFrom {
+                description: "Viewer A reports the switched source independently",
+                participant: "viewer-a",
+                publisher: "source-one",
+                min_frames: 20,
+                min_resolution: (width, height),
+            },
+            Step::CheckVideoNotRenderedFrom {
+                description: "Viewer B remains blank for the corrupt source zero stream",
+                participant: "viewer-b",
+                publisher: "source-zero",
+            },
+        ]);
+}
+
+#[test]
+fn decoded_structurally_complete_corrupt_h264_must_not_count_as_rendered_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("corrupt-video-oracle")
+                .with_participant(Participant::single_publisher("source"))
+                .with_participant(Participant::subscriber("viewer").with_corrupt_video_payload()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Forward complete frame boundaries containing corrupt H264",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "The packet-only oracle sees complete frames",
+                participant: "viewer",
+                publisher: "source",
+                min_frames: 1,
+            },
+            Step::CheckVideoNotRenderedFrom {
+                description: "Corrupt H264 does not count as a rendered picture",
+                participant: "viewer",
+                publisher: "source",
             },
         ]);
 }
@@ -222,6 +389,62 @@ fn cross_shard_keyframe_reaches_the_publisher() {
         ]);
 }
 
+#[test]
+fn a_pli_recovers_decoding_without_natural_keyframe_repeats_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("pli-decoded-recovery")
+                .with_participant(
+                    Participant::publisher("source", &["q", "h", "f"])
+                        .starts_disconnected()
+                        .suppress_natural_keyframe_repeats(),
+                )
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the viewer before the source joins",
+                duration: Duration::from_secs(5),
+            },
+            Step::Reconnect {
+                description: "Start the raw H264 source with natural keyframe repeats suppressed",
+                participant: "source",
+            },
+            Step::Run {
+                description: "Decode an initial interval before the switch",
+                duration: Duration::from_secs(10),
+            },
+            Step::SubscribeAll {
+                description: "Select the high-quality layer before the recovery test",
+                participant: "viewer",
+                heights: &[720],
+            },
+            Step::Run {
+                description: "Establish the selected layer before switching",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeAll {
+                description: "Switch layers and request an explicit PLI",
+                participant: "viewer",
+                heights: &[180],
+            },
+            Step::Run {
+                description: "Render the recovered keyframe promptly",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "The receiver decodes continued progress after PLI recovery",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(1).min_keyframes(1).allow_gaps(5),
+            },
+            Step::CheckKeyframeRequestsAtLeast {
+                description: "The publisher receives the explicit PLI",
+                participant: "source",
+                min: 1,
+            },
+        ]);
+}
+
 /// A publisher that attaches a synthetic L1T3 Dependency Descriptor to every
 /// frame flows end-to-end and the subscriber decodes it — exercising the agent's
 /// DD emission and the SFU's DD-aware forwarder (parse + Full-target forward)
@@ -313,15 +536,11 @@ fn opaque_dependency_descriptor_stream_forwards_on_dd_alone_test() {
                 description: "Alice publishes an opaque (E2EE) L1T3 DD stream; Bob subscribes",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckVideoQuality {
+            Step::CheckVideoReceivedFrom {
                 description: "Bob keeps receiving forwarded frames with no readable bitstream",
                 participant: "bob",
-                // The payload is opaque (encrypted-like), so keyframes carry no
-                // readable SPS/PPS — that is the whole point. The DD still drives
-                // reassembly and keyframe detection.
-                quality: VideoQuality::min_frames(120)
-                    .allow_gaps(10)
-                    .allow_missing_parameter_sets(u64::MAX),
+                publisher: "alice",
+                min_frames: 120,
             },
             Step::CheckKeyframeRequests {
                 // If the encrypted stream did not forward decodably, the SFU/decoder
@@ -364,14 +583,11 @@ fn opaque_dependency_descriptor_holds_framerate_under_loss_test() {
                 description: "Soak: frames must keep flowing, decoder must not stall",
                 duration: Duration::from_secs(30),
             },
-            Step::CheckVideoQuality {
-                // ~30fps over 30s is ~900 frames; a collapse to a few fps would
-                // fall far below this floor. Gaps are generous (cellular loss).
+            Step::CheckVideoReceivedFrom {
                 description: "frame rate holds — no collapse to a crawl",
                 participant: "bob",
-                quality: VideoQuality::min_frames(500)
-                    .allow_gaps(80)
-                    .allow_missing_parameter_sets(u64::MAX),
+                publisher: "alice",
+                min_frames: 500,
             },
             Step::CheckKeyframeRequests {
                 description: "no PLI storm even under loss",

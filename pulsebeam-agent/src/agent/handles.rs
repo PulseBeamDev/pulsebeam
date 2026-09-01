@@ -12,6 +12,7 @@ use crate::manager::VideoSubscription;
 use pulsebeam_proto::signaling::Publication as Track;
 use str0m::channel::ChannelId;
 use str0m::media::{Mid, Rid};
+use str0m::rtp::Ssrc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PublicationLease {
@@ -24,6 +25,9 @@ pub(crate) enum OutgoingCommand {
     /// Boxed: it is several times the size of any other variant, and an enum
     /// is as large as its largest.
     SendMedia(Box<SendMedia>),
+    RequestKeyframe {
+        ssrc: Ssrc,
+    },
     SetPlayoutDelay(Option<(u32, u32)>),
     SetAudioIntent(super::AudioIntent),
     Publish {
@@ -326,13 +330,21 @@ impl Publication {
 pub struct RemoteTrack {
     publication: Publication,
     pub(crate) rx: mailbox::Receiver<RtpPacket>,
+    commands: mailbox::Sender<OutgoingCommand>,
+    last_ssrc: Option<Ssrc>,
 }
 
 impl RemoteTrack {
-    pub(crate) fn new(track: Track, rx: mailbox::Receiver<RtpPacket>) -> Self {
+    pub(crate) fn new(
+        track: Track,
+        rx: mailbox::Receiver<RtpPacket>,
+        commands: mailbox::Sender<OutgoingCommand>,
+    ) -> Self {
         Self {
             publication: Publication::from_signaling(track),
             rx,
+            commands,
+            last_ssrc: None,
         }
     }
 
@@ -353,6 +365,17 @@ impl RemoteTrack {
     /// buffering, and decryption are higher-level concerns — see
     /// [`crate::pipeline::FrameReceiver`].
     pub async fn recv(&mut self) -> Result<RtpPacket, mailbox::RecvError> {
-        self.rx.recv().await
+        let packet = self.rx.recv().await?;
+        self.last_ssrc = packet.ssrc;
+        Ok(packet)
+    }
+
+    pub fn request_keyframe(&self) -> bool {
+        let Some(ssrc) = self.last_ssrc else {
+            return false;
+        };
+        self.commands
+            .try_send(OutgoingCommand::RequestKeyframe { ssrc })
+            .is_ok()
     }
 }

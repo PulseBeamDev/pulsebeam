@@ -1,5 +1,9 @@
 use crate::tests::common::client::{
-    AudioReceiveLog, MAX_CONCEALABLE_GAP, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+    AudioReceiveLog, MAX_CONCEALABLE_GAP, QualityVideoReference, SimClientBuilder, VideoReceiveLog,
+    VideoReceiveStats,
+};
+use crate::tests::common::decoder::{
+    MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
 };
 use crate::tests::common::{
     DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
@@ -8,6 +12,7 @@ use crate::tests::common::{
 use pulsebeam_agent::SimulcastLayer;
 use pulsebeam_agent::media::VbrProfile;
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
+use pulsebeam_testdata::{QualityVideoLayer, QualityVideoSource};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -32,6 +37,7 @@ pub struct Participant {
     pub name: &'static str,
     pub role: Role,
     pub rids: Vec<&'static str>,
+    pub quality_video: Option<(QualityVideoSource, QualityVideoLayer)>,
     /// Number of RecvOnly video slots (for multi-subscriber participants). Default 1.
     pub slots: usize,
     pub starts_disconnected: bool,
@@ -60,6 +66,9 @@ pub struct Participant {
     /// Make the published payload opaque (simulating SFrame/E2EE), forcing the SFU
     /// to forward on the Dependency Descriptor alone.
     pub opaque_payload: bool,
+    pub corrupt_video_payload: bool,
+    pub corrupt_audio_payload: bool,
+    pub suppress_natural_keyframe_repeats: bool,
     /// Model a legacy peer that never negotiates the Dependency Descriptor
     /// extension, exercising the marker/deep-inspection fallback for mixed rooms.
     pub marker_only: bool,
@@ -71,6 +80,7 @@ impl Participant {
             name,
             role: Role::Publisher,
             rids: rids.to_vec(),
+            quality_video: None,
             slots: 0,
             starts_disconnected: false,
             vbr: None,
@@ -81,6 +91,9 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            corrupt_video_payload: false,
+            corrupt_audio_payload: false,
+            suppress_natural_keyframe_repeats: false,
             marker_only: false,
         }
     }
@@ -90,6 +103,7 @@ impl Participant {
             name,
             role: Role::Publisher,
             rids: Vec::new(),
+            quality_video: None,
             slots: 0,
             starts_disconnected: false,
             vbr: None,
@@ -100,7 +114,25 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            corrupt_video_payload: false,
+            corrupt_audio_payload: false,
+            suppress_natural_keyframe_repeats: false,
             marker_only: false,
+        }
+    }
+
+    pub fn quality_publisher(name: &'static str, source: QualityVideoSource) -> Self {
+        Self::quality_publisher_at(name, source, QualityVideoLayer::P180)
+    }
+
+    pub fn quality_publisher_at(
+        name: &'static str,
+        source: QualityVideoSource,
+        layer: QualityVideoLayer,
+    ) -> Self {
+        Self {
+            quality_video: Some((source, layer)),
+            ..Self::single_publisher(name)
         }
     }
 
@@ -109,6 +141,7 @@ impl Participant {
             name,
             role: Role::Subscriber,
             rids: Vec::new(),
+            quality_video: None,
             slots: 1,
             starts_disconnected: false,
             vbr: None,
@@ -119,6 +152,9 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            corrupt_video_payload: false,
+            corrupt_audio_payload: false,
+            suppress_natural_keyframe_repeats: false,
             marker_only: false,
         }
     }
@@ -129,6 +165,7 @@ impl Participant {
             name,
             role: Role::Subscriber,
             rids: Vec::new(),
+            quality_video: None,
             slots,
             starts_disconnected: false,
             vbr: None,
@@ -139,6 +176,9 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            corrupt_video_payload: false,
+            corrupt_audio_payload: false,
+            suppress_natural_keyframe_repeats: false,
             marker_only: false,
         }
     }
@@ -157,6 +197,7 @@ impl Participant {
             name,
             role: Role::DataOnly,
             rids: Vec::new(),
+            quality_video: None,
             slots: 0,
             starts_disconnected: false,
             vbr: None,
@@ -167,6 +208,9 @@ impl Participant {
             audio_phase_offset: 0,
             audio_slots: 0,
             opaque_payload: false,
+            corrupt_video_payload: false,
+            corrupt_audio_payload: false,
+            suppress_natural_keyframe_repeats: false,
             marker_only: false,
         }
     }
@@ -266,6 +310,21 @@ impl Participant {
         self.marker_only = true;
         self
     }
+
+    pub fn with_corrupt_video_payload(mut self) -> Self {
+        self.corrupt_video_payload = true;
+        self
+    }
+
+    pub fn with_corrupt_audio_payload(mut self) -> Self {
+        self.corrupt_audio_payload = true;
+        self
+    }
+
+    pub fn suppress_natural_keyframe_repeats(mut self) -> Self {
+        self.suppress_natural_keyframe_repeats = true;
+        self
+    }
 }
 
 pub struct Room {
@@ -292,7 +351,10 @@ impl Room {
 #[derive(Clone, Debug)]
 pub struct VideoQuality {
     pub min_frames: u64,
-    pub max_missing_parameter_sets: u64,
+    pub min_keyframes: u64,
+    pub max_decoder_errors: u64,
+    pub max_decoder_error_keyframes: u64,
+    pub max_missing_parameter_set_keyframes: u64,
     pub max_non_contiguous: u64,
 }
 
@@ -301,15 +363,23 @@ impl VideoQuality {
     pub fn min_frames(n: u64) -> Self {
         Self {
             min_frames: n,
-            max_missing_parameter_sets: 0,
+            min_keyframes: 0,
+            max_decoder_errors: 0,
+            max_decoder_error_keyframes: 0,
+            max_missing_parameter_set_keyframes: 0,
             max_non_contiguous: 0,
         }
     }
 
-    /// Allow up to `n` keyframes without preceding SPS+PPS.
+    pub fn min_keyframes(mut self, n: u64) -> Self {
+        self.min_keyframes = n;
+        self
+    }
+
+    /// Allow up to `n` keyframes whose complete access unit lacked parameter sets.
     #[allow(dead_code)]
-    pub fn allow_missing_parameter_sets(mut self, n: u64) -> Self {
-        self.max_missing_parameter_sets = n;
+    pub fn allow_keyframe_parameter_set_losses(mut self, n: u64) -> Self {
+        self.max_missing_parameter_set_keyframes = n;
         self
     }
 
@@ -518,6 +588,18 @@ pub enum Step {
         publisher: &'static str,
         min_frames: u64,
     },
+    CheckVideoDecodedFrom {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_frames: u64,
+        min_resolution: (usize, usize),
+    },
+    CheckVideoNotRenderedFrom {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+    },
     /// This participant is still the same participant it was - it reconnected, it did not rejoin.
     ///
     /// A reconnect keeps the participant id and changes only the connection generation. If the
@@ -606,6 +688,22 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         expected: &'static [&'static str],
+    },
+    CheckAudioPacketsFrom {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [&'static str],
+    },
+    CheckAudioDecodedFrom {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_samples: u64,
+    },
+    CheckAudioNotHeardFrom {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
     },
     /// A listener is never handed more audio streams than it has slots, and none of them is torn.
     ///
@@ -853,6 +951,8 @@ pub struct VideoSubscription {
 struct ParticipantShared {
     video_rx: Arc<Mutex<VideoReceiveLog>>,
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
+    quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    h264_publishers: Arc<Mutex<BTreeSet<String>>>,
     paused_publishers: Arc<Mutex<BTreeSet<String>>>,
     tx_bytes: Mutex<u64>,
     rx_bytes: Mutex<u64>,
@@ -874,10 +974,15 @@ struct ParticipantShared {
 }
 
 impl ParticipantShared {
-    fn new() -> Self {
+    fn new(
+        quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+        h264_publishers: Arc<Mutex<BTreeSet<String>>>,
+    ) -> Self {
         Self {
             video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
             audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
+            quality_references,
+            h264_publishers,
             paused_publishers: Arc::new(Mutex::new(BTreeSet::new())),
             tx_bytes: Mutex::new(0),
             rx_bytes: Mutex::new(0),
@@ -914,6 +1019,7 @@ struct ParticipantHandle {
     /// something known to be true.
     publishes_video: bool,
     publishes_audio: bool,
+    quality_video: Option<(QualityVideoSource, QualityVideoLayer)>,
     observes_video: bool,
     /// Whether the plan has this participant in the room right now.
     present: bool,
@@ -1027,27 +1133,38 @@ async fn run_participant(
         } else {
             SimClientBuilder::bind(ip, server_ip).await?
         };
-
+        builder = builder.with_quality_references(shared.quality_references.clone());
+        builder = builder.with_h264_publishers(shared.h264_publishers.clone());
+        if config.suppress_natural_keyframe_repeats {
+            builder = builder.suppress_natural_keyframe_repeats();
+        }
         if config.marker_only {
             builder = builder.without_dependency_descriptor();
         }
 
         match config.role {
             Role::Publisher => {
-                let layers = if config.rids.is_empty() {
-                    None
+                if let Some((source, layer)) = config.quality_video {
+                    builder = builder.publish_quality_video(source, layer);
                 } else {
-                    Some(config.rids.iter().map(|r| SimulcastLayer::new(r)).collect())
-                };
-                builder = builder.publish_video(layers);
-                if let Some(profile) = config.vbr {
-                    builder = builder.with_vbr(profile);
-                }
-                if let Some(layers) = config.temporal_dd {
-                    builder = builder.with_temporal_dd(layers);
-                }
-                if config.opaque_payload {
-                    builder = builder.with_opaque_payload();
+                    let layers = if config.rids.is_empty() {
+                        None
+                    } else {
+                        Some(config.rids.iter().map(|r| SimulcastLayer::new(r)).collect())
+                    };
+                    builder = builder.publish_video(layers);
+                    if let Some(profile) = config.vbr {
+                        builder = builder.with_vbr(profile);
+                    }
+                    if let Some(layers) = config.temporal_dd {
+                        builder = builder.with_temporal_dd(layers);
+                    }
+                    if config.opaque_payload {
+                        builder = builder.with_opaque_payload();
+                    }
+                    if config.corrupt_video_payload {
+                        builder = builder.with_corrupt_video_payload();
+                    }
                 }
                 if config.subscribes {
                     builder = builder.receive_video(config.slots.max(1));
@@ -1055,6 +1172,9 @@ async fn run_participant(
             }
             Role::Subscriber => {
                 builder = builder.receive_video(config.slots.max(1));
+                if config.corrupt_video_payload {
+                    builder = builder.with_corrupt_video_payload();
+                }
             }
             Role::DataOnly => {
                 // No tracks; data channels only.
@@ -1065,6 +1185,9 @@ async fn run_participant(
         // shifts the mids the video paths are matched on and the viewer receives nothing at all.
         if let Some(level) = config.audio_level_dbov {
             builder = builder.publish_audio(level, config.audio_phase_offset);
+        }
+        if config.corrupt_audio_payload {
+            builder = builder.with_corrupt_audio_payload();
         }
         if config.audio_slots > 0 {
             builder = builder.receive_audio(config.audio_slots);
@@ -1443,6 +1566,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
         Step::CheckVideoReceivedFrom { .. } => "CheckVideoReceivedFrom",
+        Step::CheckVideoDecodedFrom { .. } => "CheckVideoDecodedFrom",
+        Step::CheckVideoNotRenderedFrom { .. } => "CheckVideoNotRenderedFrom",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
         Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
@@ -1455,6 +1580,9 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
         Step::CheckHeardFrom { .. } => "CheckHeardFrom",
+        Step::CheckAudioPacketsFrom { .. } => "CheckAudioPacketsFrom",
+        Step::CheckAudioDecodedFrom { .. } => "CheckAudioDecodedFrom",
+        Step::CheckAudioNotHeardFrom { .. } => "CheckAudioNotHeardFrom",
         Step::CheckSpeakerRank { .. } => "CheckSpeakerRank",
         Step::CheckAudioStreams { .. } => "CheckAudioStreams",
         Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
@@ -2027,10 +2155,44 @@ async fn execute_plan(
                     stats.keyframes,
                 );
                 assert!(
-                    stats.missing_parameter_sets <= quality.max_missing_parameter_sets,
-                    "step {n}/{total} {kind}: {description} ({participant}) observed {} keyframes without parameter sets in the interval, maximum {}",
-                    stats.missing_parameter_sets,
-                    quality.max_missing_parameter_sets
+                    stats.keyframes >= quality.min_keyframes,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} keyframes in the interval, minimum {}",
+                    stats.keyframes,
+                    quality.min_keyframes
+                );
+                assert!(
+                    stats
+                        .decoder_errors
+                        .saturating_sub(stats.missing_parameter_set_keyframes)
+                        <= quality.max_decoder_errors,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} decoder errors in the interval, maximum {}",
+                    stats
+                        .decoder_errors
+                        .saturating_sub(stats.missing_parameter_set_keyframes),
+                    quality.max_decoder_errors
+                );
+                assert!(
+                    stats
+                        .decoder_error_keyframes
+                        .saturating_sub(stats.missing_parameter_set_keyframes)
+                        <= quality.max_decoder_error_keyframes,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} undecodable keyframes in the interval, maximum {}",
+                    stats
+                        .decoder_error_keyframes
+                        .saturating_sub(stats.missing_parameter_set_keyframes),
+                    quality.max_decoder_error_keyframes
+                );
+                assert!(
+                    stats.missing_parameter_set_keyframes
+                        <= quality.max_missing_parameter_set_keyframes,
+                    "step {n}/{total} {kind}: {description} ({participant}) observed {} keyframes missing parameter sets in the interval, maximum {}",
+                    stats.missing_parameter_set_keyframes,
+                    quality.max_missing_parameter_set_keyframes
+                );
+                assert_eq!(
+                    stats.reference_mismatches, 0,
+                    "step {n}/{total} {kind}: {description} ({participant}) had {} decoded frames without an exact corpus match",
+                    stats.reference_mismatches
                 );
                 assert!(
                     stats.non_contiguous <= quality.max_non_contiguous,
@@ -2096,6 +2258,115 @@ async fn execute_plan(
                 assert!(
                     actual >= *min_frames,
                     "step {n}/{total} {kind}: {description} ({participant} <- {publisher}): expected at least {min_frames} frames from participant_id {publisher_id}, got {actual}"
+                );
+            }
+
+            Step::CheckVideoDecodedFrom {
+                description,
+                participant,
+                publisher,
+                min_frames,
+                min_resolution,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
+                );
+                let publisher_id = handles
+                    .get(publisher)
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
+                    .participant_id()
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": publisher {publisher} has no runtime participant id"))?;
+                let handle = get_handle(handles, participant, description)?;
+                let decoded = handle.video_rx().decoded_from(&publisher_id);
+                let Some(decoded) = decoded else {
+                    panic!(
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed packets but no independently decoded video"
+                    );
+                };
+                assert!(
+                    decoded.frames >= *min_frames,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {} frames, expected at least {min_frames}",
+                    decoded.frames
+                );
+                assert!(
+                    decoded.width >= min_resolution.0 && decoded.height >= min_resolution.1,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {}x{}, expected at least {}x{}",
+                    decoded.width,
+                    decoded.height,
+                    min_resolution.0,
+                    min_resolution.1
+                );
+                assert_eq!(
+                    decoded.decoder_errors, 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed {} decoder errors",
+                    decoded.decoder_errors
+                );
+                assert_eq!(
+                    decoded.reference_mismatches, 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) had {} decoded frames without an exact corpus match",
+                    decoded.reference_mismatches
+                );
+                if let Some((source, layer)) = handles
+                    .get(publisher)
+                    .and_then(|publisher_handle| publisher_handle.quality_video)
+                {
+                    assert_eq!(
+                        (decoded.source, decoded.layer),
+                        (Some(source), Some(layer)),
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded explicit corpus identity {:?}/{:?}, expected {source:?}/{layer:?}",
+                        decoded.source,
+                        decoded.layer
+                    );
+                }
+                if decoded.reference_error.samples > 0 {
+                    assert!(
+                        decoded
+                            .reference_error
+                            .mean_absolute()
+                            .is_some_and(|mean| mean <= MAX_REFERENCE_MEAN_ABSOLUTE),
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) reference mean exceeds {MAX_REFERENCE_MEAN_ABSOLUTE}: {:?}",
+                        decoded.reference_error
+                    );
+                    assert!(
+                        decoded.reference_error.max <= MAX_REFERENCE_PEAK,
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) reference peak exceeds {MAX_REFERENCE_PEAK}: {:?}",
+                        decoded.reference_error
+                    );
+                    assert!(
+                        decoded.source.is_some() && decoded.layer.is_some(),
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) has pixels but no explicit corpus source/layer identity"
+                    );
+                }
+            }
+
+            Step::CheckVideoNotRenderedFrom {
+                description,
+                participant,
+                publisher,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
+                );
+                let publisher_id = handles
+                    .get(publisher)
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
+                    .participant_id()
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": publisher {publisher} has no runtime participant id"))?;
+                let handle = get_handle(handles, participant, description)?;
+                let decoded = handle.video_rx().decoded_from(&publisher_id);
+                let Some(decoded) = decoded else {
+                    panic!(
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) has no decoder observation for a structurally complete corrupt frame"
+                    );
+                };
+                assert_eq!(
+                    decoded.frames, 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) rendered {} corrupt frames",
+                    decoded.frames
+                );
+                assert!(
+                    decoded.decoder_errors > 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) reported no decoder error for corrupt H264"
                 );
             }
 
@@ -2326,6 +2597,116 @@ async fn execute_plan(
                     heard, want,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  heard from:   {heard:?}\n  per speaker:  {:?}",
                     audio.by_publisher
+                );
+            }
+
+            Step::CheckAudioPacketsFrom {
+                description,
+                participant,
+                expected,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                let audio = handle.audio_rx();
+                let heard = audio.packet_heard_from();
+                let want: BTreeSet<String> = expected
+                    .iter()
+                    .filter_map(|name| {
+                        handles
+                            .get(*name)
+                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    heard, want,
+                    "\\nassertion failed\\n  plan step:   {n}/{total} {kind}\\n  description: \"{description}\"\\n  participant:  {participant}\\n  expected packet speakers: {expected:?}\\n  heard packet speakers:   {heard:?}\\n  per speaker:  {:?}",
+                    audio.by_publisher
+                );
+            }
+
+            Step::CheckAudioDecodedFrom {
+                description,
+                participant,
+                publisher,
+                min_samples,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
+                );
+                let publisher_id = handles
+                    .get(publisher)
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
+                    .participant_id()
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": publisher {publisher} has no runtime participant id"))?;
+                let handle = get_handle(handles, participant, description)?;
+                let decoded = handle.audio_rx().decoded_from(&publisher_id);
+                let Some(decoded) = decoded else {
+                    panic!(
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed packets but no independently decoded Opus"
+                    );
+                };
+                assert!(
+                    decoded.decoded_samples >= *min_samples,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {} samples, expected at least {min_samples}",
+                    decoded.decoded_samples
+                );
+                assert_eq!(
+                    decoded.decoder_errors, 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed {} Opus decoder errors",
+                    decoded.decoder_errors
+                );
+                assert_eq!(
+                    decoded.reference_mismatches, 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed {} Opus reference mismatches",
+                    decoded.reference_mismatches
+                );
+                if decoded.reference_error.samples > 0 {
+                    assert!(
+                        decoded
+                            .reference_error
+                            .mean_absolute()
+                            .is_some_and(|mean| mean <= MAX_REFERENCE_MEAN_ABSOLUTE),
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) Opus reference mean exceeds {MAX_REFERENCE_MEAN_ABSOLUTE}: {:?}",
+                        decoded.reference_error
+                    );
+                    assert!(
+                        decoded.reference_error.max <= MAX_AUDIO_REFERENCE_PEAK,
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) Opus reference peak exceeds {MAX_AUDIO_REFERENCE_PEAK}: {:?}",
+                        decoded.reference_error
+                    );
+                }
+            }
+
+            Step::CheckAudioNotHeardFrom {
+                description,
+                participant,
+                publisher,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
+                );
+                let publisher_id = handles
+                    .get(publisher)
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
+                    .participant_id()
+                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": publisher {publisher} has no runtime participant id"))?;
+                let handle = get_handle(handles, participant, description)?;
+                let decoded = handle.audio_rx().decoded_from(&publisher_id);
+                let Some(decoded) = decoded else {
+                    panic!(
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) has no decoder observation for invalid Opus"
+                    );
+                };
+                assert_eq!(
+                    decoded.decoded_samples, 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) counted {} invalid Opus samples as heard",
+                    decoded.decoded_samples
+                );
+                assert!(
+                    decoded.decoder_errors > 0,
+                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) reported no decoder error for invalid Opus"
                 );
             }
 
@@ -2885,34 +3266,94 @@ fn assert_video_quality(
     let kind = "CheckVideoQuality";
     assert!(
         log.frames >= quality.min_frames,
-        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} frames\n  actual:       frames={}, keyframes={}, missing_parameter_sets={}, ts_regression_count={}, non_contiguous={}",
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} decoded frames\n  actual:       frames={}, keyframes={}, decoder_errors={}, decoder_error_keyframes={}, missing_parameter_set_keyframes={}, ts_regression_count={}, non_contiguous={}",
         quality.min_frames,
         log.frames,
         log.keyframes,
-        log.missing_parameter_sets,
+        log.decoder_errors,
+        log.decoder_error_keyframes,
+        log.missing_parameter_set_keyframes,
         log.ts_regression_count,
         log.non_contiguous,
     );
     assert!(
-        log.missing_parameter_sets <= quality.max_missing_parameter_sets,
-        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} keyframes missing parameter sets (decodable)\n  actual:       frames={}, keyframes={}, missing_parameter_sets={}, ts_regression_count={}, non_contiguous={}",
-        quality.max_missing_parameter_sets,
+        log.keyframes >= quality.min_keyframes,
+        "step {n}/{total} {kind}: {description} ({participant}) observed {} keyframes, minimum {}",
+        log.keyframes,
+        quality.min_keyframes
+    );
+    assert!(
+        log.decoder_errors
+            .saturating_sub(log.missing_parameter_set_keyframes)
+            <= quality.max_decoder_errors,
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} decoder errors\n  actual:       frames={}, keyframes={}, decoder_errors={}, decoder_error_keyframes={}, ts_regression_count={}, non_contiguous={}",
+        quality.max_decoder_errors,
         log.frames,
         log.keyframes,
-        log.missing_parameter_sets,
+        log.decoder_errors,
+        log.decoder_error_keyframes,
         log.ts_regression_count,
         log.non_contiguous,
+    );
+    assert!(
+        log.decoder_error_keyframes
+            .saturating_sub(log.missing_parameter_set_keyframes)
+            <= quality.max_decoder_error_keyframes,
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} undecodable keyframes\n  actual:       frames={}, keyframes={}, decoder_errors={}, decoder_error_keyframes={}, ts_regression_count={}, non_contiguous={}",
+        quality.max_decoder_error_keyframes,
+        log.frames,
+        log.keyframes,
+        log.decoder_errors,
+        log.decoder_error_keyframes,
+        log.ts_regression_count,
+        log.non_contiguous,
+    );
+    assert!(
+        log.missing_parameter_set_keyframes <= quality.max_missing_parameter_set_keyframes,
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} keyframes missing parameter sets\n  actual:       frames={}, keyframes={}, decoder_errors={}, decoder_error_keyframes={}, missing_parameter_set_keyframes={}, ts_regression_count={}, non_contiguous={}",
+        quality.max_missing_parameter_set_keyframes,
+        log.frames,
+        log.keyframes,
+        log.decoder_errors,
+        log.decoder_error_keyframes,
+        log.missing_parameter_set_keyframes,
+        log.ts_regression_count,
+        log.non_contiguous,
+    );
+    assert_eq!(
+        log.reference_mismatches, 0,
+        "step {n}/{total} {kind}: {description} ({participant}) had {} decoded frames without an exact corpus match",
+        log.reference_mismatches
     );
     assert!(
         log.non_contiguous <= quality.max_non_contiguous,
-        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} non-contiguous frames (gap budget)\n  actual:       frames={}, keyframes={}, missing_parameter_sets={}, ts_regression_count={}, non_contiguous={}",
+        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≤ {} non-contiguous frames (gap budget)\n  actual:       frames={}, keyframes={}, decoder_errors={}, decoder_error_keyframes={}, ts_regression_count={}, non_contiguous={}",
         quality.max_non_contiguous,
         log.frames,
         log.keyframes,
-        log.missing_parameter_sets,
+        log.decoder_errors,
+        log.decoder_error_keyframes,
         log.ts_regression_count,
         log.non_contiguous,
     );
+    for (publisher, decoded) in &log.decoded_by_publisher {
+        if decoded.reference_error.samples == 0 {
+            continue;
+        }
+        assert!(
+            decoded
+                .reference_error
+                .mean_absolute()
+                .is_some_and(|mean| mean <= MAX_REFERENCE_MEAN_ABSOLUTE),
+            "step {n}/{total} {kind}: {description} ({participant} <- {publisher}) decoded reference mean exceeds {MAX_REFERENCE_MEAN_ABSOLUTE}: {:?}",
+            decoded.reference_error
+        );
+        assert!(
+            decoded.reference_error.max <= MAX_REFERENCE_PEAK,
+            "step {n}/{total} {kind}: {description} ({participant} <- {publisher}) decoded reference peak exceeds {MAX_REFERENCE_PEAK}: {:?}",
+            decoded.reference_error
+        );
+    }
 }
 
 // ── LocalNodeSim ────────────────────────────────────────────────────────────
@@ -3301,7 +3742,7 @@ fn qoe_of(handle: &ParticipantHandle, _window: Duration) -> Qoe {
     Qoe {
         frames: video.frames,
         keyframes: video.keyframes,
-        undecodable_keyframes: video.missing_parameter_sets,
+        undecodable_keyframes: video.decoder_error_keyframes,
         torn_frames: video.non_contiguous,
         // Only where the plan issued an explicit subscription. Falling back to the moment the
         // participant was created measured the plan's own scaffolding instead: nearly every plan
@@ -3517,10 +3958,10 @@ fn check_property(
             if total.keyframes == 0 {
                 return Err("no video keyframe was decoded".to_string());
             }
-            if total.missing_parameter_sets != 0 {
+            if total.decoder_error_keyframes != 0 {
                 return Err(format!(
                     "{} decoded keyframes were missing parameter sets",
-                    total.missing_parameter_sets
+                    total.decoder_error_keyframes
                 ));
             }
         }
@@ -4119,6 +4560,9 @@ impl LocalNodeSim {
         });
 
         let mut handles = PlanHandles::new();
+        let quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let h264_publishers: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
         let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
         pulsebeam_runtime::net::shaper::set_gro_window(server_ip, self.link.gro_window);
@@ -4165,7 +4609,10 @@ impl LocalNodeSim {
                     pulsebeam_runtime::net::shaper::set_downlink(ip, bps);
                 }
 
-                let shared = Arc::new(ParticipantShared::new());
+                let shared = Arc::new(ParticipantShared::new(
+                    quality_references.clone(),
+                    h264_publishers.clone(),
+                ));
                 let (cmd_tx, cmd_rx) = mpsc::channel::<ParticipantCmd>(16);
 
                 handles.insert(
@@ -4181,6 +4628,7 @@ impl LocalNodeSim {
                         publishes_video: matches!(participant.role, Role::Publisher)
                             || participant.subscribes && !participant.rids.is_empty(),
                         publishes_audio: participant.audio_level_dbov.is_some(),
+                        quality_video: participant.quality_video,
                         observes_video: participant.slots > 0 || participant.subscribes,
                         present: !participant.starts_disconnected,
                         departed_cleanly: true,

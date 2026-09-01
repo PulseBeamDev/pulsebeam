@@ -29,6 +29,7 @@ opus.workspace = true
 opusic-sys.workspace = true
 pin-project-lite = "0.2.17"
 rand.workspace = true
+str0m.workspace = true
 proptest = "1.11.0"
 pulsebeam = { path = "../pulsebeam", features = ["sim"] }
 pulsebeam-agent = { path = "../pulsebeam-agent", features = ["sim"] }

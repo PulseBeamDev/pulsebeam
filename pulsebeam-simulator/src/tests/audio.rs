@@ -6,6 +6,7 @@
 //! published audio at all.
 
 use super::common::{LocalNodeSim, Participant, Room, Step};
+use pulsebeam_testdata::QUALITY_AUDIO_FRAME_SAMPLES;
 use std::time::Duration;
 
 /// Audio published by a participant reaches the people in the room.
@@ -43,6 +44,111 @@ fn audio_reaches_the_room_test() {
                 participant: "listener",
                 min_speakers: 1,
                 max_streams: 3,
+            },
+        ]);
+}
+
+#[test]
+fn each_listener_must_count_only_decoded_opus_as_heard_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("decoded-audio-boundary")
+                .with_participant(Participant::data_participant("speaker").speaking_at(-30))
+                .with_participant(Participant::subscriber("listener-a").hearing(1))
+                .with_participant(Participant::subscriber("listener-b").hearing(1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Deliver the speaker to both independent listeners",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckHeardFrom {
+                description: "Listener A packet oracle attributes the speaker",
+                participant: "listener-a",
+                expected: &["speaker"],
+            },
+            Step::CheckHeardFrom {
+                description: "Listener B packet oracle attributes the speaker",
+                participant: "listener-b",
+                expected: &["speaker"],
+            },
+            Step::CheckAudioDecodedFrom {
+                description: "Listener A reports decoded Opus for the speaker",
+                participant: "listener-a",
+                publisher: "speaker",
+                min_samples: QUALITY_AUDIO_FRAME_SAMPLES as u64,
+            },
+            Step::CheckAudioDecodedFrom {
+                description: "Listener B reports independent decoded Opus for the speaker",
+                participant: "listener-b",
+                publisher: "speaker",
+                min_samples: QUALITY_AUDIO_FRAME_SAMPLES as u64,
+            },
+        ]);
+}
+
+#[test]
+fn decoded_invalid_opus_packets_must_not_count_as_heard_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("corrupt-audio-oracle")
+                .with_participant(Participant::data_participant("speaker").speaking_at(-30))
+                .with_participant(
+                    Participant::subscriber("listener")
+                        .hearing(1)
+                        .with_corrupt_audio_payload(),
+                ),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Forward invalid Opus packets with intact RTP structure",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckRxBytes {
+                description: "The packet-only oracle sees media bytes",
+                participant: "listener",
+                min_bytes: 1,
+            },
+            Step::CheckAudioPacketsFrom {
+                description: "The packet-only oracle attributes the packets",
+                participant: "listener",
+                expected: &["speaker"],
+            },
+            Step::CheckAudioNotHeardFrom {
+                description: "Invalid Opus does not count as heard audio",
+                participant: "listener",
+                publisher: "speaker",
+            },
+        ]);
+}
+
+#[test]
+fn decoded_opus_recovers_after_corpus_dtx_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("decoded-audio-dtx")
+                .with_participant(Participant::data_participant("speaker").speaking_at(-30))
+                .with_participant(Participant::subscriber("listener").hearing(1)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Decode active audio before the corpus DTX interval",
+                duration: Duration::from_secs(2),
+            },
+            Step::Run {
+                description: "Cross the corpus DTX interval and recover active audio",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckHeardFrom {
+                description: "The listener hears sustained decoded audio after DTX",
+                participant: "listener",
+                expected: &["speaker"],
+            },
+            Step::CheckAudioDecodedFrom {
+                description: "Decoded sample progress survives DTX recovery",
+                participant: "listener",
+                publisher: "speaker",
+                min_samples: (QUALITY_AUDIO_FRAME_SAMPLES * 150) as u64,
             },
         ]);
 }

@@ -1,12 +1,32 @@
 use openh264::decoder::Decoder as H264Decoder;
 use openh264::formats::YUVSource;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    Decoder(String),
+    ReferenceMismatch(String),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decoder(error) | Self::ReferenceMismatch(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceError {
     pub sum: u64,
     pub samples: u64,
     pub max: u16,
 }
+
+pub const MAX_REFERENCE_MEAN_ABSOLUTE: u64 = 5_500;
+pub const MAX_REFERENCE_PEAK: u16 = 32;
+pub const MAX_AUDIO_REFERENCE_PEAK: u16 = 24_000;
 
 impl ReferenceError {
     pub fn mean_absolute(self) -> Option<u64> {
@@ -19,6 +39,13 @@ pub struct DecodedVideo {
     pub width: usize,
     pub height: usize,
     pub reference_error: ReferenceError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedVideoObservation {
+    pub width: usize,
+    pub height: usize,
+    pub reference_error: Option<ReferenceError>,
 }
 
 pub struct H264ReferenceDecoder {
@@ -43,49 +70,83 @@ impl H264ReferenceDecoder {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.decoder = H264Decoder::new().unwrap_or_else(|error| {
+            panic!(
+                "OpenH264 reinitialization failed for source {:?}, stream {:?}: {error}",
+                self.source, self.stream
+            )
+        });
+    }
+
     pub fn decode(&mut self, access_unit: &[u8], reference_yuv420p: &[u8]) -> DecodedVideo {
-        assert!(
-            !access_unit.is_empty(),
-            "empty H.264 access unit for source {:?}, stream {:?}",
-            self.source,
-            self.stream
-        );
-        let image = self
-            .decoder
-            .decode(access_unit)
+        let decoded = self
+            .try_decode_observation(access_unit, Some(reference_yuv420p))
             .unwrap_or_else(|error| {
                 panic!(
                     "OpenH264 decode failed for source {:?}, stream {:?}: {error}",
                     self.source, self.stream
                 )
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "OpenH264 produced no picture for complete access unit from source {:?}, stream {:?}",
-                    self.source, self.stream
-                )
             });
+        let reference_error = decoded.reference_error.unwrap_or_else(|| {
+            panic!(
+                "H.264 reference mismatch for source {:?}, stream {:?}",
+                self.source, self.stream
+            )
+        });
+        DecodedVideo {
+            width: decoded.width,
+            height: decoded.height,
+            reference_error,
+        }
+    }
+
+    pub fn try_decode_observation(
+        &mut self,
+        access_unit: &[u8],
+        reference_yuv420p: Option<&[u8]>,
+    ) -> Result<DecodedVideoObservation, DecodeError> {
+        debug_assert!(!access_unit.is_empty());
+        if access_unit.is_empty() {
+            return Err(DecodeError::Decoder(format!(
+                "empty H.264 access unit for source {:?}, stream {:?}",
+                self.source, self.stream
+            )));
+        }
+        let image = self.decoder.decode(access_unit).map_err(|error| {
+            DecodeError::Decoder(format!(
+                "OpenH264 decode failed for source {:?}, stream {:?}: {error}",
+                self.source, self.stream
+            ))
+        })?.ok_or_else(|| {
+            DecodeError::Decoder(format!(
+                "OpenH264 produced no picture for complete access unit from source {:?}, stream {:?}",
+                self.source, self.stream
+            ))
+        })?;
         let (width, height) = image.dimensions();
-        assert!(
-            width > 0 && height > 0,
-            "OpenH264 returned invalid dimensions {width}x{height} for source {:?}, stream {:?}",
-            self.source,
-            self.stream
-        );
-        let reference_error =
-            reference_error_yuv420p(&image, reference_yuv420p).unwrap_or_else(|| {
-                panic!(
+        if width == 0 || height == 0 {
+            return Err(DecodeError::Decoder(format!(
+                "OpenH264 returned invalid dimensions {width}x{height} for source {:?}, stream {:?}",
+                self.source, self.stream
+            )));
+        }
+        let reference_error = match reference_yuv420p {
+            Some(reference) => Some(reference_error_yuv420p(&image, reference).ok_or_else(|| {
+                DecodeError::ReferenceMismatch(format!(
                     "H.264 reference mismatch for source {:?}, stream {:?}: decoded dimensions {width}x{height}, reference bytes {}",
                     self.source,
                     self.stream,
-                    reference_yuv420p.len()
-                )
-            });
-        DecodedVideo {
+                    reference.len()
+                ))
+            })?),
+            None => None,
+        };
+        Ok(DecodedVideoObservation {
             width,
             height,
             reference_error,
-        }
+        })
     }
 }
 
@@ -93,6 +154,12 @@ impl H264ReferenceDecoder {
 pub struct DecodedAudio {
     pub samples: usize,
     pub reference_error: ReferenceError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedAudioObservation {
+    pub samples: usize,
+    pub reference_error: Option<ReferenceError>,
 }
 
 pub struct OpusReferenceDecoder {
@@ -118,39 +185,68 @@ impl OpusReferenceDecoder {
     }
 
     pub fn decode(&mut self, packet: &[u8], reference_pcm_s16le: &[u8]) -> DecodedAudio {
-        assert!(
-            !packet.is_empty(),
-            "empty Opus packet for source {:?}, stream {:?}",
-            self.source,
-            self.stream
-        );
-        let samples = self
-            .decoder
-            .decode(packet, &mut self.pcm, false)
+        let decoded = self
+            .try_decode_observation(packet, Some(reference_pcm_s16le))
             .unwrap_or_else(|error| {
                 panic!(
                     "Opus decode failed for source {:?}, stream {:?}: {error}",
                     self.source, self.stream
                 )
             });
-        let pcm = self.pcm.get(..samples).unwrap_or_else(|| {
+        let reference_error = decoded.reference_error.unwrap_or_else(|| {
             panic!(
-                "Opus returned {samples} samples outside its output buffer for source {:?}, stream {:?}",
+                "Opus reference mismatch for source {:?}, stream {:?}",
                 self.source, self.stream
             )
         });
-        let reference_error = reference_error_pcm(pcm, reference_pcm_s16le).unwrap_or_else(|| {
-            panic!(
-                "Opus reference mismatch for source {:?}, stream {:?}: decoded samples {samples}, reference bytes {}",
-                self.source,
-                self.stream,
-                reference_pcm_s16le.len()
-            )
-        });
         DecodedAudio {
-            samples,
+            samples: decoded.samples,
             reference_error,
         }
+    }
+
+    pub fn try_decode_observation(
+        &mut self,
+        packet: &[u8],
+        reference_pcm_s16le: Option<&[u8]>,
+    ) -> Result<DecodedAudioObservation, DecodeError> {
+        debug_assert!(!packet.is_empty());
+        if packet.is_empty() {
+            return Err(DecodeError::Decoder(format!(
+                "empty Opus packet for source {:?}, stream {:?}",
+                self.source, self.stream
+            )));
+        }
+        let samples = self
+            .decoder
+            .decode(packet, &mut self.pcm, false)
+            .map_err(|error| {
+                DecodeError::Decoder(format!(
+                    "Opus decode failed for source {:?}, stream {:?}: {error}",
+                    self.source, self.stream
+                ))
+            })?;
+        let pcm = self.pcm.get(..samples).ok_or_else(|| {
+            DecodeError::Decoder(format!(
+                "Opus returned {samples} samples outside its output buffer for source {:?}, stream {:?}",
+                self.source, self.stream
+            ))
+        })?;
+        let reference_error = match reference_pcm_s16le {
+            Some(reference) => Some(reference_error_pcm(pcm, reference).ok_or_else(|| {
+                DecodeError::ReferenceMismatch(format!(
+                    "Opus reference mismatch for source {:?}, stream {:?}: decoded samples {samples}, reference bytes {}",
+                    self.source,
+                    self.stream,
+                    reference.len()
+                ))
+            })?),
+            None => None,
+        };
+        Ok(DecodedAudioObservation {
+            samples,
+            reference_error,
+        })
     }
 }
 
@@ -256,9 +352,13 @@ fn combine_errors(errors: [ReferenceError; 3]) -> ReferenceError {
 #[cfg(test)]
 mod tests {
     use super::{H264ReferenceDecoder, OpusReferenceDecoder};
+    use pulsebeam_agent::{FrameReceiver, FrameSender, MediaFrame, MediaTime};
     use pulsebeam_testdata::{
-        QualityVideoLayer, QualityVideoSource, quality_corpus_audio, quality_corpus_video,
+        QualityVideoLayer, QualityVideoSource, RAW_H264_FULL_CBR, RAW_H264_HALF_CBR,
+        RAW_H264_QUARTER_CBR, quality_corpus_audio, quality_corpus_video,
     };
+    use std::sync::Arc;
+    use tokio::time::Instant;
 
     #[test]
     fn decoder_h264_returns_dimensions_and_reference_facts() {
@@ -300,5 +400,68 @@ mod tests {
             "unexpected Opus fixture error: {:?}",
             decoded.reference_error
         );
+    }
+
+    #[test]
+    fn raw_h264_round_trips_through_agent_pipeline_and_decodes() {
+        let access_units: Vec<_> = pulsebeam_agent::media::H264FrameSlicer::new(RAW_H264_FULL_CBR)
+            .take(180)
+            .collect();
+        assert!(access_units.len() >= 100);
+        let mut sender = FrameSender::h264(pulsebeam_agent::Mid::from("v0"), None, 1, 1);
+        let mut receiver = FrameReceiver::with_h264();
+        let mut decoder = H264ReferenceDecoder::new("raw", "video");
+        let mut decoded = 0usize;
+        let mut received_frames = 0usize;
+        for (index, access_unit) in access_units.iter().enumerate() {
+            let frame = MediaFrame {
+                ts: MediaTime::from_90khz(u64::try_from(index).unwrap_or(0) * 3_000),
+                data: Arc::from(*access_unit),
+                capture_time: Instant::now(),
+                abs_capture_time: None,
+                contiguous: true,
+                is_keyframe: index == 0,
+                audio_level: None,
+                voice_activity: None,
+                target_bitrate_bps: None,
+                resolution: None,
+                dependency_descriptor: None,
+                temporal_layers: None,
+            };
+            for packet in sender.packetize(&frame) {
+                for received in receiver.push(packet) {
+                    received_frames += 1;
+                    if decoder.try_decode_observation(&received.data, None).is_ok() {
+                        decoded += 1;
+                    }
+                }
+            }
+        }
+        for received in receiver.flush() {
+            received_frames += 1;
+            if decoder.try_decode_observation(&received.data, None).is_ok() {
+                decoded += 1;
+            }
+        }
+        assert_eq!(received_frames, access_units.len());
+        assert_eq!(decoded, access_units.len());
+    }
+
+    #[test]
+    fn raw_h264_fixture_keyframes_decode_standalone() {
+        for (name, data) in [
+            ("full", RAW_H264_FULL_CBR),
+            ("half", RAW_H264_HALF_CBR),
+            ("quarter", RAW_H264_QUARTER_CBR),
+        ] {
+            let frame = pulsebeam_agent::media::H264FrameSlicer::new(data)
+                .next()
+                .expect("raw H264 fixture has a first access unit");
+            let mut decoder = H264ReferenceDecoder::new(name, "video");
+            assert!(
+                decoder.try_decode_observation(frame, None).is_ok(),
+                "{name} raw fixture keyframe must decode"
+            );
+        }
     }
 }

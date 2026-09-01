@@ -787,6 +787,7 @@ impl TrackLifecycle {
                 runtime: TrackRuntime {
                     descriptor: Some(TrackDescriptor {
                         origin_key: runtime.origin_key,
+                        kind: runtime.track.kind(),
                         encodings: runtime
                             .track
                             .layers()

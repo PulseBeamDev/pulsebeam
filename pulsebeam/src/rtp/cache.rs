@@ -25,6 +25,11 @@ const _: () = assert!(PACKET_WINDOW_CAPACITY.is_power_of_two());
 #[cfg(test)]
 const STREAM_CACHE_CAPACITY: usize = PACKET_WINDOW_CAPACITY;
 
+fn sequence_is_newer(candidate: u64, reference: u64) -> bool {
+    let distance = candidate.wrapping_sub(reference);
+    distance != 0 && distance < (1u64 << 63)
+}
+
 /// How many frames a switch segment may span.
 ///
 /// The keyframe itself is an unavoidable burst — the encoder built it that way.
@@ -82,7 +87,9 @@ pub struct StreamCache {
     /// segment so a switch can be prefixed with parameter sets even when the
     /// encoder only emits them once at stream start.
     sps: Option<RtpPacket>,
+    sps_seq: Option<u64>,
     pps: Option<RtpPacket>,
+    pps_seq: Option<u64>,
 }
 
 /// Fixed, sequence-addressed RTP storage shared by ingress reordering and
@@ -179,7 +186,9 @@ impl StreamCache {
             segment_start_seq: None,
             segment_ts: None,
             sps: None,
+            sps_seq: None,
             pps: None,
+            pps_seq: None,
         }
     }
 
@@ -192,18 +201,28 @@ impl StreamCache {
     /// type-keyed map, so cloning an `RtpPacket` heap-allocates — measured at
     /// 75ns against 35ns for one with no extensions.
     pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
-        if pkt.nal.sps() {
-            self.sps = Some(pkt.clone());
-        }
-        if pkt.nal.pps() {
-            self.pps = Some(pkt.clone());
-        }
-
         let seq = *pkt.seq_no;
+        if pkt.nal.sps()
+            && self
+                .sps_seq
+                .as_ref()
+                .is_none_or(|previous| sequence_is_newer(seq, *previous))
+        {
+            self.sps = Some(pkt.clone());
+            self.sps_seq = Some(seq);
+        }
+        if pkt.nal.pps()
+            && self
+                .pps_seq
+                .as_ref()
+                .is_none_or(|previous| sequence_is_newer(seq, *previous))
+        {
+            self.pps = Some(pkt.clone());
+            self.pps_seq = Some(seq);
+        }
 
         let frame_ts = pkt.rtp_ts.numer();
-        // Anchoring needs the keyframe's *first* packet, not any packet of it.
-        let opens_segment = pkt.is_keyframe && pkt.is_frame_start;
+        let opens_segment = pkt.is_keyframe;
 
         if let Some(pkt) = self.packets.push(pkt) {
             return Some(pkt);
@@ -214,10 +233,14 @@ impl StreamCache {
         // opened on a later packet would replay a frame the receiver cannot
         // start assembling, and it discards the whole thing — including the
         // template structure, which only keyframes carry.
-        if opens_segment
-            && (self.segment_ts != Some(frame_ts)
-                || self.segment_start_seq.is_none_or(|start| seq < start))
-        {
+        let newer_segment = match (self.segment_start_seq, self.segment_ts) {
+            (None, _) | (_, None) => true,
+            (Some(start), Some(previous_ts)) if frame_ts == previous_ts => {
+                sequence_is_newer(start, seq)
+            }
+            (Some(start), Some(_)) => sequence_is_newer(seq, start),
+        };
+        if opens_segment && newer_segment {
             self.open_segment(seq, frame_ts);
         }
 
@@ -297,6 +320,17 @@ impl StreamCache {
             return None;
         }
 
+        if !segment.last().is_some_and(|p| p.marker) {
+            return None;
+        }
+
+        let has_readable_h264 = segment
+            .iter()
+            .any(|p| p.nal.sps() || p.nal.pps() || p.nal.idr());
+        if has_readable_h264 && !segment.iter().any(|p| p.nal.idr()) {
+            return None;
+        }
+
         // A late-arriving keyframe fragment can end up with a higher seq_no than
         // the delta frames that followed it.  After sorting by seq_no the burst
         // would have non-monotonic RTP timestamps (T0, T1, T0), and rewriting it
@@ -348,12 +382,25 @@ impl StreamCache {
         // can arrive after the IDR under reordering.
         let needs_parameter_sets = segment.iter().any(|p| p.nal.idr());
 
+        let keyframe_packets = segment
+            .iter()
+            .take_while(|packet| packet.rtp_ts.numer() == segment_ts)
+            .count();
         let mut out = if needs_parameter_sets {
             self.parameter_set_prefix(&segment, segment_ts)?
         } else {
             Vec::new()
         };
+        let prefix_len = out.len();
         out.extend(segment);
+
+        if prefix_len > 0 {
+            Self::rewrite_replay_frame_boundaries(
+                &mut out,
+                prefix_len,
+                prefix_len.saturating_add(keyframe_packets),
+            );
+        }
 
         debug_assert!(
             !needs_parameter_sets || out.iter().any(|p| p.nal.sps()),
@@ -370,6 +417,63 @@ impl StreamCache {
             "replay must be ordered by sequence number"
         );
         Some(out)
+    }
+
+    fn rewrite_replay_frame_boundaries(
+        packets: &mut [RtpPacket],
+        prefix_len: usize,
+        frame_end: usize,
+    ) {
+        debug_assert!(prefix_len > 0 && prefix_len < frame_end && frame_end <= packets.len());
+        let Some(anchor_dd) = packets
+            .get(prefix_len)
+            .and_then(|packet| {
+                packet
+                    .ext_vals
+                    .user_values
+                    .get::<pulsebeam_core::dd::DependencyDescriptor>()
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let last = frame_end.saturating_sub(1);
+        for (index, packet) in packets.iter_mut().enumerate().take(frame_end) {
+            let start_of_frame = index == 0;
+            let end_of_frame = index == last;
+            packet.is_frame_start = start_of_frame;
+            packet.marker = end_of_frame;
+            if let Some(mut raw) = packet
+                .ext_vals
+                .user_values
+                .get::<pulsebeam_core::dd::RawDependencyDescriptor>()
+                .cloned()
+            {
+                let Some(flags) = raw.0.first_mut() else {
+                    debug_assert!(false, "a dependency descriptor has mandatory fields");
+                    continue;
+                };
+                *flags = (*flags & !0b1100_0000)
+                    | if start_of_frame { 0b1000_0000 } else { 0 }
+                    | if end_of_frame { 0b0100_0000 } else { 0 };
+                packet.ext_vals.user_values.set(raw);
+            }
+            let Some(existing) = packet
+                .ext_vals
+                .user_values
+                .get::<pulsebeam_core::dd::DependencyDescriptor>()
+            else {
+                continue;
+            };
+            let mut dd = if index < prefix_len {
+                anchor_dd.clone()
+            } else {
+                existing.clone()
+            };
+            dd.start_of_frame = index == 0;
+            dd.end_of_frame = index == last;
+            packet.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+        }
     }
 
     /// The live read for a subscriber following this stream: every buffered
@@ -450,7 +554,9 @@ impl StreamCache {
         self.segment_start_seq = None;
         self.segment_ts = None;
         self.sps = None;
+        self.sps_seq = None;
         self.pps = None;
+        self.pps_seq = None;
     }
 }
 
@@ -560,6 +666,25 @@ mod test {
             Some(head_seq),
             "the burst must begin where the receiver can begin"
         );
+    }
+
+    #[test]
+    fn late_parameter_sets_reanchor_an_idr_segment() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let frame = b.keyframe(3);
+        let mut cache = StreamCache::new();
+        assert!(!frame[0].is_keyframe);
+        for packet in frame.iter().skip(1) {
+            cache.push(packet.clone());
+        }
+        assert!(cache.replay().is_none());
+        cache.push(frame[0].clone());
+
+        let replay = cache.replay().expect("late parameter sets restore replay");
+        assert!(replay.first().is_some_and(|packet| packet.is_frame_start));
+        assert!(replay.iter().any(|packet| packet.nal.sps()));
+        assert!(replay.iter().any(|packet| packet.nal.pps()));
+        assert!(replay.iter().any(|packet| packet.nal.idr()));
     }
 
     /// And if the head never arrives, refuse rather than replay a frame with no
@@ -768,6 +893,123 @@ mod test {
             replay.iter().any(|p| p.nal.pps()),
             "readable H.264 must carry PPS even when a descriptor is present"
         );
+    }
+
+    #[test]
+    fn synthesized_parameter_sets_share_one_dependency_descriptor_frame() {
+        use pulsebeam_core::dd::{DependencyDescriptor, temporal::TemporalDdGenerator};
+
+        let mut generator = TemporalDdGenerator::new(3);
+        let mut b = builder(ParameterSetStyle::OnceAtStreamStart);
+        let mut cache = StreamCache::new();
+        let mut push = |packets: Vec<RtpPacket>, keyframe: bool| {
+            for mut packet in packets {
+                packet.ext_vals.user_values.set_arc(std::sync::Arc::new(
+                    generator.next(keyframe && packet.is_keyframe),
+                ));
+                cache.push(packet);
+            }
+        };
+        push(b.keyframe(2), true);
+        push(b.delta_frames(3, 2), false);
+        push(b.keyframe(2), true);
+        let later_delta = b.delta_frames(1, 2);
+        let mut expected_later_delta = Vec::new();
+        for mut packet in later_delta {
+            let descriptor = generator.next(false);
+            expected_later_delta.push((packet.marker, descriptor.clone()));
+            packet
+                .ext_vals
+                .user_values
+                .set_arc(std::sync::Arc::new(descriptor));
+            cache.push(packet);
+        }
+
+        let replay = cache.replay().expect("replayable");
+        assert!(replay.len() > 2, "the replay needs a synthesized prefix");
+        assert!(replay[0].nal.sps() || replay[0].nal.pps());
+        assert!(replay[0].is_frame_start);
+        assert!(!replay[1].is_frame_start);
+        let keyframe_ts = replay
+            .iter()
+            .find(|packet| packet.nal.idr())
+            .map(|packet| packet.rtp_ts.numer())
+            .expect("replay has an IDR");
+        let delta_start = replay
+            .iter()
+            .position(|packet| packet.rtp_ts.numer() > keyframe_ts)
+            .expect("replay has a delta after the keyframe");
+        assert!(replay[delta_start].is_frame_start);
+        assert!(replay[delta_start - 1].marker);
+        let later_delta_packets: Vec<_> = replay
+            .iter()
+            .filter(|packet| packet.rtp_ts.numer() > keyframe_ts)
+            .collect();
+        assert_eq!(later_delta_packets.len(), expected_later_delta.len());
+        for (packet, (marker, descriptor)) in
+            later_delta_packets.iter().zip(expected_later_delta.iter())
+        {
+            assert_eq!(packet.marker, *marker);
+            assert_eq!(
+                packet.ext_vals.user_values.get::<DependencyDescriptor>(),
+                Some(descriptor)
+            );
+        }
+        let descriptors: Vec<_> = replay
+            .iter()
+            .filter_map(|packet| packet.ext_vals.user_values.get::<DependencyDescriptor>())
+            .collect();
+        assert!(!descriptors.is_empty());
+        assert!(descriptors[0].start_of_frame);
+        assert!(
+            descriptors[..delta_start]
+                .iter()
+                .skip(1)
+                .all(|dd| !dd.start_of_frame)
+        );
+        assert!(descriptors[delta_start].start_of_frame);
+        assert!(descriptors[delta_start - 1].end_of_frame);
+        assert!(descriptors[delta_start..].iter().any(|dd| dd.end_of_frame));
+        assert!(descriptors.last().is_some_and(|dd| dd.end_of_frame));
+    }
+
+    #[test]
+    fn a_late_older_keyframe_cannot_replace_a_newer_replay_segment() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        let old = b.keyframe(2);
+        for packet in &old {
+            cache.push(packet.clone());
+        }
+        for packet in b.delta_frames(2, 2) {
+            cache.push(packet);
+        }
+        let newer = b.keyframe(2);
+        let newer_ts = newer[0].rtp_ts.numer();
+        for packet in &newer {
+            cache.push(packet.clone());
+        }
+
+        for packet in &old {
+            let late = packet.clone();
+            cache.push(late);
+        }
+
+        let replay = cache.replay().expect("newer replay remains available");
+        assert!(
+            replay
+                .iter()
+                .all(|packet| packet.rtp_ts.numer() >= newer_ts),
+            "a late older frame must not replace the newer segment"
+        );
+    }
+
+    #[test]
+    fn sequence_frontier_is_wrap_safe() {
+        assert!(sequence_is_newer(0, u64::MAX));
+        assert!(sequence_is_newer(1, u64::MAX));
+        assert!(!sequence_is_newer(u64::MAX, 0));
+        assert!(!sequence_is_newer(7, 7));
     }
 
     #[test]

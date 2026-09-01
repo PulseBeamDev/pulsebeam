@@ -1041,7 +1041,6 @@ impl Slot {
         let Some(cache) = cache else {
             return false;
         };
-
         // The switcher owns the entire switching state machine; hand it the
         // whole track cache and let it emit whatever the subscriber should see. A
         // change in the active stream means a switch was promoted this tick.

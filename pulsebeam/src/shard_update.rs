@@ -64,6 +64,7 @@ pub(crate) struct TrackPlanUpdate {
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
     pub origin_key: ParticipantKey,
+    pub kind: crate::entity::TrackKind,
     pub encodings: Vec<Option<Rid>>,
 }
 

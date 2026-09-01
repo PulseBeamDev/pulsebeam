@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 /// Payload bytes that fit in one RTP packet after headers/extensions. Kept well
 /// under a 1200-byte MTU to leave room for the DD and other header extensions.
 pub const DEFAULT_MTU_PAYLOAD: usize = 1100;
+pub const MAX_FRAME_SIZE: usize = 16usize * 1024 * 1024;
 
 /// One packet's worth of a frame, plus where it sits in the frame.
 #[derive(Debug, Clone, PartialEq, Eq)]

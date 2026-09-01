@@ -114,8 +114,11 @@ impl ShardRuntime {
                     .or(runtime.publisher)
                     .unwrap_or_default();
                 let cache = descriptor
-                    .is_some_and(|descriptor| !descriptor.encodings.is_empty())
-                    .then(TrackStreamCache::new);
+                    .filter(|descriptor| descriptor.kind == crate::entity::TrackKind::Video)
+                    .map(|descriptor| {
+                        debug_assert!(descriptor.encodings.len() <= 3);
+                        TrackStreamCache::new()
+                    });
                 let publisher = runtime.publisher;
                 let key = *key;
                 if let Some(previous) = self.tracks.get(key) {
@@ -325,6 +328,7 @@ mod tests {
             runtime: crate::shard_update::TrackRuntime {
                 descriptor: Some(crate::shard_update::TrackDescriptor {
                     origin_key,
+                    kind: crate::entity::TrackKind::Video,
                     encodings: vec![Some(str0m::media::Rid::from("q"))],
                 }),
                 ..Default::default()
@@ -336,6 +340,7 @@ mod tests {
             runtime: crate::shard_update::TrackRuntime {
                 descriptor: Some(crate::shard_update::TrackDescriptor {
                     origin_key,
+                    kind: crate::entity::TrackKind::Video,
                     encodings: vec![Some(str0m::media::Rid::from("f"))],
                 }),
                 ..Default::default()
@@ -343,6 +348,64 @@ mod tests {
         });
 
         assert_eq!(runtime.tracks.get(key).unwrap().link_seq, 7);
+    }
+
+    #[test]
+    fn an_empty_encoding_descriptor_still_allocates_stream_cache() {
+        let _rng = pulsebeam_runtime::rand::seeded_rng(1);
+        let mut runtime = ShardRuntime::new(ShardId::new(0));
+        let mut track_keys = SlotMap::<TrackKey, ()>::with_key();
+        let key = track_keys.insert(());
+        let mut participant_keys = SlotMap::<ParticipantKey, ()>::with_key();
+        let origin_key = participant_keys.insert(());
+
+        runtime.apply_update_op(&crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
+            key,
+            runtime: crate::shard_update::TrackRuntime {
+                descriptor: Some(crate::shard_update::TrackDescriptor {
+                    origin_key,
+                    kind: crate::entity::TrackKind::Video,
+                    encodings: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            runtime
+                .tracks
+                .get(key)
+                .is_some_and(|track| track.cache.is_some())
+        );
+    }
+
+    #[test]
+    fn an_audio_track_descriptor_does_not_allocate_a_stream_cache() {
+        let _rng = pulsebeam_runtime::rand::seeded_rng(1);
+        let mut runtime = ShardRuntime::new(ShardId::new(0));
+        let mut track_keys = SlotMap::<TrackKey, ()>::with_key();
+        let key = track_keys.insert(());
+        let mut participant_keys = SlotMap::<ParticipantKey, ()>::with_key();
+        let origin_key = participant_keys.insert(());
+
+        runtime.apply_update_op(&crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
+            key,
+            runtime: crate::shard_update::TrackRuntime {
+                descriptor: Some(crate::shard_update::TrackDescriptor {
+                    origin_key,
+                    kind: crate::entity::TrackKind::Audio,
+                    encodings: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            runtime
+                .tracks
+                .get(key)
+                .is_some_and(|track| track.cache.is_none())
+        );
     }
 
     #[test]

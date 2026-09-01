@@ -147,6 +147,7 @@ pub struct H264Looper {
     /// start codes are overwritten so the SFU's payload probe finds no IDR, SPS, or
     /// PPS, leaving the Dependency Descriptor as the only forwarding signal.
     opaque_payload: bool,
+    repeat_keyframes: bool,
 }
 
 impl H264Looper {
@@ -158,6 +159,7 @@ impl H264Looper {
             fps,
             dd: None,
             opaque_payload: false,
+            repeat_keyframes: true,
         }
     }
 
@@ -168,6 +170,7 @@ impl H264Looper {
             fps,
             dd: None,
             opaque_payload: false,
+            repeat_keyframes: true,
         }
     }
 
@@ -187,6 +190,16 @@ impl H264Looper {
         self
     }
 
+    pub fn without_natural_keyframe_repeats(mut self) -> Self {
+        self.repeat_keyframes = false;
+        self
+    }
+
+    fn reset_to_keyframe(&mut self) {
+        debug_assert!(self.asset.first_idr < self.asset.frames.len());
+        self.index = self.asset.first_idr;
+    }
+
     fn next(&mut self) -> Arc<[u8]> {
         debug_assert!(
             self.index < self.asset.frames.len(),
@@ -199,11 +212,14 @@ impl H264Looper {
             .cloned()
             .unwrap_or_default();
         let frame = &frame;
-        self.index = self
-            .index
-            .saturating_add(1)
-            .checked_rem(self.asset.frames.len())
-            .unwrap_or(0);
+        let next = self.index.saturating_add(1);
+        self.index = if next < self.asset.frames.len() {
+            next
+        } else if self.repeat_keyframes {
+            0
+        } else {
+            self.asset.frames.len().saturating_sub(1)
+        };
         if self.opaque_payload {
             return opaque_frame(frame);
         }
@@ -223,8 +239,6 @@ impl H264Looper {
             .unwrap_or(1);
         let mut interval = tokio::time::interval(frame_interval);
         let mut frame_count: u64 = 0;
-        // The pipeline owns Dependency Descriptor generation; the source only
-        // declares its scalability depth and which frames are keyframes.
         let mut frame_sender = if self.opaque_payload {
             crate::pipeline::FrameSender::new(mid, rid, 1, temporal_layers)
         } else {
@@ -234,14 +248,9 @@ impl H264Looper {
         loop {
             let tick_time = interval.tick().await;
 
-            if sender.keyframe_rx.is_requested() {
-                tracing::debug!(
-                    ?mid,
-                    ?rid,
-                    first_idr = self.asset.first_idr,
-                    "keyframe reset"
-                );
-                self.index = self.asset.first_idr;
+            let keyframe_requested = sender.keyframe_rx.is_requested();
+            if keyframe_requested {
+                self.reset_to_keyframe();
             }
 
             let is_keyframe = self.index == self.asset.first_idr;
@@ -603,21 +612,16 @@ impl VbrLooper {
                 .checked_add(Duration::from_secs_f64(1.0 / fps as f64))
                 .unwrap_or(now);
 
-            if sender.keyframe_rx.is_requested() {
-                tracing::debug!(
-                    ?mid,
-                    ?rid,
-                    first_idr = self.asset.first_idr,
-                    "keyframe reset"
-                );
+            let keyframe_requested = sender.keyframe_rx.is_requested();
+            if keyframe_requested {
                 self.index = self.asset.first_idr;
             }
 
             // Derive the timestamp from wall-clock elapsed rather than a frame counter: the frame
             // rate changes between phases, so a counter would drift against real time and the
             // receiver would see the media clock stall during quiet stretches.
-            let is_keyframe = active && self.index == self.asset.first_idr;
-            let data = if active {
+            let is_keyframe = (active || keyframe_requested) && self.index == self.asset.first_idr;
+            let data = if active || keyframe_requested {
                 self.next()
             } else {
                 self.next_small()
@@ -741,6 +745,31 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suppressed_natural_repeats_hold_on_delta_until_keyframe_reset() {
+        let data = [
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x06, 0, 0, 0, 1, 0x65,
+            0x80, 0x11, 0, 0, 0, 1, 0x41, 0x80, 0x22,
+        ];
+        let asset = Arc::new(SharedH264Asset::new(&data));
+        assert_eq!(asset.frames.len(), 2);
+        assert_eq!(asset.first_idr, 0);
+        let mut looper = H264Looper::new_shared(asset, 30).without_natural_keyframe_repeats();
+
+        let keyframe = looper.next();
+        let delta = looper.next();
+        assert_eq!(looper.next(), delta);
+        assert_eq!(looper.next(), delta);
+
+        looper.reset_to_keyframe();
+        assert_eq!(looper.next(), keyframe);
     }
 }
 

@@ -1,3 +1,4 @@
+use super::decoder::{DecodeError, H264ReferenceDecoder, OpusReferenceDecoder, ReferenceError};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -6,13 +7,13 @@ use pulsebeam_agent::agent::{
     DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
 };
 use pulsebeam_agent::api::HttpApiClient;
-use pulsebeam_agent::media::{AudioLooper, H264Looper, VbrLooper, VbrProfile};
+use pulsebeam_agent::media::{H264Looper, VbrLooper, VbrProfile};
 use pulsebeam_agent::{
     Agent, LocalTrack, ParticipantChange, Participants, RemoteTrack, SimulcastLayer,
 };
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,6 +42,42 @@ pub struct SimClientBuilder {
     receives_audio: bool,
     /// Make the payload opaque (SFrame/E2EE) so the SFU forwards on DD alone.
     opaque_payload: bool,
+    quality_video: Option<(
+        pulsebeam_testdata::QualityVideoSource,
+        pulsebeam_testdata::QualityVideoLayer,
+    )>,
+    corrupt_video_payload: bool,
+    corrupt_audio_payload: bool,
+    suppress_natural_keyframe_repeats: bool,
+    quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    h264_publishers: Arc<Mutex<BTreeSet<String>>>,
+}
+
+pub(crate) struct QualityVideoReference {
+    source: pulsebeam_testdata::QualityVideoSource,
+    layer: pulsebeam_testdata::QualityVideoLayer,
+    corpus: pulsebeam_testdata::QualityCorpusVideo,
+    decoded: Vec<u8>,
+    encoded_frames: Vec<(Vec<u8>, usize)>,
+}
+
+fn canonical_annex_b(data: &[u8]) -> Vec<u8> {
+    let mut canonical = Vec::with_capacity(data.len());
+    let mut index = 0;
+    while index < data.len() {
+        let start_code_len = if data.get(index..index.saturating_add(4)) == Some(&[0, 0, 0, 1]) {
+            4
+        } else if data.get(index..index.saturating_add(3)) == Some(&[0, 0, 1]) {
+            3
+        } else {
+            canonical.push(data[index]);
+            index = index.saturating_add(1);
+            continue;
+        };
+        canonical.extend_from_slice(&[0, 0, 0, 1]);
+        index = index.saturating_add(start_code_len);
+    }
+    canonical
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -78,6 +115,12 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
+            quality_video: None,
+            corrupt_video_payload: false,
+            corrupt_audio_payload: false,
+            suppress_natural_keyframe_repeats: false,
+            quality_references: Arc::new(Mutex::new(BTreeMap::new())),
+            h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -106,12 +149,29 @@ impl SimClientBuilder {
             audio_phase_offset: 0,
             receives_audio: false,
             opaque_payload: false,
+            quality_video: None,
+            corrupt_video_payload: false,
+            corrupt_audio_payload: false,
+            suppress_natural_keyframe_repeats: false,
+            quality_references: Arc::new(Mutex::new(BTreeMap::new())),
+            h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
     pub fn publish_video(mut self, simulcast_layers: Option<Vec<SimulcastLayer>>) -> Self {
         self.agent_builder = self.agent_builder.video_upstream_slots(1, simulcast_layers);
         self.publishes_video = true;
+        self
+    }
+
+    pub fn publish_quality_video(
+        mut self,
+        source: pulsebeam_testdata::QualityVideoSource,
+        layer: pulsebeam_testdata::QualityVideoLayer,
+    ) -> Self {
+        self.agent_builder = self.agent_builder.video_upstream_slots(1, None);
+        self.publishes_video = true;
+        self.quality_video = Some((source, layer));
         self
     }
 
@@ -152,6 +212,21 @@ impl SimClientBuilder {
         self
     }
 
+    pub fn with_corrupt_video_payload(mut self) -> Self {
+        self.corrupt_video_payload = true;
+        self
+    }
+
+    pub fn with_corrupt_audio_payload(mut self) -> Self {
+        self.corrupt_audio_payload = true;
+        self
+    }
+
+    pub fn suppress_natural_keyframe_repeats(mut self) -> Self {
+        self.suppress_natural_keyframe_repeats = true;
+        self
+    }
+
     pub fn receive_video(mut self, capacity: usize) -> Self {
         self.agent_builder = self.agent_builder.video_downstream_slots(capacity);
         self
@@ -183,13 +258,55 @@ impl SimClientBuilder {
         self
     }
 
+    pub(crate) fn with_quality_references(
+        mut self,
+        references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    ) -> Self {
+        self.quality_references = references;
+        self
+    }
+
+    pub(crate) fn with_h264_publishers(mut self, publishers: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.h264_publishers = publishers;
+        self
+    }
+
     pub fn with_video_rx(mut self, rx: Arc<Mutex<VideoReceiveLog>>) -> Self {
         self.video_rx = Some(rx);
         self
     }
 
-    pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
+    pub(crate) async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
         let (agent, runner) = self.agent_builder.connect_unmanaged(room).await?;
+        if self.publishes_video && !self.opaque_payload {
+            self.h264_publishers
+                .lock()
+                .unwrap()
+                .insert(agent.participant_id().to_string());
+        }
+        if let Some((source, layer)) = self.quality_video {
+            let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
+            let decoded = corpus
+                .decode_reference()
+                .unwrap_or_else(|error| panic!("quality H.264 reference failed: {error}"));
+            let encoded_frames = (0..corpus.len())
+                .filter_map(|index| {
+                    corpus
+                        .frame(index)
+                        .map(|frame| (canonical_annex_b(frame.encoded), frame.index))
+                })
+                .collect();
+            self.quality_references.lock().unwrap().insert(
+                agent.participant_id().clone(),
+                QualityVideoReference {
+                    source,
+                    layer,
+                    corpus,
+                    decoded,
+                    encoded_frames,
+                },
+            );
+        }
         let mut join_set = JoinSet::new();
         join_set.spawn(async move {
             runner.run().await.expect("agent runner failed");
@@ -240,16 +357,26 @@ impl SimClientBuilder {
             received_data: Vec::new(),
             video_rx,
             audio_rx,
+            quality_references: self.quality_references.clone(),
+            h264_publishers: self.h264_publishers.clone(),
+            corrupt_video_payload: self.corrupt_video_payload,
             local_publications: local_video.into_iter().collect(),
         };
         if let Some(mut audio_tracks) = audio_tracks {
             let log = ctx.audio_rx.clone();
+            let corrupt_payload = self.corrupt_audio_payload;
             join_set.spawn(async move {
                 while let Ok(mut track) = audio_tracks.next().await {
                     let publisher = track.publisher_id().to_owned();
                     let log = log.clone();
                     tokio::spawn(async move {
+                        let mut decoder = OpusReceiver::new(&publisher);
                         while let Ok(rtp) = track.recv().await {
+                            let mut rtp = rtp;
+                            if corrupt_payload {
+                                let payload = Arc::make_mut(&mut rtp.payload);
+                                payload.fill(0xff);
+                            }
                             log.lock().unwrap().record(
                                 &publisher,
                                 rtp.ssrc.map_or(0, |s| *s),
@@ -257,6 +384,7 @@ impl SimClientBuilder {
                                 rtp.payload.len(),
                                 Instant::now(),
                             );
+                            decoder.push(&rtp, &log, &publisher);
                         }
                     });
                 }
@@ -280,20 +408,28 @@ impl SimClientBuilder {
         for publication in &ctx.local_publications {
             for sender in publication.encodings().iter().cloned() {
                 let rid = sender.rid();
-                match self.vbr_profile {
-                    Some(profile) => {
-                        let looper = create_vbr_looper_for_rid(rid, profile);
-                        join_set.spawn(looper.run(sender));
-                    }
-                    None => {
-                        let mut looper = create_h264_looper_for_rid(rid);
-                        if let Some(layers) = self.temporal_dd {
-                            looper = looper.with_temporal_layers(layers);
+                if let Some((source, layer)) = self.quality_video {
+                    let looper = create_quality_h264_looper(source, layer);
+                    join_set.spawn(looper.run(sender));
+                } else {
+                    match self.vbr_profile {
+                        Some(profile) => {
+                            let looper = create_vbr_looper_for_rid(rid, profile);
+                            join_set.spawn(looper.run(sender));
                         }
-                        if self.opaque_payload {
-                            looper = looper.with_opaque_payload();
+                        None => {
+                            let mut looper = create_h264_looper_for_rid(rid);
+                            if self.suppress_natural_keyframe_repeats {
+                                looper = looper.without_natural_keyframe_repeats();
+                            }
+                            if let Some(layers) = self.temporal_dd {
+                                looper = looper.with_temporal_layers(layers);
+                            }
+                            if self.opaque_payload {
+                                looper = looper.with_opaque_payload();
+                            }
+                            join_set.spawn(looper.run(sender));
                         }
-                        join_set.spawn(looper.run(sender));
                     }
                 }
             }
@@ -301,10 +437,11 @@ impl SimClientBuilder {
         if let Some((publication, level)) = local_audio {
             for sender in publication.encodings().iter().cloned() {
                 join_set.spawn(
-                    AudioLooper::speaking()
-                        .with_level_dbov(level)
-                        .with_phase_offset(self.audio_phase_offset)
-                        .run(sender),
+                    QualityAudioLooper {
+                        level_dbov: level,
+                        phase_offset: self.audio_phase_offset,
+                    }
+                    .run(sender),
                 );
             }
             // The handle has to outlive the loopers. Dropping a `LocalTrack` unpublishes it, so
@@ -326,6 +463,7 @@ impl SimClientBuilder {
 #[derive(Default, Debug, Clone)]
 pub struct VideoReceiveLog {
     pub by_publisher: BTreeMap<String, u64>,
+    pub decoded_by_publisher: BTreeMap<String, DecodedVideoStream>,
     pub frames: u64,
     pub keyframes: u64,
     pub non_contiguous: u64,
@@ -338,10 +476,12 @@ pub struct VideoReceiveLog {
     pub ts_regression_count: u64,
     /// Largest backwards jump in RTP time, in 90kHz ticks.
     pub max_ts_regression: u64,
-    /// Keyframes that arrived without SPS+PPS in the same picture. The decoder
-    /// cannot render these: the SFU keeps one egress SSRC across switches while
-    /// every simulcast layer has its own SPS.
-    pub missing_parameter_sets: u64,
+    pub decoder_errors: u64,
+    pub reference_mismatches: u64,
+    /// Keyframes whose complete access unit failed to decode.
+    pub decoder_error_keyframes: u64,
+    /// Keyframes rejected before decode because the access unit had no SPS/PPS.
+    pub missing_parameter_set_keyframes: u64,
     pub bytes: u64,
     /// When the very first frame reached the decoder. Time-to-first-frame is measured from this
     /// against the moment the viewer subscribed, which only the harness knows.
@@ -363,11 +503,27 @@ pub struct VideoReceiveLog {
     seen_ts: HashSet<u64>,
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedVideoStream {
+    pub frames: u64,
+    pub width: usize,
+    pub height: usize,
+    pub source: Option<pulsebeam_testdata::QualityVideoSource>,
+    pub layer: Option<pulsebeam_testdata::QualityVideoLayer>,
+    pub decoder_errors: u64,
+    pub reference_mismatches: u64,
+    pub reference_error: ReferenceError,
+}
+
 /// What arrived from one speaker, as the listener heard it.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioStream {
     pub packets: u64,
     pub bytes: u64,
+    pub decoded_samples: u64,
+    pub decoder_errors: u64,
+    pub reference_mismatches: u64,
+    pub reference_error: ReferenceError,
     /// Longest stretch with no packet, once the stream had started.
     ///
     /// Audio is far less forgiving than video here. A picture that misses 200ms is a stutter
@@ -385,11 +541,48 @@ pub struct AudioStream {
     pub last_rank: Option<u32>,
     first_at: Option<Instant>,
     last_at: Option<Instant>,
+    decoded_first_at: Option<Instant>,
+    decoded_last_at: Option<Instant>,
+}
+
+impl DecodedVideoStream {
+    fn record(
+        &mut self,
+        width: usize,
+        height: usize,
+        reference: Option<ReferenceError>,
+        quality_identity: Option<(
+            pulsebeam_testdata::QualityVideoSource,
+            pulsebeam_testdata::QualityVideoLayer,
+        )>,
+    ) {
+        debug_assert!(width > 0 && height > 0);
+        self.frames = self.frames.saturating_add(1);
+        self.width = width;
+        self.height = height;
+        if let Some((source, layer)) = quality_identity {
+            self.source = Some(source);
+            self.layer = Some(layer);
+        }
+        if let Some(error) = reference {
+            self.reference_error.sum = self.reference_error.sum.saturating_add(error.sum);
+            self.reference_error.samples =
+                self.reference_error.samples.saturating_add(error.samples);
+            self.reference_error.max = self.reference_error.max.max(error.max);
+        }
+    }
 }
 
 impl AudioStream {
     /// How long this speaker was on the wire, first packet to last.
     pub fn audible_for(&self) -> Duration {
+        match (self.decoded_first_at, self.decoded_last_at) {
+            (Some(first), Some(last)) => last.saturating_duration_since(first),
+            _ => Duration::ZERO,
+        }
+    }
+
+    fn packet_audible_for(&self) -> Duration {
         match (self.first_at, self.last_at) {
             (Some(first), Some(last)) => last.saturating_duration_since(first),
             _ => Duration::ZERO,
@@ -406,6 +599,19 @@ impl AudioStream {
         self.last_at = Some(now);
         self.packets = self.packets.saturating_add(1);
         self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_decoded(&mut self, samples: usize, now: Instant, reference: Option<ReferenceError>) {
+        debug_assert!(samples > 0);
+        self.decoded_first_at.get_or_insert(now);
+        self.decoded_last_at = Some(now);
+        self.decoded_samples = self.decoded_samples.saturating_add(samples as u64);
+        if let Some(error) = reference {
+            self.reference_error.sum = self.reference_error.sum.saturating_add(error.sum);
+            self.reference_error.samples =
+                self.reference_error.samples.saturating_add(error.samples);
+            self.reference_error.max = self.reference_error.max.max(error.max);
+        }
     }
 }
 
@@ -459,6 +665,32 @@ impl AudioReceiveLog {
         entry.last_rank = Some(rank);
     }
 
+    fn record_decoded(
+        &mut self,
+        publisher: &str,
+        samples: usize,
+        reference: Option<ReferenceError>,
+    ) {
+        self.by_publisher
+            .entry(publisher.to_owned())
+            .or_default()
+            .record_decoded(samples, Instant::now(), reference);
+    }
+
+    fn record_decoder_error(&mut self, publisher: &str) {
+        let stream = self.by_publisher.entry(publisher.to_owned()).or_default();
+        stream.decoder_errors = stream.decoder_errors.saturating_add(1);
+    }
+
+    fn record_reference_mismatch(&mut self, publisher: &str) {
+        let stream = self.by_publisher.entry(publisher.to_owned()).or_default();
+        stream.reference_mismatches = stream.reference_mismatches.saturating_add(1);
+    }
+
+    pub fn decoded_from(&self, publisher: &str) -> Option<AudioStream> {
+        self.by_publisher.get(publisher).copied()
+    }
+
     /// Speakers this listener was told about, whether or not media arrived.
     pub fn ranked(&self) -> std::collections::BTreeMap<String, u32> {
         self.by_publisher
@@ -489,6 +721,21 @@ impl AudioReceiveLog {
         self.by_publisher
             .iter()
             .filter(|(_, stream)| stream.audible_for() >= floor)
+            .map(|(publisher, _)| publisher.clone())
+            .collect()
+    }
+
+    pub fn packet_heard_from(&self) -> std::collections::BTreeSet<String> {
+        let longest = self
+            .by_publisher
+            .values()
+            .map(AudioStream::packet_audible_for)
+            .max()
+            .unwrap_or_default();
+        let floor = MIN_AUDIBLE.max(longest / SUSTAINED_SHARE_DIVISOR);
+        self.by_publisher
+            .iter()
+            .filter(|(_, stream)| stream.packet_audible_for() >= floor)
             .map(|(publisher, _)| publisher.clone())
             .collect()
     }
@@ -526,7 +773,10 @@ pub const FREEZE_THRESHOLD: Duration = Duration::from_millis(500);
 pub struct VideoReceiveStats {
     pub frames: u64,
     pub keyframes: u64,
-    pub missing_parameter_sets: u64,
+    pub decoder_errors: u64,
+    pub decoder_error_keyframes: u64,
+    pub missing_parameter_set_keyframes: u64,
+    pub reference_mismatches: u64,
     pub non_contiguous: u64,
     pub duplicate_ts_frames: u64,
     pub ts_regression_count: u64,
@@ -542,9 +792,16 @@ impl VideoReceiveStats {
         Self {
             frames: self.frames.saturating_sub(baseline.frames),
             keyframes: self.keyframes.saturating_sub(baseline.keyframes),
-            missing_parameter_sets: self
-                .missing_parameter_sets
-                .saturating_sub(baseline.missing_parameter_sets),
+            decoder_errors: self.decoder_errors.saturating_sub(baseline.decoder_errors),
+            reference_mismatches: self
+                .reference_mismatches
+                .saturating_sub(baseline.reference_mismatches),
+            decoder_error_keyframes: self
+                .decoder_error_keyframes
+                .saturating_sub(baseline.decoder_error_keyframes),
+            missing_parameter_set_keyframes: self
+                .missing_parameter_set_keyframes
+                .saturating_sub(baseline.missing_parameter_set_keyframes),
             non_contiguous: self.non_contiguous.saturating_sub(baseline.non_contiguous),
             duplicate_ts_frames: self
                 .duplicate_ts_frames
@@ -561,41 +818,23 @@ impl VideoReceiveStats {
     }
 }
 
-/// Scans an Annex-B frame for the H.264 NAL unit types it contains, using the
-/// same `pulsebeam_core::h264::classify()` classifier as the production SFU forwarder.
-fn annexb_nalu_types(data: &[u8]) -> Vec<pulsebeam_core::h264::NalFlags> {
-    let mut flags = Vec::new();
-    let mut i = 0usize;
-    while i + 3 < data.len() {
-        let short = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
-        let long = i + 3 < data.len()
-            && data[i] == 0
-            && data[i + 1] == 0
-            && data[i + 2] == 0
-            && data[i + 3] == 1;
-        if short || long {
-            let start = i + if short { 3 } else { 4 };
-            if start < data.len() {
-                flags.push(pulsebeam_core::h264::classify(&data[start..]));
-            }
-            i = start + 1;
-        } else {
-            i += 1;
-        }
-    }
-    flags
-}
-
 impl VideoReceiveLog {
     pub fn frames_from(&self, publisher: &str) -> u64 {
         self.by_publisher.get(publisher).copied().unwrap_or(0)
+    }
+
+    pub fn decoded_from(&self, publisher: &str) -> Option<DecodedVideoStream> {
+        self.decoded_by_publisher.get(publisher).copied()
     }
 
     pub fn stats(&self) -> VideoReceiveStats {
         VideoReceiveStats {
             frames: self.frames,
             keyframes: self.keyframes,
-            missing_parameter_sets: self.missing_parameter_sets,
+            decoder_errors: self.decoder_errors,
+            reference_mismatches: self.reference_mismatches,
+            decoder_error_keyframes: self.decoder_error_keyframes,
+            missing_parameter_set_keyframes: self.missing_parameter_set_keyframes,
             non_contiguous: self.non_contiguous,
             duplicate_ts_frames: self.duplicate_ts_frames,
             ts_regression_count: self.ts_regression_count,
@@ -608,28 +847,8 @@ impl VideoReceiveLog {
     }
 
     fn record(&mut self, publisher: &str, frame: &pulsebeam_agent::MediaFrame) {
-        let now = Instant::now();
-        if let Some(previous) = self.last_frame_at {
-            let gap = now.saturating_duration_since(previous);
-            self.longest_frame_gap = self.longest_frame_gap.max(gap);
-            if gap > FREEZE_THRESHOLD {
-                self.frozen_time = self.frozen_time.saturating_add(gap);
-            }
-        }
-        self.first_frame_at.get_or_insert(now);
-        self.last_frame_at = Some(now);
         *self.by_publisher.entry(publisher.to_owned()).or_default() += 1;
-        self.frames += 1;
         self.bytes += frame.data.len() as u64;
-        if frame.is_keyframe {
-            self.keyframes += 1;
-            let nalus = annexb_nalu_types(&frame.data);
-            let has_sps = nalus.iter().any(|f| f.sps());
-            let has_pps = nalus.iter().any(|f| f.pps());
-            if !nalus.is_empty() && (!has_sps || !has_pps) {
-                self.missing_parameter_sets += 1;
-            }
-        }
         if !frame.contiguous {
             self.non_contiguous += 1;
         }
@@ -651,9 +870,335 @@ impl VideoReceiveLog {
         }
         self.last_ts = Some(ts);
     }
+
+    fn record_decoded(
+        &mut self,
+        publisher: &str,
+        width: usize,
+        height: usize,
+        reference: Option<ReferenceError>,
+        is_keyframe: bool,
+        quality_identity: Option<(
+            pulsebeam_testdata::QualityVideoSource,
+            pulsebeam_testdata::QualityVideoLayer,
+        )>,
+    ) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_frame_at {
+            let gap = now.saturating_duration_since(previous);
+            self.longest_frame_gap = self.longest_frame_gap.max(gap);
+            if gap > FREEZE_THRESHOLD {
+                self.frozen_time = self.frozen_time.saturating_add(gap);
+            }
+        }
+        self.first_frame_at.get_or_insert(now);
+        self.last_frame_at = Some(now);
+        self.frames = self.frames.saturating_add(1);
+        if is_keyframe {
+            self.keyframes = self.keyframes.saturating_add(1);
+        }
+        self.decoded_by_publisher
+            .entry(publisher.to_owned())
+            .or_default()
+            .record(width, height, reference, quality_identity);
+    }
+
+    fn record_decoder_error(&mut self, publisher: &str, is_keyframe: bool) {
+        let stream = self
+            .decoded_by_publisher
+            .entry(publisher.to_owned())
+            .or_default();
+        self.decoder_errors = self.decoder_errors.saturating_add(1);
+        stream.decoder_errors = stream.decoder_errors.saturating_add(1);
+        if is_keyframe {
+            self.decoder_error_keyframes = self.decoder_error_keyframes.saturating_add(1);
+        }
+    }
+
+    fn record_reference_mismatch(&mut self, publisher: &str) {
+        self.reference_mismatches = self.reference_mismatches.saturating_add(1);
+        let stream = self
+            .decoded_by_publisher
+            .entry(publisher.to_owned())
+            .or_default();
+        stream.reference_mismatches = stream.reference_mismatches.saturating_add(1);
+    }
+
+    fn record_missing_parameter_set(&mut self, publisher: &str) {
+        self.missing_parameter_set_keyframes =
+            self.missing_parameter_set_keyframes.saturating_add(1);
+        self.record_decoder_error(publisher, true);
+    }
 }
 
 type SubscribedTopics = Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>;
+
+struct QualityAudioLooper {
+    level_dbov: i8,
+    phase_offset: u64,
+}
+
+fn create_quality_h264_looper(
+    source: pulsebeam_testdata::QualityVideoSource,
+    layer: pulsebeam_testdata::QualityVideoLayer,
+) -> H264Looper {
+    let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
+    debug_assert!(!corpus.is_empty());
+    let mut data = Vec::new();
+    for index in 0..corpus.len() {
+        let Some(frame) = corpus.frame(index) else {
+            debug_assert!(false, "quality H.264 corpus cursor escaped its bounds");
+            continue;
+        };
+        debug_assert!(!frame.encoded.is_empty());
+        data.extend_from_slice(frame.encoded);
+    }
+    debug_assert!(!data.is_empty());
+    H264Looper::new(&data, pulsebeam_testdata::QUALITY_VIDEO_FPS)
+}
+
+impl QualityAudioLooper {
+    async fn run(self, sender: pulsebeam_agent::agent::LocalEncoding) {
+        let corpus =
+            pulsebeam_testdata::quality_corpus_audio(pulsebeam_testdata::QualityAudioSource::Zero);
+        debug_assert!(!corpus.is_empty());
+        let mut packetizer = pulsebeam_agent::pipeline::FrameSender::without_dependency_descriptor(
+            str0m::media::Mid::from("a0"),
+            None,
+            1,
+        );
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        let mut counter = 0u64;
+        loop {
+            let capture_time = interval.tick().await;
+            let phase = counter.saturating_add(self.phase_offset);
+            let payload_index = usize::try_from(phase)
+                .unwrap_or(usize::MAX)
+                .checked_rem(corpus.len())
+                .unwrap_or(0);
+            let Some(corpus_frame) = corpus.frame(payload_index) else {
+                debug_assert!(false, "quality Opus corpus cursor escaped its bounds");
+                return;
+            };
+            let speaking = self.level_dbov > -60
+                && matches!(
+                    corpus_frame.region,
+                    pulsebeam_testdata::QualityAudioRegion::Active
+                );
+            let frame = pulsebeam_agent::MediaFrame {
+                audio_level: Some(if speaking { self.level_dbov } else { -70 }),
+                voice_activity: Some(speaking),
+                ts: str0m::media::MediaTime::new(
+                    phase.saturating_mul(
+                        u64::try_from(pulsebeam_testdata::QUALITY_AUDIO_FRAME_SAMPLES)
+                            .unwrap_or(u64::MAX),
+                    ),
+                    str0m::media::Frequency::FORTY_EIGHT_KHZ,
+                ),
+                data: Arc::from(corpus_frame.opus_packet),
+                capture_time,
+                abs_capture_time: Some(pulsebeam_agent::clock::capture_wallclock()),
+                contiguous: true,
+                is_keyframe: false,
+                target_bitrate_bps: None,
+                resolution: None,
+                dependency_descriptor: None,
+                temporal_layers: None,
+            };
+            for packet in packetizer.packetize(&frame) {
+                if sender.send(packet).await.is_err() {
+                    return;
+                }
+            }
+            counter = counter.saturating_add(1);
+        }
+    }
+}
+
+struct OpusReceiver {
+    decoder: OpusReferenceDecoder,
+    corpus: pulsebeam_testdata::QualityCorpusAudio,
+    reference: Vec<u8>,
+}
+
+fn record_video_frame(
+    log: &Arc<Mutex<VideoReceiveLog>>,
+    quality_references: &Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    decoder: &mut H264ReferenceDecoder,
+    decoder_ready: &mut bool,
+    publisher: &str,
+    frame: pulsebeam_agent::MediaFrame,
+    corrupt_payload: bool,
+) {
+    log.lock().unwrap().record(publisher, &frame);
+    if !frame.contiguous {
+        *decoder_ready = false;
+    }
+    let is_keyframe = frame.is_keyframe || annex_b_has_nal_type(&frame.data, 5);
+    if !is_keyframe && !*decoder_ready {
+        return;
+    }
+    let has_parameter_sets =
+        annex_b_has_nal_type(&frame.data, 7) && annex_b_has_nal_type(&frame.data, 8);
+    if is_keyframe && !*decoder_ready && !corrupt_payload && !has_parameter_sets {
+        log.lock().unwrap().record_missing_parameter_set(publisher);
+        return;
+    }
+    let stream_reset = is_keyframe && has_parameter_sets;
+    if stream_reset {
+        decoder.reset();
+    }
+    let quality_reference_required = quality_references.lock().unwrap().contains_key(publisher);
+    let reference = quality_references
+        .lock()
+        .unwrap()
+        .get(publisher)
+        .and_then(|entry| {
+            entry.encoded_frames.iter().find_map(|(encoded, index)| {
+                (encoded.as_slice() == frame.data.as_ref()).then(|| {
+                    entry
+                        .corpus
+                        .reference_frame(&entry.decoded, *index)
+                        .map(|reference| (reference.to_vec(), entry.source, entry.layer))
+                })?
+            })
+        });
+    if quality_reference_required && reference.is_none() {
+        log.lock().unwrap().record_reference_mismatch(publisher);
+    }
+    let mut decode_frame = frame;
+    if corrupt_payload {
+        decode_frame.data = Arc::from([0, 0, 0, 1, 0x65, 0xff]);
+    }
+    let decode_result = decoder.try_decode_observation(
+        &decode_frame.data,
+        reference
+            .as_ref()
+            .map(|(reference, _, _)| reference.as_slice()),
+    );
+    let decoded_ok = decode_result.is_ok();
+    match decode_result {
+        Ok(observation) => log.lock().unwrap().record_decoded(
+            publisher,
+            observation.width,
+            observation.height,
+            observation.reference_error,
+            is_keyframe,
+            reference.map(|(_, source, layer)| (source, layer)),
+        ),
+        Err(DecodeError::Decoder(_)) | Err(DecodeError::ReferenceMismatch(_)) => {
+            log.lock()
+                .unwrap()
+                .record_decoder_error(publisher, is_keyframe);
+        }
+    }
+    if is_keyframe && decoded_ok {
+        *decoder_ready = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_keyframe_without_parameter_sets_is_recorded_as_undecodable() {
+        let log = Arc::new(Mutex::new(VideoReceiveLog::default()));
+        let references = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut decoder = H264ReferenceDecoder::new("source", "video");
+        let mut decoder_ready = false;
+        let frame = pulsebeam_agent::MediaFrame {
+            audio_level: None,
+            voice_activity: None,
+            ts: str0m::media::MediaTime::from_90khz(0),
+            data: Arc::from([0, 0, 0, 1, 0x65, 0]),
+            capture_time: tokio::time::Instant::now(),
+            abs_capture_time: None,
+            contiguous: true,
+            is_keyframe: true,
+            target_bitrate_bps: None,
+            resolution: None,
+            dependency_descriptor: None,
+            temporal_layers: None,
+        };
+
+        record_video_frame(
+            &log,
+            &references,
+            &mut decoder,
+            &mut decoder_ready,
+            "source",
+            frame,
+            false,
+        );
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.frames, 0);
+        assert_eq!(log.decoder_errors, 1);
+        assert_eq!(log.decoder_error_keyframes, 1);
+        assert_eq!(log.decoded_from("source").unwrap().decoder_errors, 1);
+    }
+}
+
+fn annex_b_has_nal_type(data: &[u8], wanted: u8) -> bool {
+    let mut index = 0usize;
+    while index.saturating_add(3) < data.len() {
+        let header = if data.get(index..index.saturating_add(4)) == Some(&[0, 0, 0, 1]) {
+            index.saturating_add(4)
+        } else if data.get(index..index.saturating_add(3)) == Some(&[0, 0, 1]) {
+            index.saturating_add(3)
+        } else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if data.get(header).is_some_and(|byte| byte & 0x1f == wanted) {
+            return true;
+        }
+        index = header;
+    }
+    false
+}
+
+impl OpusReceiver {
+    fn new(publisher: &str) -> Self {
+        let corpus =
+            pulsebeam_testdata::quality_corpus_audio(pulsebeam_testdata::QualityAudioSource::Zero);
+        let reference = corpus
+            .decode_reference()
+            .unwrap_or_else(|error| panic!("quality Opus reference failed: {error}"));
+        Self {
+            decoder: OpusReferenceDecoder::new(publisher, "audio-mono"),
+            corpus,
+            reference,
+        }
+    }
+
+    fn push(
+        &mut self,
+        packet: &pulsebeam_agent::RtpPacket,
+        log: &Arc<Mutex<AudioReceiveLog>>,
+        publisher: &str,
+    ) {
+        let reference = self
+            .corpus
+            .frame_for_rtp_timestamp(packet.ts.numer())
+            .and_then(|frame| self.corpus.reference_frame(&self.reference, frame.index));
+        match self
+            .decoder
+            .try_decode_observation(&packet.payload, reference)
+        {
+            Ok(observation) => log.lock().unwrap().record_decoded(
+                publisher,
+                observation.samples,
+                observation.reference_error,
+            ),
+            Err(DecodeError::Decoder(_)) => log.lock().unwrap().record_decoder_error(publisher),
+            Err(DecodeError::ReferenceMismatch(_)) => {
+                log.lock().unwrap().record_reference_mismatch(publisher);
+            }
+        }
+    }
+}
 
 pub struct ClientContext {
     pub ip: IpAddr,
@@ -665,6 +1210,9 @@ pub struct ClientContext {
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
     /// What this listener heard, per speaker. Shared with the harness like `video_rx`.
     pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
+    quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    h264_publishers: Arc<Mutex<BTreeSet<String>>>,
+    corrupt_video_payload: bool,
     local_publications: Vec<LocalTrack>,
 
     /// Remote track IDs that have been discovered from signaling updates.
@@ -828,17 +1376,62 @@ impl SimClient {
                             .insert(publication_id.clone(), publication_id);
                         let publisher_id = track.publisher_id().to_owned();
                         let log = self.ctx.video_rx.clone();
+                        let quality_references = self.ctx.quality_references.clone();
+                        let h264_publishers = self.ctx.h264_publishers.clone();
+                        let corrupt_payload = self.ctx.corrupt_video_payload;
                         self.join_set.spawn(async move {
                             // The agent forwards RTP; reassemble frames here (the
                             // "higher layer") before logging QoE.
-                            let mut receiver = pulsebeam_agent::FrameReceiver::new();
+                            let mut receiver = None;
+                            let mut decoder = H264ReferenceDecoder::new(&publisher_id, "video");
+                            let mut decoder_ready = false;
+                            let mut last_keyframe_request = None;
                             while let Ok(rtp) = track.recv().await {
-                                for frame in receiver.push(rtp) {
-                                    log.lock().unwrap().record(&publisher_id, &frame);
+                                let receiver = receiver.get_or_insert_with(|| {
+                                    let h264_packetized = h264_publishers
+                                        .lock()
+                                        .unwrap()
+                                        .contains(&publisher_id);
+                                    if h264_packetized {
+                                        pulsebeam_agent::FrameReceiver::with_h264()
+                                    } else {
+                                        pulsebeam_agent::FrameReceiver::new()
+                                    }
+                                });
+                                let frames = receiver.push(rtp);
+                                if !receiver.needs_keyframe() {
+                                    last_keyframe_request = None;
+                                } else if last_keyframe_request.is_none_or(|last| {
+                                    tokio::time::Instant::now().duration_since(last)
+                                        >= Duration::from_millis(500)
+                                }) && track.request_keyframe()
+                                {
+                                    last_keyframe_request = Some(tokio::time::Instant::now());
+                                }
+                                for frame in frames {
+                                    record_video_frame(
+                                        &log,
+                                        &quality_references,
+                                        &mut decoder,
+                                        &mut decoder_ready,
+                                        &publisher_id,
+                                        frame,
+                                        corrupt_payload,
+                                    );
                                 }
                             }
-                            for frame in receiver.flush() {
-                                log.lock().unwrap().record(&publisher_id, &frame);
+                            if let Some(mut receiver) = receiver {
+                                for frame in receiver.flush() {
+                                    record_video_frame(
+                                        &log,
+                                        &quality_references,
+                                        &mut decoder,
+                                        &mut decoder_ready,
+                                        &publisher_id,
+                                        frame,
+                                        corrupt_payload,
+                                    );
+                                }
                             }
                         });
 

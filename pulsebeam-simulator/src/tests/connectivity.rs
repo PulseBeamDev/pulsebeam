@@ -825,7 +825,7 @@ fn abrupt_exit_chaos_test() {
             participant: "observer",
             quality: VideoQuality::min_frames(100)
                 .allow_gaps(4)
-                .allow_missing_parameter_sets(1),
+                .allow_keyframe_parameter_set_losses(1),
         },
     ]);
 }

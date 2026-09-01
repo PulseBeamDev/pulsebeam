@@ -12,6 +12,22 @@ use str0m::rtp::RtpWrite;
 use str0m::{Event, Output, Rtc, RtcError};
 use tokio::time::Instant;
 
+fn egress_extension_values(
+    mut ext_vals: str0m::rtp::ExtensionValues,
+    playout_delay: Option<(MediaTime, MediaTime)>,
+) -> str0m::rtp::ExtensionValues {
+    ext_vals.mid = None;
+    ext_vals.rid = None;
+    ext_vals
+        .user_values
+        .remove::<str0m::rtp::vla::VideoLayersAllocation>();
+    if let Some((min, max)) = playout_delay {
+        ext_vals.play_delay_min = Some(min);
+        ext_vals.play_delay_max = Some(max);
+    }
+    ext_vals
+}
+
 pub(crate) const MAX_PENDING_INGRESS: usize = 256;
 pub(crate) const MAX_PENDING_FANOUT: usize = 256;
 pub(crate) const RTC_OUTPUT_BUDGET: usize = 128;
@@ -60,6 +76,14 @@ pub(crate) struct RtpIngress {
 
 pub(crate) enum AppliedMutation {
     Applied,
+    KeyframeUnavailable {
+        mid: Mid,
+        rid: Option<Rid>,
+    },
+    KeyframeRequested {
+        mid: Mid,
+        rid: Option<Rid>,
+    },
     RtpNotWritten,
     RtpWritten,
     RecoveredStream {
@@ -135,12 +159,13 @@ impl Transport {
         self.pending_timeout = Some(now);
     }
 
-    pub(crate) fn enqueue_mutation(&mut self, mutation: TransportMutation) {
+    pub(crate) fn enqueue_mutation(&mut self, mutation: TransportMutation) -> bool {
         if self.pending_mutations.len() >= MAX_PENDING_FANOUT {
             metrics::counter!("participant_fanout_shed").increment(1);
-            return;
+            return false;
         }
         self.pending_mutations.push_back(mutation);
+        true
     }
 
     pub(crate) fn apply_next_mutation(&mut self, _now: Instant) -> Option<AppliedMutation> {
@@ -151,8 +176,11 @@ impl Transport {
                 AppliedMutation::Applied
             }
             TransportMutation::Keyframe { mid, rid, kind } => {
-                let _ = self.request_keyframe(KeyframeRequest { mid, rid, kind });
-                AppliedMutation::Applied
+                if self.request_keyframe(KeyframeRequest { mid, rid, kind }) {
+                    AppliedMutation::KeyframeRequested { mid, rid }
+                } else {
+                    AppliedMutation::KeyframeUnavailable { mid, rid }
+                }
             }
         };
         Some(result)
@@ -390,14 +418,7 @@ impl Transport {
             #[cfg(feature = "sim")]
             pulsebeam_runtime::fatal!("egress stream invariant violated: {violation}");
         }
-        let mut ext_vals = pkt.ext_vals;
-        ext_vals
-            .user_values
-            .remove::<str0m::rtp::vla::VideoLayersAllocation>();
-        if let Some((min, max)) = playout_delay {
-            ext_vals.play_delay_min = Some(min);
-            ext_vals.play_delay_max = Some(max);
-        }
+        let ext_vals = egress_extension_values(pkt.ext_vals, playout_delay);
         if nackable {
             tracing::trace!(
                 target: crate::log::TARGET_VIDEO,
@@ -490,5 +511,24 @@ impl Transport {
     pub(crate) fn disconnect(&mut self) {
         self.rtc.disconnect();
         self.rtc_needs_drain = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::egress_extension_values;
+    use str0m::media::{Mid, Rid};
+    use str0m::rtp::ExtensionValues;
+
+    #[test]
+    fn ingress_stream_identity_is_not_reused_on_egress() {
+        let mut ingress = ExtensionValues::default();
+        ingress.mid = Some(Mid::from("source"));
+        ingress.rid = Some(Rid::from("h"));
+
+        let egress = egress_extension_values(ingress, None);
+
+        assert_eq!(egress.mid, None);
+        assert_eq!(egress.rid, None);
     }
 }
