@@ -1,17 +1,35 @@
-# `pulsebeam-agent-web`
+# PulseBeam Agent Web
 
-Browser/WASM host for [`pulsebeam-agent-core`](../pulsebeam-agent-core). It is
-responsible for driving the core state machine with browser WebRTC, HTTP, data
-channels, timers, scheduling, and application-facing events.
+Browser runtime for the PulseBeam agent.
 
-Applications provide already-acquired media tracks. Device capture, permission
-flows, DOM binding, and a direct JavaScript SDK are outside this crate.
+`agent-web` executes the SANS-I/O effects produced by `agent-core` using browser APIs.
 
-## Status
+## Owns
 
-The adapter is under active development and is not yet a usable client SDK.
-The accepted contract lives in
-[`plans/agent-sdk`](../../plans/agent-sdk/spec.md).
+* Browser WebRTC integration
+* Browser `MediaStreamTrack` integration
+* HTTP execution
+* Timer execution
+* Browser callbacks and runtime plumbing
+* WASM / JavaScript API
+* Web-specific resource handles and conversions
+* UniFFI bindings for the web environment
+
+## Does not own
+
+* Signaling policy
+* Reconnection policy
+* Topic protocol semantics
+* Platform-independent agent behavior
+* Framework integrations such as React
+
+```text
+JavaScript / Web Framework
+          ↓
+      agent-web
+          ↓
+      agent-core
+```
 
 ## Development
 

@@ -13,7 +13,7 @@ members = [
   "crates/pulsebeam-simulator",
   "crates/pulsebeam-testdata",
   "agents/pulsebeam-agent-core",
-  "agents/pulsebeam-agent-web",
+  "agents/pulsebeam-agent-web", "agents/pulsebeam-agent-native",
 ]
 
 [workspace.package]
