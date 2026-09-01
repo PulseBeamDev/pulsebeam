@@ -1,13 +1,6 @@
-use std::{
-    cell::Cell,
-    collections::VecDeque,
-    fmt,
-    marker::PhantomData,
-    net::SocketAddr,
-    time::{Instant, SystemTime},
-};
+use std::{collections::VecDeque, fmt, net::SocketAddr, time::Instant};
 
-use crate::{DepartureReceipt, IngressStream, RtcConfiguration, TransmissionId};
+use crate::{DepartureReceipt, RtcConfiguration, TransmissionId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatagramProtocol {
@@ -56,45 +49,6 @@ impl IngressDatagram {
     }
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
-    }
-}
-
-#[derive(Debug)]
-pub struct MediaPacket {
-    bytes: Vec<u8>,
-    stream: IngressStream,
-    sequence: u64,
-    timestamp: u64,
-    marker: bool,
-    packet_id: u64,
-    playout_time: SystemTime,
-    _owner_local: PhantomData<Cell<()>>,
-}
-
-impl MediaPacket {
-    pub const fn stream(&self) -> IngressStream {
-        self.stream
-    }
-    pub const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-    pub const fn timestamp(&self) -> u64 {
-        self.timestamp
-    }
-    pub const fn marker(&self) -> bool {
-        self.marker
-    }
-    pub fn payload(&self) -> &[u8] {
-        &self.bytes
-    }
-    pub fn bytes(&self) -> &[u8] {
-        self.payload()
-    }
-    pub const fn packet_id(&self) -> u64 {
-        self.packet_id
-    }
-    pub const fn playout_time(&self) -> SystemTime {
-        self.playout_time
     }
 }
 
