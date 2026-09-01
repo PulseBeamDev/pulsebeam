@@ -9,7 +9,12 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-# str0m = { package = "str0m", git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1" }
+dcsctp = "=0.1.14"
+is = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1", default-features = false }
+str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1", default-features = false, features = ["aws-lc-rs"] }
+
+[dev-dependencies]
+proptest = "1.11.0"
 
 [lints]
 workspace = true
