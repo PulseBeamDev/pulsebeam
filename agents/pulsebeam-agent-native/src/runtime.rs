@@ -147,7 +147,9 @@ enum Command {
 #[derive(Clone)]
 pub struct Agent {
     commands: mpsc::Sender<Command>,
+    topology: agent_core::MediaTopology,
     snapshot: watch::Receiver<Snapshot>,
+    snapshot_events: broadcast::Sender<Snapshot>,
     statistics: watch::Receiver<TransportStatistics>,
     events: broadcast::Sender<AgentEvent>,
 }
@@ -155,6 +157,7 @@ pub struct Agent {
 impl Agent {
     pub async fn spawn(config: Config, host: Host) -> Result<Self, Error> {
         let core = agent_core::Agent::new(config.session.clone())?;
+        let topology = config.session.topology.clone();
         let local_addr = host.udp.local_addr()?;
         let tcp = match config.tcp_server {
             Some(server) => {
@@ -167,6 +170,7 @@ impl Agent {
         };
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (snapshot_tx, snapshot) = watch::channel(core.snapshot().clone());
+        let (snapshot_events, _) = broadcast::channel(EVENT_CAPACITY);
         let (statistics_tx, statistics) = watch::channel(TransportStatistics::default());
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let actor = Actor::new(
@@ -178,13 +182,16 @@ impl Agent {
             commands.clone(),
             command_rx,
             snapshot_tx,
+            snapshot_events.clone(),
             statistics_tx,
             events.clone(),
         );
         tokio::spawn(actor.run());
         Ok(Self {
             commands,
+            topology,
             snapshot,
+            snapshot_events,
             statistics,
             events,
         })
@@ -243,8 +250,17 @@ impl Agent {
         self.snapshot.borrow().clone()
     }
 
+    pub fn topology(&self) -> &agent_core::MediaTopology {
+        &self.topology
+    }
+
     pub fn snapshots(&self) -> watch::Receiver<Snapshot> {
         self.snapshot.clone()
+    }
+
+    pub fn snapshot_events(&self) -> (Snapshot, broadcast::Receiver<Snapshot>) {
+        let events = self.snapshot_events.subscribe();
+        (self.snapshot(), events)
     }
 
     pub fn statistics(&self) -> watch::Receiver<TransportStatistics> {
@@ -265,12 +281,16 @@ impl Agent {
     }
 
     pub async fn close(&self) -> Result<(), Error> {
+        self.begin_close().await?.await.map_err(|_| Error::Closed)?
+    }
+
+    pub(crate) async fn begin_close(&self) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
         let (response, result) = oneshot::channel();
         self.commands
             .send(Command::Close { response })
             .await
             .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
+        Ok(result)
     }
 
     pub async fn abort(&self) -> Result<(), Error> {
@@ -321,6 +341,7 @@ pub struct RemoteMedia {
     packets: flume::Receiver<RtpPacket>,
     frames: FrameReceiver,
     ready: VecDeque<MediaFrame>,
+    last_audio_seq: Option<u64>,
     commands: mpsc::Sender<Command>,
     snapshot: watch::Receiver<Snapshot>,
 }
@@ -360,6 +381,31 @@ impl RemoteMedia {
     }
 
     pub async fn recv_frame(&mut self) -> Result<MediaFrame, Error> {
+        if matches!(self.slot, MediaSlot::RemoteAudio(_)) {
+            let packet = self.recv_packet().await?;
+            let sequence = *packet.seq;
+            let contiguous = self
+                .last_audio_seq
+                .is_none_or(|previous| sequence == previous.saturating_add(1));
+            self.last_audio_seq = Some(sequence);
+            return Ok(MediaFrame {
+                ts: packet.ts,
+                data: packet.payload,
+                capture_time: packet.arrival,
+                abs_capture_time: packet
+                    .ext_vals
+                    .abs_capture_time
+                    .map(|capture| capture.capture_time),
+                contiguous,
+                is_keyframe: false,
+                audio_level: packet.ext_vals.audio_level,
+                voice_activity: packet.ext_vals.voice_activity,
+                target_bitrate_bps: None,
+                resolution: None,
+                dependency_descriptor: None,
+                temporal_layers: None,
+            });
+        }
         loop {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(frame);
@@ -420,6 +466,7 @@ struct Actor {
     command_tx: mpsc::Sender<Command>,
     commands: mpsc::Receiver<Command>,
     snapshot: watch::Sender<Snapshot>,
+    snapshot_events: broadcast::Sender<Snapshot>,
     statistics: watch::Sender<TransportStatistics>,
     events: broadcast::Sender<AgentEvent>,
     peers: BTreeMap<Generation, Peer>,
@@ -450,6 +497,7 @@ impl Actor {
         command_tx: mpsc::Sender<Command>,
         commands: mpsc::Receiver<Command>,
         snapshot: watch::Sender<Snapshot>,
+        snapshot_events: broadcast::Sender<Snapshot>,
         statistics: watch::Sender<TransportStatistics>,
         events: broadcast::Sender<AgentEvent>,
     ) -> Self {
@@ -467,6 +515,7 @@ impl Actor {
             command_tx,
             commands,
             snapshot,
+            snapshot_events,
             statistics,
             events,
             peers: BTreeMap::new(),
@@ -669,6 +718,7 @@ impl Actor {
                         packets,
                         frames,
                         ready: VecDeque::new(),
+                        last_audio_seq: None,
                         commands: self.command_tx.clone(),
                         snapshot: self.snapshot.subscribe(),
                     })
@@ -1459,6 +1509,7 @@ impl Actor {
         let next = self.core.snapshot().clone();
         if *self.snapshot.borrow() != next {
             self.snapshot.send_replace(next.clone());
+            let _ = self.snapshot_events.send(next.clone());
         }
         while let Some(notification) = self.core.next_notification() {
             let _ = self.events.send(AgentEvent::Core(notification));
@@ -1612,5 +1663,48 @@ mod tests {
                 MediaSlot::RemoteAudio(0),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn remote_audio_returns_each_encoded_packet_as_a_frame() {
+        let (packet_tx, packets) = flume::bounded(1);
+        let (_mid_tx, mid) = watch::channel(None);
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
+        let mut media = RemoteMedia {
+            slot: MediaSlot::RemoteAudio(0),
+            mid,
+            packets,
+            frames: FrameReceiver::new(),
+            ready: VecDeque::new(),
+            last_audio_seq: None,
+            commands,
+            snapshot,
+        };
+        let ext_vals = crate::ExtensionValues {
+            audio_level: Some(-30),
+            voice_activity: Some(true),
+            ..crate::ExtensionValues::default()
+        };
+        packet_tx
+            .send_async(RtpPacket {
+                mid: Mid::from("audio"),
+                rid: None,
+                seq: crate::SeqNo::from(7),
+                ts: crate::MediaTime::new(960, crate::Frequency::FORTY_EIGHT_KHZ),
+                marker: false,
+                ssrc: Some(Ssrc::from(1)),
+                payload: Arc::from([0xf8, 0xff, 0xfe]),
+                ext_vals,
+                arrival: Instant::now(),
+            })
+            .await
+            .unwrap();
+
+        let frame = media.recv_frame().await.unwrap();
+        assert_eq!(frame.data.as_ref(), [0xf8, 0xff, 0xfe]);
+        assert_eq!(frame.audio_level, Some(-30));
+        assert_eq!(frame.voice_activity, Some(true));
+        assert!(frame.contiguous);
     }
 }

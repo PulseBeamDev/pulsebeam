@@ -25,12 +25,15 @@ pub mod clock;
 pub use clock::wallclock_at;
 pub use pipeline::{FrameReceiver, FrameSender, JitterBuffer};
 
+pub mod ffi;
 pub mod media;
 pub mod pipeline;
 mod runtime;
 pub(crate) mod tcp;
 
 pub use runtime::*;
+
+uniffi::setup_scaffolding!();
 
 /// One RTP packet — the currency of the agent's media API.
 ///

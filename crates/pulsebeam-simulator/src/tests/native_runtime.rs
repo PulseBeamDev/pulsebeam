@@ -2,7 +2,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pulsebeam_agent_native::{Agent, Config, Frequency, Host, MediaFrame, MediaTime};
+use pulsebeam_agent_core::ffi as core_ffi;
+use pulsebeam_agent_native::ffi::{Agent, EventUpdate, MediaUpdate, NativeEvent, SnapshotUpdate};
+use pulsebeam_agent_native::{Agent as RuntimeAgent, Config, Host};
 use pulsebeam_core::net::UdpSocket;
 
 use super::common::client::create_http_client;
@@ -149,49 +151,47 @@ async fn run_peer(
     let mut config = Config::new(session);
     config.local_ips.push(ip);
     let udp = UdpSocket::bind(unspecified_addr(ip, 0)).await?;
-    let agent = Agent::spawn(config, Host::new(create_http_client(), udp)).await?;
-    let video = agent.local_media("camera");
-    let audio = agent.local_audio("microphone");
-    let mut remote_video = agent.remote_video(0).await?;
-    let mut remote_audio = agent.remote_audio(0).await?;
-    let mut events = agent.events();
+    let runtime = RuntimeAgent::spawn(config, Host::new(create_http_client(), udp)).await?;
+    let agent = Agent::from_runtime(runtime);
+    let video = agent.local_video("camera".into());
+    let audio = agent.local_audio("microphone".into());
+    let remote_video = agent.remote_video(0).await?;
+    let remote_audio = agent.remote_audio(0).await?;
+    let events = agent.events();
 
-    let latest = pulsebeam_agent_core::TopicPublisher {
-        topic: "latest-state".into(),
-        mode: pulsebeam_agent_core::TopicMode::Latest,
+    let latest = core_ffi::TopicPublisher {
+        name: "latest-state".into(),
+        mode: core_ffi::TopicMode::Latest,
     };
-    let ordered = pulsebeam_agent_core::TopicPublisher {
-        topic: "ordered-events".into(),
-        mode: pulsebeam_agent_core::TopicMode::Ordered,
+    let ordered = core_ffi::TopicPublisher {
+        name: "ordered-events".into(),
+        mode: core_ffi::TopicMode::Ordered,
     };
-    let mut desired = pulsebeam_agent_core::DesiredState {
-        revision: 1,
+    let mut desired = core_ffi::DesiredState {
         connected: true,
         publications: vec![
-            pulsebeam_agent_core::PublicationIntent {
+            core_ffi::PublicationIntent {
                 slot: "camera".into(),
                 active: true,
             },
-            pulsebeam_agent_core::PublicationIntent {
+            core_ffi::PublicationIntent {
                 slot: "microphone".into(),
                 active: true,
             },
         ],
-        topics: pulsebeam_agent_core::TopicRegistrations {
-            publishers: vec![latest.clone(), ordered.clone()],
-            subscribers: vec![
-                pulsebeam_agent_core::TopicSubscriber {
-                    topic: latest.topic.clone(),
-                    mode: latest.mode,
-                    publisher_id: None,
-                },
-                pulsebeam_agent_core::TopicSubscriber {
-                    topic: ordered.topic.clone(),
-                    mode: ordered.mode,
-                    publisher_id: None,
-                },
-            ],
-        },
+        topic_publishers: vec![latest.clone(), ordered.clone()],
+        topic_subscribers: vec![
+            core_ffi::TopicSubscriber {
+                name: latest.name.clone(),
+                mode: latest.mode,
+                publisher_id: None,
+            },
+            core_ffi::TopicSubscriber {
+                name: ordered.name.clone(),
+                mode: ordered.mode,
+                publisher_id: None,
+            },
+        ],
         ..Default::default()
     };
     agent.replace_desired(desired.clone()).await?;
@@ -206,27 +206,26 @@ async fn run_peer(
         .ok_or_else(|| anyhow::anyhow!("{name} connected without a generation"))?;
     let remote_video_id = initial
         .publications
-        .values()
+        .iter()
         .find(|publication| {
             publication.participant_id != participant
-                && publication.kind == pulsebeam_agent_core::MediaKind::Video
+                && publication.kind == core_ffi::MediaKind::Video
         })
         .map(|publication| publication.id.clone())
         .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote video"))?;
     let remote_audio_id = initial
         .publications
-        .values()
+        .iter()
         .find(|publication| {
             publication.participant_id != participant
-                && publication.kind == pulsebeam_agent_core::MediaKind::Audio
+                && publication.kind == core_ffi::MediaKind::Audio
         })
         .map(|publication| publication.id.clone())
         .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote audio"))?;
 
-    desired.revision = 2;
-    desired.video = vec![pulsebeam_agent_core::VideoSubscription {
+    desired.video = vec![core_ffi::VideoDemand {
         slot: 0,
-        track_id: remote_video_id.clone(),
+        publication_id: remote_video_id.clone(),
         height: 720,
         min_height: 0,
         min_fps: 0,
@@ -239,9 +238,9 @@ async fn run_peer(
         &agent,
         &video,
         &audio,
-        &mut remote_video,
-        &mut remote_audio,
-        &mut events,
+        &remote_video,
+        &remote_audio,
+        &events,
         &latest,
         &ordered,
         1,
@@ -266,24 +265,23 @@ async fn run_peer(
         let replacement = wait_remote_replacement(&agent, &participant, &remote_video_id).await?;
         let replacement_video = replacement
             .publications
-            .values()
+            .iter()
             .find(|publication| {
                 publication.participant_id != participant
-                    && publication.kind == pulsebeam_agent_core::MediaKind::Video
+                    && publication.kind == core_ffi::MediaKind::Video
             })
             .map(|publication| publication.id.clone())
             .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover remote video"))?;
         let replacement_audio = replacement
             .publications
-            .values()
+            .iter()
             .find(|publication| {
                 publication.participant_id != participant
-                    && publication.kind == pulsebeam_agent_core::MediaKind::Audio
+                    && publication.kind == core_ffi::MediaKind::Audio
             })
             .map(|publication| publication.id.clone())
             .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover remote audio"))?;
-        desired.revision = 3;
-        desired.video[0].track_id = replacement_video;
+        desired.video[0].publication_id = replacement_video;
         desired.audio.pinned = vec![replacement_audio];
         agent.replace_desired(desired).await?;
     }
@@ -292,9 +290,9 @@ async fn run_peer(
         &agent,
         &video,
         &audio,
-        &mut remote_video,
-        &mut remote_audio,
-        &mut events,
+        &remote_video,
+        &remote_audio,
+        &events,
         &latest,
         &ordered,
         2,
@@ -306,8 +304,8 @@ async fn run_peer(
     Ok(PeerReport {
         participant,
         reconnected: reconnect,
-        first_generation: first_generation.get(),
-        final_generation: final_generation.get(),
+        first_generation,
+        final_generation,
         video_frames: first.0.saturating_add(second.0),
         audio_frames: first.1.saturating_add(second.1),
         latest_messages: first.2.saturating_add(second.2),
@@ -319,38 +317,38 @@ async fn wait_remote_replacement(
     agent: &Agent,
     participant: &str,
     previous_video: &str,
-) -> anyhow::Result<pulsebeam_agent_core::Snapshot> {
-    let mut snapshots = agent.snapshots();
+) -> anyhow::Result<core_ffi::Snapshot> {
+    let snapshots = agent.snapshots();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let snapshot = snapshots.borrow().clone();
-            let has_replacement_video = snapshot.publications.values().any(|publication| {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("native snapshot stream closed")
+            };
+            let has_replacement_video = snapshot.publications.iter().any(|publication| {
                 publication.participant_id != participant
-                    && publication.kind == pulsebeam_agent_core::MediaKind::Video
+                    && publication.kind == core_ffi::MediaKind::Video
                     && publication.id != previous_video
             });
-            let has_remote_audio = snapshot.publications.values().any(|publication| {
+            let has_remote_audio = snapshot.publications.iter().any(|publication| {
                 publication.participant_id != participant
-                    && publication.kind == pulsebeam_agent_core::MediaKind::Audio
+                    && publication.kind == core_ffi::MediaKind::Audio
             });
             if has_replacement_video && has_remote_audio {
                 return Ok(snapshot);
             }
-            snapshots.changed().await?;
         }
     })
     .await
     .map_err(|_| anyhow::anyhow!("native peer did not observe replacement publications"))?
 }
 
-async fn wait_ready(
-    agent: &Agent,
-    previous: Option<pulsebeam_agent_core::Generation>,
-) -> anyhow::Result<pulsebeam_agent_core::Snapshot> {
-    let mut snapshots = agent.snapshots();
+async fn wait_ready(agent: &Agent, previous: Option<u64>) -> anyhow::Result<core_ffi::Snapshot> {
+    let snapshots = agent.snapshots();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let snapshot = snapshots.borrow().clone();
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("native snapshot stream closed")
+            };
             let generation_ready = snapshot
                 .generation
                 .is_some_and(|generation| Some(generation) != previous);
@@ -358,33 +356,32 @@ async fn wait_ready(
                 .topics
                 .publishers
                 .iter()
-                .all(|publisher| publisher.channel.is_some())
+                .all(|publisher| publisher.connected)
                 && snapshot
                     .topics
                     .subscribers
                     .iter()
-                    .all(|subscriber| subscriber.channel.is_some());
+                    .all(|subscriber| subscriber.connected);
             let remote_media = snapshot.participant_id.as_ref().is_some_and(|participant| {
                 let remote: Vec<_> = snapshot
                     .publications
-                    .values()
+                    .iter()
                     .filter(|publication| &publication.participant_id != participant)
                     .collect();
                 remote
                     .iter()
-                    .any(|publication| publication.kind == pulsebeam_agent_core::MediaKind::Video)
-                    && remote.iter().any(|publication| {
-                        publication.kind == pulsebeam_agent_core::MediaKind::Audio
-                    })
+                    .any(|publication| publication.kind == core_ffi::MediaKind::Video)
+                    && remote
+                        .iter()
+                        .any(|publication| publication.kind == core_ffi::MediaKind::Audio)
             });
-            if snapshot.connection == pulsebeam_agent_core::ConnectionState::Connected
+            if snapshot.connection == core_ffi::ConnectionState::Connected
                 && generation_ready
                 && topics_ready
                 && remote_media
             {
                 return Ok(snapshot);
             }
-            snapshots.changed().await?;
         }
     })
     .await
@@ -394,33 +391,27 @@ async fn wait_ready(
 #[allow(clippy::too_many_arguments)]
 async fn exchange(
     agent: &Agent,
-    video: &pulsebeam_agent_native::LocalMedia,
-    audio: &pulsebeam_agent_native::LocalMedia,
-    remote_video: &mut pulsebeam_agent_native::RemoteMedia,
-    remote_audio: &mut pulsebeam_agent_native::RemoteMedia,
-    events: &mut tokio::sync::broadcast::Receiver<pulsebeam_agent_native::AgentEvent>,
-    latest: &pulsebeam_agent_core::TopicPublisher,
-    ordered: &pulsebeam_agent_core::TopicPublisher,
+    video: &pulsebeam_agent_native::ffi::LocalMediaSender,
+    audio: &pulsebeam_agent_native::ffi::LocalMediaSender,
+    remote_video: &pulsebeam_agent_native::ffi::RemoteMediaReceiver,
+    remote_audio: &pulsebeam_agent_native::ffi::RemoteMediaReceiver,
+    events: &pulsebeam_agent_native::ffi::EventStream,
+    latest: &core_ffi::TopicPublisher,
+    ordered: &core_ffi::TopicPublisher,
     round: u64,
 ) -> anyhow::Result<(u64, u64, u64, u64)> {
     agent
-        .send_topic(pulsebeam_agent_core::TopicSend {
-            publisher: latest.clone(),
-            payload: format!("latest-{round}-old").into_bytes(),
-        })
+        .send_topic(latest.clone(), format!("latest-{round}-old").into_bytes())
         .await?;
     agent
-        .send_topic(pulsebeam_agent_core::TopicSend {
-            publisher: latest.clone(),
-            payload: format!("latest-{round}").into_bytes(),
-        })
+        .send_topic(latest.clone(), format!("latest-{round}").into_bytes())
         .await?;
     for sequence in 0..2 {
         agent
-            .send_topic(pulsebeam_agent_core::TopicSend {
-                publisher: ordered.clone(),
-                payload: format!("ordered-{round}-{sequence}").into_bytes(),
-            })
+            .send_topic(
+                ordered.clone(),
+                format!("ordered-{round}-{sequence}").into_bytes(),
+            )
             .await?;
     }
 
@@ -438,72 +429,89 @@ async fn exchange(
             || ordered_messages < 2
         {
             tokio::select! {
-                capture_time = tick.tick() => {
+                _ = tick.tick() => {
                     if latest_messages == 0 {
                         agent
-                            .send_topic(pulsebeam_agent_core::TopicSend {
-                                publisher: latest.clone(),
-                                payload: format!("latest-{round}").into_bytes(),
-                            })
+                            .send_topic(latest.clone(), format!("latest-{round}").into_bytes())
                             .await?;
                     }
-                    let video_frame = MediaFrame {
-                        ts: MediaTime::from_90khz(frame_number.saturating_mul(3_000)),
-                        data: Arc::from(KEYFRAME),
-                        capture_time,
-                        abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
+                    let video_frame = core_ffi::MediaFrame {
+                        timestamp: frame_number.saturating_mul(3_000),
+                        clock_rate: 90_000,
+                        data: KEYFRAME.to_vec(),
+                        absolute_capture_time_unix_us: unix_micros(pulsebeam_agent_native::clock::capture_wallclock()),
                         contiguous: true,
-                        is_keyframe: true,
-                        audio_level: None,
+                        keyframe: true,
+                        audio_level_dbov: None,
                         voice_activity: None,
                         target_bitrate_bps: Some(250_000),
-                        resolution: Some((320, 180, 30)),
+                        width: Some(320),
+                        height: Some(180),
+                        frames_per_second: Some(30),
                         dependency_descriptor: None,
                         temporal_layers: None,
                     };
                     video.send(video_frame).await?;
-                    let audio_frame = MediaFrame {
-                        ts: MediaTime::new(
-                            frame_number.saturating_mul(960),
-                            Frequency::FORTY_EIGHT_KHZ,
-                        ),
-                        data: Arc::from([0xf8, 0xff, 0xfe]),
-                        capture_time,
-                        abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
+                    let audio_frame = core_ffi::MediaFrame {
+                        timestamp: frame_number.saturating_mul(960),
+                        clock_rate: 48_000,
+                        data: vec![0xf8, 0xff, 0xfe],
+                        absolute_capture_time_unix_us: unix_micros(pulsebeam_agent_native::clock::capture_wallclock()),
                         contiguous: true,
-                        is_keyframe: false,
-                        audio_level: Some(-30),
+                        keyframe: false,
+                        audio_level_dbov: Some(-30),
                         voice_activity: Some(true),
                         target_bitrate_bps: None,
-                        resolution: None,
+                        width: None,
+                        height: None,
+                        frames_per_second: None,
                         dependency_descriptor: None,
                         temporal_layers: None,
                     };
                     audio.send(audio_frame).await?;
                     frame_number = frame_number.saturating_add(1);
                 }
-                packet = remote_video.recv_packet() => {
-                    let _ = packet?;
-                    video_frames = video_frames.saturating_add(1);
+                update = remote_video.next() => {
+                    match update {
+                        MediaUpdate::Frame { .. } => {
+                            video_frames = video_frames.saturating_add(1);
+                        }
+                        MediaUpdate::Lagged { skipped } => {
+                            anyhow::bail!("native video receiver dropped {skipped} frames")
+                        }
+                        MediaUpdate::Closed => anyhow::bail!("native video receiver closed"),
+                    }
                 }
-                packet = remote_audio.recv_packet() => {
-                    let _ = packet?;
-                    audio_frames = audio_frames.saturating_add(1);
+                update = remote_audio.next() => {
+                    match update {
+                        MediaUpdate::Frame { .. } => {
+                            audio_frames = audio_frames.saturating_add(1);
+                        }
+                        MediaUpdate::Lagged { skipped } => {
+                            anyhow::bail!("native audio receiver dropped {skipped} frames")
+                        }
+                        MediaUpdate::Closed => anyhow::bail!("native audio receiver closed"),
+                    }
                 }
-                event = events.recv() => {
-                    if let pulsebeam_agent_native::AgentEvent::Core(
-                        pulsebeam_agent_core::Notification::Topic(
-                            pulsebeam_agent_core::TopicNotification::Message(message)
-                        )
-                    ) = event? {
-                        match message {
-                            pulsebeam_agent_core::TopicMessage::Latest { .. } => {
+                event = events.next() => {
+                    match event {
+                        EventUpdate::Event { event: NativeEvent::Core {
+                            notification: core_ffi::Notification::Topic {
+                                notification: core_ffi::TopicNotification::Message { message }
+                            }
+                        }} => match message {
+                            core_ffi::TopicMessage::Latest { .. } => {
                                 latest_messages = latest_messages.saturating_add(1);
                             }
-                            pulsebeam_agent_core::TopicMessage::Ordered { .. } => {
+                            core_ffi::TopicMessage::Ordered { .. } => {
                                 ordered_messages = ordered_messages.saturating_add(1);
                             }
+                        },
+                        EventUpdate::Lagged { skipped } => {
+                            anyhow::bail!("native event receiver dropped {skipped} events")
                         }
+                        EventUpdate::Closed => anyhow::bail!("native event receiver closed"),
+                        EventUpdate::Event { .. } => {}
                     }
                 }
             }
@@ -523,4 +531,12 @@ async fn exchange(
         latest_messages,
         ordered_messages,
     ))
+}
+
+fn unix_micros(value: std::time::SystemTime) -> Option<u64> {
+    let micros = value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_micros();
+    u64::try_from(micros).ok()
 }

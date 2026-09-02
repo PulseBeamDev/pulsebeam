@@ -12,7 +12,7 @@ check:
     cargo clippy --all-targets --workspace --features pulsebeam/sim
     just --justfile agents/pulsebeam-agent-web/Justfile check
     just --fmt --check
-    @for file in agents/pulsebeam-agent-web/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
+    @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
 
 # Run workspace unit tests and deterministic simulation plans.
 test:

@@ -1,0 +1,21 @@
+set shell := ["bash", "-euc"]
+
+root := "../.."
+library := "target/debug/libpulsebeam_agent_native.so"
+bindings := "target/uniffi/native"
+
+# Check the native runtime and its exported UniFFI surface.
+check:
+    cd {{ root }} && cargo check -p pulsebeam-agent-native --all-targets
+
+# Run native runtime and generated-facing contract tests.
+test:
+    cd {{ root }} && cargo test -p pulsebeam-agent-native
+
+# Generate Swift and Kotlin sources from the core and native namespaces.
+bindings:
+    cd {{ root }} && cargo build -p pulsebeam-agent-native
+    cd {{ root }} && cargo run -p pulsebeam-agent-native --features bindgen --bin pulsebeam-agent-native-bindgen -- generate --library --language kotlin --language swift --out-dir {{ bindings }} --no-format {{ library }}
+    cd {{ root }} && test -f {{ bindings }}/uniffi/pulsebeam_agent_core/pulsebeam_agent_core.kt
+    cd {{ root }} && rg -q "import uniffi\.pulsebeam_agent_core\.AgentConfig" {{ bindings }}/dev/pulsebeam/agent/pulsebeam_agent_native.kt
+    cd {{ root }} && ! rg -q "^data class (AgentConfig|DesiredState|MediaFrame|Snapshot)" {{ bindings }}/dev/pulsebeam/agent/pulsebeam_agent_native.kt

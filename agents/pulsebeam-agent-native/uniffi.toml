@@ -1,0 +1,5 @@
+[bindings.kotlin]
+package_name = "dev.pulsebeam.agent"
+
+[bindings.swift]
+module_name = "PulseBeamAgent"

@@ -8,8 +8,11 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib", "staticlib"]
+
 [features]
-default = ["pulsebeam-core/reqwest"]
+bindgen = ["uniffi/cargo-metadata", "uniffi/cli"]
 sim = ["pulsebeam-core/sim"]
 
 [dependencies]
@@ -18,15 +21,22 @@ bytes.workspace = true
 flume = "0.12.0"
 http = "1.4.1"
 if-addrs = "0.15.0"
-pulsebeam-core = { path = "../../crates/pulsebeam-core", features = ["str0m"] }
+pulsebeam-core = { path = "../../crates/pulsebeam-core", features = ["reqwest", "str0m"] }
 pulsebeam-proto = { path = "../../crates/pulsebeam-proto" }
+reqwest = "0.13.4"
 str0m.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uniffi = { version = "=0.31.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 pulsebeam-testdata = { path = "../../crates/pulsebeam-testdata" }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "pulsebeam-agent-native-bindgen"
+path = "src/bin/bindgen.rs"
+required-features = ["bindgen"]
