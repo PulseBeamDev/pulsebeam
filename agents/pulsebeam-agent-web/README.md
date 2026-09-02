@@ -2,7 +2,12 @@
 
 Browser runtime for the PulseBeam agent.
 
-`agent-web` executes the SANS-I/O effects produced by `agent-core` using browser APIs. The handwritten `@pulsebeam/agent-web` TypeScript entry point is the package boundary; generated WASM bindings under `dist/wasm` are private.
+`agent-web` executes the SANS-I/O effects produced by `agent-core` using browser APIs. Its replacement package boundary is generated from the Rust UniFFI namespaces by UBRN's web/WASM path. Handwritten TypeScript is limited to initialization and private browser-object conversion helpers.
+
+The checked-in generated proof establishes this boundary while the actor-backed
+runtime migration continues: the web namespace imports core-owned portable
+types, and private registry conversions surface opaque Rust handles as standard
+`MediaStreamTrack` and `MediaStream` values without changing object identity.
 
 ## Public contract
 
@@ -96,6 +101,16 @@ Install package tooling with `pnpm install` in this directory. Browser tests use
 * `just --justfile agents/pulsebeam-agent-web/Justfile server-test` runs the real-browser BiDi vertical slice against a repository server already listening at `127.0.0.1:7070`.
 
 The driver manager discovers an installed Chrome by default. Set `PULSEBEAM_BROWSER_BINARY` when the browser executable lives outside the standard installation paths.
+
+`just uniffi-generate` regenerates the pinned UBRN package.
+`just uniffi-check` regenerates it, type-checks the generated source and a
+Rust-authored strict consumer, and rejects checked-in drift. The Rust browser
+suite drives the generated WASM package through thirtyfour WebDriver BiDi; no
+JavaScript or TypeScript test suite owns this contract.
+
+The pnpm patch changes only UBRN's in-process `wasm-bindgen` rewriter from
+0.2.100 to the workspace's 0.2.127 schema. UBRN and `@ubjs/core` remain pinned
+to 0.31.0-5, and UniFFI remains pinned to 0.31.0.
 
 `configureLogging` installs one process-wide level and optional sink. Logs include correlation identifiers where useful and never include request authorization values, SDP bodies, topic payloads, or media bytes.
 

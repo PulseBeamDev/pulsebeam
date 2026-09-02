@@ -1,0 +1,21 @@
+[bindings.typescript]
+strictTypeChecking = true
+strictByteArrays = true
+
+[bindings.typescript.customTypes.WebMediaTrack]
+typeName = "MediaStreamTrack"
+imports = [
+  ["liftMediaStreamTrack", "../../web/media-registry.js"],
+  ["lowerMediaStreamTrack", "../../web/media-registry.js"],
+]
+lift = "liftMediaStreamTrack({})"
+lower = "lowerMediaStreamTrack({})"
+
+[bindings.typescript.customTypes.WebMediaStream]
+typeName = "MediaStream"
+imports = [
+  ["liftMediaStream", "../../web/media-registry.js"],
+  ["lowerMediaStream", "../../web/media-registry.js"],
+]
+lift = "liftMediaStream({})"
+lower = "lowerMediaStream({})"

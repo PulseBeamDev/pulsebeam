@@ -1,2 +1,4 @@
 packages:
   - .
+patchedDependencies:
+  uniffi-bindgen-react-native@0.31.0-5: patches/uniffi-bindgen-react-native@0.31.0-5.patch

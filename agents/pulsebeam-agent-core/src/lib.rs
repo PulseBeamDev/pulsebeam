@@ -1,4 +1,3 @@
-#![no_std]
 #![cfg_attr(
     test,
     allow(
@@ -19,6 +18,10 @@ mod id;
 mod model;
 mod signaling;
 mod topic;
+
+pub mod ffi;
+
+pub use ffi::UniFfiTag;
 
 pub use agent::*;
 pub use effect::*;

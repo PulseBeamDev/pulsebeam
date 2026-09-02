@@ -5,13 +5,30 @@ set tempdir := "/tmp"
 build:
     pnpm run build
 
+# Regenerate the UniFFI web proof and its WASM package.
+uniffi-generate:
+    pnpm run build:uniffi
+    pnpm exec prettier --write "generated/**/*.ts"
+
+# Transpile generated bindings for the Rust-authored browser proof.
+uniffi-browser-build: uniffi-generate
+    pnpm exec tsc -p tsconfig.uniffi.browser.json
+    mkdir -p dist/uniffi-proof/generated/bindings/wasm-bindgen
+    cp generated/bindings/wasm-bindgen/index_bg.wasm dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm
+
+# Regenerate and reject checked-in binding drift.
+uniffi-check: uniffi-generate
+    pnpm exec tsc -p tsconfig.uniffi.json
+    cargo test -p pulsebeam-agent-web --test uniffi_contract
+    git diff --exit-code -- generated
+
 # Check Rust/WASM and the handwritten TypeScript boundary.
 check:
     cargo check -p pulsebeam-agent-web --target wasm32-unknown-unknown
     pnpm run check
 
 # Run browser-runtime unit and deterministic host-boundary tests.
-test: build
+test: build uniffi-browser-build
     cargo test -p pulsebeam-agent-web
     cargo test -p pulsebeam-agent-web --features browser-tests --test browser
 

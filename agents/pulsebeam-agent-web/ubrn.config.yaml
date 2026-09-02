@@ -1,0 +1,16 @@
+rust:
+  directory: ../..
+  manifestPath: agents/pulsebeam-agent-web/Cargo.toml
+bindings:
+  ts: generated/bindings
+  uniffiToml: uniffi.toml
+web:
+  manifestPath: generated/wasm/Cargo.toml
+  wasmCrateName: pulsebeam-agent-web-wasm
+  features:
+    - uniffi
+  workspace: false
+  runtimeVersion: =0.31.0-5
+  target: web
+  entrypoint: generated/index.web.ts
+  tsBindings: generated/bindings

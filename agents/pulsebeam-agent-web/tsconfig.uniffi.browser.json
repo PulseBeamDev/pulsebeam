@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.uniffi.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist/uniffi-proof",
+    "rootDir": ".",
+    "declaration": false,
+    "sourceMap": false
+  }
+}

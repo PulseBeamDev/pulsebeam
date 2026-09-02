@@ -4,21 +4,52 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  uniffi-bindgen-react-native@0.31.0-5: db07f6b3702cc46f612564b22881d2e5920ba66d9b23d89c98da719694cfa49d
+
 importers:
 
   .:
+    dependencies:
+      '@ubjs/core':
+        specifier: 0.31.0-5
+        version: 0.31.0-5
     devDependencies:
+      prettier:
+        specifier: 3.6.2
+        version: 3.6.2
       typescript:
         specifier: ~5.9.3
         version: 5.9.3
+      uniffi-bindgen-react-native:
+        specifier: 0.31.0-5
+        version: 0.31.0-5(patch_hash=db07f6b3702cc46f612564b22881d2e5920ba66d9b23d89c98da719694cfa49d)
 
 packages:
+
+  '@ubjs/core@0.31.0-5':
+    resolution: {integrity: sha512-oRBRtyYOhaodiOY3rLMZFgAHGFMmD44XefMpsAx4Ja0/rO+45kVdQB1VZsblQMLYxP965i3IHm56eymgo3I5eQ==}
+
+  prettier@3.6.2:
+    resolution: {integrity: sha512-I7AIg5boAr5R0FFtJ6rCfD+LFsWHp81dolrFD8S79U9tb8Az2nGrJncnMSnys+bpQJfRUzqs9hnA81OAA3hCuQ==}
+    engines: {node: '>=14'}
+    hasBin: true
 
   typescript@5.9.3:
     resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
     engines: {node: '>=14.17'}
     hasBin: true
 
+  uniffi-bindgen-react-native@0.31.0-5:
+    resolution: {integrity: sha512-YtL3gTe+RVXAQx/2P2Iuypic/CunRZC65Cs47v//YRfwWNYU4Ufd1jT3rqxSrH5b5QFCYblP89Nf/9ssZRvNgg==}
+    hasBin: true
+
 snapshots:
 
+  '@ubjs/core@0.31.0-5': {}
+
+  prettier@3.6.2: {}
+
   typescript@5.9.3: {}
+
+  uniffi-bindgen-react-native@0.31.0-5(patch_hash=db07f6b3702cc46f612564b22881d2e5920ba66d9b23d89c98da719694cfa49d): {}

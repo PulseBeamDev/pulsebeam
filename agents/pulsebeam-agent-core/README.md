@@ -38,6 +38,12 @@ desired state + events
 
 Environment runtimes execute effects and feed resulting events back into the core.
 
+Core always emits UniFFI metadata for its portable records and enums so native
+and web runtimes cannot compile against a reduced contract. Runtime crates
+consume those types as external UniFFI types instead of defining platform
+copies. TypeScript generation settings live in this crate's `uniffi.toml` so
+core-owned byte arrays and strictness follow the core namespace.
+
 ## Verification
 
 Run `cargo test -p pulsebeam-agent-core` while iterating. The repository gates

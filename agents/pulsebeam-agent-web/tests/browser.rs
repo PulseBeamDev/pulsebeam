@@ -175,6 +175,78 @@ const PUBLIC_AGENT_CONTRACT: &str = r#"
 })()
 "#;
 
+const UNIFFI_MEDIA_CONTRACT: &str = r#"
+(async () => {
+  const wasm = await import("/dist/uniffi-proof/generated/bindings/wasm-bindgen/index.js");
+  await wasm.default({
+    module_or_path: "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm",
+  });
+  const core = await import("/dist/uniffi-proof/generated/bindings/pulsebeam_agent_core.js");
+  const web = await import("/dist/uniffi-proof/generated/bindings/pulsebeam_agent_web.js");
+  const registry = await import("/dist/uniffi-proof/web/media-registry.js");
+  core.default.initialize();
+  web.default.initialize();
+
+  const proof = new web.MediaRegistryProof();
+  const canvas = document.createElement("canvas");
+  const track = canvas.captureStream(5).getVideoTracks()[0];
+  const trackIdentity = proof.roundTripTrack(track) === track;
+  const trackHandle = registry.lowerMediaStreamTrack(track);
+  let foreignRejected = false;
+  try {
+    registry.liftMediaStream(trackHandle);
+  } catch (error) {
+    foreignRejected = error instanceof ReferenceError;
+  }
+  registry.invalidateMediaForTest(track);
+  let staleRejected = false;
+  try {
+    registry.liftMediaStreamTrack(trackHandle);
+  } catch (error) {
+    staleRejected = error instanceof ReferenceError;
+  }
+
+  const releaseCanvas = document.createElement("canvas");
+  const releaseTrack = releaseCanvas.captureStream(5).getVideoTracks()[0];
+  proof.roundTripTrack(releaseTrack);
+  const retainedBeforeTrackRelease = proof.retainedMedia();
+  proof.releaseTrack(releaseTrack);
+  const retainedAfterTrackRelease = proof.retainedMedia();
+
+  const stream = proof.createStream();
+  const streamIdentity = proof.roundTripStream(stream) === stream;
+  const retainedBeforeStreamRelease = proof.retainedMedia();
+  proof.releaseStream(stream);
+  const retainedAfterStreamRelease = proof.retainedMedia();
+
+  registry.exhaustMediaHandlesForTest();
+  const exhaustedCanvas = document.createElement("canvas");
+  const exhaustedTrack = exhaustedCanvas.captureStream(5).getVideoTracks()[0];
+  let exhaustionRejected = false;
+  try {
+    proof.roundTripTrack(exhaustedTrack);
+  } catch (error) {
+    exhaustionRejected = error instanceof RangeError;
+  }
+
+  track.stop();
+  releaseTrack.stop();
+  exhaustedTrack.stop();
+  proof.uniffiDestroy();
+  return {
+    trackIdentity,
+    streamIdentity,
+    foreignRejected,
+    staleRejected,
+    exhaustionRejected,
+    retainedBeforeTrackRelease,
+    retainedAfterTrackRelease,
+    retainedBeforeStreamRelease,
+    retainedAfterStreamRelease,
+  };
+})()
+"#;
+
 const SERVER_SLICE: &str = r#"
 (async () => {
   const waitForSnapshot = (agent, predicate, label) => new Promise((resolve, reject) => {
@@ -428,6 +500,20 @@ struct ServerResult {
     second_connection: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UniFfiMediaResult {
+    track_identity: bool,
+    stream_identity: bool,
+    foreign_rejected: bool,
+    stale_rejected: bool,
+    exhaustion_rejected: bool,
+    retained_before_track_release: String,
+    retained_after_track_release: String,
+    retained_before_stream_release: String,
+    retained_after_stream_release: String,
+}
+
 struct StaticServer {
     address: String,
     task: JoinHandle<()>,
@@ -451,6 +537,10 @@ impl StaticServer {
 
     fn fixture_url(&self) -> String {
         format!("http://{}/tests/fixture.html", self.address)
+    }
+
+    fn uniffi_fixture_url(&self) -> String {
+        format!("http://{}/tests/uniffi-fixture.html", self.address)
     }
 }
 
@@ -514,6 +604,43 @@ async fn public_agent_contract_runs_through_bidi() -> TestResult<()> {
     .await;
 
     result.map_err(|error| format!("browser test failed: {error}").into())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_media_types_run_through_bidi() -> TestResult<()> {
+    let server = StaticServer::start().await?;
+    let fixture_url = server.uniffi_fixture_url();
+    let mut capabilities = DesiredCapabilities::chrome();
+    capabilities.set_headless()?;
+    capabilities.set_no_sandbox()?;
+    capabilities.set_disable_gpu()?;
+    capabilities.enable_bidi()?;
+    if let Some(binary) = env::var_os("PULSEBEAM_BROWSER_BINARY") {
+        capabilities.set_binary(&binary.to_string_lossy())?;
+    }
+
+    let result = run_browser_test(WebDriver::managed(capabilities), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        bidi.browsing_context()
+            .navigate(context.clone(), fixture_url, Some(ReadinessState::Complete))
+            .await?;
+        let result: UniFfiMediaResult =
+            evaluate_json(&bidi, &context, UNIFFI_MEDIA_CONTRACT).await?;
+        assert!(result.track_identity);
+        assert!(result.stream_identity);
+        assert!(result.foreign_rejected);
+        assert!(result.stale_rejected);
+        assert!(result.exhaustion_rejected);
+        assert_eq!(result.retained_before_track_release, "1");
+        assert_eq!(result.retained_after_track_release, "0");
+        assert_eq!(result.retained_before_stream_release, "1");
+        assert_eq!(result.retained_after_stream_release, "0");
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await;
+
+    result.map_err(|error| format!("generated binding browser test failed: {error}").into())
 }
 
 fn assert_contract(contract: ContractResult) {
