@@ -5,22 +5,24 @@ use std::{
 };
 
 use agent_core::{
-    AgentCommand, AgentConfig, ChannelId, ConnectionState, DataChannelBinding, DataChannelEffect,
-    DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState, Effect, Generation,
-    HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpResponse, MediaSlot,
-    MediaTopology, Notification, OfferResources, OperationId, RetryPolicy, RtcEffect, RtcEvent,
-    SlotBinding, TimerEffect, TimerEvent, TopicMessage, TopicMode, TopicNotification,
-    TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber,
+    AgentCommand, AgentConfig, AudioSubscription, ChannelId, ConnectionState, DataChannelBinding,
+    DataChannelEffect, DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState,
+    Effect, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod,
+    HttpResponse, MediaKind, MediaSlot, MediaTopology, Notification, OfferResources, OperationId,
+    PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, SlotBinding, TimerEffect,
+    TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode, TopicNotification,
+    TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber, VideoSubscription,
 };
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AbortController, Event, Headers, MessageEvent, Request, RequestInit, Response, RtcBundlePolicy,
-    RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelType, RtcPeerConnection,
-    RtcPeerConnectionState, RtcRtpTransceiver, RtcRtpTransceiverDirection, RtcRtpTransceiverInit,
-    RtcSdpType, RtcSessionDescriptionInit,
+    AbortController, Event, Headers, MediaStreamTrack, MessageEvent, Request, RequestInit,
+    Response, RtcBundlePolicy, RtcConfiguration, RtcDataChannel, RtcDataChannelInit,
+    RtcDataChannelType, RtcPeerConnection, RtcPeerConnectionState, RtcRtpSender, RtcRtpTransceiver,
+    RtcRtpTransceiverDirection, RtcRtpTransceiverInit, RtcSdpType, RtcSessionDescriptionInit,
+    RtcTrackEvent,
 };
 
 use crate::engine::{Driver, Input, SerialQueue, Turn};
@@ -35,8 +37,6 @@ struct RuntimeConfig {
     #[serde(default)]
     request_headers: BTreeMap<String, String>,
     topology: TopologyConfig,
-    #[serde(default)]
-    topics: Vec<TopicConfig>,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +54,7 @@ struct TopologyConfig {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TopicConfig {
+struct TopicRegistrationConfig {
     name: String,
     mode: TopicModeConfig,
     #[serde(default)]
@@ -80,6 +80,143 @@ impl From<TopicModeConfig> for TopicMode {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesiredConfig {
+    connected: bool,
+    #[serde(default)]
+    publications: Vec<PublicationConfig>,
+    #[serde(default)]
+    video: Vec<VideoSubscriptionConfig>,
+    #[serde(default)]
+    audio: AudioSubscriptionConfig,
+    #[serde(default)]
+    playout_delay: PlayoutDelayConfig,
+    #[serde(default)]
+    topics: Vec<TopicRegistrationConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicationConfig {
+    slot: String,
+    active: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VideoSubscriptionConfig {
+    slot: u8,
+    track_id: String,
+    height: u32,
+    min_height: u32,
+    min_fps: u32,
+    priority: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AudioSubscriptionConfig {
+    #[serde(default)]
+    pinned: Vec<String>,
+    #[serde(default = "default_true")]
+    automatic: bool,
+}
+
+impl Default for AudioSubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            pinned: Vec::new(),
+            automatic: true,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+enum PlayoutDelayConfig {
+    #[default]
+    Adaptive,
+    Fixed {
+        #[serde(rename = "minMs")]
+        min_ms: u32,
+        #[serde(rename = "maxMs")]
+        max_ms: u32,
+    },
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SenderConfig {
+    content_hint: String,
+    degradation_preference: Option<String>,
+    #[serde(default)]
+    encodings: Vec<EncodingConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EncodingConfig {
+    rid: Option<String>,
+    active: bool,
+    scale_resolution_down_by: Option<f64>,
+    max_bitrate: Option<f64>,
+    max_framerate: Option<f64>,
+    scalability_mode: Option<String>,
+    dtx: Option<String>,
+}
+
+#[derive(Clone)]
+struct LocalTrackState {
+    track: MediaStreamTrack,
+    config: SenderConfig,
+    muted: bool,
+}
+
+impl DesiredConfig {
+    fn into_core(self) -> DesiredState {
+        DesiredState {
+            revision: 0,
+            connected: self.connected,
+            publications: self
+                .publications
+                .into_iter()
+                .map(|publication| PublicationIntent {
+                    slot: publication.slot,
+                    active: publication.active,
+                })
+                .collect(),
+            video: self
+                .video
+                .into_iter()
+                .map(|video| VideoSubscription {
+                    slot: video.slot,
+                    track_id: video.track_id,
+                    height: video.height,
+                    min_height: video.min_height,
+                    min_fps: video.min_fps,
+                    priority: video.priority,
+                })
+                .collect(),
+            audio: AudioSubscription {
+                pinned: self.audio.pinned,
+                automatic: self.audio.automatic,
+            },
+            playout_delay: match self.playout_delay {
+                PlayoutDelayConfig::Adaptive => PlayoutDelay::Adaptive,
+                PlayoutDelayConfig::Fixed { min_ms, max_ms } => {
+                    PlayoutDelay::Fixed { min_ms, max_ms }
+                }
+            },
+            topics: topic_registrations(&self.topics),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 struct DataChannel {
     channel: RtcDataChannel,
     _open: Closure<dyn FnMut(Event)>,
@@ -99,13 +236,16 @@ impl DataChannel {
 struct Peer {
     connection: RtcPeerConnection,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
+    remote_tracks: BTreeMap<String, MediaStreamTrack>,
     channels: BTreeMap<u64, DataChannel>,
     _state: Closure<dyn FnMut(Event)>,
+    _track: Closure<dyn FnMut(RtcTrackEvent)>,
 }
 
 impl Peer {
     fn close(self) {
         self.connection.set_onconnectionstatechange(None);
+        self.connection.set_ontrack(None);
         for channel in self.channels.into_values() {
             channel.close();
         }
@@ -123,6 +263,8 @@ struct RuntimeInner {
     queue: RefCell<SerialQueue<Input>>,
     desired: RefCell<DesiredState>,
     next_revision: Cell<u64>,
+    local_slots: BTreeMap<String, MediaKind>,
+    local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
     timers: RefCell<BTreeMap<u64, TimerHandle>>,
@@ -144,36 +286,47 @@ impl BrowserRuntime {
     pub fn new(config: JsValue) -> Result<BrowserRuntime, JsValue> {
         let config: RuntimeConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|error| js_error(format!("invalid browser runtime config: {error}")))?;
-        let topics = topic_registrations(&config.topics);
         let request_headers = config
             .request_headers
             .into_iter()
             .map(|(name, value)| HttpHeader { name, value })
             .collect();
+        let topology = MediaTopology {
+            local_video: config.topology.local_video,
+            local_audio: config.topology.local_audio,
+            remote_video: config.topology.remote_video,
+            remote_audio: config.topology.remote_audio,
+        };
+        let local_slots = topology
+            .local_video
+            .iter()
+            .cloned()
+            .map(|slot| (slot, MediaKind::Video))
+            .chain(
+                topology
+                    .local_audio
+                    .iter()
+                    .cloned()
+                    .map(|slot| (slot, MediaKind::Audio)),
+            )
+            .collect();
         let core_config = AgentConfig {
             endpoint: config.endpoint,
             room_id: config.room_id,
             request_headers,
-            topology: MediaTopology {
-                local_video: config.topology.local_video,
-                local_audio: config.topology.local_audio,
-                remote_video: config.topology.remote_video,
-                remote_audio: config.topology.remote_audio,
-            },
+            topology,
             manual_subscriptions: true,
             retry: RetryPolicy::default(),
         };
         let driver = Driver::new(core_config).map_err(|error| js_error(error.to_string()))?;
-        let desired = DesiredState {
-            topics,
-            ..DesiredState::default()
-        };
         Ok(Self {
             inner: Rc::new(RuntimeInner {
                 driver: RefCell::new(driver),
                 queue: RefCell::new(SerialQueue::default()),
-                desired: RefCell::new(desired),
+                desired: RefCell::new(DesiredState::default()),
                 next_revision: Cell::new(1),
+                local_slots,
+                local_tracks: RefCell::new(BTreeMap::new()),
                 peers: RefCell::new(BTreeMap::new()),
                 requests: RefCell::new(BTreeMap::new()),
                 timers: RefCell::new(BTreeMap::new()),
@@ -201,6 +354,52 @@ impl BrowserRuntime {
 
     pub fn set_error_listener(&self, listener: Option<Function>) {
         *self.inner.error_listener.borrow_mut() = listener;
+    }
+
+    pub fn replace_desired(&self, desired: JsValue) -> Result<(), JsValue> {
+        self.inner.ensure_open()?;
+        let desired: DesiredConfig = serde_wasm_bindgen::from_value(desired)
+            .map_err(|error| js_error(format!("invalid desired state: {error}")))?;
+        self.inner.replace_desired(desired.into_core());
+        Ok(())
+    }
+
+    pub async fn replace_local_track(
+        &self,
+        slot: String,
+        track: Option<MediaStreamTrack>,
+        config: JsValue,
+    ) -> Result<(), JsValue> {
+        self.inner.ensure_open()?;
+        let config: SenderConfig = serde_wasm_bindgen::from_value(config)
+            .map_err(|error| js_error(format!("invalid sender configuration: {error}")))?;
+        self.inner
+            .replace_local_track(slot, track, config)
+            .await
+            .map_err(js_error)
+    }
+
+    pub async fn set_local_muted(&self, slot: String, muted: bool) -> Result<(), JsValue> {
+        self.inner.ensure_open()?;
+        self.inner
+            .set_local_muted(slot, muted)
+            .await
+            .map_err(js_error)
+    }
+
+    pub fn remote_track(&self, mid: &str) -> Option<MediaStreamTrack> {
+        let generation = self.inner.driver.borrow().snapshot().generation?;
+        self.inner
+            .peers
+            .borrow()
+            .get(&generation.get())
+            .and_then(|peer| peer.remote_tracks.get(mid))
+            .cloned()
+    }
+
+    pub async fn statistics(&self) -> Result<JsValue, JsValue> {
+        self.inner.ensure_open()?;
+        self.inner.statistics().await.map_err(js_error)
     }
 
     pub fn connect(&self) -> Result<(), JsValue> {
@@ -283,11 +482,162 @@ impl RuntimeInner {
             return;
         }
         desired.connected = connected;
+        desired.revision = 0;
+        self.replace_desired(desired);
+    }
+
+    fn replace_desired(self: &Rc<Self>, mut desired: DesiredState) {
         desired.revision = self.next_revision.get();
         self.next_revision
             .set(self.next_revision.get().saturating_add(1));
         *self.desired.borrow_mut() = desired.clone();
         self.enqueue(Input::Command(AgentCommand::ReplaceDesired(desired)));
+    }
+
+    async fn replace_local_track(
+        self: &Rc<Self>,
+        slot: String,
+        track: Option<MediaStreamTrack>,
+        config: SenderConfig,
+    ) -> Result<(), String> {
+        let kind = self
+            .local_slots
+            .get(&slot)
+            .copied()
+            .ok_or_else(|| format!("unknown local publication slot: {slot}"))?;
+        validate_sender_config(kind, &config)?;
+        if let Some(track) = &track {
+            let expected = media_kind_name(kind);
+            if track.kind() != expected {
+                return Err(format!(
+                    "local slot {slot} requires a {expected} track, received {}",
+                    track.kind()
+                ));
+            }
+            let muted = self
+                .local_tracks
+                .borrow()
+                .get(&slot)
+                .is_some_and(|state| state.muted);
+            track.set_enabled(!muted);
+            set_property(
+                track.as_ref(),
+                "contentHint",
+                &JsValue::from_str(&config.content_hint),
+            )?;
+            self.local_tracks.borrow_mut().insert(
+                slot.clone(),
+                LocalTrackState {
+                    track: track.clone(),
+                    config,
+                    muted,
+                },
+            );
+        } else {
+            self.local_tracks.borrow_mut().remove(&slot);
+        }
+        self.sync_local_slot(&slot).await
+    }
+
+    async fn set_local_muted(self: &Rc<Self>, slot: String, muted: bool) -> Result<(), String> {
+        let track = {
+            let mut tracks = self.local_tracks.borrow_mut();
+            let state = tracks
+                .get_mut(&slot)
+                .ok_or_else(|| format!("local publication slot has no track: {slot}"))?;
+            if state.muted == muted {
+                return Ok(());
+            }
+            state.muted = muted;
+            state.track.clone()
+        };
+        track.set_enabled(!muted);
+        self.sync_local_slot(&slot).await
+    }
+
+    async fn sync_local_slot(&self, slot: &str) -> Result<(), String> {
+        let state = self.local_tracks.borrow().get(slot).cloned();
+        let senders: Vec<RtcRtpSender> = self
+            .peers
+            .borrow()
+            .values()
+            .flat_map(|peer| &peer.transceivers)
+            .filter_map(|(media_slot, transceiver)| match media_slot {
+                MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) if name == slot => {
+                    Some(transceiver.sender())
+                }
+                _ => None,
+            })
+            .collect();
+        for sender in senders {
+            apply_sender_state(&sender, state.as_ref()).await?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_peer(self: &Rc<Self>, generation: Generation) {
+        let slots: Vec<String> = self.local_slots.keys().cloned().collect();
+        for slot in slots {
+            if let Err(error) = self.sync_local_slot(&slot).await {
+                self.rtc_failed(generation, error);
+                return;
+            }
+        }
+        self.create_offer(generation);
+    }
+
+    async fn statistics(&self) -> Result<JsValue, String> {
+        let generation = self
+            .driver
+            .borrow()
+            .snapshot()
+            .generation
+            .ok_or_else(|| "statistics are unavailable before a transport exists".to_owned())?;
+        let (connection, senders) = {
+            let peers = self.peers.borrow();
+            let peer = peers
+                .get(&generation.get())
+                .ok_or_else(|| "active transport is unavailable".to_owned())?;
+            let senders = peer
+                .transceivers
+                .iter()
+                .filter_map(|(slot, transceiver)| match slot {
+                    MediaSlot::LocalVideo(name) => {
+                        Some((name.clone(), "video", transceiver.sender()))
+                    }
+                    MediaSlot::LocalAudio(name) => {
+                        Some((name.clone(), "audio", transceiver.sender()))
+                    }
+                    MediaSlot::RemoteVideo(_) | MediaSlot::RemoteAudio(_) => None,
+                })
+                .collect::<Vec<_>>();
+            (peer.connection.clone(), senders)
+        };
+        let report = JsFuture::from(connection.get_stats())
+            .await
+            .map_err(js_message)?;
+        let value = Object::new();
+        set(
+            &value,
+            "connection",
+            connection_name_from_browser(&connection),
+        );
+        set(&value, "report", report);
+        let sender_values = Array::new();
+        for (slot, kind, sender) in senders {
+            let sender_value = Object::new();
+            set(&sender_value, "slot", slot);
+            set(&sender_value, "kind", kind);
+            set(
+                &sender_value,
+                "trackId",
+                sender.track().map(|track| track.id()),
+            );
+            set(&sender_value, "parameters", sender.get_parameters());
+            sender_values.push(&sender_value);
+        }
+        set(&value, "senders", sender_values);
+        Ok(value.into())
     }
 
     fn enqueue(self: &Rc<Self>, input: Input) {
@@ -332,6 +682,14 @@ impl RuntimeInner {
         }
     }
 
+    fn publish_current_snapshot(&self) {
+        let listener = self.snapshot_listener.borrow().clone();
+        if let Some(listener) = listener {
+            let snapshot = snapshot_value(self.driver.borrow().snapshot());
+            call_listener(&listener, &snapshot, "snapshot");
+        }
+    }
+
     fn execute(self: &Rc<Self>, effect: Effect) {
         if self.closed.get() {
             return;
@@ -354,7 +712,10 @@ impl RuntimeInner {
                 Ok(peer) => {
                     let previous = self.peers.borrow_mut().insert(generation.get(), peer);
                     debug_assert!(previous.is_none(), "generation must own one peer");
-                    self.create_offer(generation);
+                    let inner = Rc::clone(self);
+                    spawn_local(async move {
+                        inner.prepare_peer(generation).await;
+                    });
                 }
                 Err(error) => self.rtc_failed(generation, error),
             },
@@ -408,6 +769,30 @@ impl RuntimeInner {
         }) as Box<dyn FnMut(Event)>);
         connection.set_onconnectionstatechange(Some(state.as_ref().unchecked_ref()));
 
+        let track_weak = Rc::downgrade(self);
+        let track = Closure::wrap(Box::new(move |event: RtcTrackEvent| {
+            let Some(inner) = track_weak.upgrade() else {
+                return;
+            };
+            let Some(mid) = event.transceiver().mid() else {
+                inner.report_error(format!(
+                    "generation={} received a remote track without a MID",
+                    generation.get()
+                ));
+                return;
+            };
+            let inserted = inner
+                .peers
+                .borrow_mut()
+                .get_mut(&generation.get())
+                .map(|peer| peer.remote_tracks.insert(mid, event.track()))
+                .is_some();
+            if inserted {
+                inner.publish_current_snapshot();
+            }
+        }) as Box<dyn FnMut(RtcTrackEvent)>);
+        connection.set_ontrack(Some(track.as_ref().unchecked_ref()));
+
         let mut channels = BTreeMap::new();
         for (index, spec) in specs.iter().enumerate() {
             let numeric = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
@@ -442,8 +827,10 @@ impl RuntimeInner {
         Ok(Peer {
             connection,
             transceivers,
+            remote_tracks: BTreeMap::new(),
             channels,
             _state: state,
+            _track: track,
         })
     }
 
@@ -832,6 +1219,7 @@ impl RuntimeInner {
             return;
         }
         self.queue.borrow_mut().clear();
+        self.local_tracks.borrow_mut().clear();
         for (_, peer) in std::mem::take(&mut *self.peers.borrow_mut()) {
             peer.close();
         }
@@ -852,7 +1240,7 @@ impl RuntimeInner {
     }
 }
 
-fn topic_registrations(topics: &[TopicConfig]) -> TopicRegistrations {
+fn topic_registrations(topics: &[TopicRegistrationConfig]) -> TopicRegistrations {
     let mut registrations = TopicRegistrations::default();
     for topic in topics {
         let mode = topic.mode.into();
@@ -913,6 +1301,192 @@ fn add_transceiver(
         .map_err(js_message)?
         .dyn_into()
         .map_err(js_message)
+}
+
+fn validate_sender_config(kind: MediaKind, config: &SenderConfig) -> Result<(), String> {
+    let valid_hint = match kind {
+        MediaKind::Video => matches!(config.content_hint.as_str(), "motion" | "detail" | "text"),
+        MediaKind::Audio => matches!(config.content_hint.as_str(), "speech" | "music"),
+    };
+    if !valid_hint {
+        return Err(format!(
+            "invalid {} content hint: {}",
+            media_kind_name(kind),
+            config.content_hint
+        ));
+    }
+    let expected = match kind {
+        MediaKind::Video => 3,
+        MediaKind::Audio => 1,
+    };
+    if config.encodings.len() != expected {
+        return Err(format!(
+            "{} sender configuration requires {expected} encoding entries",
+            media_kind_name(kind)
+        ));
+    }
+    for encoding in &config.encodings {
+        for value in [
+            encoding.scale_resolution_down_by,
+            encoding.max_bitrate,
+            encoding.max_framerate,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !value.is_finite() || value <= 0.0 {
+                return Err("sender encoding values must be finite and positive".into());
+            }
+        }
+        if encoding
+            .scalability_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "L1T1" | "L1T2" | "L1T3"))
+        {
+            return Err("sender scalability mode must be L1T1, L1T2, or L1T3".into());
+        }
+        if encoding
+            .dtx
+            .as_deref()
+            .is_some_and(|dtx| !matches!(dtx, "enabled" | "disabled"))
+        {
+            return Err("audio DTX must be enabled or disabled".into());
+        }
+    }
+    Ok(())
+}
+
+async fn apply_sender_state(
+    sender: &RtcRtpSender,
+    state: Option<&LocalTrackState>,
+) -> Result<(), String> {
+    let track = state.map(|state| &state.track);
+    JsFuture::from(sender.replace_track(track))
+        .await
+        .map_err(js_message)?;
+    let Some(state) = state else {
+        return Ok(());
+    };
+    set_property(
+        state.track.as_ref(),
+        "contentHint",
+        &JsValue::from_str(&state.config.content_hint),
+    )?;
+    apply_sender_parameters(sender, state, false).await?;
+    if state
+        .config
+        .encodings
+        .iter()
+        .any(|encoding| encoding.scalability_mode.is_some())
+        && let Err(error) = apply_sender_parameters(sender, state, true).await
+    {
+        log::warn!("browser rejected sender scalability mode: {error}");
+    }
+    Ok(())
+}
+
+async fn apply_sender_parameters(
+    sender: &RtcRtpSender,
+    state: &LocalTrackState,
+    scalability_only: bool,
+) -> Result<(), String> {
+    let parameters = sender.get_parameters();
+    let encodings: Array = Reflect::get(parameters.as_ref(), &JsValue::from_str("encodings"))
+        .map_err(js_message)?
+        .dyn_into()
+        .map_err(js_message)?;
+    for (index, value) in encodings.iter().enumerate() {
+        let Some(config) = encoding_for(&state.config.encodings, &value, index) else {
+            continue;
+        };
+        if scalability_only {
+            if let Some(mode) = &config.scalability_mode {
+                set_property(&value, "scalabilityMode", &JsValue::from_str(mode))?;
+            }
+            continue;
+        }
+        set_property(
+            &value,
+            "active",
+            &JsValue::from_bool(config.active && !state.muted),
+        )?;
+        set_optional_number(
+            &value,
+            "scaleResolutionDownBy",
+            config.scale_resolution_down_by,
+        )?;
+        set_optional_number(&value, "maxBitrate", config.max_bitrate)?;
+        set_optional_number(&value, "maxFramerate", config.max_framerate)?;
+        if let Some(dtx) = &config.dtx {
+            set_property(&value, "dtx", &JsValue::from_str(dtx))?;
+        }
+    }
+    if !scalability_only && let Some(preference) = &state.config.degradation_preference {
+        set_property(
+            parameters.as_ref(),
+            "degradationPreference",
+            &JsValue::from_str(preference),
+        )?;
+    }
+    JsFuture::from(sender.set_parameters_with_parameters(&parameters))
+        .await
+        .map_err(js_message)?;
+    Ok(())
+}
+
+fn encoding_for<'a>(
+    configs: &'a [EncodingConfig],
+    value: &JsValue,
+    index: usize,
+) -> Option<&'a EncodingConfig> {
+    let rid = Reflect::get(value, &JsValue::from_str("rid"))
+        .ok()
+        .and_then(|value| value.as_string());
+    rid.as_deref()
+        .and_then(|rid| {
+            configs
+                .iter()
+                .find(|config| config.rid.as_deref() == Some(rid))
+        })
+        .or_else(|| configs.get(index))
+}
+
+fn set_optional_number(object: &JsValue, name: &str, value: Option<f64>) -> Result<(), String> {
+    if let Some(value) = value {
+        set_property(object, name, &JsValue::from_f64(value))?;
+    }
+    Ok(())
+}
+
+fn set_property(object: &JsValue, name: &str, value: &JsValue) -> Result<(), String> {
+    Reflect::set(object, &JsValue::from_str(name), value)
+        .map_err(js_message)
+        .and_then(|set| {
+            if set {
+                Ok(())
+            } else {
+                Err(format!("browser rejected sender property: {name}"))
+            }
+        })
+}
+
+fn media_kind_name(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Video => "video",
+        MediaKind::Audio => "audio",
+    }
+}
+
+fn connection_name_from_browser(connection: &RtcPeerConnection) -> &'static str {
+    match connection.connection_state() {
+        RtcPeerConnectionState::New => "new",
+        RtcPeerConnectionState::Connecting => "connecting",
+        RtcPeerConnectionState::Connected => "connected",
+        RtcPeerConnectionState::Disconnected => "disconnected",
+        RtcPeerConnectionState::Failed => "failed",
+        RtcPeerConnectionState::Closed => "closed",
+        _ => "unknown",
+    }
 }
 
 fn browser_request(
@@ -979,18 +1553,92 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         snapshot.generation.map(Generation::get),
     );
     set(&value, "participantId", snapshot.participant_id.clone());
-    set(&value, "participants", snapshot.participants.len());
-    set(&value, "publications", snapshot.publications.len());
-    set(&value, "videoBindings", snapshot.video.len());
-    set(&value, "audioBindings", snapshot.audio.len());
+    let participants = Array::new();
+    for participant in snapshot.participants.values() {
+        let item = Object::new();
+        set(&item, "id", participant.id.clone());
+        participants.push(&item);
+    }
+    set(&value, "participants", participants);
+    let publications = Array::new();
+    for publication in snapshot.publications.values() {
+        let item = Object::new();
+        set(&item, "id", publication.id.clone());
+        set(&item, "participantId", publication.participant_id.clone());
+        set(&item, "kind", media_kind_name(publication.kind));
+        publications.push(&item);
+    }
+    set(&value, "publications", publications);
+    let video = Array::new();
+    for binding in snapshot.video.values() {
+        let item = Object::new();
+        set(&item, "trackId", binding.track_id.clone());
+        set(&item, "mid", binding.mid.clone());
+        set(&item, "paused", binding.paused);
+        video.push(&item);
+    }
+    set(&value, "video", video);
+    let audio = Array::new();
+    for binding in &snapshot.audio {
+        let item = Object::new();
+        set(&item, "trackId", binding.track_id.clone());
+        set(&item, "mid", binding.mid.clone());
+        set(&item, "levelDbov", binding.level_dbov);
+        audio.push(&item);
+    }
+    set(&value, "audio", audio);
+    set(&value, "topics", topic_snapshot_value(&snapshot.topics));
     set(
         &value,
-        "terminalFailure",
-        snapshot
-            .terminal_failure
-            .as_ref()
-            .map(|failure| failure.message.clone()),
+        "failure",
+        snapshot.terminal_failure.as_ref().map(failure_value),
     );
+    value.into()
+}
+
+fn topic_snapshot_value(snapshot: &agent_core::TopicSnapshot) -> JsValue {
+    let value = Object::new();
+    let publishers = Array::new();
+    for status in &snapshot.publishers {
+        let item = Object::new();
+        set(&item, "name", status.registration.topic.clone());
+        set(&item, "mode", topic_mode_name(status.registration.mode));
+        set(&item, "connected", status.channel.is_some());
+        set(&item, "streamId", status.stream_id);
+        set(&item, "nextSequence", status.next_sequence);
+        set(&item, "queued", status.queued_messages);
+        set(&item, "sendPending", status.send_pending);
+        publishers.push(&item);
+    }
+    set(&value, "publishers", publishers);
+    let subscribers = Array::new();
+    for status in &snapshot.subscribers {
+        let item = Object::new();
+        set(&item, "name", status.registration.topic.clone());
+        set(&item, "mode", topic_mode_name(status.registration.mode));
+        set(
+            &item,
+            "publisherId",
+            status.registration.publisher_id.clone(),
+        );
+        set(&item, "connected", status.channel.is_some());
+        set(&item, "publishers", status.publishers);
+        set(&item, "buffered", status.buffered_messages);
+        subscribers.push(&item);
+    }
+    set(&value, "subscribers", subscribers);
+    set(&value, "acceptedSends", snapshot.accepted_sends);
+    set(&value, "droppedSends", snapshot.dropped_sends);
+    set(&value, "deliveredMessages", snapshot.delivered_messages);
+    set(&value, "resynchronizations", snapshot.resynchronizations);
+    set(&value, "channelFailures", snapshot.channel_failures);
+    value.into()
+}
+
+fn failure_value(failure: &agent_core::Failure) -> JsValue {
+    let value = Object::new();
+    set(&value, "class", failure_class_name(failure.class));
+    set(&value, "message", failure.message.clone());
     value.into()
 }
 
@@ -1038,14 +1686,48 @@ fn notification_value(notification: &Notification) -> JsValue {
             set(&value, "streamId", *stream_id);
             set(&value, "nextSequence", *next_sequence);
         }
+        Notification::Topic(TopicNotification::SendAdmitted {
+            publisher,
+            operation,
+            stream_id,
+            sequence,
+        }) => {
+            set(&value, "type", "topic-send-admitted");
+            set(&value, "topic", publisher.topic.clone());
+            set(&value, "mode", topic_mode_name(publisher.mode));
+            set(&value, "operation", operation.get());
+            set(&value, "streamId", *stream_id);
+            set(&value, "sequence", *sequence);
+        }
+        Notification::Topic(TopicNotification::SendDropped { publisher, reason }) => {
+            set(&value, "type", "topic-send-dropped");
+            set(&value, "topic", publisher.topic.clone());
+            set(&value, "mode", topic_mode_name(publisher.mode));
+            set(&value, "reason", topic_drop_reason_name(*reason));
+        }
+        Notification::Topic(TopicNotification::ChannelFailed { channel, message }) => {
+            set(&value, "type", "topic-channel-failed");
+            match channel {
+                TopicChannel::Publisher(publisher) => {
+                    set(&value, "direction", "publish");
+                    set(&value, "topic", publisher.topic.clone());
+                    set(&value, "mode", topic_mode_name(publisher.mode));
+                }
+                TopicChannel::Subscriber(subscriber) => {
+                    set(&value, "direction", "subscribe");
+                    set(&value, "topic", subscriber.topic.clone());
+                    set(&value, "mode", topic_mode_name(subscriber.mode));
+                }
+            }
+            set(&value, "message", message.clone());
+        }
         Notification::Failure(failure) => {
             set(&value, "type", "failure");
             set(&value, "message", &failure.message);
-            set(&value, "class", format!("{:?}", failure.class));
+            set(&value, "class", failure_class_name(failure.class));
         }
         _ => {
             set(&value, "type", "state-change");
-            set(&value, "detail", format!("{notification:?}"));
         }
     }
     value.into()
@@ -1053,8 +1735,49 @@ fn notification_value(notification: &Notification) -> JsValue {
 
 fn connection_name(state: &ConnectionState) -> String {
     match state {
+        ConnectionState::Disconnected => "disconnected".into(),
+        ConnectionState::CreatingOffer => "creating-offer".into(),
+        ConnectionState::Joining => "joining".into(),
+        ConnectionState::ApplyingAnswer => "applying-answer".into(),
+        ConnectionState::WaitingForTransport => "waiting-for-transport".into(),
+        ConnectionState::WaitingForSignaling => "waiting-for-signaling".into(),
+        ConnectionState::Connected => "connected".into(),
+        ConnectionState::Reconnecting => "reconnecting".into(),
         ConnectionState::RetryWaiting { attempt, .. } => format!("retry-waiting:{attempt}"),
-        state => format!("{state:?}").to_lowercase(),
+        ConnectionState::Closing => "closing".into(),
+        ConnectionState::TerminalFailure => "terminal-failure".into(),
+    }
+}
+
+fn topic_mode_name(mode: TopicMode) -> &'static str {
+    match mode {
+        TopicMode::Latest => "latest",
+        TopicMode::Ordered => "ordered",
+    }
+}
+
+fn failure_class_name(class: FailureClass) -> &'static str {
+    match class {
+        FailureClass::InvalidConfiguration => "invalid-configuration",
+        FailureClass::Authorization => "authorization",
+        FailureClass::Protocol => "protocol",
+        FailureClass::Transient => "transient",
+        FailureClass::ResourceExpired => "resource-expired",
+        FailureClass::RetryExhausted => "retry-exhausted",
+    }
+}
+
+fn topic_drop_reason_name(reason: TopicDropReason) -> &'static str {
+    match reason {
+        TopicDropReason::InvalidPayload => "invalid-payload",
+        TopicDropReason::NotRegistered => "not-registered",
+        TopicDropReason::ChannelUnavailable => "channel-unavailable",
+        TopicDropReason::QueueFull => "queue-full",
+        TopicDropReason::Superseded => "superseded",
+        TopicDropReason::HostRejected => "host-rejected",
+        TopicDropReason::ChannelClosed => "channel-closed",
+        TopicDropReason::TransportReplaced => "transport-replaced",
+        TopicDropReason::SequenceExhausted => "sequence-exhausted",
     }
 }
 
