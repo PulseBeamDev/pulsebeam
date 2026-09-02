@@ -37,12 +37,12 @@ futures-lite = "2.6.1"
 more-asserts = "0.3.1"
 openh264 = "=0.9.8"
 opus = "=0.4.0"
-opusic-sys = { version = "=0.7.3", default-features = false, features = [
+opusic-sys = { version = "=0.7.5", default-features = false, features = [
   "bundled",
 ] }
 rand = "0.10.1"
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/overusing-readiness" }
 str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/bwe-6" }
 # str0m = { git = "https://github.com/algesten/str0m.git", rev = "92fac41" }
