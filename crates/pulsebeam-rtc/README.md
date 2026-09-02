@@ -119,26 +119,28 @@ URI, never source wire ID.
 
 ## Scheduling, latency, and congestion control
 
-Scheduling priority is protocol control, retransmission, audio, video, then
-padding. The SFU does not supply packet-priority knobs.
+Protocol control remains deliverable and padding remains lowest-value traffic.
+Media scheduling and allocation use mutable SFU-provided policy per sender:
+playout-delay range, relative priority, and desired bitrate. The connection
+measures actual sending rate itself. Policy is keyed by the stable negotiated
+`SenderId`, not by a source SSRC, encoding, or RTX stream.
 
-One dynamic connection-wide playout-delay range expresses the desired
-quality/latency tradeoff. The connection writes it to every negotiated egress
-video stream and derives pacer horizon, new-frame admission, stale-frame
-shedding, and retransmission usefulness through a latency governor. Tightening
-the range immediately re-evaluates already queued video. The range is
-best-effort because remote capture, decode, and render costs are not fully
-observable.
+Each sender's playout-delay range expresses its desired quality/latency
+tradeoff. A latency governor derives per-sender pacer horizon, admission,
+shedding, and retransmission usefulness, then applies the strictest active
+latency requirement to shared path queueing. Tightening a sender immediately
+re-evaluates its queued video. The range is best-effort because remote capture,
+decode, and render costs are not fully observable.
 
 Congestion control is implemented in this crate, using libwebrtc as behavioral
 guidance rather than an implementation dependency or a requirement for exact
 parity. The detailed design is in
 [docs/congestion-control.md](docs/congestion-control.md).
 
-- Egress runs one connection-level, SCReAM-v2-derived delay/loss controller and
-  exposes an aggregate latency-governed available bitrate. The SFU reports
-  aggregate sending and desired bitrate; it continues to choose sources and
-  layers.
+- Egress runs one connection-level, SCReAM-v2-derived delay/loss controller.
+  A weighted allocator divides its latency-governed media capacity into
+  per-sender allocations. The SFU configures sender priority and desired rate,
+  receives those allocations, and continues to choose sources and layers.
 - Ingress records packet arrivals and emits TWCC feedback. It exposes aggregate
   ingress rate, loss, RTT, and probe statistics but does not compete with the
   browser's send-side controller through REMB.
