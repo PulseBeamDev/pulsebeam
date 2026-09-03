@@ -211,7 +211,7 @@ pub fn from_socket(
         send_batch_limit: send_buf_size / 2,
     };
 
-    tracing::info!(
+    tracing::debug!(
         %local_addr,
         recv_buf = fmt_bytes(recv_buf_size),
         send_buf = fmt_bytes(send_buf_size),

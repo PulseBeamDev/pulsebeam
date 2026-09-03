@@ -1069,7 +1069,7 @@ pub fn tune_current_control_thread() {
         if let Err(e) = result {
             tracing::warn!("Failed to lower Control Thread priority: {:?}", e);
         } else {
-            tracing::info!("Control thread tuned: Minimum Priority");
+            tracing::debug!("Control thread tuned: Minimum Priority");
         }
     }
 
@@ -1103,7 +1103,7 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) -> bool 
             );
             false
         } else {
-            tracing::info!("Data thread successfully elevated to SCHED_FIFO (Priority 10)");
+            tracing::debug!("Data thread successfully elevated to SCHED_FIFO (Priority 10)");
             true
         };
 
@@ -1113,14 +1113,14 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) -> bool 
             tracing::warn!(?err, "Failed to set timer slack on data thread");
         } else {
             let current_slack = current_timer_slack().unwrap_or(0);
-            tracing::info!(current_slack, "Data thread timer slack successfully tuned");
+            tracing::debug!(current_slack, "Data thread timer slack successfully tuned");
         }
 
         // https://developers.redhat.com/articles/2025/03/26/rhel-real-time-cpu-throttling-and-risks#is_that_a_bug_
         // set higher priority first before pinning to avoid a potential lockup
         if let Some(core) = core_id {
             if core_affinity::set_for_current(core) {
-                tracing::info!(?core, "Data thread pinned to CPU core");
+                tracing::debug!(?core, "Data thread pinned to CPU core");
             } else {
                 tracing::warn!(?core, "Failed to pin Data thread to CPU core");
             }
