@@ -3300,6 +3300,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "spin 0.10.0",
  "thirtyfour",
  "thiserror 2.0.20",
  "tokio",
