@@ -3389,7 +3389,7 @@ function uniffiEnsureInitialized() {
   const bindingsContractVersion = 30;
   // Get the scaffolding contract version by calling the into the dylib
   const scaffoldingContractVersion =
-    nativeModule().ubrn_ffi_pulsebeam_agent_core_uniffi_contract_version();
+    nativeModule().ubrn_ffi_pulsebeam_agent_web_uniffi_contract_version();
   if (bindingsContractVersion !== scaffoldingContractVersion) {
     throw new UniffiInternalError.ContractVersionMismatch(
       scaffoldingContractVersion,
