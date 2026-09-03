@@ -1,13 +1,13 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 use agent_core::{
-    AgentCommand, AgentConfig, AudioSubscription, ChannelId, ConnectionState, DataChannelBinding,
-    DataChannelEffect, DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState,
-    Effect, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod,
+    AgentConfig, AudioSubscription, ChannelId, ConnectionState, DataChannelBinding,
+    DataChannelEffect, DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState, Effect,
+    Failure, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod,
     HttpResponse, MediaKind, MediaSlot, MediaTopology, Notification, OfferResources, OperationId,
     PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, SlotBinding, TimerEffect,
     TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode, TopicNotification,
@@ -25,7 +25,7 @@ use web_sys::{
     RtcTrackEvent,
 };
 
-use crate::engine::{Driver, Input, SerialQueue, Turn};
+use crate::engine::{spawn_actor, ActorHandle, Host, PublicCommand, TopicCommand, Turn};
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
 
@@ -258,11 +258,54 @@ struct TimerHandle {
     _callback: Closure<dyn FnMut()>,
 }
 
+#[derive(Clone)]
+struct BrowserHost {
+    inner: Weak<RuntimeInner>,
+}
+
+impl BrowserHost {
+    fn new(inner: &Rc<RuntimeInner>) -> Self {
+        Self {
+            inner: Rc::downgrade(inner),
+        }
+    }
+}
+
+impl Host for BrowserHost {
+    fn publish_turn(&self, turn: &Turn) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner.publish_turn(turn);
+    }
+
+    fn execute_effect(&self, effect: Effect) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner.execute(effect);
+    }
+
+    fn host_failed(&self, failure: &Failure) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner.report_error(format!(
+            "host failure ({:?}): {}",
+            failure.class, failure.message
+        ));
+    }
+
+    fn shutdown(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner.shutdown();
+    }
+}
+
 struct RuntimeInner {
-    driver: RefCell<Driver>,
-    queue: RefCell<SerialQueue<Input>>,
-    desired: RefCell<DesiredState>,
-    next_revision: Cell<u64>,
+    actor: RefCell<Option<ActorHandle>>,
     local_slots: BTreeMap<String, MediaKind>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
@@ -318,24 +361,24 @@ impl BrowserRuntime {
             manual_subscriptions: true,
             retry: RetryPolicy::default(),
         };
-        let driver = Driver::new(core_config).map_err(|error| js_error(error.to_string()))?;
+        let inner = Rc::new(RuntimeInner {
+            actor: RefCell::new(None),
+            local_slots,
+            local_tracks: RefCell::new(BTreeMap::new()),
+            peers: RefCell::new(BTreeMap::new()),
+            requests: RefCell::new(BTreeMap::new()),
+            timers: RefCell::new(BTreeMap::new()),
+            snapshot_listener: RefCell::new(None),
+            event_listener: RefCell::new(None),
+            error_listener: RefCell::new(None),
+            last_error: RefCell::new(None),
+            closed: Cell::new(false),
+        });
+        let actor = spawn_actor(core_config, BrowserHost::new(&inner))
+            .map_err(|error| js_error(error.to_string()))?;
+        *inner.actor.borrow_mut() = Some(actor);
         Ok(Self {
-            inner: Rc::new(RuntimeInner {
-                driver: RefCell::new(driver),
-                queue: RefCell::new(SerialQueue::default()),
-                desired: RefCell::new(DesiredState::default()),
-                next_revision: Cell::new(1),
-                local_slots,
-                local_tracks: RefCell::new(BTreeMap::new()),
-                peers: RefCell::new(BTreeMap::new()),
-                requests: RefCell::new(BTreeMap::new()),
-                timers: RefCell::new(BTreeMap::new()),
-                snapshot_listener: RefCell::new(None),
-                event_listener: RefCell::new(None),
-                error_listener: RefCell::new(None),
-                last_error: RefCell::new(None),
-                closed: Cell::new(false),
-            }),
+            inner,
         })
     }
 
@@ -343,7 +386,7 @@ impl BrowserRuntime {
         *self.inner.snapshot_listener.borrow_mut() = listener;
         let listener = self.inner.snapshot_listener.borrow().clone();
         if let Some(listener) = listener {
-            let snapshot = snapshot_value(self.inner.driver.borrow().snapshot());
+            let snapshot = snapshot_value(&self.inner.snapshot());
             call_listener(&listener, &snapshot, "snapshot");
         }
     }
@@ -360,7 +403,9 @@ impl BrowserRuntime {
         self.inner.ensure_open()?;
         let desired: DesiredConfig = serde_wasm_bindgen::from_value(desired)
             .map_err(|error| js_error(format!("invalid desired state: {error}")))?;
-        self.inner.replace_desired(desired.into_core());
+        self.inner
+            .replace_desired(desired.into_core())
+            .map_err(js_error)?;
         Ok(())
     }
 
@@ -388,7 +433,7 @@ impl BrowserRuntime {
     }
 
     pub fn remote_track(&self, mid: &str) -> Option<MediaStreamTrack> {
-        let generation = self.inner.driver.borrow().snapshot().generation?;
+        let generation = self.inner.snapshot().generation?;
         self.inner
             .peers
             .borrow()
@@ -404,20 +449,19 @@ impl BrowserRuntime {
 
     pub fn connect(&self) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
-        self.inner.replace_connection_desired(true);
+        self.inner
+            .replace_connection_desired(true)
+            .map_err(js_error)?;
         Ok(())
     }
 
     pub fn force_reconnect(&self) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
-        let generation = self.inner.driver.borrow().snapshot().generation;
+        let generation = self.inner.snapshot().generation;
         let Some(generation) = generation else {
             return Err(js_error("cannot reconnect before a transport exists"));
         };
-        self.inner
-            .enqueue(Input::Event(HostEvent::Rtc(RtcEvent::Disconnected {
-                generation,
-            })));
+        self.inner.send_event(HostEvent::Rtc(RtcEvent::Disconnected { generation }));
         Ok(())
     }
 
@@ -425,13 +469,14 @@ impl BrowserRuntime {
         self.inner.ensure_open()?;
         let mode = parse_topic_mode(mode)?;
         self.inner
-            .enqueue(Input::Command(AgentCommand::SendTopic(TopicSend {
-                publisher: TopicPublisher {
-                    topic: name.to_owned(),
-                    mode,
-                },
-                payload: payload.to_vec(),
-            })));
+            .send_topic(TopicSend {
+            publisher: TopicPublisher {
+                topic: name.to_owned(),
+                mode,
+            },
+            payload: payload.to_vec(),
+        })
+        .map_err(js_error)?;
         Ok(())
     }
 
@@ -439,15 +484,15 @@ impl BrowserRuntime {
         if self.inner.closed.get() {
             return;
         }
-        self.inner.replace_connection_desired(false);
+        self.inner.request_close();
     }
 
     pub fn abort(&self) {
-        self.inner.abort();
+        self.inner.request_abort();
     }
 
     pub fn snapshot(&self) -> JsValue {
-        snapshot_value(self.inner.driver.borrow().snapshot())
+        snapshot_value(&self.inner.snapshot())
     }
 
     pub fn diagnostics(&self) -> JsValue {
@@ -463,7 +508,7 @@ impl BrowserRuntime {
 
 impl Drop for BrowserRuntime {
     fn drop(&mut self) {
-        self.inner.abort();
+        self.inner.request_abort();
     }
 }
 
@@ -476,22 +521,67 @@ impl RuntimeInner {
         }
     }
 
-    fn replace_connection_desired(self: &Rc<Self>, connected: bool) {
-        let mut desired = self.desired.borrow().clone();
-        if desired.connected == connected && desired.revision != 0 {
+    fn send_event(&self, event: HostEvent) {
+        let actor = self.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
             return;
+        };
+        if let Err(error) = actor.send_host_event(event) {
+            self.report_error(format!("runtime actor message failure: {error}"));
         }
-        desired.connected = connected;
-        desired.revision = 0;
-        self.replace_desired(desired);
     }
 
-    fn replace_desired(self: &Rc<Self>, mut desired: DesiredState) {
-        desired.revision = self.next_revision.get();
-        self.next_revision
-            .set(self.next_revision.get().saturating_add(1));
-        *self.desired.borrow_mut() = desired.clone();
-        self.enqueue(Input::Command(AgentCommand::ReplaceDesired(desired)));
+    fn send_topic(&self, send: TopicSend) -> Result<(), String> {
+        let actor = self.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
+            return Err("runtime actor not initialized".to_owned());
+        };
+        actor.send_topic(TopicCommand::SendTopic(send))
+    }
+
+    fn replace_desired(self: &Rc<Self>, desired: DesiredState) -> Result<(), String> {
+        let actor = self.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
+            return Err("runtime actor not initialized".to_owned());
+        };
+        actor.send_public(PublicCommand::ReplaceDesired(desired))
+    }
+
+    fn replace_connection_desired(self: &Rc<Self>, connected: bool) -> Result<(), String> {
+        let actor = self.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
+            return Err("runtime actor not initialized".to_owned());
+        };
+        actor.send_public(PublicCommand::SetConnected(connected))
+    }
+
+    fn request_close(&self) {
+        let actor = self.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
+            return;
+        };
+        if let Err(error) = actor.request_close() {
+            self.report_error(format!("runtime actor message failure: {error}"));
+        }
+    }
+
+    fn request_abort(&self) {
+        let actor = self.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
+            self.shutdown();
+            return;
+        };
+        if let Err(error) = actor.abort() {
+            self.report_error(format!("runtime actor message failure: {error}"));
+            self.shutdown();
+        }
+    }
+
+    fn snapshot(&self) -> agent_core::Snapshot {
+        let actor = self.actor.borrow();
+        actor
+            .as_ref()
+            .map_or_else(agent_core::Snapshot::default, |actor| actor.snapshot())
     }
 
     async fn replace_local_track(
@@ -588,8 +678,6 @@ impl RuntimeInner {
 
     async fn statistics(&self) -> Result<JsValue, String> {
         let generation = self
-            .driver
-            .borrow()
             .snapshot()
             .generation
             .ok_or_else(|| "statistics are unavailable before a transport exists".to_owned())?;
@@ -640,27 +728,6 @@ impl RuntimeInner {
         Ok(value.into())
     }
 
-    fn enqueue(self: &Rc<Self>, input: Input) {
-        if self.closed.get() {
-            return;
-        }
-        if !self.queue.borrow_mut().push(input) {
-            return;
-        }
-
-        loop {
-            let Some(input) = self.queue.borrow_mut().pop() else {
-                break;
-            };
-            let turn = self.driver.borrow_mut().turn(input);
-            self.publish_turn(&turn);
-            for effect in turn.effects {
-                self.execute(effect);
-            }
-        }
-        self.queue.borrow_mut().finish();
-    }
-
     fn publish_turn(&self, turn: &Turn) {
         if let Some(error) = &turn.error {
             self.report_error(format!("core rejected input: {error}"));
@@ -685,7 +752,7 @@ impl RuntimeInner {
     fn publish_current_snapshot(&self) {
         let listener = self.snapshot_listener.borrow().clone();
         if let Some(listener) = listener {
-            let snapshot = snapshot_value(self.driver.borrow().snapshot());
+            let snapshot = snapshot_value(&self.snapshot());
             call_listener(&listener, &snapshot, "snapshot");
         }
     }
@@ -726,9 +793,7 @@ impl RuntimeInner {
                 if let Some(peer) = self.peers.borrow_mut().remove(&generation.get()) {
                     peer.close();
                 }
-                self.enqueue(Input::Event(HostEvent::Rtc(RtcEvent::Closed {
-                    generation,
-                })));
+                self.send_event(HostEvent::Rtc(RtcEvent::Closed { generation }));
             }
         }
     }
@@ -752,14 +817,10 @@ impl RuntimeInner {
             };
             match state_connection.connection_state() {
                 RtcPeerConnectionState::Connected => {
-                    inner.enqueue(Input::Event(HostEvent::Rtc(RtcEvent::Connected {
-                        generation,
-                    })));
+                    inner.send_event(HostEvent::Rtc(RtcEvent::Connected { generation }));
                 }
                 RtcPeerConnectionState::Disconnected | RtcPeerConnectionState::Failed => {
-                    inner.enqueue(Input::Event(HostEvent::Rtc(RtcEvent::Disconnected {
-                        generation,
-                    })));
+                    inner.send_event(HostEvent::Rtc(RtcEvent::Disconnected { generation }));
                 }
                 RtcPeerConnectionState::New
                 | RtcPeerConnectionState::Connecting
@@ -856,12 +917,10 @@ impl RuntimeInner {
         let open_weak = Rc::downgrade(self);
         let open = Closure::wrap(Box::new(move |_event: Event| {
             if let Some(inner) = open_weak.upgrade() {
-                inner.enqueue(Input::Event(HostEvent::DataChannel(
-                    DataChannelEvent::Opened {
-                        generation,
-                        channel: channel_id,
-                    },
-                )));
+                inner.send_event(HostEvent::DataChannel(DataChannelEvent::Opened {
+                    generation,
+                    channel: channel_id,
+                }));
             }
         }) as Box<dyn FnMut(Event)>);
         channel.set_onopen(Some(open.as_ref().unchecked_ref()));
@@ -869,12 +928,10 @@ impl RuntimeInner {
         let close_weak = Rc::downgrade(self);
         let close = Closure::wrap(Box::new(move |_event: Event| {
             if let Some(inner) = close_weak.upgrade() {
-                inner.enqueue(Input::Event(HostEvent::DataChannel(
-                    DataChannelEvent::Closed {
-                        generation,
-                        channel: channel_id,
-                    },
-                )));
+                inner.send_event(HostEvent::DataChannel(DataChannelEvent::Closed {
+                    generation,
+                    channel: channel_id,
+                }));
             }
         }) as Box<dyn FnMut(Event)>);
         channel.set_onclose(Some(close.as_ref().unchecked_ref()));
@@ -887,13 +944,11 @@ impl RuntimeInner {
             let data = event.data();
             if data.is_instance_of::<js_sys::ArrayBuffer>() || data.is_instance_of::<Uint8Array>() {
                 let payload = Uint8Array::new(&data).to_vec();
-                inner.enqueue(Input::Event(HostEvent::DataChannel(
-                    DataChannelEvent::Message {
-                        generation,
-                        channel: channel_id,
-                        payload,
-                    },
-                )));
+                inner.send_event(HostEvent::DataChannel(DataChannelEvent::Message {
+                    generation,
+                    channel: channel_id,
+                    payload,
+                }));
             } else {
                 inner.report_error(format!(
                     "generation={} channel={} received non-binary data",
@@ -941,11 +996,11 @@ impl RuntimeInner {
                 match result {
                     Ok(offer) => match inner.offer_resources(generation) {
                         Ok(resources) => {
-                            inner.enqueue(Input::Event(HostEvent::Rtc(RtcEvent::OfferCreated {
+                            inner.send_event(HostEvent::Rtc(RtcEvent::OfferCreated {
                                 generation,
                                 offer,
                                 resources,
-                            })));
+                            }));
                         }
                         Err(error) => inner.rtc_failed(generation, error),
                     },
@@ -1021,9 +1076,7 @@ impl RuntimeInner {
                     return;
                 }
                 match result {
-                    Ok(_) => inner.enqueue(Input::Event(HostEvent::Rtc(RtcEvent::AnswerApplied {
-                        generation,
-                    }))),
+                    Ok(_) => inner.send_event(HostEvent::Rtc(RtcEvent::AnswerApplied { generation })),
                     Err(error) => inner.rtc_failed(generation, js_message(error)),
                 }
             }
@@ -1035,10 +1088,7 @@ impl RuntimeInner {
             "generation={} RTC operation failed: {message}",
             generation.get()
         ));
-        self.enqueue(Input::Event(HostEvent::Rtc(RtcEvent::Failed {
-            generation,
-            message,
-        })));
+        self.send_event(HostEvent::Rtc(RtcEvent::Failed { generation, message }));
     }
 
     fn execute_http(self: &Rc<Self>, effect: HttpEffect) {
@@ -1089,10 +1139,10 @@ impl RuntimeInner {
                     }
                     match result {
                         Ok(response) => {
-                            inner.enqueue(Input::Event(HostEvent::Http(HttpEvent::Response {
+                            inner.send_event(HostEvent::Http(HttpEvent::Response {
                                 operation,
                                 response,
-                            })));
+                            }));
                         }
                         Err(error) => inner.http_failed(operation, error),
                     }
@@ -1111,10 +1161,7 @@ impl RuntimeInner {
             "browser HTTP request failed operation={}: {message}",
             operation.get()
         ));
-        self.enqueue(Input::Event(HostEvent::Http(HttpEvent::Failed {
-            operation,
-            message,
-        })));
+        self.send_event(HostEvent::Http(HttpEvent::Failed { operation, message }));
     }
 
     fn execute_timer(self: &Rc<Self>, effect: TimerEffect) {
@@ -1131,7 +1178,7 @@ impl RuntimeInner {
                     };
                     let handle = inner.timers.borrow_mut().remove(&timer.get());
                     if handle.is_some() {
-                        inner.enqueue(Input::Event(HostEvent::Timer(TimerEvent::Fired { timer })));
+                        inner.send_event(HostEvent::Timer(TimerEvent::Fired { timer }));
                     }
                 }) as Box<dyn FnMut()>);
                 let delay = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
@@ -1202,7 +1249,7 @@ impl RuntimeInner {
                 message,
             },
         };
-        self.enqueue(Input::Event(HostEvent::DataChannel(event)));
+        self.send_event(HostEvent::DataChannel(event));
     }
 
     fn report_error(&self, message: String) {
@@ -1214,11 +1261,10 @@ impl RuntimeInner {
         }
     }
 
-    fn abort(&self) {
+    fn shutdown(&self) {
         if self.closed.replace(true) {
             return;
         }
-        self.queue.borrow_mut().clear();
         self.local_tracks.borrow_mut().clear();
         for (_, peer) in std::mem::take(&mut *self.peers.borrow_mut()) {
             peer.close();
