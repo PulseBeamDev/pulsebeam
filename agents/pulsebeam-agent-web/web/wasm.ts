@@ -5,25 +5,7 @@ import initializeWasm, {
 
 import type { LogLevel, LogSink } from "./types.js";
 
-export interface RuntimeHost {
-  set_snapshot_listener(listener?: (snapshot: unknown) => void): void;
-  set_event_listener(listener?: (event: unknown) => void): void;
-  set_error_listener(listener?: (message: string) => void): void;
-  replace_desired(desired: object): void;
-  replace_local_track(
-    slot: string,
-    track: MediaStreamTrack | null,
-    config: object,
-  ): Promise<void>;
-  set_local_muted(slot: string, muted: boolean): Promise<void>;
-  force_reconnect(): void;
-  send_topic(name: string, mode: string, payload: Uint8Array): void;
-  snapshot(): unknown;
-  remote_track(mid: string): MediaStreamTrack | undefined;
-  statistics(): Promise<unknown>;
-  abort(): void;
-  free(): void;
-}
+export type RuntimeHost = WasmRuntime;
 
 let initialization: Promise<unknown> | undefined;
 

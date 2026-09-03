@@ -2,7 +2,6 @@
 
 #[allow(unused_imports)]
 use pulsebeam_agent_web;
-mod pulsebeam_agent_core_module;
 mod pulsebeam_agent_web_module;
 
 

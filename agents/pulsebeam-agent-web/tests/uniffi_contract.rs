@@ -4,6 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+const STRICT_CONSUMER: &str = include_str!("contracts/strict-consumer.ts");
+
 #[test]
 fn generated_package_has_strict_portable_boundaries() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -29,11 +31,12 @@ fn generated_package_has_strict_portable_boundaries() {
         );
     }
     assert!(core.contains("payload: Uint8Array"));
-    assert!(web.contains("from \"./pulsebeam_agent_core\""));
     assert!(web.contains("export type WebMediaTrack = MediaStreamTrack"));
     assert!(web.contains("export type WebMediaStream = MediaStream"));
     assert!(!web.contains("export type WebMediaTrack = bigint"));
     assert!(!web.contains("export type WebMediaStream = bigint"));
+    assert!(!web.contains("MediaRegistryProof"));
+    assert!(!web.contains("normalizeAgentConfig"));
     for boundary in ["AgentConfig", "DesiredState", "Snapshot"] {
         let definition = record_definition(&core, boundary);
         assert!(
@@ -45,40 +48,7 @@ fn generated_package_has_strict_portable_boundaries() {
     let consumer = root.join("target/uniffi-strict-consumer.ts");
     fs::create_dir_all(consumer.parent().expect("consumer has parent"))
         .expect("create consumer directory");
-    fs::write(
-        &consumer,
-        r#"import type {
-  AgentConfig,
-  AgentError,
-  DesiredState,
-  MediaFrame,
-  Notification,
-  Snapshot,
-  TopicMessage,
-  TransportStatistics,
-  WebMediaStream,
-  WebMediaTrack,
-} from "../generated/index.web.js";
-import { MediaRegistryProof, normalizeAgentConfig } from "../generated/index.web.js";
-
-declare const config: AgentConfig;
-declare const desired: DesiredState;
-declare const snapshot: Snapshot;
-declare const notification: Notification;
-declare const topic: TopicMessage;
-declare const frame: MediaFrame;
-declare const statistics: TransportStatistics;
-declare const error: AgentError;
-declare const track: MediaStreamTrack;
-
-const normalized: AgentConfig = normalizeAgentConfig(config);
-const proof = new MediaRegistryProof();
-const sameTrack: WebMediaTrack = proof.roundTripTrack(track);
-const stream: WebMediaStream = proof.createStream();
-const bytes: Uint8Array = frame.data;
-void [desired, snapshot, notification, topic, statistics, error, normalized, sameTrack, stream, bytes];
-"#,
-    )
+    fs::write(&consumer, STRICT_CONSUMER)
     .expect("write strict consumer");
 
     let status = Command::new("pnpm")
