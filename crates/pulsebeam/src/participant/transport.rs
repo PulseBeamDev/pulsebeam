@@ -30,7 +30,6 @@ fn egress_extension_values(
 
 pub(crate) const MAX_PENDING_INGRESS: usize = 256;
 pub(crate) const MAX_PENDING_FANOUT: usize = 256;
-pub(crate) const RTC_OUTPUT_BUDGET: usize = 128;
 
 pub(crate) enum TransportPollOutput {
     Timeout(Instant),

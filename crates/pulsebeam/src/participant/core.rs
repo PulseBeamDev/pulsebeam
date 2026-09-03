@@ -31,8 +31,8 @@ use crate::participant::{
     batcher::NetworkEgress,
     downstream::DownstreamAllocator,
     transport::{
-        AppliedMutation, IngressResult, RTC_OUTPUT_BUDGET, RtpWriteCommand, Transport,
-        TransportMutation, TransportPollOutput,
+        AppliedMutation, IngressResult, RtpWriteCommand, Transport, TransportMutation,
+        TransportPollOutput,
     },
     upstream::{IncomingRtpRoute, UpstreamAllocator},
 };
@@ -701,28 +701,25 @@ impl Participant {
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
     fn poll_rtc(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
-        let mut outputs = 0usize;
-
         loop {
-            if outputs >= RTC_OUTPUT_BUDGET {
-                metrics::counter!("participant_rtc_output_budget_hit").increment(1);
-                break Some(now);
-            }
             match self.transport.poll_output() {
                 Ok(Some(TransportPollOutput::Timeout(deadline))) => {
-                    break Some(deadline);
+                    return Some(deadline);
                 }
-                Ok(Some(TransportPollOutput::Transmit)) => {
-                    outputs = outputs.saturating_add(1);
-                }
+
+                Ok(Some(TransportPollOutput::Transmit)) => {}
+
                 Ok(Some(TransportPollOutput::Event(event))) => {
-                    outputs = outputs.saturating_add(1);
                     self.handle_event(now, *event, events);
                 }
-                Ok(None) => break None,
+
+                Ok(None) => {
+                    return None;
+                }
+
                 Err(error) => {
                     self.disconnect(error.into());
-                    break None;
+                    return None;
                 }
             }
         }
