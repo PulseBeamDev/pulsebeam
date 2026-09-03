@@ -12,6 +12,9 @@
 #[cfg(any(target_arch = "wasm32", test))]
 mod engine;
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod channel;
+
 #[cfg(target_arch = "wasm32")]
 mod browser;
 #[cfg(target_arch = "wasm32")]
