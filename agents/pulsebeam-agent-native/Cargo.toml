@@ -28,7 +28,7 @@ str0m.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-uniffi = { version = "=0.31.0", default-features = false, features = ["tokio"] }
+uniffi = { version = "=0.32.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 pulsebeam-testdata = { path = "../../crates/pulsebeam-testdata" }
