@@ -3394,6 +3394,7 @@ dependencies = [
  "futures-lite",
  "futures-test",
  "libc",
+ "metrics",
  "nix 0.31.3",
  "once_cell",
  "parking_lot",

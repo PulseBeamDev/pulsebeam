@@ -1,71 +1,18 @@
 # PulseBeam Agent Guide
 
-## Start with ownership
+## Discover before searching
 
-Before editing, read the `README.md` in every touched immediate child of
-`agents/` or `crates/`, then follow its links to local design documents. The
-root README is product-facing; module READMEs are the contributor map.
+- Start with structured repository truth: `cargo metadata`, the nearest manifest, `cargo tree` when dependency direction matters, `just --list` or the nearest `Justfile`, and rust-analyzer/LSP definition, implementation, and reference queries.
+- Use targeted text search only after the owning package or symbol is known. Do not begin with broad filesystem scans, tree dumps, or indiscriminate documentation reading.
+- After identifying the owner, read that module's `README.md` and only the linked design documents relevant to the change. Apply the nearest nested `AGENTS.md`.
 
-- `agents/` contains the new SANS-I/O and browser client SDK.
-- `crates/pulsebeam` is the Linux SFU server and owns its architecture docs.
-- `crates/pulsebeam-simulator` owns simulation contracts and end-to-end plans.
-- Supporting crates own protocol, routing, runtime, client, CLI, eBPF, and
-  deterministic fixture boundaries described in their READMEs.
+## Respect executable truth
 
-Keep implementation plans under root `plans/` when work spans modules.
+- Manifests, lints, tests, generators, and Just recipes are authoritative. Do not duplicate their dependency, formatting, generated-code, or command rules here.
+- When a lint or repository check rejects a design, follow its reason to the owning contract. Do not bypass architectural checks with broad allows or suppressions; any necessary exception must be narrow and justified beside the code.
+- Change generated output through its owning generator or recipe, never by hand.
 
-## Non-negotiable server architecture
+## Repository convention
 
-Read `crates/pulsebeam/docs/thread-per-core.md` before changing server state,
-routing, metrics, clocks, or packet flow.
-
-- A shard owns its mutable state and reaches other shards only by owned
-  messages. Shared mutable packet runtime is a regression, not a trade-off.
-- `Arc`, `Mutex`, `RwLock`, bare atomics, and blocking calls are denied by the
-  workspace lint policy. A genuine boundary exception needs a narrow
-  `#[allow]` with its reason.
-- Several atomic reads never form a coherent snapshot. Publish one complete
-  immutable value when fields must agree.
-- Anything that may cross a node boundary is a value, never a memory handle.
-- The runtime, simulator, agents, and CLI have documented exceptions; an
-  exception below the shard model does not license shared shard state.
-
-## Defensive code and tests
-
-- Add `debug_assert!` checks at critical state transitions, timing and buffer
-  invariants, encoding offsets, slice boundaries, and assumptions that should
-  fail early in simulation without release overhead.
-- Validate external input at its boundary. Do not use debug assertions as the
-  only defense against malformed network data in release builds.
-- Test externally visible properties and invariants, not private steps or
-  temporary buffer shapes. Put reusable setup in focused `test_utils` or
-  harness modules so scenarios read as domain stories.
-- Never use wall-clock sleeps or arbitrary retry loops in tests. Simulation
-  time and randomness are process-wide deterministic shims; one seed describes
-  one reproducible run.
-- A seed-dependent failure is evidence of a behavior difference. Follow
-  `crates/pulsebeam-simulator/docs/simulation.md`; do not relax an oracle before
-  finding the cause.
-
-## Comments
-
-Default to no comment. Prefer names, structure, and small functions. Remove
-nearby narration or stale cross-file claims when editing. Keep only short
-comments that explain a non-obvious constraint or workaround, and do not leave
-TODOs unless explicitly requested.
-
-## Commands and handoff
-
-Just is the repository task interface; there are no Makefiles. Run focused
-Cargo tests or the touched module's `Justfile` while iterating.
-
-Before every handoff:
-
-1. Run `just check`.
-2. Run `just test`.
-3. Run `just ebpf` when routing classification, envelopes, ufrags, steering,
-   eBPF, or its server loader changed.
-
-`just sweep` is exploratory nightly evidence, not a merge gate. Use the
-simulator-local `replay` recipe for one failing seed. Never substitute bare
-debug-profile `cargo test` for the simulation recipe.
+- Prefer names, types, structure, and tests over narration. Keep comments only for non-obvious constraints or workarounds, and do not add TODOs unless requested.
+- Iterate with the narrowest package-level verification exposed by Cargo or the owning `Justfile`, then use the repository gates exposed by the root `Justfile` before handoff.
