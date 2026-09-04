@@ -26,6 +26,7 @@ use super::{
 use nix::{
     cmsg_space,
     errno::Errno,
+    libc,
     sys::socket::{
         ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg,
         sendmmsg, setsockopt, sockopt,
@@ -33,7 +34,7 @@ use nix::{
 };
 use std::{
     io::{self, ErrorKind, IoSlice, IoSliceMut},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
 };
 const MEBIBYTE: usize = 1024 * 1024;
@@ -85,6 +86,43 @@ fn normalize_v4_mapped(addr: SocketAddr) -> SocketAddr {
             .unwrap_or(addr),
         IpAddr::V4(_) => addr,
     }
+}
+
+
+fn pktinfo_v4_destination(info: libc::in_pktinfo, port: u16) -> SocketAddr {
+    // `in_addr.s_addr` is stored in network byte order. `to_ne_bytes()`
+    // recovers the address octets exactly as they appear in the structure.
+    let ip = Ipv4Addr::from(info.ipi_addr.s_addr.to_ne_bytes());
+    SocketAddr::new(IpAddr::V4(ip), port)
+}
+
+fn pktinfo_v6_destination(info: libc::in6_pktinfo, port: u16) -> SocketAddr {
+    let ip = Ipv6Addr::from(info.ipi6_addr.s6_addr);
+    normalize_v4_mapped(SocketAddr::new(IpAddr::V6(ip), port))
+}
+
+fn enable_destination_pktinfo(socket: &socket2::Socket) -> io::Result<()> {
+    let bound = socket
+        .local_addr()?
+        .as_socket()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "UDP socket is not IP"))?;
+
+    match bound {
+        SocketAddr::V4(_) => {
+            setsockopt(socket, sockopt::Ipv4PacketInfo, &true).map_err(io::Error::from)?;
+        }
+        SocketAddr::V6(_) => {
+            // PulseBeam deliberately uses dual-stack IPv6 listeners. Linux can
+            // deliver IPv4-mapped traffic to them, so enable both forms of
+            // packet info. The per-datagram cmsg then tells us the real local
+            // destination address instead of forcing every packet to use the
+            // advertised address.
+            setsockopt(socket, sockopt::Ipv6RecvPacketInfo, &true).map_err(io::Error::from)?;
+            setsockopt(socket, sockopt::Ipv4PacketInfo, &true).map_err(io::Error::from)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn sockaddr_to_std(addr: &SockaddrStorage) -> io::Result<SocketAddr> {
@@ -158,6 +196,7 @@ pub fn bind_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
     socket2_sock.set_recv_buffer_size(SOCKET_RECV_SIZE)?;
     socket2_sock.set_send_buffer_size(SOCKET_SEND_SIZE)?;
     socket2_sock.bind(&addr.into())?;
+    enable_destination_pktinfo(&socket2_sock)?;
 
     Ok(socket2_sock)
 }
@@ -188,31 +227,39 @@ pub fn from_socket(
         false
     };
 
+    // `from_socket` is also public and callers may pass a socket that did not
+    // come from `bind_socket`, so enforce the receive-destination invariant
+    // here as well. Setting these options repeatedly is harmless.
+    enable_destination_pktinfo(&socket2_sock)?;
+
     let state_fd = socket2_sock.try_clone()?;
     let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
     let writer_sock = Arc::new(sock);
 
-    let local_addr = external_addr.unwrap_or(writer_sock.local_addr()?);
+    let bound_addr = writer_sock.local_addr()?;
+    let advertised_addr = external_addr.unwrap_or(bound_addr);
     let reader_sock = writer_sock.clone();
     drop(state_fd);
 
     let reader = UdpTransportReader {
         sock: reader_sock,
-        local_addr,
+        advertised_addr,
+        bound_addr,
         gro_enabled,
         arena: UdpRecvArena::preallocated(),
     };
 
     let writer = UdpTransportWriter {
         sock: writer_sock,
-        local_addr,
+        local_addr: advertised_addr,
         gso_capable,
         drop_count: 0,
         send_batch_limit: send_buf_size / 2,
     };
 
     tracing::debug!(
-        %local_addr,
+        bound_addr = %bound_addr,
+        advertised_addr = %advertised_addr,
         recv_buf = fmt_bytes(recv_buf_size),
         send_buf = fmt_bytes(send_buf_size),
         gro = gro_enabled,
@@ -229,7 +276,13 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
 
 pub struct UdpTransportReader {
     sock: Arc<tokio::net::UdpSocket>,
-    local_addr: SocketAddr,
+    /// Address exposed by `UdpTransport::local_addr()` and used by existing
+    /// callers as the externally reachable socket address. This is not used
+    /// as receive metadata.
+    advertised_addr: SocketAddr,
+    /// Actual address the kernel socket is bound to. Its port is authoritative
+    /// for destination pktinfo, which only carries the destination IP.
+    bound_addr: SocketAddr,
     gro_enabled: bool,
 
     arena: UdpRecvArena,
@@ -237,7 +290,7 @@ pub struct UdpTransportReader {
 
 impl UdpTransportReader {
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.advertised_addr
     }
 
     pub fn gro_enabled(&self) -> bool {
@@ -254,11 +307,13 @@ impl UdpTransportReader {
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<usize> {
         let Self {
             sock,
-            local_addr,
+            advertised_addr: _,
+            bound_addr,
             gro_enabled,
             arena,
         } = self;
-        let local_addr = *local_addr;
+        let bound_addr = *bound_addr;
+        let local_port = bound_addr.port();
         let gro_enabled = *gro_enabled;
 
         sock.try_io(tokio::io::Interest::READABLE, || {
@@ -272,7 +327,14 @@ impl UdpTransportReader {
             drop(slot_iter);
 
             let fd = sock.as_raw_fd();
-            let mut headers = MultiHeaders::preallocate(BATCH_SIZE, Some(cmsg_space!(i32)));
+            let mut headers = MultiHeaders::preallocate(
+                BATCH_SIZE,
+                Some(cmsg_space!(
+                    i32,
+                    libc::in_pktinfo,
+                    libc::in6_pktinfo
+                )),
+            );
 
             let mut received = [None; BATCH_SIZE];
             match recvmmsg(fd, &mut headers, iovs.iter_mut(), MsgFlags::empty(), None) {
@@ -296,23 +358,48 @@ impl UdpTransportReader {
                             None => continue, // no source address, can't attribute this datagram
                         };
 
-                        // Default: this slot holds exactly one datagram. If GRO
-                        // coalesced several same-size datagrams into it, the
-                        // kernel tells us via the UdpGroSegments cmsg.
+                        // Every received datagram must retain the local address it
+                        // actually targeted. This is required by ICE: a Binding
+                        // request received on the IPv6 candidate must be paired and
+                        // answered from that IPv6 candidate, even when IPv4 and IPv6
+                        // share one dual-stack socket.
+                        //
+                        // GRO metadata and destination pktinfo arrive in the same
+                        // ancillary-data stream, so parse it once.
                         let mut stride = total_len;
-                        if gro_enabled && let Ok(cmsgs) = item.cmsgs() {
+                        let mut dst = None;
+                        if let Ok(cmsgs) = item.cmsgs() {
                             for cmsg in cmsgs {
-                                if let ControlMessageOwned::UdpGroSegments(seg) = cmsg {
-                                    if seg > INVALID_GRO_SEGMENT_SIZE {
-                                        stride = (seg as usize).min(total_len);
+                                match cmsg {
+                                    ControlMessageOwned::UdpGroSegments(seg) if gro_enabled => {
+                                        if seg > INVALID_GRO_SEGMENT_SIZE {
+                                            stride = (seg as usize).min(total_len);
+                                        }
                                     }
-                                    break;
+                                    ControlMessageOwned::Ipv4PacketInfo(info) => {
+                                        dst = Some(pktinfo_v4_destination(info, local_port));
+                                    }
+                                    ControlMessageOwned::Ipv6PacketInfo(info) => {
+                                        dst = Some(pktinfo_v6_destination(info, local_port));
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
 
+                        // A specifically-bound socket has an unambiguous destination
+                        // even if ancillary data is unexpectedly absent. A wildcard
+                        // socket does not; fabricating its advertised address here can
+                        // create cross-family ICE pairs, so drop such a packet instead.
+                        let dst = dst.or_else(|| (!bound_addr.ip().is_unspecified()).then_some(bound_addr));
+                        let Some(dst) = dst else {
+                            metrics::counter!("udp_recv_missing_pktinfo").increment(1);
+                            tracing::debug!(%src, "dropping UDP datagram without destination pktinfo");
+                            continue;
+                        };
+
                         if let Some(slot) = received.get_mut(slot_idx) {
-                            *slot = Some((src, stride, total_len));
+                            *slot = Some((src, dst, stride, total_len));
                         } else {
                             debug_assert!(false, "recvmmsg reported slot {slot_idx} out of range");
                         }
@@ -325,13 +412,13 @@ impl UdpTransportReader {
             }
             let prev_len = out.len();
             for (slot_idx, entry) in received.into_iter().enumerate() {
-                let Some((src, stride, total_len)) = entry else {
+                let Some((src, dst, stride, total_len)) = entry else {
                     continue;
                 };
                 let buf = arena.packet(slot_idx, total_len).to_vec();
                 out.push(RecvPacketBatch {
                     src,
-                    dst: local_addr,
+                    dst,
                     buf,
                     stride,
                     len: total_len,
@@ -584,6 +671,40 @@ mod tests {
         assert_eq!(out[0].data(), b"test-udp-payload");
         assert_eq!(out[0].src, sender.local_addr().unwrap());
         assert_eq!(out[0].dst, local_addr);
+    }
+
+    #[tokio::test]
+    async fn dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations() {
+        let mut transport = bind("[::]:0".parse().unwrap(), None).await.unwrap();
+        let port = transport.local_addr().port();
+
+        let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
+
+        v4.send_to(b"v4", SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .unwrap();
+        v6.send_to(b"v6", SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port))
+            .await
+            .unwrap();
+
+        let mut out = Vec::new();
+        while out.len() < 2 {
+            tokio::time::timeout(Duration::from_millis(250), transport.readable())
+                .await
+                .unwrap()
+                .unwrap();
+            transport.try_recv_batch(&mut out).unwrap();
+        }
+
+        let v4_batch = out.iter().find(|packet| packet.data() == b"v4").unwrap();
+        assert_eq!(v4_batch.dst, SocketAddr::from(([127, 0, 0, 1], port)));
+
+        let v6_batch = out.iter().find(|packet| packet.data() == b"v6").unwrap();
+        assert_eq!(
+            v6_batch.dst,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
+        );
     }
 
     #[tokio::test]
