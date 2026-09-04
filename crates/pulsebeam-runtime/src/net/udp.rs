@@ -88,7 +88,6 @@ fn normalize_v4_mapped(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-
 fn pktinfo_v4_destination(info: libc::in_pktinfo, port: u16) -> SocketAddr {
     // `in_addr.s_addr` is stored in network byte order. `to_ne_bytes()`
     // recovers the address octets exactly as they appear in the structure.
@@ -684,9 +683,12 @@ mod tests {
         v4.send_to(b"v4", SocketAddr::from(([127, 0, 0, 1], port)))
             .await
             .unwrap();
-        v6.send_to(b"v6", SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port))
-            .await
-            .unwrap();
+        v6.send_to(
+            b"v6",
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+        )
+        .await
+        .unwrap();
 
         let mut out = Vec::new();
         while out.len() < 2 {

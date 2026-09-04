@@ -463,16 +463,7 @@ mod tests {
 
     fn rtcp_header(ssrc: u32) -> [u8; 8] {
         let bytes = ssrc.to_be_bytes();
-        [
-            0x80,
-            201,
-            0,
-            1,
-            bytes[0],
-            bytes[1],
-            bytes[2],
-            bytes[3],
-        ]
+        [0x80, 201, 0, 1, bytes[0], bytes[1], bytes[2], bytes[3]]
     }
 
     #[test]

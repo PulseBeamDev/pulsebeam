@@ -14,6 +14,10 @@ check:
     just --fmt --check
     @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
 
+fix:
+    cargo fmt --all
+    cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --features pulsebeam/sim
+
 # Run workspace unit tests and deterministic simulation plans.
 test:
     cargo test --workspace --exclude pulsebeam-simulator --features pulsebeam/sim

@@ -81,9 +81,8 @@ fn config(
         local_credentials,
         is::Candidate::host(local, is::Protocol::Udp).map_err(|_| "local candidate")?,
         remote_credentials,
-        vec![is::Candidate::host(remote, is::Protocol::Udp)
-            .map_err(|_| "remote candidate")?]
-        .into_boxed_slice(),
+        vec![is::Candidate::host(remote, is::Protocol::Udp).map_err(|_| "remote candidate")?]
+            .into_boxed_slice(),
         certificate,
         remote_fingerprint,
         DtlsRole::Active,
@@ -91,6 +90,7 @@ fn config(
     .with_ice_role(true, 2))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_reference(
     reference: &mut Rtc,
     transport: &mut Transport,
@@ -142,6 +142,7 @@ fn drain_reference(
     Err("reference output did not reach a timeout".into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_reference(
     reference: &mut Rtc,
     transport: &mut Transport,
@@ -271,12 +272,7 @@ fn standalone_transport_interoperates_with_upstream_reference_peer() -> Result<(
     let mut saw_reference_rtcp = false;
     let mut drop_reference_dtls = false;
     let mut last_reference_rtp = None;
-    transport.handle_datagram(
-        now,
-        address(6999),
-        local,
-        vec![22; 13],
-    )?;
+    transport.handle_datagram(now, address(6999), local, vec![22; 13])?;
     drive_reference(
         &mut reference,
         &mut transport,
@@ -344,9 +340,11 @@ fn standalone_transport_interoperates_with_upstream_reference_peer() -> Result<(
         .clone();
     transport.handle_datagram(now, source, destination, packet.clone())?;
     transport.handle_datagram(now, source, destination, packet)?;
-    assert!(!std::iter::from_fn(|| transport.poll_event()).any(
-        |event| matches!(event, TransportEvent::Rtp { metadata, .. } if metadata.ssrc == 8)
-    ));
+    assert!(
+        !std::iter::from_fn(|| transport.poll_event()).any(
+            |event| matches!(event, TransportEvent::Rtp { metadata, .. } if metadata.ssrc == 8)
+        )
+    );
 
     transport.send_rtcp(&[0x80, 201, 0, 1, 0, 0, 0, 7])?;
     drive_reference(
@@ -403,7 +401,7 @@ fn standalone_transport_interoperates_with_upstream_reference_peer() -> Result<(
     let mut reference_closed = false;
     for _ in 0..64 {
         match reference.poll_output()? {
-            Output::Event(event) if matches!(event, str0m_reference::Event::Closed) => {
+            Output::Event(str0m_reference::Event::Closed) => {
                 reference_closed = true;
                 break;
             }
@@ -513,15 +511,18 @@ fn upstream_reference_corruption_fails_standalone_terminally() -> Result<(), Box
         &mut drop_reference_dtls,
         &mut last_reference_rtp,
     )?;
-    let (source, destination, mut corrupt) = last_reference_rtp
-        .ok_or("reference RTP transmit was not captured")?;
+    let (source, destination, mut corrupt) =
+        last_reference_rtp.ok_or("reference RTP transmit was not captured")?;
     let last = corrupt.len().checked_sub(1).ok_or("RTP auth tag missing")?;
     corrupt[last] ^= 1;
     assert_eq!(
         transport.handle_datagram(now, source, destination, corrupt),
         Err(TransportError::Crypto)
     );
-    assert_eq!(transport.state(), pulsebeam_rtc::transport::TransportState::Failed);
+    assert_eq!(
+        transport.state(),
+        pulsebeam_rtc::transport::TransportState::Failed
+    );
     assert!(transport.poll_transmit().is_none());
     Ok(())
 }
