@@ -4,183 +4,238 @@
 SFU. It encapsulates one peer connection and is designed to replace direct
 `str0m` use in `pulsebeam`. Migrating the server is a separate project.
 
+The public and architectural contract is defined in
+[docs/design.md](docs/design.md). The congestion-control implementation contract
+is defined in
+[docs/congestion-control.md](docs/congestion-control.md).
+
 ## Ownership boundary
 
-- One `Connection` owns one peer's negotiation, ICE, DTLS, SRTP, SCTP, RTP,
-  RTCP, stream composition, timers, scheduler, pacer, probing, and congestion
-  control.
-- The caller owns sockets, all connections, and shard scheduling. It feeds
-  individual UDP packets or RFC 4571-framed ICE-TCP packets into a connection.
-- A connection has no threads, callbacks, shared mutable state, global scans,
-  or cross-connection coordination. It is `Send`, not `Sync`.
-- Internal stream state is dense and data-oriented. Storage is sized from the
-  accepted session rather than compile-time maxima.
-- `str0m` supplies low-level ICE, DTLS, and SRTP components. `dcsctp` supplies
+* One `Connection` owns one peer's negotiation, ICE, DTLS, SRTP/SRTCP, SCTP,
+  RTP, RTCP, inbound media-clock normalization, outbound RTP continuity, timers,
+  scheduler, pacer, probing, and congestion control.
+* The caller owns sockets, all connections, shard scheduling, cross-connection
+  routing, and cluster clock synchronization. It feeds individual UDP packets or
+  RFC 4571-framed ICE-TCP packets into a connection.
+* The SFU owns source and layer selection, keyframe caches, and semantic media
+  knowledge needed for routing. Once media is submitted to an outbound sender,
+  the connection owns its transport feasibility and wire representation.
+* A connection has no threads, callbacks, hidden clock reads, shared mutable
+  state, global scans, or cross-connection coordination. It is `Send`, not
+  `Sync`.
+* Internal state is dense, bounded, and connection-local.
+* `str0m` supplies low-level ICE, DTLS, and SRTP components. `dcsctp` supplies
   low-level SCTP. Their types and policy do not cross the public API.
-
-The SFU owns cross-connection routing, source and layer selection, keyframe
-caches, and semantic admission. Once media is admitted, the connection owns
-its wire representation and transport feasibility.
 
 ## Connection model
 
 The public surface is one `Connection` facade plus configuration, stable typed
-IDs, immutable media values, events, transmits, and statistics.
+IDs, immutable media values, commands, events, transmits, and coherent
+statistics.
 
-Inputs mutate connection state. The caller repeatedly drives:
+Conceptually:
 
 ```text
-poll(now) -> Transmit | Event | Idle { next_wakeup }
+Connection::accept(...)
+connection.receive(...)
+connection.command(...)
+connection.poll(...)
+connection.stats()
 ```
 
-`Idle` is the connection's single externally scheduled timer. Every emitted
-transmit has an opaque receipt. The caller must report its actual socket
-departure time or failure; TWCC history and forwarding-latency measurements use
-that result rather than poll time.
+All protocol progress occurs through explicit calls. The caller drains `poll`
+until it returns:
+
+```text
+Idle { next_wakeup }
+```
+
+`next_wakeup` is the connection's single externally scheduled timer.
+
+Returning `Transmit` is an irrevocable send commit. RTP/RTCP continuity,
+congestion-control sent history, bytes in flight, pacing, and forwarding
+accounting have already advanced. The caller must immediately submit the
+transmit to its selected UDP socket or ICE-TCP stream before driving the
+connection again. There is no departure receipt or rollback API.
 
 A connection supports graceful close, which rejects new application work and
-drains protocol shutdown traffic to a deadline, and immediate abort.
+drains required protocol shutdown traffic to a deadline, and immediate abort.
+
+## Time and media model
+
+PulseBeam deliberately separates local execution time from globally comparable
+media time.
+
+* `Instant` drives local timers, RTT, congestion control, pacing,
+  retransmission, and `next_wakeup`.
+* `GlobalMediaTime` is a serializable cluster-global microsecond time domain
+  supplied from the runtime's NTP/PTP-disciplined clock.
+* The runtime supplies coherent local/global `TimePoint` values; the connection
+  never reads or disciplines clocks itself.
+* First-ingress RTP is normalized into `GlobalMediaTime` using the server clock,
+  RTP clock progression, and RTCP Sender Report relationships. Endpoint
+  wall-clock epochs are not authoritative.
+* Every media packet carries an immutable `global_media_at`. Routing across
+  shards or nodes preserves it exactly.
+* `global_media_at` is comparable across media kinds, participants, connections,
+  and nodes in the same PulseBeam clock domain. It is normalized server media
+  time, not a claim of exact physical capture time.
+
+The SFU supplies frame semantics it already knows, including frame identity,
+boundaries, random-access state, and dependencies. `pulsebeam-rtc` uses those
+facts for admission, deadline enforcement, shedding, RTX usefulness, and
+outbound dependency continuity. Core forwarding does not require codec-payload
+parsing and must carry opaque or SFrame-protected media.
 
 ## Session and interoperability
 
-- The session is one immutable ICE-lite remote-offer/local-answer exchange.
-- BUNDLE, RTCP mux, inline candidates, all SDP media directions, UDP, and
+* The session is one immutable ICE-lite remote-offer/local-answer exchange.
+* BUNDLE, RTCP mux, inline candidates, all SDP media directions, UDP, and
   passive ICE-TCP over IPv4 and IPv6 are supported.
-- Trickle ICE, ICE restart, media renegotiation, and a TURN client are outside
+* Trickle ICE, ICE restart, media renegotiation, and a TURN client are outside
   this boundary. A changed session creates a new connection. Client relay
   candidates remain usable.
-- A fresh ephemeral DTLS identity is generated from injected cryptographic
-  entropy for each connection. Its private key is neither exported nor reused.
-- Codecs and RTP header extensions are negotiated from SFU configuration. Core
-  forwarding does not require payload parsing and must carry opaque or SFrame
-  protected media.
-- Egress video requires transport-wide congestion control. Negotiation rejects
-  its absence with a specific reason instead of silently selecting a poorly
-  performing fallback.
-
-Compatibility means any standards-compliant client can connect when its offer
-intersects the configured capabilities. Live acceptance evidence covers current
-Chrome and Firefox. Stored SDP is parser regression evidence only; Safari and
-`webrtcbin` are not acceptance targets.
+* A fresh ephemeral DTLS identity is generated from caller-supplied
+  cryptographic entropy for each connection. Its private key is neither exported
+  nor reused.
+* Codecs and RTP header extensions are negotiated from SFU configuration.
+* Every accepted outbound RTP session, including audio-only RTP, requires one
+  supported packet-feedback mode: transport-wide congestion-control feedback or
+  RFC 8888. There is no REMB or fixed-rate egress fallback.
+* Compatibility means compatibility with the negotiated PulseBeam WebRTC
+  profile. Live acceptance evidence covers current pinned Chrome and Firefox
+  versions. Stored SDP is parser regression evidence only.
 
 ## Packet and stream model
 
-After ingress decryption, one immutable `Bytes` allocation is the canonical
-plaintext packet. Parsing records compact byte ranges; semantic accessors decode
-metadata lazily. Local fanout uses shallow clones. `to_transit` performs an
-explicit deep copy before a packet crosses a shard or node boundary, so
-reference counts never become shared packet-runtime state across cores.
+After ingress authentication and decryption, one immutable `Bytes` allocation
+is the canonical plaintext packet. Parsing records compact byte ranges and
+semantic accessors decode metadata lazily. Local fanout uses shallow clones.
+Cross-shard or cross-node transit performs an explicit deep copy so shared
+packet reference counts do not become cross-core runtime state.
 
-Every ingress media packet retains its receive timestamp. Egress transmits
-retain that timestamp until the socket departure receipt, making forwarding
-latency directly measurable without a logging or metrics dependency. Timestamps
-are comparable only within their monotonic clock domain.
+Negotiated outbound media produce stable `SenderId` values. A sender's identity,
+policy, outbound SSRC, RTP sequence and timestamp spaces, RTX state, extension
+state, RTCP state, and congestion state survive source and layer changes.
 
-- Negotiated media produce stable sender IDs. The set of senders cannot change
-  after the answer.
-- Unsignaled ingress SSRCs and RIDs produce stable encoding IDs and an
-  `EncodingDiscovered` event before media delivery.
-- Negotiated encodings are always admitted. Unsignaled encodings consume a
-  configured connection-wide budget; overflow is dropped and counted without
-  closing the connection.
-- An unsignaled encoding remains stable until RTCP BYE or explicit SFU
-  retirement. Inactivity alone never retires a paused encoding.
-- The session accepts at most 128 negotiated media sections. Runtime encoding,
-  RTX, and SSRC-zero probe entities are separate, dense, externally bounded
-  entities rather than reserved media slots. There is no crate-level connection
-  count limit.
+Unsignaled authenticated ingress SSRCs or RIDs can produce stable encoding
+identities within a configured connection-wide bound. Overflow is dropped and
+counted without closing the connection. Inactivity alone does not retire a
+paused encoding.
 
-The SFU forwards packets with `send_media(sender_id, packet)` and can switch
-sources at any packet boundary. The connection preserves outbound SSRC,
-payload-type, sequence, timestamp, RTP-extension, retransmission, and RTCP
-continuity. It owns NACK/RTX handling and exposes only semantic keyframe request
-operations and events.
+Source packets retain their canonical `global_media_at`. An outbound sender maps
+that global media timeline into its own continuous RTP clock, so source
+switching does not depend on source RTP timestamps or SSRCs and does not rewind
+the receiver's RTP timeline.
 
-Forwarding is packet-level and cut-through; the connection does not wait for a
-complete video frame. It tracks frame boundaries and dependencies so admission
-and shedding prefer whole, not-yet-started frames. If bounded pressure causes
-post-admission packet loss, RTP sequence gaps remain visible to the receiver.
-TWCC numbers are assigned only to packets actually transmitted.
+Forwarding is packet-level and cut-through. Frame metadata allows admission and
+shedding to prefer complete not-yet-started frames, but a started frame is not
+an unbounded commitment when congestion or deadline safety requires dropping
+remaining packets.
 
 ## RTP extension policy
 
 Extension policy is immutable per negotiated media sender and keyed by semantic
 URI, never source wire ID.
 
-- Connection-managed extensions, including MID, RID, repaired RID, TWCC,
-  absolute send time, and dependency descriptors that require continuity, are
-  regenerated or rewritten.
-- Known endpoint-independent values such as audio level and video orientation
+* Connection-managed extensions such as MID, RID, repaired RID, transport-wide
+  sequence numbers, absolute send time, playout delay, and dependency
+  descriptors requiring outbound continuity are generated or rewritten.
+* Known endpoint-independent values such as audio level and video orientation
   can be forwarded after URI-based remapping.
-- Unknown extensions are dropped by default and can be explicitly allowed as
-  opaque pass-through.
-- All ingress extensions remain available through lazy URI-based accessors even
-  when they are not forwarded.
+* Absolute Capture Time may be forwarded or exposed diagnostically but is not
+  authoritative for `GlobalMediaTime`, A/V synchronization, deadlines, or
+  congestion control.
+* Unknown extensions are dropped by default and may be explicitly permitted as
+  validated opaque pass-through.
+* Authenticated ingress extensions remain available through lazy URI-based
+  accessors even when they are not forwarded.
 
 ## Scheduling, latency, and congestion control
 
-Protocol control remains deliverable and padding remains lowest-value traffic.
-Media scheduling and allocation use mutable SFU-provided policy per sender:
-playout-delay range, relative priority, and desired bitrate. The connection
-measures actual sending rate itself. Policy is keyed by the stable negotiated
-`SenderId`, not by a source SSRC, encoding, or RTX stream.
+Protocol control remains deliverable under load and padding remains the
+lowest-value traffic.
 
-Each sender's playout-delay range expresses its desired quality/latency
-tradeoff. A latency governor derives per-sender pacer horizon, admission,
-shedding, and retransmission usefulness, then applies the strictest active
-latency requirement to shared path queueing. Tightening a sender immediately
-re-evaluates its queued video. The range is best-effort because remote capture,
-decode, and render costs are not fully observable.
+Every outbound sender has mutable SFU-provided semantic policy:
 
-Congestion control is implemented in this crate, using libwebrtc as behavioral
-guidance rather than an implementation dependency or a requirement for exact
-parity. The detailed design is in
+* playout-delay range;
+* relative media priority;
+* desired media-payload bitrate.
+
+The SFU chooses sources and layers. The connection returns governed aggregate
+and per-sender allocations and owns transport scheduling.
+
+Egress uses one connection-level SCReAM-v2-derived RTP congestion controller.
+The SCReAM core remains independently testable and self-contained. A private
+PulseBeam latency governor may only tighten its native queue-delay target; it
+cannot increase SCReAM's congestion window, pacing permission, or estimated
+capacity.
+
+The latency governor uses sender policy and immutable `global_media_at` to
+derive private receiver-specific admission, pacing, shedding, retransmission,
+and probing limits. A larger playout range can trade latency headroom for
+quality recovery, but it never maps directly to an equivalently large network
+queue.
+
+Constrained media capacity is divided among active senders using weighted
+max-min allocation. Priority controls relative share; it does not manufacture
+capacity or make stale media useful.
+
+Pre-media and application-limited probing uses ordinary RTP padding on a
+negotiated media or RTX SSRC. There is no synthetic SSRC-zero probe stream.
+
+SCTP retains its own congestion controller and acknowledgment state.
+DataChannel bytes never enter RTP packet-feedback history or SCReAM bytes in
+flight. RTP and SCTP service are coordinated by the connection's bounded
+top-level scheduler.
+
+The complete algorithm, fixed version-one profiles, hard bounds, alternatives
+considered, and validation requirements are in
 [docs/congestion-control.md](docs/congestion-control.md).
-
-- Egress runs one connection-level, SCReAM-v2-derived delay/loss controller.
-  A weighted allocator divides its latency-governed media capacity into
-  per-sender allocations. The SFU configures sender priority and desired rate,
-  receives those allocations, and continues to choose sources and layers.
-- Ingress records packet arrivals and emits TWCC feedback. It exposes aggregate
-  ingress rate, loss, RTT, and probe statistics but does not compete with the
-  browser's send-side controller through REMB.
-- SSRC-zero ingress packets contribute only transport feedback and never become
-  media events or streams.
-- SSRC-zero egress padding supports probing before media, during variable-rate
-  media, and while streams are paused or application-limited.
-- Probing and allocation behavior follows libwebrtc where useful, with
-  documented SFU-specific decisions and deterministic tests.
 
 ## DataChannels and resource safety
 
 DataChannels support local and remote DCEP opening, externally negotiated
 channels, ordered and unordered delivery, reliability by retransmit count or
-lifetime, text and binary message boundaries, buffered-amount backpressure, and
-graceful close. No dcSCTP type is public.
+lifetime, text and binary message boundaries, priority, buffered-amount
+backpressure, and graceful close. No `dcsctp` type is public.
 
-Configuration explicitly bounds total buffered channel bytes, inbound message
-size, channel count, transmit queues, incomplete protocol state, and dynamic
-encodings. Outbound pressure returns a typed `WouldBlock`. An oversized
-authenticated DataChannel message closes that channel where protocol semantics
-permit rather than the peer connection.
+Configuration explicitly bounds dynamic encodings, channel count, message
+sizes, buffered DataChannel data, media queues, retransmission history, protocol
+state, feedback history, and per-poll work.
 
-Malformed, unauthenticated, replayed, unknown-tuple, and SRTP-authentication
-failures are dropped with bounded cumulative counters and do not change
-connection state. Authenticated violations are isolated to their stream or
-channel where possible. Only unrecoverable authenticated transport state,
-mandatory resource exhaustion, cryptographic failure, or timeout is terminal.
-Statistics are coherent snapshots with aggregate connection data and stable-ID
-stream detail; the crate has no metrics-framework dependency.
+Outbound pressure returns a typed `WouldBlock` before exceeding configured
+bounds. Authenticated violations are isolated to their stream or channel where
+protocol semantics permit. Malformed or unauthenticated network input is
+normally dropped and counted rather than surfaced as an application error.
+
+Only unrecoverable authenticated transport state, mandatory resource exhaustion
+required for correctness, cryptographic failure, or timeout is terminal.
+
+Statistics are coherent snapshots with connection, sender, encoding, and
+DataChannel detail. The crate has no metrics-framework dependency and does not
+expose mutable controller internals.
 
 ## Validation boundary
 
 All implementation checks, tests, fixtures, benchmarks, and browser harnesses
-for this project are isolated to `crates/pulsebeam-rtc`. Do not run workspace
-tests for this work.
+for this project are isolated to `crates/pulsebeam-rtc`. Workspace-wide tests
+are outside this implementation project.
 
-Required evidence includes deterministic crate-local network scenarios for
-loss, delay, reordering, VBR, pauses, probing, malformed traffic, overload, and
-timer scaling; parameterized many-connection/many-stream benchmarks with one
-wakeup per connection; and live Chrome and Firefox sessions. Differential
-checks against `str0m` are useful component evidence but are not independent
-interoperability proof.
+Required evidence includes deterministic crate-local tests and simulation for
+negotiation, media-clock normalization, source switching, RTP/RTCP continuity,
+loss, delay, reordering, VBR, pauses, probing, feedback loss, DataChannel
+coexistence, malformed traffic, overload, resource bounds, and timer scaling.
+
+Parameterized many-connection and many-stream benchmarks must preserve one
+externally scheduled wakeup per connection and avoid global scans.
+
+Live pinned Chrome and Firefox sessions are required interoperability evidence.
+Differential checks against `str0m`, Ericsson SCReAM, or libwebrtc are useful
+component evidence but do not replace the documented contract or live-browser
+tests.
+
+Detailed public types, ownership decisions, alternatives considered, and their
+rationale are specified in [docs/design.md](docs/design.md). Detailed
+congestion-control behavior and rationale are specified in
+[docs/congestion-control.md](docs/congestion-control.md).
