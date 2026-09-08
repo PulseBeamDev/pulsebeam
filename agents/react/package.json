@@ -1,0 +1,35 @@
+{
+  "name": "@pulsebeam/react",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PulseBeamDev/pulsebeam.git"
+  },
+  "type": "module",
+  "files": ["dist/**/*.js", "dist/**/*.d.ts"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build:web": "pnpm --dir ../pulsebeam-agent-web run build:ts",
+    "build": "pnpm run build:web && tsc -p tsconfig.json",
+    "check": "pnpm run build:web && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json",
+    "test": "pnpm run build && node --test tests/contracts/public-react-contract.test.js"
+  },
+  "dependencies": {
+    "@pulsebeam/web": "^0.1.0"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.24",
+    "@types/react-test-renderer": "^18.3.1",
+    "react": "^18.3.1",
+    "react-test-renderer": "^18.3.1",
+    "typescript": "~5.9.3"
+  }
+}

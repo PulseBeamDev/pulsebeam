@@ -1,0 +1,4 @@
+packages:
+  - .
+overrides:
+  "@pulsebeam/web": link:../pulsebeam-agent-web

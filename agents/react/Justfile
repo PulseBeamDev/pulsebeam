@@ -1,0 +1,14 @@
+set shell := ["bash", "-euc"]
+set tempdir := "/tmp"
+
+# Build the React adapter and its declarations.
+build:
+    pnpm run build
+
+# Check the implementation and public type contract.
+check:
+    pnpm run check
+
+# Run the React runtime contract tests.
+test:
+    pnpm run test

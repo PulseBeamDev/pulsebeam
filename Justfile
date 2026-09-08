@@ -11,8 +11,9 @@ check:
     cargo fmt --all --check
     cargo clippy --all-targets --workspace --features pulsebeam/sim
     just --justfile agents/pulsebeam-agent-web/Justfile check
+    just --justfile agents/react/Justfile check
     just --fmt --check
-    @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
+    @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
 
 fix:
     cargo fmt --all
@@ -23,6 +24,7 @@ test:
     cargo test --workspace --exclude pulsebeam-simulator --features pulsebeam/sim
     cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast
     just --justfile agents/pulsebeam-agent-web/Justfile test
+    just --justfile agents/react/Justfile test
 
 # Build, load, and attach the eBPF steering programs.
 ebpf:

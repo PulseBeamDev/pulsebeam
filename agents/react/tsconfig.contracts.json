@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": false,
+    "noEmit": true,
+    "rootDir": ".",
+    "paths": {
+      "@pulsebeam/react": ["./src/index.ts"]
+    }
+  },
+  "include": ["tests/contracts/strict-consumer.ts"]
+}
