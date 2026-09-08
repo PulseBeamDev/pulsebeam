@@ -43,30 +43,13 @@
     topics: [{ name: "presence", mode: "latest", publish: true }],
   });
 
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error("latest desired state was not applied")),
-      5000,
-    );
-    const inspect = () => {
-      if (first.getSnapshot().desiredRevision !== 1) return;
-      clearTimeout(timeout);
-      remove();
-      resolve();
-    };
-    const remove = first.subscribe(inspect);
-    inspect();
-  });
-  const latestOnly =
-    first.getSnapshot().desiredRevision === 1 &&
-    first.getSnapshot().connection === "disconnected";
-
   const canvas = document.createElement("canvas");
   const track = canvas.captureStream(1).getVideoTracks()[0];
   await first.replaceLocalTrack("camera", track, {
     contentHint: "motion",
     encodings: [],
   });
+  const latestOnly = first.getSnapshot().connection === "disconnected";
   await first.setLocalMuted("camera", true);
   const muted = !track.enabled;
   await first.setLocalMuted("camera", false);
@@ -104,7 +87,14 @@
     initialStable,
     initialFrozen,
     initial: initial.connection,
-    latestOnly,
+    latestOnly:
+      latestOnly &&
+      events.some(
+        (event) =>
+          event.type === "topic-send-dropped" &&
+          event.topic === "presence" &&
+          event.reason !== "not-registered",
+      ),
     closeBeforeSettlement: second.getSnapshot().connection === "disconnected",
     localOperations: muted && unmuted,
     validationRejected,
@@ -116,4 +106,4 @@
     closed: closed.connection,
     postClose: first.getSnapshot() === closed,
   };
-})();
+})()

@@ -64,6 +64,7 @@ struct LiveAgentResult {
     delivered: bool,
     reconnected: bool,
     topic_metadata: bool,
+    runtime_failure_event: bool,
     caller_owns_track: bool,
 }
 
@@ -211,6 +212,7 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
         assert!(result.delivered);
         assert!(result.reconnected);
         assert!(result.topic_metadata);
+        assert!(result.runtime_failure_event);
         assert!(result.caller_owns_track);
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })
@@ -235,7 +237,7 @@ async fn initialization_failure_is_private_and_deterministic() -> TestResult<()>
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         load_fixture(&bidi, &context, &fixture_url).await?;
-        let connection: String = evaluate_json(
+        let persisted: bool = evaluate_json(
             &bidi,
             &context,
             r#"new Promise((resolve, reject) => {
@@ -248,13 +250,19 @@ async fn initialization_failure_is_private_and_deterministic() -> TestResult<()>
                 agent.subscribe(() => {
                     if (agent.getSnapshot().connection !== "terminal-failure") return;
                     clearTimeout(timeout);
-                    resolve("terminal-failure");
+                    const failure = agent.getSnapshot().failure;
+                    agent.setState({ connected: false });
+                    const after = agent.getSnapshot();
+                    resolve(
+                        after.connection === "terminal-failure" &&
+                        after.failure === failure
+                    );
                 });
                 agent.setState({ connected: true });
             })"#,
         )
         .await?;
-        assert_eq!(connection, "terminal-failure");
+        assert!(persisted);
         let unhandled_rejections: usize = evaluate_json(
             &bidi,
             &context,

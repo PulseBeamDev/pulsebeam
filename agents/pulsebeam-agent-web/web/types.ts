@@ -185,15 +185,32 @@ export interface SenderEncoding {
   readonly scaleResolutionDownBy?: number;
   readonly maxBitrate?: number;
   readonly maxFramerate?: number;
-  readonly scalabilityMode?: string;
-  readonly dtx?: string;
+  readonly scalabilityMode?: "L1T1" | "L1T2" | "L1T3";
+  readonly dtx?: "enabled" | "disabled";
 }
 
-export interface SenderConfig {
-  readonly contentHint: string;
-  readonly degradationPreference?: string;
-  readonly encodings?: readonly SenderEncoding[];
+interface SenderConfigBase {
+  readonly degradationPreference?:
+    | "maintain-framerate"
+    | "maintain-resolution"
+    | "balanced";
 }
+
+export interface VideoSenderConfig extends SenderConfigBase {
+  readonly contentHint: "motion" | "detail" | "text";
+  /** Omit or pass an empty tuple to use the runtime's three-layer defaults. */
+  readonly encodings?:
+    | readonly []
+    | readonly [SenderEncoding, SenderEncoding, SenderEncoding];
+}
+
+export interface AudioSenderConfig extends SenderConfigBase {
+  readonly contentHint: "speech" | "music";
+  /** Omit or pass an empty tuple to use the runtime's single-layer default. */
+  readonly encodings?: readonly [] | readonly [SenderEncoding];
+}
+
+export type SenderConfig = VideoSenderConfig | AudioSenderConfig;
 
 export type TopicDropReason =
   | "invalid-payload"

@@ -122,6 +122,18 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function localFailureClass(error: unknown): "validation" | "runtime" {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "pulsebeamClass" in error &&
+    error.pulsebeamClass === "validation"
+  ) {
+    return "validation";
+  }
+  return "runtime";
+}
+
 function freezeTopicSnapshot(topics: TopicSnapshot): TopicSnapshot {
   return Object.freeze({
     publishers: Object.freeze(
@@ -145,6 +157,7 @@ class AgentFacade implements Agent {
   #state: AgentState = copyState({ connected: false });
   #runtime: Runtime | undefined;
   #localOperations = new Map<string, Promise<void>>();
+  #localTracks = new Map<string, MediaStreamTrack>();
   #closed = false;
   readonly #ready: Promise<Runtime>;
 
@@ -217,6 +230,7 @@ class AgentFacade implements Agent {
     if (this.#closed) return;
     this.#state = copyState(state);
     if (!this.#runtime) {
+      if (this.#snapshot.connection === "terminal-failure") return;
       this.#publish(
         Object.freeze({
           ...this.#snapshot,
@@ -249,12 +263,19 @@ class AgentFacade implements Agent {
     });
     return this.#queueLocal(slot, async (runtime) => {
       await runtime.replace_local_track(slot, track, sender);
+      if (track) {
+        this.#localTracks.set(slot, track);
+      } else {
+        this.#localTracks.delete(slot);
+      }
     });
   }
 
   setLocalMuted(slot: string, muted: boolean): Promise<void> {
     return this.#queueLocal(slot, async (runtime) => {
       await runtime.set_local_muted(slot, muted);
+      const track = this.#localTracks.get(slot);
+      if (track) track.enabled = !muted;
     });
   }
 
@@ -280,6 +301,7 @@ class AgentFacade implements Agent {
     }
     this.#state = copyState({ connected: false });
     this.#localOperations.clear();
+    this.#localTracks.clear();
     this.#publish(emptySnapshot("disconnected"));
     this.#listeners.clear();
     this.#eventListeners.clear();
@@ -308,7 +330,7 @@ class AgentFacade implements Agent {
       })
       .catch((error: unknown) => {
         if (!this.#closed && this.#snapshot.failure === null) {
-          this.#emitFailure("validation", message(error));
+          this.#emitFailure(localFailureClass(error), message(error));
         }
         throw error;
       });

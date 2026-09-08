@@ -6,6 +6,7 @@ export type {
   AgentFailure,
   AgentSnapshot,
   AgentState,
+  AudioSenderConfig,
   AudioBinding,
   AudioDemand,
   ConnectionState,
@@ -29,4 +30,5 @@ export type {
   TopicSubscriberStatus,
   VideoBinding,
   VideoDemand,
+  VideoSenderConfig,
 } from "./types.js";

@@ -155,6 +155,37 @@ struct SenderConfig {
     encodings: Vec<EncodingConfig>,
 }
 
+struct LocalOperationError {
+    class: &'static str,
+    message: String,
+}
+
+impl LocalOperationError {
+    fn validation(message: impl Into<String>) -> Self {
+        Self {
+            class: "validation",
+            message: message.into(),
+        }
+    }
+
+    fn runtime(message: impl Into<String>) -> Self {
+        Self {
+            class: "runtime",
+            message: message.into(),
+        }
+    }
+
+    fn into_js(self) -> JsValue {
+        let error = js_sys::Error::new(&self.message);
+        let _ = Reflect::set(
+            error.as_ref(),
+            &JsValue::from_str("pulsebeamClass"),
+            &JsValue::from_str(self.class),
+        );
+        error.into()
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EncodingConfig {
@@ -429,12 +460,14 @@ impl BrowserRuntime {
         config: JsValue,
     ) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
-        let config: SenderConfig = serde_wasm_bindgen::from_value(config)
-            .map_err(|error| js_error(format!("invalid sender configuration: {error}")))?;
+        let config: SenderConfig = serde_wasm_bindgen::from_value(config).map_err(|error| {
+            LocalOperationError::validation(format!("invalid sender configuration: {error}"))
+                .into_js()
+        })?;
         self.inner
             .replace_local_track(slot, track, config)
             .await
-            .map_err(js_error)
+            .map_err(LocalOperationError::into_js)
     }
 
     pub async fn set_local_muted(&self, slot: String, muted: bool) -> Result<(), JsValue> {
@@ -442,7 +475,7 @@ impl BrowserRuntime {
         self.inner
             .set_local_muted(slot, muted)
             .await
-            .map_err(js_error)
+            .map_err(LocalOperationError::into_js)
     }
 
     pub fn remote_track(&self, mid: &str) -> Option<MediaStreamTrack> {
@@ -603,20 +636,19 @@ impl RuntimeInner {
         slot: String,
         track: Option<MediaStreamTrack>,
         config: SenderConfig,
-    ) -> Result<(), String> {
-        let kind = self
-            .local_slots
-            .get(&slot)
-            .copied()
-            .ok_or_else(|| format!("unknown local publication slot: {slot}"))?;
-        validate_sender_config(kind, &config)?;
+    ) -> Result<(), LocalOperationError> {
+        let kind = self.local_slots.get(&slot).copied().ok_or_else(|| {
+            LocalOperationError::validation(format!("unknown local publication slot: {slot}"))
+        })?;
         if let Some(track) = &track {
+            let config =
+                normalize_sender_config(kind, config).map_err(LocalOperationError::validation)?;
             let expected = media_kind_name(kind);
             if track.kind() != expected {
-                return Err(format!(
+                return Err(LocalOperationError::validation(format!(
                     "local slot {slot} requires a {expected} track, received {}",
                     track.kind()
-                ));
+                )));
             }
             let muted = self
                 .local_tracks
@@ -628,7 +660,8 @@ impl RuntimeInner {
                 track.as_ref(),
                 "contentHint",
                 &JsValue::from_str(&config.content_hint),
-            )?;
+            )
+            .map_err(LocalOperationError::runtime)?;
             self.local_tracks.borrow_mut().insert(
                 slot.clone(),
                 LocalTrackState {
@@ -640,15 +673,23 @@ impl RuntimeInner {
         } else {
             self.local_tracks.borrow_mut().remove(&slot);
         }
-        self.sync_local_slot(&slot).await
+        self.sync_local_slot(&slot)
+            .await
+            .map_err(LocalOperationError::runtime)
     }
 
-    async fn set_local_muted(self: &Rc<Self>, slot: String, muted: bool) -> Result<(), String> {
+    async fn set_local_muted(
+        self: &Rc<Self>,
+        slot: String,
+        muted: bool,
+    ) -> Result<(), LocalOperationError> {
         let track = {
             let mut tracks = self.local_tracks.borrow_mut();
-            let state = tracks
-                .get_mut(&slot)
-                .ok_or_else(|| format!("local publication slot has no track: {slot}"))?;
+            let state = tracks.get_mut(&slot).ok_or_else(|| {
+                LocalOperationError::validation(format!(
+                    "local publication slot has no track: {slot}"
+                ))
+            })?;
             if state.muted == muted {
                 return Ok(());
             }
@@ -656,7 +697,9 @@ impl RuntimeInner {
             state.track.clone()
         };
         track.set_enabled(!muted);
-        self.sync_local_slot(&slot).await
+        self.sync_local_slot(&slot)
+            .await
+            .map_err(LocalOperationError::runtime)
     }
 
     async fn sync_local_slot(&self, slot: &str) -> Result<(), String> {
@@ -1397,6 +1440,39 @@ fn add_transceiver(
         .map_err(js_message)?
         .dyn_into()
         .map_err(js_message)
+}
+
+fn normalize_sender_config(
+    kind: MediaKind,
+    mut config: SenderConfig,
+) -> Result<SenderConfig, String> {
+    if config.encodings.is_empty() {
+        config.encodings = match kind {
+            MediaKind::Video => ["q", "h", "f"]
+                .into_iter()
+                .map(|rid| EncodingConfig {
+                    rid: Some(rid.to_owned()),
+                    active: true,
+                    scale_resolution_down_by: None,
+                    max_bitrate: None,
+                    max_framerate: None,
+                    scalability_mode: None,
+                    dtx: None,
+                })
+                .collect(),
+            MediaKind::Audio => vec![EncodingConfig {
+                rid: None,
+                active: true,
+                scale_resolution_down_by: None,
+                max_bitrate: None,
+                max_framerate: None,
+                scalability_mode: None,
+                dtx: None,
+            }],
+        };
+    }
+    validate_sender_config(kind, &config)?;
+    Ok(config)
 }
 
 fn validate_sender_config(kind: MediaKind, config: &SenderConfig) -> Result<(), String> {

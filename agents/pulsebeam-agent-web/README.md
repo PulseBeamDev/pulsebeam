@@ -52,8 +52,12 @@ are named by the topology and are limited to two audio and two video slots;
 remote capacities are limited to three audio and seven video slots.
 
 Use `replaceLocalTrack` and `setLocalMuted` for declared local slots. The
-runtime validates media kinds and sender settings. Capture tracks remain owned
-by the caller: replacement and `close()` detach them but never stop them.
+runtime validates media kinds and sender settings. Omitted or empty encoding
+settings enable the runtime's default three-layer video or single-layer audio
+sender configuration; explicit video and audio settings contain three and one
+encoding entries respectively. Sender settings are ignored when detaching with
+a `null` track. Capture tracks remain owned by the caller: replacement and
+`close()` detach them but never stop them.
 Local-track operations are serialized per slot so an older replacement cannot
 become the final attachment after a newer one.
 

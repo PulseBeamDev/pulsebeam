@@ -132,6 +132,27 @@
     "reconnected media",
   );
 
+  const runtimeEvents = [];
+  const removeRuntimeEvents = sender.subscribeEvents((event) =>
+    runtimeEvents.push(event),
+  );
+  const originalSetParameters = RTCRtpSender.prototype.setParameters;
+  RTCRtpSender.prototype.setParameters = () =>
+    Promise.reject(new DOMException("contract runtime failure"));
+  const runtimeRejected = await sender
+    .replaceLocalTrack("camera", localTrack, { contentHint: "motion" })
+    .then(
+      () => false,
+      () => true,
+    );
+  RTCRtpSender.prototype.setParameters = originalSetParameters;
+  removeRuntimeEvents();
+  const runtimeFailureEvent =
+    runtimeRejected &&
+    runtimeEvents.some(
+      (event) => event.type === "failure" && event.class === "runtime",
+    );
+
   sender.close();
   receiver.close();
   const callerOwnsTrack = localTrack.readyState === "live";
@@ -148,6 +169,7 @@
       receivedTopic.streamId > 0 &&
       receivedTopic.sequence >= 0 &&
       receivedTopic.payload.join(",") === "7,8,9",
+    runtimeFailureEvent,
     callerOwnsTrack,
   };
-})();
+})()
