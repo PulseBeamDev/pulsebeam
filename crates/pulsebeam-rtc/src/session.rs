@@ -3,7 +3,7 @@
     reason = "the v3 public value contract uses immutable Arc-backed strings, slices, and Bytes"
 )]
 
-use std::{num::NonZeroU16, sync::Arc, time::Duration};
+use std::{fmt, num::NonZeroU16, sync::Arc, time::Duration};
 
 use crate::{AcceptError, DataChannelId, SenderId};
 
@@ -21,7 +21,7 @@ impl SessionCapabilities {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SdpOffer(Arc<str>);
 
 impl SdpOffer {
@@ -34,7 +34,15 @@ impl SdpOffer {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl fmt::Debug for SdpOffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SdpOffer")
+            .field("bytes", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct SdpAnswer(Arc<str>);
 
 impl SdpAnswer {
@@ -48,6 +56,14 @@ impl SdpAnswer {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for SdpAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SdpAnswer")
+            .field("bytes", &self.0.len())
+            .finish_non_exhaustive()
     }
 }
 

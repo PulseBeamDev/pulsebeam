@@ -80,6 +80,14 @@ pub(crate) struct MonotonicObserver {
     reason = "the observer is exercised by Connection methods beginning in Plan 02"
 )]
 impl MonotonicObserver {
+    pub(crate) const fn starting_at(at: TimePoint) -> Self {
+        Self {
+            last: Some(at),
+            regressions: 0,
+            warning_pending: false,
+        }
+    }
+
     pub(crate) fn observe(&mut self, at: TimePoint) -> TimePoint {
         self.observe_with_debug_assertions::<{ cfg!(debug_assertions) }>(at)
     }
