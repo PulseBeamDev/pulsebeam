@@ -9,7 +9,7 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const disconnected = Object.freeze({
   connection: "disconnected",
   participantId: null,
-  tracks: Object.freeze([]),
+  tracks: Object.freeze({}),
 });
 
 class FakeAgent {
@@ -75,7 +75,7 @@ test("renders snapshots, rerenders on updates, and preserves stable results", ()
   assert.equal(results.length, 1);
   assert.equal(results[0].connection, "disconnected");
   assert.equal(results[0].participantId, null);
-  assert.deepEqual(results[0].tracks, []);
+  assert.deepEqual(results[0].tracks, {});
 
   act(() => agent.emit());
   assert.equal(results.length, 1);
@@ -87,7 +87,7 @@ test("renders snapshots, rerenders on updates, and preserves stable results", ()
   const connected = Object.freeze({
     connection: "connected",
     participantId: "participant-1",
-    tracks: Object.freeze([]),
+    tracks: Object.freeze({}),
   });
   act(() => agent.emit(connected));
   assert.equal(results.length, 3);
@@ -106,9 +106,9 @@ test("replacement resubscribes, delegates to the current agent, and never closes
   const first = new FakeAgent();
   const second = new FakeAgent(
     Object.freeze({
-      connection: "connecting",
+      connection: "joining",
       participantId: null,
-      tracks: Object.freeze([]),
+      tracks: Object.freeze({}),
     }),
   );
   const results = [];
@@ -124,9 +124,9 @@ test("replacement resubscribes, delegates to the current agent, and never closes
   assert.equal(first.listeners.size, 0);
   assert.equal(first.unsubscribeCalls, 1);
   assert.equal(second.listeners.size, 1);
-  assert.equal(results.at(-1).connection, "connecting");
+  assert.equal(results.at(-1).connection, "joining");
 
-  const state = { connection: { roomId: "room", token: "token" } };
+  const state = { connected: true };
   results.at(-1).setState(state);
   assert.deepEqual(first.states, []);
   assert.deepEqual(second.states, [state]);

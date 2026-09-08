@@ -1,4 +1,5 @@
 import initializeWasm, {
+  BrowserRuntime,
   configure_logging as configureWasmLogging,
 } from "../dist/wasm/pulsebeam_agent_web.js";
 
@@ -9,6 +10,8 @@ const initialization = initializeWasm().then((wasm) => {
 
 void initialization.catch(() => {});
 
-export function afterInitialization(callback: () => void): void {
-  void initialization.then(callback, callback).catch(() => {});
+export { BrowserRuntime };
+
+export function whenInitialized(): Promise<void> {
+  return initialization.then(() => undefined);
 }

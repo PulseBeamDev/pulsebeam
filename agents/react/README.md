@@ -16,12 +16,16 @@ closes its agent.
 import { AgentProvider, useAgent } from "@pulsebeam/react";
 import { createAgent } from "@pulsebeam/web";
 
-const agent = createAgent();
+const agent = createAgent({
+  endpoint: "https://pulsebeam.example",
+  roomId: "standup",
+  topology: {},
+});
 
 function Status() {
   const { connection, setState } = useAgent();
   return (
-    <button onClick={() => setState({ connection: null })}>
+    <button onClick={() => setState({ connected: false })}>
       {connection}
     </button>
   );
@@ -38,6 +42,5 @@ function App() {
 // Call agent.close() when the caller's lifecycle ends.
 ```
 
-The current web agent has a signaling stub: a non-null connection intent moves
-from `connecting` to `failed` after initialization, while publication,
-subscription, and data-track intent do not yet create transport state.
+The web agent owns the browser runtime. The React adapter only subscribes to
+its immutable snapshots and forwards complete desired state updates.

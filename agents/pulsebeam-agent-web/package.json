@@ -6,7 +6,11 @@
     "url": "https://github.com/PulseBeamDev/pulsebeam.git"
   },
   "type": "module",
-  "files": ["dist/**/*.js", "dist/**/*.d.ts", "dist/**/*.wasm"],
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.wasm"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -18,7 +22,7 @@
     "build:wasm": "wasm-pack build --target web --out-dir dist/wasm --out-name pulsebeam_agent_web && touch dist/wasm/.npmignore",
     "build:ts": "tsc -p tsconfig.json",
     "build": "pnpm run build:wasm && pnpm run build:ts",
-    "check": "tsc -p tsconfig.json --noEmit",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.public-contract.json",
     "test": "just test"
   },
   "dependencies": {

@@ -5,41 +5,79 @@
 ```ts
 import { createAgent } from "@pulsebeam/web";
 
-const agent = createAgent();
-
-agent.setState({
-  connection: { roomId: "standup", token: "token" },
-  publish: [camera],
-  subscribe: [{ participantId: "speaker", kind: "audio", label: "microphone" }],
+const agent = createAgent({
+  endpoint: "https://pulsebeam.example",
+  roomId: "standup",
+  requestHeaders: { "x-session": "session-id" },
+  topology: {
+    localAudio: ["microphone"],
+    localVideo: ["camera", "screen"],
+    remoteAudio: 3,
+    remoteVideo: 7,
+  },
 });
 
-const snapshot = agent.getSnapshot();
-const unsubscribe = agent.subscribe(() => render(agent.getSnapshot()));
+agent.setState({
+  connected: true,
+  publications: [{ slot: "microphone", active: true }],
+  video: [
+    {
+      slot: 0,
+      trackId: "speaker-camera",
+      height: 720,
+      minHeight: 180,
+      minFps: 15,
+      priority: 100,
+    },
+  ],
+  audio: { pinned: ["speaker-microphone"], automatic: true },
+  topics: [{ name: "presence", mode: "latest", subscribe: true }],
+});
 
-agent.close();
-unsubscribe();
+const unsubscribe = agent.subscribe(() => render(agent.getSnapshot()));
+const unsubscribeEvents = agent.subscribeEvents((event) => {
+  if (event.type === "topic-message") consume(event.payload);
+});
 ```
 
-`createAgent()` is synchronous. Package evaluation begins private WASM
-initialization, but callers neither await it nor receive its result. Snapshots
-are immutable and retain their identity until public state changes. `setState`
-replaces the complete intent; omitted `publish` and `subscribe` are empty, and
-the supplied connection record and arrays are copied. `close()` is terminal.
+`createAgent()` is synchronous and safe to call while its private WASM module
+is still initializing. The facade retains only the latest complete desired
+state during initialization and then gives it to the browser runtime. Omitted
+publication, video, audio-pinning, and topic collections are empty, retracting
+their previous desired values.
 
-## Current transport status
+The endpoint is the absolute HTTP(S) PulseBeam server endpoint; the core adds
+`/api/v1`. Only explicitly supplied request headers are forwarded. Local slots
+are named by the topology and are limited to two audio and two video slots;
+remote capacities are limited to three audio and seven video slots.
 
-Transport reconciliation is deliberately stubbed pending the signaling redesign.
-A non-null connection intent immediately reports `connecting`, then deterministically
-reports `failed` after WASM initialization settles. A null connection reports an
-empty `disconnected` snapshot. Publication, subscription, and data-track intent
-does not create remote state or transport media/data in this milestone.
+Use `replaceLocalTrack` and `setLocalMuted` for declared local slots. The
+runtime validates media kinds and sender settings. Capture tracks remain owned
+by the caller: replacement and `close()` detach them but never stop them.
+Local-track operations are serialized per slot so an older replacement cannot
+become the final attachment after a newer one.
 
-The Rust browser runtime and generated WASM bindings remain private implementation
-details. This package does not expose endpoint configuration, topology, commands,
-topics, statistics, logging, or generated bindings.
+Snapshots contain participants and discoverable publications independently of
+whether media is currently bound. Available remote `MediaStreamTrack` objects
+are exposed in `snapshot.tracks`, keyed by publication ID. Snapshot records and
+collections are immutable and retain identity until an observable update;
+platform track objects themselves are not frozen.
+
+Topics support `latest` and `ordered` registrations and sends. Event
+subscriptions preserve message bytes plus publisher, stream, and sequence
+metadata, and distinguish admission, drop, resynchronization, channel failure,
+and agent failure events. Send admission is not a delivery acknowledgment.
+
+`reconnect()` delegates to the runtime's reconnect operation and retains the
+complete desired state. A fixed playout delay cannot return to adaptive mode
+during the same session; create a new agent for adaptive mode. `close()` is
+terminal and idempotent, detaches callbacks, aborts browser resources, and
+fences initialization and pending operations. Unsubscribe functions are also
+idempotent.
 
 ## Development
 
-`just --justfile agents/pulsebeam-agent-web/Justfile check` checks the private
-WASM package and TypeScript boundary. `just --justfile agents/pulsebeam-agent-web/Justfile test`
-builds the package and runs retained runtime and browser checks.
+`just --justfile agents/pulsebeam-agent-web/Justfile check` checks the WASM
+runtime and strict public TypeScript contract. `just --justfile
+agents/pulsebeam-agent-web/Justfile test` builds the package and runs the Rust
+and browser boundary tests.

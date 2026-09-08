@@ -6,12 +6,13 @@ use std::{
 
 use agent_core::{
     AgentConfig, AudioSubscription, ChannelId, ConnectionState, DataChannelBinding,
-    DataChannelEffect, DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState, Effect,
-    Failure, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod,
-    HttpResponse, MediaKind, MediaSlot, MediaTopology, Notification, OfferResources, OperationId,
-    PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, SlotBinding, TimerEffect,
-    TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode, TopicNotification,
-    TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber, VideoSubscription,
+    DataChannelEffect, DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState,
+    Effect, Failure, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader,
+    HttpMethod, HttpResponse, MediaKind, MediaSlot, MediaTopology, Notification, OfferResources,
+    OperationId, PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, SlotBinding,
+    TimerEffect, TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode,
+    TopicNotification, TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber,
+    VideoSubscription,
 };
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use serde::Deserialize;
@@ -25,7 +26,7 @@ use web_sys::{
     RtcTrackEvent,
 };
 
-use crate::engine::{spawn_actor, ActorHandle, Host, PublicCommand, TopicCommand, Turn};
+use crate::engine::{ActorHandle, Host, PublicCommand, TopicCommand, Turn, spawn_actor};
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
 
@@ -236,7 +237,7 @@ impl DataChannel {
 struct Peer {
     connection: RtcPeerConnection,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
-    remote_tracks: BTreeMap<String, MediaStreamTrack>,
+    remote_tracks: BTreeMap<String, RemoteTrackState>,
     channels: BTreeMap<u64, DataChannel>,
     _state: Closure<dyn FnMut(Event)>,
     _track: Closure<dyn FnMut(RtcTrackEvent)>,
@@ -246,10 +247,24 @@ impl Peer {
     fn close(self) {
         self.connection.set_onconnectionstatechange(None);
         self.connection.set_ontrack(None);
+        for track in self.remote_tracks.into_values() {
+            track.close();
+        }
         for channel in self.channels.into_values() {
             channel.close();
         }
         self.connection.close();
+    }
+}
+
+struct RemoteTrackState {
+    track: MediaStreamTrack,
+    _ended: Closure<dyn FnMut(Event)>,
+}
+
+impl RemoteTrackState {
+    fn close(self) {
+        self.track.set_onended(None);
     }
 }
 
@@ -377,9 +392,7 @@ impl BrowserRuntime {
         let actor = spawn_actor(core_config, BrowserHost::new(&inner))
             .map_err(|error| js_error(error.to_string()))?;
         *inner.actor.borrow_mut() = Some(actor);
-        Ok(Self {
-            inner,
-        })
+        Ok(Self { inner })
     }
 
     pub fn set_snapshot_listener(&self, listener: Option<Function>) {
@@ -439,7 +452,7 @@ impl BrowserRuntime {
             .borrow()
             .get(&generation.get())
             .and_then(|peer| peer.remote_tracks.get(mid))
-            .cloned()
+            .map(|state| state.track.clone())
     }
 
     pub async fn statistics(&self) -> Result<JsValue, JsValue> {
@@ -461,7 +474,8 @@ impl BrowserRuntime {
         let Some(generation) = generation else {
             return Err(js_error("cannot reconnect before a transport exists"));
         };
-        self.inner.send_event(HostEvent::Rtc(RtcEvent::Disconnected { generation }));
+        self.inner
+            .send_event(HostEvent::Rtc(RtcEvent::Disconnected { generation }));
         Ok(())
     }
 
@@ -470,13 +484,13 @@ impl BrowserRuntime {
         let mode = parse_topic_mode(mode)?;
         self.inner
             .send_topic(TopicSend {
-            publisher: TopicPublisher {
-                topic: name.to_owned(),
-                mode,
-            },
-            payload: payload.to_vec(),
-        })
-        .map_err(js_error)?;
+                publisher: TopicPublisher {
+                    topic: name.to_owned(),
+                    mode,
+                },
+                payload: payload.to_vec(),
+            })
+            .map_err(js_error)?;
         Ok(())
     }
 
@@ -842,12 +856,43 @@ impl RuntimeInner {
                 ));
                 return;
             };
-            let inserted = inner
+            let remote_track = event.track();
+            let ended_weak = Rc::downgrade(&inner);
+            let ended_mid = mid.clone();
+            let ended_track = remote_track.clone();
+            let ended = Closure::wrap(Box::new(move |_event: Event| {
+                let Some(inner) = ended_weak.upgrade() else {
+                    return;
+                };
+                let removed = inner
+                    .peers
+                    .borrow_mut()
+                    .get_mut(&generation.get())
+                    .and_then(|peer| {
+                        let current = peer.remote_tracks.get(&ended_mid)?;
+                        if !Object::is(current.track.as_ref(), ended_track.as_ref()) {
+                            return None;
+                        }
+                        peer.remote_tracks.remove(&ended_mid)
+                    });
+                if removed.is_some() {
+                    inner.publish_current_snapshot();
+                }
+            }) as Box<dyn FnMut(Event)>);
+            remote_track.set_onended(Some(ended.as_ref().unchecked_ref()));
+            let state = RemoteTrackState {
+                track: remote_track,
+                _ended: ended,
+            };
+            let replaced = inner
                 .peers
                 .borrow_mut()
                 .get_mut(&generation.get())
-                .map(|peer| peer.remote_tracks.insert(mid, event.track()))
-                .is_some();
+                .map(|peer| peer.remote_tracks.insert(mid, state));
+            let inserted = replaced.is_some();
+            if let Some(previous) = replaced.flatten() {
+                previous.close();
+            }
             if inserted {
                 inner.publish_current_snapshot();
             }
@@ -1076,7 +1121,9 @@ impl RuntimeInner {
                     return;
                 }
                 match result {
-                    Ok(_) => inner.send_event(HostEvent::Rtc(RtcEvent::AnswerApplied { generation })),
+                    Ok(_) => {
+                        inner.send_event(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
+                    }
                     Err(error) => inner.rtc_failed(generation, js_message(error)),
                 }
             }
@@ -1088,7 +1135,10 @@ impl RuntimeInner {
             "generation={} RTC operation failed: {message}",
             generation.get()
         ));
-        self.send_event(HostEvent::Rtc(RtcEvent::Failed { generation, message }));
+        self.send_event(HostEvent::Rtc(RtcEvent::Failed {
+            generation,
+            message,
+        }));
     }
 
     fn execute_http(self: &Rc<Self>, effect: HttpEffect) {

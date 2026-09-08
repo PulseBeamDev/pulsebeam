@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -19,22 +20,24 @@ use tokio::task::JoinHandle;
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const PUBLIC_AGENT_CONTRACT: &str = include_str!("contracts/public-agent-contract.js");
+const LIVE_AGENT_CONTRACT: &str = include_str!("contracts/live-agent-contract.js");
 const UNIFFI_MEDIA_CONTRACT: &str = include_str!("contracts/uniffi-media-contract.js");
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContractResult {
     exports: Vec<String>,
     independent: bool,
+    config_copied: bool,
     initial_stable: bool,
     initial_frozen: bool,
     initial: String,
-    connecting: String,
-    connecting_stable: bool,
-    null_cancelled: bool,
-    defensive_copies: bool,
+    latest_only: bool,
     close_before_settlement: bool,
-    failed: String,
-    calls: Vec<String>,
+    local_operations: bool,
+    validation_rejected: bool,
+    failure_event: bool,
+    caller_owns_track: bool,
+    no_removed_listener_calls: bool,
     closed: String,
     post_close: bool,
 }
@@ -51,6 +54,53 @@ struct UniFfiMediaResult {
     retained_after_track_release: String,
     retained_before_stream_release: String,
     retained_after_stream_release: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveAgentResult {
+    connected: bool,
+    discovered: bool,
+    delivered: bool,
+    reconnected: bool,
+    topic_metadata: bool,
+    caller_owns_track: bool,
+}
+
+struct DestinationServer {
+    child: Child,
+}
+
+impl DestinationServer {
+    fn start() -> TestResult<Self> {
+        let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = package
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("web package must be inside the workspace")?;
+        let mut child = Command::new("cargo")
+            .args(["run", "--release", "-p", "pulsebeam", "--", "--dev"])
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        for _ in 0..300 {
+            if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
+                return Ok(Self { child });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Err("PulseBeam development server did not listen on port 7070".into())
+    }
+}
+
+impl Drop for DestinationServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 struct StaticServer {
@@ -138,6 +188,37 @@ async fn public_agent_contract_runs_through_bidi() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
+    let _destination = DestinationServer::start()?;
+    let server = StaticServer::start().await?;
+    let fixture_url = server.fixture_url();
+    let mut capabilities = DesiredCapabilities::chrome();
+    capabilities.set_headless()?;
+    capabilities.set_no_sandbox()?;
+    capabilities.set_disable_gpu()?;
+    capabilities.enable_bidi()?;
+    if let Some(binary) = env::var_os("PULSEBEAM_BROWSER_BINARY") {
+        capabilities.set_binary(&binary.to_string_lossy())?;
+    }
+
+    run_browser_test(WebDriver::managed(capabilities), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        load_fixture(&bidi, &context, &fixture_url).await?;
+        let result: LiveAgentResult = evaluate_json(&bidi, &context, LIVE_AGENT_CONTRACT).await?;
+        assert!(result.connected);
+        assert!(result.discovered);
+        assert!(result.delivered);
+        assert!(result.reconnected);
+        assert!(result.topic_metadata);
+        assert!(result.caller_owns_track);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|error| format!("live browser agent test failed: {error}").into())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn initialization_failure_is_private_and_deterministic() -> TestResult<()> {
     let server = StaticServer::start_with_wasm_failure(true).await?;
     let fixture_url = server.fixture_url();
@@ -158,18 +239,22 @@ async fn initialization_failure_is_private_and_deterministic() -> TestResult<()>
             &bidi,
             &context,
             r#"new Promise((resolve, reject) => {
-                const agent = window.pulsebeam.createAgent();
+                const agent = window.pulsebeam.createAgent({
+                    endpoint: location.origin,
+                    roomId: "room",
+                    topology: {},
+                });
                 const timeout = setTimeout(() => reject(new Error("initialization did not fail")), 5000);
                 agent.subscribe(() => {
-                    if (agent.getSnapshot().connection !== "failed") return;
+                    if (agent.getSnapshot().connection !== "terminal-failure") return;
                     clearTimeout(timeout);
-                    resolve("failed");
+                    resolve("terminal-failure");
                 });
-                agent.setState({ connection: { roomId: "room", token: "token" } });
+                agent.setState({ connected: true });
             })"#,
         )
         .await?;
-        assert_eq!(connection, "failed");
+        assert_eq!(connection, "terminal-failure");
         let unhandled_rejections: usize = evaluate_json(
             &bidi,
             &context,
@@ -228,21 +313,17 @@ async fn generated_media_types_run_through_bidi() -> TestResult<()> {
 fn assert_contract(contract: ContractResult) {
     assert_eq!(contract.exports, ["createAgent"]);
     assert!(contract.independent);
+    assert!(contract.config_copied);
     assert!(contract.initial_stable);
     assert!(contract.initial_frozen);
     assert_eq!(contract.initial, "disconnected");
-    assert_eq!(contract.connecting, "connecting");
-    assert!(contract.connecting_stable);
-    assert!(contract.null_cancelled);
-    assert!(contract.defensive_copies);
+    assert!(contract.latest_only);
     assert!(contract.close_before_settlement);
-    assert_eq!(contract.failed, "failed");
-    assert_eq!(
-        contract.calls,
-        [
-            "first", "second", "second", "late", "second", "late", "second", "late", "late"
-        ]
-    );
+    assert!(contract.local_operations);
+    assert!(contract.validation_rejected);
+    assert!(contract.failure_event);
+    assert!(contract.caller_owns_track);
+    assert!(contract.no_removed_listener_calls);
     assert_eq!(contract.closed, "disconnected");
     assert!(contract.post_close);
 }
