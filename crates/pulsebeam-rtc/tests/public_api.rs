@@ -1,8 +1,13 @@
-use std::{any::TypeId, time::Duration};
+use std::{
+    any::TypeId,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    time::Duration,
+};
 
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionLimits, DataChannelId, FrameDependencies, FrameId,
-    GlobalMediaTime, IceTcpFlowId, MediaPacket, MediaPriority, PlayoutDelay, PolicyError,
+    AcceptError, Connection, ConnectionConfig, ConnectionLimits, DataChannelId, FrameDependencies,
+    FrameId, GlobalMediaTime, IceTcpFlowId, LocalCandidate, MediaPacket, MediaPriority,
+    PlayoutDelay, PolicyError,
 };
 
 fn assert_send<T: Send>() {}
@@ -112,6 +117,106 @@ fn configured_hard_limits_reject_invalid_values() {
     assert!(invalid.validate().is_err());
 
     assert!(ConnectionConfig::default().validate().is_ok());
+}
+
+#[test]
+fn local_candidate_configuration_is_bounded_and_structural() {
+    let address = SocketAddr::from(([192, 0, 2, 1], 5000));
+    assert!(ConnectionConfig::default().local_candidates.is_empty());
+    let one = ConnectionConfig {
+        local_candidates: vec![LocalCandidate::Udp(address)],
+        ..ConnectionConfig::default()
+    };
+    assert!(one.validate().is_ok());
+
+    let sixteen = ConnectionConfig {
+        local_candidates: (0..16)
+            .map(|index| LocalCandidate::Udp(SocketAddr::from(([192, 0, 2, 1], 5000 + index))))
+            .collect(),
+        ..ConnectionConfig::default()
+    };
+    assert_eq!(
+        sixteen
+            .validate()
+            .map(|config| config.local_candidates.len()),
+        Ok(16)
+    );
+
+    let seventeen = ConnectionConfig {
+        local_candidates: (0..17)
+            .map(|index| LocalCandidate::Udp(SocketAddr::from(([192, 0, 2, 1], 5000 + index))))
+            .collect(),
+        ..ConnectionConfig::default()
+    };
+    assert_eq!(
+        seventeen.validate().err(),
+        Some(AcceptError::SessionLimitExceeded)
+    );
+
+    for candidate in [
+        LocalCandidate::Udp(SocketAddr::from(([0, 0, 0, 0], 5000))),
+        LocalCandidate::Udp(SocketAddr::from(([224, 0, 0, 1], 5000))),
+        LocalCandidate::Udp(SocketAddr::from(([255, 255, 255, 255], 5000))),
+        LocalCandidate::Udp(SocketAddr::from(([192, 0, 2, 1], 0))),
+        LocalCandidate::Udp(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 5000))),
+        LocalCandidate::Udp(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))),
+        LocalCandidate::TcpPassive(SocketAddr::from((
+            "ff02::1".parse::<Ipv6Addr>().unwrap(),
+            5000,
+        ))),
+        LocalCandidate::TcpPassive(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            5000,
+            1,
+            0,
+        ))),
+        LocalCandidate::TcpPassive(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            5000,
+            0,
+            1,
+        ))),
+    ] {
+        let invalid = ConnectionConfig {
+            local_candidates: vec![candidate],
+            ..ConnectionConfig::default()
+        };
+        assert_eq!(
+            invalid.validate().err(),
+            Some(AcceptError::InvalidConfiguration)
+        );
+    }
+
+    for candidate in [
+        LocalCandidate::Udp(SocketAddr::from(([10, 0, 0, 1], 5000))),
+        LocalCandidate::Udp(SocketAddr::from(([127, 0, 0, 1], 5000))),
+        LocalCandidate::TcpPassive(SocketAddr::from(([169, 254, 1, 1], 5000))),
+        LocalCandidate::TcpPassive(SocketAddr::from((Ipv6Addr::LOCALHOST, 5000))),
+    ] {
+        let valid = ConnectionConfig {
+            local_candidates: vec![candidate],
+            ..ConnectionConfig::default()
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    let duplicate = ConnectionConfig {
+        local_candidates: vec![LocalCandidate::Udp(address), LocalCandidate::Udp(address)],
+        ..ConnectionConfig::default()
+    };
+    assert_eq!(
+        duplicate.validate().err(),
+        Some(AcceptError::InvalidConfiguration)
+    );
+
+    let distinct_transports = ConnectionConfig {
+        local_candidates: vec![
+            LocalCandidate::Udp(address),
+            LocalCandidate::TcpPassive(address),
+        ],
+        ..ConnectionConfig::default()
+    };
+    assert!(distinct_transports.validate().is_ok());
 }
 
 #[test]

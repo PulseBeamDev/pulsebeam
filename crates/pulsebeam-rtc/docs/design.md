@@ -354,10 +354,16 @@ pacer factors, feedback filters, or controller selection.
 ```rust
 pub struct ConnectionConfig {
     pub capabilities: SessionCapabilities,
+    pub local_candidates: Vec<LocalCandidate>,
     pub limits: ConnectionLimits,
     pub default_audio_policy: SenderPolicy,
     pub default_video_policy: SenderPolicy,
     pub unknown_extension_policy: UnknownExtensionPolicy,
+}
+
+pub enum LocalCandidate {
+    Udp(SocketAddr),
+    TcpPassive(SocketAddr),
 }
 
 pub struct ConnectionLimits {
@@ -381,7 +387,17 @@ Version-one defaults and hard maxima are:
 | Queued outbound media payload | 8 MiB | 64 MiB |
 | Retained retransmission payload | 16 MiB | 128 MiB |
 
-A configured value above a hard maximum is rejected at construction. Internal
+A configured value above a hard maximum is rejected at construction. Candidate
+configuration is caller-owned because the caller also owns the corresponding UDP
+sockets and passive TCP listeners. Structural validation permits the default
+empty list, accepts at most 16 component-1 host candidates, and rejects duplicate
+transport/address pairs, zero ports, wildcard or non-unicast addresses, and IPv6
+addresses with flow information or a scope ID. UDP and passive TCP candidates at
+the same address are distinct. `Connection::accept` requires at least one
+candidate and advertises the complete validated list without interface discovery,
+STUN, TURN, or truncation.
+
+Internal
 packet counts, feedback histories, timers, and queue horizons have additional
 fixed bounds in the congestion-control contract and are not public knobs.
 
@@ -527,8 +543,15 @@ Private controller names and mutable internal objects are not returned.
 ## Session and interoperability contract
 
 - The session is one immutable ICE-lite remote-offer/local-answer exchange.
+- The caller supplies every advertised local host candidate and retains ownership
+  of its matching socket or listener. Negotiation converts that ordered set once
+  and retains it with the immutable ICE credentials for answer construction and
+  later transport initialization.
 - BUNDLE, RTCP mux, inline candidates, all SDP media directions, UDP, and passive
   ICE-TCP over IPv4 and IPv6 are supported.
+- Local server-reflexive and relay gathering, active or simultaneous-open TCP,
+  interface discovery, STUN discovery, and a TURN client are outside the local
+  candidate profile. Remote relay candidates remain supported.
 - Trickle ICE, ICE restart, media renegotiation, and a TURN client are outside this
   boundary. A changed session creates a new connection. Client relay candidates
   remain usable.

@@ -1,13 +1,19 @@
-use std::time::Instant;
+use std::{net::SocketAddr, time::Instant};
 
 use pulsebeam_rtc::{
-    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, GlobalMediaTime,
+    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, GlobalMediaTime, LocalCandidate,
     PacketFeedbackKind, SdpOffer, TimePoint,
 };
 
 fn accepts(offer: &'static str) -> Result<(), AcceptError> {
     let accepted = Connection::accept(
-        ConnectionConfig::default(),
+        ConnectionConfig {
+            local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
+                [192, 0, 2, 1],
+                5000,
+            )))],
+            ..ConnectionConfig::default()
+        },
         SdpOffer::new(offer),
         TimePoint {
             monotonic: Instant::now(),
@@ -20,6 +26,12 @@ fn accepts(offer: &'static str) -> Result<(), AcceptError> {
         Some(PacketFeedbackKind::TransportWide)
     );
     assert!(accepted.answer.as_str().contains("a=ice-lite"));
+    assert!(
+        accepted
+            .answer
+            .as_str()
+            .contains(" 192.0.2.1 5000 typ host")
+    );
     Ok(())
 }
 

@@ -3,12 +3,13 @@
     reason = "the v3 public value contract uses immutable Arc-backed strings, slices, and Bytes"
 )]
 
-use std::{fmt, num::NonZeroU16, sync::Arc, time::Duration};
+use std::{fmt, net::SocketAddr, num::NonZeroU16, sync::Arc, time::Duration};
 
 use crate::{AcceptError, DataChannelId, SenderId};
 
 const MAX_PLAYOUT_TICKS: u16 = 4095;
 const MILLIS_PER_PLAYOUT_TICK: u64 = 10;
+const MAX_LOCAL_CANDIDATES: usize = 16;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionCapabilities {
@@ -103,6 +104,48 @@ pub enum UnknownExtensionPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalCandidate {
+    Udp(SocketAddr),
+    TcpPassive(SocketAddr),
+}
+
+impl LocalCandidate {
+    pub(crate) const fn address(self) -> SocketAddr {
+        match self {
+            Self::Udp(address) | Self::TcpPassive(address) => address,
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        let address = self.address();
+        if address.port() == 0 {
+            return false;
+        }
+        match address {
+            SocketAddr::V4(address) => {
+                let ip = address.ip();
+                !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
+            }
+            SocketAddr::V6(address) => {
+                let ip = address.ip();
+                !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && address.flowinfo() == 0
+                    && address.scope_id() == 0
+            }
+        }
+    }
+
+    fn same_transport_and_address(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Udp(left), Self::Udp(right))
+                | (Self::TcpPassive(left), Self::TcpPassive(right)) if left == right
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionLimits {
     pub max_unsignaled_encodings: u16,
     pub max_data_channels: u16,
@@ -156,6 +199,7 @@ impl Default for ConnectionLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionConfig {
     pub capabilities: SessionCapabilities,
+    pub local_candidates: Vec<LocalCandidate>,
     pub limits: ConnectionLimits,
     pub default_audio_policy: SenderPolicy,
     pub default_video_policy: SenderPolicy,
@@ -163,11 +207,28 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    pub const fn validate(self) -> Result<Self, AcceptError> {
-        match self.limits.validate() {
-            Ok(_) => Ok(self),
-            Err(error) => Err(error),
+    pub fn validate(self) -> Result<Self, AcceptError> {
+        self.limits.validate()?;
+        if self.local_candidates.len() > MAX_LOCAL_CANDIDATES {
+            return Err(AcceptError::SessionLimitExceeded);
         }
+        for candidate in self.local_candidates.iter().copied() {
+            if !candidate.is_valid() {
+                return Err(AcceptError::InvalidConfiguration);
+            }
+        }
+        for (index, candidate) in self.local_candidates.iter().copied().enumerate() {
+            if self
+                .local_candidates
+                .iter()
+                .copied()
+                .skip(index.saturating_add(1))
+                .any(|other| candidate.same_transport_and_address(other))
+            {
+                return Err(AcceptError::InvalidConfiguration);
+            }
+        }
+        Ok(self)
     }
 }
 
@@ -175,6 +236,7 @@ impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             capabilities: SessionCapabilities::default(),
+            local_candidates: Vec::new(),
             limits: ConnectionLimits::default(),
             default_audio_policy: SenderPolicy {
                 playout_delay: PlayoutDelay::ZERO,
