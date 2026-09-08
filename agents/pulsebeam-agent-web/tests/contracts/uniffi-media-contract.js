@@ -30,16 +30,16 @@
   const releaseCanvas = document.createElement("canvas");
   const releaseTrack = releaseCanvas.captureStream(5).getVideoTracks()[0];
   const releaseHandle = registry.lowerMediaStreamTrack(releaseTrack);
-  const retainedBeforeTrackRelease = registry.size().toString();
+  const retainedBeforeTrackRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
   registry.invalidateMediaForTest(releaseTrack);
-  const retainedAfterTrackRelease = registry.size().toString();
+  const retainedAfterTrackRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
 
   const stream = new MediaStream();
   const streamHandle = registry.lowerMediaStream(stream);
   const streamIdentity = registry.liftMediaStream(streamHandle) === stream;
-  const retainedBeforeStreamRelease = registry.size().toString();
+  const retainedBeforeStreamRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
   registry.invalidateMediaForTest(stream);
-  const retainedAfterStreamRelease = registry.size().toString();
+  const retainedAfterStreamRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
 
   registry.exhaustMediaHandlesForTest();
   const exhaustedCanvas = document.createElement("canvas");

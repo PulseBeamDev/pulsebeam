@@ -2,6 +2,8 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -18,101 +20,23 @@ type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const PUBLIC_AGENT_CONTRACT: &str = include_str!("contracts/public-agent-contract.js");
 const UNIFFI_MEDIA_CONTRACT: &str = include_str!("contracts/uniffi-media-contract.js");
-const SERVER_SLICE: &str = include_str!("contracts/server-slice-contract.js");
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContractResult {
-    invalid_code: String,
-    command_code: String,
-    immutable_code: String,
-    initial_identity: bool,
-    order: Vec<String>,
-    revisions: Vec<String>,
-    topic_identity: bool,
-    topic_iterator_closed: bool,
-    registered_topics: usize,
-    topics_after_close: usize,
-    local: LocalResult,
-    audio: AudioResult,
-    sender: SenderResult,
-    replacement: ReplacementResult,
-    closed: ClosedResult,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LocalResult {
-    same_track: bool,
-    policy: String,
-    content_hint: String,
-    muted: bool,
-    enabled_when_muted: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AudioResult {
-    same_track: bool,
-    policy: String,
-    content_hint: String,
-    max_bitrate: u32,
-    dtx: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SenderResult {
-    track_id: String,
-    encodings: Vec<EncodingResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EncodingResult {
-    rid: Option<String>,
-    active: bool,
-    #[serde(rename = "scalabilityMode")]
-    scalability_mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReplacementResult {
-    initial_track_id: String,
-    track_id: String,
-    expected_track_id: String,
-    snapshot_has_replacement: bool,
-    active: usize,
-    removed_tracks: usize,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ClosedResult {
-    connection: String,
-    local_tracks: usize,
-    remote_video: usize,
-    notifications_at_close: usize,
-    notifications_after_close: usize,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-struct TopicMessage {
-    mode: String,
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerResult {
-    messages: Vec<TopicMessage>,
-    resynchronizations: usize,
-    participant_id: String,
-    replacement_participant_id: String,
-    stable_stream: bool,
-    sender_count: usize,
-    first_connection: String,
-    second_connection: String,
+    exports: Vec<String>,
+    independent: bool,
+    initial_stable: bool,
+    initial_frozen: bool,
+    initial: String,
+    connecting: String,
+    connecting_stable: bool,
+    null_cancelled: bool,
+    defensive_copies: bool,
+    close_before_settlement: bool,
+    failed: String,
+    calls: Vec<String>,
+    closed: String,
+    post_close: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,22 +56,34 @@ struct UniFfiMediaResult {
 struct StaticServer {
     address: String,
     task: JoinHandle<()>,
+    wasm_requests: Arc<AtomicUsize>,
 }
 
 impl StaticServer {
     async fn start() -> io::Result<Self> {
+        Self::start_with_wasm_failure(false).await
+    }
+
+    async fn start_with_wasm_failure(fail_wasm: bool) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?.to_string();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let wasm_requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&wasm_requests);
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let root = root.clone();
+                let request_count = Arc::clone(&request_count);
                 tokio::spawn(async move {
-                    let _ = serve(stream, &root).await;
+                    let _ = serve(stream, &root, fail_wasm, &request_count).await;
                 });
             }
         });
-        Ok(Self { address, task })
+        Ok(Self {
+            address,
+            task,
+            wasm_requests,
+        })
     }
 
     fn fixture_url(&self) -> String {
@@ -156,6 +92,10 @@ impl StaticServer {
 
     fn uniffi_fixture_url(&self) -> String {
         format!("http://{}/tests/uniffi-fixture.html", self.address)
+    }
+
+    fn wasm_requests(&self) -> usize {
+        self.wasm_requests.load(Ordering::Relaxed)
     }
 }
 
@@ -186,39 +126,66 @@ async fn public_agent_contract_runs_through_bidi() -> TestResult<()> {
             evaluate_json(&bidi, &context, PUBLIC_AGENT_CONTRACT).await?;
         assert_contract(contract);
 
-        if env::var_os("PULSEBEAM_BROWSER_SERVER").is_some() {
-            load_fixture(&bidi, &context, &fixture_url).await?;
-            let slice: ServerResult = evaluate_json(&bidi, &context, SERVER_SLICE).await?;
-            assert_eq!(
-                slice.messages,
-                [
-                    TopicMessage {
-                        mode: "latest".into(),
-                        text: "latest".into()
-                    },
-                    TopicMessage {
-                        mode: "ordered".into(),
-                        text: "ordered".into()
-                    },
-                    TopicMessage {
-                        mode: "ordered".into(),
-                        text: "recovered".into()
-                    },
-                ]
-            );
-            assert_eq!(slice.resynchronizations, 1);
-            assert_eq!(slice.replacement_participant_id, slice.participant_id);
-            assert!(slice.stable_stream);
-            assert_eq!(slice.sender_count, 2);
-            assert_eq!(slice.first_connection, "closed");
-            assert_eq!(slice.second_connection, "closed");
-        }
-
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })
     .await;
 
-    result.map_err(|error| format!("browser test failed: {error}").into())
+    result.map_err(|error| -> Box<dyn Error + Send + Sync> {
+        format!("browser test failed: {error}").into()
+    })?;
+    assert_eq!(server.wasm_requests(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initialization_failure_is_private_and_deterministic() -> TestResult<()> {
+    let server = StaticServer::start_with_wasm_failure(true).await?;
+    let fixture_url = server.fixture_url();
+    let mut capabilities = DesiredCapabilities::chrome();
+    capabilities.set_headless()?;
+    capabilities.set_no_sandbox()?;
+    capabilities.set_disable_gpu()?;
+    capabilities.enable_bidi()?;
+    if let Some(binary) = env::var_os("PULSEBEAM_BROWSER_BINARY") {
+        capabilities.set_binary(&binary.to_string_lossy())?;
+    }
+
+    let result = run_browser_test(WebDriver::managed(capabilities), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        load_fixture(&bidi, &context, &fixture_url).await?;
+        let connection: String = evaluate_json(
+            &bidi,
+            &context,
+            r#"new Promise((resolve, reject) => {
+                const agent = window.pulsebeam.createAgent();
+                const timeout = setTimeout(() => reject(new Error("initialization did not fail")), 5000);
+                agent.subscribe(() => {
+                    if (agent.getSnapshot().connection !== "failed") return;
+                    clearTimeout(timeout);
+                    resolve("failed");
+                });
+                agent.setState({ connection: { roomId: "room", token: "token" } });
+            })"#,
+        )
+        .await?;
+        assert_eq!(connection, "failed");
+        let unhandled_rejections: usize = evaluate_json(
+            &bidi,
+            &context,
+            r#"new Promise((resolve) => setTimeout(() => resolve(globalThis.__pulsebeamUnhandledRejections.length), 20))"#,
+        )
+        .await?;
+        assert_eq!(unhandled_rejections, 0);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await;
+
+    result.map_err(|error| -> Box<dyn Error + Send + Sync> {
+        format!("browser failure test failed: {error}").into()
+    })?;
+    assert_eq!(server.wasm_requests(), 1);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -259,79 +226,25 @@ async fn generated_media_types_run_through_bidi() -> TestResult<()> {
 }
 
 fn assert_contract(contract: ContractResult) {
-    assert_eq!(contract.invalid_code, "invalid-config");
-    assert_eq!(contract.command_code, "invalid-command");
-    assert_eq!(contract.immutable_code, "invalid-command");
-    assert!(contract.initial_identity);
-    assert_eq!(contract.order, ["first", "second", "second", "second"]);
-    assert!(contract.revisions.windows(2).all(|pair| {
-        let left = pair
-            .first()
-            .and_then(|revision| revision.parse::<u64>().ok());
-        let right = pair
-            .get(1)
-            .and_then(|revision| revision.parse::<u64>().ok());
-        left.zip(right).is_some_and(|(left, right)| left < right)
-    }));
-    assert!(contract.topic_identity);
-    assert!(contract.topic_iterator_closed);
-    assert_eq!(contract.registered_topics, 1);
-    assert_eq!(contract.topics_after_close, 0);
-    assert!(contract.local.same_track);
-    assert_eq!(contract.local.policy, "detail");
-    assert_eq!(contract.local.content_hint, "detail");
-    assert!(contract.local.muted);
-    assert!(!contract.local.enabled_when_muted);
-    assert!(contract.audio.same_track);
-    assert_eq!(contract.audio.policy, "music");
-    assert_eq!(contract.audio.content_hint, "music");
-    assert_eq!(contract.audio.max_bitrate, 128_000);
-    assert!(
-        contract
-            .audio
-            .dtx
-            .as_deref()
-            .is_none_or(|dtx| dtx == "disabled")
-    );
-    assert!(!contract.sender.track_id.is_empty());
-    assert_eq!(contract.sender.encodings.len(), 3);
-    let active = contract
-        .sender
-        .encodings
-        .iter()
-        .filter(|encoding| encoding.active)
-        .count();
-    assert_eq!(active, 1);
+    assert_eq!(contract.exports, ["createAgent"]);
+    assert!(contract.independent);
+    assert!(contract.initial_stable);
+    assert!(contract.initial_frozen);
+    assert_eq!(contract.initial, "disconnected");
+    assert_eq!(contract.connecting, "connecting");
+    assert!(contract.connecting_stable);
+    assert!(contract.null_cancelled);
+    assert!(contract.defensive_copies);
+    assert!(contract.close_before_settlement);
+    assert_eq!(contract.failed, "failed");
     assert_eq!(
-        contract
-            .sender
-            .encodings
-            .iter()
-            .filter_map(|encoding| encoding.rid.as_deref())
-            .collect::<Vec<_>>(),
-        ["q", "h", "f"]
+        contract.calls,
+        [
+            "first", "second", "second", "late", "second", "late", "second", "late", "late"
+        ]
     );
-    assert!(contract.sender.encodings.iter().all(|encoding| {
-        matches!(
-            encoding.scalability_mode.as_deref(),
-            Some("L1T2") | Some("L1T3")
-        )
-    }));
-    assert_ne!(
-        contract.replacement.track_id,
-        contract.replacement.initial_track_id
-    );
-    assert!(!contract.replacement.expected_track_id.is_empty());
-    assert!(contract.replacement.snapshot_has_replacement);
-    assert_eq!(contract.replacement.active, 3);
-    assert_eq!(contract.replacement.removed_tracks, 0);
-    assert_eq!(contract.closed.connection, "closed");
-    assert_eq!(contract.closed.local_tracks, 0);
-    assert_eq!(contract.closed.remote_video, 0);
-    assert_eq!(
-        contract.closed.notifications_at_close,
-        contract.closed.notifications_after_close
-    );
+    assert_eq!(contract.closed, "disconnected");
+    assert!(contract.post_close);
 }
 
 async fn load_fixture(
@@ -342,6 +255,12 @@ async fn load_fixture(
     bidi.browsing_context()
         .navigate(context.clone(), fixture_url, Some(ReadinessState::Complete))
         .await?;
+    evaluate_json::<()>(
+        bidi,
+        context,
+        r#"(globalThis.__pulsebeamUnhandledRejections = [], addEventListener("unhandledrejection", (event) => globalThis.__pulsebeamUnhandledRejections.push(event.reason)), null)"#,
+    )
+    .await?;
     evaluate_json::<()>(
         bidi,
         context,
@@ -372,7 +291,12 @@ async fn evaluate_json<T: DeserializeOwned>(
     Ok(serde_json::from_str(json)?)
 }
 
-async fn serve(mut stream: TcpStream, root: &Path) -> io::Result<()> {
+async fn serve(
+    mut stream: TcpStream,
+    root: &Path,
+    fail_wasm: bool,
+    wasm_requests: &AtomicUsize,
+) -> io::Result<()> {
     let mut request = [0_u8; 16 * 1024];
     let length = stream.read(&mut request).await?;
     debug_assert!(length <= request.len());
@@ -383,6 +307,20 @@ async fn serve(mut stream: TcpStream, root: &Path) -> io::Result<()> {
     let mut parts = head.lines().next().unwrap_or_default().split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
+
+    if target.ends_with(".wasm") {
+        wasm_requests.fetch_add(1, Ordering::Relaxed);
+        if fail_wasm {
+            return respond(
+                &mut stream,
+                503,
+                "text/plain",
+                b"test wasm unavailable",
+                method,
+            )
+            .await;
+        }
+    }
 
     if method != "GET" && method != "HEAD" {
         if target.contains("/rooms/sender-stats/") {

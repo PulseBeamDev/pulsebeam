@@ -1,12 +1,12 @@
 {
-  "name": "@pulsebeam/agent-web",
+  "name": "@pulsebeam/web",
   "version": "0.1.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PulseBeamDev/pulsebeam.git"
   },
   "type": "module",
-  "files": ["dist"],
+  "files": ["dist/**/*.js", "dist/**/*.d.ts", "dist/**/*.wasm"],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -15,10 +15,11 @@
   },
   "scripts": {
     "build:uniffi": "ubrn build web --config ubrn.config.yaml",
-    "build:wasm": "wasm-pack build --target web --out-dir dist/wasm --out-name pulsebeam_agent_web",
+    "build:wasm": "wasm-pack build --target web --out-dir dist/wasm --out-name pulsebeam_agent_web && touch dist/wasm/.npmignore",
     "build:ts": "tsc -p tsconfig.json",
     "build": "pnpm run build:wasm && pnpm run build:ts",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "just test"
   },
   "dependencies": {
     "@ubjs/core": "0.31.0-5"
