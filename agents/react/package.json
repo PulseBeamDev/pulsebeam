@@ -14,7 +14,7 @@
     }
   },
   "scripts": {
-    "build:web": "pnpm --dir ../pulsebeam-agent-web run build:ts",
+    "build:web": "pnpm --dir ../pulsebeam-agent-web run build",
     "build": "pnpm run build:web && tsc -p tsconfig.json",
     "check": "pnpm run build:web && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json",
     "test": "pnpm run build && node --test tests/contracts/public-react-contract.test.js"

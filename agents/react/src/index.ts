@@ -9,6 +9,41 @@ import {
 import type * as React from "react";
 import type { Agent, AgentSnapshot, AgentState } from "@pulsebeam/web";
 
+export { createAgent } from "@pulsebeam/web";
+export type {
+  Agent,
+  AgentConfig,
+  AgentEvent,
+  AgentFailure,
+  AgentSnapshot,
+  AgentState,
+  AudioBinding,
+  AudioDemand,
+  AudioSenderConfig,
+  ConnectionState,
+  FailureClass,
+  FixedPlayoutDelay,
+  MediaKind,
+  MediaTopology,
+  Participant,
+  Publication,
+  PublicationIntent,
+  RemoteAudioTrack,
+  RemoteTrack,
+  RemoteVideoTrack,
+  SenderConfig,
+  SenderEncoding,
+  TopicDropReason,
+  TopicMode,
+  TopicPublisherStatus,
+  TopicRegistration,
+  TopicSnapshot,
+  TopicSubscriberStatus,
+  VideoBinding,
+  VideoDemand,
+  VideoSenderConfig,
+} from "@pulsebeam/web";
+
 const AgentContext = createContext<Agent | null>(null);
 
 export interface AgentProviderProps {
@@ -23,11 +58,13 @@ export function AgentProvider({
   return createElement(AgentContext.Provider, { value: agent }, children);
 }
 
-export interface UseAgentResult {
-  readonly connection: AgentSnapshot["connection"];
-  readonly participantId: AgentSnapshot["participantId"];
-  readonly tracks: AgentSnapshot["tracks"];
-  setState(state: AgentState): void;
+export interface UseAgentResult extends AgentSnapshot {
+  readonly setState: Agent["setState"];
+  readonly replaceLocalTrack: Agent["replaceLocalTrack"];
+  readonly setLocalMuted: Agent["setLocalMuted"];
+  readonly reconnect: Agent["reconnect"];
+  readonly sendTopic: Agent["sendTopic"];
+  readonly subscribeEvents: Agent["subscribeEvents"];
 }
 
 export function useAgent(): UseAgentResult {
@@ -45,14 +82,42 @@ export function useAgent(): UseAgentResult {
     (state: AgentState): void => agent.setState(state),
     [agent],
   );
+  const replaceLocalTrack = useCallback<Agent["replaceLocalTrack"]>(
+    (slot, track, config) => agent.replaceLocalTrack(slot, track, config),
+    [agent],
+  );
+  const setLocalMuted = useCallback<Agent["setLocalMuted"]>(
+    (slot, muted) => agent.setLocalMuted(slot, muted),
+    [agent],
+  );
+  const reconnect = useCallback((): void => agent.reconnect(), [agent]);
+  const sendTopic = useCallback<Agent["sendTopic"]>(
+    (name, mode, payload) => agent.sendTopic(name, mode, payload),
+    [agent],
+  );
+  const subscribeEvents = useCallback<Agent["subscribeEvents"]>(
+    (listener) => agent.subscribeEvents(listener),
+    [agent],
+  );
 
   return useMemo(
     () => ({
-      connection: snapshot.connection,
-      participantId: snapshot.participantId,
-      tracks: snapshot.tracks,
+      ...snapshot,
       setState,
+      replaceLocalTrack,
+      setLocalMuted,
+      reconnect,
+      sendTopic,
+      subscribeEvents,
     }),
-    [snapshot, setState],
+    [
+      snapshot,
+      setState,
+      replaceLocalTrack,
+      setLocalMuted,
+      reconnect,
+      sendTopic,
+      subscribeEvents,
+    ],
   );
 }
