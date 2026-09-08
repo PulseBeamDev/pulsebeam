@@ -60,6 +60,48 @@
 
   const events = [];
   const removeEvents = first.subscribeEvents((event) => events.push(event));
+  first.setState({
+    connected: false,
+    video: [
+      {
+        slot: -1,
+        trackId: "invalid-slot",
+        height: 720,
+        minHeight: 180,
+        minFps: 15,
+        priority: 100,
+      },
+    ],
+  });
+  const serializationFailureNonterminal =
+    first.getSnapshot().connection !== "terminal-failure" &&
+    first.getSnapshot().failure === null;
+  first.setState({
+    connected: false,
+    video: [
+      {
+        slot: 0,
+        trackId: "duplicate-a",
+        height: 720,
+        minHeight: 180,
+        minFps: 15,
+        priority: 100,
+      },
+      {
+        slot: 0,
+        trackId: "duplicate-b",
+        height: 720,
+        minHeight: 180,
+        minFps: 15,
+        priority: 100,
+      },
+    ],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  first.setState({
+    connected: false,
+    topics: [{ name: "presence", mode: "latest", publish: true }],
+  });
   const validationRejected = await first.setLocalMuted("camera", true).then(
     () => false,
     () => true,
@@ -98,12 +140,19 @@
     closeBeforeSettlement: second.getSnapshot().connection === "disconnected",
     localOperations: muted && unmuted,
     validationRejected,
+    serializationFailureNonterminal,
     failureEvent: events.some(
       (event) => event.type === "failure" && event.class === "validation",
+    ),
+    coreValidationEvent: events.some(
+      (event) =>
+        event.type === "failure" &&
+        event.class === "validation" &&
+        event.message.startsWith("core rejected input:"),
     ),
     callerOwnsTrack: track.readyState === "live",
     noRemovedListenerCalls: calls === 0,
     closed: closed.connection,
     postClose: first.getSnapshot() === closed,
   };
-})()
+})();

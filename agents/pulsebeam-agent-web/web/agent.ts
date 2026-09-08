@@ -182,7 +182,7 @@ class AgentFacade implements Agent {
           this.#runtimeEvent(event),
         );
         runtime.set_error_listener((error: unknown) =>
-          this.#emitFailure("runtime", message(error)),
+          this.#emitFailure(localFailureClass(error), message(error)),
         );
         try {
           runtime.replace_desired(desiredValue(this.#state));
@@ -242,7 +242,7 @@ class AgentFacade implements Agent {
       try {
         this.#runtime.replace_desired(desiredValue(this.#state));
       } catch (error) {
-        this.#terminalFailure("invalid-configuration", message(error));
+        this.#emitFailure(localFailureClass(error), message(error));
       }
     }
   }

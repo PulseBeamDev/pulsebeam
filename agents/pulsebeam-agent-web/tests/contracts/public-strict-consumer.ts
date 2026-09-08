@@ -1,8 +1,10 @@
 import {
   createAgent,
   type AgentEvent,
+  type AgentFailure,
   type AgentSnapshot,
   type AgentState,
+  type FailureClass,
 } from "../../web/index.js";
 
 declare const audioTrack: MediaStreamTrack;
@@ -42,6 +44,13 @@ const desired: AgentState = {
 agent.setState(desired);
 
 const snapshot: AgentSnapshot = agent.getSnapshot();
+if (snapshot.failure) {
+  const failure: AgentFailure = snapshot.failure;
+  const failureClass: FailureClass = failure.class;
+  const failureMessage: string = failure.message;
+  void failureClass;
+  void failureMessage;
+}
 const media: MediaStreamTrack | undefined =
   snapshot.tracks["publication-audio"]?.media;
 const removeSnapshot = agent.subscribe(() => agent.getSnapshot());
@@ -49,6 +58,12 @@ const removeEvents = agent.subscribeEvents((event: AgentEvent) => {
   if (event.type === "topic-message") {
     const payload: Uint8Array = event.payload;
     void payload;
+  }
+  if (event.type === "failure") {
+    const failureClass: FailureClass = event.class;
+    const failureMessage: string = event.message;
+    void failureClass;
+    void failureMessage;
   }
 });
 const replacement: Promise<void> = agent.replaceLocalTrack(

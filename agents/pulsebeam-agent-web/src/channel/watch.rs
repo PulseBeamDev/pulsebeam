@@ -176,9 +176,9 @@ impl<'a, T: Clone> Future for Changed<'a, T> {
 
             if this.registered {
                 let mut found = false;
-                for (id, waker) in shared.waiters.iter_mut() {
+                for (id, waker) in &mut shared.waiters {
                     if *id == this.waiter_id {
-                        *waker = cx.waker().clone();
+                        waker.clone_from(cx.waker());
                         found = true;
                         break;
                     }

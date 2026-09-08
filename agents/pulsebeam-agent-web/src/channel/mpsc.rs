@@ -164,10 +164,10 @@ impl<T> Receiver<T> {
             let mut shared = self.shared.lock();
             shared_invariants(&shared);
             let value = shared.queue.pop_front();
-            if value.is_some() {
-                if let Some((_, waker)) = shared.waiting_senders.pop_front() {
-                    wake_sender = Some(waker);
-                }
+            if value.is_some()
+                && let Some((_, waker)) = shared.waiting_senders.pop_front()
+            {
+                wake_sender = Some(waker);
             }
             shared_invariants(&shared);
             value
@@ -216,9 +216,8 @@ impl<T> Future for Send<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        let value = match this.value.take() {
-            Some(value) => value,
-            None => return Poll::Pending,
+        let Some(value) = this.value.take() else {
+            return Poll::Pending;
         };
         let receiver_waker = {
             let mut shared = this.shared.lock();
@@ -232,7 +231,7 @@ impl<T> Future for Send<T> {
                 let mut index = 0;
                 while index < shared.waiting_senders.len() {
                     if shared.waiting_senders[index].0 == this.token {
-                        shared.waiting_senders[index].1 = cx.waker().clone();
+                        shared.waiting_senders[index].1.clone_from(cx.waker());
                         this.value = Some(value);
                         this.awaiting = true;
                         return Poll::Pending;

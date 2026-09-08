@@ -35,7 +35,9 @@ struct ContractResult {
     close_before_settlement: bool,
     local_operations: bool,
     validation_rejected: bool,
+    serialization_failure_nonterminal: bool,
     failure_event: bool,
+    core_validation_event: bool,
     caller_owns_track: bool,
     no_removed_listener_calls: bool,
     closed: String,
@@ -329,7 +331,9 @@ fn assert_contract(contract: ContractResult) {
     assert!(contract.close_before_settlement);
     assert!(contract.local_operations);
     assert!(contract.validation_rejected);
+    assert!(contract.serialization_failure_nonterminal);
     assert!(contract.failure_event);
+    assert!(contract.core_validation_event);
     assert!(contract.caller_owns_track);
     assert!(contract.no_removed_listener_calls);
     assert_eq!(contract.closed, "disconnected");

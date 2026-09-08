@@ -48,8 +48,7 @@ fn generated_package_has_strict_portable_boundaries() {
     let consumer = root.join("target/uniffi-strict-consumer.ts");
     fs::create_dir_all(consumer.parent().expect("consumer has parent"))
         .expect("create consumer directory");
-    fs::write(&consumer, STRICT_CONSUMER)
-    .expect("write strict consumer");
+    fs::write(&consumer, STRICT_CONSUMER).expect("write strict consumer");
 
     let status = Command::new("pnpm")
         .args([

@@ -445,8 +445,9 @@ impl BrowserRuntime {
 
     pub fn replace_desired(&self, desired: JsValue) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
-        let desired: DesiredConfig = serde_wasm_bindgen::from_value(desired)
-            .map_err(|error| js_error(format!("invalid desired state: {error}")))?;
+        let desired: DesiredConfig = serde_wasm_bindgen::from_value(desired).map_err(|error| {
+            LocalOperationError::validation(format!("invalid desired state: {error}")).into_js()
+        })?;
         self.inner
             .replace_desired(desired.into_core())
             .map_err(js_error)?;
@@ -787,7 +788,9 @@ impl RuntimeInner {
 
     fn publish_turn(&self, turn: &Turn) {
         if let Some(error) = &turn.error {
-            self.report_error(format!("core rejected input: {error}"));
+            self.report_classified_error(LocalOperationError::validation(format!(
+                "core rejected input: {error}"
+            )));
         }
         let snapshot_listener = self.snapshot_listener.borrow().clone();
         if let Some(snapshot) = &turn.snapshot
@@ -1351,6 +1354,15 @@ impl RuntimeInner {
         let listener = self.error_listener.borrow().clone();
         if let Some(listener) = listener {
             call_listener(&listener, &JsValue::from_str(&message), "error");
+        }
+    }
+
+    fn report_classified_error(&self, error: LocalOperationError) {
+        log::warn!("{}", error.message);
+        *self.last_error.borrow_mut() = Some(error.message.clone());
+        let listener = self.error_listener.borrow().clone();
+        if let Some(listener) = listener {
+            call_listener(&listener, &error.into_js(), "error");
         }
     }
 
