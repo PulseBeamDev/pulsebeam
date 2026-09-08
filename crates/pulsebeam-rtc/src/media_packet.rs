@@ -52,7 +52,12 @@ impl MediaPacket {
         Self {
             bytes: Bytes::copy_from_slice(&self.bytes),
             global_media_at: self.global_media_at,
-            extensions: Arc::clone(&self.extensions),
+            extensions: self
+                .extensions
+                .iter()
+                .map(|(uri, range)| (Arc::from(uri.as_ref()), range.clone()))
+                .collect::<Vec<_>>()
+                .into(),
             _not_sync: PhantomData,
         }
     }
@@ -93,5 +98,34 @@ impl FrameDependencies {
     pub fn known(dependencies: impl Into<Arc<[FrameId]>>) -> Option<Self> {
         let dependencies = dependencies.into();
         (dependencies.len() <= Self::MAX_DIRECT_DEPENDENCIES).then_some(Self::Known(dependencies))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transit_deep_copies_packet_owned_state() {
+        let packet = MediaPacket::new(
+            Bytes::from_static(b"headerextensionpayload"),
+            GlobalMediaTime::from_micros(42),
+            vec![(Arc::from("urn:example:extension"), 6..15)].into(),
+        );
+
+        let transit = packet.to_transit();
+
+        assert_eq!(transit.bytes(), packet.bytes());
+        assert_eq!(transit.global_media_at(), packet.global_media_at());
+        assert_eq!(
+            transit.extension("urn:example:extension"),
+            packet.extension("urn:example:extension")
+        );
+        assert_ne!(transit.bytes().as_ptr(), packet.bytes().as_ptr());
+        assert!(!Arc::ptr_eq(&transit.extensions, &packet.extensions));
+        assert!(!Arc::ptr_eq(
+            &transit.extensions[0].0,
+            &packet.extensions[0].0
+        ));
     }
 }
