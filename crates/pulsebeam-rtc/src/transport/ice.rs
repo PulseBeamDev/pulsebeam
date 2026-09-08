@@ -14,6 +14,7 @@ pub enum IceEvent {
     StateChanged(IceConnectionState),
     Restart,
     Nominated {
+        proto: is::Protocol,
         source: SocketAddr,
         destination: SocketAddr,
     },
@@ -21,34 +22,39 @@ pub enum IceEvent {
 
 pub(crate) struct IceLayer {
     agent: IceAgent,
-    local: SocketAddr,
-    validated: Option<(SocketAddr, SocketAddr)>,
-    nominated: Option<(SocketAddr, SocketAddr)>,
+    locals: Box<[Candidate]>,
+    validated: Option<(is::Protocol, SocketAddr, SocketAddr)>,
+    nominated: Option<(is::Protocol, SocketAddr, SocketAddr)>,
 }
 
 impl IceLayer {
     pub(crate) fn new(
         local_credentials: IceCreds,
-        local_candidate: Candidate,
+        local_candidates: &[Candidate],
         remote_credentials: IceCreds,
         remote_candidates: &[Candidate],
         controlling: bool,
         max_candidate_pairs: usize,
         control_tie_breaker: u64,
     ) -> Self {
-        let local = local_candidate.addr();
+        debug_assert!(
+            !local_candidates.is_empty(),
+            "transport validates candidates"
+        );
         let mut agent = IceAgent::new(local_credentials);
         agent.set_controlling(controlling);
         agent.set_control_tie_breaker(control_tie_breaker);
         agent.set_max_candidate_pairs(max_candidate_pairs);
-        agent.add_local_candidate(local_candidate);
+        for candidate in local_candidates {
+            agent.add_local_candidate(candidate.clone());
+        }
         agent.set_remote_credentials(remote_credentials);
         for candidate in remote_candidates {
             agent.add_remote_candidate(candidate.clone());
         }
         Self {
             agent,
-            local,
+            locals: local_candidates.to_vec().into_boxed_slice(),
             validated: None,
             nominated: None,
         }
@@ -59,11 +65,12 @@ impl IceLayer {
         now: Instant,
         source: SocketAddr,
         destination: SocketAddr,
+        proto: is::Protocol,
         bytes: &[u8],
     ) -> Result<(), IceError> {
         let message = is::stun::StunMessage::parse(bytes).map_err(|_| IceError::InvalidPacket)?;
         let packet = is::stun::StunPacket {
-            proto: is::Protocol::Udp,
+            proto,
             source,
             destination,
             message,
@@ -71,7 +78,7 @@ impl IceLayer {
         if !self.agent.handle_packet(now, packet) {
             return Err(IceError::InvalidPacket);
         }
-        self.validated = Some((destination, source));
+        self.validated = Some((proto, destination, source));
         Ok(())
     }
 
@@ -94,12 +101,14 @@ impl IceLayer {
                     return Some(IceEvent::StateChanged(state));
                 }
                 IceAgentEvent::NominatedSend {
+                    proto,
                     source,
                     destination,
                     ..
                 } => {
-                    self.nominated = Some((source, destination));
+                    self.nominated = Some((proto, source, destination));
                     return Some(IceEvent::Nominated {
+                        proto,
                         source,
                         destination,
                     });
@@ -115,17 +124,37 @@ impl IceLayer {
         self.agent.poll_timeout()
     }
 
-    pub(crate) fn accepts_tuple(&self, source: SocketAddr, destination: SocketAddr) -> bool {
-        destination == self.local
+    pub(crate) fn accepts_tuple(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        proto: is::Protocol,
+    ) -> bool {
+        self.has_local_candidate(destination, proto)
             && self
                 .nominated
-                .is_some_and(|(local, remote)| local == destination && remote == source)
+                .is_some_and(|(selected_proto, local, remote)| {
+                    selected_proto == proto && local == destination && remote == source
+                })
     }
 
-    pub(crate) fn can_queue_tuple(&self, source: SocketAddr, destination: SocketAddr) -> bool {
-        destination == self.local
+    pub(crate) fn can_queue_tuple(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        proto: is::Protocol,
+    ) -> bool {
+        self.has_local_candidate(destination, proto)
             && self
                 .validated
-                .is_some_and(|(local, remote)| local == destination && remote == source)
+                .is_some_and(|(validated_proto, local, remote)| {
+                    validated_proto == proto && local == destination && remote == source
+                })
+    }
+
+    pub(crate) fn has_local_candidate(&self, address: SocketAddr, proto: is::Protocol) -> bool {
+        self.locals
+            .iter()
+            .any(|candidate| candidate.addr() == address && candidate.proto() == proto)
     }
 }

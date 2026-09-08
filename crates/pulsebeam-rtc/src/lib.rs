@@ -5,6 +5,7 @@ mod media_packet;
 mod negotiation;
 mod session;
 mod time;
+mod transport;
 
 pub use connection::{AcceptedConnection, Connection};
 pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId};
