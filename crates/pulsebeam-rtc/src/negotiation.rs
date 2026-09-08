@@ -46,14 +46,14 @@ pub(crate) struct NegotiationResult {
     reason = "immutable protocol facts are consumed by subsequent plans"
 )]
 pub(crate) struct NegotiatedSessionFacts {
-    local_ice: IceCredentials,
-    local_candidates: Box<[is::Candidate]>,
-    remote_ice: IceCredentials,
-    remote_candidates: Box<[String]>,
-    local_fingerprint: Fingerprint,
-    remote_fingerprint: Fingerprint,
-    local_dtls_role: DtlsRole,
-    dtls_identity: str0m::crypto::dtls::DtlsCert,
+    pub(crate) local_ice: IceCredentials,
+    pub(crate) local_candidates: Box<[is::Candidate]>,
+    pub(crate) remote_ice: IceCredentials,
+    pub(crate) remote_candidates: Box<[String]>,
+    pub(crate) local_fingerprint: Fingerprint,
+    pub(crate) remote_fingerprint: Fingerprint,
+    pub(crate) local_dtls_role: DtlsRole,
+    pub(crate) dtls_identity: str0m::crypto::dtls::DtlsCert,
     protocol_randomness: [u8; 32],
     media: Box<[NegotiatedMediaSection]>,
     feedback: PacketFeedbackKind,
@@ -61,18 +61,18 @@ pub(crate) struct NegotiatedSessionFacts {
     accepted_at: TimePoint,
 }
 
-struct IceCredentials {
-    ufrag: String,
-    password: String,
+pub(crate) struct IceCredentials {
+    pub(crate) ufrag: String,
+    pub(crate) password: String,
 }
 
-struct Fingerprint {
-    algorithm: &'static str,
-    value: Box<[u8]>,
+pub(crate) struct Fingerprint {
+    pub(crate) algorithm: &'static str,
+    pub(crate) value: Box<[u8]>,
 }
 
-#[derive(Clone, Copy)]
-enum DtlsRole {
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DtlsRole {
     Active,
     Passive,
 }

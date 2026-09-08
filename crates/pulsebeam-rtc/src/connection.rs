@@ -3,9 +3,11 @@ use std::{cell::Cell, marker::PhantomData};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AcceptError, ConnectionConfig, ConnectionEntropy, SdpAnswer, SdpOffer, SessionInfo, TimePoint,
+    AcceptError, ConnectionConfig, ConnectionEntropy, NetworkInput, ReceiveError, SdpAnswer,
+    SdpOffer, SessionInfo, TimePoint,
     negotiation::{self, NegotiatedSessionFacts},
     time::MonotonicObserver,
+    transport::Transport,
 };
 
 pub struct Connection {
@@ -21,9 +23,7 @@ pub struct Connection {
     reason = "protocol subsystems are initialized by subsequent plans"
 )]
 struct SubsystemSlots {
-    ice: Option<()>,
-    dtls: Option<()>,
-    srtp: Option<()>,
+    transport: Transport,
     sctp: Option<()>,
 }
 
@@ -34,6 +34,25 @@ pub struct AcceptedConnection {
 }
 
 impl Connection {
+    #[allow(
+        dead_code,
+        reason = "the public receive lifecycle is introduced after transport preparation"
+    )]
+    pub(crate) fn receive(
+        &mut self,
+        at: TimePoint,
+        input: NetworkInput,
+    ) -> Result<(), ReceiveError> {
+        let at = self._time.observe(at);
+        self._subsystems
+            .transport
+            .receive(at.monotonic, input)
+            .map_err(|error| match error {
+                crate::transport::TransportError::Closed => ReceiveError::Closed,
+                crate::transport::TransportError::QueueFull => ReceiveError::InputLimitExceeded,
+                _ => ReceiveError::InvalidNetworkEnvelope,
+            })
+    }
     pub fn accept(
         config: ConnectionConfig,
         offer: SdpOffer,
@@ -47,14 +66,14 @@ impl Connection {
         let mut entropy = EntropyConsumer::new(entropy);
         let negotiated = negotiation::negotiate(&config, &offer, at, &mut entropy)?;
         let session = negotiated.session.clone();
+        let transport = Transport::from_session(&negotiated.facts, at.monotonic)
+            .map_err(|_| AcceptError::CryptographicFailure)?;
         let connection = Self {
             _config: config,
             _session: negotiated.facts,
             _time: MonotonicObserver::starting_at(at),
             _subsystems: SubsystemSlots {
-                ice: None,
-                dtls: None,
-                srtp: None,
+                transport,
                 sctp: None,
             },
             _not_sync: PhantomData,

@@ -3,8 +3,6 @@ use str0m::crypto::dtls::{KeyingMaterial, SrtpProfile};
 use str0m::rtp::RtpHeader;
 use str0m::rtp_::{SrtpContext, extend_u16};
 
-use crate::packet::{PacketError, RtpPacket};
-
 const MAX_SSRC_STATES: usize = 512;
 const MAX_RTP_EXTENSION_BYTES: usize = 16 * 1024;
 const SRTCP_INDEX_MASK: u64 = 0x7fff_ffff;
@@ -193,9 +191,9 @@ impl SrtpLayer {
     }
 
     pub(crate) fn protect_rtp(&mut self, packet: &[u8]) -> Result<Vec<u8>, SrtpError> {
-        let parsed = RtpPacket::parse(packet).map_err(|_| SrtpError::InvalidPacket)?;
-        let index = self.next_tx_index(parsed.ssrc(), parsed.sequence())?;
-        let header = to_str0m_header(&parsed)?;
+        let parsed = RtpHeaderFacts::parse(packet)?;
+        let index = self.next_tx_index(parsed.ssrc, parsed.sequence)?;
+        let header = to_str0m_header_facts(&parsed);
         Ok(self.tx.protect_rtp(packet, &header, index))
     }
 
@@ -426,35 +424,8 @@ fn to_str0m_header_facts(packet: &RtpHeaderFacts) -> RtpHeader {
     }
 }
 
-fn to_str0m_header(packet: &RtpPacket<'_>) -> Result<RtpHeader, SrtpError> {
-    let mut csrc = [0_u32; 15];
-    for (slot, value) in csrc.iter_mut().zip(packet.csrcs()) {
-        *slot = value;
-    }
-    Ok(RtpHeader {
-        version: 2,
-        has_padding: packet.padding() != 0,
-        has_extension: packet.extension_profile().is_some(),
-        csrc_count: usize::from(packet.csrc_count()),
-        marker: packet.marker(),
-        payload_type: packet.payload_type().into(),
-        sequence_number: packet.sequence(),
-        timestamp: packet.timestamp(),
-        ssrc: packet.ssrc().into(),
-        csrc,
-        ext_vals: Default::default(),
-        header_len: packet.payload_range().start,
-    })
-}
-
 fn extend_sequence(previous: Option<u64>, sequence: u16) -> u64 {
     extend_u16(previous, sequence)
-}
-
-impl From<PacketError> for SrtpError {
-    fn from(_: PacketError) -> Self {
-        Self::InvalidPacket
-    }
 }
 
 #[cfg(test)]
