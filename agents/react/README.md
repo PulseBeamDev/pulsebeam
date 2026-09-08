@@ -16,7 +16,7 @@ builds the internal web runtime and WASM assets; applications do not need a web
 SDK dependency, runtime override, or private asset path.
 
 ```tsx
-import { AgentProvider, createAgent, useAgent } from "@pulsebeam/react";
+import { AgentProvider, createAgent, useAgent, type Agent } from "@pulsebeam/react";
 import { useEffect, useState } from "react";
 
 function Status() {
@@ -32,7 +32,7 @@ function Status() {
 }
 
 function App() {
-  const [agent, setAgent] = useState(null);
+  const [agent, setAgent] = useState<Agent | null>(null);
   useEffect(() => {
     const current = createAgent({ endpoint: "https://pulsebeam.example", roomId: "standup", topology: { localVideo: ["camera", "screen"], localAudio: ["mic"] } });
     current.setState({ connected: true, publications: [{ slot: "camera", active: true }, { slot: "mic", active: true }, { slot: "screen", active: true }], video: [{ slot: 0, trackId: "remote-camera", height: 720, minHeight: 360, minFps: 24, priority: 1 }], audio: { automatic: true }, playoutDelay: { mode: "fixed", minMs: 50, maxMs: 100 }, topics: [{ name: "chat", mode: "ordered", publish: true, subscribe: true }, { name: "reaction", mode: "latest", publish: true, subscribe: true }] });

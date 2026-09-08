@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createElement } from "react";
+import { createElement, StrictMode, useEffect } from "react";
 import TestRenderer, { act } from "react-test-renderer";
 import { AgentProvider, useAgent } from "../../dist/index.js";
 
@@ -24,6 +24,7 @@ const disconnected = Object.freeze({
 class FakeAgent {
   snapshot;
   listeners = new Set();
+  subscribeCalls = 0;
   states = [];
   replacedTracks = [];
   muted = [];
@@ -40,6 +41,7 @@ class FakeAgent {
   getSnapshot = () => this.snapshot;
 
   subscribe = (listener) => {
+    this.subscribeCalls += 1;
     this.listeners.add(listener);
     return () => {
       if (this.listeners.delete(listener)) {
@@ -200,6 +202,35 @@ test("replacement resubscribes, delegates to the current agent, and never closes
   assert.equal(second.unsubscribeCalls, 1);
   assert.equal(first.closeCalls, 0);
   assert.equal(second.closeCalls, 0);
+});
+
+test("Strict Mode releases caller subscriptions without closing its agent", () => {
+  const agent = new FakeAgent();
+  let renderer;
+
+  function EventProbe() {
+    const { subscribeEvents } = useAgent();
+    useEffect(() => subscribeEvents(() => {}), [subscribeEvents]);
+    return null;
+  }
+
+  act(() => {
+    renderer = TestRenderer.create(
+      createElement(
+        StrictMode,
+        null,
+        createElement(AgentProvider, { agent }, createElement(EventProbe)),
+      ),
+    );
+  });
+  assert.equal(agent.listeners.size, 1);
+  assert.equal(agent.eventListeners.size, 1);
+
+  act(() => renderer.unmount());
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.eventListeners.size, 0);
+  assert.equal(agent.unsubscribeCalls, agent.subscribeCalls);
+  assert.equal(agent.closeCalls, 0);
 });
 
 test("fails deterministically without a provider", () => {

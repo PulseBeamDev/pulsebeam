@@ -1,0 +1,15 @@
+{
+  "name": "pulsebeam-react-consumer-contract",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@pulsebeam/react": "link:../..",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3"
+  }
+}

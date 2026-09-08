@@ -12,3 +12,7 @@ check:
 # Run the React runtime contract tests.
 test:
     pnpm run test
+
+# Build a React-only consumer after preparing the local runtime and its assets.
+consumer:
+    pnpm run test:consumer
