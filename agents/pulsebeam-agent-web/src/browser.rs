@@ -26,7 +26,9 @@ use web_sys::{
     RtcTrackEvent,
 };
 
-use crate::engine::{ActorHandle, Host, PublicCommand, TopicCommand, Turn, spawn_actor};
+use crate::engine::{
+    ActorHandle, Host, PublicCommand, TopicCommand, Turn, TurnErrorSource, spawn_actor,
+};
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
 
@@ -788,9 +790,14 @@ impl RuntimeInner {
 
     fn publish_turn(&self, turn: &Turn) {
         if let Some(error) = &turn.error {
-            self.report_classified_error(LocalOperationError::validation(format!(
-                "core rejected input: {error}"
-            )));
+            let class = match error.source {
+                TurnErrorSource::Command => "validation",
+                TurnErrorSource::HostEvent => "protocol",
+            };
+            self.report_classified_error(LocalOperationError {
+                class,
+                message: format!("core rejected input: {error}"),
+            });
         }
         let snapshot_listener = self.snapshot_listener.borrow().clone();
         if let Some(snapshot) = &turn.snapshot

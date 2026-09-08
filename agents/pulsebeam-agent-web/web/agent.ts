@@ -122,14 +122,15 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function localFailureClass(error: unknown): "validation" | "runtime" {
+function localFailureClass(error: unknown): AgentFailure["class"] {
   if (
     typeof error === "object" &&
     error !== null &&
     "pulsebeamClass" in error &&
-    error.pulsebeamClass === "validation"
+    (error.pulsebeamClass === "validation" ||
+      error.pulsebeamClass === "protocol")
   ) {
-    return "validation";
+    return error.pulsebeamClass;
   }
   return "runtime";
 }

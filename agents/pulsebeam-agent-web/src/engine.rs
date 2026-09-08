@@ -1,11 +1,12 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::fmt;
 
 use crate::channel::{self, mpsc, mpsc::TrySendError as MpscTrySendError, watch};
 
 use agent_core::{
-    Agent, AgentCommand, AgentConfig, AgentError, DesiredState, Effect, Failure, FailureClass,
-    HostEvent, Notification, Snapshot, TopicSend,
+    Agent, AgentCommand, AgentConfig, AgentError, DesiredState, Effect, Failure, HostEvent,
+    Notification, Snapshot, TopicSend,
 };
 
 #[derive(Clone)]
@@ -19,7 +20,24 @@ pub(crate) struct Turn {
     pub(crate) effects: Vec<Effect>,
     pub(crate) notifications: Vec<Notification>,
     pub(crate) snapshot: Option<Snapshot>,
-    pub(crate) error: Option<AgentError>,
+    pub(crate) error: Option<TurnError>,
+}
+
+pub(crate) struct TurnError {
+    pub(crate) source: TurnErrorSource,
+    error: AgentError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnErrorSource {
+    Command,
+    HostEvent,
+}
+
+impl fmt::Display for TurnError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
 }
 
 pub(crate) struct Driver {
@@ -40,11 +58,16 @@ impl Driver {
     }
 
     pub(crate) fn turn(&mut self, input: Input) -> Turn {
+        let source = match &input {
+            Input::Command(_) => TurnErrorSource::Command,
+            Input::Event(_) => TurnErrorSource::HostEvent,
+        };
         let error = match input {
             Input::Command(command) => self.agent.command(command),
             Input::Event(event) => self.agent.handle(event),
         }
-        .err();
+        .err()
+        .map(|error| TurnError { source, error });
 
         let mut effects = Vec::new();
         while let Some(effect) = self.agent.next_effect() {
@@ -412,12 +435,12 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        Actor, Driver, FailureClass, Host, Input, LifecycleCommand, Message, PublicCommand,
-        SerialQueue, TopicCommand,
+        Actor, Driver, Host, Input, LifecycleCommand, Message, PublicCommand, SerialQueue,
+        TopicCommand, TurnErrorSource,
     };
     use agent_core::{
-        AgentCommand, DesiredState, Effect, Failure, HostEvent, RtcEffect, RtcEvent, TopicMode,
-        TopicPublisher, TopicSend,
+        AgentCommand, ChannelId, DesiredState, Effect, Failure, FailureClass, HostEvent,
+        OfferResources, RtcEffect, RtcEvent, TopicMode, TopicPublisher, TopicSend,
     };
 
     #[derive(Default)]
@@ -512,6 +535,35 @@ mod tests {
         assert!(unchanged.error.is_none());
         assert!(unchanged.effects.is_empty());
         assert!(unchanged.snapshot.is_none());
+    }
+
+    #[test]
+    fn driver_marks_host_rejections_separately_from_command_rejections() {
+        let mut driver = Driver::new(config()).unwrap();
+        let opening = driver.turn(Input::Command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 1,
+            connected: true,
+            ..DesiredState::default()
+        })));
+        let generation = match opening.effects.as_slice() {
+            [Effect::Rtc(RtcEffect::CreateOffer { generation, .. })] => *generation,
+            effects => panic!("expected one create-offer effect, got {effects:?}"),
+        };
+
+        let rejected = driver.turn(Input::Event(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: "offer".into(),
+            resources: OfferResources {
+                slots: Vec::new(),
+                signaling_channel: ChannelId::new(1).unwrap(),
+                data_channels: Vec::new(),
+            },
+        })));
+
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.source),
+            Some(TurnErrorSource::HostEvent)
+        );
     }
 
     #[test]
