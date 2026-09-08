@@ -1,858 +1,1208 @@
 # Congestion control and latency governance
 
-This document defines the egress congestion-control contract for
-`pulsebeam-rtc`. It is an implementation design, not a public promise to match
-one revision of SCReAM or libwebrtc exactly.
+Status: normative private implementation contract for `pulsebeam-rtc` version one.
 
-The connection owns one aggregate congestion controller, pacer, probe manager,
-latency governor, and multi-stream allocator. The SFU supplies each sender's
-desired bitrate, relative priority, and playout-delay range. The connection
-divides one network-safe envelope into per-sender allocations and schedules the
-resulting traffic. The SFU continues to choose sources and layers; it does not
-set congestion-window gains, pacing factors, queue targets, or probe clusters.
+This document defines the egress RTP congestion controller, latency governor,
+media allocator, pacer, scheduler, probe manager, and DataChannel coordination.
+It does not add public controller types. The only public inputs are the semantic
+values in [`design.md`](design.md): `TimePoint`, `MediaPacket`, `FrameMetadata`,
+`SenderPolicy`, DataChannel commands, network input, `poll`, semantic events, and
+statistics.
+
+The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
+
+## Normative hierarchy and pinned algorithm
+
+The network-control core is a direct implementation of
+[`draft-ietf-ccwg-rfc8298bis-screamv2-01`](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-rfc8298bis-screamv2-01),
+pinned to revision `01`. The source artifact used by the implementation review
+has SHA-256:
+
+```text
+UNAVAILABLE: download the pinned draft before implementation review
+```
+
+A later Internet-Draft revision, RFC, Ericsson commit, or libwebrtc commit MUST
+NOT silently change production behavior. Adopting one requires a new documented
+profile and fresh trace/simulation/browser evidence.
+
+Normative precedence is:
+
+1. the ownership/invariants in `../README.md` and exact public contracts in
+   [`design.md`](design.md);
+2. explicit PulseBeam decisions and deviations in this document;
+3. the pinned SCReAM v2 revision for the self-contained core;
+4. the cited RTP, RTCP, feedback, priority, SCTP, and DataChannel RFCs;
+5. pinned Ericsson and libwebrtc revisions as comparison oracles only.
+
+Where the pinned draft gives an equation, ordering rule, or numeric constant, the
+private `ScreamDraft01` implementation MUST transcribe it unchanged unless the
+complete deviation is listed below. The implementation keeps a source citation
+beside each transcribed equation or constant. No undocumented local tuning
+constant is allowed.
+
+### Explicit PulseBeam deviations and extensions
+
+PulseBeam intentionally adds or changes only these behaviors:
+
+1. Browser transport-wide feedback is normalized into the draft's packet-feedback
+   model. RFC 8888 is an alternative normalized input.
+2. A private latency governor supplies an upper ceiling on SCReAM's native
+   queue-delay target. It can only make the controller more latency-conservative.
+3. A weighted max-min allocator divides governed RTP media-payload capacity among
+   stable outbound senders. The pinned draft does not define this SFU layer.
+4. A deadline-aware transport scheduler combines per-sender service, frame
+   usefulness, RTX, protocol control, DataChannels, and padding.
+5. A bounded probe manager uses ordinary padding on a negotiated media or RTX
+   SSRC; it never creates an SSRC-zero source.
+6. SCTP retains its own congestion controller. Its acknowledged/admitted transport
+   load is coordinated once with media capacity and top-level scheduling, but
+   SCTP packets never become SCReAM-acknowledged data units.
+7. Public allocation and demand are expressed in RTP media-payload bits per
+   second, while in-flight and pacing accounting use emitted transport bytes.
+
+These decisions mean PulseBeam is **SCReAM-v2-derived**, not a promise of bit-for-
+bit behavior with any libwebrtc or Ericsson build.
+
+## Congestion-control decisions considered
+
+These are the consequential alternatives considered before implementation. The SCReAM
+core remains separately testable; PulseBeam-specific behavior is explicit rather than
+being hidden as tuning.
+
+| Topic | Decision | Alternatives considered | Why this direction |
+| --- | --- | --- | --- |
+| Normative controller | Implement pinned SCReAM v2 revision `01` as the core | libwebrtc normative; Ericsson normative; custom controller inspired by SCReAM | Gives one reviewable algorithm baseline. Other implementations are comparison evidence, not moving production semantics. |
+| PulseBeam influence on SCReAM | Only cap the native queue-delay target: `effective = min(native, policy_ceiling)` | Replace SCReAM qdelay logic; mutate gains/windows from playout policy; never influence SCReAM | Preserves SCReAM self-containment while allowing the product to choose lower latency than its coexistence logic might otherwise tolerate. |
+| Controller scope | One aggregate RTP controller per connection | Per-sender congestion controllers plus coupling | All bundled RTP shares one bottleneck; sender priority should divide capacity, not manufacture independent capacity estimates. |
+| Feedback | TWCC baseline; RFC 8888 normalized alternative | REMB; fixed-rate fallback; simultaneous TWCC + RFC 8888 | Packet-level arrival/loss data fits SCReAM. One selected mode avoids conflicting acknowledgment domains. |
+| RFC 8888 accounting | Maintain acknowledgment progression per SSRC | Invent one aggregate RTP sequence cursor | RFC 8888 reports RTP sequence progression per SSRC; aggregation would mis-acknowledge packets. |
+| Sent timestamp | `Output::Transmit` commit time | Caller departure receipts; NIC/kernel timestamp feedback | Keeps public API small; controller uses the last time observable inside the sans-I/O engine and conservatively treats later caller failure as loss. |
+| Latency input | `global_media_at` + receiver playout policy derive private usefulness | Treat raw playout max as network queue target; trust Absolute Capture Time | Global server time is comparable across nodes; playout intent should affect usefulness/headroom, not create bufferbloat or rely on endpoint clocks. |
+| Latency curve | Saturating private operating-point curve | Linear mapping of full playout range to queue/recovery; expose expert knobs | Large playout budgets must stop relaxing network behavior; fixed policy keeps API semantic and testable. |
+| Multi-sender allocation | Weighted max-min over governed media-payload demand | Strict priority; equal split; per-sender cwnd | Gives proportional fairness without starvation or reservations while keeping source/layer selection in the SFU. |
+| Rate units | SFU-facing allocations use media payload; pacer/BIF use transport bytes | One generic bitrate/byte unit | Keeps allocations directly comparable to codec/layer rates while congestion accounting includes observable transport overhead. |
+| SCTP | Keep SCTP congestion control; reserve/coordinate its service outside SCReAM | Count SCTP as SCReAM BIF; feed SACK into a new coupled controller | TWCC/RFC 8888 does not acknowledge SCTP. V1 avoids inventing a second research-grade coupled controller. |
+| Probing | RTP padding on negotiated media/RTX SSRC | Synthetic SSRC zero; no active probing | Matches normal RTP sender identity and enables pre-media/application-limited capacity observations without a special source. |
+| Application-limited behavior | Freeze unsupported growth, decay confidence, demand-aware bounded probes | Collapse estimate to media rate; grow without observations | Separates offered media rate from path capacity and avoids both needless collapse and evidence-free optimism. |
+| ECN/L4S | Optional only with validated RFC 8888 ECN | Require L4S/ECN; force-enable from configuration | Baseline must work on ordinary Internet paths; inconsistent/bleached ECN must not compromise control. |
+| Frame scheduling | Prefer whole unstarted-frame drops; started frame is not guaranteed completion | Packet-only FIFO; unbounded commitment once first packet sends | Minimizes decoder damage while preserving bounded queues and congestion safety. |
+| Constants | Freeze `CongestionProfileV1`; changes require profile/doc evidence | Leave tuning qualitative or implementation-defined | Prevents implementation agents from silently choosing controller semantics and makes deterministic comparison meaningful. |
 
 ## Goals
 
-- Keep interactive media near the live edge without sacrificing congestion
-  safety or fairness.
-- Turn each sender's playout-delay control into a useful, continuous
-  quality/latency policy.
-- Allocate one safe connection rate among senders according to SFU-provided
-  demand and relative priority.
-- Remain interoperable with ordinary Chrome and Firefox transport-wide
-  congestion-control feedback.
-- Stay responsive before media starts, during variable-rate media, and while
-  every media stream is paused or application-limited.
-- Treat actual socket departure, not packet construction or polling, as the
-  start of network flight.
-- Share one network estimate and one transport budget across every media and
-  DataChannel stream on the connection.
-- Keep all histories, queues, and timers bounded and local to one `Connection`.
-- Expose semantic bitrate and statistics, without exposing SCReAM, TWCC, pacer,
-  or RTCP implementation types.
+- Keep interactive media near the live edge while remaining congestion safe.
+- Preserve the SCReAM core as one independently testable network controller.
+- Give each receiver a continuous, monotonic quality/latency policy without
+  exposing queue targets or controller gains.
+- Divide one safe connection envelope among senders according to SFU demand and
+  relative priority.
+- Support ordinary Chrome and Firefox packet feedback without modified clients.
+- Remain responsive before media, during VBR/application-limited media, after
+  pauses, and during feedback loss.
+- Commit packets at `Output::Transmit` without a transmit-receipt lifecycle.
+- Keep all state bounded, dense, and local to one `Connection`.
+- Make every public rate and statistic unambiguous about payload versus transport
+  units.
 
 ## Non-goals
 
-- Controlling a browser's uplink encoder. The browser owns its send-side
-  controller; this crate only generates ingress feedback for it.
-- Selecting an SFU source, simulcast layer, SVC layer, or keyframe cache entry.
-- Promising an exact capture-to-render deadline. Remote capture, decode,
-  rendering, and jitter-buffer state are not fully observable.
-- Mapping a playout-delay value directly to a network queue target.
-- Depending on L4S, ECN, RFC 8888 feedback, synchronized endpoint clocks, or a
-  modified browser for baseline operation.
-- Offering public expert knobs for controller gains, queue targets, or pacer
-  implementation details. Per-sender latency, demand, and relative priority are
-  intentional SFU controls.
+- Controlling a browser's uplink encoder. Ingress feedback generation is separate
+  from this egress controller.
+- Selecting an SFU source, simulcast/SVC layer, or keyframe cache entry.
+- Proving exact physical capture-to-render latency. Endpoint capture clocks,
+  encode time, and render internals are not fully trusted or observable.
+- Mapping the playout-delay maximum directly or linearly to a network queue.
+- Depending on L4S, ECN, RFC 8888, synchronized endpoint clocks, Absolute Capture
+  Time, or a modified browser for baseline operation.
+- Treating TCP fallback as a separately configurable public congestion mode.
+- Exposing SCReAM revisions, gains, histories, probe clusters, pacer factors, or
+  queue targets through the public API.
 
-## The central distinction
-
-The playout-delay extension and congestion control describe related but
-different things.
-
-| Quantity | Meaning | Owner |
-| --- | --- | --- |
-| Playout minimum | Best-effort minimum capture-to-render delay requested for one sender | Per-sender SFU policy, signaled by the connection |
-| Playout maximum | Best-effort maximum capture-to-render delay requested for one sender | Per-sender SFU policy, signaled by the connection |
-| Stream priority | Relative share of constrained media capacity | Per-sender SFU policy, enforced by the connection |
-| Desired bitrate | Media capacity the SFU can currently use for a sender | Per-sender SFU policy |
-| End-to-end latency | Capture through encode, uplink, SFU, downlink, decode, and render | Not fully observable by this crate |
-| Forwarding delay | Ingress socket receipt through egress socket departure | Measured exactly within one clock domain |
-| Network queue delay | Variable delay above the estimated path baseline | Estimated by the SCReAM core |
-| Pacer delay | Predicted time before an admitted packet can depart | Owned by the connection |
-| Recovery horizon | Time during which retransmission is likely to improve rendered quality | Chosen by the latency governor |
-
-The playout maximum is an intent and an upper envelope, not a target to fill.
-A larger maximum must never cause the connection to deliberately build a
-similarly large network queue. Extra latency budget is spent first on receiver
-smoothing and useful recovery, not bufferbloat.
-
-The `min = 0, max = 0` value is a special request to render as soon as
-possible. It does not mean that transport, decode, or render can complete in
-zero time, and it must not produce a zero-sized congestion window or a literal
-zero-duration packet deadline.
-
-## Architecture
+## Fixed architecture
 
 ```text
- sender policies: playout ranges, priorities, desired rates
+sender policy + immutable packet global_media_at + frame metadata
                               |
                               v
-                       latency governor <--- packet age and frame state
+                      latency governor
                               |
-                   per-sender operating points
+                per-sender operating points
                               |
-                              v
-departure receipts ---> SCReAM v2 core ---> safe envelope ---> allocator
-        ^                     ^                                  |
-        |                     |                                  v
-        +------------- TWCC feedback <---------------- pacer/scheduler
-                                                             |
-                                                             v
-                                                      socket transmits
+                              +------ strict queue-target ceiling -----+
+                              |                                         |
+                              v                                         v
+packet feedback ------> self-contained SCReAM v2 core ----------> safe RTP envelope
+                              |                                         |
+                              +----------------+------------------------+
+                                               v
+                                   media-capacity accounting
+                                               |
+                              desired rates + priority weights
+                                               v
+                                  weighted max-min allocator
+                                               |
+                     +-------------------------+-------------------------+
+                     |                                                   |
+                     v                                                   v
+          deadline/frame-aware RTP scheduler                 bounded SCTP scheduler
+                     |                                                   |
+                     +------------------- top-level service -------------+
+                                               |
+                                               v
+                                      Output::Transmit
+                                  (irrevocable send commit)
 ```
 
-The design has four cooperating parts:
+One connection owns exactly one RTP path controller. Original media, RTX, FEC,
+and RTP padding share its path state. There is no per-sender congestion window
+and no coupled layer above several independent RTP estimators.
 
-1. The SCReAM core estimates a network-safe reference window and sustainable
-   rate from actual departures and packet feedback.
-2. The latency governor translates each sender's playout intent and current
-   conditions into a bounded per-sender operating point, then derives the
-   strictest path-level constraints required by active senders.
-3. The probe manager creates SSRC-zero padding when ordinary media does not
-   provide enough observations.
-4. The allocator divides safe media capacity by demand and relative priority.
-   The scheduler enforces those shares, latency constraints, and frame-aware
-   shedding across all connection traffic.
+The latency governor is not a second bandwidth estimator. The allocator cannot
+create capacity. The scheduler cannot exceed the controller's RTP send-window
+rules merely because a frame has a deadline.
 
-These are internal components of one connection. They do not run independent
-timers or communicate through callbacks. Their next actions contribute to the
-single deadline returned by `Connection::poll`.
+All parts are ordinary fields of one `Connection`; they do not own independent
+threads, callbacks, or public timers. Their earliest internal deadline contributes
+to the one `Idle.next_wakeup` returned by `poll`.
 
-## Public contract
+## Time-domain separation
 
-The public API remains algorithm-neutral. Conceptually, the SFU can:
+The controller uses two intentionally separate domains:
+
+- `TimePoint.monotonic` drives sent history, feedback intervals, RTT, queue-delay
+  trends, SCReAM state, pacing, retransmission timers, probes, and wakeups.
+- `TimePoint.global` and `MediaPacket.global_media_at` drive cross-node media age
+  and receiver-specific usefulness.
+
+SCReAM never uses `GlobalMediaTime` to estimate RTT or network queue delay. RTCP
+Sender Reports never drive SCReAM. Conversely, an RTP packet's receiver deadline
+is never derived from an endpoint's untrusted wall-clock epoch.
+
+A runtime global-clock correction can make queued media older and therefore less
+useful; it cannot increase the SCReAM congestion window or fabricate path
+capacity.
+
+## Exact units
+
+Version one uses distinct internal newtypes even where their storage is the same:
+
+```rust
+struct MediaPayloadBytes(u32);
+struct TransportBytes(u32);
+struct MediaPayloadRate(u64); // bits/s
+struct TransportRate(u64);    // bits/s
+```
+
+### Media payload
+
+`MediaPayloadBytes` is the original encoded audio/video payload represented by an
+RTP packet. It excludes the RTP header, RTP header extensions, SRTP tag, RTX
+header, padding, RTCP, SCTP, DTLS, ICE, RFC 4571 framing, and outer network
+headers.
+
+`SenderPolicy.desired_bitrate`, governed sender demand, sender allocation,
+allocation events, and SFU-facing admitted/transmitted media rates use
+`MediaPayloadRate`.
+
+Relative media priority is also enforced over media payload service, matching the
+WebRTC media-priority contract. Retransmitted media is charged to the originating
+sender by its recovered original media payload size; repair and transport overhead
+are accounted separately.
+
+### Transport bytes
+
+`TransportBytes` is exactly `Transmit.payload.len()` at the public connection
+boundary:
+
+- for UDP, the complete emitted STUN/DTLS/RTP/RTCP/SCTP datagram payload;
+- for ICE-TCP, the complete emitted RFC 4571 frame including its two-byte length.
+
+It does not include IP, UDP, TCP, link-layer, tunnel, or kernel framing that the
+sans-I/O crate cannot observe. The document therefore uses **transport bytes**,
+not “wire bytes.”
+
+SCReAM sent-unit size, RTP bytes-in-flight, pacer tokens, queue byte limits,
+protocol/SCTP service, and padding use `TransportBytes` or `TransportRate`.
+
+### Payload-to-transport conversion
+
+Each sender maintains bounded EWMAs of:
 
 ```text
-set_sender_policy(sender_id, {
-    playout_delay: { min, max },
-    priority,
-    desired_bitrate,
-})
-send_media(sender_id, packet)
-report_departure(receipt, sent_or_dropped, observed_at)
-poll(now) -> Transmit | Event | Idle { next_wakeup }
-stats() -> coherent snapshot
+payload_efficiency = media_payload_bytes / emitted_rtp_transport_bytes
 ```
 
-The exact Rust names can evolve, but the ownership must not.
+The initial value is `0.90`; the value is clamped to `[0.50, 0.99]` and updated
+only from non-padding RTP packets after `Transmit` commit. A sender allocation
+`A_payload` is converted to expected RTP transport service as:
 
-- `sender_id` identifies one stable negotiated outbound RTP sender. Its policy
-  survives source, encoding, primary SSRC, and RTX changes; those are wire or
-  routing details rather than separate congestion-policy identities.
-- Every negotiated sender has a mutable policy. Connection configuration
-  supplies its initial default, so no sender begins with undefined latency or
-  priority behavior.
-- When the playout-delay extension is negotiated for a video sender, the
-  connection writes that sender's range and repeats a changed value until RTCP
-  proves a carrying packet was received. When the extension is absent, the
-  sender's local latency policy still applies and statistics report that it was
-  not signaled.
-- `desired_bitrate` describes capacity the SFU could use for that sender by
-  choosing a better source or layer. Zero means intentionally inactive. The
-  connection measures actual sending rate from admitted media instead of asking
-  the SFU to duplicate that accounting.
-- `priority` is a bounded positive relative weight. Named presets corresponding
-  to the WebRTC very-low, low, medium, and high levels use 1:2:4:8 weights; the
-  SFU may choose another bounded weight when four levels are too coarse. Zero
-  priority is invalid; inactivity is represented by zero desired bitrate.
-- Allocation events report both the aggregate governed media capacity and each
-  sender's current allocation. The SFU maps a sender allocation to its own
-  source and layer choices.
-- There is no public controller-selection enum. SCReAM revisions and PulseBeam
-  tuning are implementation details.
+```text
+A_transport = ceil(A_payload / payload_efficiency)
+```
 
-## Feedback and departure truth
+This conversion is used for pacing and aggregate scheduler reservation. It does
+not change the public allocation unit and it does not count the same header bytes
+twice.
 
-### Baseline feedback
+The connection-level aggregate efficiency is a transmitted-payload-weighted mean
+of active senders, with the same initial value and bounds.
 
-The production baseline is transport-wide congestion-control feedback. It
-provides transport sequence numbers, receiver arrival deltas, and loss across
-the bundled connection. SCReAM is a sender algorithm; the remote browser does
-not need to run SCReAM.
+## Packet-feedback contract
 
-Egress video negotiation rejects the absence of required packet-level feedback
-with a specific error. It does not silently fall back to REMB or a fixed-rate
-controller.
+Every accepted connection with outbound RTP negotiates exactly one packet-
+feedback mode. The absence of both modes rejects the session. REMB is never an
+egress fallback.
 
-RFC 8888 congestion-control feedback can later be normalized into the same
-internal packet-feedback representation. It is negotiated instead of TWCC,
-not concurrently with it. ECN and L4S behavior must remain disabled unless the
-selected feedback format actually reports ECN markings and the path proves it
-preserves them. Baseline SCReAM behavior must be excellent without ECN.
+```rust
+private enum PacketFeedbackMode {
+    TransportWide,
+    Rfc8888,
+}
+```
 
-### Departure receipts
+Both modes normalize to one private record:
 
-A packet is in flight only after the caller reports a successful socket send.
-Every emitted transmit therefore carries an opaque receipt.
+```rust
+struct PacketFeedback {
+    sent_id: SentPacketId,
+    received: bool,
+    receiver_arrival: Option<ReceiverTime>,
+    ecn: Option<EcnMark>,
+}
+```
 
-- Successful departure records the observed departure time, wire size,
-  transport sequence number, probe identity, and current in-flight bytes.
-- A socket drop before departure never enters TWCC sent history and never
-  increases bytes in flight.
-- A missing receipt is abandoned after a bounded deadline and counted. It
-  cannot remain in flight forever.
-- Batched socket sends can return batched receipts, but each packet retains its
-  own observed result and timestamp.
+`ReceiverTime` is a mode-specific relative timeline. Its absolute epoch is never
+interpreted as server or endpoint wall time.
 
-RTP sequence numbers can already have been committed when post-admission media
-is lost, so such loss remains visible as an RTP gap. TWCC sequence numbers are
-assigned only to packets that are about to be emitted and are entered into sent
-history only after successful departure.
+### Transport-wide feedback
+
+- One 16-bit transport sequence number space covers all bundled outbound RTP,
+  RTX, and probe packets.
+- A sequence number is assigned only when the encrypted packet is selected for
+  immediate `Transmit` emission.
+- Wrap is unwrapped against bounded sent history. A feedback status outside the
+  accepted generation/reordering window is unknown and counted.
+- Receiver arrival deltas are reconstructed in feedback order, then associated
+  with committed sent entries.
+- Duplicate reports update no bytes twice.
+- Feedback for a padding probe follows exactly the same path as media.
+
+### RFC 8888 feedback
+
+RFC 8888 acknowledgment progression is **per reported SSRC**. The normalizer keys
+sent media by `(outbound_ssrc, extended_rtp_sequence_number)` and maintains a
+separate unwrap/acknowledgment cursor per SSRC. It MUST NOT invent one aggregate
+“highest acknowledged RTP sequence number” across SSRCs.
+
+- Original media, RTX, and any distinct repair SSRC retain separate report state.
+- Multiple report blocks in one RTCP feedback packet are normalized independently.
+- A report for an unknown SSRC or sequence is ignored and counted without
+  allocating state.
+- ECN is usable only when this selected feedback format reports it consistently
+  and path validation succeeds.
+
+### Feedback hold and staleness
+
+Where the feedback format permits it, the implementation separates receiver
+feedback hold from the network loop:
+
+```text
+feedback_rtt = feedback_received_at - packet_committed_at
+network_loop = max(0, feedback_rtt - receiver_feedback_hold)
+```
+
+Sparse or application-limited samples cannot rapidly rewrite either estimate.
+Feedback staleness is evaluated from monotonic send/feedback time and can never
+increase the target rate.
+
+## `Transmit` is the sent-data-unit commit
+
+There is no departure receipt.
+
+When `poll(at)` returns `Output::Transmit`, the connection has already, in this
+order:
+
+1. selected one eligible packet under the current schedule and send window;
+2. assigned and committed any RTP, RTX, RTCP, SCTP, and transport sequence values;
+3. encrypted/framed the final transport payload;
+4. inserted an RTP sent-history entry when applicable at `at.monotonic`;
+5. increased RTP bytes-in-flight by the applicable transport size;
+6. charged pacer tokens and sender service;
+7. recorded forwarding latency through the commit point;
+8. returned the immutable `Transmit` value.
+
+The caller synchronously attempts socket submission before invoking the connection
+again. A caller-side drop or failed syscall is indistinguishable from path loss;
+the packet remains a committed sent unit until acknowledged or expired by the
+normal SCReAM history rules. This is intentionally conservative and keeps the
+public API small.
+
+For ICE-TCP, commit means submission to the caller-owned TCP stream, not physical
+network departure. Kernel/TCP queueing is part of fallback-path behavior. No TCP
+receipt, rollback, or alternate public controller exists.
+
+RTP sequence numbers can be committed before a later queue overflow or caller
+failure. Such loss remains an RTP gap. A TWCC number is never assigned to a packet
+that has not reached the immediate `Transmit` selection point.
 
 ## SCReAM v2 core
 
-PulseBeam implements the controller in Rust using the current SCReAM v2 draft,
-the Ericsson reference implementation, and libwebrtc behavior as guidance. It
-does not link either implementation and does not inherit their public APIs or
-unstable constants.
+The private core accepts normalized sent/feedback facts and produces one safe RTP
+envelope:
 
-The core is one aggregate controller per connection. Multiple RTP senders,
-RTX, probes, and congestion-controlled DataChannel bytes share the same path
-state. There is no per-sender congestion window and no coupled-controller layer
-above several independent estimators. Stream priority divides the aggregate
-safe envelope; it cannot create more path capacity.
+```rust
+struct SafeRtpEnvelope {
+    target_media_payload_rate: MediaPayloadRate,
+    max_rtp_bytes_in_flight: TransportBytes,
+    pacing_transport_rate: TransportRate,
+    native_queue_delay_target: Duration,
+    effective_queue_delay_target: Duration,
+    queue_delay: Duration,
+    queue_delay_confidence: Confidence,
+    smoothed_rtt: Duration,
+    feedback_hold: Duration,
+    delivered_rtp_transport_rate: TransportRate,
+    application_limited: bool,
+    feedback_stale: bool,
+}
+```
+
+This type is private. Statistics copy semantic scalar values; callers never receive
+or mutate it.
 
 ### Inputs
 
 The core consumes:
 
-- Successfully departed packet time, wire size, and transport sequence number.
-- Packet arrival or loss reported by TWCC.
-- Feedback receipt time and estimated receiver feedback-hold time.
-- Current bytes in flight and paced queue state.
-- Network availability and selected-path changes.
-- Per-sender desired bitrate and connection-observed sending rate, aggregated
-  for network estimation and retained individually for allocation.
-- Application-limited state from actual offered traffic, not merely a low media
-  rate.
-- The aggregate path operating point derived from active sender policies by
-  the latency governor.
+- committed RTP data-unit time, transport size, transport/RTP identity, and class;
+- normalized packet arrival/loss and valid ECN marks;
+- feedback receipt time and estimated receiver feedback hold;
+- current RTP bytes-in-flight and paced RTP queue state;
+- selected-path changes and network availability;
+- aggregate offered/admitted RTP media-payload rate;
+- aggregate SFU desired media-payload rate;
+- the private PulseBeam queue-delay ceiling.
 
-### Network model
+Per-sender priority, frame IDs, source selection, SCTP sequence/SACK state, and
+raw playout ranges are not SCReAM inputs.
 
-The delay estimator tracks a baseline one-way delay and treats delay above that
-baseline as queueing. It must tolerate endpoint clock offset, gradual clock
-drift, feedback batching, packet reordering, and wireless scheduling jitter.
-Synchronized endpoint clocks are not required.
+### Delay model
 
-Conceptually:
+The delay estimator follows the pinned draft. Conceptually:
 
 ```text
-relative_one_way_delay = receiver_arrival_time - sender_departure_time
+relative_one_way_delay = receiver_arrival_time - sender_commit_time
 queue_delay = relative_one_way_delay - rolling_path_baseline
 ```
 
-Only differences and trends are meaningful across endpoint clocks. The
-implementation maintains bounded rolling minima and smoothed variation rather
-than interpreting the absolute value as wall-clock latency. A path change
-invalidates the baseline.
+Only differences and trends are meaningful across endpoint clock domains. The
+implementation uses bounded rolling minima and drift/variation filters and never
+interprets the absolute result as wall-clock latency. Reordering, batching,
+wireless scheduling jitter, and gradual receiver clock drift are accepted within
+the pinned algorithm's rules. A selected-path replacement invalidates the path
+baseline.
 
-Feedback RTT is separated into network loop time and receiver feedback hold
-where the feedback format allows it. Sparse application-limited samples must
-not rapidly rewrite either estimate.
+### Reference and send windows
 
-### Reference window and rate
+The draft's reference window is retained as its internal network-safety state. It
+is not renamed or treated as an absolute public congestion window. The draft's
+bounded slack between reference window, send window, pacing, and bytes-in-flight
+is implemented exactly. No PulseBeam layer can bypass those rules.
 
-The reference window is the network-safety state. It grows only when feedback
-supports growth and falls in response to persistent queue growth, congestion
-loss, or valid ECN signals. Random isolated wireless loss must not be treated
-the same as sustained congestion loss, but loss filtering cannot hide repeated
-loss or an overflowing queue.
+The reference window grows only from delivered evidence and falls on the draft's
+queue, congestion-loss, or valid ECN signals. Random isolated wireless loss is
+not silently reclassified as sustained congestion, but repeated loss or an
+overflowing queue cannot be filtered away.
 
-The send window is a bounded function of the reference window. The target rate
-is derived from the reference window, smoothed feedback loop time, delivery
-rate, and configured constraints. The pacer can serialize a burst faster than
-the long-term allocation rate, but it cannot exceed the allowed in-flight
-window or manufacture average capacity.
-
-The core exposes an internal safe envelope containing at least:
-
-- Sustainable target rate.
-- Maximum bytes in flight.
-- Pacing-rate ceiling.
-- Estimated queue delay and its confidence.
-- Smoothed RTT and feedback-hold time.
-- Delivery and loss observations.
-- Application-limited and feedback-stale state.
+The target bitrate is a controller output for RTP media payload. It is not a proof
+of physical bottleneck capacity and is named `target_media_payload_rate` in local
+code and statistics. “Sustainable path capacity” is not used as a synonym.
 
 ### Application-limited behavior
 
-When admitted traffic is below the safe rate, the connection is
-application-limited. This includes paused video, low-complexity VBR scenes, and
-audio-only periods.
+The connection is RTP application-limited when offered RTP payload remains below
+`85%` of the governed aggregate media allocation for at least `200 ms` and no
+eligible RTP packet is held back by pacing or the send window.
 
-Application-limited operation must:
+While application-limited:
 
-- Stop unobserved reference-window growth.
-- Prevent sparse RTT and delay samples from rapidly moving the path baseline.
-- Preserve the last credible capacity estimate with decaying confidence rather
-  than immediately collapsing it to the media rate.
-- Use bounded periodic probes when demand indicates that retained or higher
-  capacity would be useful.
-- Resume normal estimation promptly when media returns.
+- unsupported reference-window growth stops;
+- sparse delay/RTT samples cannot rapidly move the baseline;
+- the last credible rate is retained while confidence decays with a `5 s`
+  half-life;
+- demand-aware probes MAY test retained or higher capacity;
+- returning media exits application-limited state immediately once offered load
+  reaches the threshold.
 
-The media bitrate and available network bitrate are never treated as the same
-quantity.
+Low-complexity VBR video, audio-only periods, paused video, and all-media-paused
+periods can be application-limited. Media rate and available network rate are
+never equated.
 
-### Stability parameters
+### Native and effective queue-delay targets
 
-Loss backoff, ECN response, baseline filters, clock-drift handling, reference
-window minimums, estimator gains, and fairness rules are controller stability
-parameters. They are versioned implementation constants backed by trace and
-simulation evidence. Per-sender playout-delay controls must not tune them.
+SCReAM computes its native queue-delay target using the pinned draft, including
+its competing-flow adaptation. Revision `01` begins from the draft's recommended
+`60 ms` target and can natively relax as far as `400 ms` where the algorithm
+permits.
+
+PulseBeam supplies one upper ceiling:
+
+```text
+effective_queue_delay_target =
+    min(native_queue_delay_target,
+        strictest_active_sender_queue_delay_ceiling)
+```
+
+The ceiling cannot increase the native target, reference window, send window,
+pacing rate, or bitrate. It is the only latency-governor input to the SCReAM core.
+All native gains, loss response, ECN response, baseline handling, and competing-
+flow logic remain self-contained.
+
+This deliberately trades some coexistence aggressiveness against loss-based bulk
+traffic for PulseBeam's interactive latency bound. That product decision is an
+explicit deviation, not hidden “SCReAM tuning.”
+
+### ECN/L4S
+
+Baseline version-one behavior uses delay and loss and MUST be excellent without
+ECN. ECN is disabled unless:
+
+1. RFC 8888 is the selected feedback mode and reports ECN marks;
+2. the negotiated sender/path supports the required marking semantics;
+3. validation traffic proves marks are preserved and internally consistent.
+
+Bleaching, impossible transitions, or inconsistent counts disable ECN for the
+path without disabling delay/loss control. No public switch can force ECN on.
+
+## `CongestionProfileV1`
+
+`CongestionProfileV1` is private and compile-time fixed. Every value below is
+normative. A code change to one value requires a profile-version change or a
+matching documentation revision with new evidence.
+
+Where a field says **pinned draft**, its complete formula and constants come
+unchanged from revision `01`; this is still an exact value by normative reference,
+not permission for implementation choice.
+
+### Core and feedback ledger
+
+| Field | Version-one value |
+| --- | ---: |
+| SCReAM algorithm revision | `draft-ietf-ccwg-rfc8298bis-screamv2-01` |
+| Initial RTP media-payload target | `300_000 bit/s`, capped by active desired rate |
+| Minimum RTP media-payload target | `20_000 bit/s` while RTP demand is nonzero |
+| Maximum RTP media-payload target | `100_000_000 bit/s` and active desired sum, whichever is lower |
+| Initial smoothed feedback RTT | `100 ms` |
+| Native initial queue-delay target | `60 ms` |
+| Native maximum queue-delay target | `400 ms` |
+| Reference-window update | pinned draft |
+| Send-window/reference-window slack | pinned draft |
+| Queue/loss backoff | pinned draft |
+| ECN response | pinned draft, gated by validated RFC 8888 ECN |
+| Clock-drift and path-baseline filters | pinned draft |
+| Target-rate derivation | pinned draft |
+| Normal pacing derivation | pinned draft, then bounded by the transport limits below |
+| Sent-history entries | `32_768` |
+| Sent-history maximum age | `5 s` |
+| Maximum accepted ack reordering behind newest generation | `4_096` packets |
+| Maximum statuses normalized from one feedback packet | `8_192` |
+| Feedback stale threshold | `clamp(max(500 ms, 3 * srtt), 500 ms, 2 s)` |
+| Confidence half-life while stale or application-limited | `5 s` |
+| Feedback recovery requirement | one syntactically valid report covering one committed packet |
+| Maximum expiration work in one `poll` | `256` entries; return immediate wakeup if more remains |
+
+### Transport, queue, and scheduler ledger
+
+| Field | Version-one value |
+| --- | ---: |
+| Initial payload efficiency | `0.90` |
+| Payload-efficiency clamp | `[0.50, 0.99]` |
+| Payload-efficiency EWMA time constant | `1 s` |
+| Maximum paced RTP packets | `8_192` |
+| Maximum private paced RTP transport bytes | `8 MiB`, additionally capped by public configured media bytes |
+| Hard maximum pacer horizon | `100 ms` |
+| Maximum retained RTX age | `2 s`, additionally capped by sender usefulness |
+| Maximum retained RTX transport bytes | public retransmission limit |
+| Protocol-control minimum service reserve | `max(16_000 bit/s, 1% of current total transport service)` |
+| Scheduler quantum | one current path-MTU transport packet |
+| Sender allocation hysteresis | `max(25_000 bit/s, 10% of previous allocation)` |
+| Upward allocation confirmation | threshold held for `2` valid feedback rounds |
+| Downward safety change | immediate |
+| Upward operating-point relaxation | at most `10%` of remaining delta per smoothed RTT |
+| Fixed-range (`min == max != 0`) relaxation | at most `5%` of remaining delta per smoothed RTT |
+| Maximum frame dependencies | `8` |
+
+### Probe ledger
+
+| Field | Version-one value |
+| --- | ---: |
+| Concurrent probe clusters | `1` |
+| Probe-history records | `64` |
+| Minimum unmet-demand trigger | desired payload exceeds credible allocation by `20%` and `50_000 bit/s` |
+| Cluster target | `min(total governed demand, max(2 * credible media rate, 300_000 bit/s))` |
+| Cluster duration | `20 ms` |
+| Minimum packets | `5` |
+| Maximum packets | `32` |
+| Maximum cluster transport bytes | `48 KiB` and current send window, whichever is lower |
+| Minimum interval | `max(1 s, 4 * srtt)` |
+| Rolling probe overhead | at most `5%` of emitted transport bytes over `5 s` |
+| Success feedback deadline | `2 * srtt`, clamped to `[200 ms, 2 s]` |
+| Successful observation | at least `80%` of probe bytes reported received with no SCReAM congestion response |
+| Queue-growth abort | effective target exceeded or queue rises `10 ms` during cluster |
+| Loss abort | `5%` of reported probe packets lost before completion |
+
+### Latency-governor ledger
+
+| Field | Version-one value |
+| --- | ---: |
+| Most urgent queue-delay ceiling | `15 ms` |
+| Quality-saturated queue-delay ceiling | `60 ms` |
+| Urgent playout-maximum knee | `75 ms` |
+| Quality saturation playout maximum | `500 ms` |
+| Urgent allocation utilization | `0.80` |
+| Quality allocation utilization cap | `0.95` |
+| Urgent pacer horizon | `15 ms` |
+| Quality pacer horizon cap | `80 ms` |
+| Audio receiver processing reserve | `10 ms` |
+| Video receiver processing reserve | `25 ms` |
+| Synchronized media-clock uncertainty reserve | `5 ms` |
+| Provisional media-clock uncertainty reserve | `25 ms` |
+| Unverified media-clock uncertainty reserve | `50 ms` |
+| Discontinuous media-clock uncertainty reserve | `75 ms` |
+| Minimum network uncertainty reserve | `5 ms` |
+| Maximum network uncertainty reserve | `50 ms` |
+| ASAP audio maximum age | `100 ms` |
+| ASAP video maximum age | `150 ms` |
+| ASAP new-packet pacer horizon | `15 ms` |
+| Maximum extra quality-oriented RTX allowance | `50 ms` |
+
+The profile is encoded as one private immutable value. Tests obtain it through a
+crate-private accessor; production callers cannot select or mutate it.
 
 ## Latency governor
 
-The governor turns each sender's intent into a safe operating point. It is not
-a second bandwidth estimator and cannot grant capacity that SCReAM has not
-established. Per-sender operating points share one path-level SCReAM core.
+The governor converts each sender's public policy and packet media time into a
+private stable operating point. It does not continuously retune SCReAM per packet.
 
-### Inputs
-
-The governor observes:
-
-- Sender identity, requested playout minimum and maximum, relative priority,
-  and desired bitrate.
-- Whether that sender's playout request has been acknowledged by the receiver.
-- Ingress receive time and current age of each forwarded packet.
-- Current and predicted pacer delay.
-- Smoothed RTT, queue delay, feedback hold, and estimator confidence.
-- Recent video frame-size and burst variation.
-- Connection-observed sending rate and SFU-provided desired rate for each
-  sender.
-- Retransmission age and whether its original frame is still useful.
-- Frame boundary, keyframe, dependency, audio, retransmission, and probe class.
-- Queue occupancy and the safe envelope from SCReAM.
-
-Ingress receive time is an exact forwarding-latency origin, not capture time.
-When trustworthy absolute-capture-time metadata exists it can improve
-diagnostics, but the governor must remain correct for opaque media and clients
-that do not provide it.
-
-### Outputs
-
-The governor chooses an internal `SenderOperatingPoint` for every sender with:
-
-- A requested path queue-delay target within fixed safety bounds.
-- A media-utilization fraction applied to that sender's demand.
-- Pacing headroom within the shared safe send window.
-- Maximum paced queue and new-frame admission horizons.
-- Retransmission usefulness horizon.
-- Allowed probe queue impact while that sender has unmet demand.
-- Stale-media shedding thresholds.
-- A governed demand cap presented to the allocator.
-
-The governor combines active sender operating points into one
-`PathOperatingPoint`. The strictest active latency requirement controls the
-shared queue-delay target and other path-wide limits because all senders share
-the same bottleneck queue. A weighted or arithmetic average could let a
-high-delay stream create queueing that violates a low-delay stream's intent.
-
-A sender participates in path aggregation while it has nonzero desired rate,
-queued or in-flight media, or useful retransmissions. A sender with zero desired
-rate and no remaining work is inactive and cannot permanently hold the path at
-its latency settings.
-
-These structures are internal. The SFU supplies high-level per-sender intent,
-not derived queue, pacing, recovery, or probe values.
-
-### What playout delay may tune
-
-| Tunable | Lower-latency direction | Higher-quality direction |
-| --- | --- | --- |
-| Queue-delay target | Lower, subject to a jitter-tolerant floor | May rise modestly, subject to a low fixed cap |
-| Allocation utilization | More capacity held as VBR headroom | Operate closer to the safe rate |
-| Pacing headroom | Drain admitted bursts promptly within the send window | Smoother serialization is acceptable |
-| Pacer horizon | Shorter | Longer, but still bounded independently of playout maximum |
-| Frame admission | Reject predicted-late new frames earlier | Admit more frames when recovery remains useful |
-| RTX horizon | Retransmit only when very likely to arrive usefully | Permit more loss recovery |
-| Probe impact | Smaller queue footprint and faster abort | More evidence can be gathered when slack permits |
-
-The governor must not map a sender's `playout_max` linearly to
-`queue_delay_target`.
-Network queue delay remains deliberately small at every quality setting.
-
-### Interpreting minimum and maximum
-
-The maximum expresses one sender's urgency. A smaller maximum reduces that
-sender's queue horizons, allocation utilization, and recovery time. A larger
-maximum allows more quality recovery, but does not authorize a larger
-connection congestion window than network feedback supports.
-
-The minimum expresses intentional receiver smoothing. A retransmission
-predicted to arrive before the minimum is more likely to improve quality
-without delaying render. The minimum is not free network budget: capture and
-uplink time have already consumed part of the end-to-end interval.
-
-The width of the range indicates how much freedom the receiver has to adapt its
-jitter buffer. A fixed nonzero range (`min == max`) asks for stable playback;
-the governor should avoid latency oscillation even when it could temporarily
-drain faster.
-
-### Predicted usefulness
-
-For each queued packet or retransmission, the governor estimates:
-
-```text
-forwarding_age = now - ingress_received_at
-predicted_departure = now + estimated_pacer_wait + serialization_cost
-predicted_network_cost = path_delay_estimate + uncertainty_margin
-predicted_forwarding_cost = forwarding_age
-                          + estimated_pacer_wait
-                          + serialization_cost
-                          + predicted_network_cost
+```rust
+struct SenderOperatingPoint {
+    queue_delay_ceiling: Duration,
+    allocation_utilization: Ratio,
+    pacer_horizon: Duration,
+    new_frame_horizon: Duration,
+    rtx_extra_allowance: Duration,
+    probe_queue_impact: Duration,
+    governed_demand: MediaPayloadRate,
+}
 ```
 
-This is not claimed as capture-to-render latency. It is a conservative ranking
-and admission signal. Unknown decode/render cost and capture-to-ingress time
-remain outside the model.
+### Active sender definition
 
-The governor prefers dropping a complete frame that has not begun transmission.
-Cut-through forwarding means later pressure can still lose a packet from a
-started frame. In that case boundedness wins, the RTP gap remains visible, and
-statistics record post-admission damage. The controller must never create an
-unbounded commitment to finish an unknown-sized frame.
+A sender participates in strict path-level aggregation while any is true:
 
-### Operating-point derivation
+- `desired_bitrate > 0`;
+- it has queued or committed media;
+- it has useful retained retransmission work;
+- it has an active probe caused by its unmet demand.
 
-The governor derives one operating point per sender separately from per-packet
-usefulness. It does not continuously retune SCReAM for each packet.
+A sender with zero desired rate and no remaining work is inactive and cannot hold
+the path at its latency ceiling indefinitely.
 
-For a nonzero playout maximum, it first forms a conservative remaining-slack
-estimate from:
+### Operating-point curve
+
+For `playout_max > 0`, define:
 
 ```text
-observed_transport_floor = path_delay_estimate
-                         + receiver_feedback_uncertainty
-                         + serialization_floor
-
-policy_slack = playout_max
-             - observed_transport_floor
-             - decode_and_render_reserve
-             - unobserved_capture_and_uplink_reserve
+x = clamp((playout_max - 75 ms) / (500 ms - 75 ms), 0, 1)
 ```
 
-The last two reserves are uncertainty allowances, not claims that those remote
-costs are measured. Their policy curves and bounds are implementation tuning
-backed by browser and trace evidence. Missing or stale observations increase
-the reserves; uncertainty can never create apparent extra slack.
-
-`policy_slack` is mapped through a bounded monotonic curve to an urgency value.
-The curve has saturation at both ends: very large playout values stop relaxing
-network behavior after a quality-oriented cap, and values below the observable
-transport floor all produce the most urgent operating point. `0/0` bypasses
-the calculation and selects that most urgent point directly.
-
-Conceptually:
+Then:
 
 ```text
-urgency = urgency_curve(policy_slack, estimator_confidence)
-
-queue_delay_target = bounded_inverse_map(urgency,
-                                         low_queue_target,
-                                         quality_queue_cap)
-
-allocation_utilization = bounded_inverse_map(urgency,
-                                             low_latency_utilization,
-                                             quality_utilization_cap)
-
-pacer_horizon = bounded_inverse_map(urgency,
-                                    low_latency_horizon,
-                                    quality_horizon_cap)
-
-recovery_horizon = min(pacer_horizon + useful_rtx_allowance,
-                       policy_slack_bound)
+queue_delay_ceiling  = lerp(15 ms, 60 ms, x)
+allocation_utilization = lerp(0.80, 0.95, x)
+pacer_horizon        = lerp(15 ms, 80 ms, x)
+rtx_extra_allowance  = lerp(0 ms, 50 ms, x)
+probe_queue_impact   = lerp(5 ms, 20 ms, x)
+governed_demand      = desired_bitrate * allocation_utilization
 ```
 
-The symbolic bounds are private, versioned tuning values. They are not public
-configuration and are not inferred by simply multiplying `playout_max`. The
-relationships and saturation behavior are the contract.
+Interpolation uses integer fixed-point arithmetic with round-to-nearest ties-to-
+even. Values above `500 ms` saturate and never authorize larger network queues.
+Values at or below `75 ms` select the urgent endpoint. `0/0` bypasses the curve
+and selects the urgent endpoint plus the ASAP rules below.
 
-Each sender's base operating point changes on its policy updates, meaningful
-path-estimate changes, congestion transitions, and application-limited
-transitions. Small feedback noise is handled inside SCReAM and must not churn
-the governor. Sender operating points are then combined into the path operating
-point: queue-delay and probe-impact limits take the strictest active value,
-while utilization and recovery remain per sender. Downward safety changes apply
-immediately; upward changes are rate-limited over feedback rounds.
+`playout_min` does not alter SCReAM's queue target or create network capacity. It
+controls recovery classification and stability:
 
-Per-packet admission then combines the stable operating point with packet age,
-predicted departure, frame state, and recovery cost. This two-level design
-prevents an old packet from globally forcing the network controller into a
-different mode while still allowing that packet to be rejected as no longer
-useful.
+- predicted delivery before the minimum is comfortably recoverable;
+- delivery between minimum and maximum has linearly decaying utility;
+- delivery after the maximum has zero utility;
+- a fixed nonzero range requests stable playback and uses the slower upward
+  relaxation in the profile.
 
-The playout minimum affects recovery classification after the operating point
-is selected. A packet predicted to arrive before the minimum is considered
-comfortably recoverable. Arrival between minimum and maximum is best-effort and
-weighted by estimator confidence. Predicted arrival after the maximum is stale.
-None of these classifications can override the SCReAM safe window.
+The strictest `queue_delay_ceiling` and `probe_queue_impact` among active senders
+become the path values. Utilization, demand, frame/RTX usefulness, and service
+balance remain per sender.
+
+### Receiver-specific deadline derivation
+
+`MediaPacket.global_media_at` remains immutable and cluster-global. The egress
+connection privately derives usefulness for the selected receiver.
+
+For a nonzero playout maximum:
+
+```text
+receiver_reserve = media_kind_reserve + media_clock_uncertainty
+
+network_prediction = srtt / 2
+                   + current_queue_delay
+                   + clamp(max(5 ms, 2 * delay_variation), 5 ms, 50 ms)
+
+predicted_handoff = now_global
+                  + predicted_pacer_wait
+                  + serialization_time
+
+predicted_receiver_arrival = predicted_handoff + network_prediction
+
+comfortable_arrival = global_media_at
+                    + playout_min
+                    - receiver_reserve
+
+latest_useful_arrival = global_media_at
+                      + playout_max
+                      - receiver_reserve
+```
+
+All arithmetic is checked. Underflow makes the deadline already expired; overflow
+saturates to the maximum representable global time and is counted.
+
+A new frame is admitted only when its predicted receiver arrival is no later than
+`latest_useful_arrival` and its predicted pacer wait is no longer than the current
+sender pacer horizon. An RTX is admitted only when its predicted receiver arrival
+has positive utility and fits the SCReAM send window.
+
+This is a best-effort normalized media deadline, not proof of physical
+capture-to-render latency. Endpoint-to-first-edge uncertainty is already part of
+the server-anchored timeline and is reported separately.
+
+### `0/0` ASAP policy
+
+`0/0` does not construct `global_media_at + 0` as a literal deadline. It means:
+
+- do not queue a newly admitted packet longer than `15 ms`;
+- drop audio older than `100 ms` and video older than `150 ms` at admission;
+- retransmit only when immediate prediction says it can arrive before newer
+  replacement media and within the same age limit;
+- use the `15 ms` queue-delay ceiling and `0.80` allocation utilization;
+- never wait to fill a smoothing interval.
+
+### Dynamic policy changes
+
+Tightening takes effect in the same `Command::SetSenderPolicy` call:
+
+- the new playout extension value is scheduled for signaling;
+- private deadlines are recomputed from each queued packet's immutable
+  `global_media_at`;
+- not-yet-started stale video frames are removed whole;
+- obsolete RTX is removed;
+- governed demand, pacer horizon, and allocation may fall immediately;
+- the path queue-delay ceiling tightens immediately when this sender becomes the
+  strictest active sender.
+
+Relaxing follows the profile's per-RTT damping. It cannot release a burst, jump
+the SCReAM reference window, trust a stale estimate, or reconstruct dropped
+media.
 
 ### Required monotonicity
 
-For identical network, traffic, and other-sender state, reducing one sender's
-playout maximum must never:
+For identical network, packet, and other-sender state, reducing one sender's
+playout maximum MUST NOT:
 
-- Increase the SCReAM queue-delay target.
-- Increase media allocation utilization.
-- Increase pacer or admission horizons.
-- Extend retransmission usefulness.
-- Admit an older video frame that the looser policy rejected.
-- Permit a probe with greater predicted queue impact.
+- increase its or the path queue-delay ceiling;
+- increase its allocation utilization, governed demand, pacer horizon, or RTX
+  allowance;
+- admit an older frame rejected by the looser policy;
+- permit a probe with greater predicted queue impact;
+- increase SCReAM's native target or reference window.
 
-Increasing one sender's playout maximum may relax that sender's limits
-gradually, but can never increase the safe congestion window directly. It also
-cannot relax a path-level limit still required by another active sender. These
-properties are tested over the full supported playout range, not only named
-example profiles.
+Increasing a maximum may relax only that sender's private limits and only through
+damping. It cannot relax a path ceiling still required by another active sender.
 
-### Dynamic changes
+## Global media time and frame admission
 
-Tightening one sender takes effect immediately:
+The global timeline contract is defined in [`design.md`](design.md). Congestion-control code
+uses these additional invariants:
 
-- That sender's new playout value is scheduled for signaling.
-- Its not-yet-started queued video is re-evaluated.
-- Its obsolete retransmissions are removed.
-- Its queue, demand cap, and recovery horizons shrink.
-- Shared path limits tighten if it is now the strictest active sender.
-- Its allocation can fall immediately and unused capacity is redistributed.
+- all packets of one frame have identical `global_media_at`;
+- a transit packet's value is never changed;
+- source switching does not reset congestion state or sender policy;
+- a packet mapping behind an already committed outbound frame is stale rather
+  than an excuse to rewind RTP time;
+- RTP clock discontinuities are ingress clock-mapper events, not congestion
+  events;
+- global-clock uncertainty affects usefulness reserves, never network capacity.
 
-Relaxing is damped over feedback rounds. It must not release a burst, jump the
-reference window, or instantly trust a stale application-limited estimate.
-Already dropped media is never reconstructed merely because the policy became
-looser.
+The scheduler prefers dropping a complete not-yet-started frame. Cut-through
+forwarding means a started frame is not an unbounded commitment: later safety
+pressure may drop a remaining packet, leaving a visible RTP gap and a
+post-admission-damage counter.
 
-## Multi-stream allocation and priority
+When dependencies are known, dropping a required frame marks queued dependents
+ineligible until a random-access or otherwise independent frame restores the
+chain. `Unknown` dependencies permit only whole-current-frame decisions; the
+connection does not invent dependency relationships.
 
-SCReAM v2 defines one network congestion-control envelope and describes
-distribution of media rate by relative stream priority, while leaving the
-multi-stream scheduling algorithm to the sender. PulseBeam owns that missing
-layer because it has the sender identities, desired rates, latency policies,
-packet queues, and actual departure feedback needed to make the decision.
+## Media-capacity accounting and SCTP coordination
 
-Priority and latency are orthogonal:
+SCReAM's target is the upper bound for RTP media payload. SCTP has its own
+acknowledgments and congestion window. Version one coordinates them without
+pretending that RTP feedback acknowledged SCTP bytes.
 
-- Priority controls a sender's relative share when aggregate governed demand
-  exceeds safe media capacity.
-- Playout delay controls whether that sender's media is still useful and how
-  much headroom its bursty production requires.
-- High priority cannot make stale media useful or override congestion safety.
-- Low latency does not automatically grant a larger long-term share. If its
-  allocated rate is insufficient, the SFU must select a cheaper layer or pause
-  the sender, and the connection sheds media at that sender's live edge.
+The connection maintains:
 
-### Allocation
+```text
+rtp_safe_transport_rate =
+    target_media_payload_rate / aggregate_payload_efficiency
 
-On every material safe-rate, demand, or policy change, the allocator:
+observed_path_transport_rate =
+    delivered_rtp_transport_rate
+  + delivered_sctp_transport_rate
+  + delivered_protocol_control_transport_rate
 
-1. Starts with aggregate congestion-safe capacity after non-media transport
-   obligations and configured safety reserves.
-2. Applies each active sender's latency-derived utilization and demand cap.
-3. Distributes constrained capacity using weighted max-min fairness, capped by
-   each sender's governed desired bitrate.
-4. Immediately redistributes capacity a sender cannot use because it is paused,
-   application-limited, or demand-capped.
-5. Emits per-sender allocation changes with bounded hysteresis so the SFU does
-   not flap between adjacent layers on estimator noise.
+reserved_sctp_transport_rate =
+    max(sctp_acknowledged_rate_ewma,
+        bounded_immediately_admissible_sctp_rate)
 
-Weights express proportions, not reservations or guaranteed minimums. Two
-backlogged senders with equal governed demand and weights 1 and 4 should trend
-toward a 1:4 capacity split while both remain constrained. A sender capped below
-its share returns the excess to the active set. A positive weight prevents
-permanent scheduler starvation, but expired media can still be dropped.
+reserved_control_transport_rate =
+    max(16_000 bit/s, 1% of current total transport service)
+```
 
-The standards-aligned priority presets use weights 1, 2, 4, and 8. These match
-WebRTC's expectation that each priority level receives approximately twice the
-capacity of the level below while constrained. Custom bounded weights preserve
-the same relative-share semantics for SFU layouts that need more granularity.
+When `observed_path_transport_rate` has at least one RTT of credible samples:
 
-### Scheduling
+```text
+observed_media_transport_cap =
+    max(0,
+        observed_path_transport_rate
+      - reserved_sctp_transport_rate
+      - reserved_control_transport_rate)
 
-The packet scheduler is work-conserving inside the aggregate SCReAM window. It
-uses per-sender byte deficits derived from allocation and weight, while packet
-deadlines decide whether queued work remains eligible.
+media_transport_cap =
+    min(rtp_safe_transport_rate,
+        observed_media_transport_cap)
+```
 
-- Protocol control is outside media weighting and remains deliverable.
-- Each sender's original media, RTX, and FEC are charged to that sender.
-- A sender can consume otherwise idle capacity, but borrowed service is charged
-  to its deficit so it does not silently become a permanent priority boost.
-- Padding uses only capacity that no eligible real traffic can use.
-- Deadline expiration drops media rather than accumulating debt or queueing it
-  behind a higher-delay sender.
-- Audio and video receive configurable sender priorities. Connection defaults
-  can make audio high and video medium, but media kind is not an immutable
-  priority rule.
+Before that observation is credible, `media_transport_cap` is
+`rtp_safe_transport_rate`; SCTP remains bounded by its own controller and the
+scheduler's queue limits.
 
-DataChannels use their own channel policy and bounded SCTP scheduler. Their wire
-bytes still count against the same SCReAM envelope; they cannot bypass media
-congestion accounting or starve protocol control.
+Finally:
 
-### Policy changes
+```text
+available_media_payload_rate =
+    media_transport_cap * aggregate_payload_efficiency
+```
 
-- A priority change takes effect at the next scheduling decision. Existing
-  deficit is normalized and bounded so a promotion cannot release a burst and
-  a demotion cannot create unpayable debt.
-- Increasing desired bitrate does not grant capacity. It updates allocator
-  demand and may make connection-level probing useful.
-- Setting desired bitrate to zero rejects new media admission for that sender.
-  Already queued, in-flight, or useful retransmission work is drained or shed
-  under its existing deadlines; once no work remains, the sender becomes
-  inactive for path-latency aggregation.
-- Priority and desired-bitrate changes never reset path estimation, sent
-  history, transport sequence numbers, or RTP continuity.
+This construction reserves SCTP exactly once. SCTP transport bytes are never
+inserted into SCReAM sent history, never increase SCReAM RTP bytes-in-flight, and
+never appear as RTP delivery. Their queueing can still increase RTP delay and
+therefore cause a normal SCReAM response.
 
-## Pacing and admission
+A data-only connection uses SCTP congestion control and the bounded DataChannel
+scheduler; the RTP SCReAM core remains unproven/inactive until RTP demand exists.
 
-The SCReAM safe rate, reference window, aggregate path operating point, and
-per-sender operating points jointly control pacing.
+## Weighted media allocation
 
-- Protocol control remains deliverable under media load.
-- Sender allocations and priorities protect important streams from unrelated
-  media bursts.
-- Retransmissions are admitted only while useful and still count against the
-  connection's congestion budget.
-- DataChannel traffic is congestion-accounted and bounded; it cannot consume
-  reserved protocol service or allocated media capacity indefinitely.
-- Video uses packet-level cut-through forwarding and frame-aware admission.
-- Padding is always lowest-value traffic and disappears immediately when real
-  traffic or congestion needs the budget.
+On a material safe-rate, demand, policy, or activity change, the allocator:
 
-Pacing headroom permits short encoder or forwarded-frame bursts to drain
-without setting the long-term media allocation equal to the burst rate. It is
-always constrained by bytes in flight and current delay signals. A low-latency
-policy should normally reserve more average-rate headroom while allowing safe
-short serialization bursts.
+1. computes `available_media_payload_rate`;
+2. computes each active sender's governed demand from the latency governor;
+3. distributes capacity with weighted max-min fairness, capped by governed demand;
+4. redistributes capacity unused by paused, demand-capped, or application-limited
+   senders;
+5. applies the fixed event hysteresis without delaying downward safety changes.
 
-The aggregate and per-sender bitrates exposed to the SFU are the rates at which
-it can sustainably admit media under current latency and priority policies.
-Their sum can be lower than the raw SCReAM target. This is intentional: low
-latency is purchased partly by leaving room for VBR bursts rather than filling
-every estimated bit with average layer allocations.
+### Exact water-filling algorithm
 
-## Probing and silence
+For active sender set `S`, capacity `C`, governed demand `d_i`, and positive weight
+`w_i`:
 
-SCReAM v2 does not remove the need for active observations when the source is
-silent. PulseBeam owns a probe manager integrated with the latency governor and
-pacer.
+```text
+allocation_i = 0
+remaining_capacity = C
+U = S
 
-### SSRC zero
+while U is not empty and remaining_capacity > 0:
+    share_unit = remaining_capacity / sum(w_j for j in U)
+    capped = { i in U | d_i - allocation_i <= w_i * share_unit }
 
-- Egress SSRC-zero padding can probe after SRTP is ready and before the first
-  media packet.
-- Probe packets receive ordinary transport sequence numbers and are processed
-  by the same feedback and departure machinery as media.
-- An ingress SSRC-zero packet contributes arrival and transport feedback only.
-  It never creates an encoding, sender, media event, RTP stream, or keyframe
-  state.
+    if capped is empty:
+        allocation_i += w_i * share_unit for every i in U
+        remaining_capacity = 0
+    else:
+        for i in capped:
+            grant = d_i - allocation_i
+            allocation_i += grant
+            remaining_capacity -= grant
+            remove i from U
+```
 
-### Probe lifecycle
+Arithmetic uses unsigned fixed-point bits per second; the final remainder from
+rounding is distributed one bit/s at a time by ascending `SenderId`. This makes
+simulation deterministic.
 
-Probes are considered when:
+Weights express proportions, not guarantees. Two equally backlogged senders with
+weights `1` and `4` converge to a 1:4 media-payload split while both remain
+constrained. A capped sender returns unused capacity. A positive weight prevents
+scheduler starvation while eligible, but expired media can still be dropped.
 
-- The connection first becomes writable.
-- Desired bitrate materially exceeds the credible available bitrate.
-- VBR media has left the controller application-limited long enough that
-  capacity confidence is decaying.
-- Every media stream is paused but the SFU still has nonzero desired demand.
-- A previous congestion response has stabilized and evidence is needed before
-  recovering allocation.
+Priority changes apply at the next scheduling decision. Existing service balance
+is normalized to at most one scheduler quantum in either direction, preventing a
+promotion burst or unpayable demotion debt. Priority changes never alter SCReAM
+state.
 
-A probe is bounded by the safe send window, current queue delay, playout-derived
-queue-impact limit of the strictest active sender, and configured overhead
-budget. It aborts on delay growth, loss, departure failure, stale feedback, or
-real media arrival that consumes the budget. Probe traffic never forces
-admitted media past any active sender's latency horizon.
+Setting desired bitrate to zero rejects new media admission for that sender.
+Already queued, committed, or useful RTX work drains or is shed under existing
+deadlines. Once no work remains, the sender becomes inactive for path latency
+aggregation.
 
-Probing remains connection-level. It tests shared path capacity rather than a
-sender's allocation. Unmet desired rates and priorities determine whether more
-capacity would be useful, then successful evidence is returned to the allocator
-for a new weighted distribution.
+## Pacer and top-level scheduler
 
-Pre-media probing must not depend on a prior media SSRC, prior RTP timestamp, or
-packet history. Periodic probing must not inflate the estimate merely because
-the application cannot produce the probed rate.
+The pacer is work-conserving only inside all active safety constraints:
 
-## Controller states
+- SCReAM send-window/reference-window rules;
+- transport pacing rate;
+- path and per-sender pacer horizons;
+- sender allocation/service balance;
+- frame and RTX usefulness;
+- protocol and DataChannel bounds.
 
-The implementation does not need a public state enum, but its behavior must be
-equivalent to these phases:
+### Service classes
 
-1. **Unproven:** Transport is writable but no valid packet feedback exists.
-   Use a conservative initial envelope and bounded SSRC-zero probing.
-2. **Learning:** Initial or recovery observations are arriving. Increase only
-   from delivered evidence.
-3. **Steady:** Delay, loss, and delivery estimates are credible. Track the path
-   and current aggregate path operating point.
-4. **Application-limited:** Offered traffic is insufficient to test capacity.
-   Freeze unsupported growth and use demand-aware periodic probing.
-5. **Congested:** Queue growth, sustained loss, or valid ECN requires backoff.
-   Stop probes, reduce the window, and shed stale video.
-6. **Feedback-stale:** Sent packets lack timely feedback. Stop growth and
-   probes, reduce confidence, and apply a conservative bounded envelope.
+Selection has four bounded classes:
 
-A selected-path change resets path baseline, reference-window confidence,
-in-flight history that cannot apply to the new path, and probe state. It retains
-every sender's playout, priority, and desired-bitrate policy.
+1. ICE, DTLS, SCTP association control, and RTCP required for liveness or
+   congestion feedback;
+2. governed user traffic, consisting of an RTP lane and an SCTP-user-data lane;
+3. non-urgent reports/control;
+4. RTP padding probes.
+
+Class 1 can preempt user traffic but normally consumes only the fixed control
+reserve. Class 4 is selected only when every real-traffic lane is empty or blocked.
+
+The two class-2 lanes are **not** strict-priority ordered. A transport-byte deficit
+scheduler gives the RTP lane service at `media_transport_cap` and the SCTP lane
+service at `reserved_sctp_transport_rate`, subject respectively to the SCReAM send
+window and SCTP congestion window. An eligible nonempty lane receives at least one
+path-MTU quantum during each `max(100 ms, srtt)` interval, unless its own
+congestion controller or deadline makes every packet ineligible. Borrowed idle
+service is charged to the borrowing lane's deficit.
+
+Within the RTP lane, one media-payload deficit is maintained per `SenderId`.
+Original media, RTX, and FEC are charged to that sender. Packet deadlines determine
+eligibility before deficit selection. A sender can borrow otherwise idle service,
+but borrowed payload is charged to its balance and cannot become a permanent
+priority boost.
+
+Within the SCTP lane, `dcsctp` applies the negotiated RFC 8260 scheduler and the
+public 16-bit DataChannel weights. SCTP user data cannot bypass its association
+congestion window merely because the top-level lane has service.
+
+The pacer charges final emitted transport bytes. Payload allocation and transport
+pacing therefore remain consistent even when header/RTX overhead differs between
+senders.
+
+### Frame behavior
+
+- A complete not-yet-started stale frame is removed atomically.
+- A key/random-access frame is not immune to congestion safety; it receives only
+  usefulness-aware preference.
+- A started frame may be completed only while every next packet remains inside
+  the send window, queue bound, and deadline. Unknown final frame size never
+  creates an unbounded commitment.
+- Padding disappears immediately when any eligible real traffic needs service.
+- Protocol control remains deliverable under a large media keyframe.
+
+## Probing
+
+The probe manager is a PulseBeam extension around the self-contained SCReAM core.
+It tests shared RTP path capacity only when greater capacity would be useful.
+
+### Probe SSRC and packet form
+
+- A probe uses ordinary RTP padding on an already negotiated outbound media SSRC
+  or its negotiated RTX SSRC.
+- RTX SSRC is preferred when its negotiated payload/extension form supports
+  pure padding before original media; otherwise the media SSRC is used.
+- The packet carries the selected feedback extension and ordinary outbound
+  sequence continuity.
+- No SSRC-zero entity, encoding, event, RTP stream, timestamp source, or keyframe
+  state exists.
+- Pre-media probing does not require a prior source RTP timestamp. Padding does
+  not create or advance `GlobalMediaTime` or frame state.
+
+With multiple candidates, the probe manager chooses the active sender with the
+largest weighted unmet governed demand that has a valid padding form. Probe
+results remain connection-level and are redistributed by the allocator.
+
+### Eligibility and lifecycle
+
+A probe may begin when:
+
+- the path first becomes writable and RTP desired demand is nonzero;
+- governed demand exceeds credible allocation by both fixed trigger thresholds;
+- VBR or paused traffic has left capacity confidence decaying;
+- all media is paused while nonzero desired demand remains;
+- a congestion response has stabilized and evidence is needed before recovery.
+
+The exact cluster size, interval, overhead, and success criteria are fixed in the
+profile. One cluster aborts immediately on:
+
+- effective queue target violation or the configured queue rise;
+- configured probe loss;
+- stale feedback;
+- selected-path change;
+- send-window contraction that removes budget;
+- real media arrival that consumes the remaining service;
+- connection close.
+
+A successful observation is evidence supplied to the normal SCReAM growth logic;
+it does not directly set a bitrate or reference window. A failed/aborted probe can
+reduce confidence but cannot increase rate. Periodic probes cannot inflate the
+estimate merely because the application cannot sustain the probed rate.
+
+## Controller classifications and transitions
+
+The implementation may encode these as flags rather than a public enum, but its
+behavior MUST be equivalent.
+
+| Classification | Entry | Required behavior | Exit |
+| --- | --- | --- | --- |
+| Unproven | RTP path writable, no feedback for a committed RTP packet | Initial target, bounded pre-media probe, no evidence-free growth | First valid packet feedback |
+| Learning | Valid feedback exists but fewer than three feedback rounds or one smoothed RTT of delivery | Grow only from delivered evidence | Evidence threshold met, or congestion/staleness |
+| Steady | Credible feedback and offered load | Follow pinned SCReAM and governed policy | ALR, congestion, stale feedback, or path change |
+| Application-limited | Offered RTP below 85% threshold for 200 ms with no pacing/window block | Freeze unsupported growth, decay confidence, demand-aware probes | Offered load recovers or another state dominates |
+| Congested | Pinned SCReAM queue/loss/ECN response triggers | Stop probes, back off, shed stale video/RTX | Pinned recovery conditions hold |
+| Feedback-stale | No covering feedback by stale threshold | Stop growth/probes, decay confidence, conservative envelope | One valid covering report; return through Learning |
+
+A selected-path replacement returns RTP control to `Unproven`, clears feedback
+and in-flight entries that cannot apply to the new path, resets baseline/probes,
+and preserves sender policy, desired rates, priorities, global media timestamps,
+and outbound RTP identity where protocol continuity permits.
 
 ## Failure and ambiguity handling
 
-- Reordered feedback updates delivery state once and cannot acknowledge the
-  same bytes twice.
-- Feedback for unknown or abandoned transport sequence numbers is ignored and
-  counted without allocating state.
-- A receiver feedback pause cannot increase available bitrate.
-- A delayed feedback batch is separated from forward-path delay where possible;
-  it must not be interpreted wholly as network queue growth.
-- Clock drift or a persistent baseline shift triggers bounded baseline recovery,
-  not indefinite queue-target inflation.
-- Isolated random loss slows unsupported growth but does not necessarily cause
-  a full congestion backoff. Persistent loss or loss combined with queue growth
-  does.
-- ECN bleaching or inconsistent ECN reporting disables ECN use. Baseline
-  delay/loss control continues.
-- A rate policer is treated as a path condition: probing becomes conservative
-  and repeated burst loss cannot be answered by ever larger probes.
-- Congestion-control failure alone is not a reason to emit unbounded per-packet
-  events. Counters and coherent snapshots carry diagnostics.
+- Duplicate or overlapping feedback acknowledges one committed data unit at most
+  once.
+- Unknown, abandoned, pre-history, or future packet IDs are ignored and counted.
+- RFC 8888 report progression remains per SSRC.
+- A receiver feedback pause cannot increase any rate, window, or probe budget.
+- Delayed/batched feedback is separated from forward-path delay where the format
+  permits and is never interpreted wholly as queue growth.
+- Clock drift or a persistent delay-baseline shift triggers bounded draft-defined
+  recovery, not queue-target inflation.
+- Isolated random loss may slow unsupported growth; repeated loss or loss with
+  queue growth causes the pinned congestion response.
+- An external rate policer is a path condition. Repeated burst loss makes probes
+  more conservative and cannot be answered by ever larger clusters.
+- A caller-side failure after `Transmit` is ordinary apparent packet loss. There
+  is no rollback or missing-receipt state.
+- Controller faults produce bounded counters and one actionable warning/state
+  transition, never unbounded per-packet events.
 
-## Data-oriented state and bounds
+## Dense state and hard bounds
 
-Controller state is connection-local and aggregate. Hot feedback processing
-uses dense bounded rings indexed by unwrapped transport sequence number rather
-than per-packet heap objects or unbounded maps.
+Hot sent/feedback processing uses dense rings indexed by unwrapped packet identity,
+not per-packet heap objects or unbounded hash maps. Per-sender state uses dense
+arrays indexed internally from `SenderId`.
 
-Per-sender policy, allocation, deficit, queue summary, and latency state use
-dense arrays indexed by stable `SenderId`. Removing or closing a sender clears
-its active allocation state without scanning unrelated connections.
+Version-one hard internal bounds are:
 
-At minimum, configuration bounds:
+| State | Bound |
+| --- | ---: |
+| Negotiated outbound RTP senders | `128` |
+| Sent RTP entries | `32_768` and `5 s` |
+| Feedback statuses accepted per RTCP packet | `8_192` |
+| Acknowledgment reordering window | `4_096` |
+| Paced RTP packets | `8_192` |
+| Paced RTP transport bytes | `8 MiB` and public configured limit |
+| Pacer time horizon | `100 ms` |
+| Retained RTX age | `2 s` |
+| Retained RTX bytes | public configured limit |
+| Active probe clusters | `1` |
+| Probe history | `64` records |
+| Direct frame dependencies | `8` |
+| Delay samples | `4_096` and `10 s` |
+| Rate samples per category | `2_048` and `5 s` |
+| Expirations processed per `poll` | `256` |
 
-- Sent-packet history duration and entry count.
-- Maximum acknowledged reordering window.
-- Feedback report span.
-- Outstanding departure receipts.
-- Probe history and concurrent probe clusters.
-- Pacer bytes, packets, and queue horizon.
-- Retransmission history by bytes and age.
-- Rate and delay sample windows.
+When both a count and duration/byte bound apply, the first reached wins. Expiration
+advances monotonically. A ring slot validates packet generation before reuse.
+Network input receives release-mode validation; internal generation invariants
+also have debug assertions.
 
-The sent ring stores only facts needed by feedback, accounting, retransmission,
-and metrics. Expiration advances monotonically. Wraparound is validated before
-an entry is reused, with debug assertions for internal generation and sequence
-invariants and release checks for network input.
+Reaching a media queue bound rejects new application admission or sheds whole
+not-yet-started stale frames according to policy. Reaching feedback/history bounds
+drops oldest no-longer-actionable diagnostic state, never still-required
+congestion accounting. If preserving required accounting is impossible, the
+connection enters a conservative terminal resource-exhaustion error rather than
+continuing with false low bytes-in-flight.
 
-No state is shared between connections. Scaling many connections is the
-caller's scheduling problem; each connection contributes one earliest wakeup
-and performs work proportional to new input, expired bounded state, or emitted
-output.
+No state is shared across connections. Scaling many connections is the caller's
+scheduling problem. Each connection contributes one earliest wakeup and bounded
+work.
 
-## Statistics
+## Statistics contract
 
-Statistics are coherent snapshots. They do not register a metrics backend.
-The snapshot should make controller behavior explainable without exposing
-mutable internals.
+Statistics are coherent snapshots. They expose semantic scalar values and reason
+codes, not mutable controller objects.
 
-Required connection-level observations include:
+### Connection-level observations
 
-- Raw SCReAM target rate and governed available bitrate.
-- Aggregate observed sending, desired, and allocated bitrate.
-- Reference window, allowed bytes in flight, and actual bytes in flight.
-- Pacing rate, paced queue bytes, predicted pacer delay, and oldest media age.
-- Baseline delay, queue delay, smoothed RTT, feedback hold, delivery rate, and
-  estimator confidence.
-- Application-limited, feedback-stale, probing, and congestion state.
-- Probe attempts, successful observations, sent bytes, aborted probes, and
-  abort reasons.
-- Reported, recovered, reordered, unknown, and congestion-classified loss.
-- Pre-admission frame drops, post-admission packet drops, deadline misses, and
-  retransmissions skipped as no longer useful.
-- Successful, failed, missing, and late departure receipts.
-- Whether TWCC or another normalized feedback mode is active and whether ECN is
-  usable.
+- packet-feedback mode and ECN usability;
+- raw controller target and governed available RTP media-payload rates;
+- aggregate desired, allocated, admitted, and transmitted media-payload rates;
+- RTP, RTCP, SCTP, ICE/DTLS, and padding transport rates;
+- payload-efficiency values and conversion overhead;
+- native/effective queue targets, reference window, allowed/actual RTP
+  bytes-in-flight, and pacing rate;
+- paced queue bytes/packets, predicted delay, and oldest media age;
+- baseline/queue delay, variation, smoothed RTT, feedback hold, delivery rate,
+  loss classes, and confidence;
+- controller classifications and transition reasons;
+- SCTP acknowledged/admitted reserve and observed total transport rate;
+- probe attempts, successes, transport bytes, aborts, and abort reasons;
+- pre-admission frame drops, post-admission packet damage, deadline misses,
+  dependency drops, RTX outcomes, and padding;
+- unknown/duplicate/reordered feedback and every hard-bound high-water mark;
+- caller clock regressions and global-time/deadline arithmetic saturation.
 
-Required per-sender observations include:
+### Per-sender observations
 
-- Requested playout minimum and maximum, last change time, and whether that
-  sender's current value is acknowledged by the receiver.
-- Priority weight, desired bitrate, governed demand cap, observed sending rate,
-  and current allocation.
-- Active/inactive and application-limited classification.
-- Queue bytes, oldest packet age, predicted pacer delay, and deficit or service
-  balance.
-- Effective admission and retransmission horizons.
-- Pre-admission frame drops, post-admission packet loss, deadline misses,
-  retransmission outcomes, and allocation-change reason.
+- requested playout range and extension acknowledgment state;
+- priority weight, desired media-payload rate, utilization, governed demand,
+  allocation, admitted rate, and transmitted rate;
+- queue-delay ceiling, pacer horizon, private latest useful horizon, and RTX
+  allowance;
+- active/application-limited classification and service balance;
+- queue bytes/packets, oldest global media age, source switches, timestamp-stale
+  drops, whole-frame drops, dependency drops, deadline misses, and RTX outcomes;
+- allocation-change reason and hysteresis state.
 
-Per-transmit metadata retains ingress receive time through the departure
-receipt so the caller can record arbitrary forwarding-latency distributions.
-The crate may also expose cumulative delay buckets, but those are not a
-substitute for the receipt correlation needed by rich metrics.
+The snapshot may use stable public enums for reason categories, but no field is
+named after a private SCReAM C++/draft variable except where the semantic concept
+itself is useful (`reference_window`, for example).
 
 ## Validation
 
-The implementation is accepted through deterministic crate-local simulation,
-component comparison, and live browsers. Workspace tests are outside this
-project.
+Acceptance uses deterministic crate-local simulation, property tests, component
+comparison, and live browsers. Workspace-wide tests are outside this project.
 
 ### Property tests
 
-- Per-sender playout-policy monotonicity across the full valid range while
-  holding network and other-sender state constant.
-- Tightening one active sender cannot relax a shared path constraint; making
-  that sender inactive allows another active sender to determine the path
-  constraint.
-- Weighted allocation is capped by desired rates, conserves available media
-  capacity, redistributes unused shares, and converges to configured relative
-  weights under sustained equal demand.
-- Priority changes cannot alter the aggregate SCReAM safe window.
-- No successful departure means no TWCC sent-history entry or in-flight bytes.
-- Every acknowledged byte was previously reported as departed exactly once.
-- In-flight bytes remain within the active send-window policy, except for
-  explicitly bounded accounting races around batched departure results.
-- Tightening latency cannot retain a frame or retransmission rejected by the
-  same state under a looser policy.
-- Application-limited traffic cannot cause unsupported window growth.
-- Unknown, duplicate, reordered, and wrapped feedback cannot corrupt the sent
-  ring.
-- One connection always exposes one next wakeup regardless of stream count.
+- Reducing a sender's playout maximum satisfies every monotonicity property across
+  all `0..=4095` ticks.
+- Tightening one active sender cannot relax a shared path ceiling; making it
+  inactive permits the next strictest active sender to control it.
+- `effective_queue_delay_target <= native_queue_delay_target` always.
+- Weighted allocation is demand-capped, capacity-conserving, deterministic, and
+  converges to configured ratios.
+- Priority or desired-rate changes never reset SCReAM, sent history, transport
+  sequence space, or RTP continuity.
+- Every acknowledged RTP transport byte corresponds to one previously committed
+  sent entry and is acknowledged once.
+- SCTP bytes never enter SCReAM sent history or RTP bytes-in-flight.
+- Payload and transport accounting round trips without double-counting overhead.
+- Feedback-stale and application-limited states cannot cause unsupported growth.
+- Unknown, duplicate, reordered, wrapped, and per-SSRC RFC 8888 feedback cannot
+  corrupt rings or acknowledgment progression.
+- Paced queues, histories, dependency lists, and per-poll work remain within every
+  hard bound.
+- Policy changes recompute private deadlines but never mutate
+  `MediaPacket.global_media_at`.
+- Outbound RTP timestamps never rewind across source switches.
+- One connection always exposes at most one next wakeup regardless of sender count.
 
 ### Deterministic network scenarios
 
-- Startup with media, startup before media, and delayed first feedback.
-- Constant-rate, strongly VBR, large keyframe, screen-share, audio-only, and
-  fully paused traffic.
-- Bandwidth steps in both directions and rapid wireless capacity variation.
-- Low and high RTT, changing RTT, receiver feedback batching, and feedback loss.
-- Uniform random loss, burst loss, reordering, duplication, and path-MTU-sized
-  packets.
-- Tail-drop queues, active queue management, rate policers, and competing
-  CUBIC/BBR-like flows.
-- Optional L4S/ECN paths plus bleaching and fallback to non-ECN behavior.
-- Independent playout ranges tightened and relaxed while other senders, queues,
-  retransmissions, and probes are active.
-- Multiple simultaneous audio/video senders with equal, skewed, and changing
-  priorities and desired rates.
-- A highly important buffered stream sharing a path with a low-priority
-  zero-playout-delay stream, in both constrained and unconstrained conditions.
-- Missing, failed, late, and batched departure receipts.
-- Selected-path replacement and delay-baseline reset.
+The corpus includes:
 
-The primary outcomes are delivered useful media, p50/p95/p99 forwarding delay,
-network queue delay, freeze duration, startup and post-pause convergence,
-deadline damage, probe overhead, loss, fairness, and utilization. Pass
-thresholds must be fixed against the trace corpus before tuning a candidate so
-tests do not simply encode the latest constants.
+- startup with media, startup before media, and delayed first feedback;
+- constant rate, strong VBR, large keyframes, screen sharing, audio-only, and all
+  media paused;
+- bandwidth steps and rapid wireless capacity variation;
+- low/high/changing RTT, receiver feedback batching, feedback loss, and stale
+  recovery;
+- uniform random loss, burst loss, reordering, duplication, and wraparound;
+- tail-drop, AQM, rate policers, and competing CUBIC/BBR-like flows;
+- optional RFC 8888 ECN/L4S paths, bleaching, and fallback;
+- independent playout policies changing while queues, RTX, probes, and other
+  senders are active;
+- equal/skewed/changing priorities and desired rates;
+- simultaneous SCTP and RTP load, large fragmented messages, and DataChannel
+  priority changes;
+- source switches with unrelated RTP timestamps but continuous global media time;
+- provisional, synchronized, absent, contradictory, and discontinuous RTCP SR
+  mappings;
+- UDP and fallback ICE-TCP transport commit behavior;
+- selected-path replacement and baseline reset.
+
+### Quantitative acceptance
+
+For deterministic scenarios whose configured bottleneck and propagation model are
+known:
+
+- the internal effective queue target never exceeds the strictest active ceiling;
+- after convergence, controlled-bottleneck p99 queue delay is no more than the
+  effective target plus `10 ms`, except during a declared path step or probe;
+- a sustained equal-demand weighted allocation is within `10%` of its expected
+  ratio after `5` smoothed RTTs;
+- probe overhead never exceeds the fixed rolling `5%` bound;
+- no target/window growth occurs while feedback is stale;
+- no queue/history/resource count exceeds its hard bound;
+- tightening latency never improves utilization by retaining work the looser
+  policy rejected;
+- SCTP/media accounting differs from independently summed emitted transport bytes
+  by at most integer-rounding error;
+- source switching produces no backward outbound RTP timestamp and no reset of
+  feedback history.
+
+The primary reported outcomes are useful delivered media, p50/p95/p99 global
+media age at `Transmit`, queue delay, freeze duration, startup/post-pause
+convergence, deadline damage, probe overhead, loss, fairness, and utilization.
+Scenario pass thresholds are committed before tuning a candidate profile.
 
 ### External evidence
 
-Live Chrome and Firefox sessions must prove negotiation, TWCC feedback, RTP and
-RTX behavior, pre-media SSRC-zero probing, independent per-sender playout-delay
-updates, priority reallocation, pause/resume, and sustained VBR forwarding.
-Stored SDP cannot prove these behaviors.
+Pinned current Chrome and Firefox sessions MUST prove:
 
-GCC and current libwebrtc SCReAM traces are comparison oracles, not production
-dependencies and not independent browser evidence. PulseBeam-specific behavior
-is accepted only when the same deterministic scenario demonstrates the intended
-latency/quality improvement without a congestion-safety regression.
+- negotiation and selected TWCC feedback;
+- RTP, RTCP, NACK, and RTX behavior;
+- pre-media padding on negotiated media/RTX SSRCs;
+- independent per-sender playout-delay signaling and acknowledgment;
+- priority reallocation, pause/resume, sustained VBR, and source switching;
+- DataChannel coexistence and priority under RTP load;
+- graceful close and fallback ICE-TCP behavior.
 
-## References
+RFC 8888 behavior is proven with a standards test peer until ordinary browser
+support is an acceptance target. Stored SDP cannot prove any runtime behavior.
+Ericsson/libwebrtc traces are comparison oracles, not production dependencies or
+independent browser evidence. A PulseBeam deviation is accepted only when the
+same deterministic scenario demonstrates its intended latency/quality benefit
+without violating congestion safety or the fixed bounds.
 
-- [SCReAM v2 Internet-Draft](https://datatracker.ietf.org/doc/draft-ietf-ccwg-rfc8298bis-screamv2/)
+## Primary references
+
+- [SCReAM v2, pinned revision 01](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-rfc8298bis-screamv2-01)
 - [Ericsson SCReAM reference implementation](https://github.com/EricssonResearch/scream)
 - [libwebrtc SCReAM implementation](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/congestion_controller/scream/)
 - [libwebrtc SCReAM implementation differences](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/congestion_controller/scream/g3doc/implementation_diff.md)
 - [libwebrtc transport-wide congestion-control extension](https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/transport-wide-cc-02/README.md)
-- [RFC 8835 WebRTC media transport priority](https://datatracker.ietf.org/doc/html/rfc8835)
-- [RFC 8888 congestion-control feedback](https://www.rfc-editor.org/rfc/rfc8888.html)
+- [RFC 3550: RTP/RTCP](https://www.rfc-editor.org/rfc/rfc3550.html)
+- [RFC 8835: WebRTC media transport priority](https://www.rfc-editor.org/rfc/rfc8835.html)
+- [RFC 8888: RTP congestion-control feedback](https://www.rfc-editor.org/rfc/rfc8888.html)
+- [RFC 8260: SCTP stream schedulers and message interleaving](https://www.rfc-editor.org/rfc/rfc8260.html)
+- [RFC 8831: WebRTC DataChannels](https://www.rfc-editor.org/rfc/rfc8831.html)
+- [RFC 8832: WebRTC DataChannel establishment](https://www.rfc-editor.org/rfc/rfc8832.html)
 - [libwebrtc playout-delay extension](https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md)
