@@ -1,11 +1,8 @@
-use std::{
-    net::SocketAddr,
-    time::{Duration, Instant},
-};
+use std::{any::TypeId, time::Duration};
 
 use pulsebeam_rtc::{
-    ChannelId, DatagramProtocol, EgressSlot, IngressDatagram, IngressStream, MaxMessageSize,
-    MediaPacket, RtcConfiguration, RtcConnectionState, RtcEvent, RtcPeer, RtcPeerError,
+    Connection, ConnectionConfig, ConnectionLimits, DataChannelId, FrameDependencies, FrameId,
+    GlobalMediaTime, IceTcpFlowId, MediaPacket, MediaPriority, PlayoutDelay, PolicyError,
 };
 
 fn assert_send<T: Send>() {}
@@ -28,119 +25,110 @@ macro_rules! assert_not_impl {
     };
 }
 
+assert_not_impl!(Connection, Sync);
 assert_not_impl!(MediaPacket, Sync);
 
 #[test]
-fn facade_types_compile_for_external_consumers() {
-    assert_send::<RtcPeer>();
+fn facade_values_are_send_but_connection_owned_values_are_not_sync() {
+    assert_send::<Connection>();
     assert_send::<MediaPacket>();
 }
 
 #[test]
-fn checked_inputs_reject_invalid_values() {
-    assert!(IngressStream::new(0).is_none());
-    assert!(EgressSlot::new(0).is_none());
-    assert_eq!(ChannelId::new(0).expect("stream zero is valid").get(), 0);
-    assert_eq!(
-        pulsebeam_rtc::DataChannel::new(0)
-            .expect("stream zero is valid")
-            .get(),
-        0
-    );
-    assert_eq!(
-        IngressStream::new(7)
-            .expect("nonzero stream IDs are valid")
-            .get(),
-        7
-    );
-    assert_eq!(
-        EgressSlot::new(9)
-            .expect("nonzero slot IDs are valid")
-            .get(),
-        9
-    );
-    assert_eq!(
-        ChannelId::new(11)
-            .expect("nonzero channel IDs are valid")
-            .get(),
-        11
-    );
-
-    let configuration = RtcConfiguration::new(1, 1, 1, 1).expect("positive bounds are valid");
-    assert_eq!(configuration.max_ingress_streams(), 1);
-    assert_eq!(configuration.max_egress_slots(), 1);
-    assert_eq!(configuration.max_events(), 1);
-    assert_eq!(configuration.max_transmissions(), 1);
-    assert!(RtcConfiguration::new(1, 1, 1, 0).is_none());
-    assert!(RtcConfiguration::new(513, 1, 1, 1).is_none());
-    assert!(RtcConfiguration::new(1, 513, 1, 1).is_none());
-
-    let endpoint = SocketAddr::from(([127, 0, 0, 1], 4000));
-    assert!(IngressDatagram::new(DatagramProtocol::Udp, endpoint, endpoint, Vec::new()).is_none());
+fn stable_identifiers_are_nominally_distinct() {
+    assert_ne!(TypeId::of::<DataChannelId>(), TypeId::of::<FrameId>());
+    assert_ne!(TypeId::of::<FrameId>(), TypeId::of::<IceTcpFlowId>());
+    assert_eq!(DataChannelId::from_value(7).value(), 7);
+    assert_eq!(FrameId::from_value(9).value(), 9);
+    assert_eq!(IceTcpFlowId::from_value(11).value(), 11);
 }
 
 #[test]
-fn data_channel_maximum_is_explicit() {
-    assert_eq!(MaxMessageSize::default(), MaxMessageSize::Default);
+fn global_media_time_has_exact_big_endian_wire_representation() {
+    assert_eq!(GlobalMediaTime::from_micros(0).to_be_bytes(), [0; 8]);
     assert_eq!(
-        MaxMessageSize::finite(65536),
-        Some(MaxMessageSize::finite(65536).expect("finite size"))
+        GlobalMediaTime::from_micros(1).to_be_bytes(),
+        [0, 0, 0, 0, 0, 0, 0, 1]
     );
-    assert_eq!(MaxMessageSize::finite(0), None);
-    assert!(MaxMessageSize::Unlimited.is_unlimited());
-}
-
-#[test]
-fn close_preserves_bounds_and_reports_terminal_facts() {
-    let configuration = RtcConfiguration::new(1, 1, 1, 1).expect("positive bounds are valid");
-    let mut peer = RtcPeer::new(configuration);
-    let now = Instant::now();
-
-    assert_eq!(peer.state(), RtcConnectionState::Configured);
-    assert_eq!(peer.next_deadline(), None);
-    assert!(peer.poll_transmit().is_none());
     assert_eq!(
-        peer.close(now, pulsebeam_rtc::CloseReason::Application),
-        Err(RtcPeerError::QueueFull)
+        GlobalMediaTime::from_micros(u64::MAX).to_be_bytes(),
+        [u8::MAX; 8]
     );
-    assert_eq!(peer.state(), RtcConnectionState::Configured);
-    assert_eq!(peer.close_reason(), None);
-    assert!(matches!(
-        peer.poll_event(),
-        Some(RtcEvent::ConnectionStateChanged(
-            RtcConnectionState::Configured
-        ))
-    ));
 
-    peer.close(now, pulsebeam_rtc::CloseReason::Application)
-        .expect("space is available after polling");
-    assert_eq!(peer.state(), RtcConnectionState::Closed);
+    let encoded = 0x0102_0304_0506_0708_u64.to_be_bytes();
     assert_eq!(
-        peer.close_reason(),
-        Some(pulsebeam_rtc::CloseReason::Application)
+        GlobalMediaTime::from_be_bytes(encoded).as_micros(),
+        0x0102_0304_0506_0708
     );
-    assert!(matches!(
-        peer.poll_event(),
-        Some(RtcEvent::Closed(pulsebeam_rtc::CloseReason::Application))
-    ));
-    assert!(peer.poll_event().is_none());
     assert_eq!(
-        peer.close(now, pulsebeam_rtc::CloseReason::Timeout),
-        Err(RtcPeerError::Closed)
+        GlobalMediaTime::from_micros(u64::MAX).checked_add(Duration::from_micros(1)),
+        None
+    );
+    assert_eq!(
+        GlobalMediaTime::from_micros(0).checked_sub(Duration::from_micros(1)),
+        None
     );
 }
 
 #[test]
-fn close_rejects_backward_time() {
-    let mut peer = RtcPeer::new(RtcConfiguration::default());
-    let now = Instant::now();
+fn configured_hard_limits_reject_invalid_values() {
+    let defaults = ConnectionLimits::default();
+    assert_eq!(defaults.validate(), Ok(defaults));
+
+    let invalid = ConnectionLimits {
+        max_unsignaled_encodings: ConnectionLimits::HARD_MAX_UNSIGNALED_ENCODINGS + 1,
+        ..defaults
+    };
+    assert!(invalid.validate().is_err());
+
+    let invalid = ConnectionLimits {
+        max_data_channels: ConnectionLimits::HARD_MAX_DATA_CHANNELS + 1,
+        ..defaults
+    };
+    assert!(invalid.validate().is_err());
+
+    let invalid = ConnectionLimits {
+        max_inbound_data_message_bytes: ConnectionLimits::HARD_MAX_INBOUND_DATA_MESSAGE_BYTES + 1,
+        ..defaults
+    };
+    assert!(invalid.validate().is_err());
+
+    let invalid = ConnectionLimits {
+        max_buffered_data_bytes: ConnectionLimits::HARD_MAX_BUFFERED_DATA_BYTES + 1,
+        ..defaults
+    };
+    assert!(invalid.validate().is_err());
+
+    let invalid = ConnectionLimits {
+        max_queued_media_bytes: ConnectionLimits::HARD_MAX_QUEUED_MEDIA_BYTES + 1,
+        ..defaults
+    };
+    assert!(invalid.validate().is_err());
+
+    let invalid = ConnectionLimits {
+        max_retransmission_bytes: ConnectionLimits::HARD_MAX_RETRANSMISSION_BYTES + 1,
+        ..defaults
+    };
+    assert!(invalid.validate().is_err());
+
+    assert!(ConnectionConfig::default().validate().is_ok());
+}
+
+#[test]
+fn policy_values_reject_unrepresentable_construction() {
+    assert_eq!(MediaPriority::new(0), Err(PolicyError::PriorityOutOfRange));
     assert_eq!(
-        peer.handle_timeout(now + Duration::from_secs(1)),
-        Err(RtcPeerError::NotNegotiated)
+        MediaPriority::new(257),
+        Err(PolicyError::PriorityOutOfRange)
+    );
+    assert_eq!(MediaPriority::new(1).map(MediaPriority::weight), Ok(1));
+    assert_eq!(
+        PlayoutDelay::from_millis_exact(1, 10),
+        Err(PolicyError::PlayoutNotExactlyRepresentable)
     );
     assert_eq!(
-        peer.close(now, pulsebeam_rtc::CloseReason::Timeout),
-        Err(RtcPeerError::InvalidInput)
+        PlayoutDelay::from_ticks(2, 1),
+        Err(PolicyError::PlayoutRange)
     );
-    assert_eq!(peer.state(), RtcConnectionState::Configured);
+    assert_eq!(FrameDependencies::known([FrameId::from_value(1); 9]), None);
 }

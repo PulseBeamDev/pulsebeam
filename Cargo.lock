@@ -3391,11 +3391,13 @@ dependencies = [
 name = "pulsebeam-rtc"
 version = "0.3.2"
 dependencies = [
+ "bytes",
  "dcsctp",
  "is 0.11.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1)",
  "proptest",
  "str0m 0.23.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "str0m 0.23.1 (git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1)",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

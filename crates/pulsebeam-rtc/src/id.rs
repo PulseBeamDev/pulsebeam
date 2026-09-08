@@ -1,56 +1,74 @@
-macro_rules! checked_identifier {
-    ($name:ident, $inner:ty) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use std::fmt;
+
+macro_rules! connection_id {
+    ($name:ident, $value:ty) => {
         #[repr(transparent)]
-        pub struct $name($inner);
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name($value);
 
         impl $name {
-            pub const fn new(value: $inner) -> Option<Self> {
+            #[allow(
+                dead_code,
+                reason = "connection-owned IDs are allocated by Connection beginning in Plan 02"
+            )]
+            pub(crate) const fn new(value: $value) -> Option<Self> {
                 if value == 0 { None } else { Some(Self(value)) }
             }
+        }
 
-            pub const fn get(self) -> $inner {
-                self.0
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_tuple(stringify!($name))
+                    .field(&self.0)
+                    .finish()
             }
         }
     };
 }
 
-checked_identifier!(IngressStream, u32);
-checked_identifier!(EgressSlot, u32);
+macro_rules! caller_id {
+    ($name:ident, $value:ty) => {
+        #[repr(transparent)]
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name($value);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct DataChannel(u16);
+        impl $name {
+            pub const fn from_value(value: $value) -> Self {
+                Self(value)
+            }
 
-impl DataChannel {
-    pub const fn new(value: u16) -> Option<Self> {
-        Some(Self(value))
-    }
+            pub const fn value(self) -> $value {
+                self.0
+            }
+        }
 
-    pub const fn get(self) -> u16 {
-        self.0
-    }
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_tuple(stringify!($name))
+                    .field(&self.0)
+                    .finish()
+            }
+        }
+    };
 }
 
-pub type ChannelId = DataChannel;
+connection_id!(SenderId, u16);
+connection_id!(EncodingId, u32);
+caller_id!(DataChannelId, u16);
+caller_id!(IceTcpFlowId, u64);
+caller_id!(FrameId, u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct DepartureReceipt(u64);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl DepartureReceipt {
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct TransmissionId(u64);
-
-impl TransmissionId {
-    pub const fn get(self) -> u64 {
-        self.0
+    #[test]
+    fn connection_allocated_ids_are_distinct_values() {
+        assert_ne!(SenderId::new(1), SenderId::new(2));
+        assert_ne!(EncodingId::new(1), EncodingId::new(2));
+        assert_eq!(SenderId::new(0), None);
+        assert_eq!(EncodingId::new(0), None);
     }
 }

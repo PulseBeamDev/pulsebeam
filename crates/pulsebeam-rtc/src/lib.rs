@@ -1,40 +1,61 @@
-mod api;
-pub mod clock;
 mod id;
-pub mod media_packet;
-mod negotiation;
-pub mod packet;
-pub mod rtcp;
+mod io;
+mod media_packet;
 mod session;
-pub mod transport;
+mod time;
 
-pub use api::{
-    ApplicationCommand, CloseReason, DataChannelMode, DataPayload, DatagramProtocol,
-    IngressDatagram, MediaDirection, MediaKind, RtcConnectionState, RtcEvent, RtcPeer,
-    RtcPeerError, Transmit,
+use std::{cell::Cell, marker::PhantomData};
+
+pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId};
+pub use io::{
+    AcceptError, AllocationSnapshot, CloseReason, Command, CommandError, ConnectionStats,
+    ConnectionWarning, DataChannelEvent, DataChannelStats, EcnCodepoint, EncodingInfo,
+    EncodingRetireReason, EncodingStats, Event, NetworkInput, Output, ReceiveError,
+    SenderAllocation, SenderStats, StatsSnapshot, Transmit, TransmitTarget,
 };
-pub use clock::{
-    ClockAnchor, ClockError, DISCONTINUITY_CONFIRMATIONS, MAX_DISCONTINUITY, MAX_SENDER_REPORT_AGE,
-    MAX_SENDER_REPORT_FUTURE, MAX_SENDER_REPORT_RATE_ERROR_DENOMINATOR,
-    MAX_SENDER_REPORT_RATE_ERROR_NUMERATOR, MAX_SENDER_REPORT_SAMPLE_INTERVAL,
-    MAX_SENDER_REPORT_SLEW, MappedMediaTime, RtpClockMapper, SenderReportDecision,
-    SenderReportRejection,
-};
-pub use id::{ChannelId, DataChannel, DepartureReceipt, EgressSlot, IngressStream, TransmissionId};
 pub use media_packet::{
-    AbsCaptureTimeFact, AudioLevelFact, DependencyDescriptorFact, H264Fact, H264PacketShape,
-    MediaPacket, MediaPacketClockError, MediaPacketDescriptor, OpusFact, OwnedMediaPacket,
-    PlayoutDelayFact, SemanticFamily, VideoLayerAllocationFact, VlaSpatialLayerFact, VlaStreamFact,
-};
-pub use negotiation::{NegotiationError, negotiate};
-pub use packet::{ExtensionIter, PacketError, RtcpCompound, RtcpPacket, RtpExtension, RtpPacket};
-pub use rtcp::{
-    Bye, Fir, FirEntry, Nack, Pli, ReceiverReport, ReportBlock, Sdes, SdesChunk, SdesItem,
-    SdesItems, SenderReport, Twcc, TwccPacketStatus, TwccRecvDelta, TwccReferenceTime,
+    ForwardedMedia, FrameBoundary, FrameDependencies, FrameMetadata, MediaPacket,
 };
 pub use session::{
-    Codec, DataChannelParameters, DtlsFingerprint, DtlsRole, H264Parameters, HeaderExtension,
-    IceCandidate, IceCredentials, MaxMessageSize, NegotiatedCodec, NegotiatedMedia,
-    NegotiatedMediaSection, NegotiatedSession, NegotiationParameters, RtcConfiguration,
-    RtcNegotiation, SdpAnswer, SsrcGroup,
+    ConnectionConfig, ConnectionLimits, DataChannelConfig, DataChannelConfigError,
+    DataChannelPriority, DataMessage, DataReliability, MediaKind, MediaPayloadBitrate,
+    MediaPriority, PacketFeedbackKind, PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderInfo,
+    SenderPolicy, SessionCapabilities, SessionInfo, UnknownExtensionPolicy,
 };
+pub use time::{ConnectionEntropy, GlobalMediaTime, TimePoint};
+
+pub struct Connection {
+    _time: time::MonotonicObserver,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+pub struct AcceptedConnection {
+    pub connection: Connection,
+    pub answer: SdpAnswer,
+    pub session: SessionInfo,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn connection_owns_a_monotonic_observer() {
+        let mut connection = Connection {
+            _time: time::MonotonicObserver::default(),
+            _not_sync: PhantomData,
+        };
+        let at = TimePoint {
+            monotonic: Instant::now(),
+            global: GlobalMediaTime::from_micros(1),
+        };
+        assert_eq!(connection._time.observe(at).global, at.global);
+    }
+
+    #[test]
+    fn entropy_is_consumed_as_exactly_32_bytes() {
+        assert_eq!(ConnectionEntropy::new([7; 32]).into_bytes(), [7; 32]);
+    }
+}
