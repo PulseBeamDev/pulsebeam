@@ -87,10 +87,17 @@ impl IceLayer {
         Ok(())
     }
 
-    pub(crate) fn poll_transmit(&mut self) -> Option<(SocketAddr, SocketAddr, Vec<u8>)> {
-        self.agent
-            .poll_transmit()
-            .map(|packet| (packet.source, packet.destination, packet.contents.into()))
+    pub(crate) fn poll_transmit(
+        &mut self,
+    ) -> Option<(is::Protocol, SocketAddr, SocketAddr, Vec<u8>)> {
+        self.agent.poll_transmit().map(|packet| {
+            (
+                packet.proto,
+                packet.source,
+                packet.destination,
+                packet.contents.into(),
+            )
+        })
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<IceEvent> {
